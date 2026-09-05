@@ -15,12 +15,26 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Error variants for infotheory estimations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum InfoTheoryError {
+    /// Paired series contain different numbers of samples.
     #[error("input slices have mismatched lengths: {len_a} vs {len_b}")]
-    LengthMismatch { len_a: usize, len_b: usize },
+    LengthMismatch {
+        /// Number of samples in the first series.
+        len_a: usize,
+        /// Number of samples in the second series.
+        len_b: usize,
+    },
+    /// The estimator cannot run on the supplied sample count.
     #[error("insufficient sample size: have {have}, need {need}")]
-    InsufficientSamples { have: usize, need: usize },
+    InsufficientSamples {
+        /// Number of supplied samples.
+        have: usize,
+        /// Minimum number required by this estimation path.
+        need: usize,
+    },
+    /// Requested discretization count is outside the supported range.
     #[error("bins count {0} is out of valid range (2..=32)")]
     InvalidBinCount(usize),
+    /// The series admits no shift in the circular surrogate's allowed range.
     #[error(
         "circular-shift surrogate needs at least {need} samples to form a non-degenerate shift, have {samples}"
     )]
@@ -30,6 +44,7 @@ pub enum InfoTheoryError {
         /// Shortest length admitting a non-degenerate circular shift.
         need: usize,
     },
+    /// The requested null does not preserve the estimator's required structure.
     #[error("{estimator} does not support the {requested} surrogate null: {why}")]
     SurrogateUnsupported {
         /// Which estimator refused.
@@ -39,6 +54,7 @@ pub enum InfoTheoryError {
         /// Why it is not meaningful here.
         why: &'static str,
     },
+    /// A sampled input is infinite or NaN.
     #[error("non-finite value encountered in input series")]
     NonFiniteInput,
 }
@@ -353,16 +369,27 @@ pub enum EmergenceVerdict {
 /// Pre-registered study evaluation report for communication emergence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommunicationStudyReport {
+    /// Caller-supplied scenario identity.
     pub scenario_id: String,
+    /// Caller-supplied configuration digest.
     pub config_digest: String,
+    /// I/O layout version used by the study.
     pub io_layout_version: u16,
+    /// Number of communication bands in that layout.
     pub bands: u8,
+    /// Whether the signal-arm p-value is below 0.01.
     pub criterion_1_signal_mi: bool,
+    /// Whether the scrambled-arm p-value is at least 0.05.
     pub criterion_2_scrambled_null: bool,
+    /// Whether the behavioral conditioning delta exceeds 0.05.
     pub criterion_3_behavioral_conditioning: bool,
+    /// Positive only when all three pre-registered criteria hold.
     pub verdict: EmergenceVerdict,
+    /// Supplied signal-arm mutual-information p-value.
     pub signal_arm_p_value: f64,
+    /// Supplied scrambled-arm mutual-information p-value.
     pub scrambled_arm_p_value: f64,
+    /// Supplied behavioral conditioning effect delta.
     pub behavioral_effect_delta: f64,
 }
 
@@ -912,6 +939,12 @@ fn decorrelation_lag(series: &[f64], max_lag: usize) -> usize {
 
 /// Computes discretized bin index for `v` in `[0.0, 1.0]` over `bins`.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "uniform binning uses floating multiplication followed by a floored saturating index conversion; preserve the public boundary and NaN behavior"
+)]
 pub fn discretize(v: f64, bins: usize) -> usize {
     if v <= 0.0 {
         0
@@ -953,6 +986,11 @@ pub fn compute_mi_with_surrogate(
         });
     }
 
+    // Reject caller-supplied widths before squaring them for the sample floor.
+    if params.bins < 2 || params.bins > MAX_ESTIMATOR_BINS {
+        return Err(InfoTheoryError::InvalidBinCount(params.bins));
+    }
+
     let n = emitter.len();
     let min_required = params.bins * params.bins * 2;
     let sufficient = n >= min_required;
@@ -962,9 +1000,6 @@ pub fn compute_mi_with_surrogate(
             have: 0,
             need: min_required,
         });
-    }
-    if params.bins < 2 || params.bins > 32 {
-        return Err(InfoTheoryError::InvalidBinCount(params.bins));
     }
 
     let mut saturated_count = 0usize;
@@ -978,6 +1013,10 @@ pub fn compute_mi_with_surrogate(
             saturated_count += 1;
         }
     }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the saturation report is an f64 ratio of integer sample counts, not an exact integer identity"
+    )]
     let saturated_fraction = saturated_count as f64 / n as f64;
 
     let b = params.bins;
@@ -1056,50 +1095,8 @@ pub fn compute_mi_with_surrogate(
         });
     }
 
-    let p_value = (1.0 + ge_count as f64) / (r_runs as f64 + 1.0);
-
-    // Surrogate stats
-    let surr_sum: f64 = surrogates.iter().sum();
-    let surr_mean = surr_sum / r_runs as f64;
-    let surr_var: f64 = surrogates
-        .iter()
-        .map(|v| (v - surr_mean) * (v - surr_mean))
-        .sum::<f64>()
-        / r_runs as f64;
-    let surr_sd = surr_var.sqrt();
-
-    let mut sorted_surr = surrogates.clone();
-    sorted_surr.sort_by(f64::total_cmp);
-    let q95_idx = ((r_runs as f64) * 0.95).floor() as usize;
-    let q95 = sorted_surr[q95_idx.min(r_runs - 1)];
-
-    let surrogate_stats = SurrogateStats {
-        r: r_runs,
-        mean: surr_mean,
-        sd: surr_sd,
-        q95,
-    };
-
-    // Bootstrap CI
-    let boot_runs = params.bootstrap_runs.max(10);
-    let mut boot_mis = Vec::with_capacity(boot_runs);
-    let mut boot_e = vec![0.0f64; n];
-    let mut boot_r = vec![0.0f64; n];
-
-    for _ in 0..boot_runs {
-        for i in 0..n {
-            let idx = rng.random_range(0..n);
-            boot_e[i] = emitter[idx];
-            boot_r[i] = receiver[idx];
-        }
-        let (_, b_corr) = calc_mi_mm(&boot_e, &boot_r, b);
-        boot_mis.push(b_corr.max(0.0));
-    }
-    boot_mis.sort_by(f64::total_cmp);
-    let lo_idx = ((boot_runs as f64) * 0.025).floor() as usize;
-    let hi_idx = ((boot_runs as f64) * 0.975).floor() as usize;
-    let ci_lo = boot_mis[lo_idx.min(boot_runs - 1)];
-    let ci_hi = boot_mis[hi_idx.min(boot_runs - 1)];
+    let (p_value, surrogate_stats) = summarize_surrogates(&surrogates, ge_count);
+    let (ci_lo, ci_hi) = bootstrap_mi(emitter, receiver, params, &mut rng);
 
     Ok(MiEstimate {
         bits_plugin: plugin,
@@ -1122,7 +1119,79 @@ pub fn compute_mi_with_surrogate(
     })
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "surrogate probabilities and moments are f64 estimates of integer run counts; retain the existing ratio and reduction order"
+)]
+fn summarize_surrogates(surrogates: &[f64], ge_count: usize) -> (f64, SurrogateStats) {
+    let r_runs = surrogates.len();
+    let p_value = (1.0 + ge_count as f64) / (r_runs as f64 + 1.0);
+    let surr_sum: f64 = surrogates.iter().sum();
+    let surr_mean = surr_sum / r_runs as f64;
+    let surr_var: f64 = surrogates
+        .iter()
+        .map(|v| (v - surr_mean) * (v - surr_mean))
+        .sum::<f64>()
+        / r_runs as f64;
+    let surr_sd = surr_var.sqrt();
+    let mut sorted_surr = surrogates.to_vec();
+    sorted_surr.sort_by(f64::total_cmp);
+    let q95 = sorted_quantile(&sorted_surr, 0.95);
+    (
+        p_value,
+        SurrogateStats {
+            r: r_runs,
+            mean: surr_mean,
+            sd: surr_sd,
+            q95,
+        },
+    )
+}
+
+// Callers supply nonempty sorted samples and one of the fixed 0.025, 0.95, 0.975 quantiles.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the estimator's quantile convention is floor(f64 sample count times quantile), clamped to the final sample; integer reformulation can select a different boundary"
+)]
+fn sorted_quantile(sorted: &[f64], quantile: f64) -> f64 {
+    let index = ((sorted.len() as f64) * quantile).floor() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+fn bootstrap_mi(
+    emitter: &[f64],
+    receiver: &[f64],
+    params: &MiParams,
+    rng: &mut SmallRngStream,
+) -> (f64, f64) {
+    let n = emitter.len();
+    let boot_runs = params.bootstrap_runs.max(10);
+    let mut boot_mis = Vec::with_capacity(boot_runs);
+    let mut boot_e = vec![0.0f64; n];
+    let mut boot_r = vec![0.0f64; n];
+    for _ in 0..boot_runs {
+        for i in 0..n {
+            let idx = rng.random_range(0..n);
+            boot_e[i] = emitter[idx];
+            boot_r[i] = receiver[idx];
+        }
+        let (_, b_corr) = calc_mi_mm(&boot_e, &boot_r, params.bins);
+        boot_mis.push(b_corr.max(0.0));
+    }
+    boot_mis.sort_by(f64::total_cmp);
+    (
+        sorted_quantile(&boot_mis, 0.025),
+        sorted_quantile(&boot_mis, 0.975),
+    )
+}
+
 /// Helper calculating plug-in and Miller-Madow corrected MI.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the plug-in and Miller-Madow estimators convert integer histogram frequencies to f64 probabilities; the report retains exact sample counts separately"
+)]
 fn calc_mi_mm(emitter: &[f64], receiver: &[f64], b: usize) -> (f64, f64) {
     let n = emitter.len() as f64;
     let mut joint = vec![0usize; b * b];
@@ -1138,25 +1207,33 @@ fn calc_mi_mm(emitter: &[f64], receiver: &[f64], b: usize) -> (f64, f64) {
     }
 
     let mut plugin = 0.0f64;
-    let mut k_xy = 0usize;
+    let mut occupied_joint = 0usize;
     for be in 0..b {
         for br in 0..b {
             let count = joint[be * b + br];
             if count > 0 {
-                k_xy += 1;
-                let p_xy = count as f64 / n;
-                let p_x = margin_e[be] as f64 / n;
-                let p_y = margin_r[br] as f64 / n;
-                plugin += p_xy * (p_xy / (p_x * p_y)).log2();
+                occupied_joint += 1;
+                let joint_probability = count as f64 / n;
+                let emitter_probability = margin_e[be] as f64 / n;
+                let receiver_probability = margin_r[br] as f64 / n;
+                #[expect(
+                    clippy::suboptimal_flops,
+                    reason = "MI is accumulated in deterministic bin order with separately rounded multiplication and addition; FMA can change reported estimator bits"
+                )]
+                {
+                    plugin += joint_probability
+                        * (joint_probability / (emitter_probability * receiver_probability)).log2();
+                }
             }
         }
     }
 
-    let k_x = margin_e.iter().filter(|&&c| c > 0).count();
-    let k_y = margin_r.iter().filter(|&&c| c > 0).count();
+    let occupied_emitter = margin_e.iter().filter(|&&c| c > 0).count();
+    let occupied_receiver = margin_r.iter().filter(|&&c| c > 0).count();
 
     let mm_correction =
-        (k_xy as f64 - k_x as f64 - k_y as f64 + 1.0) / (2.0 * n * std::f64::consts::LN_2);
+        (occupied_joint as f64 - occupied_emitter as f64 - occupied_receiver as f64 + 1.0)
+            / (2.0 * n * std::f64::consts::LN_2);
 
     // bd-r4ja: returns the correction UNCLAMPED. Callers that report a point estimate apply the
     // non-negativity floor themselves; callers that measure bias must not, because averaging
@@ -1284,51 +1361,8 @@ pub fn compute_te_with_surrogate(
         });
     }
 
-    let p_value = (1.0 + ge_count as f64) / (r_runs as f64 + 1.0);
-
-    let surr_sum: f64 = surrogates.iter().sum();
-    let surr_mean = surr_sum / r_runs as f64;
-    let surr_var: f64 = surrogates
-        .iter()
-        .map(|v| (v - surr_mean) * (v - surr_mean))
-        .sum::<f64>()
-        / r_runs as f64;
-    let surr_sd = surr_var.sqrt();
-
-    let mut sorted_surr = surrogates.clone();
-    sorted_surr.sort_by(f64::total_cmp);
-    let q95_idx = ((r_runs as f64) * 0.95).floor() as usize;
-    let q95 = sorted_surr[q95_idx.min(r_runs - 1)];
-
-    let surrogate_stats = SurrogateStats {
-        r: r_runs,
-        mean: surr_mean,
-        sd: surr_sd,
-        q95,
-    };
-
-    // Bootstrap CI
-    let boot_runs = params.bootstrap_runs.max(10);
-    let mut boot_tes = Vec::with_capacity(boot_runs);
-    let mut boot_rn = vec![0.0f64; n];
-    let mut boot_ec = vec![0.0f64; n];
-    let mut boot_rc = vec![0.0f64; n];
-
-    for _ in 0..boot_runs {
-        for i in 0..n {
-            let idx = rng.random_range(0..n);
-            boot_rn[i] = r_next[idx];
-            boot_ec[i] = e_curr[idx];
-            boot_rc[i] = r_curr[idx];
-        }
-        let b_te = calc_te_mm(&boot_rn, &boot_ec, &boot_rc, b);
-        boot_tes.push(b_te);
-    }
-    boot_tes.sort_by(f64::total_cmp);
-    let lo_idx = ((boot_runs as f64) * 0.025).floor() as usize;
-    let hi_idx = ((boot_runs as f64) * 0.975).floor() as usize;
-    let ci_lo = boot_tes[lo_idx.min(boot_runs - 1)];
-    let ci_hi = boot_tes[hi_idx.min(boot_runs - 1)];
+    let (p_value, surrogate_stats) = summarize_surrogates(&surrogates, ge_count);
+    let (ci_lo, ci_hi) = bootstrap_te(&r_next, &e_curr, &r_curr, params, &mut rng);
 
     Ok(TeEstimate {
         te_bits,
@@ -1347,7 +1381,46 @@ pub fn compute_te_with_surrogate(
     })
 }
 
+fn bootstrap_te(
+    r_next: &[f64],
+    e_curr: &[f64],
+    r_curr: &[f64],
+    params: &MiParams,
+    rng: &mut SmallRngStream,
+) -> (f64, f64) {
+    let n = r_next.len();
+    let boot_runs = params.bootstrap_runs.max(10);
+    let mut boot_tes = Vec::with_capacity(boot_runs);
+    let mut boot_next_receiver = vec![0.0f64; n];
+    let mut boot_emitter = vec![0.0f64; n];
+    let mut boot_current_receiver = vec![0.0f64; n];
+    for _ in 0..boot_runs {
+        for i in 0..n {
+            let idx = rng.random_range(0..n);
+            boot_next_receiver[i] = r_next[idx];
+            boot_emitter[i] = e_curr[idx];
+            boot_current_receiver[i] = r_curr[idx];
+        }
+        let b_te = calc_te_mm(
+            &boot_next_receiver,
+            &boot_emitter,
+            &boot_current_receiver,
+            params.bins,
+        );
+        boot_tes.push(b_te);
+    }
+    boot_tes.sort_by(f64::total_cmp);
+    (
+        sorted_quantile(&boot_tes, 0.025),
+        sorted_quantile(&boot_tes, 0.975),
+    )
+}
+
 /// Helper calculating TE with Miller-Madow bias correction.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the transfer-entropy estimator converts integer histogram frequencies to f64 probabilities; the report retains exact sample counts separately"
+)]
 fn calc_te_mm(r_next: &[f64], e_curr: &[f64], r_curr: &[f64], b: usize) -> f64 {
     let n = r_next.len() as f64;
     let mut counts_3d = vec![0usize; b * b * b];
@@ -1379,7 +1452,13 @@ fn calc_te_mm(r_next: &[f64], e_curr: &[f64], r_curr: &[f64], b: usize) -> f64 {
 
                     let arg = (p_3d * p_rc) / (p_rn_rc * p_ec_rc);
                     if arg > 0.0 {
-                        plugin += p_3d * arg.log2();
+                        #[expect(
+                            clippy::suboptimal_flops,
+                            reason = "TE is accumulated in deterministic bin order with separately rounded multiplication and addition; FMA can change reported estimator bits"
+                        )]
+                        {
+                            plugin += p_3d * arg.log2();
+                        }
                     }
                 }
             }
@@ -1969,6 +2048,76 @@ mod tests {
                 &vec![0.0, 0.25, 0.5, 0.75, 1.0],
                 "{label} must report the actual bin boundaries, not just the bin count"
             );
+        }
+    }
+
+    #[test]
+    fn mi_validates_bin_bounds_before_sample_size_arithmetic() {
+        for bins in [0, 1, MAX_ESTIMATOR_BINS + 1, usize::MAX] {
+            let params = MiParams {
+                bins,
+                surrogate_runs: 1,
+                bootstrap_runs: 10,
+                seed: 7,
+            };
+            for series in [&[][..], &[0.25, 0.75][..]] {
+                assert_eq!(
+                    compute_mi(series, series, &params).expect_err("invalid bin count"),
+                    InfoTheoryError::InvalidBinCount(bins)
+                );
+                assert_eq!(
+                    compute_mi_with_surrogate(
+                        series,
+                        series,
+                        &params,
+                        SurrogateKind::PairingPermutation,
+                    )
+                    .expect_err("invalid bin count with permutation null"),
+                    InfoTheoryError::InvalidBinCount(bins)
+                );
+            }
+        }
+
+        let invalid = MiParams {
+            bins: usize::MAX,
+            ..MiParams::default()
+        };
+        assert_eq!(
+            compute_mi(&[0.25], &[], &invalid).expect_err("length mismatch remains first"),
+            InfoTheoryError::LengthMismatch { len_a: 1, len_b: 0 }
+        );
+
+        for bins in [2, MAX_ESTIMATOR_BINS] {
+            let params = MiParams {
+                bins,
+                surrogate_runs: 1,
+                bootstrap_runs: 10,
+                seed: 7,
+            };
+            let minimum_samples = bins * bins * 2;
+            assert_eq!(
+                compute_mi(&[], &[], &params).expect_err("empty series"),
+                InfoTheoryError::InsufficientSamples {
+                    have: 0,
+                    need: minimum_samples,
+                }
+            );
+            assert_eq!(
+                compute_mi(&[0.25, 0.75], &[0.25, 0.75], &params)
+                    .expect_err("two samples admit no circular surrogate"),
+                InfoTheoryError::SurrogateInfeasible {
+                    samples: 2,
+                    need: MIN_CIRCULAR_SURROGATE_SAMPLES,
+                }
+            );
+            let series: Vec<f64> = (0..minimum_samples)
+                .map(|i| if i % 2 == 0 { 0.25 } else { 0.75 })
+                .collect();
+            let estimate = compute_mi(&series, &series, &params).expect("valid bin endpoint");
+            assert_eq!(estimate.bins, bins);
+            assert_eq!(estimate.n, minimum_samples);
+            assert!(estimate.sufficient);
+            assert!(estimate.bits_plugin.is_finite());
         }
     }
 

@@ -89,7 +89,7 @@ pub struct VoicePlan {
     /// One-shot sound events to trigger.
     pub one_shots: Vec<OneShot>,
     /// Number of overflow events dropped by rate limiting.
-    pub dropped: u32,
+    pub dropped: u64,
 }
 
 /// Audio engine configuration settings.
@@ -116,8 +116,12 @@ impl Default for AudioConfig {
     }
 }
 
-/// Map a single AudioFrame into updated AudioParams and a rate-limited VoicePlan.
+/// Map a single `AudioFrame` into updated `AudioParams` and a rate-limited `VoicePlan`.
 #[must_use]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "deterministic audio smoothing rounds its multiplication before adding the prior parameter"
+)]
 pub fn map_frame(
     prev: &AudioParams,
     frame: &AudioFrame,
@@ -126,7 +130,9 @@ pub fn map_frame(
     let mut next_params = prev.clone();
 
     // Smooth drone density based on population
-    let target_density = (frame.population as f32 / 500.0).clamp(0.0, 1.0);
+    let target_density = u16::try_from(frame.population).map_or(1.0, |population| {
+        (f32::from(population) / 500.0).clamp(0.0, 1.0)
+    });
     next_params.drone_density += (target_density - next_params.drone_density) * 0.1;
 
     // Smooth dissonance based on diet ratio: carnivore-heavy -> higher dissonance
@@ -137,46 +143,57 @@ pub fn map_frame(
     next_params.master_gain = config.master_gain;
 
     let mut plan = VoicePlan::default();
-    let total_triggers = frame.births + frame.deaths + frame.spike_hits;
+    let total_triggers =
+        u64::from(frame.births) + u64::from(frame.deaths) + u64::from(frame.spike_hits);
 
     if total_triggers == 0 {
         return (next_params, plan);
     }
 
-    let allowed = total_triggers.min(config.max_oneshots_per_tick as u32) as usize;
-    plan.dropped = total_triggers.saturating_sub(allowed as u32);
+    let allowed = total_triggers.min(config.max_oneshots_per_tick as u64);
+    plan.dropped = total_triggers.saturating_sub(allowed);
 
     // Generate bell oneshots for births
     let mut added = 0;
-    for _ in 0..frame.births.min(allowed as u32) {
+    for _ in 0..u64::from(frame.births).min(allowed) {
         if added >= allowed {
             break;
         }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the PCM voice plan uses an f32 pitch offset; retain the existing integer-to-f32 rounding"
+        )]
+        let detune_cents = added as f32 * 5.0;
         plan.one_shots.push(OneShot {
             kind: "Bell".into(),
             pan: 0.0,
             gain: 0.5,
-            detune_cents: added as f32 * 5.0,
+            detune_cents,
         });
         added += 1;
     }
 
     // Generate thud oneshots for deaths
-    for _ in 0..frame.deaths.min(allowed as u32) {
+    for _ in 0..u64::from(frame.deaths).min(allowed) {
         if added >= allowed {
             break;
         }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the PCM voice plan uses an f32 pitch offset; retain the existing integer-to-f32 rounding"
+        )]
+        let detune_cents = -(added as f32 * 10.0);
         plan.one_shots.push(OneShot {
             kind: "Thud".into(),
             pan: -0.2,
             gain: 0.6,
-            detune_cents: -(added as f32 * 10.0),
+            detune_cents,
         });
         added += 1;
     }
 
     // Generate transient oneshots for spike hits
-    for _ in 0..frame.spike_hits.min(allowed as u32) {
+    for _ in 0..u64::from(frame.spike_hits).min(allowed) {
         if added >= allowed {
             break;
         }
@@ -192,20 +209,83 @@ pub fn map_frame(
     (next_params, plan)
 }
 
-/// Render a sequence of AudioFrames to deterministic 48kHz mono 32-bit float PCM samples.
-#[must_use]
+/// A PCM buffer whose size cannot be represented or allocated on this target.
+#[derive(Debug, thiserror::Error)]
+pub enum AudioRenderError {
+    /// The number of output samples does not fit an addressable buffer length.
+    #[error("PCM sample count overflows: {frames} frames with {samples_per_tick} samples per tick")]
+    SampleCountOverflow {
+        /// Number of input frames.
+        frames: usize,
+        /// Requested output samples for each frame.
+        samples_per_tick: u64,
+    },
+    /// The sample count fits an index, but its byte length exceeds a vector's capacity.
+    #[error("PCM buffer of {samples} f32 samples exceeds the target allocation capacity")]
+    CapacityExceeded {
+        /// Requested number of samples.
+        samples: usize,
+    },
+    /// The allocator refused a representable PCM buffer.
+    #[error("could not reserve PCM buffer for {samples} samples: {source}")]
+    AllocationFailed {
+        /// Requested number of samples.
+        samples: usize,
+        /// The allocator's exact refusal.
+        #[source]
+        source: std::collections::TryReserveError,
+    },
+}
+
+fn pcm_sample_count(frames: usize, samples_per_tick: u64) -> Result<usize, AudioRenderError> {
+    let samples_per_tick_usize =
+        usize::try_from(samples_per_tick).map_err(|_| AudioRenderError::SampleCountOverflow {
+            frames,
+            samples_per_tick,
+        })?;
+    let samples = frames.checked_mul(samples_per_tick_usize).ok_or(
+        AudioRenderError::SampleCountOverflow {
+            frames,
+            samples_per_tick,
+        },
+    )?;
+    std::alloc::Layout::array::<f32>(samples)
+        .map_err(|_| AudioRenderError::CapacityExceeded { samples })?;
+    Ok(samples)
+}
+
+/// Render a sequence of `AudioFrame` values to deterministic mono 32-bit float PCM samples.
+///
+/// # Errors
+/// Returns a typed error if the sample count or allocation byte size overflows,
+/// or the allocator refuses the buffer. Empty input and a zero tick rate produce
+/// an empty buffer.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "the deterministic PCM synthesis contract uses f32 sample coordinates and separately rounded oscillator products and sums"
+)]
 pub fn render_offline_pcm(
     frames: &[AudioFrame],
     config: &AudioConfig,
     ticks_per_second: u64,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, AudioRenderError> {
     if frames.is_empty() || ticks_per_second == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let samples_per_tick = config.sample_rate as u64 / ticks_per_second;
-    let total_samples = (frames.len() as u64 * samples_per_tick) as usize;
-    let mut pcm = vec![0.0f32; total_samples];
+    // A tick rate wider than the u32 sample rate necessarily yields zero samples.
+    let samples_per_tick = u32::try_from(ticks_per_second).map_or(0, |tick_rate| {
+        config.sample_rate as usize / tick_rate as usize
+    });
+    let total_samples = pcm_sample_count(frames.len(), samples_per_tick as u64)?;
+    let mut pcm = Vec::new();
+    pcm.try_reserve_exact(total_samples)
+        .map_err(|source| AudioRenderError::AllocationFailed {
+            samples: total_samples,
+            source,
+        })?;
+    pcm.resize(total_samples, 0.0_f32);
 
     let mut current_params = AudioParams::default();
     let dt = 1.0 / config.sample_rate as f32;
@@ -214,11 +294,11 @@ pub fn render_offline_pcm(
         let (next_params, plan) = map_frame(&current_params, frame, config);
         current_params = next_params;
 
-        let start_sample = tick_idx * samples_per_tick as usize;
-        let end_sample = (start_sample + samples_per_tick as usize).min(total_samples);
+        let start_sample = tick_idx * samples_per_tick;
+        let end_sample = (start_sample + samples_per_tick).min(total_samples);
 
         for (sample_offset, s_idx) in (start_sample..end_sample).enumerate() {
-            let t = (tick_idx * samples_per_tick as usize + sample_offset) as f32 * dt;
+            let t = (tick_idx * samples_per_tick + sample_offset) as f32 * dt;
             // Synthesize drone oscillator
             let freq = 110.0 + current_params.dissonance * 20.0;
             let drone =
@@ -242,7 +322,7 @@ pub fn render_offline_pcm(
         }
     }
 
-    pcm
+    Ok(pcm)
 }
 
 #[cfg(test)]
@@ -266,7 +346,7 @@ mod tests {
 
         let (next_params, plan) = map_frame(&prev, &frame, &cfg);
         assert!(plan.one_shots.len() <= cfg.max_oneshots_per_tick);
-        assert_eq!(plan.dropped, 80 - plan.one_shots.len() as u32);
+        assert_eq!(plan.dropped, 80 - plan.one_shots.len() as u64);
         assert!(next_params.drone_density > 0.0);
     }
 
@@ -287,7 +367,7 @@ mod tests {
             },
         ];
         let cfg = AudioConfig::default();
-        let pcm = render_offline_pcm(&frames, &cfg, 60);
+        let pcm = render_offline_pcm(&frames, &cfg, 60).expect("bounded PCM buffer");
 
         assert!(!pcm.is_empty());
         assert_eq!(pcm.len(), (48_000 / 60) * 2);
@@ -301,7 +381,93 @@ mod tests {
 
     #[test]
     fn test_empty_frames_renders_empty_pcm() {
-        let pcm = render_offline_pcm(&[], &AudioConfig::default(), 60);
+        let pcm = render_offline_pcm(&[], &AudioConfig::default(), 60).expect("empty PCM buffer");
         assert!(pcm.is_empty());
+    }
+
+    #[test]
+    fn event_count_overflow_preserves_full_dropped_total() {
+        let frame = AudioFrame {
+            births: u32::MAX,
+            deaths: u32::MAX,
+            spike_hits: u32::MAX,
+            ..AudioFrame::default()
+        };
+        let config = AudioConfig {
+            max_oneshots_per_tick: 1,
+            ..AudioConfig::default()
+        };
+        let (_, plan) = map_frame(&AudioParams::default(), &frame, &config);
+        assert_eq!(plan.one_shots.len(), 1);
+        assert_eq!(plan.one_shots[0].kind, "Bell");
+        assert_eq!(plan.dropped, 3 * u64::from(u32::MAX) - 1);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn voice_budget_above_u32_does_not_wrap_to_zero() {
+        let frame = AudioFrame {
+            births: 1,
+            deaths: 1,
+            spike_hits: 1,
+            ..AudioFrame::default()
+        };
+        let config = AudioConfig {
+            max_oneshots_per_tick: u32::MAX as usize + 1,
+            ..AudioConfig::default()
+        };
+        let (_, plan) = map_frame(&AudioParams::default(), &frame, &config);
+        assert_eq!(plan.one_shots.len(), 3);
+        assert_eq!(plan.dropped, 0);
+        assert_eq!(
+            plan.one_shots
+                .iter()
+                .map(|shot| shot.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["Bell", "Thud", "Transient"]
+        );
+    }
+
+    #[test]
+    fn pcm_layout_refuses_sample_and_byte_overflow_before_allocation() {
+        assert_eq!(
+            pcm_sample_count(2, 800).expect("ordinary sample count"),
+            1_600
+        );
+        assert!(matches!(
+            pcm_sample_count(usize::MAX, 2),
+            Err(AudioRenderError::SampleCountOverflow {
+                frames: usize::MAX,
+                samples_per_tick: 2,
+            })
+        ));
+        let samples =
+            usize::try_from(isize::MAX).expect("positive isize fits usize") / size_of::<f32>() + 1;
+        assert!(matches!(
+            pcm_sample_count(samples, 1),
+            Err(AudioRenderError::CapacityExceeded { samples: actual }) if actual == samples
+        ));
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn pcm_layout_refuses_samples_per_tick_that_do_not_fit_usize() {
+        assert!(matches!(
+            pcm_sample_count(1, u64::from(u32::MAX) + 1),
+            Err(AudioRenderError::SampleCountOverflow { frames: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn zero_and_above_sample_tick_rates_produce_empty_pcm() {
+        let frames = [AudioFrame::default()];
+        let config = AudioConfig::default();
+        for tick_rate in [0, u64::from(config.sample_rate) + 1, u64::MAX] {
+            assert!(
+                render_offline_pcm(&frames, &config, tick_rate)
+                    .expect("empty PCM for this tick rate")
+                    .is_empty()
+            );
+        }
     }
 }

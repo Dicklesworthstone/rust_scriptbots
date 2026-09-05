@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct ExpectedEvent {
     /// Simulation tick on which the event is expected.
     pub tick: u64,
-    /// Type/kind of narrative event (e.g. "PopulationCrash", "Extinction").
+    /// Type/kind of narrative event (e.g. `PopulationCrash`, `Extinction`).
     pub kind: String,
     /// Optional metric name associated with the event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +74,7 @@ pub struct GalleryWorld {
 
 impl GalleryWorld {
     /// Compare expected timeline with actual narrative events from a run up to `horizon_ticks`.
+    #[must_use]
     pub fn verify_timeline(
         &self,
         actual_events: &[crate::narrative::EventRecord],
@@ -121,7 +122,7 @@ impl GalleryWorld {
             let act_kind_str = format!("{:?}", act.kind);
             let kind_matches = exp.kind == act_kind_str
                 || exp.kind == act.metric
-                || exp.metric.as_ref().map_or(false, |m| m == &act.metric);
+                || exp.metric.as_ref() == Some(&act.metric);
             let tick_matches = exp.tick == act.tick.0;
 
             if !tick_matches || !kind_matches {

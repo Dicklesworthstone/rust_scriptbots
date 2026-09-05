@@ -437,7 +437,7 @@ pub trait RandomStream: RngCore {
 /// Restorable target-independent scientific random stream.
 ///
 /// The historical type name is retained, but the algorithm is project-owned Xoshiro256++ seeded
-/// by SplitMix64 on every supported pointer width. The adapter implements [`RngCore`], so core and
+/// by `SplitMix64` on every supported pointer width. The adapter implements [`RngCore`], so core and
 /// brain-family consumers use the same sampling operations after selecting an explicit world
 /// domain on native and WASM targets.
 #[derive(Clone, Debug)]
@@ -1237,7 +1237,7 @@ fn validated_grid_index_f32(value: usize) -> f32 {
     clippy::cast_precision_loss,
     reason = "the analytics schema is f64 and intentionally rounds observational usize counts above 2^53; these values never feed simulation state"
 )]
-fn telemetry_count_f64(value: usize) -> f64 {
+const fn telemetry_count_f64(value: usize) -> f64 {
     value as f64
 }
 
@@ -1302,7 +1302,7 @@ fn carcass_neighbor_normalizer(count: usize, exponent: f32) -> f32 {
 )]
 pub fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
     let raw = a - b;
-    if !(extent > 0.0) || !extent.is_finite() || !a.is_finite() || !b.is_finite() {
+    if extent <= 0.0 || !extent.is_finite() || !a.is_finite() || !b.is_finite() {
         return raw;
     }
 
@@ -1536,7 +1536,9 @@ impl ControlCommand {
     pub fn validate(&self) -> Result<(), WorldStateError> {
         match self {
             Self::UpdateConfig(config) => config.validate(),
-            Self::UpdateSelection(_) => Ok(()),
+            Self::UpdateSelection(_) | Self::Pause | Self::Resume | Self::Step | Self::Shutdown => {
+                Ok(())
+            }
             Self::AdjustAgentMutationRates {
                 delta_primary,
                 delta_secondary,
@@ -1551,12 +1553,12 @@ impl ControlCommand {
                 }
             }
             Self::SpawnAgent { herbivore_tendency } => {
-                if !herbivore_tendency.is_finite() {
+                if herbivore_tendency.is_finite() {
+                    Ok(())
+                } else {
                     Err(WorldStateError::InvalidConfig(
                         "agent herbivore tendency must be finite",
                     ))
-                } else {
-                    Ok(())
                 }
             }
             Self::SpawnCrossover { parent_a, parent_b } => {
@@ -1569,7 +1571,6 @@ impl ControlCommand {
                 }
             }
             Self::UpdateSimulation(command) => command.validate(),
-            Self::Pause | Self::Resume | Self::Step | Self::Shutdown => Ok(()),
             Self::SetSpeed(speed) => {
                 if !speed.is_finite() || *speed < 0.0 {
                     Err(WorldStateError::InvalidConfig(
@@ -2018,7 +2019,7 @@ pub enum SelectionMode {
 }
 
 /// External selection update request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SelectionUpdate {
     /// How the update merges with the existing selection.
     pub mode: SelectionMode,
@@ -5239,6 +5240,7 @@ const fn neutral_cohort_diet() -> f32 {
     0.5
 }
 
+/// An operator intervention applied at a simulation tick boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Intervention {
@@ -5782,7 +5784,7 @@ impl ResourceFlowKind {
         }
     }
 
-    /// Stable snake_case label for this flow category.
+    /// Stable `snake_case` label for this flow category.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -8208,6 +8210,10 @@ const fn default_interaction_event_tick_stride() -> u32 {
 
 const DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE: u32 = u32::MAX;
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
+)]
 const fn interaction_event_tick_stride_is_digest_sentinel(value: &u32) -> bool {
     *value == DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE
 }
@@ -8232,32 +8238,56 @@ const fn default_archive_max_cells() -> u64 {
 const fn default_archive_max_bytes() -> usize {
     64 * 1024 * 1024
 }
-fn default_archive_quality_metric() -> QualityMetric {
+const fn default_archive_quality_metric() -> QualityMetric {
     QualityMetric::LifetimeIntake
 }
 fn default_archive_space() -> BehaviorSpaceV0 {
     BehaviorSpaceV0::default()
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
+)]
 const fn archive_enabled_is_digest_sentinel(value: &bool) -> bool {
     !*value
 }
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
+)]
 const fn archive_interval_is_digest_sentinel(value: &u64) -> bool {
     *value == DIGEST_NEUTRAL_ARCHIVE_INTERVAL
 }
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
+)]
 const fn archive_min_lifetime_is_digest_sentinel(value: &u32) -> bool {
     *value == DIGEST_NEUTRAL_ARCHIVE_MIN_LIFETIME_TICKS
 }
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
+)]
 const fn archive_max_cells_is_digest_sentinel(value: &u64) -> bool {
     *value == DIGEST_NEUTRAL_ARCHIVE_MAX_CELLS
 }
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
+)]
 const fn archive_max_bytes_is_digest_sentinel(value: &usize) -> bool {
     *value == DIGEST_NEUTRAL_ARCHIVE_MAX_BYTES
 }
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
+)]
 fn archive_metric_is_digest_sentinel(value: &QualityMetric) -> bool {
     *value == QualityMetric::LifetimeIntake
 }
-fn archive_space_is_digest_sentinel(value: &BehaviorSpaceV0) -> bool {
+const fn archive_space_is_digest_sentinel(value: &BehaviorSpaceV0) -> bool {
     value.axes.is_empty()
 }
 
@@ -9056,6 +9086,8 @@ impl BrainMutationTrialGroupV1 {
     /// Evaluate the group's exact Bernoulli probability on `rand`'s uniform `f32` lattice.
     #[must_use]
     pub fn effective_probability(self, primary_rate: f32) -> f64 {
+        const SAMPLE_CARDINALITY: f64 = 16_777_216.0;
+
         let threshold = primary_rate * f32::from(self.primary_rate_numerator)
             / f32::from(self.primary_rate_denominator);
         let threshold = threshold.clamp(0.0, 1.0);
@@ -9071,11 +9103,10 @@ impl BrainMutationTrialGroupV1 {
 
         // `StandardUniform<f32>` samples one of 2^24 equally likely values `n / 2^24`.
         // Exactly `ceil(threshold * 2^24)` of them satisfy `sample < threshold`.
-        const SAMPLE_CARDINALITY: f64 = 16_777_216.0;
         (f64::from(threshold) * SAMPLE_CARDINALITY).ceil() / SAMPLE_CARDINALITY
     }
 
-    fn validate(self) -> Result<(), &'static str> {
+    const fn validate(self) -> Result<(), &'static str> {
         if self.trials_per_offspring == 0 {
             return Err("mutation gate count must be nonzero");
         }
@@ -9120,7 +9151,7 @@ pub enum BrainHeredityCapabilityV1 {
 impl BrainHeredityCapabilityV1 {
     /// Construct a locus-capable declaration.
     #[must_use]
-    pub fn locus_capable(
+    pub const fn locus_capable(
         locus_schema: BrainLocusSchemaIdentityV1,
         mutation_trials: Vec<BrainMutationTrialGroupV1>,
     ) -> Self {
@@ -10523,7 +10554,7 @@ pub struct Tick(
 
 impl Tick {
     /// Maximum representable Tick value.
-    pub const MAX: Tick = Tick(u64::MAX);
+    pub const MAX: Self = Self(u64::MAX);
 }
 
 impl fmt::Display for Tick {
@@ -12600,6 +12631,10 @@ pub enum LocomotionModel {
 /// Static configuration for a `ScriptBots` world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Topography, population closure, economy diagnostics and archive enablement are independent serialized configuration switches"
+)]
 pub struct ScriptBotsConfig {
     /// Width of the world in world units.
     pub world_width: u32,
@@ -12865,7 +12900,7 @@ pub struct ScriptBotsConfig {
         skip_serializing_if = "archive_min_lifetime_is_digest_sentinel"
     )]
     pub archive_min_lifetime_ticks: u32,
-    /// Maximum allowed grid cells in the MAP-Elites archive (default 100_000, max 1_000_000).
+    /// Maximum allowed grid cells in the MAP-Elites archive (default `100_000`, max `1_000_000`).
     #[serde(
         default = "default_archive_max_cells",
         skip_serializing_if = "archive_max_cells_is_digest_sentinel"
@@ -12877,7 +12912,7 @@ pub struct ScriptBotsConfig {
         skip_serializing_if = "archive_max_bytes_is_digest_sentinel"
     )]
     pub archive_max_bytes: usize,
-    /// Quality metric for elite replacement in MAP-Elites (default LifetimeIntake).
+    /// Quality metric for elite replacement in MAP-Elites (default `LifetimeIntake`).
     #[serde(
         default = "default_archive_quality_metric",
         skip_serializing_if = "archive_metric_is_digest_sentinel"
@@ -14312,18 +14347,14 @@ pub mod narrative {
         pub const fn rail_glyph(self) -> char {
             match self {
                 Self::PopulationCrash => '\u{25BC}',
-                Self::PopulationBoom => '\u{25B2}',
-                Self::DietShift => '\u{25C7}',
+                Self::PopulationBoom | Self::FloorEngaged => '\u{25B2}',
+                Self::DietShift | Self::EnergyRecovery => '\u{25C7}',
                 Self::Extinction => '\u{2716}',
-                Self::EnergyCollapse => '\u{25C6}',
-                Self::EnergyRecovery => '\u{25C7}',
+                Self::EnergyCollapse | Self::ResourceCollapse => '\u{25C6}',
                 Self::CombatSurge => '\u{271A}',
                 Self::RegimeChange => '\u{25CF}',
-                Self::PredatorEmergence => '\u{26A1}',
+                Self::PredatorEmergence | Self::SpeciationHint => '\u{26A1}',
                 Self::AltruismOnset => '\u{2665}',
-                Self::SpeciationHint => '\u{26A1}',
-                Self::FloorEngaged => '\u{25B2}',
-                Self::ResourceCollapse => '\u{25C6}',
             }
         }
 
@@ -14432,7 +14463,7 @@ pub mod narrative {
         /// # Errors
         ///
         /// Returns a typed schema or finite-value refusal naming this input's tick.
-        pub fn validate(self) -> Result<(), NarrativeInputError> {
+        pub const fn validate(self) -> Result<(), NarrativeInputError> {
             if self.schema_version != NARRATIVE_INPUT_V1_SCHEMA_VERSION {
                 return Err(NarrativeInputError::UnsupportedSchema {
                     tick: self.tick.0,
@@ -14683,7 +14714,7 @@ pub mod narrative {
     }
 
     impl SubjectRef {
-        /// Encode SubjectRef to string for database storage.
+        /// Encode `SubjectRef` to string for database storage.
         #[must_use]
         pub fn to_db_string(self) -> String {
             match self {
@@ -14693,7 +14724,7 @@ pub mod narrative {
             }
         }
 
-        /// Decode SubjectRef from database string.
+        /// Decode `SubjectRef` from database string.
         pub fn from_db_string(s: &str) -> Result<Self, String> {
             let (kind, id_str) = s
                 .split_once(':')
@@ -14719,7 +14750,7 @@ pub mod narrative {
     /// One thing that happened, with the evidence that says so.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct EventRecord {
-        /// Schema version for narrative events (schema_version = 1).
+        /// Schema version for narrative events (`schema_version = 1`).
         #[serde(default = "default_event_schema_version")]
         pub schema_version: u32,
         /// Tick the detector fired at.
@@ -14731,7 +14762,7 @@ pub mod narrative {
         /// Magnitude of the change.
         #[serde(default)]
         pub magnitude: f64,
-        /// Window of detection (start_tick, end_tick).
+        /// Window of detection (`start_tick`, `end_tick`).
         #[serde(default)]
         pub window: (u64, u64),
         /// Which series this was detected on.
@@ -14793,9 +14824,7 @@ pub mod narrative {
             {
                 Some(EventKind::Extinction)
             }
-            (DetectionKind::Regime, EvidenceClass::Regime(regime))
-                if matches!(regime, Regime::Collapse | Regime::Growth) =>
-            {
+            (DetectionKind::Regime, EvidenceClass::Regime(Regime::Collapse | Regime::Growth)) => {
                 Some(EventKind::RegimeChange)
             }
             (DetectionKind::Bimodality, EvidenceClass::Bimodal(true)) => {
@@ -15414,7 +15443,7 @@ pub mod narrative {
         Ok(())
     }
 
-    fn validate_tick_pair(previous: u64, current: u64) -> Result<(), NarrativeInputError> {
+    const fn validate_tick_pair(previous: u64, current: u64) -> Result<(), NarrativeInputError> {
         if current == previous {
             return Err(NarrativeInputError::DuplicateTick { tick: current });
         }
@@ -18376,7 +18405,7 @@ const fn legacy_clock_counter(next_tick: u64) -> u64 {
     clippy::cast_precision_loss,
     reason = "the legacy clock counter is reduced modulo 10,000 and is therefore exactly representable in f32"
 )]
-fn legacy_clock_counter_f32(next_tick: u64) -> f32 {
+const fn legacy_clock_counter_f32(next_tick: u64) -> f32 {
     legacy_clock_counter(next_tick) as f32
 }
 
@@ -19053,6 +19082,10 @@ impl WorldState {
         Ok((world, session))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "World construction initializes every owned field together; splitting the initializer would hide the initial state"
+    )]
     fn build(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
         configure_parallelism();
         let (food_w, food_h) = config.food_dimensions()?;
@@ -19248,23 +19281,23 @@ impl WorldState {
     }
 
     /// Sets the hard ceiling on per-tick activation snapshotting (bd-16g.4.4).
-    pub fn set_capture_budget(&mut self, budget: CaptureBudget) {
+    pub const fn set_capture_budget(&mut self, budget: CaptureBudget) {
         self.capture_budget = budget;
     }
 
     /// Returns the active capture budget ceiling (bd-16g.4.4).
     #[must_use]
-    pub fn capture_budget(&self) -> CaptureBudget {
+    pub const fn capture_budget(&self) -> CaptureBudget {
         self.capture_budget
     }
 
     /// Returns the diagnostic probe statistics from the last tick (bd-16g.4.4).
     #[must_use]
-    pub fn probe_stats(&self) -> ProbeStats {
+    pub const fn probe_stats(&self) -> ProbeStats {
         self.probe_stats
     }
 
-    /// Sets or clears the active activation probe target, binding AgentUid for death detection (bd-16g.4.4).
+    /// Sets or clears the active activation probe target, binding `AgentUid` for death detection (bd-16g.4.4).
     pub fn set_activation_probe(&mut self, probe: Option<AgentId>) {
         if let Some(id) = probe {
             if let Some(uid) = self.agent_uid(id) {
@@ -19292,7 +19325,7 @@ impl WorldState {
     }
 
     /// Updates probe statistics for the current tick under the bounded capture budget (bd-16g.4.4).
-    pub fn update_probe_stats(&mut self, captured: usize, selected_total: usize) {
+    pub const fn update_probe_stats(&mut self, captured: usize, selected_total: usize) {
         let budget = self.capture_budget.max_agents;
         let dropped = selected_total.saturating_sub(captured);
         self.probe_stats = ProbeStats {
@@ -19304,7 +19337,6 @@ impl WorldState {
     }
 
     /// Make the dense `SoA` layout match stable logical identity before any tick work begins.
-
     ///
     /// Normal monotonic insertion and stable removal keep this invariant, so the hot path pays
     /// only one branch. A checkpoint restore or test that materializes the same scientific world
@@ -20610,11 +20642,7 @@ impl WorldState {
         let probed_agent = self.active_activation_probe();
         let selected_total = usize::from(probed_agent.is_some());
         let max_agents = self.capture_budget.max_agents;
-        let captured = if selected_total > 0 && max_agents > 0 {
-            1
-        } else {
-            0
-        };
+        let captured = usize::from(selected_total > 0 && max_agents > 0);
         self.update_probe_stats(captured, selected_total);
 
         first_error.map_or(Ok(()), Err)
@@ -21430,7 +21458,7 @@ impl WorldState {
         handles.sort_unstable_by_key(|id| {
             self.identities
                 .get(*id)
-                .map_or(id.data().as_ffi(), |ident| ident.uid.0)
+                .map_or_else(|| id.data().as_ffi(), |ident| ident.uid.0)
         });
         for handle in handles {
             let Some(identity) = self.identities.get(handle) else {
@@ -21540,39 +21568,14 @@ impl WorldState {
             evaluated_candidates.push(entry);
         }
 
-        if total_pop > 0 && rejected_count.saturating_mul(10) > total_pop.saturating_mul(9) {
-            if !archive.logged_eligibility_warning {
-                archive.logged_eligibility_warning = true;
-                #[allow(clippy::cast_precision_loss)]
-                let rejection_ratio = rejected_count as f32 / total_pop as f32;
-                tracing::warn!(
-                    target: "scriptbots::qd::archive",
-                    tick = %next_tick.0,
-                    rejected_count,
-                    total_pop,
-                    rejection_ratio,
-                    "MAP-Elites eligibility filter rejected >90% of the population"
-                );
-            }
-        }
-
-        if evaluated_candidates.len() >= 5 {
-            for (axis_idx, bins) in axis_bins.iter().enumerate() {
-                if let Some(&first) = bins.first() {
-                    if bins.iter().all(|&b| b == first) {
-                        let axis_name = &archive.space.axes[axis_idx].name;
-                        tracing::warn!(
-                            target: "scriptbots::qd::archive",
-                            tick = %next_tick.0,
-                            axis = %axis_name,
-                            bin = %first,
-                            candidate_count = %bins.len(),
-                            "observed values for axis fall entirely inside one bin; domain may be mis-scaled"
-                        );
-                    }
-                }
-            }
-        }
+        Self::report_archive_eligibility(
+            &mut archive,
+            next_tick,
+            total_pop,
+            rejected_count,
+            evaluated_candidates.len(),
+            &axis_bins,
+        );
 
         for entry in evaluated_candidates {
             if let Err(err) = archive.insert(entry) {
@@ -21585,7 +21588,7 @@ impl WorldState {
             }
         }
 
-        if self.archive_evaluations % 100 == 0 {
+        if self.archive_evaluations.is_multiple_of(100) {
             tracing::info!(
                 target: "scriptbots::qd::archive",
                 tick = %next_tick.0,
@@ -21599,6 +21602,53 @@ impl WorldState {
         }
 
         self.archive = Some(archive);
+    }
+
+    fn report_archive_eligibility(
+        archive: &mut MapElitesArchive,
+        next_tick: Tick,
+        total_pop: usize,
+        rejected_count: usize,
+        candidate_count: usize,
+        axis_bins: &[Vec<u8>],
+    ) {
+        if total_pop > 0
+            && rejected_count.saturating_mul(10) > total_pop.saturating_mul(9)
+            && !archive.logged_eligibility_warning
+        {
+            archive.logged_eligibility_warning = true;
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "The logged rejection ratio is approximate; the warning threshold uses the original integer counts"
+            )]
+            let rejection_ratio = rejected_count as f32 / total_pop as f32;
+            tracing::warn!(
+                target: "scriptbots::qd::archive",
+                tick = %next_tick.0,
+                rejected_count,
+                total_pop,
+                rejection_ratio,
+                "MAP-Elites eligibility filter rejected >90% of the population"
+            );
+        }
+
+        if candidate_count >= 5 {
+            for (axis_idx, bins) in axis_bins.iter().enumerate() {
+                if let Some(&first) = bins.first()
+                    && bins.iter().all(|&b| b == first)
+                {
+                    let axis_name = &archive.space.axes[axis_idx].name;
+                    tracing::warn!(
+                        target: "scriptbots::qd::archive",
+                        tick = %next_tick.0,
+                        axis = %axis_name,
+                        bin = %first,
+                        candidate_count = %bins.len(),
+                        "observed values for axis fall entirely inside one bin; domain may be mis-scaled"
+                    );
+                }
+            }
+        }
     }
 
     fn stage_reset_events(&mut self, preserve_persistence_tail: bool) {
@@ -24415,12 +24465,11 @@ impl WorldState {
             if let Some(stats) = self.agent_stats.get_mut(&order.parent_uid) {
                 stats.record_offspring();
             }
-            if let Some(partner_id) = order.partner_id {
-                if let Some(identity) = self.identities.get(partner_id) {
-                    if let Some(stats) = self.agent_stats.get_mut(&identity.uid) {
-                        stats.record_offspring();
-                    }
-                }
+            if let Some(partner_id) = order.partner_id
+                && let Some(identity) = self.identities.get(partner_id)
+                && let Some(stats) = self.agent_stats.get_mut(&identity.uid)
+            {
+                stats.record_offspring();
             }
             let SpawnOrder {
                 parent_uid: _,
@@ -27158,27 +27207,6 @@ impl WorldState {
         }
     }
 
-    /// Resolve a stable `AgentUid` inside a stage that cannot return an error.
-    ///
-    /// On success this is exactly `agent_uid`. On the unreachable miss it latches the typed
-    /// fault and yields `None`, so the caller skips that agent, the transition still completes
-    /// deterministically, and every later transition is refused (bd-cqja).
-    fn require_agent_uid_or_latch(
-        &mut self,
-        id: AgentId,
-        path: impl FnOnce() -> String,
-    ) -> Option<AgentUid> {
-        match self.agent_uid(id) {
-            Some(uid) => Some(uid),
-            None => {
-                self.latch_scientific_fault(ScientificStateError::MissingAgentIdentity {
-                    path: path(),
-                });
-                None
-            }
-        }
-    }
-
     /// World-owned view of any fault or unresolved marker that prevents a later science tick.
     ///
     /// Detailed sink acknowledgement failures live on [`PersistenceAdmissionSession`].
@@ -27281,7 +27309,6 @@ impl WorldState {
     }
 
     /// Iterate over retained tick summaries.
-    #[must_use]
     pub fn history(&self) -> impl DoubleEndedIterator<Item = &TickSummary> {
         self.history.iter()
     }
@@ -27381,7 +27408,7 @@ impl WorldState {
 
     /// Mutable reference to the MAP-Elites behavioral archive, if enabled.
     #[must_use]
-    pub fn archive_mut(&mut self) -> Option<&mut MapElitesArchive> {
+    pub const fn archive_mut(&mut self) -> Option<&mut MapElitesArchive> {
         self.archive.as_mut()
     }
 
@@ -27515,10 +27542,10 @@ impl WorldState {
         delta_primary: f32,
         delta_secondary: f32,
     ) -> Result<bool, ScientificStateError> {
-        let Some(agent_id) = self.agent_id_for_control_uid(agent_uid) else {
+        let Some(handle) = self.agent_id_for_control_uid(agent_uid) else {
             return Ok(false);
         };
-        self.try_update_agent_runtime(agent_id, |runtime| {
+        self.try_update_agent_runtime(handle, |runtime| {
             runtime.mutation_rates.primary =
                 (runtime.mutation_rates.primary + delta_primary).max(0.0001);
             runtime.mutation_rates.secondary =
@@ -27531,8 +27558,8 @@ impl WorldState {
         herbivore_tendency: f32,
     ) -> Result<AgentId, WorldStateError> {
         self.validate_external_arrival_boundary()?;
-        let width = self.config.world_width as f32;
-        let height = self.config.world_height as f32;
+        let width = validated_world_unit_f32(self.config.world_width);
+        let height = validated_world_unit_f32(self.config.world_height);
         if width <= 0.0 || height <= 0.0 {
             return Err(WorldStateError::InvalidConfig(
                 "world dimensions must be positive before agent injection",
@@ -27581,6 +27608,14 @@ impl WorldState {
     /// A typed refusal is the same rule this command family already applies
     /// elsewhere: reject rather than silently do something other than what was
     /// asked. `Ok` now means a child exists.
+    #[expect(
+        clippy::similar_names,
+        reason = "Paired parent handles and snapshots use the same a/b names as the command's parent identities"
+    )]
+    #[expect(
+        clippy::manual_midpoint,
+        reason = "Crossover replay preserves addition followed by multiplication, including its rounding and non-finite validation behavior"
+    )]
     fn try_inject_control_crossover(
         &mut self,
         parent_a: AgentUid,

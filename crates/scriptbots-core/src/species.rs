@@ -337,6 +337,67 @@ struct RawCluster {
     norm_vectors: Vec<Vec<f32>>,
 }
 
+impl RawCluster {
+    fn centroid_and_spread(&self) -> (Vec<f32>, f32) {
+        let dim = self.norm_vectors[0].len();
+        let count = self.norm_vectors.len() as f32;
+        let mut centroid = vec![0.0f32; dim];
+        for vec in &self.norm_vectors {
+            for (i, &val) in vec.iter().enumerate() {
+                centroid[i] += val;
+            }
+        }
+        for val in &mut centroid {
+            *val /= count;
+        }
+
+        let sum_sq_dist: f32 = self
+            .norm_vectors
+            .iter()
+            .map(|vec| {
+                let dist = euclidean_distance(vec, &centroid);
+                dist * dist
+            })
+            .sum();
+        let spread = (sum_sq_dist / count).sqrt();
+        (centroid, spread)
+    }
+}
+
+fn cluster_phenotypes(samples: &[(AgentUid, Vec<f32>)], params: &SpeciesParams) -> Vec<RawCluster> {
+    // Stable identity order chooses the leaders, independently of input order.
+    let mut sorted_samples = samples.to_vec();
+    sorted_samples.sort_by_key(|(uid, _)| *uid);
+    let normalized_samples: Vec<(AgentUid, Vec<f32>)> = sorted_samples
+        .into_iter()
+        .map(|(uid, vec)| (uid, normalize_phenotype(&vec, &params.dimension_ranges)))
+        .collect();
+
+    let mut raw_clusters: Vec<RawCluster> = Vec::new();
+    for (uid, norm_vec) in normalized_samples {
+        let mut matched_idx = None;
+        for (idx, cluster) in raw_clusters.iter().enumerate() {
+            let leader_vec = &cluster.norm_vectors[0];
+            let dist = euclidean_distance(&norm_vec, leader_vec);
+            if dist <= params.distance_threshold {
+                matched_idx = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = matched_idx {
+            raw_clusters[idx].members.push(uid);
+            raw_clusters[idx].norm_vectors.push(norm_vec);
+        } else {
+            raw_clusters.push(RawCluster {
+                members: vec![uid],
+                norm_vectors: vec![norm_vec],
+            });
+        }
+    }
+    raw_clusters.retain(|c| c.members.len() >= params.min_cluster_size);
+    raw_clusters
+}
+
 /// Main entry point for species segmentation.
 ///
 /// Segments living agents into species, enforcing label continuity from `prev` table.
@@ -370,43 +431,7 @@ pub fn segment_species(
         );
     }
 
-    // 1. Sort samples deterministically by AgentUid ascending (ensures order invariance)
-    let mut sorted_samples = samples.to_vec();
-    sorted_samples.sort_by_key(|(uid, _)| *uid);
-
-    // 2. Normalize vectors against fixed ranges
-    let normalized_samples: Vec<(AgentUid, Vec<f32>)> = sorted_samples
-        .into_iter()
-        .map(|(uid, vec)| (uid, normalize_phenotype(&vec, &params.dimension_ranges)))
-        .collect();
-
-    // 3. Leader-based agglomerative clustering
-    let mut raw_clusters: Vec<RawCluster> = Vec::new();
-    for (uid, norm_vec) in normalized_samples {
-        let mut matched_idx = None;
-        for (idx, cluster) in raw_clusters.iter().enumerate() {
-            // Compare against leader (first member) of each cluster
-            let leader_vec = &cluster.norm_vectors[0];
-            let dist = euclidean_distance(&norm_vec, leader_vec);
-            if dist <= params.distance_threshold {
-                matched_idx = Some(idx);
-                break;
-            }
-        }
-
-        if let Some(idx) = matched_idx {
-            raw_clusters[idx].members.push(uid);
-            raw_clusters[idx].norm_vectors.push(norm_vec);
-        } else {
-            raw_clusters.push(RawCluster {
-                members: vec![uid],
-                norm_vectors: vec![norm_vec],
-            });
-        }
-    }
-
-    // Filter clusters by minimum size
-    raw_clusters.retain(|c| c.members.len() >= params.min_cluster_size);
+    let raw_clusters = cluster_phenotypes(samples, params);
 
     // 4. Match raw clusters to previous species using Jaccard continuity
     let mut matched_prev_ids = BTreeSet::new();
@@ -442,27 +467,7 @@ pub fn segment_species(
         }
 
         // Calculate centroid and spread for this cluster
-        let dim = cluster.norm_vectors[0].len();
-        let count = cluster.norm_vectors.len() as f32;
-        let mut centroid = vec![0.0f32; dim];
-        for vec in &cluster.norm_vectors {
-            for (i, &val) in vec.iter().enumerate() {
-                centroid[i] += val;
-            }
-        }
-        for val in &mut centroid {
-            *val /= count;
-        }
-
-        let sum_sq_dist: f32 = cluster
-            .norm_vectors
-            .iter()
-            .map(|vec| {
-                let dist = euclidean_distance(vec, &centroid);
-                dist * dist
-            })
-            .sum();
-        let spread = (sum_sq_dist / count).sqrt();
+        let (centroid, spread) = cluster.centroid_and_spread();
 
         let (sp_id, sp_name, first_tick, founders) = if let Some((prev_sp, _)) = best_prev_match {
             matched_prev_ids.insert(prev_sp.id);
@@ -623,6 +628,7 @@ pub struct PhenotypeAnalysisReport {
 }
 
 /// Compares two phenotype feature cohorts computing effect sizes (Cohen's d) per dimension (bd-2z0.11.2).
+#[must_use]
 pub fn compare_phenotype_clusters(
     name_a: &str,
     a: &[AgentPhenotypeVector],
@@ -653,6 +659,10 @@ pub fn compare_phenotype_clusters(
             let var_b =
                 vals_b.iter().map(|x| (x - mean_b).powi(2)).sum::<f32>() / vals_b.len() as f32;
 
+            #[expect(
+                clippy::manual_midpoint,
+                reason = "retain the reported Cohen's d estimator's f32 sum-then-divide rounding and overflow behavior"
+            )]
             let pooled_sd = ((var_a + var_b) / 2.0).sqrt().max(1e-6);
             let cohens_d = (mean_a - mean_b) / pooled_sd;
             effect_sizes.insert(name.to_string(), cohens_d);
@@ -821,6 +831,7 @@ fn cholesky_lower(
 }
 
 /// Generates a comprehensive phenotype analysis report over population samples (bd-2z0.11.2).
+#[must_use]
 pub fn compute_phenotype_analysis(
     run_id: &str,
     tick: Tick,
@@ -858,8 +869,8 @@ pub fn compute_phenotype_analysis(
             means[i] += f[i];
         }
     }
-    for i in 0..6 {
-        means[i] /= count;
+    for mean in &mut means {
+        *mean /= count;
     }
 
     let mut vars = vec![0.0f32; 6];
@@ -869,8 +880,8 @@ pub fn compute_phenotype_analysis(
             vars[i] += (f[i] - means[i]).powi(2);
         }
     }
-    for i in 0..6 {
-        vars[i] /= count;
+    for variance in &mut vars {
+        *variance /= count;
     }
 
     PhenotypeAnalysisReport {
@@ -940,7 +951,7 @@ pub const RADIATION_GROWTH_FACTOR: f64 = 3.0;
 pub const RADIATION_MIN_MEMBERS: usize = 4;
 
 /// One entry in the phylogeny timeline.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhylogenyEvent {
     /// Tick of the sample in which the change was observed.
     pub tick: Tick,
@@ -982,7 +993,7 @@ pub fn diff_species_tables(before: &SpeciesTable, after: &SpeciesTable) -> Vec<P
             }),
             Some(prev) => {
                 let grew = species.members.len() >= RADIATION_MIN_MEMBERS
-                    && prev.members.len() >= 1
+                    && !prev.members.is_empty()
                     && species.members.len() as f64
                         >= prev.members.len() as f64 * RADIATION_GROWTH_FACTOR;
                 if grew {
@@ -1186,6 +1197,10 @@ impl SpeciationWatch {
     ///
     /// Verdicts are emitted in `SpeciesId` order so the sequence is byte-identical
     /// across runs of the same seed, which the parent bead's acceptance requires.
+    ///
+    /// # Panics
+    /// Panics if an internally collected pending key disappears before removal.
+    /// The method retains exclusive access to that map throughout this operation.
     pub fn observe(&mut self, table: &SpeciesTable) -> Vec<SpeciationVerdict> {
         let present: BTreeSet<SpeciesId> = table.species.iter().map(|s| s.id).collect();
 
@@ -1395,7 +1410,7 @@ pub struct SpeciationHint {
 /// the parent bead requires each hint to be "either confirmed or explicitly
 /// rejected", and a reconciliation that silently dropped unmatched hints would
 /// report perfect agreement by discarding its own counter-evidence.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HintReconciliation {
     /// Speciations that had a hint inside the window.
     pub confirmed: Vec<SpeciesId>,
@@ -1408,7 +1423,7 @@ pub struct HintReconciliation {
 impl HintReconciliation {
     /// Every hint is accounted for exactly once.
     #[must_use]
-    pub fn accounts_for_all_hints(&self, hint_count: usize) -> bool {
+    pub const fn accounts_for_all_hints(&self, hint_count: usize) -> bool {
         self.confirmed.len() + self.rejected_hints.len() == hint_count
     }
 }
@@ -1536,7 +1551,10 @@ impl TypedPhenotypeInput {
 
     /// Creates a typed phenotype input from an [`AgentPhenotypeVector`] and observation count.
     #[must_use]
-    pub fn from_phenotype_vector(v: &AgentPhenotypeVector, lifetime_observations: u64) -> Self {
+    pub const fn from_phenotype_vector(
+        v: &AgentPhenotypeVector,
+        lifetime_observations: u64,
+    ) -> Self {
         Self {
             agent_uid: v.agent_uid,
             lifetime_observations,

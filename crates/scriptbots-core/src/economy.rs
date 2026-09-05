@@ -480,8 +480,9 @@ pub struct SeedVerdict {
 /// Number of breaches retained per seed in the verdict artifact.
 pub const BREACH_REPORT_CAP: usize = 100;
 
-/// Incremental, memory-light conservation gate (bd-16g.11.2). Feed every
-/// [`ResourceLedgerTick`] of one seed's run; [`Self::finish`] yields the seed's
+/// Incremental, memory-light conservation gate (bd-16g.11.2).
+///
+/// Feed every [`ResourceLedgerTick`] of one seed's run; [`Self::finish`] yields the seed's
 /// verdict. O(1) per tick, no allocation beyond the bounded breach list.
 #[derive(Debug, Default)]
 pub struct ConservationGate {
@@ -516,11 +517,21 @@ impl ConservationGate {
             }
         }
         if !report.reconciliation.reconciled {
-            let (stock, residual) = EconomyStock::ALL
+            let [first_stock, remaining_stocks @ ..] = EconomyStock::ALL;
+            let (stock, residual) = remaining_stocks
                 .into_iter()
                 .map(|stock| (stock, stock.lane(unexplained)))
-                .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
-                .expect("three stocks");
+                .fold(
+                    (first_stock, first_stock.lane(unexplained)),
+                    |worst, candidate| {
+                        // Like Iterator::max_by, the later stock wins an exact tie.
+                        if worst.1.abs().total_cmp(&candidate.1.abs()).is_gt() {
+                            worst
+                        } else {
+                            candidate
+                        }
+                    },
+                );
             let worst_category = report
                 .flows
                 .iter()
@@ -727,14 +738,16 @@ impl ConservationVerdict {
     }
 }
 
-/// Relative bound for the cumulative criterion (bd-16g.11.2): catches a tiny
-/// systematic bias that per-tick tolerance would wave through — precisely how
+/// Relative bound for the cumulative criterion (bd-16g.11.2).
+///
+/// Catches a tiny systematic bias that per-tick tolerance would wave through — precisely how
 /// a 0.0002-vs-0.002 drain error hides. Mirrors
 /// [`EPOCH_RESIDUAL_RELATIVE_TOLERANCE`]; a change to either is a reviewable diff.
 pub const CUMULATIVE_RESIDUAL_RELATIVE_TOLERANCE: f64 = 1.0e-7;
 
-/// Evaluate the three gate criteria over the sealed seed verdicts. All three
-/// are required — any one alone is gameable: (1) zero per-tick breaches;
+/// Evaluate the three gate criteria over the sealed seed verdicts.
+///
+/// All three are required — any one alone is gameable: (1) zero per-tick breaches;
 /// (2) cumulative residual within the derived bound per stock; (3) a quiet run
 /// (zero warn-level economy events, which in-process is exactly the breach
 /// count).
@@ -788,11 +801,11 @@ pub fn evaluate_conservation(seeds: &[SeedVerdict]) -> ConservationVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DietClass {
-    /// Herbivorous diet preference (herbivore_tendency >= 0.7).
+    /// Herbivorous diet preference (`herbivore_tendency >= 0.7`).
     Herbivore,
-    /// Omnivorous diet preference (0.3 < herbivore_tendency < 0.7).
+    /// Omnivorous diet preference (`0.3 < herbivore_tendency < 0.7`).
     Omnivore,
-    /// Carnivorous diet preference (herbivore_tendency <= 0.3).
+    /// Carnivorous diet preference (`herbivore_tendency <= 0.3`).
     Carnivore,
 }
 
@@ -875,7 +888,7 @@ pub enum NodeClass {
 }
 
 /// A node in the Sankey energy-flow graph.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SankeyNode {
     /// Node identifier.
     pub id: usize,
@@ -1038,9 +1051,9 @@ pub fn sankey_layout(flows: &EpochFlows, opts: &SankeyOpts) -> SankeyGraph {
             | ResourceFlowKind::Aging
             | ResourceFlowKind::DeathRemoval
             | ResourceFlowKind::ReproductionAllocation
-            | ResourceFlowKind::CapacityRejection => (2, 5),
+            | ResourceFlowKind::CapacityRejection
+            | ResourceFlowKind::Combat => (2, 5),
             ResourceFlowKind::EnergySharing => (2, 3),
-            ResourceFlowKind::Combat => (2, 5),
             ResourceFlowKind::CarcassReward | ResourceFlowKind::PopulationInjection => (0, 2),
         };
 
@@ -1085,7 +1098,7 @@ pub struct TrophicRow {
     pub drain_rate: f64,
     /// Ratio of intake to drain (`None` if intake == 0 or drain == 0).
     pub conversion_efficiency: Option<f64>,
-    /// Net rate (intake_rate - drain_rate).
+    /// Net rate (`intake_rate - drain_rate`).
     pub net: f64,
 }
 

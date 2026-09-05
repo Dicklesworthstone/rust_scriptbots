@@ -44,7 +44,7 @@ pub struct Clip {
 }
 
 /// Configuration parameters for clip selection.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectionConfig {
     /// Scoring formula version.
     pub scoring_version: ScoringVersion,
@@ -72,28 +72,30 @@ impl Default for SelectionConfig {
 
 /// Compute weight for an event kind.
 #[must_use]
-pub fn kind_weight(kind: EventKind, version: ScoringVersion) -> f32 {
+pub const fn kind_weight(kind: EventKind, version: ScoringVersion) -> f32 {
     match version {
         ScoringVersion::V1 => match kind {
             EventKind::Extinction => 3.0,
             EventKind::SpeciationHint => 2.5,
-            EventKind::PredatorEmergence => 2.0,
-            EventKind::AltruismOnset => 2.0,
-            EventKind::PopulationCrash => 1.8,
-            EventKind::PopulationBoom => 1.5,
+            EventKind::PredatorEmergence
+            | EventKind::AltruismOnset
+            | EventKind::ResourceCollapse
+            | EventKind::CombatSurge => 2.0,
+            EventKind::PopulationCrash | EventKind::EnergyCollapse => 1.8,
+            EventKind::PopulationBoom | EventKind::EnergyRecovery => 1.5,
             EventKind::DietShift => 1.2,
             EventKind::RegimeChange => 1.0,
             EventKind::FloorEngaged => 0.8,
-            EventKind::ResourceCollapse => 2.0,
-            EventKind::EnergyCollapse => 1.8,
-            EventKind::EnergyRecovery => 1.5,
-            EventKind::CombatSurge => 2.0,
         },
     }
 }
 
 /// Compute rarity multiplier based on occurrence count in run.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "V1 reel scoring rounds occurrence counts to f32 before its logarithm; widening changes versioned scores"
+)]
 pub fn rarity_weight(count_of_kind: usize) -> f32 {
     1.0 / (2.0 + count_of_kind as f32).log2()
 }
@@ -107,6 +109,10 @@ pub fn score_event(
 ) -> f32 {
     let kw = kind_weight(event.kind, version);
     let rw = rarity_weight(count_of_kind_in_run);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "V1 reel scoring narrows magnitude to f32 before normalization and multiplication"
+    )]
     let mag_norm = (event.magnitude as f32).max(0.1);
     let sev_norm = event.severity.max(0.1);
     kw * mag_norm * sev_norm * rw
@@ -127,17 +133,17 @@ pub fn merge_clips(
     config: &SelectionConfig,
     last_tick: u64,
 ) -> Vec<Clip> {
-    if scored_events.is_empty() {
-        return Vec::new();
-    }
-
-    // Convert scored events to raw clip items with tick ranges
     struct RawItem {
         range: Range<u64>,
         score: f32,
         event: EventRef,
     }
 
+    if scored_events.is_empty() {
+        return Vec::new();
+    }
+
+    // Convert scored events to raw clip items with tick ranges
     let mut items: Vec<RawItem> = scored_events
         .iter()
         .map(|&(score, ev)| RawItem {

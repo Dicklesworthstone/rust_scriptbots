@@ -11,6 +11,7 @@
 use crate::{AgentUid, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, Tick};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 /// One addressable genome locus, in canonical order (index order, never a hash walk).
 ///
@@ -194,33 +195,38 @@ pub fn trace_lineage_locus(
 #[must_use]
 pub fn export_locus_trace_csv(samples: &[LocusSample], locus: Locus) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Locus Trace: {}\n", locus.human()));
+    // Formatting into a String is infallible.
+    let _ = writeln!(out, "# Locus Trace: {}", locus.human());
     out.push_str("generation,agent_uid,tick,value_type,value\n");
     for s in samples {
         match s.value {
             Some(LocusValue::Scalar(v)) => {
-                out.push_str(&format!(
-                    "{},{},{},scalar,{v}\n",
+                let _ = writeln!(
+                    out,
+                    "{},{},{},scalar,{v}",
                     s.generation, s.agent_uid.0, s.tick.0
-                ));
+                );
             }
             Some(LocusValue::Target(v)) => {
-                out.push_str(&format!(
-                    "{},{},{},target,{v}\n",
+                let _ = writeln!(
+                    out,
+                    "{},{},{},target,{v}",
                     s.generation, s.agent_uid.0, s.tick.0
-                ));
+                );
             }
             Some(LocusValue::Kind(v)) => {
-                out.push_str(&format!(
-                    "{},{},{},kind,{v}\n",
+                let _ = writeln!(
+                    out,
+                    "{},{},{},kind,{v}",
                     s.generation, s.agent_uid.0, s.tick.0
-                ));
+                );
             }
             None => {
-                out.push_str(&format!(
-                    "{},{},{},gap,GAP\n",
+                let _ = writeln!(
+                    out,
+                    "{},{},{},gap,GAP",
                     s.generation, s.agent_uid.0, s.tick.0
-                ));
+                );
             }
         }
     }
@@ -229,21 +235,28 @@ pub fn export_locus_trace_csv(samples: &[LocusSample], locus: Locus) -> String {
 
 /// Export a locus trace as an SVG chart string.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "SVG coordinates retain their existing f32 generation projection and separate arithmetic rounding before decimal formatting"
+)]
 pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
     let width = 600.0;
     let height = 300.0;
     let padding = 40.0;
 
     let mut svg = String::new();
-    svg.push_str(&format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"##
-    ));
+    let _ = write!(
+        svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"#
+    );
     svg.push_str(r##"<rect width="100%" height="100%" fill="#1e1e2e"/>"##);
-    svg.push_str(&format!(
+    let _ = write!(
+        svg,
         r##"<text x="{}" y="25" fill="#cdd6f4" font-size="14" font-family="sans-serif" text-anchor="middle">Locus Trace: {}</text>"##,
         width / 2.0,
         locus.human()
-    ));
+    );
 
     let valid_scalars: Vec<(f32, f32)> = samples
         .iter()
@@ -281,18 +294,19 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
             if !points.is_empty() {
                 points.push(' ');
             }
-            points.push_str(&format!("{x:.1},{y:.1}"));
+            let _ = write!(points, "{x:.1},{y:.1}");
         }
-        svg.push_str(&format!(
+        let _ = write!(
+            svg,
             "<polyline fill=\"none\" stroke=\"#89b4fa\" stroke-width=\"2\" points=\"{points}\"/>"
-        ));
+        );
     }
 
     svg.push_str("</svg>");
     svg
 }
 
-fn crc32_chunk(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
+fn crc32_chunk(chunk_type: [u8; 4], data: &[u8]) -> u32 {
     let mut crc: u32 = 0xffff_ffff;
     for &byte in chunk_type.iter().chain(data.iter()) {
         crc ^= u32::from(byte);
@@ -307,10 +321,10 @@ fn crc32_chunk(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
     !crc
 }
 
-fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+fn write_png_chunk(out: &mut Vec<u8>, chunk_type: [u8; 4], data: &[u8]) {
     let len = u32::try_from(data.len()).expect("PNG chunk length fits u32");
     out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(&chunk_type);
     out.extend_from_slice(data);
     let crc = crc32_chunk(chunk_type, data);
     out.extend_from_slice(&crc.to_be_bytes());
@@ -330,7 +344,7 @@ fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     ihdr_data.push(0); // compression method 0
     ihdr_data.push(0); // filter method 0
     ihdr_data.push(0); // interlace method 0
-    write_png_chunk(&mut out, b"IHDR", &ihdr_data);
+    write_png_chunk(&mut out, *b"IHDR", &ihdr_data);
 
     // 3. IDAT Chunk
     let scanline_len = 1 + (width as usize) * 4;
@@ -343,108 +357,118 @@ fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     }
 
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw_scanlines, 6);
-    write_png_chunk(&mut out, b"IDAT", &compressed);
+    write_png_chunk(&mut out, *b"IDAT", &compressed);
 
     // 4. IEND Chunk
-    write_png_chunk(&mut out, b"IEND", &[]);
+    write_png_chunk(&mut out, *b"IEND", &[]);
 
     out
 }
 
+const TRACE_WIDTH: u16 = 600;
+const TRACE_HEIGHT: u16 = 300;
+const TRACE_PADDING: u16 = 40;
+
+fn put_trace_pixel(pixels: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
+    let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
+        return;
+    };
+    if x < usize::from(TRACE_WIDTH) && y < usize::from(TRACE_HEIGHT) {
+        let idx = (y * usize::from(TRACE_WIDTH) + x) * 4;
+        pixels[idx..idx + 4].copy_from_slice(&color);
+    }
+}
+
+fn draw_trace_line(pixels: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: [u8; 4]) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        put_trace_pixel(pixels, x0, y0, color);
+        put_trace_pixel(pixels, x0 + 1, y0, color);
+        put_trace_pixel(pixels, x0, y0 + 1, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn draw_trace_dot(pixels: &mut [u8], cx: i32, cy: i32, radius: i32, color: [u8; 4]) {
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy <= radius * radius {
+                put_trace_pixel(pixels, cx + dx, cy + dy, color);
+            }
+        }
+    }
+}
+
+fn draw_trace_cross(pixels: &mut [u8], cx: i32, cy: i32, size: i32, color: [u8; 4]) {
+    for d in -size..=size {
+        put_trace_pixel(pixels, cx + d, cy + d, color);
+        put_trace_pixel(pixels, cx + d, cy - d, color);
+    }
+}
+
+fn draw_trace_frame(pixels: &mut [u8]) {
+    let axis_color = [69, 71, 90, 255]; // Catppuccin surface0
+    draw_trace_line(
+        pixels,
+        i32::from(TRACE_PADDING),
+        i32::from(TRACE_HEIGHT - TRACE_PADDING),
+        i32::from(TRACE_WIDTH - TRACE_PADDING),
+        i32::from(TRACE_HEIGHT - TRACE_PADDING),
+        axis_color,
+    );
+    draw_trace_line(
+        pixels,
+        i32::from(TRACE_PADDING),
+        i32::from(TRACE_PADDING),
+        i32::from(TRACE_PADDING),
+        i32::from(TRACE_HEIGHT - TRACE_PADDING),
+        axis_color,
+    );
+    draw_trace_line(
+        pixels,
+        i32::from(TRACE_WIDTH - TRACE_PADDING),
+        i32::from(TRACE_PADDING),
+        i32::from(TRACE_WIDTH - TRACE_PADDING),
+        i32::from(TRACE_HEIGHT - TRACE_PADDING),
+        axis_color,
+    );
+    draw_trace_line(
+        pixels,
+        i32::from(TRACE_PADDING),
+        i32::from(TRACE_PADDING),
+        i32::from(TRACE_WIDTH - TRACE_PADDING),
+        i32::from(TRACE_PADDING),
+        axis_color,
+    );
+}
+
 /// Export a locus trace as a headless PNG image buffer.
 #[must_use]
-pub fn export_locus_trace_png(samples: &[LocusSample], locus: Locus) -> Vec<u8> {
-    let _ = locus;
-    const WIDTH: usize = 600;
-    const HEIGHT: usize = 300;
-    const PADDING: usize = 40;
-
-    let mut pixels = [30u8, 30u8, 46u8, 255u8].repeat(WIDTH * HEIGHT);
-
-    let put_pixel = |pixels: &mut [u8], x: i32, y: i32, color: [u8; 4]| {
-        if x >= 0 && (x as usize) < WIDTH && y >= 0 && (y as usize) < HEIGHT {
-            let idx = ((y as usize) * WIDTH + (x as usize)) * 4;
-            pixels[idx..idx + 4].copy_from_slice(&color);
-        }
-    };
-
-    let draw_line =
-        |pixels: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: [u8; 4]| {
-            let dx = (x1 - x0).abs();
-            let dy = -(y1 - y0).abs();
-            let sx = if x0 < x1 { 1 } else { -1 };
-            let sy = if y0 < y1 { 1 } else { -1 };
-            let mut err = dx + dy;
-            loop {
-                put_pixel(pixels, x0, y0, color);
-                put_pixel(pixels, x0 + 1, y0, color);
-                put_pixel(pixels, x0, y0 + 1, color);
-                if x0 == x1 && y0 == y1 {
-                    break;
-                }
-                let e2 = 2 * err;
-                if e2 >= dy {
-                    err += dy;
-                    x0 += sx;
-                }
-                if e2 <= dx {
-                    err += dx;
-                    y0 += sy;
-                }
-            }
-        };
-
-    let draw_dot = |pixels: &mut [u8], cx: i32, cy: i32, radius: i32, color: [u8; 4]| {
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                if dx * dx + dy * dy <= radius * radius {
-                    put_pixel(pixels, cx + dx, cy + dy, color);
-                }
-            }
-        }
-    };
-
-    let draw_cross = |pixels: &mut [u8], cx: i32, cy: i32, size: i32, color: [u8; 4]| {
-        for d in -size..=size {
-            put_pixel(pixels, cx + d, cy + d, color);
-            put_pixel(pixels, cx + d, cy - d, color);
-        }
-    };
-
-    // Draw frame/axes
-    let axis_color = [69, 71, 90, 255]; // Catppuccin surface0
-    draw_line(
-        &mut pixels,
-        PADDING as i32,
-        (HEIGHT - PADDING) as i32,
-        (WIDTH - PADDING) as i32,
-        (HEIGHT - PADDING) as i32,
-        axis_color,
-    );
-    draw_line(
-        &mut pixels,
-        PADDING as i32,
-        PADDING as i32,
-        PADDING as i32,
-        (HEIGHT - PADDING) as i32,
-        axis_color,
-    );
-    draw_line(
-        &mut pixels,
-        (WIDTH - PADDING) as i32,
-        PADDING as i32,
-        (WIDTH - PADDING) as i32,
-        (HEIGHT - PADDING) as i32,
-        axis_color,
-    );
-    draw_line(
-        &mut pixels,
-        PADDING as i32,
-        PADDING as i32,
-        (WIDTH - PADDING) as i32,
-        PADDING as i32,
-        axis_color,
-    );
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::suboptimal_flops,
+    reason = "PNG projection preserves f32 generation coordinates, separate arithmetic rounding, and round-then-saturating i32 pixel conversion"
+)]
+pub fn export_locus_trace_png(samples: &[LocusSample], _locus: Locus) -> Vec<u8> {
+    let mut pixels =
+        [30u8, 30u8, 46u8, 255u8].repeat(usize::from(TRACE_WIDTH) * usize::from(TRACE_HEIGHT));
+    draw_trace_frame(&mut pixels);
 
     let valid_scalars: Vec<(f32, f32)> = samples
         .iter()
@@ -480,15 +504,16 @@ pub fn export_locus_trace_png(samples: &[LocusSample], locus: Locus) -> Vec<u8> 
         let dot_color = [205, 214, 244, 255]; // Catppuccin text
 
         for (g, v) in &valid_scalars {
-            let x = (PADDING as f32 + (g - min_gen) / gen_span * (WIDTH - 2 * PADDING) as f32)
-                .round() as i32;
-            let y = ((HEIGHT - PADDING) as f32
-                - (v - min_val) / val_span * (HEIGHT - 2 * PADDING) as f32)
-                .round() as i32;
+            let x = (f32::from(TRACE_PADDING)
+                + (g - min_gen) / gen_span * f32::from(TRACE_WIDTH - 2 * TRACE_PADDING))
+            .round() as i32;
+            let y = (f32::from(TRACE_HEIGHT - TRACE_PADDING)
+                - (v - min_val) / val_span * f32::from(TRACE_HEIGHT - 2 * TRACE_PADDING))
+            .round() as i32;
             if let Some((px, py)) = prev_pt {
-                draw_line(&mut pixels, px, py, x, y, line_color);
+                draw_trace_line(&mut pixels, px, py, x, y, line_color);
             }
-            draw_dot(&mut pixels, x, y, 3, dot_color);
+            draw_trace_dot(&mut pixels, x, y, 3, dot_color);
             prev_pt = Some((x, y));
         }
 
@@ -497,19 +522,16 @@ pub fn export_locus_trace_png(samples: &[LocusSample], locus: Locus) -> Vec<u8> 
         for s in samples {
             if s.value.is_none() {
                 let g = s.generation as f32;
-                let x = (PADDING as f32 + (g - min_gen) / gen_span * (WIDTH - 2 * PADDING) as f32)
-                    .round() as i32;
-                let y = (HEIGHT - PADDING) as i32;
-                draw_cross(&mut pixels, x, y, 4, gap_color);
+                let x = (f32::from(TRACE_PADDING)
+                    + (g - min_gen) / gen_span * f32::from(TRACE_WIDTH - 2 * TRACE_PADDING))
+                .round() as i32;
+                let y = i32::from(TRACE_HEIGHT - TRACE_PADDING);
+                draw_trace_cross(&mut pixels, x, y, 4, gap_color);
             }
         }
     }
 
-    encode_rgba_png(
-        u32::try_from(WIDTH).expect("fits u32"),
-        u32::try_from(HEIGHT).expect("fits u32"),
-        &pixels,
-    )
+    encode_rgba_png(u32::from(TRACE_WIDTH), u32::from(TRACE_HEIGHT), &pixels)
 }
 
 /// Degenerate inputs are typed, never a panic and never a silent empty diff.
@@ -579,7 +601,7 @@ pub enum GenomeDiffError {
     },
 }
 
-const fn locus_value_type_name(val: &LocusValue) -> &'static str {
+const fn locus_value_type_name(val: LocusValue) -> &'static str {
     match val {
         LocusValue::Scalar(_) => "scalar",
         LocusValue::Target(_) => "target",
@@ -587,16 +609,10 @@ const fn locus_value_type_name(val: &LocusValue) -> &'static str {
     }
 }
 
-/// Compute the typed structural diff between two genomes of the same family and schema.
-///
-/// Decoded through the family codec's locus view. Deltas are emitted in canonical locus
-/// order, so two invocations produce identical bytes on any platform at any thread count.
-/// An empty delta list means "no mutations" — and nothing else.
-pub fn diff_genomes(
-    codec: &dyn BrainFamilyCodec,
+fn validate_diff_envelopes(
     parent: &BrainGenomeEnvelope,
     child: &BrainGenomeEnvelope,
-) -> Result<GenomeDiff, GenomeDiffError> {
+) -> Result<(), GenomeDiffError> {
     if parent.family_id() != child.family_id() {
         return Err(GenomeDiffError::FamilyMismatch {
             a: parent.family_id().clone(),
@@ -609,6 +625,20 @@ pub fn diff_genomes(
             b: child.schema_version(),
         });
     }
+    Ok(())
+}
+
+/// Compute the typed structural diff between two genomes of the same family and schema.
+///
+/// Decoded through the family codec's locus view. Deltas are emitted in canonical locus
+/// order, so two invocations produce identical bytes on any platform at any thread count.
+/// An empty delta list means "no mutations" — and nothing else.
+pub fn diff_genomes(
+    codec: &dyn BrainFamilyCodec,
+    parent: &BrainGenomeEnvelope,
+    child: &BrainGenomeEnvelope,
+) -> Result<GenomeDiff, GenomeDiffError> {
+    validate_diff_envelopes(parent, child)?;
     let family = parent.family_id().clone();
     let schema_version = parent.schema_version();
     let parent_loci = codec
@@ -684,8 +714,8 @@ pub fn diff_genomes(
                 return Err(GenomeDiffError::ValueTypeMismatch {
                     index,
                     locus: *locus,
-                    parent_type: locus_value_type_name(before),
-                    child_type: locus_value_type_name(after),
+                    parent_type: locus_value_type_name(*before),
+                    child_type: locus_value_type_name(*after),
                 });
             }
         }

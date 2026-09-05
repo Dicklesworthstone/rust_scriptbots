@@ -180,10 +180,102 @@ struct ConnAccumulator {
     kind: Option<String>,
 }
 
+fn accumulate_nodes(loci: &[(Locus, LocusValue)]) -> BTreeMap<u32, NodeAccumulator> {
+    let mut nodes: BTreeMap<u32, NodeAccumulator> = BTreeMap::new();
+    for (locus, val) in loci {
+        match (*locus, *val) {
+            (Locus::NodeBias(node), LocusValue::Scalar(s)) => {
+                nodes.entry(node).or_default().bias = Some(s);
+            }
+            (Locus::NodeDamping(node), LocusValue::Scalar(s)) => {
+                nodes.entry(node).or_default().damping = Some(s);
+            }
+            (Locus::NodeGain(node), LocusValue::Scalar(s)) => {
+                nodes.entry(node).or_default().gain = Some(s);
+            }
+            (Locus::NodeWeight { node, conn }, LocusValue::Scalar(s)) => {
+                nodes
+                    .entry(node)
+                    .or_default()
+                    .connections
+                    .entry(conn)
+                    .or_default()
+                    .weight = s;
+            }
+            (Locus::NodeTarget { node, conn }, LocusValue::Target(t)) => {
+                nodes
+                    .entry(node)
+                    .or_default()
+                    .connections
+                    .entry(conn)
+                    .or_default()
+                    .target_node = t;
+            }
+            (Locus::NodeKind { node, conn }, LocusValue::Kind(k)) => {
+                nodes
+                    .entry(node)
+                    .or_default()
+                    .connections
+                    .entry(conn)
+                    .or_default()
+                    .kind = Some(format!("kind_{k}"));
+            }
+            (Locus::Cell(cell_idx), LocusValue::Scalar(s)) => {
+                nodes.entry(cell_idx).or_default().bias = Some(s);
+            }
+            (Locus::Hyper(id), LocusValue::Scalar(s)) => {
+                nodes.entry(100_000 + u32::from(id)).or_default().bias = Some(s);
+            }
+            _ => {}
+        }
+    }
+    nodes
+}
+
+fn mutation_diff(
+    codec: &dyn BrainFamilyCodec,
+    envelope: &BrainGenomeEnvelope,
+    parent_envelope: Option<&BrainGenomeEnvelope>,
+    parent_uids: &[AgentUid],
+) -> (MutationDiffStatus, Vec<GenomeDelta>) {
+    parent_envelope.map_or_else(
+        || (MutationDiffStatus::FounderNoParent, Vec::new()),
+        |parent| match diff_genomes(codec, parent, envelope) {
+            Ok(diff) => {
+                let status = if parent_uids.len() > 1 {
+                    MutationDiffStatus::SexualPrimary {
+                        parent_uids: parent_uids.to_vec(),
+                        total_deltas: diff.deltas.len(),
+                        summary: diff.summary,
+                    }
+                } else {
+                    let parent_uid = parent_uids.first().copied().unwrap_or(AgentUid(0));
+                    MutationDiffStatus::Computed {
+                        parent_uid,
+                        total_deltas: diff.deltas.len(),
+                        summary: diff.summary,
+                    }
+                };
+                (status, diff.deltas)
+            }
+            Err(e) => (
+                MutationDiffStatus::Unavailable {
+                    reason: e.to_string(),
+                },
+                Vec::new(),
+            ),
+        },
+    )
+}
+
 impl GenomeBrowserViewModel {
     /// Build a frontend-neutral bounded genome browser view model from versioned protocol envelopes.
     ///
     /// Consumes only [`BrainFamilyCodec`] and [`BrainGenomeEnvelope`]; never downcasts to concrete brain types.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each input supplies distinct view evidence: codec/genome, agent/generation/tick identity, parent envelope/identities, locus/history, and retained paging offset/limit"
+    )]
     pub fn build(
         codec: &dyn BrainFamilyCodec,
         agent_uid: AgentUid,
@@ -204,55 +296,7 @@ impl GenomeBrowserViewModel {
         let total_loci = loci.len();
 
         // Group into node topology
-        let mut node_accum: BTreeMap<u32, NodeAccumulator> = BTreeMap::new();
-
-        for (locus, val) in &loci {
-            match (*locus, *val) {
-                (Locus::NodeBias(node), LocusValue::Scalar(s)) => {
-                    node_accum.entry(node).or_default().bias = Some(s);
-                }
-                (Locus::NodeDamping(node), LocusValue::Scalar(s)) => {
-                    node_accum.entry(node).or_default().damping = Some(s);
-                }
-                (Locus::NodeGain(node), LocusValue::Scalar(s)) => {
-                    node_accum.entry(node).or_default().gain = Some(s);
-                }
-                (Locus::NodeWeight { node, conn }, LocusValue::Scalar(s)) => {
-                    node_accum
-                        .entry(node)
-                        .or_default()
-                        .connections
-                        .entry(conn)
-                        .or_default()
-                        .weight = s;
-                }
-                (Locus::NodeTarget { node, conn }, LocusValue::Target(t)) => {
-                    node_accum
-                        .entry(node)
-                        .or_default()
-                        .connections
-                        .entry(conn)
-                        .or_default()
-                        .target_node = t;
-                }
-                (Locus::NodeKind { node, conn }, LocusValue::Kind(k)) => {
-                    node_accum
-                        .entry(node)
-                        .or_default()
-                        .connections
-                        .entry(conn)
-                        .or_default()
-                        .kind = Some(format!("kind_{k}"));
-                }
-                (Locus::Cell(cell_idx), LocusValue::Scalar(s)) => {
-                    node_accum.entry(cell_idx).or_default().bias = Some(s);
-                }
-                (Locus::Hyper(id), LocusValue::Scalar(s)) => {
-                    node_accum.entry(100_000 + id as u32).or_default().bias = Some(s);
-                }
-                _ => {}
-            }
-        }
+        let node_accum = accumulate_nodes(&loci);
 
         let total_nodes = node_accum.len();
         let effective_limit = if page_limit == 0 {
@@ -296,34 +340,7 @@ impl GenomeBrowserViewModel {
         };
 
         // Compute mutation diff
-        let (mutation_diff, deltas) = match parent_envelope {
-            None => (MutationDiffStatus::FounderNoParent, Vec::new()),
-            Some(parent) => match diff_genomes(codec, parent, envelope) {
-                Ok(diff) => {
-                    let status = if parent_uids.len() > 1 {
-                        MutationDiffStatus::SexualPrimary {
-                            parent_uids: parent_uids.clone(),
-                            total_deltas: diff.deltas.len(),
-                            summary: diff.summary,
-                        }
-                    } else {
-                        let parent_uid = parent_uids.first().copied().unwrap_or(AgentUid(0));
-                        MutationDiffStatus::Computed {
-                            parent_uid,
-                            total_deltas: diff.deltas.len(),
-                            summary: diff.summary,
-                        }
-                    };
-                    (status, diff.deltas)
-                }
-                Err(e) => (
-                    MutationDiffStatus::Unavailable {
-                        reason: e.to_string(),
-                    },
-                    Vec::new(),
-                ),
-            },
-        };
+        let (mutation_diff, deltas) = mutation_diff(codec, envelope, parent_envelope, &parent_uids);
 
         // Lineage locus plot
         let locus_plot = if let (Some(locus), Some(history)) = (selected_locus, lineage_history) {

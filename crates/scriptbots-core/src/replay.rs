@@ -85,7 +85,7 @@ impl WorldState {
             && tick.0.is_multiple_of(u64::from(stride))
     }
 
-    fn begin_replay_tick(&mut self, tick: Tick) {
+    const fn begin_replay_tick(&mut self, tick: Tick) {
         if self.replay_tick != tick.0 {
             self.replay_tick = tick.0;
             self.replay_interactions_this_tick = 0;

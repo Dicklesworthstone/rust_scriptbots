@@ -1312,31 +1312,7 @@ impl DetectionEvidence {
                 )
             }
             (DetectionKind::Bimodality, EvidenceClass::Bimodal(is_bimodal)) => {
-                let (lower, upper) = self.sides();
-                let (lower_n, upper_n) = self
-                    .before
-                    .zip(self.after)
-                    .map_or((0, 0), |(b, a)| (b.samples, a.samples));
-                if is_bimodal {
-                    format!(
-                        "t={}-{} {} split into two clusters: {} near {}, {} near {}",
-                        self.start_tick,
-                        self.end_tick,
-                        self.metric,
-                        count(lower_n as f64),
-                        fixed(lower, 2),
-                        count(upper_n as f64),
-                        fixed(upper, 2)
-                    )
-                } else {
-                    format!(
-                        "t={}-{} {} remained a single population ({} samples)",
-                        self.start_tick,
-                        self.end_tick,
-                        self.metric,
-                        count(self.samples as f64)
-                    )
-                }
+                self.narrate_bimodality(is_bimodal)
             }
             (DetectionKind::Speciation, EvidenceClass::Lineage(corroborated)) => {
                 let (_, after) = self.sides();
@@ -1378,6 +1354,36 @@ impl DetectionEvidence {
                 "t={} {} produced inconsistent evidence ({kind:?} with {class:?})",
                 self.start_tick, self.metric
             ),
+        }
+    }
+
+    fn narrate_bimodality(&self, is_bimodal: bool) -> String {
+        use crate::narrative_text::{count, fixed};
+
+        let (lower, upper) = self.sides();
+        let (lower_n, upper_n) = self
+            .before
+            .zip(self.after)
+            .map_or((0, 0), |(b, a)| (b.samples, a.samples));
+        if is_bimodal {
+            format!(
+                "t={}-{} {} split into two clusters: {} near {}, {} near {}",
+                self.start_tick,
+                self.end_tick,
+                self.metric,
+                count(lower_n as f64),
+                fixed(lower, 2),
+                count(upper_n as f64),
+                fixed(upper, 2)
+            )
+        } else {
+            format!(
+                "t={}-{} {} remained a single population ({} samples)",
+                self.start_tick,
+                self.end_tick,
+                self.metric,
+                count(self.samples as f64)
+            )
         }
     }
 

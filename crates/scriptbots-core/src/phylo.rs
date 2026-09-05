@@ -59,9 +59,13 @@ impl LayoutIdx {
 /// 2D Bounding Box for layout elements.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
+    /// Lower horizontal bound in layout coordinates.
     pub x_min: f32,
+    /// Lower vertical bound in layout coordinates.
     pub y_min: f32,
+    /// Upper horizontal bound in layout coordinates.
     pub x_max: f32,
+    /// Upper vertical bound in layout coordinates.
     pub y_max: f32,
 }
 
@@ -79,7 +83,9 @@ impl Default for Rect {
 /// Simulation tick viewport range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TickRange {
+    /// Inclusive first tick in the viewport.
     pub start: Tick,
+    /// Inclusive last tick in the viewport.
     pub end: Tick,
 }
 
@@ -118,7 +124,9 @@ pub enum ParentRef {
 /// Single node in the 2D phylogeny layout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayoutNode {
+    /// Stable graph identity represented by this node.
     pub key: PhyloKey,
+    /// Resolved parent slot, absent for roots and unresolved parents.
     pub parent: Option<LayoutIdx>,
     /// Immutable declared ancestry relation.
     pub declared_parent: ParentRef,
@@ -133,17 +141,24 @@ pub struct LayoutNode {
     pub thickness: f32,
     /// Current observed population.
     pub population: u32,
+    /// Birth tick of the represented agent or species.
     pub first_tick: Tick,
+    /// Observed death tick, absent while the node remains alive.
     pub last_tick: Option<Tick>,
+    /// Whether the node's descendants are hidden by a collapse operation.
     pub collapsed: bool,
+    /// Largest population observed for this node.
     pub peak_population: u32,
 }
 
 /// Report emitted after incremental layout extension.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutDelta {
+    /// Slots allocated for newly accepted nodes.
     pub added: Vec<LayoutIdx>,
+    /// Existing slots whose layout projection changed.
     pub moved: Vec<LayoutIdx>,
+    /// Whether this update performed a whole-tree relayout.
     pub full_relayout: bool,
     /// Input rows examined, including idempotent duplicates.
     pub updates_seen: usize,
@@ -168,62 +183,105 @@ pub struct LayoutDelta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayoutIssue {
     /// Conflicting duplicate rows for one key appeared in the same batch.
-    ConflictingDuplicate { key: PhyloKey },
+    ConflictingDuplicate {
+        /// Identity with conflicting rows.
+        key: PhyloKey,
+    },
     /// An existing node's immutable identity/topology fields changed.
-    ImmutableConflict { key: PhyloKey },
+    ImmutableConflict {
+        /// Existing identity whose immutable fields differed.
+        key: PhyloKey,
+    },
     /// A node declared itself, or one of its descendants, as parent.
-    Cycle { key: PhyloKey, parent: PhyloKey },
+    Cycle {
+        /// Node whose proposed parent would create a cycle.
+        key: PhyloKey,
+        /// Proposed parent closing the cycle.
+        parent: PhyloKey,
+    },
     /// A known parent was born after its child.
-    ParentBornAfterChild { child: PhyloKey, parent: PhyloKey },
+    ParentBornAfterChild {
+        /// Child with the earlier birth tick.
+        child: PhyloKey,
+        /// Proposed parent with the later birth tick.
+        parent: PhyloKey,
+    },
     /// Death precedes birth.
-    InvalidLifetime { key: PhyloKey },
+    InvalidLifetime {
+        /// Identity whose death tick precedes its birth.
+        key: PhyloKey,
+    },
     /// Retaining another node would cross the configured node/byte ceiling.
-    BudgetExceeded { key: PhyloKey },
+    BudgetExceeded {
+        /// Identity that could not be retained within the budget.
+        key: PhyloKey,
+    },
 }
 
 /// Input update for a node in the phylogeny graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhyloNodeUpdate {
+    /// Stable identity to insert or update.
     pub key: PhyloKey,
+    /// Declared ancestry relation, including explicit pruning.
     pub parent: ParentRef,
+    /// Immutable founder used to anchor species ordering.
     pub founder_uid: AgentUid,
+    /// First tick of the represented lifetime.
     pub birth_tick: Tick,
+    /// Final tick of the lifetime, absent while alive.
     pub death_tick: Option<Tick>,
+    /// Current observed population.
     pub population: u32,
 }
 
 /// Batch of node updates to incorporate into the layout.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhyloDelta {
+    /// Node observations to validate and incorporate.
     pub updates: Vec<PhyloNodeUpdate>,
 }
 
 /// Report returned when expanding a collapsed clade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpandReport {
+    /// Number of nodes expanded by this operation.
     pub expanded_nodes: usize,
+    /// Whether the expansion stopped at its node or depth budget.
     pub truncated: bool,
 }
 
 /// Allocation-aware retained-memory estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryReport {
+    /// Inline size of the layout owner.
     pub inline_bytes: usize,
+    /// Bytes reserved by the layout-node vector.
     pub node_capacity_bytes: usize,
+    /// Bytes reserved by the exact subtree-aggregate vector.
     pub aggregate_capacity_bytes: usize,
+    /// Bytes reserved by topology metadata vectors.
     pub topology_capacity_bytes: usize,
+    /// Bytes reserved by per-node child vectors.
     pub child_capacity_bytes: usize,
+    /// Conservative retained bytes for the identity-to-slot index.
     pub key_index_bytes: usize,
+    /// Conservative retained bytes for unresolved-parent entries and child lists.
     pub pending_index_bytes: usize,
+    /// Conservative retained bytes for the augmented spatial index.
     pub lod_index_bytes: usize,
+    /// Sum of the reported inline and retained-allocation estimates.
     pub total_retained_bytes: usize,
 }
 
 /// Indexed LOD result plus inspectable query work.
 #[derive(Debug)]
 pub struct LodReport<'a> {
+    /// Selected nodes in deterministic level-of-detail rank order.
     pub nodes: Vec<&'a LayoutNode>,
+    /// Spatial-index nodes examined by this query.
     pub index_nodes_visited: usize,
+    /// Height of the retained spatial index.
     pub index_height: usize,
     /// More index candidates remained after the explicit output budget.
     pub truncated: bool,
@@ -268,6 +326,10 @@ impl SubtreeAggregate {
     }
 
     #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the exact integer leaf aggregate is projected to the layout's f32 coordinate; retain the existing f64 division before rounding"
+    )]
     fn y(self) -> f32 {
         debug_assert!(self.leaves > 0);
         ((self.sum as f64) / (self.leaves as f64)) as f32
@@ -402,7 +464,7 @@ impl LodIndex {
                 root
             }
         } else {
-            debug_assert!(inserted_key != root_key);
+            debug_assert_ne!(inserted_key, root_key);
             let right = self.node(root).right;
             let new_right = self.insert_at(right, inserted, visited);
             self.node_mut(root).right = Some(new_right);
@@ -555,7 +617,7 @@ impl LodIndex {
         })
     }
 
-    fn retained_bytes(&self) -> usize {
+    const fn retained_bytes(&self) -> usize {
         self.slots
             .capacity()
             .saturating_mul(std::mem::size_of::<Option<LodIndexNode>>())
@@ -612,7 +674,7 @@ fn lod_rank(node: &LayoutNode) -> LodRank {
     }
 }
 
-fn deterministic_priority(key: PhyloKey) -> u64 {
+const fn deterministic_priority(key: PhyloKey) -> u64 {
     let raw = match key {
         PhyloKey::PrunedAncestor => 0xA076_1D64_78BD_642F,
         PhyloKey::Species(id) => id ^ 0xE703_7ED1_A0B4_28DB,
@@ -667,19 +729,19 @@ impl TreeLayout {
 
     /// Returns the total number of nodes stored in the layout.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Returns `true` if the layout contains no nodes.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
     /// Returns the bounding box of the entire layout.
     #[must_use]
-    pub fn bounds(&self) -> Rect {
+    pub const fn bounds(&self) -> Rect {
         self.bounds
     }
 
@@ -1371,7 +1433,7 @@ impl TreeLayout {
                 CandidateKind::Subtree(slot) => {
                     report.index_nodes_visited = report.index_nodes_visited.saturating_add(1);
                     let indexed = self.lod_index.node(slot);
-                    if self.lod_item_matches(indexed, viewport, y_start, y_end) {
+                    if Self::lod_item_matches(indexed, viewport, y_start, y_end) {
                         candidates.push(LodCandidate {
                             rank: indexed.rank,
                             kind: CandidateKind::Item(slot),
@@ -1406,8 +1468,7 @@ impl TreeLayout {
             && node.max_last_tick >= viewport.start.0
     }
 
-    fn lod_item_matches(
-        &self,
+    const fn lod_item_matches(
         node: &LodIndexNode,
         viewport: TickRange,
         y_start: u32,
@@ -1441,11 +1502,18 @@ impl TreeLayout {
         for node in &self.nodes {
             let dx = node.x - x;
             let dy = node.y - y;
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "hit-test tolerance and exact tie decisions use the existing separately rounded squared-distance sum"
+            )]
             let dist_sq = dx * dx + dy * dy;
             if dist_sq <= tol_sq {
                 match best {
                     Some((best_dist, best_key)) => {
-                        if dist_sq < best_dist || (dist_sq == best_dist && node.key < best_key) {
+                        if dist_sq < best_dist
+                            || (dist_sq.partial_cmp(&best_dist) == Some(Ordering::Equal)
+                                && node.key < best_key)
+                        {
                             best = Some((dist_sq, node.key));
                         }
                     }
@@ -1466,14 +1534,11 @@ impl TreeLayout {
         depth_budget: usize,
         node_budget: usize,
     ) -> ExpandReport {
-        let root_idx = match self.index.get(&root) {
-            Some(&idx) => idx,
-            None => {
-                return ExpandReport {
-                    expanded_nodes: 0,
-                    truncated: false,
-                };
-            }
+        let Some(&root_idx) = self.index.get(&root) else {
+            return ExpandReport {
+                expanded_nodes: 0,
+                truncated: false,
+            };
         };
 
         let effective_depth_budget = depth_budget.min(self.budget.max_depth);
@@ -1507,7 +1572,7 @@ impl TreeLayout {
     }
 }
 
-fn update_anchor(key: PhyloKey, founder_uid: AgentUid) -> u64 {
+const fn update_anchor(key: PhyloKey, founder_uid: AgentUid) -> u64 {
     match key {
         PhyloKey::PrunedAncestor => 0,
         PhyloKey::Species(_) => founder_uid.get().saturating_add(1),
@@ -1515,7 +1580,7 @@ fn update_anchor(key: PhyloKey, founder_uid: AgentUid) -> u64 {
     }
 }
 
-fn node_anchor(node: &LayoutNode) -> u64 {
+const fn node_anchor(node: &LayoutNode) -> u64 {
     update_anchor(node.key, node.founder_uid)
 }
 
@@ -1622,7 +1687,8 @@ pub enum PhyloEvent {
         /// Realized cross-cluster mating rate over the observation window.
         cross_mating_rate: f32,
         /// Number of consecutive segmentation samples the split persisted.
-        persisted_samples: u32,
+        /// Uses the same count representation as [`SplitTracking::samples_held`].
+        persisted_samples: usize,
         /// Cross-validated detector hint ID, if any.
         hint: Option<HintId>,
         /// Simulation tick at which speciation was confirmed.
@@ -2025,7 +2091,7 @@ pub fn step_phylo_events(
                 founders: sb.founders.clone(),
                 separation,
                 cross_mating_rate: cross_rate,
-                persisted_samples: tracking.samples_held as u32,
+                persisted_samples: tracking.samples_held,
                 hint: tracking.matched_hint,
                 tick: current_tick,
             };
@@ -2043,34 +2109,35 @@ pub fn step_phylo_events(
 
     // Clean up resolved / transient splits and reconcile hints for failed splits
     for key in resolved_split_keys {
-        if let Some(tracking) = state.pending_splits.remove(&key) {
-            if let Some(reason) = tracking.last_rejection_reason {
-                if let Some(hid) = tracking.matched_hint {
-                    let mut metrics = BTreeMap::new();
-                    metrics.insert(
-                        "cross_mating_rate".to_string(),
-                        tracking.last_cross_mating_rate,
-                    );
-                    metrics.insert(
-                        "child_a_size".to_string(),
-                        tracking.last_sample_sizes.0 as f32,
-                    );
-                    metrics.insert(
-                        "child_b_size".to_string(),
-                        tracking.last_sample_sizes.1 as f32,
-                    );
-                    verdicts.push(HintVerdict::Rejected {
-                        reason,
-                        evidence: HintEvidence {
-                            hint_id: hid,
-                            tick: current_tick,
-                            score: 0.0,
-                            detail: format!("Candidate split {key:?} rejected: {reason:?}"),
-                            metrics,
-                        },
-                    });
-                }
-            }
+        if let Some(tracking) = state.pending_splits.remove(&key)
+            && let Some(reason) = tracking.last_rejection_reason
+            && let Some(hid) = tracking.matched_hint
+        {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "hint metrics store approximate f32 counts; exact member counts remain in the species table"
+            )]
+            let child_sizes = (
+                tracking.last_sample_sizes.0 as f32,
+                tracking.last_sample_sizes.1 as f32,
+            );
+            let mut metrics = BTreeMap::new();
+            metrics.insert(
+                "cross_mating_rate".to_string(),
+                tracking.last_cross_mating_rate,
+            );
+            metrics.insert("child_a_size".to_string(), child_sizes.0);
+            metrics.insert("child_b_size".to_string(), child_sizes.1);
+            verdicts.push(HintVerdict::Rejected {
+                reason,
+                evidence: HintEvidence {
+                    hint_id: hid,
+                    tick: current_tick,
+                    score: 0.0,
+                    detail: format!("Candidate split {key:?} rejected: {reason:?}"),
+                    metrics,
+                },
+            });
         }
     }
 
@@ -2088,17 +2155,13 @@ pub fn step_phylo_events(
                 .get(&prev_sp_id)
                 .cloned()
                 .unwrap_or_default();
-            let living_members: Vec<AgentUid> = known_members
-                .iter()
-                .copied()
-                .filter(|uid| {
-                    ancestry
-                        .node(*uid)
-                        .is_some_and(|node| node.death_tick.is_none() && !node.pruned)
-                })
-                .collect();
+            let has_living_members = known_members.iter().any(|uid| {
+                ancestry
+                    .node(*uid)
+                    .is_some_and(|node| node.death_tick.is_none() && !node.pruned)
+            });
 
-            if !living_members.is_empty() {
+            if has_living_members {
                 // ANOMALY: clustering dropped a species that still has living members!
                 anomalies_this_step += 1;
                 state.anomaly_count += 1;
@@ -2116,11 +2179,11 @@ pub fn step_phylo_events(
 
             for uid in &known_members {
                 if let Some(node) = ancestry.node(*uid) {
-                    if let Some(dt) = node.death_tick {
-                        if dt.0 >= latest_death.0 {
-                            latest_death = dt;
-                            last_member = *uid;
-                        }
+                    if let Some(dt) = node.death_tick
+                        && dt.0 >= latest_death.0
+                    {
+                        latest_death = dt;
+                        last_member = *uid;
                     }
                     if let Some(cause) = node.death_cause {
                         *cause_histogram.entry(cause).or_insert(0) += 1;
@@ -2150,10 +2213,14 @@ pub fn step_phylo_events(
     for (&sp_id, species) in &current_species_map {
         if let Some(&prev_size) = state.prev_species_sizes.get(&sp_id) {
             let curr_size = species.members.len();
-            if curr_size >= params.radiation_min_members
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "radiation uses the existing f32 population ratio and configured f32 growth threshold; widening would change boundary decisions"
+            )]
+            let is_radiation = curr_size >= params.radiation_min_members
                 && prev_size >= 1
-                && (curr_size as f32) >= (prev_size as f32) * params.radiation_growth_factor
-            {
+                && (curr_size as f32) >= (prev_size as f32) * params.radiation_growth_factor;
+            if is_radiation {
                 // Radiation detected!
                 state.next_event_id += 1;
                 let event_id = EventId(state.next_event_id);
@@ -2198,7 +2265,7 @@ pub fn step_phylo_events(
                     && (match e {
                         PhyloEvent::Speciation { hint: h, .. }
                         | PhyloEvent::Radiation { hint: h, .. } => *h == Some(hint.id),
-                        _ => false,
+                        PhyloEvent::Extinction { .. } => false,
                     })
             }),
             HintVerdict::Rejected { evidence, .. } => evidence.hint_id == hint.id,
@@ -3119,6 +3186,84 @@ mod tests {
 
         assert_eq!(out3.verdicts.len(), 1);
         assert_eq!(out3.verdicts[0], HintVerdict::Confirmed(*eid));
+    }
+
+    #[test]
+    fn speciation_preserves_sample_counts_at_representation_boundaries() {
+        let mut sample_counts = vec![2, 3, usize::MAX];
+        if let Ok(above_u32) = usize::try_from(u64::from(u32::MAX) + 1) {
+            sample_counts.push(above_u32);
+        }
+        let ancestry = build_test_ancestry(&[1, 2, 3, 4], None);
+        let births = [make_birth(5, Some(1), Some(2))];
+        let split_key = CandidateSplitKey {
+            parent: SpeciesId(1),
+            child_a: SpeciesId(1),
+            child_b: SpeciesId(2),
+        };
+
+        for expected_count in sample_counts {
+            let mut table = SpeciesTable {
+                tick: Tick(10),
+                species: vec![make_test_species(1, &[1, 2]), make_test_species(2, &[3, 4])],
+                ..SpeciesTable::default()
+            };
+            let params = PhyloEventParams {
+                persistence_samples: expected_count,
+                min_species_size: 2,
+                min_two_parent_births: 1,
+                ..PhyloEventParams::default()
+            };
+            let mut state = PhyloEngineState::default();
+            state.pending_splits.insert(
+                split_key,
+                SplitTracking {
+                    first_seen_tick: Tick(0),
+                    samples_held: expected_count - 2,
+                    last_cross_mating_rate: 0.0,
+                    last_sample_sizes: (2, 2),
+                    matched_hint: None,
+                    last_rejection_reason: None,
+                    separation_kind: SeparationKind::Phenotypic,
+                },
+            );
+
+            let before = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
+            assert!(
+                before.events.is_empty(),
+                "one more sample is still required"
+            );
+            assert_eq!(
+                state.pending_splits[&split_key].samples_held,
+                expected_count - 1
+            );
+            table.tick = Tick(20);
+            let output = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
+            assert_eq!(output.events.len(), 1);
+            assert!(!state.pending_splits.contains_key(&split_key));
+            let expected_u64 = u64::try_from(expected_count).expect("sample count fits u64");
+            let observed = match &output.events[0].1 {
+                PhyloEvent::Speciation {
+                    persisted_samples, ..
+                } => Some(u64::try_from(*persisted_samples).expect("reported count fits u64")),
+                PhyloEvent::Extinction { .. } | PhyloEvent::Radiation { .. } => None,
+            };
+            assert_eq!(observed, Some(expected_u64));
+
+            let json = serde_json::to_vec(&output).expect("encode phylogeny output as JSON");
+            let value: serde_json::Value = serde_json::from_slice(&json).expect("read JSON fields");
+            assert_eq!(
+                value["events"][0][1]["Speciation"]["persisted_samples"].as_u64(),
+                Some(expected_u64)
+            );
+            let json_output: PhyloEngineOutput =
+                serde_json::from_slice(&json).expect("decode phylogeny JSON");
+            assert_eq!(json_output, output);
+            let binary = postcard::to_allocvec(&output).expect("encode phylogeny postcard");
+            let binary_output: PhyloEngineOutput =
+                postcard::from_bytes(&binary).expect("decode phylogeny postcard");
+            assert_eq!(binary_output, output);
+        }
     }
 
     /// (b) Split that reverts after K-1 samples -> NO event, hint Rejected{Transient}.

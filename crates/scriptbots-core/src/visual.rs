@@ -1020,6 +1020,10 @@ pub const FERTILITY_LUSHNESS_WEIGHT: f32 = 0.25;
 /// Both inputs are clamped defensively, so a caller sampling a partially initialized field
 /// cannot push the shading path out of gamut.
 #[must_use]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "shared terrain color semantics retain separate rounding of fertility multiplication and moisture addition"
+)]
 pub fn terrain_lushness(moisture: f32, fertility_bias: f32) -> f32 {
     let moisture = clamp01(moisture);
     let bias = if fertility_bias.is_finite() {
@@ -1073,7 +1077,7 @@ pub const TERRAIN_LIGHT_FACTOR_RANGE: (f32, f32) = (0.72, 1.28);
 )]
 pub fn terrain_normal_light_factor(kind: TerrainKind, gradient: [f32; 2], daylight: f32) -> f32 {
     let (gx, gy) = match (gradient[0].is_finite(), gradient[1].is_finite()) {
-        (true, true) => (gradient[0], gradient[1]),
+        (true, true) => <(f32, f32)>::from(gradient),
         _ => return 1.0,
     };
     let daylight = clamp01(daylight);
@@ -1244,7 +1248,7 @@ pub enum WorldVisualEvent {
     SpikeExtend,
     /// Movement boost engaged this tick.
     ///
-    /// Defined here rather than left to the renderer (WildDuck's `vfx.rs` question): boost is
+    /// Defined here rather than left to the renderer (`WildDuck`'s `vfx.rs` question): boost is
     /// a real, observable agent action with an existing output channel, so it gets a canonical
     /// cue like every other action. Leaving it undefined is what produces a second palette --
     /// the renderer would have had to invent a colour, and then core and GPUI would disagree
@@ -1523,7 +1527,7 @@ pub struct TerrainSampleCorners {
 }
 
 impl TerrainFieldView<'_> {
-    fn cell_count(&self) -> usize {
+    const fn cell_count(&self) -> usize {
         (self.width as usize).saturating_mul(self.height as usize)
     }
 
@@ -1748,6 +1752,10 @@ pub fn splat_weights(input: &SplatInput) -> [f32; SPLAT_LAYERS] {
 /// may rasterize, light, and post-process differently, but none may own a
 /// competing six-layer blend or accessibility transform.
 #[must_use]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the shared six-layer color blend rounds each product before its ordered accumulation"
+)]
 pub fn terrain_surface_srgb(input: &TerrainSurfaceInput) -> [f32; 3] {
     const KINDS: [TerrainKind; SPLAT_LAYERS] = [
         TerrainKind::DeepWater,
@@ -1926,9 +1934,17 @@ pub fn bake_biome_texture(kind: TerrainKind, seed: u64, size: u32) -> Vec<u8> {
                 x as f32 / size as f32 * spec.grain_scale,
                 y as f32 / size as f32 * spec.grain_scale,
             );
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "deterministic texture bytes depend on separate noise modulation rounding"
+            )]
             let m = 1.0 + n * spec.grain_amplitude;
             for &channel in &base {
                 let v = (channel * m).clamp(0.0, 1.0);
+                #[expect(
+                    clippy::suboptimal_flops,
+                    reason = "RGBA8 quantization rounds the channel multiplication before adding the half-byte offset"
+                )]
                 out.push((v * 255.0 + 0.5) as u8);
             }
             out.push(255);

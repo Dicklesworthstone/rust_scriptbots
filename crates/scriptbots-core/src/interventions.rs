@@ -6,9 +6,22 @@ use serde::{Deserialize, Serialize};
 /// Toroidal-aware spatial region specification.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToroidalRegion {
+    /// Every point in the world.
     All,
-    Disc { center: Vec2, radius: f32 },
-    Rect { min: Vec2, max: Vec2 },
+    /// Closed disc measured using the shortest toroidal displacement.
+    Disc {
+        /// Disc center in world coordinates.
+        center: Vec2,
+        /// Disc radius in world units; validation requires a finite positive value.
+        radius: f32,
+    },
+    /// Closed axis-aligned rectangle without wraparound across world seams.
+    Rect {
+        /// Inclusive lower coordinate bounds.
+        min: Vec2,
+        /// Inclusive upper coordinate bounds.
+        max: Vec2,
+    },
 }
 
 impl ToroidalRegion {
@@ -49,13 +62,20 @@ impl ToroidalRegion {
         }
     }
 
+    /// Test membership, using `world_size` for disc wrapping and direct rectangle bounds.
+    #[must_use]
     pub fn contains(&self, point: Vec2, world_size: Vec2) -> bool {
         match self {
             Self::All => true,
             Self::Disc { center, radius } => {
                 let dx = toroidal_delta(point.x, center.x, world_size.x);
                 let dy = toroidal_delta(point.y, center.y, world_size.y);
-                (dx * dx + dy * dy) <= (radius * radius)
+                #[expect(
+                    clippy::suboptimal_flops,
+                    reason = "Separate f32 products and addition preserve intervention membership at replay boundary points; fused rounding can change which agents are affected"
+                )]
+                let distance_squared = dx * dx + dy * dy;
+                distance_squared <= (radius * radius)
             }
             Self::Rect { min, max } => {
                 point.x >= min.x && point.x <= max.x && point.y >= min.y && point.y <= max.y
@@ -69,31 +89,52 @@ impl ToroidalRegion {
 pub enum InterventionAction {
     /// Suppress food growth in a region for a specified duration.
     Drought {
+        /// Region whose food growth is suppressed.
         region: ToroidalRegion,
+        /// Number of simulation ticks to retain the drought effect.
         duration_ticks: u64,
     },
     /// Kill all agents and scorch food in a target disc.
-    Meteor { center: Vec2, radius: f32 },
+    Meteor {
+        /// Center of the affected toroidal disc in world coordinates.
+        center: Vec2,
+        /// Radius of the affected disc in world units.
+        radius: f32,
+    },
     /// Inject a cohort of predator agents with specified brain/genome parameters.
-    PredatorInjection { count: usize, position: Vec2 },
+    PredatorInjection {
+        /// Number of predators requested for injection.
+        count: usize,
+        /// Requested injection position in world coordinates.
+        position: Vec2,
+    },
     /// Paint terrain in a specified region.
     TerrainPaint {
+        /// Region whose terrain cells are painted.
         region: ToroidalRegion,
+        /// Encoded terrain kind to apply.
         terrain_kind: u8,
     },
     /// Freeze food diffusion across the entire world for T ticks.
-    FoodEmbargo { duration_ticks: u64 },
+    FoodEmbargo {
+        /// Number of simulation ticks to retain the diffusion embargo.
+        duration_ticks: u64,
+    },
 }
 
 /// Record of an issued intervention for replay and science provenance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterventionRecord {
+    /// Simulation tick attached to the intervention.
     pub tick: Tick,
+    /// Intervention parameters to apply and record.
     pub action: InterventionAction,
+    /// Caller-supplied provenance label identifying the issuer.
     pub issued_by: String,
 }
 
 impl InterventionRecord {
+    /// Validate action-specific durations, counts, radii, and region bounds.
     pub fn validate(&self) -> Result<(), String> {
         match &self.action {
             InterventionAction::Drought {

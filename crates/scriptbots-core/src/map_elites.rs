@@ -171,8 +171,7 @@ impl PhenotypeFeature {
         match self {
             Self::DietTendency => "ratio",
             Self::MeanSpeed => "world_unit_per_tick",
-            Self::SpikeUsageRate => "event_per_tick",
-            Self::GiveRate => "event_per_tick",
+            Self::SpikeUsageRate | Self::GiveRate => "event_per_tick",
             Self::SoundUsage => "unit_per_tick",
             Self::TurnRate => "radian_per_tick",
             Self::SensingMean => "trait_multiplier",
@@ -190,7 +189,7 @@ pub struct Axis {
     pub feature: PhenotypeFeature,
     /// Valid domain `(lo, hi)` with `lo < hi`.
     pub domain: (f32, f32),
-    /// Number of uniform discrete bins along this axis (1..=256).
+    /// Number of uniform discrete bins along this axis (`1..=u8::MAX`).
     pub bins: u8,
 }
 
@@ -258,7 +257,7 @@ impl Axis {
         }
         let lo = self.domain.0;
         let hi = self.domain.1;
-        let bins = self.bins as u32;
+        let bins = u32::from(self.bins);
 
         let clamped = value.clamp(lo, hi);
         if clamped >= hi {
@@ -267,7 +266,7 @@ impl Axis {
             let span = hi - lo;
             let frac = ((clamped - lo) / span).clamp(0.0, 1.0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let bin = (frac * bins as f32).floor() as u32;
+            let bin = (frac * f32::from(self.bins)).floor() as u32;
             let capped = bin.min(bins.saturating_sub(1));
             #[allow(clippy::cast_possible_truncation)]
             Ok(capped as u8)
@@ -333,7 +332,8 @@ impl Default for BehaviorSpaceV0 {
 
 impl BehaviorSpaceV0 {
     /// Create a new behavior space with explicit axes.
-    pub fn new(version: u16, axes: Vec<Axis>) -> Self {
+    #[must_use]
+    pub const fn new(version: u16, axes: Vec<Axis>) -> Self {
         Self { version, axes }
     }
 
@@ -374,7 +374,7 @@ impl BehaviorSpaceV0 {
         let mut total = 1u64;
         for axis in &self.axes {
             total = total
-                .checked_mul(axis.bins as u64)
+                .checked_mul(u64::from(axis.bins))
                 .ok_or(QdError::MixedRadixOverflow)?;
         }
         Ok(total)
@@ -395,7 +395,7 @@ impl BehaviorSpaceV0 {
         let mut cell_id = 0u64;
         let mut multiplier = 1u64;
         for (i, (axis, &val)) in self.axes.iter().zip(&descriptor.0).enumerate() {
-            let bin = axis.discretize(val, i)? as u64;
+            let bin = u64::from(axis.discretize(val, i)?);
             let term = bin
                 .checked_mul(multiplier)
                 .ok_or(QdError::MixedRadixOverflow)?;
@@ -403,7 +403,7 @@ impl BehaviorSpaceV0 {
                 .checked_add(term)
                 .ok_or(QdError::MixedRadixOverflow)?;
             multiplier = multiplier
-                .checked_mul(axis.bins as u64)
+                .checked_mul(u64::from(axis.bins))
                 .ok_or(QdError::MixedRadixOverflow)?;
         }
         Ok(CellId(cell_id))
@@ -417,7 +417,7 @@ impl BehaviorSpaceV0 {
         let mut remaining = cell_id.0;
         let mut coords = Vec::with_capacity(self.axes.len());
         for axis in &self.axes {
-            let bins = axis.bins as u64;
+            let bins = u64::from(axis.bins);
             #[allow(clippy::cast_possible_truncation)]
             let coord = (remaining % bins) as u8;
             coords.push(coord);
@@ -434,7 +434,7 @@ pub struct BehaviorDescriptor(pub Vec<f32>);
 impl BehaviorDescriptor {
     /// Construct a new behavior descriptor from a vector of continuous feature values.
     #[must_use]
-    pub fn new(values: Vec<f32>) -> Self {
+    pub const fn new(values: Vec<f32>) -> Self {
         Self(values)
     }
 
@@ -452,13 +452,13 @@ impl BehaviorDescriptor {
 
     /// Dimension of this descriptor vector.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Whether this descriptor has zero dimensions.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -532,7 +532,11 @@ pub enum QualityMetric {
 impl QualityMetric {
     /// Compute the quality value for an agent according to this metric.
     #[must_use]
-    pub fn compute(
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Archive quality is f32 for all metrics; preserving u32-to-f32 rounding retains the existing ranking and UID tie breaks above the exact-integer range"
+    )]
+    pub const fn compute(
         self,
         runtime: &AgentRuntime,
         data: &AgentData,
@@ -666,27 +670,12 @@ impl MapElitesArchive {
                 match ordering {
                     std::cmp::Ordering::Greater => {
                         let incumbent_bytes = incumbent.approximate_bytes();
-                        let net_delta = entry_bytes.saturating_sub(incumbent_bytes);
-                        if self.current_bytes.saturating_add(net_delta) > self.max_archive_bytes {
-                            return Err(QdError::ByteCapExceeded {
-                                current_bytes: self.current_bytes,
-                                entry_bytes: net_delta,
-                                cap_bytes: self.max_archive_bytes,
-                            });
-                        }
                         let displaced_uid = incumbent.uid;
                         let displaced_quality = incumbent.quality;
                         let uid = entry.uid;
                         let quality = entry.quality;
                         let tick_inserted = entry.tick_inserted.0;
-                        if entry_bytes >= incumbent_bytes {
-                            self.current_bytes = self.current_bytes.saturating_add(net_delta);
-                        } else {
-                            self.current_bytes = self
-                                .current_bytes
-                                .saturating_sub(incumbent_bytes.saturating_sub(entry_bytes));
-                        }
-                        self.cells.insert(cell_id, entry);
+                        self.replace_incumbent(cell_id, entry, entry_bytes, incumbent_bytes)?;
                         let binned_axes =
                             self.space.decode_cell_coords(cell_id).unwrap_or_default();
                         tracing::debug!(
@@ -707,27 +696,12 @@ impl MapElitesArchive {
                     }
                     std::cmp::Ordering::Equal if entry.uid < incumbent.uid => {
                         let incumbent_bytes = incumbent.approximate_bytes();
-                        let net_delta = entry_bytes.saturating_sub(incumbent_bytes);
-                        if self.current_bytes.saturating_add(net_delta) > self.max_archive_bytes {
-                            return Err(QdError::ByteCapExceeded {
-                                current_bytes: self.current_bytes,
-                                entry_bytes: net_delta,
-                                cap_bytes: self.max_archive_bytes,
-                            });
-                        }
                         let displaced_uid = incumbent.uid;
                         let displaced_quality = incumbent.quality;
                         let uid = entry.uid;
                         let quality = entry.quality;
                         let tick_inserted = entry.tick_inserted.0;
-                        if entry_bytes >= incumbent_bytes {
-                            self.current_bytes = self.current_bytes.saturating_add(net_delta);
-                        } else {
-                            self.current_bytes = self
-                                .current_bytes
-                                .saturating_sub(incumbent_bytes.saturating_sub(entry_bytes));
-                        }
-                        self.cells.insert(cell_id, entry);
+                        self.replace_incumbent(cell_id, entry, entry_bytes, incumbent_bytes)?;
                         let binned_axes =
                             self.space.decode_cell_coords(cell_id).unwrap_or_default();
                         tracing::debug!(
@@ -752,12 +726,38 @@ impl MapElitesArchive {
         }
     }
 
+    fn replace_incumbent(
+        &mut self,
+        cell_id: CellId,
+        entry: ArchiveEntry,
+        entry_bytes: usize,
+        incumbent_bytes: usize,
+    ) -> Result<(), QdError> {
+        let net_delta = entry_bytes.saturating_sub(incumbent_bytes);
+        if self.current_bytes.saturating_add(net_delta) > self.max_archive_bytes {
+            return Err(QdError::ByteCapExceeded {
+                current_bytes: self.current_bytes,
+                entry_bytes: net_delta,
+                cap_bytes: self.max_archive_bytes,
+            });
+        }
+        if entry_bytes >= incumbent_bytes {
+            self.current_bytes = self.current_bytes.saturating_add(net_delta);
+        } else {
+            self.current_bytes = self
+                .current_bytes
+                .saturating_sub(incumbent_bytes.saturating_sub(entry_bytes));
+        }
+        self.cells.insert(cell_id, entry);
+        Ok(())
+    }
+
     /// Compute Quality-Diversity (QD) score (sum of all elite qualities).
     ///
     /// Summation is done in sorted [`CellId`] iteration order.
     #[must_use]
     pub fn qd_score(&self) -> f64 {
-        self.cells.values().map(|r| r.quality as f64).sum()
+        self.cells.values().map(|r| f64::from(r.quality)).sum()
     }
 
     /// Number of distinct occupied cells in the archive.
@@ -800,6 +800,10 @@ impl MapElitesArchive {
             #[allow(clippy::cast_precision_loss)]
             let count = self.cells.len() as f64;
             #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "The public coverage ratio is f32; retain the existing f64 division followed by narrowing instead of changing its rounding"
+            )]
             let ratio = (count / total as f64) as f32;
             ratio.clamp(0.0, 1.0)
         }
@@ -912,7 +916,12 @@ impl AgentAccumulatedStats {
             if let Some(prev) = self.last_heading {
                 let diff = (heading - prev).abs();
                 let wrapped = if diff > std::f32::consts::PI {
-                    (2.0 * std::f32::consts::PI - diff).max(0.0)
+                    #[expect(
+                        clippy::suboptimal_flops,
+                        reason = "Retain the existing multiplication-then-subtraction form used for lifetime turn descriptors; lint cleanup preserves the scientific evaluation order"
+                    )]
+                    let remaining_turn = 2.0 * std::f32::consts::PI - diff;
+                    remaining_turn.max(0.0)
                 } else {
                     diff
                 };
@@ -923,12 +932,16 @@ impl AgentAccumulatedStats {
     }
 
     /// Record that this agent successfully produced an offspring.
-    pub fn record_offspring(&mut self) {
+    pub const fn record_offspring(&mut self) {
         self.offspring_count = self.offspring_count.saturating_add(1);
     }
 
     /// Extract a single feature's accumulated average for behavior space mapping.
     #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Lifetime descriptors and sums use f32; keeping counter rounding before division preserves existing rate values and archive bin assignment"
+    )]
     pub fn feature_value(&self, feature: PhenotypeFeature, runtime: &AgentRuntime) -> f32 {
         let obs = (self.ticks_observed as f32).max(1.0);
         match feature {
@@ -1058,7 +1071,7 @@ impl ArchiveEntry {
             descriptor: descriptor_bytes,
             genome: genome_bytes,
             genome_version: self.genome.schema_version(),
-            parent_uid: self.provenance.parent_uid.map(|u| u.get()),
+            parent_uid: self.provenance.parent_uid.map(AgentUid::get),
             generation: self.provenance.generation.0,
         })
     }
@@ -1066,6 +1079,8 @@ impl ArchiveEntry {
 
 impl ArchiveCellRow {
     /// Convert this persistence row back into a cell ID and archive entry.
+    ///
+    /// Narrows the persisted `f64` quality to the archive's `f32` representation.
     pub fn to_entry(&self) -> Result<(CellId, ArchiveEntry), QdError> {
         let descriptor: BehaviorDescriptor = serde_json::from_slice(&self.descriptor)
             .map_err(|e| QdError::Serialization(e.to_string()))?;
@@ -1076,11 +1091,16 @@ impl ArchiveCellRow {
             parent_uid: self.parent_uid.map(AgentUid),
             generation: Generation(self.generation),
         };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "ArchiveEntry persists its f32 quality widened to f64; decoding restores that representation and retains the existing narrowing behavior for externally supplied rows"
+        )]
+        let quality = self.quality as f32;
         let entry = ArchiveEntry {
             uid: AgentUid(self.uid),
             tick_inserted: Tick(self.tick_inserted),
             descriptor,
-            quality: self.quality as f32,
+            quality,
             genome,
             provenance,
         };

@@ -439,7 +439,8 @@ const _: () = {
             "sensor layout is out of order or has a duplicate index"
         );
         assert!(
-            SENSOR_LAYOUT[i].range.0 == 0.0 && SENSOR_LAYOUT[i].range.1 == 1.0,
+            SENSOR_LAYOUT[i].range.0 == 0.0
+                && SENSOR_LAYOUT[i].range.1.to_bits() == 1.0_f32.to_bits(),
             "sensor range must be normalized [0.0, 1.0]"
         );
         i += 1;
@@ -898,10 +899,15 @@ pub enum IoLayoutError {
         "brain IO layout mismatch for '{brain_kind}': expected {expected_inputs}in/{expected_outputs}out, got {actual_inputs}in/{actual_outputs}out"
     )]
     LayoutMismatch {
+        /// Brain family whose declared dimensions differ from the world layout.
         brain_kind: String,
+        /// Sensor input count required by the world.
         expected_inputs: usize,
+        /// Actuator output count required by the world.
         expected_outputs: usize,
+        /// Sensor input count reported by the brain.
         actual_inputs: usize,
+        /// Actuator output count reported by the brain.
         actual_outputs: usize,
     },
 }
@@ -935,7 +941,7 @@ impl WorldIoLayout {
     };
 
     /// Constructs a new layout specification with `bands` signal communication channels (1..=8).
-    pub fn new(bands: u8) -> Result<Self, IoLayoutError> {
+    pub const fn new(bands: u8) -> Result<Self, IoLayoutError> {
         if bands == 0 || bands > 8 {
             return Err(IoLayoutError::InvalidBands(bands));
         }
