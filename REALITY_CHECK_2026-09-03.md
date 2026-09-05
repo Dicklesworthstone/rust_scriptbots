@@ -178,7 +178,9 @@ Continuation block — **bd-16g.5.5.2, in progress, TurquoiseLake**:
     All 208 storage unit tests then passed (700.22s), followed by all 11 admission integration
     tests (127.67s), zero failures/ignored. Five-k passed again with `flush_ms=22656`.
     Child re-execution subtests are not added to the 208-test denominator. The 600-tick
-    ancestry target and later integrations are still running; no aggregate lane pass yet.
+    ancestry target then passed all 3 tests (658.29s), including the live-versus-rebuilt
+    canonical graph after actual births and deaths. Async integration passed 3/3.
+    Durability and later integration targets are still running; no aggregate lane pass yet.
   - [ ] Verify the original `bd-w1oi` server workload for its full 600-second reproduction
     window with live REST tick observations and retained logs. A five-k flush pass alone
     cannot establish long-running server progress. Replace the old bug-observed-is-green
