@@ -1387,9 +1387,9 @@ const SCRIPTBOTS_SCHEMA_V14: &str = r#"
 /// surface for no correctness gain. Per-island locality for those is a measured decision that
 /// belongs with the reporting work in bd-16g.5.5, not smuggled into a durability migration.
 ///
-/// V18/V19 separately partition `run_events`, its plain-content FTS index, and `genomes`.
-/// `interactions` and `domain_events` remain tied to the durable host-session archive;
-/// the recorded isolated-island mode uses volatile host journals and does not populate them.
+/// V18/V19 separately partition `run_events`, its plain-content FTS index, `genomes`,
+/// and `interactions`. Interaction edges are derived from science replay rows, including
+/// when host-command journals are volatile; their island identity must survive as well.
 const SCRIPTBOTS_SCHEMA_V15: &str = r#"
     ALTER TABLE tick_summaries RENAME TO tick_summaries_pre_v15;
     CREATE TABLE tick_summaries (
@@ -1822,6 +1822,29 @@ const SCRIPTBOTS_SCHEMA_V18: &str = r#"
     CREATE INDEX genomes_run_agent_tick_index
         ON genomes (run_id, island_id, agent_uid, created_at_tick);
     CREATE INDEX genomes_run_digest_index ON genomes (run_id, genome_digest);
+    ALTER TABLE interactions RENAME TO interactions_pre_v18;
+    CREATE TABLE interactions (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        seq INTEGER NOT NULL CHECK (seq >= 0),
+        actor_agent_uid INTEGER CHECK (actor_agent_uid IS NULL OR actor_agent_uid >= 0),
+        target_agent_uid INTEGER CHECK (target_agent_uid IS NULL OR target_agent_uid >= 0),
+        kind TEXT NOT NULL CHECK (kind <> ''),
+        value REAL,
+        payload_json TEXT NOT NULL CHECK (payload_json <> ''),
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
+        PRIMARY KEY (run_id, island_id, tick, seq),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO interactions
+        SELECT run_id, tick, seq, actor_agent_uid, target_agent_uid, kind, value,
+               payload_json, 0 FROM interactions_pre_v18;
+    DROP TABLE interactions_pre_v18;
+    CREATE INDEX interactions_run_actor_tick_index
+        ON interactions (run_id, island_id, actor_agent_uid, tick, seq);
+    CREATE INDEX interactions_run_target_tick_index
+        ON interactions (run_id, island_id, target_agent_uid, tick, seq);
     PRAGMA user_version = 18;
 "#;
 
@@ -2053,6 +2076,7 @@ fn refuse_ambiguous_island_attribution_migration(
     let ambiguous = connection.query(
         "SELECT run_id FROM genomes
          UNION SELECT run_id FROM run_events
+         UNION SELECT run_id FROM interactions
          INTERSECT SELECT run_id FROM (
              SELECT run_id FROM tick_summaries WHERE island_id <> 0
              UNION SELECT run_id FROM islands WHERE island_id <> 0
@@ -2063,9 +2087,41 @@ fn refuse_ambiguous_island_attribution_migration(
         return Err(StorageError::InvalidData {
             context: "storage.migration.island_attribution",
             reason: format!(
-                "refusing pre-v18 run {run_id}: unscoped genomes or narrative events cannot be assigned to an island in a multi-island run; preserve this database for explicit provenance repair"
+                "refusing pre-v18 run {run_id}: unscoped genomes, narrative events or interactions cannot be assigned to an island in a multi-island run; preserve this database for explicit provenance repair"
             ),
         });
+    }
+    // Admitted-but-unapplied science can be the only evidence of another island. Inspect
+    // one retained payload at a time before DDL; serde defaults alone would misattribute
+    // pre-V18 genomes and narrative rows to island zero on recovery.
+    let mut after_run = String::new();
+    let mut after_batch = 0_i64;
+    loop {
+        let rows = connection.query_with_params(
+            "SELECT run_id, batch_id, payload FROM storage_outbox
+             WHERE run_id > ?1 OR (run_id = ?1 AND batch_id > ?2)
+             ORDER BY run_id, batch_id LIMIT 1",
+            &[after_run.as_str().into(), after_batch.into()],
+        )?;
+        let Some(row) = rows.first() else { break };
+        after_run = decode(row, 0, "storage_outbox.run_id")?;
+        after_batch = decode(row, 1, "storage_outbox.batch_id")?;
+        let payload: String = decode(row, 2, "storage_outbox.payload")?;
+        let decoded: OutboxPayload =
+            serde_json::from_str(&payload).map_err(|error| StorageError::InvalidData {
+                context: "storage.migration.island_attribution",
+                reason: format!("cannot inspect retained pre-v18 batch: {error}"),
+            })?;
+        if (!decoded.storage.genomes.is_empty() || !decoded.storage.run_events.is_empty())
+            && decoded.storage.ticks.iter().any(|tick| tick.island_id != 0)
+        {
+            return Err(StorageError::InvalidData {
+                context: "storage.migration.island_attribution",
+                reason: format!(
+                    "refusing pre-v18 run {after_run} batch {after_batch}: retained multi-island payload has unscoped genomes or narrative events"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -10323,6 +10379,22 @@ impl StorageReader {
         Ok(observations)
     }
 
+    fn require_island_zero_interactions(&self) -> Result<(), StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT island_id FROM replay_events WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM interactions WHERE run_id = ?1 AND island_id <> 0
+             LIMIT 1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        if !rows.is_empty() {
+            return Err(StorageError::InvalidData {
+                context: "interactions.island_scope",
+                reason: "this interaction reader uses island-local agent IDs and requires an island-zero run; cross-island graph analysis is not implemented".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Load every directed interaction edge in a complete half-open tick window.
     ///
     /// This differs from [`Self::recent_interactions`]: it does not truncate to
@@ -10332,6 +10404,7 @@ impl StorageReader {
         start_tick: u64,
         end_tick: u64,
     ) -> Result<Vec<PersistedInteraction>, StorageError> {
+        self.require_island_zero_interactions()?;
         let (start, end) =
             checked_tick_window("interactions.analysis_window", start_tick, end_tick)?;
         let rows = self.finished_connection()?.query_with_params(
@@ -10341,7 +10414,8 @@ impl StorageReader {
                     e.counterpart_position_x, e.counterpart_position_y
              FROM interactions i
              LEFT JOIN replay_events e
-                    ON e.run_id = i.run_id AND e.tick = i.tick AND e.seq = i.seq
+                    ON e.run_id = i.run_id AND e.island_id = i.island_id
+                       AND e.tick = i.tick AND e.seq = i.seq
              WHERE i.run_id = ?1 AND i.tick >= ?2 AND i.tick < ?3
              ORDER BY i.tick ASC, i.seq ASC",
             &[sqlite_run_id(self.run_id), start.into(), end.into()],
@@ -10360,6 +10434,7 @@ impl StorageReader {
         selection: InteractionGraphSelection,
         budget: InteractionGraphBudget,
     ) -> Result<InteractionGraphPage, StorageError> {
+        self.require_island_zero_interactions()?;
         let bound = checked_query_limit("interaction_graph.max_rows", budget.max_rows)?;
         let projected_bytes = (budget.max_rows + 1) * std::mem::size_of::<InteractionGraphEvent>();
         if projected_bytes > budget.max_projected_bytes {
@@ -10522,8 +10597,9 @@ impl StorageReader {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        self.require_island_zero_interactions()?;
         let bound = checked_query_limit("recent_interactions.limit", limit)?;
-        // Joined to `replay_events` on the shared (run_id, tick, seq) key rather than copying
+        // Joined to `replay_events` on the shared (run_id, island_id, tick, seq) key rather than copying
         // coordinates into `interactions`. The edge and the geometry are the same fact recorded
         // once each: duplicating position into both tables would create two answers to "where
         // did this happen" that nothing keeps in agreement. LEFT JOIN because an edge is still
@@ -10535,7 +10611,8 @@ impl StorageReader {
                     e.counterpart_position_x, e.counterpart_position_y
              FROM interactions i
              LEFT JOIN replay_events e
-                    ON e.run_id = i.run_id AND e.tick = i.tick AND e.seq = i.seq
+                    ON e.run_id = i.run_id AND e.island_id = i.island_id
+                       AND e.tick = i.tick AND e.seq = i.seq
              WHERE i.run_id = ?1
              ORDER BY i.tick DESC, i.seq DESC
              LIMIT ?2",
@@ -18664,8 +18741,8 @@ impl Storage {
         rows: &[ReplayEventRow],
     ) -> Result<usize, FrankenError> {
         let sql = "insert or replace into interactions (
-                run_id, tick, seq, actor_agent_uid, target_agent_uid, kind, value, payload_json
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+                run_id, tick, seq, actor_agent_uid, target_agent_uid, kind, value, payload_json, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
         let mut inserted = 0usize;
         for row in rows {
             let (Some(actor), Some(target)) = (row.agent_uid, row.counterpart) else {
@@ -18682,6 +18759,7 @@ impl Storage {
                     row.event_type.as_str().into(),
                     row.interaction_value.map_or(SqliteValue::Null, Into::into),
                     row.payload.as_str().into(),
+                    row.island_id.into(),
                 ],
             )?;
             inserted += 1;
@@ -27250,6 +27328,27 @@ mod tests {
                 subject: None,
                 human_text: format!("island {island} population increased"),
             });
+            batch.replay_events.push(ReplayEvent {
+                agent_uid: Some(AgentUid(7)),
+                position: Some(Position::new(island as f32, 2.0)),
+                counterpart: Some(AgentUid(8)),
+                counterpart_position: Some(Position::new(3.0, 4.0)),
+                kind: ReplayEventKind::Interaction {
+                    tick: Tick(1),
+                    ordinal: 0,
+                    kind: ReplayInteractionKind::Combat,
+                    magnitude: island as f32 + 0.5,
+                },
+            });
+            for kind in [
+                INTERACTION_EVENTS_OBSERVED_KIND,
+                INTERACTION_EVENTS_PERSISTED_KIND,
+            ] {
+                batch.events.push(PersistenceEvent::new(
+                    PersistenceEventKind::Custom(kind.into()),
+                    1,
+                ));
+            }
             batches.push(batch);
         }
         assert_ne!(hashes[0], hashes[1]);
@@ -27321,6 +27420,42 @@ mod tests {
             2
         );
         assert_eq!(reader.narrative_around_tick(1, 0)?.len(), 2);
+        let interactions = reader.connection()?.query(
+            "SELECT i.island_id, i.value, e.position_x FROM interactions i
+             JOIN replay_events e ON e.run_id = i.run_id AND e.island_id = i.island_id
+                AND e.tick = i.tick AND e.seq = i.seq ORDER BY i.island_id",
+        )?;
+        assert_eq!(
+            interactions.len(),
+            2,
+            "equal local event sequences must both survive"
+        );
+        for (island, row) in interactions.iter().enumerate() {
+            assert_eq!(row.get_typed::<i64>(0)?, i64::try_from(island)?);
+            assert_eq!(row.get_typed::<f64>(1)?, island as f64 + 0.5);
+            assert_eq!(row.get_typed::<f64>(2)?, island as f64);
+        }
+        for error in [
+            reader.recent_interactions(10).unwrap_err(),
+            reader.load_interactions_window(1, 2).unwrap_err(),
+            reader
+                .load_interaction_graph(
+                    InteractionGraphSelection::RecentPage,
+                    InteractionGraphBudget::default(),
+                )
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    error,
+                    StorageError::InvalidData {
+                        context: "interactions.island_scope",
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+        }
         reader.close()?;
         Ok(())
     }
@@ -27687,7 +27822,21 @@ mod tests {
             .query_row("SELECT genome_json, genome_digest, provenance_json FROM genomes")?;
         let narrative_before =
             connection.query_row("SELECT human_text, metric, magnitude FROM run_events")?;
+        connection.execute_with_params(
+            "INSERT INTO interactions (run_id, tick, seq, actor_agent_uid,
+                target_agent_uid, kind, value, payload_json)
+             VALUES (?1, 1, 0, 7, 8, 'combat', 0.5, '{\"damage\":0.5}')",
+            &[sqlite_run_id(run)],
+        )?;
         install_scriptbots_schema(&connection)?;
+        let interaction =
+            connection.query_row("SELECT island_id, value, payload_json FROM interactions")?;
+        assert_eq!(interaction.get_typed::<i64>(0)?, 0);
+        assert_eq!(
+            interaction.get_typed::<f64>(1)?.to_bits(),
+            0.5_f64.to_bits()
+        );
+        assert_eq!(interaction.get_typed::<String>(2)?, "{\"damage\":0.5}");
         let genome = connection.query_row(
             "SELECT genome_json, genome_digest, provenance_json, island_id FROM genomes",
         )?;
@@ -27744,7 +27893,7 @@ mod tests {
     #[test]
     fn pre_v18_ambiguous_island_rows_refuse_before_any_migration_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
-        for narrative in [false, true] {
+        for row_kind in ["genomes", "run_events", "interactions"] {
             for metadata in [false, true] {
                 let connection = Connection::open(":memory:")?;
                 scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_V17_VERSION)
@@ -27767,7 +27916,7 @@ mod tests {
                 }
                 // An old archipelago with no unscoped rows is unambiguous for this migration.
                 refuse_ambiguous_island_attribution_migration(&connection)?;
-                let preserved_query = if narrative {
+                let preserved_query = if row_kind == "run_events" {
                     connection.execute_with_params(
                         "INSERT INTO run_events (run_id, tick, kind, severity, magnitude,
                             window_start, window_end, metric, before_value, after_value, score,
@@ -27777,7 +27926,7 @@ mod tests {
                         &[sqlite_run_id(run)],
                     )?;
                     "SELECT human_text FROM run_events"
-                } else {
+                } else if row_kind == "genomes" {
                     connection.execute_with_params(
                         "INSERT INTO genomes (run_id, genome_id, agent_uid, created_at_tick,
                             brain_kind, genome_json, genome_digest, provenance_json)
@@ -27785,6 +27934,14 @@ mod tests {
                         &[sqlite_run_id(run)],
                     )?;
                     "SELECT genome_digest FROM genomes"
+                } else {
+                    connection.execute_with_params(
+                        "INSERT INTO interactions (run_id, tick, seq, actor_agent_uid,
+                            target_agent_uid, kind, value, payload_json)
+                         VALUES (?1, 1, 0, 7, 8, 'combat', 0.5, '{\"island\":\"unknown\"}')",
+                        &[sqlite_run_id(run)],
+                    )?;
+                    "SELECT payload_json FROM interactions"
                 };
                 let payload: String = connection.query_row(preserved_query)?.get_typed(0)?;
                 let schema = read_schema_objects(&connection)?;
@@ -27801,7 +27958,7 @@ mod tests {
                             ..
                         }
                     ),
-                    "narrative={narrative}, metadata={metadata}: {error}"
+                    "row_kind={row_kind}, metadata={metadata}: {error}"
                 );
                 assert_eq!(read_schema_objects(&connection)?, schema);
                 assert_eq!(
@@ -27826,6 +27983,76 @@ mod tests {
                 connection.close()?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pre_v18_pending_island_genomes_refuse_before_schema_or_payload_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_V17_VERSION).run(&connection)?;
+        let run = RunId::new(0x181b);
+        register_bare_run(&connection, run)?;
+        let mut prepared = PreparedPersistenceBatch::from_batch(&sample_batch(1, 1.0))?;
+        prepared.storage.ticks[0].island_id = 1;
+        prepared.storage.genomes.push(GenomeRow {
+            genome_id: "agent:7:tick:0".to_owned(),
+            agent_uid: Some(7),
+            created_at_tick: 0,
+            brain_kind: "mlp".to_owned(),
+            genome_json: "{}".to_owned(),
+            genome_digest: "unknown".to_owned(),
+            provenance_json: "{}".to_owned(),
+            island_id: 1,
+        });
+        let mut payload = serde_json::to_value(OutboxPayload {
+            version: OUTBOX_PAYLOAD_VERSION,
+            run_id: run,
+            tick: 1,
+            storage: prepared.storage,
+        })?;
+        payload["storage"]["genomes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("island_id");
+        let payload = serde_json::to_string(&payload)?;
+        connection.execute_with_params(
+            "INSERT INTO storage_outbox (run_id, batch_id, payload) VALUES (?1, 1, ?2)",
+            &[sqlite_run_id(run), payload.as_str().into()],
+        )?;
+        let schema = read_schema_objects(&connection)?;
+        let error = install_scriptbots_schema(&connection).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                StorageError::InvalidData {
+                    context: "storage.migration.island_attribution",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(read_schema_objects(&connection)?, schema);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version")?
+                .get_typed::<i64>(0)?,
+            SCRIPTBOTS_SCHEMA_V17_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT payload FROM storage_outbox")?
+                .get_typed::<String>(0)?,
+            payload
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM tick_summaries")?
+                .get_typed::<i64>(0)?,
+            0,
+            "pending payload is the sole island evidence"
+        );
+        connection.close()?;
         Ok(())
     }
 
@@ -28420,10 +28647,10 @@ mod tests {
     /// Every table a post-V12 migration rebuilt, so the V12 fixture must restore all of them.
     ///
     /// V15 rebuilt seven per-tick tables, V16 rebuilt `islands` and `migrations`, and V18
-    /// rebuilt `run_events` and `genomes`. A
+    /// rebuilt `run_events`, `genomes`, and `interactions`. A
     /// downgrade that reverted only one migration's worth would leave a database that is not
     /// V12 and would be asserted to be.
-    const POST_V12_REBUILT_TABLES: [&str; 11] = [
+    const POST_V12_REBUILT_TABLES: [&str; 12] = [
         "tick_summaries",
         "metrics",
         "events",
@@ -28435,6 +28662,7 @@ mod tests {
         "migrations",
         "run_events",
         "genomes",
+        "interactions",
     ];
 
     /// The per-tick tables V15 partitions by `island_id`, in migration order.

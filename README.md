@@ -448,8 +448,9 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
    `rng_seed` and `persistence_interval=1`. Islands step in ascending order with separate
    derived seeds; the inner Rayon pool defaults to one thread and honors `--threads`.
    Each complete tick is atomically applied and flushed before the next tick begins.
-   Genomes and narrative records retain island IDs; genome read APIs require an explicit
-   island, and narrative search results include it in each event identity.
+   Genomes, narrative records, and interaction edges retain island IDs; genome read APIs
+   require an explicit island, and narrative search results include it in each event identity.
+   Existing single-population interaction graph readers refuse multi-island runs.
    This mode currently has no migration, scheduled interventions, bootstrap, or host-session
    checkpoint resume. The JSON result names those limits and the observed durability watermarks.
    The manifest's `archipelago` extension records all island configs and the common root seed;

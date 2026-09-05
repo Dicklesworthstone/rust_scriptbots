@@ -138,7 +138,7 @@ fn recorded_archipelago_cli_persists_every_island_and_tick()
     if let Ok(expected) = std::env::var("SCRIPTBOTS_EXPECTED_COMMIT") {
         assert_eq!(result["source"].as_str(), Some(expected.as_str()));
     }
-    let islands = reader.islands()?;
+    let islands = reader.archipelago_islands()?;
     assert_eq!(islands.len(), 3);
     for island in &islands {
         let history = reader.island_history(island.island_id)?;
