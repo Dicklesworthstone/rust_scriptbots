@@ -9,6 +9,7 @@ blake3 = { workspace = true }
 fsqlite = { workspace = true }
 libc = { workspace = true }
 postcard = { workspace = true }
+rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -102,7 +102,7 @@ fn eventful_cadence_world() -> WorldState {
         spike_energy_cost: 0.0,
         spike_growth_rate: 1.0,
         spike_min_length: 0.1,
-        spike_alignment_cosine: 0.0,
+        spike_alignment_cosine: 0.5,
         spike_speed_damage_bonus: 0.0,
         spike_length_damage_bonus: 0.0,
         carnivore_threshold: 0.5,
@@ -323,7 +323,9 @@ fn resolve_authority_submission(
         thread::sleep(Duration::from_millis(1));
     }
     panic!(
-        "durable command authority did not resolve within {WORKER_RETRY_LIMIT} nonblocking polls"
+        "durable command authority did not resolve within {WORKER_RETRY_LIMIT} nonblocking polls; \
+         envelope={envelope:?}; snapshot={:?}",
+        core.latest_snapshot()
     );
 }
 
@@ -449,17 +451,18 @@ fn wait_channel_command_durable(
 ) -> CommandStatus {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(status) = port
+        let observed = port
             .command_status(command_id)
-            .expect("channel command-status lookup")
+            .expect("channel command-status lookup");
+        if let Some(status) = &observed
             && !matches!(status.application(), ApplicationState::Admitted)
             && status.journal() == &JournalState::Durable
         {
-            return status;
+            return status.clone();
         }
         assert!(
             Instant::now() < deadline,
-            "channel command {command_id:?} did not become durable"
+            "channel command {command_id:?} did not become durable; last status={observed:?}"
         );
         thread::sleep(Duration::from_millis(1));
     }

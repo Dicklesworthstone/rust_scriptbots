@@ -672,7 +672,7 @@ enum HostCommandPostcardV1 {
     Resume,
     SetSpeedBits(u32),
     Step,
-    UpdateConfig(Box<ScriptBotsConfig>),
+    UpdateConfig(#[serde(with = "config_command_wire")] Box<ScriptBotsConfig>),
     Shutdown,
     // The durable discriminant order is append-only. New command kinds belong
     // after the original six variants so existing V1 archives remain decodable.
@@ -787,7 +787,7 @@ enum HostCommandPostcardRefV1<'a> {
     Resume,
     SetSpeedBits(u32),
     Step,
-    UpdateConfig(&'a ScriptBotsConfig),
+    UpdateConfig(#[serde(serialize_with = "config_command_wire::serialize")] &'a ScriptBotsConfig),
     Shutdown,
     UpdateSelection(&'a SelectionUpdate),
     AdjustAgentMutationRates {
@@ -850,6 +850,83 @@ impl<'a> HostCommandPostcardRefV1<'a> {
                 origin_uid: origin_uid.get(),
             },
         }
+    }
+}
+
+// Configuration has conditionally omitted fields and nested JSON-oriented types.
+// Encode it as a named MessagePack map inside the postcard byte sequence. Unlike
+// JSON, MessagePack preserves non-finite floats in rejected command evidence.
+// Stream both sizing and encoding so the outer authority permit still precedes
+// any encoded-payload allocation. Scientific config/digest serialization is unchanged.
+mod config_command_wire {
+    use super::ScriptBotsConfig;
+    use serde::{Deserialize, Serializer, ser::SerializeSeq};
+    use std::io::{self, Write};
+
+    struct ByteSequence<S> {
+        sequence: Option<S>,
+        len: usize,
+    }
+
+    impl<S: SerializeSeq> Write for ByteSequence<S> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let len = self
+                .len
+                .checked_add(bytes.len())
+                .ok_or_else(|| io::Error::other("configuration wire length overflow"))?;
+            if let Some(sequence) = &mut self.sequence {
+                for byte in bytes {
+                    sequence
+                        .serialize_element(byte)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                }
+            }
+            self.len = len;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        config: &ScriptBotsConfig,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut counter = ByteSequence::<S::SerializeSeq> {
+            sequence: None,
+            len: 0,
+        };
+        rmp_serde::encode::write_named(&mut counter, config).map_err(serde::ser::Error::custom)?;
+        let mut writer = ByteSequence {
+            sequence: Some(serializer.serialize_seq(Some(counter.len))?),
+            len: 0,
+        };
+        rmp_serde::encode::write_named(&mut writer, config).map_err(serde::ser::Error::custom)?;
+        if writer.len != counter.len {
+            return Err(serde::ser::Error::custom("configuration wire size changed"));
+        }
+        writer
+            .sequence
+            .ok_or_else(|| {
+                <S::Error as serde::ser::Error>::custom("configuration wire sequence missing")
+            })?
+            .end()
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Box<ScriptBotsConfig>, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        let mut input = bytes.as_slice();
+        let config = rmp_serde::from_read(&mut input).map_err(serde::de::Error::custom)?;
+        if !input.is_empty() {
+            return Err(serde::de::Error::custom(
+                "trailing configuration wire bytes",
+            ));
+        }
+        Ok(config)
     }
 }
 
@@ -4860,6 +4937,75 @@ mod tests {
             )
             .expect("encode original rejected command")
         );
+    }
+
+    #[test]
+    fn configuration_command_wire_round_trips_optional_fields_and_rejects_damage() {
+        let default = ScriptBotsConfig::default();
+        let configured = ScriptBotsConfig {
+            archive_enabled: true,
+            archive_interval: 17,
+            archive_min_lifetime_ticks: 3,
+            archive_max_cells: 256,
+            archive_max_bytes: 1 << 20,
+            interaction_event_tick_stride: 7,
+            ..default.clone()
+        };
+        assert_ne!(
+            default, configured,
+            "the codec matrix must vary its payload"
+        );
+        for config in [default, configured] {
+            let envelope = CommandEnvelope::new(
+                CommandId::new(0xc0f1),
+                HostCommand::UpdateConfig(Box::new(config)),
+            );
+            let encoded = encode_command_envelope_postcard_hex("config test", &envelope)
+                .expect("encode borrowed configuration envelope");
+            assert_eq!(
+                encoded,
+                encode_postcard_hex(
+                    "config test",
+                    &CommandEnvelopePostcardV1::from_runtime(&envelope),
+                )
+                .expect("encode owned configuration envelope"),
+                "owned lifecycle and borrowed authority encoders must agree"
+            );
+            assert_eq!(
+                decode_command_envelope_postcard_hex("config test", &encoded)
+                    .expect("decode configuration with omitted or present archive fields"),
+                envelope
+            );
+            assert!(
+                decode_command_envelope_postcard_hex("config test", &encoded[..encoded.len() - 2])
+                    .is_err(),
+                "truncating the configuration must fail decoding"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_command_wire_preserves_rejected_float_bits() {
+        let nan_bits = 0x7fc0_37a1;
+        let command = HostCommand::UpdateConfig(Box::new(ScriptBotsConfig {
+            spike_damage: f32::from_bits(nan_bits),
+            spike_energy_cost: f32::NEG_INFINITY,
+            food_growth_rate: -0.0,
+            ..ScriptBotsConfig::default()
+        }));
+        let encoded = encode_host_command_postcard_hex("config test", &command)
+            .expect("rejected configuration remains encodable evidence");
+        let decoded = decode_host_command_postcard_hex("config test", &encoded)
+            .expect("decode rejected configuration evidence");
+        let HostCommand::UpdateConfig(config) = decoded else {
+            panic!("configuration command changed durable kind");
+        };
+        assert_eq!(config.spike_damage.to_bits(), nan_bits);
+        assert_eq!(
+            config.spike_energy_cost.to_bits(),
+            f32::NEG_INFINITY.to_bits()
+        );
+        assert_eq!(config.food_growth_rate.to_bits(), (-0.0_f32).to_bits());
     }
 
     #[test]
