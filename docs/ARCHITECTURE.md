@@ -79,12 +79,11 @@ Source of truth: `crates/scriptbots-core/src/lib.rs` (`WorldState`, the `stage_*
   HTTP/MCP servers (`crates/scriptbots-app/src/servers.rs`), and the TUI loop (`crates/scriptbots-app/src/terminal/mod.rs`)
   lock this mutex directly. Closed bead `bd-2z0.4.9` completed a vital transitional milestone by
   migrating control commands to use typed, validated envelopes (`CommandEnvelope`, `CommandId`) and
-  eliminating discarded receipts across Bevy, CLI, REST, and MCP. [Correction 2026-09-03 —
-  `bd-docs-status-truth-sweep-v2iw`: the structural migration this paragraph called open is
-  further along than stated: `bd-k7nq` is CLOSED — `ControlHandle` now reaches `HostClient`
-  (server-only mode, `ControlService` seam, stream resume/gap, real E2E). Remaining
-  transitional surfaces: server world-ownership transfer (`bd-pcfj`, in progress) and the
-  frontend migration chain (`bd-88yj`, in progress).]
+  eliminating discarded receipts across Bevy, CLI, REST, and MCP. The September 3 correction
+  inferred migration from closed `bd-k7nq`; source inspection on September 5 contradicts it:
+  `ControlHandle` still stores `SharedWorld` and `with_world` locks it. Host ownership and
+  frontend cutover remain with `bd-pcfj` and `bd-88yj`. The closed preparation bead is not
+  evidence that those production callers were migrated.
 
 The runtime control surface (`crates/scriptbots-runtime/src/lib.rs`):
 
@@ -103,17 +102,16 @@ The runtime control surface (`crates/scriptbots-runtime/src/lib.rs`):
 
 - **[Target Invariant] Ownership is exclusive.** Do not introduce new paths holding `&mut WorldState`
   outside `HostCore`. Transitional paths must lock `SharedWorld` strictly within bounded helpers and
-  prepare for migration to `HostClient` (ControlHandle slice completed in `bd-k7nq`; the
-  remaining transitional paths are tracked under `bd-pcfj`/`bd-88yj` — corrected 2026-09-03,
-  `bd-docs-status-truth-sweep-v2iw`).
+  prepare for migration to `HostClient`; `ControlHandle` is among those transitional paths
+  tracked under `bd-pcfj`/`bd-88yj`.
 - **Commands are validated, not trusted.** New control operations must add a `HostCommand` variant and
   implement validation; they must never bypass the `CommandEnvelope` or discard receipts (`bd-2z0.4.9`).
 
 Source of truth: `crates/scriptbots-runtime/src/lib.rs` (`HostCore`, `HostCommand`, `HostEventKind`,
 `CommandEnvelope`, `CommandId`); `crates/scriptbots-app/src/lib.rs` (`SharedWorld`);
 `crates/scriptbots-app/src/control.rs` (`ControlHandle`); transitional receipt fixes under `bd-2z0.4.9`;
-HostClient migration: ControlHandle slice closed in `bd-k7nq`; remaining transfer under `bd-pcfj`/`bd-88yj`
-(corrected 2026-09-03, `bd-docs-status-truth-sweep-v2iw`).
+HostClient migration: preparation in closed `bd-k7nq`; actual ownership transfer under
+`bd-pcfj`/`bd-88yj` (source correction, 2026-09-05).
 
 ---
 
@@ -149,14 +147,17 @@ A brain has two parts, and both are science state:
   next output depends on its last, so two brains with identical genomes but different evaluator
   state are **different brains** that diverge on the very next tick.
 
-Families implement the `BrainRunner` trait (`scriptbots-core`), adapted from the `Brain` trait in
-`scriptbots-brain`. Key hooks:
+Versioned evolutionary families implement `BrainFamilyCodec` and `BrainEvaluator` in
+`scriptbots-core`. Existing `Brain` implementations in `scriptbots-brain` also have legacy
+`BrainRunner` adapters. These contracts have different admission and checkpoint capabilities:
 
-- `clone_runner` — duplicate including all evolved parameters. `Ok(None)` means the family is
-  *non-heritable* and reproduction would spawn a fresh brain instead of the parent's.
-- `mutate` — perturb in place. The default does nothing and returns `Ok(())`.
-- `state_digest` — a stable hash of genome **and** evaluator state, the hook `WorldDigestV1` uses to
-  see inside a brain (§6). One-way: it can prove a restored brain identical but cannot rebuild one.
+- Legacy `clone_runner` may decline copying; its default mutation is a no-op. Those permissive
+  hooks are insufficient for versioned founder admission.
+- `BrainFamilyAdapter` creates, clones, mutates and crosses validated genome material while
+  preserving caller-supplied provenance. Evaluator state has a separate envelope and explicit
+  offspring inheritance policy.
+- `BrainEvaluator::checkpoint_state` captures future-affecting dynamic state. Reconstructing
+  through the family validates the genome/state pairing; a digest alone cannot reconstruct it.
 - `BrainFamilyCodec::adapter_identity` — a stable versioned BLAKE3 semantic attestation owned by
   each protocol family. It identifies construction and evaluation behavior independently from the
   family/schema/codec tuple; it is not derived from addresses, Rust type names, compiler output,
@@ -164,16 +165,12 @@ Families implement the `BrainRunner` trait (`scriptbots-core`), adapted from the
 
 **Rules.**
 
-- **Heredity is copy AND vary, and it is proven, not declared.** `install_brains`
-  (`scriptbots-app`) admits a family to the *founding population* only after probing that it both
-  duplicates itself and changes under mutation. A family that clones but no-ops its `mutate` (the
-  historical `ml.placeholder`) is withheld — a population that cannot evolve is not science, and
-  the trait's permissive defaults make such families *invisible* unless the registry proves the
-  contract. Non-heritable families stay registered for explicit selection but never found a
-  population.
-- **A brain's digest must cover its state, not just its family name.** Anything that compares runs
-  must go through `state_digest`, never through the family label — the label is identical across a
-  million ticks of divergent evolution.
+- **Heredity needs behavioral evidence.** `install_brains` admits versioned protocol families;
+  registry-derived heredity tests verify their declared loci and mutation behavior. The legacy
+  Neuroflow adapter is withheld from mixed founders and remains explicitly selectable. The ML
+  sensor-copy placeholder is not installed. Registration is not a mutation-quality probe.
+- **A brain's digest covers parameters and dynamic state.** Use the scientific digest/checkpoint
+  APIs rather than a family label; the label alone stays unchanged as evolution proceeds.
 
 Source of truth: `crates/scriptbots-core/src/lib.rs` (`BrainRunner`, `BrainBinding`,
 `install_brains` in `scriptbots-app`); `crates/scriptbots-brain/src/lib.rs` (`Brain`, the MLP/DWRAON/Assembly
@@ -366,9 +363,9 @@ Frontends are simulation consumers, never authors of core science state. They re
   still hold a `SharedWorld` mutex bridge to drive ticks and query state directly.
 - **[Target State (`bd-k7nq` + `bd-pcfj`/`bd-88yj`)]**: All frontends, including the TUI and headless server runners,
   interact strictly via `HostClient` over asynchronous channels. No frontend crate will have link or
-  runtime access to `WorldState` or `SharedWorld`. [Correction 2026-09-03 —
-  `bd-docs-status-truth-sweep-v2iw`: the `ControlHandle` leg of this target is complete
-  (`bd-k7nq` closed); the TUI/server-runner legs remain open under `bd-pcfj`/`bd-88yj`.]
+  runtime access to `WorldState` or `SharedWorld`. `ControlHandle` still owns the transitional
+  mutex, and Bevy still owns a separate simulation worker. Their cutover remains open under
+  `bd-pcfj`/`bd-88yj` and the frontend migration beads.
 
 Crate responsibilities:
 
@@ -836,7 +833,7 @@ guard or test, or an explicit open tracking bead.
 | :--- | :--- | :--- | :--- | :--- |
 | **Core Science Purity** (no clock, network, or filesystem in ticks) | `scriptbots-core` | `WorldState::step_outcome` (`crates/scriptbots-core/src/lib.rs`) | `tests/world_determinism.rs` | Enforced; closed in `bd-16g.11` |
 | **Deterministic Stage Order** (21 ordered simulation stages) | `scriptbots-core` | `WorldState::step_outcome` (`crates/scriptbots-core/src/lib.rs`) | `tests/world_digest_v1.rs` golden digest | Enforced; closed in `bd-3n7p` |
-| **Exclusive Simulation Ownership** (HostCore sole owner) | `scriptbots-runtime` | `HostCore` (`crates/scriptbots-runtime/src/lib.rs`) | Transitional `SharedWorld` in `crates/scriptbots-app/src/lib.rs` | ControlHandle slice closed in `bd-k7nq`; TUI/server ownership transfer open: `bd-pcfj`/`bd-88yj` (corrected 2026-09-03) |
+| **Exclusive Simulation Ownership** (HostCore sole owner) | `scriptbots-runtime` | `HostCore` (`crates/scriptbots-runtime/src/lib.rs`) | Transitional `SharedWorld` in `crates/scriptbots-app/src/lib.rs` and `ControlHandle` | Production ownership transfer open: `bd-pcfj`/`bd-88yj`; closed preparation is insufficient (corrected 2026-09-05) |
 | **Command Receipt Accounting** (no discarded receipts) | `scriptbots-app` | `CommandEnvelope`, `CommandId` (`crates/scriptbots-runtime/src/lib.rs`) | `no_control_command_discards_its_receipt` (`crates/scriptbots-app/src/servers.rs`) | Closed in `bd-2z0.4.9`; workspace guard in `bd-d6gv` |
 | **WASM Dependency Purity** (no native franken in WASM graph) | `scriptbots-web` | `crates/scriptbots-web/Cargo.toml` | `ci/check_wasm_graph.sh` | Enforced in CI; purity slice closed in `bd-2z0.12.3`, which has since REOPENED for the broader browser-frontend deliverable (guard itself stays enforced; corrected 2026-09-03) |
 | **Brain Heredity Gate** (copy AND vary proven before founding) | `scriptbots-app` | `install_brains` (`crates/scriptbots-app/src/lib.rs`) | `tests/heredity_gate.rs` | Enforced; closed in `bd-2z0.13.2` |
@@ -852,12 +849,13 @@ guard or test, or an explicit open tracking bead.
 
 - **One shared working tree, many agents.** Reserve files (MCP agent-mail
   `file_reservation_paths`, exclusive) before editing; another agent's uncommitted changes appear in
-  your `git status`, so stage only your own files (`git add <path>`, never `git add -A`) and never
-  commit someone else's WIP. Coordinate handoffs by mail.
+  your `git status`, so use `scripts/shared_tree_commit.py` to review and commit exact owned
+  paths. Never commit someone else's WIP.
 - **Track work in beads** via the `br` CLI (not `bd`). Mark a bead in-progress when you start, and
   close it with evidence when it lands. `bv`'s robot triage can read a stale merge artifact — verify
   its picks against `br` before acting.
-- **Builds offload via RCH**; the canonical target is `x86_64-unknown-linux-gnu`. See
-  `AGENTS.md` for the toolchain and the offload/lock protocol.
+- **Acceptance executes through pinned DSR profiles** with retained source-bound evidence.
+  RCH runs are diagnostic. See `README.md`, `AGENTS.md`, and `ci/dsr_verify.yaml` for the
+  correctness lanes; performance requires the checked-in golden's exact DSR machine class.
 - **Never lose a feature to a refactor, and never make a test pass by weakening what it proves.** A
   green suite that no longer certifies the thing it names is worse than a red one.
