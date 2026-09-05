@@ -6332,6 +6332,15 @@ impl Palette {
         Style::default().fg(self.diet_color(diet))
     }
 
+    /// The non-colour diet channel shared by flat glyphs and canvas body cells.
+    const fn diet_modifier(diet: DietClass) -> Modifier {
+        match diet {
+            DietClass::Carnivore => Modifier::BOLD,
+            DietClass::Herbivore => Modifier::UNDERLINED,
+            DietClass::Omnivore => Modifier::empty(),
+        }
+    }
+
     fn population_spark_style(&self) -> Style {
         Style::default().fg(self.theme().population_spark)
     }
@@ -6760,16 +6769,9 @@ impl Palette {
             }
         };
 
-        let mut style = base.fg(self.diet_color(class));
-        match class {
-            DietClass::Carnivore => {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            DietClass::Herbivore => {
-                style = style.add_modifier(Modifier::UNDERLINED);
-            }
-            DietClass::Omnivore => {}
-        }
+        let mut style = base
+            .fg(self.diet_color(class))
+            .add_modifier(Self::diet_modifier(class));
         if occupancy.boosted || total > 1 {
             style = style.add_modifier(Modifier::BOLD);
         }
@@ -7514,6 +7516,7 @@ impl MapWidget<'_> {
             Color::Rgb(q[0], q[1], q[2])
         };
 
+        let mode = canvas.mode();
         let frame = canvas.composite();
         for cy in 0..frame.height_cells {
             for cx in 0..frame.width_cells {
@@ -7528,9 +7531,23 @@ impl MapWidget<'_> {
                 cell.set_style(
                     Style::default()
                         .fg(to_color(composed.fg))
-                        .bg(to_color(composed.bg)),
+                        .bg(to_color(composed.bg))
+                        .remove_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 );
             }
+        }
+
+        // Modifiers belong to terminal cells, not individual braille dots. Mark
+        // cells containing visible bodies; whiskers and offscreen agents must
+        // not label a neighbouring cell. Mixed cells retain both diet markers,
+        // independent of agent order, while glyphs, colours and headings remain
+        // the compositor's output. The blit above clears last frame's markers.
+        for agent in &ctx.snapshot.agents {
+            let Some((sx, sy)) = agent_dot(agent) else {
+                continue;
+            };
+            let cell = &mut buf[(area.x + sx / mode.dots_x(), area.y + sy / mode.dots_y())];
+            cell.set_style(Style::default().add_modifier(Palette::diet_modifier(agent.diet)));
         }
     }
 }
@@ -9369,10 +9386,7 @@ mod tests {
         assert_eq!(seen.len(), kinds.len(), "every terrain kind needs a glyph");
     }
 
-    /// KNOWN GAP, pinned so it cannot be quietly forgotten or wrongly assumed
-    /// fixed.
-    ///
-    /// Every lone agent conveys diet by non-colour style modifier channel (bd-q2w9).
+    /// A lone flat-map agent conveys diet by non-colour style modifiers (bd-q2w9).
     ///
     /// Formerly `a_lone_agent_conveys_diet_by_colour_alone_bd_xg82_known_gap`, which
     /// verified that heading arrows were the same glyph across diet classes.
@@ -9429,6 +9443,146 @@ mod tests {
         assert_ne!(styles[0].add_modifier, styles[1].add_modifier);
         assert_ne!(styles[1].add_modifier, styles[2].add_modifier);
         assert_ne!(styles[0].add_modifier, styles[2].add_modifier);
+    }
+
+    #[test]
+    fn canvas_body_cells_convey_diet_at_every_density_and_colour_depth() {
+        let terrain = canvas_test_terrain();
+        for mode in [
+            SubCellMode::Braille,
+            SubCellMode::Quadrant,
+            SubCellMode::HalfBlock,
+        ] {
+            for depth in [
+                ColorDepth::TrueColor,
+                ColorDepth::Ansi256,
+                ColorDepth::Ansi16,
+            ] {
+                let mut glyph = None;
+                for (diet, expected) in [
+                    (DietClass::Herbivore, Modifier::UNDERLINED),
+                    (DietClass::Omnivore, Modifier::empty()),
+                    (DietClass::Carnivore, Modifier::BOLD),
+                ] {
+                    let snapshot = Snapshot {
+                        agents: vec![AgentViz {
+                            diet,
+                            ..canvas_test_agent(0.0, 0.0)
+                        }],
+                        ..Snapshot::default()
+                    };
+                    let buffer = render_canvas_frame_with(
+                        &snapshot,
+                        &terrain,
+                        (4, 2),
+                        canvas_test_day_night(),
+                        CanvasCapability {
+                            mode,
+                            depth: Some(depth),
+                        },
+                    );
+                    let body = &buffer[(0, 0)];
+                    assert_eq!(body.modifier, expected, "{mode:?}/{depth:?}/{diet:?}");
+                    assert_eq!(buffer[(3, 1)].modifier, Modifier::empty());
+                    if let Some(previous) = &glyph {
+                        assert_eq!(body.symbol(), previous, "diet must preserve heading glyphs");
+                    }
+                    glyph = Some(body.symbol().to_owned());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canvas_mixed_body_markers_are_order_independent_and_offscreen_bodies_are_absent() {
+        let terrain = canvas_test_terrain();
+        let mut snapshot = Snapshot {
+            agents: vec![
+                canvas_test_agent(0.0, 0.0),
+                AgentViz {
+                    diet: DietClass::Carnivore,
+                    ..canvas_test_agent(0.13, 0.13)
+                },
+            ],
+            ..Snapshot::default()
+        };
+        let first = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
+        assert_eq!(
+            first[(0, 0)].modifier,
+            Modifier::BOLD | Modifier::UNDERLINED
+        );
+        // The second body's whisker enters cell (1,0); it must not carry diet there.
+        assert_eq!(first[(1, 0)].modifier, Modifier::empty());
+        snapshot.agents.reverse();
+        let reversed = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
+        assert_eq!(first[(0, 0)].modifier, reversed[(0, 0)].modifier);
+
+        let viewport = CanvasViewport::new(2.0, (0.5, 0.5));
+        let offscreen = render_canvas_frame_viewport(
+            &snapshot,
+            &terrain,
+            (4, 2),
+            canvas_test_day_night(),
+            canvas_test_capability(),
+            viewport,
+        );
+        let empty = render_canvas_frame_viewport(
+            &Snapshot::default(),
+            &terrain,
+            (4, 2),
+            canvas_test_day_night(),
+            canvas_test_capability(),
+            viewport,
+        );
+        assert_eq!(
+            offscreen, empty,
+            "offscreen bodies must not leave any canvas evidence"
+        );
+    }
+
+    #[test]
+    fn canvas_repaint_clears_a_departed_agents_diet_marker() {
+        let terrain = canvas_test_terrain();
+        let palette = Palette::test_backend_evidence();
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buffer = Buffer::empty(area);
+        let mut scratch =
+            vec![CellOccupancy::default(); usize::from(area.width) * usize::from(area.height)];
+        let capability = canvas_test_capability();
+        let mut canvas = SubCellBuffer::new(area.width, area.height, capability.mode);
+        let mut density = Vec::new();
+        let occupied = Snapshot {
+            agents: vec![canvas_test_agent(0.0, 0.0)],
+            ..Snapshot::default()
+        };
+        let empty = Snapshot::default();
+        for (snapshot, expected) in [
+            (&occupied, Modifier::UNDERLINED),
+            (&empty, Modifier::empty()),
+        ] {
+            MapWidget {
+                snapshot,
+                terrain: &terrain,
+                palette: &palette,
+                scratch: &mut scratch,
+                stamp: 1,
+                canvas: Some(&mut canvas),
+                day_night: canvas_test_day_night(),
+                capability,
+                motion: MotionPolicy::Full,
+                density: &mut density,
+                viewport: CanvasViewport::new(1.0, (0.5, 0.5)),
+            }
+            .render(area, &mut buffer);
+            assert_eq!(buffer[(0, 0)].modifier, expected);
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .skip(1)
+                    .all(|cell| cell.modifier.is_empty())
+            );
+        }
     }
 
     /// Every event kind must be distinguishable with no colour at all.
