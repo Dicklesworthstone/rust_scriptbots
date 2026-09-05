@@ -1575,7 +1575,9 @@ fn test_map_elites_archive_persistence_roundtrip() {
     let mut storage = Storage::create_unattributed_file(path_str).expect("create storage");
     let run_id = storage.run_id().to_string();
 
-    // Submit a tick batch to verify standard tables coexist with archive tables
+    // Standard tables coexist with archive tables, but demographic summaries
+    // must still agree with their origin/death rows. Preserve both refusals
+    // before admitting this archive-only fixture's tick with no demographics.
     let tick_summary = TickSummary {
         tick: Tick(100),
         agent_count: 5,
@@ -1587,21 +1589,38 @@ fn test_map_elites_archive_persistence_roundtrip() {
         max_age: 150,
         spike_hits: 3,
     };
-    storage
-        .persist(&PersistenceBatch {
-            summary: tick_summary,
-            epoch: 1,
-            closed: false,
-            metrics: Vec::new(),
-            events: Vec::new(),
-            agents: Vec::new(),
-            births: Vec::new(),
-            deaths: Vec::new(),
-            replay_events: Vec::new(),
-            narrative_events: Vec::new(),
-            genomes: Vec::new(),
+    let mut batch = PersistenceBatch {
+        summary: tick_summary,
+        epoch: 1,
+        closed: false,
+        metrics: Vec::new(),
+        events: Vec::new(),
+        agents: Vec::new(),
+        births: Vec::new(),
+        deaths: Vec::new(),
+        replay_events: Vec::new(),
+        narrative_events: Vec::new(),
+        genomes: Vec::new(),
+    };
+    assert!(matches!(
+        storage.persist(&batch),
+        Err(scriptbots_storage::StorageError::InvalidData {
+            context: "ticks.births",
+            ..
         })
-        .expect("write tick batch");
+    ));
+    batch.summary.births = batch.births.len();
+    assert!(matches!(
+        storage.persist(&batch),
+        Err(scriptbots_storage::StorageError::InvalidData {
+            context: "ticks.deaths",
+            ..
+        })
+    ));
+    batch.summary.deaths = batch.deaths.len();
+    storage
+        .persist(&batch)
+        .expect("write consistent tick batch");
 
     // Build a behavioral archive
     let space = BehaviorSpaceV0::new(
