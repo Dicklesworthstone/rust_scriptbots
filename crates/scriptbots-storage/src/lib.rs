@@ -25202,10 +25202,18 @@ mod tests {
         let failure = Storage::flush_attempt(connection, ":memory:", storage.run_id, &buffer, &[])
             .expect_err("the final row's real CHECK constraint must fail");
         assert_eq!(failure.commit_state, FailureCommitState::RolledBack);
-        assert!(matches!(
-            failure.source,
-            FrankenError::CheckViolation { .. }
-        ));
+        // The pinned engine reports SQL CHECK failures through its VDBE halt
+        // error, rather than constructing the public CheckViolation variant.
+        assert!(
+            matches!(
+                &failure.source,
+                FrankenError::Internal(detail)
+                    if detail.starts_with("VDBE halted with code 19: CHECK constraint failed:")
+                        && detail.contains("scope <> ''")
+            ),
+            "expected the empty scope CHECK failure, observed {:?}",
+            failure.source
+        );
         let count_new_rows = || -> Result<i64, FrankenError> {
             connection
                 .query_row_with_params(
@@ -25232,6 +25240,14 @@ mod tests {
         let failure = Storage::flush_attempt(connection, ":memory:", storage.run_id, &buffer, &[])
             .expect_err("narrative inputs must never become replaceable");
         assert_eq!(failure.commit_state, FailureCommitState::RolledBack);
+        assert!(
+            failure
+                .source
+                .to_string()
+                .contains("UNIQUE constraint failed: replay_events."),
+            "expected the narrative identity constraint, observed {:?}",
+            failure.source
+        );
         assert_eq!(count_new_rows()?, 0);
         assert_eq!(read_rows()?, expected);
         storage.close()?;
