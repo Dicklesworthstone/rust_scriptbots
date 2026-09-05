@@ -1,4 +1,4 @@
-# Reality Check — rust_scriptbots — refreshed 2026-09-04
+# Reality Check — rust_scriptbots — execution refreshed 2026-09-05
 
 ## Execution TODO — started 2026-09-05
 
@@ -6,9 +6,17 @@ This checklist is the operator-requested working memory for the eight added task
 Its consumers are the operator and implementing agent; Beads remains the claim and
 dependency authority. It retires as an active checklist when those tasks are
 implemented and verified. It earns no product-completion credit. No additional
-process machinery is needed; the next useful output is working interaction analysis.
+process machinery is needed; these records do not substitute for working simulation
+and analysis.
 
-- [ ] **bd-2z0.11.11 — interaction semantics [Currently In Progress], TurquoiseLake.**
+Delivery snapshot, 2026-09-05: five of the eight added beads are closed; three remain
+open. Actual clean DSR `combined-c5ac1a9-20260905-06` completed all 14 named correctness
+steps at `c5ac1a989444f48b0f5ff3d34f90a46cd6d2c85b`, with process exit zero, typed
+`pass`, and successful source/profile/command-log readback. This is focused Linux
+correctness evidence. Full workspace, performance and product-journey acceptance
+remain outstanding. The historical audit below retains its original source boundary.
+
+- [x] **bd-2z0.11.11 — interaction semantics, closed, TurquoiseLake.**
   Validate complete half-open windows versus newest pages; reject one-sided bounds;
   define zero limits; bound materialized input and graph work before loading;
   retain repeated-edge count and magnitude; reject invalid magnitudes; share selection
@@ -20,15 +28,17 @@ process machinery is needed; the next useful output is working interaction analy
     invalid magnitudes and unsupported parameters are rejected.
   - [x] Capture uncertainty, exact selected event identities, algorithm weighting and
     seeded sampling are exposed. Candidate implementation committed as `428d102`.
-  - [ ] Re-execute the final fixture additions through clean pinned DSR; inspect failures
+  - [x] Re-execute the final fixture additions through clean pinned DSR; inspect failures
     and original acceptance criteria before closing the implementation bead.
     DSR at `f98a819` executed all ten graph tests successfully; the overall lane
     failed later in the unrelated archive fixture. Fresh DSR at `3bb1fb4` again
     passed all ten (106.02 seconds); all 14 combined-lane steps subsequently passed.
     I prematurely closed this bead, then reopened it when review found the tested
     window had no event exactly at its exclusive end. Candidate `fe2271d` supplies
-    that discriminator and the independent row-cap control; fresh execution remains.
-- [ ] **bd-2z0.11.12 — real storage and CLI proof [Currently In Progress], TurquoiseLake.** Persist a hand-enumerated fixture
+    that discriminator and the independent row-cap control. Clean DSR at `c5ac1a9`
+    passed all ten graph tests (312.88 seconds), and the full combined lane completed
+    with typed pass. Re-closed only after the missing discriminator actually ran.
+- [x] **bd-2z0.11.12 — real storage and CLI proof, closed, TurquoiseLake.** Persist a hand-enumerated fixture
   with repeated/directed/boundary events and two runs; close and reopen it; exercise
   actual report/export processes; independently parse counts, weights and selection;
   test missing capture evidence, empty/reversed/one-sided windows, zero limits,
@@ -40,12 +50,24 @@ process machinery is needed; the next useful output is working interaction analy
   - [x] Persisted a third run with internally balanced counters contradicting actual
     edge rows; report and both export formats refused it in that DSR run.
   - [x] Claim companion proof after implementation closes. The implementation was
-    subsequently reopened for missing boundary evidence; both remain in progress.
-  - [ ] Finish clean DSR `combined-c5ac1a9-20260905-06` through the actual analytics
-    E2E wrapper: exclude an actual
-    end-tick event, reach the row cap with generous byte/work budgets, and require
-    each declared refusal cause. Retain expected/observed results and first failure.
-    Solo re-execution is not independent verification.
+    subsequently reopened for missing boundary evidence; both are now closed after
+    that evidence was supplied and executed.
+  - [x] Execute the final graph suite in clean DSR `combined-c5ac1a9-20260905-06`
+    through the actual analytics E2E wrapper: ten tests passed. Readback parsed 28
+    unique CLI records (10 successes, 18 expected refusals), all expectations true.
+    `[5,6)` selected only the two tick-5 rows, excluding the actual tick-6 event.
+    The isolated row-cap case returned `interaction_graph.max_rows` with generous
+    byte/work budgets. Real SQLite and subprocess outputs are retained on hz4 under
+    `/data/tmp/scriptbots-dsr-20260905-TmJwOJ/proofs/combined-c5ac1a9-20260905-06/tmp/.tmprfk6Be`.
+  - [x] Emit explicit per-pair count/magnitude residuals from all four saved exports.
+    The one-off external readback accepted all four with zero residuals and rejected
+    ten altered artifact/input expectations (changed expected row, dropped edge,
+    missing weight, swapped run and false completeness, in both formats). Records:
+    `/tmp/scriptbots-c5-graph-artifact-readback-20260905.jsonl`. These are artifact
+    checks; the actual CLI denominator remains 28 and the graph test count remains ten.
+  - [x] Require the complete combined lane's typed pass before closure. The paired
+    graph beads share these ten tests; they are counted once. Fresh solo review
+    is not independent verification.
   - [x] Replace the analytics E2E wrapper's ignored simulation failure, empty database
     and unconditional success with the actual pinned DSR graph lane. Full seeded
     simulation/report acceptance remains open under `bd-2z0.11.9`.
@@ -93,7 +115,7 @@ process machinery is needed; the next useful output is working interaction analy
   - [ ] Locate the checked-in golden's exact M4/macOS/toolchain machine class and
     run its pinned DSR comparison. No compatible host is available in this session;
     no performance command, fingerprint change or re-baseline was attempted.
-- [ ] **bd-2z0.13.8 — repair extension recipes [Currently In Progress], TurquoiseLake.** Reconcile exact Brain/registry APIs;
+- [x] **bd-2z0.13.8 — repair extension recipes, closed, TurquoiseLake.** Reconcile exact Brain/registry APIs;
   compile the literal custom-family recipe; normalize and execute the scenario;
   demonstrate actual host command application and projection; correct architecture
   claims at their source without removing extension topics.
@@ -117,7 +139,8 @@ process machinery is needed; the next useful output is working interaction analy
     explicitly selected by DSR; ordinary discovery does not execute it.
   - [x] Latest workspace all-target check passed diagnostically after mutation-test
     additions. The standalone checker now derives target-specific library, metadata
-    and transitive dependency paths from Cargo records; execute this final revision.
+    and transitive dependency paths from Cargo records; the final revision executed
+    successfully in the complete `c5ac1a9` DSR run.
   - [x] Fresh review found the custom recipe accepted another genome's recurrent
     checkpoint. Candidate `209d5d4` binds state to the core material hash, advances
     the state schema/codec and adapter identity, and resets offspring with the
@@ -130,10 +153,11 @@ process machinery is needed; the next useful output is working interaction analy
     prose. Candidate `c5ac1a9` emits parsed, versioned scientific records from all
     four literal programs. It retains measured food-cell comparisons, applied
     meteor cells/tick and actual command/journal/projection states.
-  - [ ] Finish the new combined run at `c5ac1a9`, including its eighth mutation:
-    a successful meteor process whose observation was redirected away from stdout
-    must fail the same acceptance predicate. No recipe closure before this passes.
-- [ ] **bd-2z0.13.10 — execute extension recipes.** Register/evaluate/mutate/reproduce
+  - [x] Finish the combined run at `c5ac1a9`, including its eighth mutation:
+    the meteor process exited zero after redirecting its observation to stderr,
+    and the same acceptance predicate rejected its empty stdout. All 14 lane steps
+    passed; the twelve standalone cases finished in 13.86 seconds.
+- [x] **bd-2z0.13.10 — execute extension recipes, closed, TurquoiseLake.** Register/evaluate/mutate/reproduce
   and checkpoint the documented family; execute both scheduled scenario effects;
   correlate host application, journal and projection; mutate the real recipe as the
   negative control; replace tests that only grep names or check disconnected strings.
@@ -143,10 +167,21 @@ process machinery is needed; the next useful output is working interaction analy
     method, missing founder installation, disabled genome/state binding, nonexistent
     CLI preset, unknown literal TOML key, omitted meteor step and admission
     substituted for application.
-  - [ ] Observe the additional missing-observation mutation and parse all four valid
-    scientific records at `c5ac1a9`; expected total is twelve distinct cases.
-  - [ ] Read the retained compiler diagnostics, scientific outputs and receipt
-    observations; claim and close only after the paired implementation passes.
+  - [x] Observe the additional missing-observation mutation and parse all four valid
+    scientific records at `c5ac1a9`: twelve unique source-bound cases, all expectations
+    observed. Four positives, two compiler refusals, five runtime refusals and one
+    successful process refused for missing observation. The ordinary suite's ignored
+    expensive test was explicitly selected and executed by the DSR mutation step.
+  - [x] Read actual compiler diagnostics and runtime outputs; the four positive saved
+    records match stdout exactly. Observed 16 bound custom founders, changed output
+    sequences, rejected foreign-genome state, both scenario patches, food-cell
+    differences of 0/64 before and 35/64 after drought application, 17 meteor cells,
+    and applied/volatile-journal/projection agreement with 14 visible agents and no
+    duplicate retry tick. Fixture on hz4:
+    `/data/tmp/scriptbots-dsr-20260905-TmJwOJ/proofs/combined-c5ac1a9-20260905-06/tmp/literal-recipes-caTyY0`.
+  - [x] Claim after the paired implementation closed, then close after fresh review
+    against the original criteria. These twelve cases support both recipe beads and
+    count once. This was solo re-verification, not an independent verifier.
 - [ ] **bd-2z0.13.9 — compose the Evolution Lab journey.** Reuse production startup,
   scene inspection, control receipts, durable history, checkpoint continuation,
   matched-seed experiment and report/bundle paths; bind each stage to predecessor
@@ -155,6 +190,7 @@ process machinery is needed; the next useful output is working interaction analy
   - [x] Inspect existing consumers and declarations. No canonical versioned product
     matrix exists yet; `bd-1bdd` owns it. Browser hardware coverage is a different
     matrix and cannot define release support. The manifest is not implemented.
+    Recorded the actual blocking dependency on `bd-1bdd`; no active cycle resulted.
   - [ ] Consume the owning product matrix without shrinking its required cells.
   - [ ] Join startup, inspection, applied/journaled controls, durable run, checkpoint,
     matched-seed comparison and report/bundle records by their actual identities.
@@ -180,6 +216,13 @@ process machinery is needed; the next useful output is working interaction analy
   negative tests; required compiler/lint/format checks; fresh self-review against the
   original bead; accurate status and evidence; reviewed exact-path commits and sync.
   No test weakening, fixture-as-live claims, or closure of unmet positive requirements.
+
+Work-block corrections retained: the premature graph closure was reopened and repaired;
+the `209d5d4` UBS scan was mistakenly run after its commit (the existing test-only panic
+finding was inspected, with no suppression). Subsequent code commits were scanned
+before committing. The full scratch audit, including all twenty honesty prompts, is
+`/tmp/scriptbots-work-block-audit-20260905.md`. Strict Clippy remains red; no clean
+scanner, full-workspace, performance, GUI, PTY or browser result is claimed.
 
 ## Current verdict and evidence boundary
 
