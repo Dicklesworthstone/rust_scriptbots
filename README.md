@@ -443,6 +443,24 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
  - `--profile-sweep N`: run a sweep of configurations for profiling and print a summary.
  - `--auto-tune N`: quick sweep to pick threads/thresholds for the chosen storage, then continue.
  - `--det-check N`: run determinism self-check (1-thread vs N-threads summaries comparison).
+ - `--run-archipelago N --archipelago-db FILE --archipelago-ticks TICKS`: record bounded
+   isolated populations through sole-owner hosts in one new database. Requires an explicit
+   `rng_seed` and `persistence_interval=1`. Islands step in ascending order with separate
+   derived seeds; the inner Rayon pool defaults to one thread and honors `--threads`.
+   Each complete tick is atomically applied and flushed before the next tick begins.
+   This mode currently has no migration, scheduled interventions, bootstrap, or host-session
+   checkpoint resume. The JSON result names those limits and the observed durability watermarks.
+   The manifest's `archipelago` extension records all island configs and the common root seed;
+   its ordinary world fields describe island zero. For example:
+
+   ```bash
+   cargo run -p scriptbots-app -- --run-archipelago 3 \
+     --archipelago-db runs/islands.sqlite --archipelago-ticks 100 \
+     --brain mlp --set rng_seed=42 --set persistence_interval=1
+   cargo run -p scriptbots-app -- report-archipelago runs/islands.sqlite \
+     --verify-conservation --json runs/islands-report.json
+   ```
+
  - `--set PATH=VALUE`: dotted-path configuration override in TOML syntax, repeatable (e.g., `--set world_width=800 --set neuroflow.enabled=true`; string values use TOML quotes). Configuration layers apply defaults → `--config` files (in order) → environment → CLI; every applied layer appends a kind-tagged content digest to the run manifest's `scenario.ordered_config_layer_digests`, and any field where one explicit layer displaced another is recorded in the manifest's `config_overrides`.
 - `--quality TIER`: visual quality shortcut for `--set render.quality=TIER`, validated at parse time (`auto|potato|low|medium|high|ultra`). The unified `render.*` settings (quality tier, post stack bloom/vignette/fog/AA, day/night cycle, TUI theme, accessibility palette) are consumed by every frontend; `None` values defer to per-tier frontend defaults.
  - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.

@@ -16,6 +16,7 @@ verify_evidence() {
         graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
         graphs-and-recipes) required+=(graph-check graph-tests archive-unit archive-integration architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
+        archipelago) required+=(archipelago-check archipelago-tests capture-tests barrier-tests) ;;
         *) refuse "unknown evidence lane" ;;
     esac
     required+=(analytics-binary)
@@ -95,7 +96,7 @@ fi
 proof_version=${1:-}
 [[ "$proof_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "missing or unsafe proof version"
 [[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned source commit"
-[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes ]] || refuse "unknown correctness lane"
+[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago ]] || refuse "unknown correctness lane"
 [[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || refuse "invoke through the native DSR profile"
 [[ ${SCRIPTBOTS_VERIFY_PROFILE:-} = /* && -f "$SCRIPTBOTS_VERIFY_PROFILE" ]] || refuse "missing materialized DSR profile"
 [[ ${SCRIPTBOTS_PROOF_ROOT:-} = /* && -d "$SCRIPTBOTS_PROOF_ROOT" ]] || refuse "missing external proof root"
@@ -168,6 +169,12 @@ run_step franken-licenses check bash ci/check_franken_licenses.sh
 run_step asupersync-universe check bash ci/check_asupersync_universe.sh
 run_step wasm-graph check bash ci/check_wasm_graph.sh
 case "$SCRIPTBOTS_VERIFY_LANE" in
+    archipelago)
+        run_step archipelago-check check cargo check --locked --workspace --all-targets
+        run_step archipelago-tests test cargo test --locked -p scriptbots-app --test archipelago_report_cli recorded_archipelago_cli -- --nocapture
+        run_step capture-tests test cargo test --locked -p scriptbots-app --lib archipelago_report::tests:: -- --nocapture
+        run_step barrier-tests test cargo test --locked -p scriptbots-storage --lib a_barrier_sink_ -- --nocapture
+        ;;
     workspace)
         run_step workspace-check check cargo check --locked --workspace --all-targets
         run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings

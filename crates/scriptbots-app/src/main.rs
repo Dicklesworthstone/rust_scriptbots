@@ -248,6 +248,58 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(islands) = cli.run_archipelago {
+        ensure_recorded_archipelago_scenario(&launch_scenario)?;
+        let path = cli
+            .archipelago_db
+            .as_ref()
+            .context("--archipelago-db is required")?;
+        let path = path
+            .to_str()
+            .context("archipelago database path is not UTF-8")?;
+        let ticks = cli.archipelago_ticks;
+        let env_threads = std::env::var("SCRIPTBOTS_MAX_THREADS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|threads| *threads > 0);
+        let mut policy = resolve_thread_policy(cli.threads, env_threads, None, cli.low_power);
+        let threads = policy.threads.unwrap_or(1);
+        if threads == 0 {
+            bail!("recorded archipelago requires a positive thread count");
+        }
+        policy.threads = Some(threads);
+        let identity = RunIdentityV1::new(
+            allocate_run_id(),
+            run_started_at_unix_ms()?,
+            Some(ticks),
+            None,
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()?;
+        let result = pool.install(|| {
+            archipelago_report::run_recorded_archipelago(
+                config,
+                islands,
+                ticks,
+                cli.brain,
+                path,
+                |world| {
+                    let manifest = build_run_manifest(
+                        world,
+                        identity,
+                        launch_scenario,
+                        policy,
+                        config_overrides,
+                    )?;
+                    Ok(manifest.to_storage_record()?)
+                },
+            )
+        })?;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
+
     if let Some(ref run_db) = cli.create_bundle {
         let output_dir = cli
             .bundle_output
@@ -1402,6 +1454,15 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
          for one pinned build lane, not a cross-platform reproducibility promise.",
         "ℹ".blue().bold()
     );
+    Ok(())
+}
+
+fn ensure_recorded_archipelago_scenario(scenario: &ScenarioIdentityV0) -> Result<()> {
+    if scenario.bootstrap_ticks != 0 || !scenario.interventions.is_empty() {
+        bail!(
+            "recorded isolated-island runs require zero bootstrap ticks and no scheduled scenario interventions"
+        );
+    }
     Ok(())
 }
 
@@ -2616,6 +2677,17 @@ struct AppCli {
     /// Run archipelago determinism self-check across thread budgets for N ticks.
     #[arg(long = "det-check-archipelago", value_name = "TICKS")]
     det_check_archipelago: Option<u64>,
+
+    /// Record N isolated populations in one database (sequential islands, no migration).
+    #[arg(long, value_name = "ISLANDS", requires = "archipelago_db",
+        conflicts_with_all = ["replay_db", "det_check", "det_check_archipelago", "profile_steps", "profile_storage_steps", "profile_sweep", "create_bundle", "verify_bundle", "lab_goal", "characterize_v0"])]
+    run_archipelago: Option<u32>,
+    /// Exclusive new database for --run-archipelago.
+    #[arg(long, value_name = "FILE", requires = "run_archipelago")]
+    archipelago_db: Option<PathBuf>,
+    /// Number of complete recorded island ticks (requires persistence_interval=1).
+    #[arg(long, default_value_t = 100, requires = "run_archipelago")]
+    archipelago_ticks: u64,
     /// Overlay a tiny debug watermark in the render canvas (diagnostics).
     #[arg(long = "debug-watermark", action = ArgAction::SetTrue)]
     debug_watermark: bool,
@@ -2890,6 +2962,8 @@ fn run_scene_capture_cli(scene_path: &Path) -> Result<()> {
 fn storage_owning_startup_requested(cli: &AppCli) -> bool {
     !cli.config_only
         && cli.replay_db.is_none()
+        && cli.run_archipelago.is_none()
+        && cli.det_check_archipelago.is_none()
         && cli.det_check.is_none()
         && cli.profile_steps.is_none()
         && cli.profile_storage_steps.is_none()

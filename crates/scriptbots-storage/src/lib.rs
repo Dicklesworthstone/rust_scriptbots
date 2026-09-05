@@ -323,12 +323,13 @@ impl ArchipelagoBarrierSink {
             }
             Some(_) => {}
         }
-        if self.pending.insert(island, batch).is_some() {
+        if self.pending.contains_key(&island) {
             return Err(StorageError::InvalidData {
                 context: "archipelago_barrier.island_id",
                 reason: format!("island {} reported twice in one barrier", island.0),
             });
         }
+        self.pending.insert(island, batch);
         Ok(())
     }
 
@@ -30817,7 +30818,7 @@ mod tests {
         sink.admit(IslandId(0), sample_batch(3, 1.0))?;
 
         let repeated = sink
-            .admit(IslandId(0), sample_batch(3, 1.0))
+            .admit(IslandId(0), sample_batch(3, 9.0))
             .expect_err("an island reported twice into one barrier");
         assert!(repeated.to_string().contains("reported twice"));
 
@@ -30833,6 +30834,13 @@ mod tests {
         // refusals are attributable to their stated causes and not to a wedged sink.
         sink.admit(IslandId(1), sample_batch(3, 1.0))?;
         assert!(sink.is_complete());
+        let completed = sink.completed_barrier()?;
+        assert_eq!(completed[0].0, IslandId(0));
+        assert_eq!(
+            completed[0].1.summary,
+            sample_batch(3, 1.0).summary,
+            "refusing a changed duplicate must retain the original payload for persistence"
+        );
 
         Ok(())
     }
