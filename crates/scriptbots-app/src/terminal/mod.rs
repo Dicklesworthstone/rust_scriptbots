@@ -9466,14 +9466,15 @@ mod tests {
 
     #[test]
     fn flat_capability_frames_keep_every_diet_agent_visible() {
-        let palette = Palette::test_backend_evidence();
+        let theme = CuratedThemeId::default();
+        let mut palette = Palette::test_backend_evidence();
+        palette.theme_id = theme;
         for row in capability_matrix_rows()
             .into_iter()
             .filter(|row| row.mode == SubCellMode::Ascii)
         {
             for width in [80, 81] {
-                let (buffer, layout, _) =
-                    capability_frame(&row, CuratedThemeId::default(), width, 36);
+                let (buffer, layout, _) = capability_frame(&row, theme, width, 36);
                 let area = layout.map;
                 // These agents have tendencies 0, 0.5 and 1. The extremes
                 // intentionally use ANSI green/red instead of theme colours.
