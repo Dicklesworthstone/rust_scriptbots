@@ -1158,12 +1158,13 @@ No panel receives fixed heights that silently exceed the viewport. Every size ha
 
 ### 8.4 world canvas
 
-[Currently In Progress — `bd-q2w9` reopened, TurquoiseLake, 2026-09-05: the previous
+[Completed bounded diet/visibility repairs — `bd-q2w9` and `bd-2z0.14.2.7`, TurquoiseLake,
+2026-09-05: the previous
 non-colour diet fix reached only flat glyphs. `61da01c` connects the same modifiers to
 actual canvas body cells, with density/depth, mixed-cell, offscreen and repaint tests.
 DSR40/41 pass its three real-buffer controls, workspace compilation and strict Clippy.
 Raw-cell review isolates the new modifiers from unchanged canvas glyphs/colours, but
-also exposes wide-emoji terrain hiding flat-map agents. `bd-2z0.14.2.7` is in progress:
+also exposed wide-emoji terrain hiding flat-map agents, tracked as `bd-2z0.14.2.7`:
 two-column tile placement and actual TestBackend edge/visibility controls are committed
 in `7740aab`/`e46f59d`. DSR42 raw cells now retain all three agents, with the other seven
 capability files unchanged. Its two new tests failed on an authored ANSI/RGB oracle error;
@@ -1173,8 +1174,12 @@ Clippy; its full-frame test exposes a second authored oracle mismatch between th
 `486dab8` aligns that setup; `ca0918d` plants nonblank underlying cells to falsify a missing
 clear. DSR44 passes all six flat controls, main tests and compiler/strict Clippy. Both
 goldens were deliberately generated and reviewed; `0e930be` retains the exact capability
-candidate, while the theme file is byte-identical. Clean DSR45 is now verifying the
-committed comparisons and terminal/control/shutdown integrations before closure.]
+candidate, while the theme file is byte-identical. Clean DSR45 at `0e930be` passes both
+committed comparisons and all 488 selected app tests, including terminal/control/shutdown
+integrations, plus formatting, workspace all-target compilation and strict Clippy. Final
+DSR exits0 after packaging. Fresh solo acceptance review closes visibility first, then
+diet markers; this is not independent certification or native-pixel/full-suite/long-run
+qualification. The broader FrankenTUI visual-excellence work remains open.]
 
 Use `ftui-extras` directly for:
 
