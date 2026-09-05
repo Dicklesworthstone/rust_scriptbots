@@ -12559,7 +12559,7 @@ mod tests {
              # a_colourless_terminal_falls_back_to_the_flat_map for what IS pinned and\n\
              # why the rest needs an env-driven integration test.\n",
         );
-        for row in capability_matrix_rows() {
+        for (index, row) in capability_matrix_rows().into_iter().enumerate() {
             let (buffer, layout, tick) = capability_frame(
                 &row,
                 CuratedThemeId::default(),
@@ -12568,9 +12568,57 @@ mod tests {
             );
             let evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
                 .expect("every capability tier must render an inspectable frame");
+            // Opt-in raw cells for reviewing a changed golden. Hashes identify
+            // drift but cannot show which glyph, colour or modifier changed.
+            if let Some(proof_dir) = std::env::var_os("SCRIPTBOTS_TUI_CAPABILITY_PROOF_DIR") {
+                write_capability_frame_evidence(
+                    std::path::Path::new(&proof_dir),
+                    index,
+                    &row,
+                    &buffer,
+                    &evidence,
+                );
+            }
             append_frame_evidence(&mut out, &format!("capability {}", row.label), &evidence);
         }
         out
+    }
+
+    fn write_capability_frame_evidence(
+        proof_dir: &std::path::Path,
+        index: usize,
+        row: &CapabilityRow,
+        buffer: &Buffer,
+        evidence: &HeadlessBufferEvidence,
+    ) {
+        let cells: Vec<_> = buffer
+            .content
+            .iter()
+            .enumerate()
+            .map(|(offset, cell)| {
+                let (x, y) = buffer.pos_of(offset);
+                serde_json::json!({
+                    "x": x, "y": y, "symbol": cell.symbol(),
+                    "fg": format!("{:?}", cell.fg),
+                    "bg": format!("{:?}", cell.bg),
+                    "underline_color": format!("{:?}", cell.underline_color),
+                    "modifier": format!("{:?}", cell.modifier),
+                    "modifier_bits": cell.modifier.bits(),
+                    "diff_option": format!("{:?}", cell.diff_option),
+                })
+            })
+            .collect();
+        let artifact = serde_json::json!({
+            "capability": row.label,
+            "evidence": evidence,
+            "cells": cells,
+        });
+        std::fs::create_dir_all(proof_dir).expect("create capability proof directory");
+        std::fs::write(
+            proof_dir.join(format!("capability-{index}.json")),
+            serde_json::to_vec_pretty(&artifact).expect("encode actual capability cells"),
+        )
+        .expect("retain actual capability cells");
     }
 
     /// The viewport the capability matrix renders at: the headless evidence size, so
