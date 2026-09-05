@@ -12,6 +12,8 @@
 //!
 //! Skip loudly (never silently pass) when no GPU adapter exists.
 
+#![recursion_limit = "256"]
+
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::prelude::*;

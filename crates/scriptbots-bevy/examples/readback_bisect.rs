@@ -1,4 +1,6 @@
 //! Bisect: replicate capture.rs's exact build sequence to find the wedge.
+#![recursion_limit = "256"]
+
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::core_pipeline::tonemapping::Tonemapping;
