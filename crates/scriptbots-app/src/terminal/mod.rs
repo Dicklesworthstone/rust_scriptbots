@@ -354,11 +354,18 @@ impl TerminalRenderer {
         self.run_headless_frames(ctx, self.headless_frame_budget())
     }
 
-    fn run_headless_frames(
+    /// Execute and inspect a bounded sequence of real terminal TestBackend frames.
+    /// This is the same headless path used by `Renderer::run`; it does not prove
+    /// interactive PTY behavior. The report serializes the observed frame evidence.
+    pub fn run_headless_frames(
         &self,
         ctx: RendererContext<'_>,
         frames: usize,
     ) -> Result<HeadlessReport> {
+        ensure!(
+            (1..=MAX_HEADLESS_FRAMES).contains(&frames),
+            "headless frame budget must be in 1..={MAX_HEADLESS_FRAMES}"
+        );
         let backend = ratatui::backend::TestBackend::new(80, 36);
         let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
         let mut app = TerminalApp::new(self, ctx);
@@ -4739,7 +4746,8 @@ impl Snapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HeadlessReport {
+/// Observations from the terminal's bounded TestBackend execution path.
+pub struct HeadlessReport {
     scenario: ScenarioSummary,
     initial: FrameStats,
     frames: Vec<FrameStats>,

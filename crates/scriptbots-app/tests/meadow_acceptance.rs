@@ -1,10 +1,12 @@
-//! Default meadow acceptance test with GUI/TUI parity and balanced-ledger cohort proof (bd-2z0.10.5).
+//! Meadow cohort checks using the terminal TestBackend and CPU PNG renderer.
+//! These helper paths do not prove production GUI startup or real PTY behavior;
+//! that acceptance remains with bd-2z0.10.5.
 //!
 //! Completion-proof debt from bd-2z0.10.2:
 //! 1. The checked-in meadow scenario (`scenarios/meadow.scenario.toml`) executes its full declared
 //!    cohort schedule (`seeds = [42, 137, 20260717]`, 300 ticks).
 //! 2. Satisfies all declared envelope criteria on every seed (population in [10, 250], births >= 5, deaths >= 1).
-//! 3. Scientific parity: Default GUI and TUI show the EXACT same scientific run (bit-exact WorldDigestV1 match).
+//! 3. Scientific parity between these two named helper paths (bit-exact WorldDigestV1 match).
 //! 4. Balanced ledger: Resource ledger enabled, reconciles at every tick, and evaluates to zero breaches
 //!    under `ConservationGate` and `evaluate_conservation`.
 //! 5. Negative controls: Divergent seeds break parity; injected ledger breach fails conservation gate.
@@ -12,17 +14,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
 use scriptbots_app::{
     BrainPreset, ScenarioDocumentV1, ScenarioEnvelopeV1, ScenarioIdentityV0, install_brains,
-    renderer::{Renderer, RendererContext},
+    precedence::{ConfigLayerKind, ConfigLayerStatement, resolve_config_layers},
+    renderer::RendererContext,
     seed_founding_population,
-    terminal::{HeadlessBufferEvidence, Palette, TerminalApp, TerminalRenderer},
+    terminal::TerminalRenderer,
 };
 use scriptbots_core::economy::{
-    ConservationBreach, ConservationGate, ConservationVerdict, EconomyStock, SeedVerdict,
-    evaluate_conservation,
+    ConservationGate, ConservationVerdict, SeedVerdict, evaluate_conservation,
 };
 use scriptbots_core::{
     ResourceAmounts, ResourceFlow, ResourceFlowKind, ResourceLedgerTick, ScriptBotsConfig, Tick,
@@ -55,61 +55,30 @@ fn load_meadow_scenario() -> ScenarioDocumentV1 {
 }
 
 fn build_meadow_world(document: &ScenarioDocumentV1, seed: u64) -> WorldState {
-    let mut defaults = ScriptBotsConfig {
+    let defaults = ScriptBotsConfig {
         persistence_interval: 0,
         history_capacity: 600,
         rng_seed: Some(seed),
         ..ScriptBotsConfig::default()
     };
-    // Apply document.config fields
-    let doc_config = &document.config;
-    if let Some(obj) = doc_config.as_object() {
-        if let Some(v) = obj.get("reproduction_cooldown").and_then(|v| v.as_u64()) {
-            defaults.reproduction_cooldown = v;
-        }
-        if let Some(v) = obj
-            .get("reproduction_attempt_chance")
-            .and_then(|v| v.as_f64())
-        {
-            defaults.reproduction_attempt_chance = v as f32;
-        }
-        if let Some(v) = obj.get("closed").and_then(|v| v.as_bool()) {
-            defaults.closed = v;
-        }
-        if let Some(v) = obj.get("population_minimum").and_then(|v| v.as_u64()) {
-            defaults.population_minimum = v as u32;
-        }
-        if let Some(v) = obj
-            .get("population_spawn_interval")
-            .and_then(|v| v.as_u64())
-        {
-            defaults.population_spawn_interval = v;
-        }
-        if let Some(v) = obj.get("population_spawn_count").and_then(|v| v.as_u64()) {
-            defaults.population_spawn_count = v as u32;
-        }
-        if let Some(v) = obj
-            .get("population_crossover_chance")
-            .and_then(|v| v.as_f64())
-        {
-            defaults.population_crossover_chance = v as f32;
-        }
-        if let Some(v) = obj.get("food_max").and_then(|v| v.as_f64()) {
-            defaults.food_max = v as f32;
-        }
-        if let Some(v) = obj.get("food_growth_rate").and_then(|v| v.as_f64()) {
-            defaults.food_growth_rate = v as f32;
-        }
-        if let Some(v) = obj.get("food_respawn_interval").and_then(|v| v.as_u64()) {
-            defaults.food_respawn_interval = v;
-        }
-        if let Some(v) = obj.get("food_respawn_amount").and_then(|v| v.as_f64()) {
-            defaults.food_respawn_amount = v as f32;
-        }
-    }
-    defaults.rng_seed = Some(seed);
-
-    let mut world = WorldState::new(defaults).expect("create meadow world");
+    let resolved = resolve_config_layers(
+        &serde_json::to_value(defaults).expect("serialize defaults"),
+        &[
+            ConfigLayerStatement {
+                kind: ConfigLayerKind::File,
+                label: document.id.clone(),
+                fields: document.config.clone(),
+            },
+            ConfigLayerStatement {
+                kind: ConfigLayerKind::Cli,
+                label: "cohort seed".into(),
+                fields: serde_json::json!({"rng_seed": seed}),
+            },
+        ],
+    );
+    let config: ScriptBotsConfig =
+        serde_json::from_value(resolved.merged).expect("decode complete scenario config");
+    let mut world = WorldState::new(config).expect("create meadow world");
     world.set_resource_ledger_enabled(true);
 
     let brain_keys = install_brains(&mut world, BrainPreset::Mixed)
@@ -139,16 +108,8 @@ fn assert_envelope(id: &str, seed: u64, envelope: &ScenarioEnvelopeV1, world: &W
             "{id}/seed {seed}: population {agent_count} exceeded ceiling {max}"
         );
     }
-    let total_births = world
-        .history()
-        .iter()
-        .map(|h| h.births as usize)
-        .sum::<usize>();
-    let total_deaths = world
-        .history()
-        .iter()
-        .map(|h| h.deaths as usize)
-        .sum::<usize>();
+    let total_births = world.history().map(|h| h.births as usize).sum::<usize>();
+    let total_deaths = world.history().map(|h| h.deaths as usize).sum::<usize>();
     if let Some(min) = envelope.births_min {
         assert!(
             total_births >= min as usize,
@@ -171,22 +132,31 @@ struct TuiRunResult {
 }
 
 fn run_tui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> TuiRunResult {
-    let mut world = build_meadow_world(document, seed);
-    let mut gate = ConservationGate::new();
-
-    let backend = TestBackend::new(80, 36);
-    let mut terminal = Terminal::new(backend).expect("build ratatui test backend");
+    let world = build_meadow_world(document, seed);
+    let gate = Arc::new(Mutex::new(ConservationGate::new()));
     let shared_world = Arc::new(Mutex::new(world));
-
-    let noop_drain: scriptbots_app::GuiCommandDrain = Arc::new(Vec::new);
-    let noop_submit: Arc<dyn Fn(scriptbots_core::ControlCommand) -> Option<String> + Send + Sync> =
-        Arc::new(|_| None);
-
     let renderer = TerminalRenderer::default();
     let step_world = Arc::clone(&shared_world);
-    let simulation_step = Arc::new(move || step_world.lock().expect("world lock").step());
+    let step_gate = Arc::clone(&gate);
+    let simulation_step = Arc::new(move || {
+        let mut world = step_world.lock().expect("world lock");
+        let summary = world.step()?;
+        let report = world
+            .resource_ledger()
+            .latest
+            .as_ref()
+            .expect("enabled ledger produced tick report");
+        assert!(
+            report.reconciliation.reconciled,
+            "seed {seed} tick {}: resource reconciliation breach: {:?}",
+            world.tick().0,
+            report.reconciliation
+        );
+        step_gate.lock().expect("gate lock").observe(report);
+        Ok(summary)
+    });
 
-    let (dummy_control, _drain_rx, _submit_tx) = {
+    let (control, command_drain, command_submit) = {
         let config = scriptbots_app::ControlServerConfig {
             rest_enabled: false,
             mcp_transport: scriptbots_app::McpTransportConfig::Disabled,
@@ -206,58 +176,36 @@ fn run_tui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> TuiRunR
         world: Arc::clone(&shared_world),
         simulation_step,
         analytics: AnalyticsSnapshotProvider::empty(),
-        control_runtime: &dummy_control,
-        command_drain: noop_drain,
-        command_submit: noop_submit,
+        control_runtime: &control,
+        command_drain,
+        command_submit,
         scenario: Arc::new(ScenarioIdentityV0::caller_seeded("meadow-tui")),
     };
 
-    let mut app = TerminalApp::new(&renderer, context);
-    app.palette = Palette::test_backend_evidence();
-
-    for tick in 1..=ticks {
-        if tick == ticks {
-            shared_world
-                .lock()
-                .expect("world lock")
-                .request_replay_world_digest();
-        }
-
-        app.step_once();
-        terminal
-            .draw(|frame| app.draw(frame))
-            .expect("draw terminal frame");
-
-        let backend_buffer = terminal.backend().buffer();
-        let layout = app.frame_layout(backend_buffer.area);
-        let _evidence =
-            HeadlessBufferEvidence::inspect(backend_buffer, app.snapshot().tick, &layout)
-                .expect("headless buffer evidence");
-
-        // Collect ledger tick for conservation gate
-        let guard = shared_world.lock().expect("world lock");
-        if let Some(ref report) = guard.resource_ledger().latest {
-            assert!(
-                report.reconciliation.reconciled,
-                "seed {seed} tick {tick}: resource reconciliation breach! unexplained={:?}, tol={}",
-                report.reconciliation.unexplained_delta, report.reconciliation.tolerance
-            );
-            gate.observe(report);
-        }
-    }
-
-    let mut world = Arc::try_unwrap(shared_world)
+    let report = renderer
+        .run_headless_frames(context, usize::try_from(ticks).unwrap())
+        .expect("render actual TestBackend frames");
+    let report = serde_json::to_value(report).expect("serialize observed frames");
+    let rendered_frames = report["frames"].as_array().expect("observed frames").len();
+    assert_eq!(u64::try_from(rendered_frames).unwrap(), ticks);
+    control
+        .shutdown()
+        .expect("join control runtime before releasing world");
+    let world = Arc::try_unwrap(shared_world)
         .expect("unwrap shared world")
         .into_inner()
         .expect("into inner world");
 
     let digest = world.world_digest_v1().expect("world digest v1");
-
+    let gate = Arc::try_unwrap(gate)
+        .expect("step closure released gate")
+        .into_inner()
+        .expect("gate lock");
     TuiRunResult {
         world,
         digest,
         gate,
-        rendered_frames: ticks as usize,
+        rendered_frames,
     }
 }
 
@@ -311,7 +259,7 @@ fn run_gui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> GuiRunR
 }
 
 #[test]
-fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
+fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
     let document = load_meadow_scenario();
     let envelope = document
         .envelope
@@ -320,7 +268,9 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
     let ticks = envelope.ticks;
 
     println!("================================================================================");
-    println!("MEADOW COHORT ACCEPTANCE: GUI/TUI PARITY & BALANCED LEDGER PROOF (bd-2z0.10.5)");
+    println!(
+        "MEADOW HELPER COHORT: TESTBACKEND/CPU PNG PARITY & BALANCED LEDGER (bd-2z0.10.5 remains open)"
+    );
     println!(
         "Cohort seeds: {:?}, Horizon: {} ticks",
         document.seeds, ticks
@@ -339,6 +289,7 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
 
         // 1. Run TUI path (terminal headless drawing frames into test buffer)
         let tui_result = run_tui_path(&document, seed, ticks);
+        assert_eq!(u64::try_from(tui_result.rendered_frames).unwrap(), ticks);
         assert_envelope("meadow-tui", seed, &envelope, &tui_result.world);
         println!(
             "  [TUI] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
@@ -347,13 +298,11 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
             tui_result
                 .world
                 .history()
-                .iter()
                 .map(|h| h.births as usize)
                 .sum::<usize>(),
             tui_result
                 .world
                 .history()
-                .iter()
                 .map(|h| h.deaths as usize)
                 .sum::<usize>(),
             tui_result.digest.overall
@@ -369,13 +318,11 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
             gui_result
                 .world
                 .history()
-                .iter()
                 .map(|h| h.births as usize)
                 .sum::<usize>(),
             gui_result
                 .world
                 .history()
-                .iter()
                 .map(|h| h.deaths as usize)
                 .sum::<usize>(),
             gui_result.digest.overall
@@ -400,6 +347,11 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
 
         // 4. BALANCED LEDGER: seal the seed verdict
         let seed_verdict = tui_result.gate.finish(seed);
+        let gui_verdict = gui_result.gate.finish(seed);
+        assert!(
+            gui_verdict.breaches.is_empty() && gui_verdict.truncated_breaches == 0,
+            "CPU PNG path must also conserve resources"
+        );
         assert!(
             seed_verdict.breaches.is_empty() && seed_verdict.truncated_breaches == 0,
             "seed {seed}: expected 0 ledger breaches, got {} (+{})",
@@ -484,8 +436,8 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
             }, // 5.0 missing!
             flows: vec![ResourceFlow {
                 kind: ResourceFlowKind::FoodDynamics,
-                delta: ResourceAmounts::empty(),
-                activity: ResourceAmounts::empty(),
+                delta: ResourceAmounts::default(),
+                activity: ResourceAmounts::default(),
             }],
             reconciliation: scriptbots_core::ResourceReconciliation {
                 observed_delta: ResourceAmounts {
@@ -493,7 +445,7 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
                     energy: -5.0,
                     health: 0.0,
                 },
-                attributed_delta: ResourceAmounts::empty(),
+                attributed_delta: ResourceAmounts::default(),
                 unexplained_delta: ResourceAmounts {
                     food: 0.0,
                     energy: -5.0,
@@ -523,6 +475,9 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
     // 7. EMIT MACHINE-PARSEABLE STRUCTURED JSON EVIDENCE
     let evidence_json = serde_json::json!({
         "schema": "scriptbots.meadow-acceptance.v1",
+        "terminal_backend": "ratatui_testbackend",
+        "image_backend": "cpu_png_offscreen",
+        "production_gui_and_pty_verified": false,
         "scenario": "meadow",
         "seeds": document.seeds,
         "ticks": ticks,
@@ -540,5 +495,7 @@ fn default_meadow_acceptance_gui_tui_parity_and_balanced_ledger_cohort_proof() {
         serde_json::to_string(&evidence_json).expect("serialize evidence JSON")
     );
     println!("EVIDENCE_END");
-    println!("\n✔ ALL MEADOW ACCEPTANCE CRITERIA VERIFIED (bd-2z0.10.5)");
+    println!(
+        "\nMeadow helper cohort checks passed; production GUI/PTY acceptance remains unverified."
+    );
 }
