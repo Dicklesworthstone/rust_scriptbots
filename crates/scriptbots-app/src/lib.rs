@@ -1,4 +1,5 @@
 //! Shared application plumbing for ScriptBots control surfaces.
+#![doc = include_str!("../../../docs/ARCHITECTURE.md")]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
