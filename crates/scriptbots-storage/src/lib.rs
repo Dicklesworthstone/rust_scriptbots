@@ -1388,8 +1388,8 @@ const SCRIPTBOTS_SCHEMA_V14: &str = r#"
 /// belongs with the reporting work in bd-16g.5.5, not smuggled into a durability migration.
 ///
 /// V18/V19 separately partition `run_events`, its plain-content FTS index, `genomes`,
-/// and `interactions`. Interaction edges are derived from science replay rows, including
-/// when host-command journals are volatile; their island identity must survive as well.
+/// `interactions`, and `lineage_edges`. The latter two are derived inside replay and birth
+/// insertion, including when host-command journals are volatile; both need island identity.
 const SCRIPTBOTS_SCHEMA_V15: &str = r#"
     ALTER TABLE tick_summaries RENAME TO tick_summaries_pre_v15;
     CREATE TABLE tick_summaries (
@@ -1845,6 +1845,26 @@ const SCRIPTBOTS_SCHEMA_V18: &str = r#"
         ON interactions (run_id, island_id, actor_agent_uid, tick, seq);
     CREATE INDEX interactions_run_target_tick_index
         ON interactions (run_id, island_id, target_agent_uid, tick, seq);
+    ALTER TABLE lineage_edges RENAME TO lineage_edges_pre_v18;
+    CREATE TABLE lineage_edges (
+        run_id TEXT NOT NULL,
+        child_agent_uid INTEGER NOT NULL CHECK (child_agent_uid >= 0),
+        parent_agent_uid INTEGER NOT NULL CHECK (parent_agent_uid >= 0),
+        parent_ordinal INTEGER NOT NULL CHECK (parent_ordinal >= 0),
+        relationship TEXT NOT NULL CHECK (relationship <> ''),
+        birth_tick INTEGER NOT NULL CHECK (birth_tick >= 0),
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
+        PRIMARY KEY (run_id, island_id, child_agent_uid, parent_ordinal),
+        UNIQUE (run_id, island_id, child_agent_uid, parent_agent_uid, relationship),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO lineage_edges
+        SELECT run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship,
+               birth_tick, 0 FROM lineage_edges_pre_v18;
+    DROP TABLE lineage_edges_pre_v18;
+    CREATE INDEX lineage_edges_run_parent_index
+        ON lineage_edges (run_id, island_id, parent_agent_uid, birth_tick);
     PRAGMA user_version = 18;
 "#;
 
@@ -2077,6 +2097,7 @@ fn refuse_ambiguous_island_attribution_migration(
         "SELECT run_id FROM genomes
          UNION SELECT run_id FROM run_events
          UNION SELECT run_id FROM interactions
+         UNION SELECT run_id FROM lineage_edges
          INTERSECT SELECT run_id FROM (
              SELECT run_id FROM tick_summaries WHERE island_id <> 0
              UNION SELECT run_id FROM islands WHERE island_id <> 0
@@ -2087,7 +2108,7 @@ fn refuse_ambiguous_island_attribution_migration(
         return Err(StorageError::InvalidData {
             context: "storage.migration.island_attribution",
             reason: format!(
-                "refusing pre-v18 run {run_id}: unscoped genomes, narrative events or interactions cannot be assigned to an island in a multi-island run; preserve this database for explicit provenance repair"
+                "refusing pre-v18 run {run_id}: unscoped genomes, narrative events, interactions or lineage edges cannot be assigned to an island in a multi-island run; preserve this database for explicit provenance repair"
             ),
         });
     }
@@ -10379,17 +10400,20 @@ impl StorageReader {
         Ok(observations)
     }
 
-    fn require_island_zero_interactions(&self) -> Result<(), StorageError> {
+    fn require_island_zero_science(&self, context: &'static str) -> Result<(), StorageError> {
         let rows = self.connection()?.query_with_params(
             "SELECT island_id FROM replay_events WHERE run_id = ?1 AND island_id <> 0
              UNION SELECT island_id FROM interactions WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM tick_summaries WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM islands WHERE run_id = ?1 AND island_id <> 0
+             UNION SELECT island_id FROM lineage_edges WHERE run_id = ?1 AND island_id <> 0
              LIMIT 1",
             &[sqlite_run_id(self.run_id)],
         )?;
         if !rows.is_empty() {
             return Err(StorageError::InvalidData {
-                context: "interactions.island_scope",
-                reason: "this interaction reader uses island-local agent IDs and requires an island-zero run; cross-island graph analysis is not implemented".to_owned(),
+                context,
+                reason: "this reader has no island dimension and requires an island-zero run; use the archipelago report or explicit island-scoped readers".to_owned(),
             });
         }
         Ok(())
@@ -10404,7 +10428,7 @@ impl StorageReader {
         start_tick: u64,
         end_tick: u64,
     ) -> Result<Vec<PersistedInteraction>, StorageError> {
-        self.require_island_zero_interactions()?;
+        self.require_island_zero_science("interactions.island_scope")?;
         let (start, end) =
             checked_tick_window("interactions.analysis_window", start_tick, end_tick)?;
         let rows = self.finished_connection()?.query_with_params(
@@ -10434,7 +10458,7 @@ impl StorageReader {
         selection: InteractionGraphSelection,
         budget: InteractionGraphBudget,
     ) -> Result<InteractionGraphPage, StorageError> {
-        self.require_island_zero_interactions()?;
+        self.require_island_zero_science("interactions.island_scope")?;
         let bound = checked_query_limit("interaction_graph.max_rows", budget.max_rows)?;
         let projected_bytes = (budget.max_rows + 1) * std::mem::size_of::<InteractionGraphEvent>();
         if projected_bytes > budget.max_projected_bytes {
@@ -10597,7 +10621,7 @@ impl StorageReader {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.require_island_zero_interactions()?;
+        self.require_island_zero_science("interactions.island_scope")?;
         let bound = checked_query_limit("recent_interactions.limit", limit)?;
         // Joined to `replay_events` on the shared (run_id, island_id, tick, seq) key rather than copying
         // coordinates into `interactions`. The edge and the geometry are the same fact recorded
@@ -18495,8 +18519,8 @@ impl Storage {
                     "asexual"
                 };
                 let edge_sql = "insert or ignore into lineage_edges (
-                        run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship, birth_tick
-                    ) values (?1, ?2, ?3, 0, ?4, ?5)";
+                        run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship, birth_tick, island_id
+                    ) values (?1, ?2, ?3, 0, ?4, ?5, ?6)";
                 tx.execute_with_params(
                     edge_sql,
                     &[
@@ -18505,13 +18529,14 @@ impl Storage {
                         parent_a.into(),
                         rel.into(),
                         row.tick.into(),
+                        row.island_id.into(),
                     ],
                 )?;
             }
             if let Some(parent_b) = row.parent_b {
                 let edge_sql = "insert or ignore into lineage_edges (
-                        run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship, birth_tick
-                    ) values (?1, ?2, ?3, 1, 'sexual_parent_b', ?4)";
+                        run_id, child_agent_uid, parent_agent_uid, parent_ordinal, relationship, birth_tick, island_id
+                    ) values (?1, ?2, ?3, 1, 'sexual_parent_b', ?4, ?5)";
                 tx.execute_with_params(
                     edge_sql,
                     &[
@@ -18519,6 +18544,7 @@ impl Storage {
                         row.agent_uid.into(),
                         parent_b.into(),
                         row.tick.into(),
+                        row.island_id.into(),
                     ],
                 )?;
             }
@@ -19061,6 +19087,20 @@ impl Storage {
         }
         while self.flush_one()? {}
         Ok(())
+    }
+
+    /// Apply all buffered batches, finalize their persistence markers, and read them back.
+    ///
+    /// File storage advances the durable watermark; memory storage retains its explicit
+    /// volatile guarantee. Unlike [`Self::flush`], this completes the outbox finalization
+    /// stage before returning, without closing the connection or running maintenance.
+    ///
+    /// # Errors
+    /// Returns an application, finalization, or watermark-read error without claiming that
+    /// an incomplete stage succeeded. Retained outbox payloads remain available to recovery.
+    pub fn flush_with_watermarks(&mut self) -> Result<PersistenceWatermarks, StorageError> {
+        self.flush()?;
+        self.finalize_applied_outbox()
     }
 
     /// Apply the OLDEST buffered batch in its own transaction (bd-w1oi).
@@ -27828,7 +27868,20 @@ mod tests {
              VALUES (?1, 1, 0, 7, 8, 'combat', 0.5, '{\"damage\":0.5}')",
             &[sqlite_run_id(run)],
         )?;
+        connection.execute_with_params(
+            "INSERT INTO lineage_edges (run_id, child_agent_uid, parent_agent_uid,
+                parent_ordinal, relationship, birth_tick)
+             VALUES (?1, 7, 8, 0, 'asexual', 1)",
+            &[sqlite_run_id(run)],
+        )?;
         install_scriptbots_schema(&connection)?;
+        let lineage = connection.query_row(
+            "SELECT island_id, child_agent_uid, parent_agent_uid, relationship FROM lineage_edges",
+        )?;
+        assert_eq!(lineage.get_typed::<i64>(0)?, 0);
+        assert_eq!(lineage.get_typed::<i64>(1)?, 7);
+        assert_eq!(lineage.get_typed::<i64>(2)?, 8);
+        assert_eq!(lineage.get_typed::<String>(3)?, "asexual");
         let interaction =
             connection.query_row("SELECT island_id, value, payload_json FROM interactions")?;
         assert_eq!(interaction.get_typed::<i64>(0)?, 0);
@@ -27893,7 +27946,7 @@ mod tests {
     #[test]
     fn pre_v18_ambiguous_island_rows_refuse_before_any_migration_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
-        for row_kind in ["genomes", "run_events", "interactions"] {
+        for row_kind in ["genomes", "run_events", "interactions", "lineage_edges"] {
             for metadata in [false, true] {
                 let connection = Connection::open(":memory:")?;
                 scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_V17_VERSION)
@@ -27934,7 +27987,7 @@ mod tests {
                         &[sqlite_run_id(run)],
                     )?;
                     "SELECT genome_digest FROM genomes"
-                } else {
+                } else if row_kind == "interactions" {
                     connection.execute_with_params(
                         "INSERT INTO interactions (run_id, tick, seq, actor_agent_uid,
                             target_agent_uid, kind, value, payload_json)
@@ -27942,6 +27995,14 @@ mod tests {
                         &[sqlite_run_id(run)],
                     )?;
                     "SELECT payload_json FROM interactions"
+                } else {
+                    connection.execute_with_params(
+                        "INSERT INTO lineage_edges (run_id, child_agent_uid, parent_agent_uid,
+                            parent_ordinal, relationship, birth_tick)
+                         VALUES (?1, 7, 8, 0, 'asexual', 1)",
+                        &[sqlite_run_id(run)],
+                    )?;
+                    "SELECT relationship FROM lineage_edges"
                 };
                 let payload: String = connection.query_row(preserved_query)?.get_typed(0)?;
                 let schema = read_schema_objects(&connection)?;
@@ -28647,10 +28708,10 @@ mod tests {
     /// Every table a post-V12 migration rebuilt, so the V12 fixture must restore all of them.
     ///
     /// V15 rebuilt seven per-tick tables, V16 rebuilt `islands` and `migrations`, and V18
-    /// rebuilt `run_events`, `genomes`, and `interactions`. A
+    /// rebuilt `run_events`, `genomes`, `interactions`, and `lineage_edges`. A
     /// downgrade that reverted only one migration's worth would leave a database that is not
     /// V12 and would be asserted to be.
-    const POST_V12_REBUILT_TABLES: [&str; 12] = [
+    const POST_V12_REBUILT_TABLES: [&str; 13] = [
         "tick_summaries",
         "metrics",
         "events",
@@ -28663,6 +28724,7 @@ mod tests {
         "run_events",
         "genomes",
         "interactions",
+        "lineage_edges",
     ];
 
     /// The per-tick tables V15 partitions by `island_id`, in migration order.
@@ -30684,8 +30746,22 @@ mod tests {
         assert_eq!(duplicate.batch_id, first.batch_id);
         assert!(!storage.enqueue_staged(first.batch_id, prepared.storage)?);
         storage.flush()?;
-        let watermarks = storage.finalize_applied_outbox()?;
+        assert_eq!(
+            storage.persistence_watermarks()?.applied,
+            Some(first.batch_id)
+        );
+        assert_eq!(
+            storage.persistence_watermarks()?.durable,
+            None,
+            "application alone must not masquerade as finalization"
+        );
+        let watermarks = storage.flush_with_watermarks()?;
         assert_eq!(watermarks.durable, Some(first.batch_id));
+        assert_eq!(
+            storage.flush_with_watermarks()?,
+            watermarks,
+            "repeating the public barrier must preserve its completed identity"
+        );
         let ledger_count: i64 = storage
             .connection()?
             .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
@@ -31803,6 +31879,130 @@ mod tests {
         storage.persist_barrier(&[(IslandId(0), &at_five), (IslandId(1), &at_five)])?;
 
         storage.close()?;
+        Ok(())
+    }
+
+    /// Equal local child identities retain different parent ordinals on each island.
+    #[test]
+    fn fused_barriers_preserve_each_islands_parent_edges() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::export_pipeline::{ExportFormat, ExportTable, export_storage_table};
+
+        let path = temp_db_path("island-lineage-edges");
+        let mut storage = Storage::create_unattributed_file_with_thresholds(
+            path.to_str().ok_or("UTF-8 path")?,
+            100,
+            100,
+            100,
+            100,
+        )?;
+        let mut parents = sample_batch(1, 1.0);
+        parents.births = vec![
+            sample_birth(1, 1, BirthOrigin::Born),
+            sample_birth(1, 2, BirthOrigin::Born),
+        ];
+        parents.agents = (1..=2)
+            .map(|uid| {
+                let mut agent = sample_agent(1.0);
+                agent.identity.uid = AgentUid(uid);
+                agent.identity.spawn_ordinal = uid - 1;
+                agent.identity.birth_ordinal = Some(uid);
+                agent
+            })
+            .collect();
+        parents.summary.agent_count = parents.agents.len();
+        parents.summary.total_energy = 2.0;
+        synchronize_lifecycle_counts(&mut parents);
+        storage.persist_barrier(&[(IslandId(0), &parents), (IslandId(1), &parents)])?;
+        storage.flush_with_watermarks()?;
+        let children: Vec<_> = (0..2)
+            .map(|island| {
+                let mut batch = sample_batch(2, 1.0);
+                batch.agents.clone_from(&parents.agents);
+                let mut offspring = sample_agent(1.0);
+                offspring.identity.uid = AgentUid(3);
+                offspring.identity.spawn_ordinal = 2;
+                offspring.identity.birth_ordinal = Some(3);
+                offspring.data.generation = Generation(1);
+                batch.agents.push(offspring);
+                batch.summary.agent_count = batch.agents.len();
+                batch.summary.total_energy = 3.0;
+                let mut child = sample_birth(2, 3, BirthOrigin::Born);
+                child.parent_a = Some(AgentUid(island + 1));
+                child.parent_b = Some(AgentUid(2 - island));
+                child.generation = Generation(1);
+                batch.births.push(child);
+                synchronize_lifecycle_counts(&mut batch);
+                batch
+            })
+            .collect();
+        storage.persist_barrier(&[(IslandId(0), &children[0]), (IslandId(1), &children[1])])?;
+        storage.flush_with_watermarks()?;
+        let rows = storage.connection()?.query(
+            "SELECT island_id, child_agent_uid, parent_agent_uid, parent_ordinal
+             FROM lineage_edges ORDER BY island_id, parent_ordinal",
+        )?;
+        assert_eq!(rows.len(), 4, "both parents must survive on both islands");
+        for (row, expected) in
+            rows.iter()
+                .zip([(0, 3, 1, 0), (0, 3, 2, 1), (1, 3, 2, 0), (1, 3, 1, 1)])
+        {
+            assert_eq!(
+                (
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<i64>(1)?,
+                    row.get_typed::<i64>(2)?,
+                    row.get_typed::<i64>(3)?
+                ),
+                expected
+            );
+        }
+        storage.close()?;
+        let reader = StorageReader::open(path.to_str().ok_or("UTF-8 path")?)?;
+        for error in [
+            reader.load_run_export_row().unwrap_err(),
+            reader.load_agent_export_rows().unwrap_err(),
+            reader.load_lineage_export_rows().unwrap_err(),
+            reader.load_event_export_rows().unwrap_err(),
+            reader.load_metric_export_rows().unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    error,
+                    StorageError::InvalidData {
+                        context: "export.island_scope",
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+        }
+        for table in [
+            ExportTable::Run,
+            ExportTable::Agent,
+            ExportTable::Lineage,
+            ExportTable::Event,
+            ExportTable::Metric,
+        ] {
+            let mut bytes = Vec::new();
+            let error = export_storage_table(&reader, table, ExportFormat::JsonLines, &mut bytes)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    StorageError::InvalidData {
+                        context: "export.island_scope",
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+            assert!(
+                bytes.is_empty(),
+                "refusal must precede even a provenance header"
+            );
+        }
+        reader.close()?;
         Ok(())
     }
 

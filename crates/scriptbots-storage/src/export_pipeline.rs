@@ -1391,6 +1391,7 @@ pub fn export_storage_table<W: Write>(
     format: ExportFormat,
     writer: W,
 ) -> Result<ExportReceipt, StorageError> {
+    reader.require_island_zero_science("export.island_scope")?;
     let mut export_writer = CoreTableExportWriter::new_with_format(writer, format);
     let manifest = reader.run_manifest()?;
     let run_id = reader.run_id();
@@ -1605,6 +1606,7 @@ pub fn export_storage_table<W: Write>(
 impl StorageReader {
     /// Load the canonical [`RunExportRow`] for this run.
     pub fn load_run_export_row(&self) -> Result<RunExportRow, StorageError> {
+        self.require_island_zero_science("export.island_scope")?;
         let manifest = self.run_manifest()?;
         Ok(RunExportRow {
             run_id: manifest.run_id.to_string(),
@@ -1622,6 +1624,7 @@ impl StorageReader {
 
     /// Load all canonical [`AgentExportRow`] records for this run.
     pub fn load_agent_export_rows(&self) -> Result<Vec<AgentExportRow>, StorageError> {
+        self.require_island_zero_science("export.island_scope")?;
         let run_id = self.run_id();
         let limit = 1024;
         let mut offset = 0;
@@ -1671,6 +1674,7 @@ impl StorageReader {
 
     /// Load all canonical [`LineageExportRow`] records for this run.
     pub fn load_lineage_export_rows(&self) -> Result<Vec<LineageExportRow>, StorageError> {
+        self.require_island_zero_science("export.island_scope")?;
         let run_id = self.run_id();
         let limit = 1024;
         let mut offset = 0;
@@ -1750,6 +1754,7 @@ impl StorageReader {
 
     /// Load all canonical [`EventExportRow`] records for this run.
     pub fn load_event_export_rows(&self) -> Result<Vec<EventExportRow>, StorageError> {
+        self.require_island_zero_science("export.island_scope")?;
         let run_id = self.run_id();
         let limit = 1024;
         let mut offset = 0;
@@ -1797,6 +1802,7 @@ impl StorageReader {
 
     /// Load all canonical [`MetricExportRow`] records for this run.
     pub fn load_metric_export_rows(&self) -> Result<Vec<MetricExportRow>, StorageError> {
+        self.require_island_zero_science("export.island_scope")?;
         let run_id = self.run_id();
         let limit = 1024;
         let mut offset = 0;

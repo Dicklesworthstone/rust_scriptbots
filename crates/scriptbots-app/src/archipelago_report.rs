@@ -226,8 +226,7 @@ pub fn run_recorded_archipelago(
             storage
                 .persist_barrier_from(&sink)
                 .with_context(|| format!("persist complete barrier {expected_tick}"))?;
-            storage.flush()?;
-            let watermarks = storage.persistence_watermarks()?;
+            let watermarks = storage.flush_with_watermarks()?;
             ensure!(
                 watermarks.admitted.map(|id| id.get()) == Some(expected_tick)
                     && watermarks.admitted == watermarks.applied
