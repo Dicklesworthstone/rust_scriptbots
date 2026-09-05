@@ -561,9 +561,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let changed = family.mutate_genome(&parent, MutationRates { primary: 1.0, ..Default::default() },
         BrainProvenance::default(), &mut rng)?;
     assert_ne!(changed.payload(), parent.payload());
+    let initial = family.initial_state(&parent, &mut rng)?;
+    let changed_initial = family.initial_state(&changed, &mut rng)?;
+    let mut before = family.evaluator(&parent, &initial)?;
+    let mut after = family.evaluator(&changed, &changed_initial)?;
+    let mut before_outputs = Vec::new();
+    let mut after_outputs = Vec::new();
+    for sensor in [0.0, 0.5, 1.0, 0.0, 1.0, 0.5] {
+        before_outputs.push(before.evaluate(&[sensor; INPUT_SIZE])?);
+        after_outputs.push(after.evaluate(&[sensor; INPUT_SIZE])?);
+    }
+    assert_ne!(before_outputs, after_outputs, "the changed genome must affect evaluation");
     let crossed = family.crossover_genomes(&parent, &changed, BrainProvenance::default(), &mut rng)?;
     assert_eq!(crossed.payload(), &[parent.payload()[0], changed.payload()[1]]);
-    let initial = family.initial_state(&parent, &mut rng)?;
     let mut live = family.evaluator(&parent, &initial)?;
     let input = [1.0; INPUT_SIZE];
     assert!(live.evaluate(&input)?[0] > 0.0);
@@ -579,8 +589,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = world.register_brain_family("custom-byte-neuron", Box::new(family))?;
     assert_eq!(world.brain_registry().family(key).unwrap().family_id(), &identity);
     scriptbots_app::seed_founding_population(&mut world, &[key])?;
+    let founders = world.agents().iter_handles().collect::<Vec<_>>();
+    assert!(!founders.is_empty());
+    for agent in &founders {
+        let genome = world.agent_brain_genome(*agent).expect("founder must have a protocol genome");
+        assert_eq!(genome.family_id(), &identity);
+        assert!(world.agent_brain_evaluator_state(*agent)?.is_some());
+    }
     world.step()?;
     assert_eq!(world.tick(), scriptbots_core::Tick(1));
+    println!("{}", serde_json::json!({
+        "family": identity, "bound_founders": founders.len(), "tick": world.tick().0,
+        "parent_payload": parent.payload(), "mutated_payload": changed.payload(),
+        "before_outputs": before_outputs, "after_outputs": after_outputs,
+        "checkpoint_blake3": blake3::hash(&encoded).to_hex().to_string(),
+    }));
     Ok(())
 }
 ```

@@ -34,5 +34,6 @@ jq -e --arg source "$expected" \
     "$proof/verdict.json"
 jq -e '.passed > 0' "$proof/architecture-doc-examples.tests.json"
 jq -e '.passed > 0' "$proof/architecture-recipes.tests.json"
+jq -e '.passed > 0' "$proof/architecture-mutations.tests.json"
 echo "Literal Rust recipes and scenario controls executed; evidence: $proof"
 echo "This verifies the named library recipes, not production GUI/PTY/browser migration."

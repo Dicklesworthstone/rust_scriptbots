@@ -98,6 +98,11 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
     recipes)
         run_step architecture-doc-examples test cargo test --locked -p scriptbots-app --doc -- --nocapture
         run_step architecture-recipes test cargo test --locked -p scriptbots-app --test architecture_contract -- --nocapture
+        run_step recipe-link-artifacts check cargo build --locked -p scriptbots-app --lib --message-format=json
+        run_step recipe-dependencies check cargo metadata --locked --format-version 1 --filter-platform "$actual_target"
+        export SCRIPTBOTS_RECIPE_ARTIFACT_LOG="$proof_dir/recipe-link-artifacts.log"
+        export SCRIPTBOTS_RECIPE_METADATA_LOG="$proof_dir/recipe-dependencies.log"
+        run_step architecture-mutations test cargo test --locked -p scriptbots-app --test architecture_contract literal_recipe_compiler_and_runtime_mutations -- --ignored --exact --nocapture
         ;;
 esac
 run_step analytics-binary check cargo build --locked -p scriptbots-analytics --bin sb-analyze

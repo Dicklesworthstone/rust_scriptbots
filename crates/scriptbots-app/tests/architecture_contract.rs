@@ -372,3 +372,254 @@ fn custom_family_is_a_library_extension_not_an_invented_cli_preset() {
     assert!(brain.contains("world.register_brain_family("));
     assert!(guide.contains("`--brain custom` does not exist"));
 }
+
+/// Compile and execute literal recipes against the artifacts Cargo just built.
+/// This expensive lane is explicitly selected by the pinned DSR runner; ordinary
+/// integration tests above do not stand in for these compiler/runtime controls.
+#[test]
+#[ignore = "requires the recipes DSR profile's exact Cargo artifact and dependency records"]
+fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
+    use std::{collections::BTreeMap, fs, io::Write, process::Command};
+
+    let artifact_log = fs::read_to_string(std::env::var("SCRIPTBOTS_RECIPE_ARTIFACT_LOG")?)?;
+    let metadata_log = fs::read_to_string(std::env::var("SCRIPTBOTS_RECIPE_METADATA_LOG")?)?;
+    let metadata: serde_json::Value = metadata_log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("resolve").is_some())
+        .ok_or_else(|| anyhow::anyhow!("missing Cargo dependency resolution"))?;
+    let app_id = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "scriptbots-app")
+        .and_then(|package| package["id"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing app package identity"))?;
+    let app_node = metadata["resolve"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == app_id)
+        .ok_or_else(|| anyhow::anyhow!("missing app dependency node"))?;
+    let mut packages = BTreeMap::from([("scriptbots_app", app_id)]);
+    for name in [
+        "scriptbots_core",
+        "scriptbots_runtime",
+        "rand",
+        "serde_json",
+        "blake3",
+    ] {
+        let package = app_node["deps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dependency| dependency["name"] == name)
+            .and_then(|dependency| dependency["pkg"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing resolved direct dependency {name}"))?;
+        packages.insert(name, package);
+    }
+    let artifacts = artifact_log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value["reason"] == "compiler-artifact")
+        .collect::<Vec<_>>();
+    let mut libraries = BTreeMap::new();
+    for (name, package) in packages {
+        let files = artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact["package_id"] == package && artifact["target"]["name"] == name
+            })
+            .filter_map(|artifact| artifact["filenames"].as_array())
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|filename| filename.ends_with(".rlib"))
+            .collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(
+            files.len() == 1,
+            "expected one exact rlib for {name}, got {files:?}"
+        );
+        let path = PathBuf::from(files.first().unwrap());
+        anyhow::ensure!(path.is_file(), "missing library {}", path.display());
+        libraries.insert(name, path);
+    }
+    let target = std::env::var("SCRIPTBOTS_VERIFY_TARGET")?;
+    let source_commit = std::env::var("SCRIPTBOTS_EXPECTED_COMMIT")?;
+    let evidence = tempfile::Builder::new()
+        .prefix("literal-recipes-")
+        .tempdir()?
+        .keep();
+    let mut records = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(evidence.join("cases.jsonl"))?;
+    let guide = load_architecture_guide();
+    // (case, recipe, literal replacement, expected compiler code/runtime text).
+    // Every negative changes an input accepted by the same checker below.
+    let cases = [
+        ("brain-valid", "brain", None, None),
+        ("scenario-valid", "scenario", None, None),
+        ("meteor-valid", "meteor", None, None),
+        ("frontend-valid", "frontend", None, None),
+        (
+            "brain-signature",
+            "brain",
+            Some((
+                "fn evaluate(&mut self, sensors:",
+                "fn evaluate_typo(&mut self, sensors:",
+            )),
+            Some(("compile", "E0407")),
+        ),
+        (
+            "brain-unbound",
+            "brain",
+            Some((
+                "scriptbots_app::seed_founding_population(&mut world, &[key])?;",
+                "// deliberately omit the actual founder installation",
+            )),
+            Some(("runtime", "assertion failed: !founders.is_empty()")),
+        ),
+        (
+            "unsupported-preset",
+            "frontend",
+            Some(("BrainPreset::Mlp", "BrainPreset::Custom")),
+            Some(("compile", "E0599")),
+        ),
+        (
+            "unknown-config",
+            "scenario",
+            Some(("food_max = 5000.0", "food_max_typo = 5000.0")),
+            Some(("runtime", "unknown field")),
+        ),
+        (
+            "unapplied-meteor",
+            "meteor",
+            Some((
+                "world.step()?;",
+                "// deliberately omit the actual world step",
+            )),
+            Some(("runtime", "meteor application record")),
+        ),
+        (
+            "admitted-receipt",
+            "frontend",
+            Some((
+                "let receipt = client.command_status(id)?.expect(\"retained command status\");",
+                "let receipt = admitted;",
+            )),
+            Some(("runtime", "step did not apply")),
+        ),
+    ];
+    for (name, recipe, replacement, expected_failure) in cases {
+        let body = recipe_block(&guide, recipe, "rust").map_err(anyhow::Error::msg)?;
+        let case_guide = if let Some((old, new)) = replacement {
+            if name == "unknown-config" {
+                anyhow::ensure!(
+                    guide.matches(old).count() == 1,
+                    "ambiguous literal input mutation"
+                );
+                guide.replacen(old, new, 1)
+            } else {
+                anyhow::ensure!(body.matches(old).count() == 1, "ambiguous {name} mutation");
+                guide.replacen(body, &body.replacen(old, new, 1), 1)
+            }
+        } else {
+            guide.clone()
+        };
+        if replacement.is_some() {
+            anyhow::ensure!(case_guide != guide, "mutation did not change input");
+        }
+        let source = recipe_block(&case_guide, recipe, "rust").map_err(anyhow::Error::msg)?;
+        let directory = evidence.join(name);
+        // The scenario's include_str! resolves the exact (possibly mutated) guide
+        // in this unique external fixture, never a separately maintained scenario.
+        fs::create_dir_all(directory.join("crates/scriptbots-app"))?;
+        fs::create_dir(directory.join("docs"))?;
+        fs::write(directory.join("docs/ARCHITECTURE.md"), &case_guide)?;
+        let input = directory.join("recipe.rs");
+        let executable = directory.join("recipe");
+        fs::write(&input, source)?;
+        let mut compiler = Command::new("rustc");
+        compiler
+            .args([
+                "--edition=2024",
+                "--crate-type=bin",
+                "--crate-name=literal_recipe",
+                "--error-format=json",
+                "--target",
+            ])
+            .arg(&target)
+            .arg(&input)
+            .arg("-o")
+            .arg(&executable)
+            .env(
+                "CARGO_MANIFEST_DIR",
+                directory.join("crates/scriptbots-app"),
+            );
+        for (name, library) in &libraries {
+            compiler
+                .arg("--extern")
+                .arg(format!("{name}={}", library.display()));
+            compiler.arg("-L").arg(format!(
+                "dependency={}",
+                library.parent().unwrap().display()
+            ));
+        }
+        let arguments = compiler
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let compiled = compiler.output()?;
+        fs::write(directory.join("compiler.stdout"), &compiled.stdout)?;
+        fs::write(directory.join("compiler.stderr"), &compiled.stderr)?;
+        let mut record = serde_json::json!({
+            "case": name, "recipe": recipe, "source": source_commit, "target": target,
+            "guide_blake3": blake3::hash(case_guide.as_bytes()).to_hex().to_string(),
+            "recipe_blake3": blake3::hash(source.as_bytes()).to_hex().to_string(),
+            "command": {"program": "rustc", "args": arguments},
+            "compiler_exit": compiled.status.code(), "expected_failure": expected_failure,
+            "compiler_stderr_blake3": blake3::hash(&compiled.stderr).to_hex().to_string(),
+        });
+        let observed = if compiled.status.success() {
+            let executed = Command::new(&executable).output()?;
+            fs::write(directory.join("runtime.stdout"), &executed.stdout)?;
+            fs::write(directory.join("runtime.stderr"), &executed.stderr)?;
+            record["runtime_exit"] = serde_json::json!(executed.status.code());
+            record["runtime_stdout_blake3"] =
+                serde_json::json!(blake3::hash(&executed.stdout).to_hex().to_string());
+            record["runtime_stderr_blake3"] =
+                serde_json::json!(blake3::hash(&executed.stderr).to_hex().to_string());
+            match expected_failure {
+                None => executed.status.success(),
+                Some(("runtime", message)) => {
+                    !executed.status.success()
+                        && String::from_utf8_lossy(&executed.stderr).contains(message)
+                }
+                _ => false,
+            }
+        } else {
+            match expected_failure {
+                Some(("compile", code)) => String::from_utf8_lossy(&compiled.stderr)
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .any(|diagnostic| {
+                        diagnostic["level"] == "error" && diagnostic["code"]["code"] == code
+                    }),
+                _ => false,
+            }
+        };
+        record["expectation_observed"] = serde_json::json!(observed);
+        writeln!(records, "{record}")?;
+        records.flush()?;
+        println!(
+            "literal_recipe case={name} expectation_observed={observed} evidence={}",
+            directory.display()
+        );
+        anyhow::ensure!(
+            observed,
+            "{name} did not produce its declared result; inspect {}",
+            directory.display()
+        );
+    }
+    Ok(())
+}
