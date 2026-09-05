@@ -7467,7 +7467,9 @@ impl StorageBuffer {
                         }
                         .into());
                     }
-                    if contract.2 != expected.2 {
+                    // Configuration advances are authenticated against the
+                    // command journal on the connection-owning admission path.
+                    if contract.2 < expected.2 {
                         return Err(NarrativeInputStreamError::MixedConfiguration {
                             tick: record.input.tick.0,
                             expected: expected.2,
@@ -7475,7 +7477,7 @@ impl StorageBuffer {
                         }
                         .into());
                     }
-                    if contract.3 != expected.3 {
+                    if contract.2 == expected.2 && contract.3 != expected.3 {
                         return Err(NarrativeInputStreamError::MixedPolicy {
                             tick: record.input.tick.0,
                         }
@@ -7497,8 +7499,8 @@ impl StorageBuffer {
                         }
                         .into());
                     }
-                    narrative_contract.insert(row.island_id, contract);
                 }
+                narrative_contract.insert(row.island_id, contract);
                 previous_narrative_tick.insert(row.island_id, record.input.tick.0);
             }
             if let Some(value) = row.interaction_value
@@ -14855,19 +14857,13 @@ impl Storage {
                         }
                         .into());
                     }
-                    if contract.2 != expected.2 {
-                        return Err(NarrativeInputStreamError::MixedConfiguration {
-                            tick: row_tick,
-                            expected: expected.2,
-                            actual: contract.2,
-                        }
-                        .into());
-                    }
-                    if contract.3 != expected.3 {
-                        return Err(
-                            NarrativeInputStreamError::MixedPolicy { tick: row_tick }.into()
-                        );
-                    }
+                    Self::validate_narrative_configuration_boundary(
+                        connection,
+                        run_id,
+                        island,
+                        (expected.2, expected.3),
+                        record,
+                    )?;
                 } else {
                     if (contract.0, contract.1)
                         != (
@@ -14884,8 +14880,8 @@ impl Storage {
                         }
                         .into());
                     }
-                    expected_contract = Some(contract);
                 }
+                expected_contract = Some(contract);
                 after_tick = row_tick;
                 count = count.saturating_add(1);
             }
@@ -15537,6 +15533,159 @@ impl Storage {
         )
     }
 
+    fn validate_narrative_configuration_boundary(
+        connection: &Connection,
+        run_id: RunId,
+        island: i64,
+        previous: (u64, NarrativeInputPolicyV1),
+        candidate: NarrativeInputRecordV1,
+    ) -> Result<(), StorageError> {
+        let mismatch = || NarrativeInputStreamError::MixedConfiguration {
+            tick: candidate.input.tick.0,
+            expected: previous.0,
+            actual: candidate.config_revision,
+        };
+        let policy = NarrativeInputPolicyV1::from(candidate);
+        if candidate.config_revision == previous.0 {
+            return if policy == previous.1 {
+                Ok(())
+            } else {
+                Err(NarrativeInputStreamError::MixedPolicy {
+                    tick: candidate.input.tick.0,
+                }
+                .into())
+            };
+        }
+        // Host command projections currently address the single-world island.
+        // Never use another island's command history to authorize a change.
+        if island != 0 || candidate.config_revision < previous.0 {
+            return Err(mismatch().into());
+        }
+        let boundary_tick = candidate.input.tick.0.checked_sub(1).ok_or_else(mismatch)?;
+        let records = connection.query_with_params(
+            "SELECT host_session_id, command_id, terminal_config_revision,
+                    application_transition_count
+             FROM host_command_records
+             WHERE run_id = ?1 AND terminal_tick = ?2
+               AND terminal_config_revision > ?3 AND terminal_config_revision <= ?4
+             ORDER BY terminal_config_revision, command_id
+             LIMIT ?5",
+            &[
+                sqlite_run_id(run_id),
+                encode_journal_u64(boundary_tick).into(),
+                encode_journal_u64(previous.0).into(),
+                encode_journal_u64(candidate.config_revision).into(),
+                checked_i64("narrative.config_commands", MAX_STORAGE_QUERY_PAGE + 1)?.into(),
+            ],
+        )?;
+        if records.len() > MAX_STORAGE_QUERY_PAGE {
+            return Err(mismatch().into());
+        }
+        let mut revision = previous.0;
+        let mut observed_policy = previous.1;
+        for row in records {
+            let session: String = decode(&row, 0, "host_command_records.host_session_id")?;
+            let command: String = decode(&row, 1, "host_command_records.command_id")?;
+            let terminal: String =
+                decode(&row, 2, "host_command_records.terminal_config_revision")?;
+            let transitions: i64 =
+                decode(&row, 3, "host_command_records.application_transition_count")?;
+            let ordinal = transitions
+                .checked_sub(1)
+                .filter(|value| *value >= 0)
+                .ok_or_else(mismatch)?;
+            let Some(config) = Self::applied_configuration_command(
+                connection, run_id, &session, &command, ordinal,
+            )?
+            else {
+                continue;
+            };
+            let actual =
+                decode_journal_u64("host_command_records.terminal_config_revision", &terminal)?;
+            if revision.checked_add(1) != Some(actual) {
+                return Err(mismatch().into());
+            }
+            revision = actual;
+            observed_policy = NarrativeInputPolicyV1 {
+                narrative_interval: config.narrative_interval,
+                history_capacity: u64::try_from(config.history_capacity).map_err(|_| mismatch())?,
+                event_capacity: u64::try_from(config.narrative_capacity).map_err(|_| mismatch())?,
+            };
+        }
+        if revision != candidate.config_revision {
+            return Err(mismatch().into());
+        }
+        if observed_policy != policy {
+            return Err(NarrativeInputStreamError::MixedPolicy {
+                tick: candidate.input.tick.0,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn applied_configuration_command(
+        connection: &Connection,
+        run_id: RunId,
+        session: &str,
+        command: &str,
+        ordinal: i64,
+    ) -> Result<Option<Box<scriptbots_core::ScriptBotsConfig>>, StorageError> {
+        let state = connection.query_row_with_params(
+            "SELECT application_state FROM host_command_application_transitions
+             WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3
+               AND transition_ordinal = ?4",
+            &[
+                sqlite_run_id(run_id),
+                session.into(),
+                command.into(),
+                ordinal.into(),
+            ],
+        )?;
+        if decode::<String>(
+            &state,
+            0,
+            "host_command_application_transitions.application_state",
+        )? != "applied"
+        {
+            return Ok(None);
+        }
+        // Bound the payload before loading it, including malformed databases.
+        let payloads = connection.query_with_params(
+            "SELECT command_payload_postcard_hex FROM host_command_records
+             WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3
+               AND length(CAST(command_payload_postcard_hex AS BLOB)) <= ?4",
+            &[
+                sqlite_run_id(run_id),
+                session.into(),
+                command.into(),
+                checked_i64(
+                    "narrative.config_command_bytes",
+                    MAX_COMMAND_ENVELOPE_BYTES * 2,
+                )?
+                .into(),
+            ],
+        )?;
+        let [payload] = payloads.as_slice() else {
+            return Err(StorageError::InvalidData {
+                context: "narrative.config_command_bytes",
+                reason: "applied command has no single bounded configuration payload".to_owned(),
+            });
+        };
+        let encoded: String = decode(
+            payload,
+            0,
+            "host_command_records.command_payload_postcard_hex",
+        )?;
+        match decode_host_command_postcard_hex(
+            "host_command_records.command_payload_postcard_hex",
+            &encoded,
+        )? {
+            scriptbots_runtime::HostCommand::UpdateConfig(config) => Ok(Some(config)),
+            _ => Ok(None),
+        }
+    }
+
     fn validate_new_narrative_input_identities(
         &self,
         prepared: &StorageBuffer,
@@ -15719,20 +15868,6 @@ impl Storage {
                 }
                 .into());
             }
-            if candidate.config_revision != previous.config_revision {
-                return Err(NarrativeInputStreamError::MixedConfiguration {
-                    tick: candidate.input.tick.0,
-                    expected: previous.config_revision,
-                    actual: candidate.config_revision,
-                }
-                .into());
-            }
-            if NarrativeInputPolicyV1::from(candidate) != NarrativeInputPolicyV1::from(previous) {
-                return Err(NarrativeInputStreamError::MixedPolicy {
-                    tick: candidate.input.tick.0,
-                }
-                .into());
-            }
         } else if (
             candidate.record_schema_version,
             candidate.input.schema_version,
@@ -15748,6 +15883,27 @@ impl Storage {
                 actual_input: candidate.input.schema_version,
             }
             .into());
+        }
+        let mut predecessor = previous;
+        for row in prepared
+            .replay_events
+            .iter()
+            .filter(|row| row.island_id == island && row.event_type == NARRATIVE_INPUT_EVENT_TYPE)
+        {
+            let record = narrative_input_record_from_row(row, false)?;
+            if let Some(previous) = predecessor {
+                Self::validate_narrative_configuration_boundary(
+                    self.connection()?,
+                    self.run_id,
+                    island,
+                    (
+                        previous.config_revision,
+                        NarrativeInputPolicyV1::from(previous),
+                    ),
+                    record,
+                )?;
+            }
+            predecessor = Some(record);
         }
         Ok(())
     }
@@ -16181,6 +16337,7 @@ impl Storage {
         batch: &JournalBatch,
         prepared: &PreparedHostJournalArchive,
     ) -> Result<bool, StorageError> {
+        let _span = debug_span!("journal_archive_admission", batch_id = ?batch.id()).entered();
         let batch_id = batch.id();
         let session_id = batch_id.session_id();
         let sequence = batch_id.sequence();
@@ -16772,6 +16929,8 @@ impl Storage {
         run_id: RunId,
         projection: &PreparedCommandProjection,
     ) -> Result<(), FrankenError> {
+        let _span =
+            debug_span!("journal_command_projection", batch_id = ?projection.batch_id).entered();
         let lifecycle = &projection.lifecycle;
         let envelope = lifecycle.envelope();
         let session = encode_journal_u64(projection.batch_id.session_id().get());
@@ -17275,6 +17434,12 @@ impl Storage {
         domain_events: Option<&PreparedDomainEventProjection>,
         command: Option<&PreparedCommandProjection>,
     ) -> Result<(), StorageError> {
+        let _span = debug_span!(
+            "journal_state_transition",
+            ?batch_id,
+            target = target.as_str()
+        )
+        .entered();
         let previous = match target {
             HostJournalState::Admitted => return Ok(()),
             HostJournalState::Applied => HostJournalState::Admitted,
@@ -17477,7 +17642,9 @@ impl Storage {
         domain_events: Option<&PreparedDomainEventProjection>,
         command: Option<&PreparedCommandProjection>,
     ) -> Result<JournalReceiptState, StorageError> {
+        let _span = debug_span!("journal_archive_completion", ?batch_id).entered();
         if let Some(prepared) = persistence {
+            let _persistence_span = debug_span!("journal_science_persistence", ?batch_id).entered();
             let (receipt, newly_admitted) = self.stage_outbox(applied_tick, &prepared)?;
             self.link_host_journal_persistence(batch_id, receipt.batch_id)?;
             if newly_admitted {
@@ -32862,6 +33029,43 @@ mod tests {
         ));
         assert_eq!(storage.persistence_watermarks()?, after_first);
 
+        for revision in [6, 8, 10] {
+            assert!(
+                matches!(
+                    storage.persist(&sample_narrative_batch(3, 1.0, revision, 8)),
+                    Err(StorageError::NarrativeInputStream(
+                        NarrativeInputStreamError::MixedConfiguration {
+                            tick: 3,
+                            expected: 7,
+                            actual,
+                        }
+                    )) if actual == revision
+                ),
+                "revision {revision} has no applied configuration command"
+            );
+            assert_eq!(storage.persistence_watermarks()?, after_first);
+        }
+        let mut changed_span = sample_narrative_span_batch(3, 4, 7, 8);
+        let ReplayEventKind::NarrativeInputV1 { record } = &mut changed_span
+            .replay_events
+            .last_mut()
+            .expect("nonempty narrative span")
+            .kind
+        else {
+            panic!("span tail must be a narrative input");
+        };
+        record.config_revision = 8;
+        assert!(matches!(
+            storage.persist(&changed_span),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MixedConfiguration {
+                    tick: 4,
+                    expected: 7,
+                    actual: 8
+                }
+            ))
+        ));
+        assert_eq!(storage.persistence_watermarks()?, after_first);
         storage.persist(&sample_narrative_batch(3, 1.0, 7, 8))?;
         storage.close()?;
 

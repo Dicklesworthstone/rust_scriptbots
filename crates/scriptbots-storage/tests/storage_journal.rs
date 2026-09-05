@@ -1,6 +1,6 @@
 //! Public-boundary coverage for the HostCore storage-journal adapter.
 
-use fsqlite::Connection;
+use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentUid, BrainRunner, ControlCommand, INPUT_SIZE, OUTPUT_SIZE, Position,
     ReplayEventKind, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, Tick,
@@ -17,13 +17,13 @@ use scriptbots_runtime::{
 };
 use scriptbots_storage::{
     CommandJournalCursor, CommandStorageTransitionKind, DomainEventExpectation, DomainEventPayload,
-    HostJournalPrefixes, HostJournalRecordState, HostJournalSessionPage, PersistenceGuarantee,
-    StorageError, StorageEventJournalReader, StorageIntegrityCheckResult, StorageJournalOptions,
-    StoragePipeline, StorageReader,
+    HostJournalPrefixes, HostJournalRecordState, HostJournalSessionPage, NarrativeInputStreamError,
+    PersistenceGuarantee, StorageError, StorageEventJournalReader, StorageIntegrityCheckResult,
+    StorageJournalOptions, StoragePipeline, StorageReader,
 };
 use std::{
     fs,
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, Once},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -161,6 +161,19 @@ fn host_options(scientific_event_capacity: usize) -> HostCoreOptions {
 }
 
 fn unique_database_path(label: &str) -> String {
+    static TRACING: Once = Once::new();
+    TRACING.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(
+                tracing_subscriber::fmt::format::FmtSpan::NEW
+                    | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+            )
+            .with_thread_names(true)
+            .with_ansi(false)
+            .try_init()
+            .expect("install journal integration tracing subscriber");
+    });
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock follows the Unix epoch")
@@ -2018,6 +2031,9 @@ fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
     };
     let mut closed_config = first_core.world().config().clone();
     closed_config.closed = true;
+    closed_config.narrative_interval += 1;
+    closed_config.history_capacity *= 2;
+    closed_config.narrative_capacity *= 2;
     for (sequence, command) in [
         (4, ControlCommand::UpdateSelection(selection)),
         (
@@ -2083,6 +2099,19 @@ fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
 
     let first_reader = StorageReader::open_finished_for_run(&first_path, first_run_id)
         .expect("open immutable first command journal");
+    assert!(
+        matches!(
+            first_reader.narrative_input_page_v1(None, 2, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MixedConfiguration {
+                    tick: 2,
+                    expected: 0,
+                    actual: 1,
+                }
+            ))
+        ),
+        "fixed-configuration offline replay must refuse a live configuration boundary"
+    );
     let command_count =
         u64::try_from(original_envelopes.len()).expect("bounded command count fits u64");
     let first_evidence = first_reader
@@ -2232,6 +2261,53 @@ fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
     replay_reader
         .close()
         .expect("close immutable replay command journal");
+
+    let corrupted_path = unique_database_path("gui_narrative_policy_corruption");
+    fs::copy(&first_path, &corrupted_path).expect("copy the validated GUI replay database");
+    fs::copy(
+        format!("{first_path}.scriptbots-writer.lock"),
+        format!("{corrupted_path}.scriptbots-writer.lock"),
+    )
+    .expect("copy the stable writer-lease companion");
+    StorageReader::open_finished_for_run(&corrupted_path, first_run_id)
+        .expect("copied configuration boundary must validate before mutation")
+        .close()
+        .expect("close valid configuration copy");
+    let connection = Connection::open(&corrupted_path).expect("open policy mutation fixture");
+    let payload: String = connection
+        .query_row("SELECT payload FROM replay_events WHERE tick = 2 AND event_type = 'narrative_input_v1'")
+        .expect("the second science tick has a narrative input")
+        .get_typed(0)
+        .expect("narrative payload is text");
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&payload).expect("valid narrative JSON");
+    let interval = payload["narrative_interval"]
+        .as_u64()
+        .expect("numeric narrative interval");
+    payload["narrative_interval"] = (interval + 1).into();
+    let changed = connection
+        .execute_with_params(
+            "UPDATE replay_events SET payload = ?1 WHERE tick = 2 AND event_type = 'narrative_input_v1'",
+            &[serde_json::to_string(&payload).expect("encode changed policy").into()],
+        )
+        .expect("change the policy without changing its authentic command");
+    assert_eq!(changed, 1);
+    connection.close().expect("close policy mutation fixture");
+    let before = fs::read(&corrupted_path).expect("read corrupted fixture before validation");
+    let refusal = StorageReader::open_finished_for_run(&corrupted_path, first_run_id);
+    assert_eq!(
+        fs::read(&corrupted_path).expect("read after refusal"),
+        before
+    );
+    assert!(
+        matches!(
+            refusal,
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MixedPolicy { tick: 2 }
+            ))
+        ),
+        "an applied configuration command cannot authorize a different narrative policy"
+    );
 
     // The uniquely named databases are intentionally retained; this test performs no file deletion.
 }
@@ -2780,6 +2856,15 @@ fn finished_command_reader_preserves_complete_lifecycle_and_storage_evidence() {
 
     let corrupted_path = unique_database_path("command_transition_ordinal_corruption");
     fs::copy(&path, &corrupted_path).expect("copy finished command database for corruption proof");
+    fs::copy(
+        format!("{path}.scriptbots-writer.lock"),
+        format!("{corrupted_path}.scriptbots-writer.lock"),
+    )
+    .expect("copy the finished database's stable writer-lease companion");
+    StorageReader::open_finished_for_run(&corrupted_path, run_id)
+        .expect("the copied database must pass validation before corruption")
+        .close()
+        .expect("close the valid copied command reader");
     let connection = Connection::open(&corrupted_path)
         .expect("open copied command database for deliberate corruption");
     let changed = connection
