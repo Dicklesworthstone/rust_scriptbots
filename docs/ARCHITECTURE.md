@@ -445,7 +445,10 @@ use rand::Rng;
 
 const GENOME_BYTES: usize = 2;
 struct CustomFamily { id: BrainFamilyId }
-struct CustomEvaluator { id: BrainFamilyId, genome: [u8; GENOME_BYTES], previous: u8 }
+struct CustomEvaluator {
+    id: BrainFamilyId, genome: [u8; GENOME_BYTES],
+    genome_hash: [u8; blake3::OUT_LEN], previous: u8,
+}
 
 impl CustomFamily {
     fn invalid(&self, kind: BrainEnvelopeKind, detail: &str) -> BrainProtocolError {
@@ -458,11 +461,13 @@ impl CustomFamily {
         value.payload().try_into()
             .map_err(|_| self.invalid(BrainEnvelopeKind::Genome, "expected gain and bias bytes"))
     }
-    fn state(&self, value: &BrainEvaluatorStateEnvelope) -> Result<u8, BrainProtocolError> {
-        value.require_protocol(&self.id, 1, 1)?;
-        match value.payload() {
-            [previous] => Ok(*previous),
-            _ => Err(self.invalid(BrainEnvelopeKind::EvaluatorState, "expected one state byte")),
+    fn state(&self, value: &BrainEvaluatorStateEnvelope)
+        -> Result<([u8; blake3::OUT_LEN], u8), BrainProtocolError> {
+        value.require_protocol(&self.id, 2, 2)?;
+        match value.payload().split_last() {
+            Some((previous, digest)) if digest.len() == blake3::OUT_LEN =>
+                Ok((digest.try_into().unwrap(), *previous)),
+            _ => Err(self.invalid(BrainEnvelopeKind::EvaluatorState, "expected genome hash and state byte")),
         }
     }
 }
@@ -490,15 +495,17 @@ impl BrainEvaluator for CustomEvaluator {
         Ok(None)
     }
     fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
-        BrainEvaluatorStateEnvelope::new(self.id.clone(), 1, 1, vec![self.previous])
+        let mut payload = self.genome_hash.to_vec();
+        payload.push(self.previous);
+        BrainEvaluatorStateEnvelope::new(self.id.clone(), 2, 2, payload)
     }
 }
 
 impl BrainFamilyCodec for CustomFamily {
     fn family_id(&self) -> &BrainFamilyId { &self.id }
     fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
-        BrainAdapterIdentityV1::from_semantic_descriptor(&self.id, 1,
-            b"byte-neuron:v1;gain,bias;recurrent-u8;clamped-input;divide-three;reset;xor-mutation")
+        BrainAdapterIdentityV1::from_semantic_descriptor(&self.id, 2,
+            b"byte-neuron:v2;gain,bias;state=material-hash+recurrent-u8;clamped-input;divide-three;reset;xor-mutation")
     }
     fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
         BrainHeredityCapabilityV1::locus_capable(
@@ -536,7 +543,9 @@ impl BrainFamilyCodec for CustomFamily {
     fn initial_state(&self, genome: &BrainGenomeEnvelope, _: &mut dyn RandomStream)
         -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
         self.validate_genome(genome)?;
-        BrainEvaluatorStateEnvelope::new(self.id.clone(), 1, 1, vec![0])
+        let mut payload = genome.material_hash().as_bytes().to_vec();
+        payload.push(0);
+        BrainEvaluatorStateEnvelope::new(self.id.clone(), 2, 2, payload)
     }
     fn offspring_state_policy(&self) -> OffspringStatePolicy { OffspringStatePolicy::Reset }
     fn offspring_state(&self, child: &BrainGenomeEnvelope, parents: &[&BrainEvaluatorStateEnvelope],
@@ -546,8 +555,14 @@ impl BrainFamilyCodec for CustomFamily {
     }
     fn evaluator(&self, genome: &BrainGenomeEnvelope, state: &BrainEvaluatorStateEnvelope)
         -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+        let genes = self.genome(genome)?;
+        let (state_hash, previous) = self.state(state)?;
+        let expected_hash = *genome.material_hash().as_bytes();
+        if state_hash != expected_hash {
+            return Err(self.invalid(BrainEnvelopeKind::EvaluatorState, "state belongs to another genome"));
+        }
         Ok(Box::new(CustomEvaluator {
-            id: self.id.clone(), genome: self.genome(genome)?, previous: self.state(state)?,
+            id: self.id.clone(), genome: genes, genome_hash: expected_hash, previous,
         }))
     }
 }
@@ -583,7 +598,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut restored = family.evaluator(&parent, &decoded)?;
     assert_eq!(live.evaluate(&input)?, restored.evaluate(&input)?);
     assert_eq!(live.checkpoint_state()?, restored.checkpoint_state()?);
-    assert_eq!(family.offspring_state(&crossed, &[&checkpoint], &mut rng)?.payload(), &[0]);
+    let foreign_genome_rejected = family.evaluator(&changed, &checkpoint).is_err();
+    assert!(foreign_genome_rejected, "foreign-genome checkpoint must be rejected");
+    let offspring = family.offspring_state(&crossed, &[&checkpoint], &mut rng)?;
+    assert_eq!(family.state(&offspring)?.1, 0);
+    assert!(family.evaluator(&crossed, &offspring).is_ok());
     let mut world = WorldState::new(ScriptBotsConfig { rng_seed: Some(42), ..Default::default() })?;
     let identity = family.id.clone();
     let key = world.register_brain_family("custom-byte-neuron", Box::new(family))?;
@@ -603,6 +622,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "parent_payload": parent.payload(), "mutated_payload": changed.payload(),
         "before_outputs": before_outputs, "after_outputs": after_outputs,
         "checkpoint_blake3": blake3::hash(&encoded).to_hex().to_string(),
+        "checkpoint_genome_hash": parent.material_hash(), "foreign_genome_rejected": foreign_genome_rejected,
     }));
     Ok(())
 }
@@ -617,8 +637,10 @@ it does not by itself prove mutation quality, reproduction or ecological usefuln
 
 Advance the adapter semantic identity whenever evaluation/construction behavior changes, and
 schema/codec versions when byte interpretation changes. The example checkpoints an evaluator;
-whole-world checkpoints additionally bind the family registry and adapter identity. Foreign family
-IDs, malformed payload lengths and unsupported versions must fail before evaluation.
+whole-world checkpoints additionally bind the family registry and adapter identity. The state
+payload binds the core's canonical material hash, which excludes lineage provenance. A changed
+genome cannot reuse the parent's recurrent state; offspring reset creates a new binding. Foreign
+family IDs, malformed payload lengths and unsupported versions must fail before evaluation.
 
 ---
 

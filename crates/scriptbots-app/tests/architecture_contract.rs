@@ -505,6 +505,15 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
             Some(("runtime", "assertion failed: !founders.is_empty()")),
         ),
         (
+            "foreign-genome-state",
+            "brain",
+            Some((
+                "if state_hash != expected_hash {",
+                "if false && state_hash != expected_hash {",
+            )),
+            Some(("runtime", "foreign-genome checkpoint must be rejected")),
+        ),
+        (
             "unsupported-preset",
             "frontend",
             Some(("BrainPreset::Mlp", "BrainPreset::Custom")),
