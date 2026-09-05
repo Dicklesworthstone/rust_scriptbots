@@ -3331,3 +3331,243 @@ fn capacity_one_backpressure_retries_the_exact_retained_batch() {
     assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
     pipeline.shutdown().expect("close bounded memory storage");
 }
+
+#[test]
+fn memory_channel_recovers_capacity_one_without_caller_journal_retries() {
+    let mut pipeline = StoragePipeline::unattributed_memory().expect("real memory worker");
+    verify_channel_capacity_recovery(&mut pipeline, JournalState::CommittedVolatile);
+    assert_eq!(
+        pipeline.shutdown().expect("close memory worker").guarantee,
+        PersistenceGuarantee::CommittedVolatile
+    );
+}
+
+#[test]
+fn file_channel_recovers_capacity_one_without_caller_journal_retries() {
+    let path = unique_database_path("channel_capacity_recovery");
+    let mut pipeline = StoragePipeline::create_unattributed_file(&path).expect("real file worker");
+    let run_id = pipeline.run_id();
+    let session_id = verify_channel_capacity_recovery(&mut pipeline, JournalState::Durable);
+    assert_eq!(
+        pipeline.shutdown().expect("close file worker").guarantee,
+        PersistenceGuarantee::Durable
+    );
+    let reader = StorageReader::open_finished_for_run(&path, run_id)
+        .expect("independent finished file readback");
+    let page = reader
+        .host_journal_session_conformance_page(
+            session_id,
+            None,
+            8,
+            StorageJournalOptions::default().max_event_page_bytes,
+        )
+        .expect("read actual recovered journal");
+    assert_eq!(page.next_after, None);
+    assert_eq!(
+        page.records.len(),
+        4,
+        "three Steps and one Shutdown, without duplicates"
+    );
+    assert!(
+        page.records
+            .iter()
+            .all(|record| record.state == HostJournalRecordState::Durable)
+    );
+    assert_eq!(
+        page.progress.journal,
+        HostJournalPrefixes {
+            admitted: 4,
+            applied: 4,
+            committed_volatile: 4,
+            durable: 4,
+        }
+    );
+    assert_eq!(
+        page.progress.events,
+        HostJournalPrefixes {
+            admitted: 3,
+            applied: 3,
+            committed_volatile: 3,
+            durable: 3,
+        }
+    );
+    reader.close().expect("close finished recovery reader");
+}
+
+fn verify_channel_capacity_recovery(
+    pipeline: &mut StoragePipeline,
+    expected: JournalState,
+) -> HostSessionId {
+    let session_id = HostSessionId::new(0x1004);
+    let journal = pipeline
+        .journal_port(
+            session_id,
+            StorageJournalOptions {
+                admission_capacity: 1,
+                ..StorageJournalOptions::default()
+            },
+        )
+        .expect("capacity-one real worker journal");
+    let mut core = HostCore::with_journal(
+        session_id,
+        compact_world(),
+        host_options(8),
+        Box::new(journal),
+    )
+    .expect("real worker-backed host");
+    let mut frontend = NullFrontend::new(core.local_port(), 0x2004);
+    let first =
+        submit_command_with_authority_before_owner_drive(&mut frontend, HostCommand::Step, None);
+    let second =
+        submit_command_with_authority_before_owner_drive(&mut frontend, HostCommand::Step, None);
+    let blocked = frontend
+        .drive_at(&mut core, ManualInstant::from_nanos(0))
+        .expect("seed actual worker backpressure before channel ownership");
+    assert_eq!(blocked.scientific_steps, 2);
+    assert!(matches!(
+        blocked.blocker,
+        Some(HostBlocker::JournalFull { capacity: 1, .. })
+    ));
+    assert_eq!(core.world_tick(), Tick(2));
+    let retained = core
+        .pending_journal_batch()
+        .expect("actual second batch retained");
+    let before_retry = core.scientific_digest_v1().expect("blocked science digest");
+    let (mut driver, _port) = ChannelHostDriver::new(
+        FixedDeadlineHost::new(core),
+        ChannelHostOptions {
+            maintenance_period: Duration::from_millis(1),
+            ..ChannelHostOptions::default()
+        },
+    )
+    .expect("move the blocked host into its production channel driver");
+    let clock = Instant::now();
+
+    // The caller only steps the channel. It never polls HostCore directly or invokes
+    // retry_retained_journal: removing the channel's retry path must fail this proof.
+    drive_channel_until_committed(
+        &mut driver,
+        &mut frontend,
+        &[first.command_id(), second.command_id()],
+        &expected,
+        &clock,
+        Some(&retained),
+    );
+    assert!(driver.host().core().pending_journal_batch().is_none());
+    assert_eq!(driver.host().core().world_tick(), Tick(2));
+    assert_eq!(
+        driver
+            .host()
+            .core()
+            .scientific_digest_v1()
+            .expect("retry science digest"),
+        before_retry,
+        "journal recovery must not repeat either scientific transition"
+    );
+
+    let third =
+        submit_command_with_authority_before_owner_drive(&mut frontend, HostCommand::Step, None);
+    drive_channel_until_committed(
+        &mut driver,
+        &mut frontend,
+        &[third.command_id()],
+        &expected,
+        &clock,
+        None,
+    );
+    assert_eq!(
+        driver.host().core().world_tick(),
+        Tick(3),
+        "fresh Step advances exactly once"
+    );
+    let mut oracle = compact_world();
+    for _ in 0..3 {
+        oracle.step().expect("independent science-only oracle step");
+    }
+    assert_eq!(
+        driver
+            .host()
+            .core()
+            .scientific_digest_v1()
+            .expect("resumed science digest"),
+        oracle
+            .world_digest_v1()
+            .expect("independent three-tick digest")
+    );
+
+    let shutdown = submit_command_with_authority_before_owner_drive(
+        &mut frontend,
+        HostCommand::Shutdown,
+        None,
+    );
+    drive_channel_until_committed(
+        &mut driver,
+        &mut frontend,
+        &[shutdown.command_id()],
+        &expected,
+        &clock,
+        None,
+    );
+    assert_eq!(
+        driver.host().core().latest_snapshot().lifecycle,
+        HostLifecycle::Stopped
+    );
+    assert_eq!(driver.host().core().world_tick(), Tick(3));
+    session_id
+}
+
+fn drive_channel_until_committed(
+    driver: &mut ChannelHostDriver,
+    frontend: &mut NullFrontend<LocalHostPort>,
+    command_ids: &[CommandId],
+    expected: &JournalState,
+    clock: &Instant,
+    retained: Option<&Arc<scriptbots_runtime::JournalBatch>>,
+) {
+    assert!(
+        !command_ids.is_empty(),
+        "the proof must observe actual commands"
+    );
+    for _ in 0..WORKER_RETRY_LIMIT {
+        driver
+            .step(ManualInstant::from_nanos(
+                u64::try_from(clock.elapsed().as_nanos()).expect("test clock fits u64"),
+            ))
+            .expect("channel performs its own bounded journal maintenance");
+        assert!(
+            driver.host().core().health().fault().is_none(),
+            "worker recovery must remain healthy: {:?}",
+            driver.host().core().health()
+        );
+        if let Some(pending) = driver.host().core().pending_journal_batch()
+            && let Some(retained) = retained
+        {
+            assert!(
+                Arc::ptr_eq(retained, &pending),
+                "retry must retain the exact allocation"
+            );
+        }
+        let statuses: Vec<_> = command_ids
+            .iter()
+            .map(|id| {
+                frontend
+                    .command_status(*id)
+                    .expect("query actual owner command status")
+                    .expect("submitted command retained")
+            })
+            .collect();
+        if statuses.iter().all(|status| {
+            matches!(status.application(), ApplicationState::Applied(_))
+                && status.journal() == expected
+        }) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!(
+        "channel did not commit {command_ids:?} as {expected:?}; tick={:?}, health={:?}, interest={:?}",
+        driver.host().core().world_tick(),
+        driver.host().core().health(),
+        driver.host().core().drive_interest()
+    );
+}

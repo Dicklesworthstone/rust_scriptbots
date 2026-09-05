@@ -27,15 +27,16 @@
 //! - [`ChannelHostDriver`] owns the [`FixedDeadlineHost`] on the owner thread:
 //!   it processes at most the configured ingress budget before each drive,
 //!   drives at fixed cadence deadlines with bounded catch-up, parks without a
-//!   periodic timer while the world is quiescent, converts a full client
+//!   periodic timer while the world is quiescent, retries retained journal
+//!   backpressure at bounded maintenance deadlines, converts a full client
 //!   disconnect into one ordered shutdown, and returns an explicit receipt
 //!   when the host lifecycle terminates.
 
 use crate::{
     CommandEnvelope, CommandId, CommandStatus, EventCatchUp, EventCatchUpLocator, EventCursor,
-    EventHub, EventPoll, FixedDeadlineHost, HostAccessError, HostDriveInterest, HostEvent,
-    HostPort, HostSessionId, LocalHostPort, ManualInstant, NativeDriveTrigger, NativeScheduleError,
-    ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
+    EventHub, EventPoll, FixedDeadlineHost, HostAccessError, HostBlocker, HostDriveInterest,
+    HostEvent, HostPort, HostSessionId, LocalHostPort, ManualInstant, NativeDriveTrigger,
+    NativeScheduleError, ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
@@ -147,7 +148,8 @@ enum IngressMessage {
         /// Single-use reply carrying authoritative found/absent/fail-closed knowledge.
         reply: Sender<Result<Option<CommandStatus>, HostAccessError>>,
     },
-    /// A coalesced non-command observation request.
+    /// Test-only no-op that occupies ingress without admitting a command.
+    #[cfg(test)]
     Wake,
 }
 
@@ -173,11 +175,7 @@ impl StatusBoard {
             let evict = self
                 .order
                 .iter()
-                .position(|id| {
-                    self.statuses
-                        .get(id)
-                        .is_some_and(|status| status_is_finished(status))
-                })
+                .position(|id| self.statuses.get(id).is_some_and(status_is_finished))
                 .unwrap_or(0);
             let Some(removed) = self.order.remove(evict) else {
                 break;
@@ -192,7 +190,7 @@ impl StatusBoard {
 }
 
 /// Whether both axes of a command status reached a terminal state.
-fn status_is_finished(status: &CommandStatus) -> bool {
+const fn status_is_finished(status: &CommandStatus) -> bool {
     let application_finished = !matches!(status.application(), crate::ApplicationState::Admitted);
     let journal_finished = !matches!(status.journal(), crate::JournalState::Pending);
     application_finished && journal_finished
@@ -260,7 +258,7 @@ impl ChannelHostPort {
         }
     }
 
-    fn command_authority_timeout(command_id: CommandId, waited: Duration) -> HostAccessError {
+    const fn command_authority_timeout(command_id: CommandId, waited: Duration) -> HostAccessError {
         HostAccessError::CommandAuthorityLookup {
             command_id,
             failure: crate::CommandAuthorityLookupFailure::Timeout { waited },
@@ -362,15 +360,16 @@ impl HostPort for ChannelHostPort {
         &mut self,
         command_id: CommandId,
     ) -> Result<Option<CommandStatus>, HostAccessError> {
-        if let Some(status) = self
-            .statuses
-            .read()
-            .map_err(|_| Self::protocol_violation("channel status board poisoned"))?
-            .get(command_id)
-        {
-            return Ok(Some(status));
-        }
         const RETRY_PARK: Duration = Duration::from_millis(2);
+        {
+            let board = self
+                .statuses
+                .read()
+                .map_err(|_| Self::protocol_violation("channel status board poisoned"))?;
+            if let Some(status) = board.get(command_id) {
+                return Ok(Some(status));
+            }
+        }
         let started = Instant::now();
         loop {
             let (reply, reply_rx) = std::sync::mpsc::channel();
@@ -514,6 +513,7 @@ pub struct ChannelHostDriver {
     status_board_capacity: usize,
     protocol_event_capacity: usize,
     maintenance_period: Duration,
+    journal_retry_at: Option<ManualInstant>,
     controller_disconnected: bool,
     shutdown_requested: bool,
 }
@@ -556,6 +556,7 @@ impl ChannelHostDriver {
             status_board_capacity: options.status_board_capacity,
             protocol_event_capacity: options.protocol_event_capacity,
             maintenance_period: options.maintenance_period,
+            journal_retry_at: None,
             controller_disconnected: false,
             shutdown_requested: false,
         };
@@ -603,10 +604,10 @@ impl ChannelHostDriver {
         match message {
             IngressMessage::Command { envelope, reply } => {
                 let result = self.host.submit(envelope);
-                if let Ok(status) = &result {
-                    if let Ok(mut board) = self.statuses.write() {
-                        board.insert(status.clone(), self.status_board_capacity);
-                    }
+                if let Ok(status) = &result
+                    && let Ok(mut board) = self.statuses.write()
+                {
+                    board.insert(status.clone(), self.status_board_capacity);
                 }
                 // A client that timed out is unreachable; the admission
                 // remains authoritative and mirrored either way.
@@ -621,6 +622,7 @@ impl ChannelHostDriver {
                 }
                 let _ = reply.send(result);
             }
+            #[cfg(test)]
             IngressMessage::Wake => {}
         }
     }
@@ -656,14 +658,20 @@ impl ChannelHostDriver {
         Ok(())
     }
 
-    fn wait_for_timed_ingress(
-        &mut self,
+    fn timed_ingress_wait(
+        &self,
         interest: HostDriveInterest,
         now: &mut impl FnMut() -> ManualInstant,
-    ) -> Result<(), HostAccessError> {
-        let wait = match interest {
-            HostDriveInterest::Draining => self.maintenance_period,
-            HostDriveInterest::ReadyNow | HostDriveInterest::Deadline => self
+    ) -> Result<Duration, HostAccessError> {
+        match interest {
+            HostDriveInterest::Draining => {
+                Ok(self
+                    .journal_retry_at
+                    .map_or(self.maintenance_period, |deadline| {
+                        Duration::from_nanos(deadline.as_nanos().saturating_sub(now().as_nanos()))
+                    }))
+            }
+            HostDriveInterest::ReadyNow | HostDriveInterest::Deadline => Ok(self
                 .host
                 .next_deadline()
                 .map_or(self.maintenance_period, |deadline| {
@@ -674,15 +682,28 @@ impl ChannelHostDriver {
                         Duration::ZERO
                     }
                 })
-                .min(self.maintenance_period.max(Duration::from_millis(1))),
+                .min(self.maintenance_period.max(Duration::from_millis(1)))),
             HostDriveInterest::WakeOnly
             | HostDriveInterest::Terminated
-            | HostDriveInterest::Faulted => {
-                return Err(ChannelHostPort::protocol_violation(format!(
-                    "driver requested a timed wait for non-timed interest {interest:?}"
-                )));
-            }
-        };
+            | HostDriveInterest::Faulted => Err(ChannelHostPort::protocol_violation(format!(
+                "driver requested a timed wait for non-timed interest {interest:?}"
+            ))),
+        }
+    }
+
+    fn wait_for_timed_ingress(
+        &mut self,
+        interest: HostDriveInterest,
+        now: &mut impl FnMut() -> ManualInstant,
+    ) -> Result<(), HostAccessError> {
+        let wait = self.timed_ingress_wait(interest, now)?;
+        if self.controller_disconnected {
+            // A disconnected receiver returns immediately even for a positive
+            // timeout. No producers remain, so park through maintenance instead
+            // of spinning while the ordered shutdown waits for journal capacity.
+            std::thread::park_timeout(wait);
+            return Ok(());
+        }
         match self.receiver.recv_timeout(wait) {
             Ok(message) => self.retain_waited_ingress(message)?,
             Err(RecvTimeoutError::Timeout) => {}
@@ -691,6 +712,67 @@ impl ChannelHostDriver {
             }
         }
         Ok(())
+    }
+
+    const fn journal_retry_needed(&self) -> bool {
+        matches!(
+            self.host.core().health().blocker(),
+            Some(HostBlocker::JournalFull { .. })
+        )
+    }
+
+    fn update_journal_retry_deadline(&mut self, now: ManualInstant) -> Result<(), HostAccessError> {
+        if !self.journal_retry_needed() {
+            self.journal_retry_at = None;
+        } else if self.journal_retry_at.is_none() {
+            let deadline = u64::try_from(self.maintenance_period.as_nanos())
+                .ok()
+                .and_then(|period| now.as_nanos().checked_add(period))
+                .ok_or_else(|| {
+                    ChannelHostPort::protocol_violation(
+                        "channel journal retry deadline exceeds the monotonic clock range",
+                    )
+                })?;
+            self.journal_retry_at = Some(ManualInstant::from_nanos(deadline));
+        }
+        Ok(())
+    }
+
+    fn drive_due_boundary(&mut self, now: ManualInstant) -> Result<bool, ChannelDriveError> {
+        if let Some(deadline) = self.journal_retry_at {
+            if now < deadline {
+                return Ok(false);
+            }
+            // Receipt polling releases the adapter's outstanding capacity before the
+            // exact retained allocation is offered again. Ingress cannot accelerate
+            // this maintenance cadence, even when a science deadline is overdue.
+            self.host.drive_at(now, NativeDriveTrigger::Maintenance)?;
+            if self.journal_retry_needed() {
+                self.host.retry_retained_journal()?;
+            }
+            self.journal_retry_at = None;
+            return Ok(true);
+        }
+
+        let trigger = match self.host.drive_interest() {
+            HostDriveInterest::ReadyNow => NativeDriveTrigger::Command,
+            HostDriveInterest::Deadline => {
+                if self
+                    .host
+                    .next_deadline()
+                    .is_some_and(|deadline| now < deadline)
+                {
+                    return Ok(false);
+                }
+                NativeDriveTrigger::Deadline
+            }
+            HostDriveInterest::Draining => NativeDriveTrigger::Maintenance,
+            HostDriveInterest::WakeOnly
+            | HostDriveInterest::Terminated
+            | HostDriveInterest::Faulted => return Ok(false),
+        };
+        self.host.drive_at(now, trigger)?;
+        Ok(true)
     }
 
     /// Process at most the configured ingress budget, drive the host when due,
@@ -702,31 +784,8 @@ impl ChannelHostDriver {
     pub fn step(&mut self, now: ManualInstant) -> Result<ChannelStepReport, ChannelDriveError> {
         let admission_before = self.host.core().admission_cursor();
         self.drain_ingress();
-        let mut interest = self.host.drive_interest();
-        let mut drove = false;
-        match interest {
-            HostDriveInterest::ReadyNow => {
-                self.host.drive_at(now, NativeDriveTrigger::Command)?;
-                drove = true;
-            }
-            HostDriveInterest::Deadline => {
-                let due = self
-                    .host
-                    .next_deadline()
-                    .is_none_or(|deadline| now >= deadline);
-                if due {
-                    self.host.drive_at(now, NativeDriveTrigger::Deadline)?;
-                    drove = true;
-                }
-            }
-            HostDriveInterest::Draining => {
-                self.host.drive_at(now, NativeDriveTrigger::Maintenance)?;
-                drove = true;
-            }
-            HostDriveInterest::WakeOnly
-            | HostDriveInterest::Terminated
-            | HostDriveInterest::Faulted => {}
-        }
+        self.update_journal_retry_deadline(now)?;
+        let drove = self.drive_due_boundary(now)?;
         if self.controller_disconnected && !self.shutdown_requested {
             match self.host.request_shutdown() {
                 Ok(_) => self.shutdown_requested = true,
@@ -742,7 +801,12 @@ impl ChannelHostDriver {
         }
         self.mirror_retained_statuses();
         self.mirror_protocol_events();
-        interest = self.host.drive_interest();
+        self.update_journal_retry_deadline(now)?;
+        let mut interest = if self.journal_retry_at.is_some() {
+            HostDriveInterest::Draining
+        } else {
+            self.host.drive_interest()
+        };
         if self.controller_disconnected
             && !self.shutdown_requested
             && interest == HostDriveInterest::WakeOnly
@@ -768,8 +832,10 @@ impl ChannelHostDriver {
 
     /// Drive the host to its terminal lifecycle and return exact accounting.
     ///
-    /// The loop parks without a periodic timer while the host reports
-    /// [`HostDriveInterest::WakeOnly`]. A full client disconnect converts into
+    /// Quiescent hosts park without a periodic timer. Retained
+    /// [`HostBlocker::JournalFull`] work is retried at the configured maintenance
+    /// cadence, even though the runtime-neutral host requests an external wake.
+    /// A full client disconnect converts into
     /// one ordered shutdown rather than abandoning the world. An error leaves
     /// this driver and its exact host state owned by the caller for an explicit
     /// [`Self::step`] recovery or a later run retry; retained client ports stay
@@ -830,7 +896,7 @@ impl ChannelHostDriver {
     }
 
     /// Mutable access to the driver-owned host.
-    pub fn host_mut(&mut self) -> &mut FixedDeadlineHost {
+    pub const fn host_mut(&mut self) -> &mut FixedDeadlineHost {
         &mut self.host
     }
 
@@ -848,7 +914,6 @@ impl ChannelHostDriver {
     }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +952,268 @@ mod tests {
             maintenance_period: Duration::from_millis(2),
             ..ChannelHostOptions::default()
         }
+    }
+
+    fn bounded_journal_driver() -> (ChannelHostDriver, ChannelHostPort) {
+        let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("deterministic bounded-journal world");
+        let core = HostCore::with_journal(
+            HostSessionId::new(83),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    ..PlaybackSnapshot::default()
+                },
+                tick_period_nanos: 10,
+                ..HostCoreOptions::default()
+            },
+            Box::new(VolatileJournal::with_capacity(1)),
+        )
+        .expect("real capacity-one volatile journal");
+        ChannelHostDriver::new(
+            FixedDeadlineHost::new(core),
+            ChannelHostOptions {
+                maintenance_period: Duration::from_nanos(100),
+                ..fast_options()
+            },
+        )
+        .expect("bounded-journal channel driver")
+    }
+
+    fn queue_command(port: &ChannelHostPort, id: u128, command: HostCommand) -> AdmissionReceipt {
+        let (reply, receipt) = std::sync::mpsc::channel();
+        assert!(
+            port.sender
+                .try_send(IngressMessage::Command {
+                    envelope: CommandEnvelope::new(CommandId::new(id), command),
+                    reply,
+                })
+                .is_ok(),
+            "test command must enter the actual bounded ingress"
+        );
+        receipt
+    }
+
+    fn fill_bounded_journal(
+        driver: &mut ChannelHostDriver,
+        port: &ChannelHostPort,
+    ) -> Arc<JournalBatch> {
+        let pause = queue_command(port, 1, HostCommand::Pause);
+        let step = queue_command(port, 2, HostCommand::Step);
+        let report = driver
+            .step(ManualInstant::from_nanos(0))
+            .expect("initial drive");
+        assert_eq!(report.admitted, 2);
+        assert!(report.drove);
+        assert_eq!(report.interest, HostDriveInterest::Draining);
+        for receipt in [pause, step] {
+            let admitted = receipt.try_recv().expect("owner reply").expect("admission");
+            assert!(matches!(admitted.application(), ApplicationState::Admitted));
+        }
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(1));
+        assert!(matches!(
+            driver.host().core().health().blocker(),
+            Some(HostBlocker::JournalFull { capacity: 1, .. })
+        ));
+        driver
+            .host()
+            .core()
+            .pending_journal_batch()
+            .expect("exact retained step batch")
+    }
+
+    #[test]
+    fn retained_journal_full_retries_after_receipt_drain_and_resumes_exactly_once() {
+        let (mut driver, mut port) = bounded_journal_driver();
+        let retained = fill_bounded_journal(&mut driver, &port);
+        assert_eq!(retained.command_id(), Some(CommandId::new(2)));
+        assert_eq!(
+            driver.journal_retry_at,
+            Some(ManualInstant::from_nanos(100))
+        );
+
+        let before = driver
+            .step(ManualInstant::from_nanos(99))
+            .expect("before retry");
+        assert!(!before.drove);
+        assert!(Arc::ptr_eq(
+            &retained,
+            &driver
+                .host()
+                .core()
+                .pending_journal_batch()
+                .expect("still retained")
+        ));
+        let retry = driver
+            .step(ManualInstant::from_nanos(100))
+            .expect("due retry");
+        assert!(retry.drove);
+        assert!(driver.host().core().pending_journal_batch().is_none());
+        assert_eq!(driver.journal_retry_at, None);
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(1));
+        assert_eq!(
+            port.command_status(CommandId::new(2))
+                .expect("lookup")
+                .expect("step")
+                .journal(),
+            &crate::JournalState::Pending,
+            "retry admission must not invent a commitment receipt"
+        );
+        let committed = driver
+            .step(ManualInstant::from_nanos(101))
+            .expect("poll retry receipt");
+        assert_eq!(committed.interest, HostDriveInterest::WakeOnly);
+        assert_eq!(
+            port.command_status(CommandId::new(2))
+                .expect("lookup")
+                .expect("step")
+                .journal(),
+            &crate::JournalState::CommittedVolatile
+        );
+
+        let step = queue_command(&port, 3, HostCommand::Step);
+        driver
+            .step(ManualInstant::from_nanos(102))
+            .expect("next explicit step");
+        step.try_recv()
+            .expect("step reply")
+            .expect("step admission");
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(2));
+        let paused = driver
+            .step(ManualInstant::from_nanos(103))
+            .expect("step commitment");
+        assert_eq!(paused.interest, HostDriveInterest::WakeOnly);
+        assert!(
+            !driver
+                .step(ManualInstant::from_nanos(200))
+                .expect("paused drive")
+                .drove
+        );
+        assert_eq!(
+            driver.host().last_observed(),
+            Some(ManualInstant::from_nanos(103))
+        );
+        assert_eq!(driver.journal_retry_at, None);
+
+        let shutdown = queue_command(&port, 4, HostCommand::Shutdown);
+        driver
+            .step(ManualInstant::from_nanos(201))
+            .expect("ordered shutdown");
+        shutdown
+            .try_recv()
+            .expect("shutdown reply")
+            .expect("shutdown admission");
+        let stopped = driver
+            .step(ManualInstant::from_nanos(202))
+            .expect("shutdown commitment");
+        assert_eq!(stopped.interest, HostDriveInterest::Terminated);
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(2));
+        for id in 1..=4 {
+            let status = port
+                .command_status(CommandId::new(id))
+                .expect("status lookup")
+                .expect("status");
+            assert!(matches!(status.application(), ApplicationState::Applied(_)));
+            assert_eq!(status.journal(), &crate::JournalState::CommittedVolatile);
+        }
+    }
+
+    #[test]
+    fn journal_retry_deadline_resists_command_flood_and_overdue_science_deadlines() {
+        let (mut driver, mut port) = bounded_journal_driver();
+        let retained = fill_bounded_journal(&mut driver, &port);
+        for now in 1..=20 {
+            let receipt = queue_command(&port, u128::from(now) + 10, HostCommand::Pause);
+            let report = driver
+                .step(ManualInstant::from_nanos(now))
+                .expect("flood ingress");
+            assert_eq!(report.admitted, 1);
+            assert!(!report.drove);
+            assert_eq!(report.interest, HostDriveInterest::Draining);
+            let admitted = receipt
+                .try_recv()
+                .expect("flood reply")
+                .expect("flood admission");
+            assert!(matches!(admitted.application(), ApplicationState::Admitted));
+            assert!(Arc::ptr_eq(
+                &retained,
+                &driver
+                    .host()
+                    .core()
+                    .pending_journal_batch()
+                    .expect("retained during flood")
+            ));
+        }
+        assert_eq!(
+            driver.host().last_observed(),
+            Some(ManualInstant::from_nanos(0))
+        );
+        assert_eq!(
+            driver.host().next_deadline(),
+            Some(ManualInstant::from_nanos(10))
+        );
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(1));
+        assert_eq!(
+            port.command_status(CommandId::new(1))
+                .expect("lookup")
+                .expect("pause")
+                .journal(),
+            &crate::JournalState::Pending,
+            "early ingress must not poll receipts or retry the journal"
+        );
+        assert_eq!(
+            driver
+                .timed_ingress_wait(HostDriveInterest::Draining, &mut || {
+                    ManualInstant::from_nanos(20)
+                })
+                .expect("retry wait"),
+            Duration::from_nanos(80),
+            "overdue science must not turn retained-journal waits into a zero-time spin"
+        );
+        let retry = driver
+            .step(ManualInstant::from_nanos(100))
+            .expect("scheduled retry");
+        assert!(retry.drove);
+        assert!(driver.host().core().pending_journal_batch().is_none());
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(1));
+    }
+
+    #[test]
+    fn retained_journal_disconnect_completes_ordered_shutdown() {
+        let (mut driver, port) = bounded_journal_driver();
+        let retained = fill_bounded_journal(&mut driver, &port);
+        drop(port);
+        let mut observations = 0_u64;
+        let receipt = driver
+            .run(|| {
+                observations += 1;
+                assert!(
+                    observations <= 100,
+                    "disconnected host must resolve retained journal work before shutdown"
+                );
+                ManualInstant::from_nanos(observations * 100)
+            })
+            .expect("bounded retained-journal shutdown");
+        assert_eq!(receipt.outcome, ChannelRunOutcome::ControllerDisconnected);
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(1));
+        assert!(driver.host().core().pending_journal_batch().is_none());
+        assert_eq!(driver.journal_retry_at, None);
+        assert_eq!(
+            driver.host().core().latest_snapshot().lifecycle,
+            HostLifecycle::Stopped
+        );
+        let mut local = driver.host().local_port();
+        let status = local
+            .command_status(retained.command_id().expect("retained command identity"))
+            .expect("retained command lookup")
+            .expect("retained command status");
+        assert!(matches!(status.application(), ApplicationState::Applied(_)));
+        assert_eq!(status.journal(), &crate::JournalState::CommittedVolatile);
     }
 
     struct ScriptedChannelAuthority {
