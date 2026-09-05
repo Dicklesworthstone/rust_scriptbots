@@ -18418,6 +18418,9 @@ impl Storage {
         Ok(())
     }
 
+    /// Insert prevalidated rows only inside `flush_attempt`'s whole-batch transaction.
+    /// Any error must propagate to that caller's explicit rollback; no caller may keep
+    /// using or commit the transaction after a failed insert.
     fn insert_agents(
         tx: &Transaction<'_>,
         run_id: RunId,
@@ -18427,7 +18430,7 @@ impl Storage {
             return Ok(());
         }
         for row in rows {
-            tx.execute_with_params(
+            tx.execute_with_params_skip_statement_savepoint(
                 scriptbots_agent_insert_sql(),
                 &[
                     sqlite_run_id(run_id),
@@ -26072,8 +26075,18 @@ mod tests {
                 }
             }
             "expect-open" => {
+                let started = Instant::now();
+                eprintln!("writer-lease child: recovery starting at {path}");
                 let mut pipeline = StoragePipeline::recover_existing(&path)?;
+                eprintln!(
+                    "writer-lease child: recovery completed after {:?}; shutdown starting",
+                    started.elapsed()
+                );
                 pipeline.shutdown()?;
+                eprintln!(
+                    "writer-lease child: shutdown completed after {:?}",
+                    started.elapsed()
+                );
             }
             other => return Err(format!("unknown writer-lease child mode {other:?}").into()),
         }
@@ -28139,7 +28152,7 @@ mod tests {
             ) VALUES (
                 'test_run_mig', 1, 'exp', 'var', 'scen', 1, '{}', 'cdig',
                 '0000', 'wyrand', 1, '[]', 'rev', 'stdig', 0, 'sbd', 'nightly',
-                'cld', 'target', '0', '0', 'default', 1, '{}', 'mdig'
+                'cld', 'target', '0', NULL, 'default', 1, '{}', 'mdig'
             )",
         )?;
         connection.execute(

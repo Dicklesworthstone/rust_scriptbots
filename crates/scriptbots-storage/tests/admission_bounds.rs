@@ -148,7 +148,24 @@ fn a_narration_burst_cannot_starve_simulation_admission_through_the_real_path() 
     });
 
     let mut loud = batch(1, 8);
-    loud.narrative_events = (0..512).map(|_| narrative_event(1)).collect();
+    // Exercise budget pressure with valid identities. Repeating one identity tests the
+    // independent corruption guard, which must continue to refuse duplicate commentary.
+    loud.narrative_events = (0..512)
+        .map(|index| {
+            let mut event = narrative_event(1);
+            event.metric = format!("population.cohort.{index}");
+            event
+        })
+        .collect();
+    assert_eq!(
+        loud.narrative_events
+            .iter()
+            .map(|event| (&event.tick, &event.kind, &event.metric))
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        loud.narrative_events.len(),
+        "budget pressure must not be confounded with duplicate identities"
+    );
     let (narrative_bytes, narrative_events) = estimate_narrative_size(&loud);
     assert!(
         narrative_events > 128 && narrative_bytes > (64 << 10),
