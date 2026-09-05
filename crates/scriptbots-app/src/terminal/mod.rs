@@ -9567,6 +9567,10 @@ mod tests {
                 let mut scratch = vec![CellOccupancy::default(); usize::from(width) * 2];
                 terminal
                     .draw(|frame| {
+                        // A fresh blank buffer would hide a missing clear. Plant
+                        // content so continuation and odd-edge assertions fail
+                        // if the map leaves underlying cells untouched.
+                        frame.render_widget(Paragraph::new("xxxxx\nxxxxx"), frame.area());
                         frame.render_widget(
                             MapWidget {
                                 snapshot: &snapshot,
