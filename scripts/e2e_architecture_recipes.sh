@@ -1,46 +1,38 @@
 #!/usr/bin/env bash
-# e2e_architecture_recipes.sh — End-to-end verification for architecture guide contracts & recipes (bd-bsuh)
+# Execute literal architecture recipes through a materialized native DSR profile.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-
-echo "=== Running architecture contract & extension recipe verification ==="
-cd "${REPO_ROOT}"
-
-OUTPUT=$(rch exec -- cargo test -p scriptbots-app --test architecture_contract -- --nocapture 2>&1)
-
-EVIDENCE=$(python3 -c "
-import sys, json
-text = sys.stdin.read()
-results = []
-for line in text.splitlines():
-    idx = line.find('{\"schema\":\"scriptbots.architecture-recipe.evidence.v1\"')
-    if idx != -1:
-        json_str = line[idx:].strip()
-        try:
-            data = json.loads(json_str)
-            results.append(json.dumps(data))
-        except Exception:
-            pass
-if results:
-    print('\n'.join(results))
-" <<< "${OUTPUT}")
-
-if [ -z "${EVIDENCE}" ]; then
-    echo "ERROR: Expected JSONL evidence not found in test output" >&2
-    exit 1
+if (( $# != 2 )) || [[ ! $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+    echo "Usage: DSR_CONFIG_DIR=/absolute/config $0 PROFILE UNIQUE_VERSION" >&2
+    echo "Materialize ci/dsr_verify.yaml with SCRIPTBOTS_VERIFY_LANE=recipes first." >&2
+    exit 2
 fi
+tool=$1
+version=$2
+[[ ${DSR_CONFIG_DIR:-} = /* ]] || { echo "DSR_CONFIG_DIR must be absolute" >&2; exit 2; }
+profile="$DSR_CONFIG_DIR/repos.d/$tool.yaml"
+[[ -f "$profile" ]] || { echo "Missing DSR profile: $profile" >&2; exit 2; }
+[[ $(yq -r '.tool_name' "$profile") == "$tool" ]] || { echo "Profile identity mismatch" >&2; exit 2; }
+[[ $(yq -r '.env.SCRIPTBOTS_VERIFY_LANE' "$profile") == recipes ]] || {
+    echo "Profile must select the recipes correctness lane" >&2
+    exit 2
+}
+expected=$(yq -r '.env.SCRIPTBOTS_EXPECTED_COMMIT' "$profile")
+proof_root=$(yq -r '.env.SCRIPTBOTS_PROOF_ROOT' "$profile")
+target=$(yq -r '.targets[0]' "$profile")
+profile_hash=$(sha256sum "$profile" | cut -d ' ' -f 1)
 
-echo "${EVIDENCE}"
+dsr build --tool "$tool" --target "$target" --only-native --no-sync --version "$version"
 
-# Verify each recipe ID is present with none failure disposition
-for recipe_id in "brain_family_extension" "scenario_extension" "frontend_extension"; do
-    if ! echo "${OUTPUT}" | grep -q "\"recipe_id\":\"${recipe_id}\".*\"failure_disposition\":\"none\""; then
-        echo "ERROR: Missing clean evidence for recipe ${recipe_id}" >&2
-        exit 1
-    fi
-done
-
-echo "=== All architecture contracts and extension recipes verified successfully! ==="
-exit 0
+[[ $(sha256sum "$profile" | cut -d ' ' -f 1) == "$profile_hash" ]] || {
+    echo "Profile changed during execution" >&2
+    exit 1
+}
+proof="$proof_root/$version"
+jq -e --arg source "$expected" \
+    '.status == "pass" and .source == $source and .lane == "recipes" and .exit_code == 0' \
+    "$proof/verdict.json"
+jq -e '.passed > 0' "$proof/architecture-doc-examples.tests.json"
+jq -e '.passed > 0' "$proof/architecture-recipes.tests.json"
+echo "Literal Rust recipes and scenario controls executed; evidence: $proof"
+echo "This verifies the named library recipes, not production GUI/PTY/browser migration."

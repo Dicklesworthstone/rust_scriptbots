@@ -778,7 +778,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let envelope = CommandEnvelope::new(id, HostCommand::Step);
     let admitted = client.submit(envelope.clone())?;
     assert_eq!(admitted.application(), &ApplicationState::Admitted);
-    assert_eq!(initial.world.tick, Tick(0));
+    assert_eq!(initial.world.tick, 0);
     host.drive(ManualInstant::from_nanos(0))?;
     host.drive(ManualInstant::from_nanos(1))?;
     let receipt = client.command_status(id)?.expect("retained command status");
@@ -789,7 +789,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(receipt.journal(), &JournalState::CommittedVolatile);
     assert_eq!(applied.tick, Tick(1));
     let snapshot = client.poll_snapshot(&mut subscription)?.expect("step publication");
-    assert_eq!(snapshot.world.tick, applied.tick);
+    assert_eq!(snapshot.world.tick, applied.tick.0);
     assert_eq!(snapshot.revisions, applied.revisions);
     assert_eq!(snapshot.last_applied_command, Some(id));
     let request = ProjectionRequest {
@@ -804,7 +804,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!projection.visible_agents.is_empty());
     assert_eq!(client.submit(envelope)?, receipt, "retry must preserve the original result");
     host.drive(ManualInstant::from_nanos(2))?;
-    assert_eq!(host.latest_snapshot().world.tick, Tick(1), "retry must not step twice");
+    assert_eq!(host.latest_snapshot().world.tick, 1, "retry must not step twice");
     assert!(HostCommand::SetSpeed(f32::NAN).validate().is_err());
     let mut invalid_viewport = request;
     invalid_viewport.viewport.width = 0;

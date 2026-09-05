@@ -1051,6 +1051,10 @@ reviewed `SCRIPTBOTS_EXPECTED_COMMIT`, `SCRIPTBOTS_VERIFY_PROFILE`,
 `SCRIPTBOTS_PROOF_ROOT`, and `CARGO_TARGET_DIR` to real absolute host paths.
 Create the proof root outside the checkout; each invocation creates a new child
 directory and refuses reuse. Use the toolchain pinned in `rust-toolchain.toml`.
+The host needs DSR's native-build prerequisites, including Mike Farah's `yq` v4,
+`jq`, Git, Bash, Python 3 and Rustup, plus the system libraries required by the
+selected Cargo lane. `dsr config validate` checks the materialized configuration;
+it does not compile the workspace or prove those system libraries are installed.
 
 The external `config.yaml` needs `schema_version: "1.0.0"`. For native execution
 on the Linux host where DSR runs, use this external `hosts.yaml`:
@@ -1085,6 +1089,13 @@ separate core `economy-faults` tests. Pin/license/WASM dependency guards run in
 every lane. Missing profiles, hosts or toolchains are infrastructure refusals,
 not test outcomes. Relevant ignored native acceptance tests still need explicit
 profiles; this runner does not infer that they ran from a green default suite.
+
+For the literal architecture examples, materialize a profile with
+`SCRIPTBOTS_VERIFY_LANE: recipes`, then run
+`DSR_CONFIG_DIR=/absolute/path/to/dsr-config scripts/e2e_architecture_recipes.sh scriptbots-verify proof-recipes-001`.
+That wrapper runs DSR, verifies the typed source-bound verdict and requires actual
+executed documentation and integration test counts. Its scope is the documented
+library recipes; production GUI, PTY and browser journeys remain separate.
 
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
