@@ -1505,7 +1505,7 @@ mod tests {
         .expect("status world");
         world.step().expect("first observed tick");
         world
-            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .try_inject_agent(scriptbots_core::AgentData::default())
             .expect("one observed agent");
         let mut config = world.config().clone();
         config.closed = false;
