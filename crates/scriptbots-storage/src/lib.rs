@@ -18341,10 +18341,12 @@ impl Storage {
     /// Preserve input order while amortizing statement setup and FK schema refreshes.
     /// The binding budget bounds each statement's temporary storage; the enclosing
     /// `flush_attempt` transaction remains responsible for rolling back every chunk.
+    /// The returned row count must match the chunk. `RETURNING` selects the pinned engine's
+    /// direct VDBE path; non-returning multi-row inserts with FKs replay and reload each row.
     fn execute_bounded_insert<const WIDTH: usize>(
         tx: &Transaction<'_>,
         one_row_sql: &str,
-        rows: impl Iterator<Item = [SqliteValue; WIDTH]>,
+        mut rows: impl Iterator<Item = [SqliteValue; WIDTH]>,
     ) -> Result<usize, FrankenError> {
         if WIDTH == 0 || WIDTH > MAX_SCIENCE_INSERT_BINDINGS {
             return Err(FrankenError::Internal(format!(
@@ -18354,30 +18356,35 @@ impl Storage {
         let mut sql = one_row_sql.to_owned();
         let mut parameters = Vec::with_capacity(MAX_SCIENCE_INSERT_BINDINGS);
         let mut inserted = 0;
-        for values in rows {
-            if parameters.len() + WIDTH > MAX_SCIENCE_INSERT_BINDINGS {
-                tx.execute_with_params(&sql, &parameters)?;
-                inserted += parameters.len() / WIDTH;
-                parameters.clear();
-                sql.truncate(one_row_sql.len());
-            }
-            if !parameters.is_empty() {
-                sql.push_str(", (");
-                for column in 0..WIDTH {
-                    if column != 0 {
-                        sql.push_str(", ");
+        loop {
+            parameters.clear();
+            sql.truncate(one_row_sql.len());
+            for values in rows.by_ref().take(MAX_SCIENCE_INSERT_BINDINGS / WIDTH) {
+                if !parameters.is_empty() {
+                    sql.push_str(", (");
+                    for column in 0..WIDTH {
+                        if column != 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&format!("?{}", parameters.len() + column + 1));
                     }
-                    sql.push_str(&format!("?{}", parameters.len() + column + 1));
+                    sql.push(')');
                 }
-                sql.push(')');
+                parameters.extend(values);
             }
-            parameters.extend(values);
+            if parameters.is_empty() {
+                return Ok(inserted);
+            }
+            sql.push_str(" RETURNING 1");
+            let affected = tx.query_with_params(&sql, &parameters)?.len();
+            let expected = parameters.len() / WIDTH;
+            if affected != expected {
+                return Err(FrankenError::Internal(format!(
+                    "scientific insert returned {affected} rows for {expected} inputs"
+                )));
+            }
+            inserted += affected;
         }
-        if !parameters.is_empty() {
-            tx.execute_with_params(&sql, &parameters)?;
-            inserted += parameters.len() / WIDTH;
-        }
-        Ok(inserted)
     }
 
     fn insert_ticks(
@@ -25147,6 +25154,36 @@ mod tests {
     }
 
     #[test]
+    fn chunked_insert_rejects_a_short_returning_row_count() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let connection = Connection::open(":memory:")?;
+        connection.execute("CREATE TABLE receipt_probe (id INTEGER PRIMARY KEY)")?;
+        connection.execute("INSERT INTO receipt_probe (id) VALUES (1)")?;
+        let mut transaction = connection.transaction()?;
+        let error = Storage::execute_bounded_insert(
+            &transaction,
+            "INSERT OR IGNORE INTO receipt_probe (id) VALUES (?1)",
+            [[1_i64.into()], [2_i64.into()]].into_iter(),
+        )
+        .expect_err("one ignored input must not satisfy the two-row count guard");
+        assert!(
+            matches!(
+                &error,
+                FrankenError::Internal(detail)
+                    if detail == "scientific insert returned 1 rows for 2 inputs"
+            ),
+            "expected the returned-row count mismatch, observed {error:?}"
+        );
+        transaction.rollback()?;
+        drop(transaction);
+        let rows = connection.query("SELECT id FROM receipt_probe ORDER BY id")?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_typed::<i64>(0)?, 1);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn chunked_replay_inserts_preserve_rows_and_roll_back_late_sql_failures()
     -> Result<(), Box<dyn std::error::Error>> {
         let storage = Storage::unattributed_memory()?;
@@ -25232,6 +25269,43 @@ mod tests {
             "earlier chunks escaped batch rollback"
         );
         assert_eq!(read_rows()?, expected, "rollback changed the prior commit");
+
+        // The direct RETURNING path must still enforce run ownership. In the pinned
+        // engine FK validation follows the write, making rollback essential here.
+        let missing_run = RunId::new(storage.run_id.get() ^ 1);
+        assert_eq!(
+            connection
+                .query_row_with_params(
+                    "SELECT COUNT(*) FROM runs WHERE run_id = ?1",
+                    &[sqlite_run_id(missing_run)],
+                )?
+                .get_typed::<i64>(0)?,
+            0,
+            "the foreign-key control needs an absent parent"
+        );
+        let buffer = StorageBuffer {
+            replay_events: rows.clone(),
+            ..StorageBuffer::default()
+        };
+        let failure = Storage::flush_attempt(connection, ":memory:", missing_run, &buffer, &[])
+            .expect_err("RETURNING must not bypass the run foreign key");
+        assert_eq!(failure.commit_state, FailureCommitState::RolledBack);
+        assert!(
+            matches!(&failure.source, FrankenError::ForeignKeyViolation),
+            "expected the missing run foreign key, observed {:?}",
+            failure.source
+        );
+        assert_eq!(
+            connection
+                .query_row_with_params(
+                    "SELECT COUNT(*) FROM replay_events WHERE run_id = ?1",
+                    &[sqlite_run_id(missing_run)],
+                )?
+                .get_typed::<i64>(0)?,
+            0,
+            "failed foreign-key validation left inserted rows"
+        );
+        assert_eq!(read_rows()?, expected);
 
         // A strict narrative input must still reject an existing identity even
         // when preceded by a replaceable replay group in the same science batch.
