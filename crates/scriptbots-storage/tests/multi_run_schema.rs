@@ -8,7 +8,8 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    BatchPersistenceState, RunManifestRecord, StoragePipeline, StorageReader,
+    BatchPersistenceState, FailureCommitState, RunManifestRecord, StorageError, StorageOperation,
+    StoragePipeline, StorageReader, StorageWorkerError,
 };
 use std::{
     fs,
@@ -1483,37 +1484,26 @@ fn legacy_v5_database_is_refused_before_its_primary_file_is_mutated()
             return Err("a legacy v5 database must not be upgraded implicitly".into());
         }
     };
-    // Assert the refusal's identity, not its prose.
-    //
-    // This previously matched the literal string "expected exactly two ScriptBots
-    // migrations through v7, found 3". That was accurate while the chain ended at v7, and
-    // went stale the moment V8 and V9 were added — production now says "four ... through
-    // v9". The failure was not a v5-refusal regression at all, but it fired *before* the
-    // byte-identity check below, so a test named for "refused before its primary file is
-    // mutated" stopped verifying that entirely.
-    //
-    // The expected-count phrasing is coupled to the length of the migration chain and will
-    // go stale again at v10. What is actually invariant here is the typed context and the
-    // count this fixture *supplies* — three legacy migrations — so pin those instead.
-    // The refusal arrives as `StorageError::Worker(StorageWorkerError::…)` wrapping the
-    // inner `InvalidData`, so matching the typed variant means reaching through two enums
-    // whose shapes are themselves churn-prone. Assert the two parts of the message that are
-    // genuinely invariant instead: the stable `&'static str` context identifying schema
-    // validation as the refusing stage, and the migration count this fixture supplies.
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("storage.recovery_schema"),
-        "a legacy schema must be refused by schema validation, got {rendered}"
-    );
-    assert!(
-        rendered.contains("found 3"),
-        "the refusal must name the three legacy migrations this fixture supplies: {rendered}"
-    );
+    // Observe file preservation before interpreting the refusal. A version check
+    // may correctly refuse this fixture before inspecting its migration row count.
     let after = fs::read(&path)?;
     assert_eq!(
         after, before,
         "refusing an unsupported legacy schema must not rewrite the primary database file"
     );
+    match error {
+        StorageError::Worker(StorageWorkerError::Internal {
+            operation: StorageOperation::Startup,
+            commit_state: FailureCommitState::NotAdmitted,
+            detail,
+            ..
+        }) => assert!(
+            detail.contains("storage.recovery_schema")
+                && detail.contains("unsupported ScriptBots schema v5"),
+            "the fixture must be refused as an unsupported schema: {detail}"
+        ),
+        other => panic!("expected definite schema startup refusal, got {other:?}"),
+    }
 
     let verification = Connection::open(&path)?;
     let sentinel = verification

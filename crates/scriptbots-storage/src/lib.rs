@@ -15627,6 +15627,17 @@ impl Storage {
             (None, None) => None,
         };
 
+        // Tick zero records launch state before any science step. Its narrative
+        // prefix is empty, just as in recovery validation; tick one still needs
+        // its own input evidence. Do not admit future or prior input through this case.
+        if enclosing_tick == 0
+            && previous_batch_tick == 0
+            && previous.is_none()
+            && first_candidate.is_none()
+        {
+            return Ok(());
+        }
+
         if previous.is_none() && first_candidate.is_none() {
             let row = self.connection()?.query_row_with_params(
                 "SELECT manifest_schema_version FROM runs WHERE run_id = ?1",
@@ -32765,6 +32776,18 @@ mod tests {
             ))
         ));
         assert_eq!(attributed.persistence_watermarks()?, before);
+        attributed.persist(&sample_batch(0, 1.0))?;
+        let after_launch = attributed.persistence_watermarks()?;
+        assert_eq!(after_launch.admitted.map(PersistenceBatchId::get), Some(1));
+        assert!(matches!(
+            attributed.persist(&sample_batch(1, 1.0)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MissingEvidence {
+                    first_offending_tick: 1
+                }
+            ))
+        ));
+        assert_eq!(attributed.persistence_watermarks()?, after_launch);
         assert_eq!(
             attributed.connection()?.execute_with_params(
                 "UPDATE runs SET manifest_schema_version = 0 WHERE run_id = ?1",

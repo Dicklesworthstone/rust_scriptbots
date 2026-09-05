@@ -6,7 +6,7 @@
 //! precisely the surface a user meets first. This drives the SHIPPED BINARY.
 //!
 //! NOTHING HERE IS STUBBED. A real child process, its real REST listener on an
-//! OS-assigned port, real HTTP over a real socket, and a real SIGTERM at the end.
+//! OS-assigned port, real HTTP over a real socket, and child kill/reap at the end.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -216,7 +216,7 @@ fn wait_for_control_addresses(
 ///     protocolVersion; POST /mcp notifications/initialized -> 202; POST /mcp tools/list -> 200
 ///     with all 13 tools; POST /mcp tools/call get_status -> 200 with live tick;
 ///     POST /mcp tools/call unknown -> JSON-RPC error.
-///  9. Process lifecycle: process remains alive throughout and shuts down cleanly.
+///  9. Process lifecycle: process remains alive throughout, then the test kills and reaps it.
 #[test]
 #[serial]
 fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screenshot() -> Result<()> {
@@ -591,7 +591,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         "MCP unknown tool must return JSON-RPC error object: {unknown_body}"
     );
 
-    // (9) Lifecycle: the child must still be running and terminates cleanly.
+    // (9) Lifecycle: observe a live child, then deliberately kill and reap it.
     let child = guard.0.as_mut().expect("child still held");
     assert!(
         child.try_wait()?.is_none(),
