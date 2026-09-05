@@ -164,43 +164,8 @@ fn lone_observer_sensors() -> [f32; INPUT_SIZE] {
     rt.sensors
 }
 
-#[test]
-fn stage_sense_drift_test_channel_by_channel() {
-    let sensors = lone_observer_sensors();
-
-    // 1. Lone agent: all neighbor channels MUST be exactly 0.0
-    for c in sensor_layout() {
-        if c.source == SensorSource::Neighbors {
-            assert_eq!(
-                sensors[c.index], 0.0,
-                "neighbor sensor {} (idx {}) must be 0 for lone agent",
-                c.name, c.index
-            );
-        }
-    }
-
-    // 2. Food channel (index 4) with zero food underfoot must be 0.0
-    assert_eq!(sensors[4], 0.0, "food sensor must be 0 with no food");
-
-    // 3. Health channel (index 11) is health * 0.5 clamped
-    // Note health was 0.8 -> 0.8 * 0.5 = 0.4
-    assert!(
-        (sensors[11] - 0.4).abs() < 0.05,
-        "health sensor (idx 11) expected ~0.4, got {}",
-        sensors[11]
-    );
-
-    // 4. Clocks (index 16, 17) must be within [0.0, 1.0]
-    assert!((0.0..=1.0).contains(&sensors[16]), "clock1 out of range");
-    assert!((0.0..=1.0).contains(&sensors[17]), "clock2 out of range");
-
-    // 5. Temperature (index 20) must be within [0.0, 1.0]
-    assert!(
-        (0.0..=1.0).contains(&sensors[20]),
-        "temperature out of range"
-    );
-
-    // World 2: Observer with a red neighbor directly in front (heading 0.0 looks in +X direction)
+fn world_with_neighbor_ahead() -> (WorldState, scriptbots_core::AgentId) {
+    // Observer with a red neighbor directly in front (heading 0.0 looks in +X direction)
     let mut world2 = WorldState::new(ScriptBotsConfig {
         world_width: 500,
         world_height: 500,
@@ -253,6 +218,47 @@ fn stage_sense_drift_test_channel_by_channel() {
             ..AgentData::default()
         })
         .expect("spawn neighbor");
+    (world2, obs2)
+}
+
+#[test]
+fn stage_sense_drift_test_channel_by_channel() {
+    let sensors = lone_observer_sensors();
+
+    // 1. Lone agent: all neighbor channels MUST be exactly 0.0
+    for c in sensor_layout() {
+        if c.source == SensorSource::Neighbors {
+            assert_eq!(
+                sensors[c.index], 0.0,
+                "neighbor sensor {} (idx {}) must be 0 for lone agent",
+                c.name, c.index
+            );
+        }
+    }
+
+    // 2. Food channel (index 4) with zero food underfoot must be 0.0
+    assert_eq!(sensors[4], 0.0, "food sensor must be 0 with no food");
+
+    // 3. Health channel (index 11) is health * 0.5 clamped
+    // Note health was 0.8 -> 0.8 * 0.5 = 0.4
+    assert!(
+        (sensors[11] - 0.4).abs() < 0.05,
+        "health sensor (idx 11) expected ~0.4, got {}",
+        sensors[11]
+    );
+
+    // 4. Clocks (index 16, 17) must be within [0.0, 1.0]
+    assert!((0.0..=1.0).contains(&sensors[16]), "clock1 out of range");
+    assert!((0.0..=1.0).contains(&sensors[17]), "clock2 out of range");
+
+    // 5. Temperature (index 20) must be within [0.0, 1.0]
+    assert!(
+        (0.0..=1.0).contains(&sensors[20]),
+        "temperature out of range"
+    );
+
+    // World 2: Observer with a red neighbor directly in front (heading 0.0 looks in +X direction)
+    let (mut world2, obs2) = world_with_neighbor_ahead();
     let expl = world2.explain_sensors(obs2, 16).expect("explain obs2");
     let explained = expl.clamped;
 

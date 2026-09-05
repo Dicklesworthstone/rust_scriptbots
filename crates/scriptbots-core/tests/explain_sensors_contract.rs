@@ -9,7 +9,7 @@
 //! `explain_sensors` is an instantaneous counterfactual over the completed boundary. It does not
 //! project the three stages that run before the next Sense, each of which can change an input:
 //!
-//!   - FoodDynamics grows, decays and diffuses the observer's food cell (channel 4)
+//!   - `FoodDynamics` grows, decays and diffuses the observer's food cell (channel 4)
 //!   - Aging damages agents on its cadence, moving health- and blood-derived channels
 //!   - Interventions can spawn, remove or damage agents outright
 //!

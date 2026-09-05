@@ -147,7 +147,7 @@ enum Baseline {
     ///
     /// `aging_health_decay_max` defaults to 0.0 and the validator requires
     /// `max >= rate`, so NO positive decay rate can be set from a default world at any
-    /// value. `aging_health_decay_start` also defaults to 12_000, far beyond any witness
+    /// value. `aging_health_decay_start` also defaults to `12_000`, far beyond any witness
     /// tick budget. Both have to move together for the family to be reachable at all --
     /// the cross-field case this bead was filed around.
     AgingEnabled,
@@ -236,7 +236,7 @@ impl BrainRunner for GiverBrain {
 /// Expressed at SPAWN TIME through the public `AgentData` fields rather than by reaching
 /// into world internals: an integration test sees only the public surface, and a helper
 /// that needed private access would be proving something the real callers cannot do.
-fn baseline_agent(baseline: Baseline, index: u32, base: AgentData) -> AgentData {
+const fn baseline_agent(baseline: Baseline, index: u32, base: AgentData) -> AgentData {
     match (baseline, index) {
         (Baseline::CombatReachable, 0) => AgentData {
             // Above stage_combat's 0.5 eligibility floor; decays only 0.005/tick.
@@ -312,6 +312,10 @@ fn arm_baseline(world: &mut WorldState, baseline: Baseline) -> Result<(), String
             .register("test.bd-3mul-giver", |_rng| {
                 Ok(Box::new(GiverBrain) as Box<dyn BrainRunner>)
             });
+        #[expect(
+            clippy::needless_collect,
+            reason = "Snapshot handles before binding and runtime updates mutably borrow world; iter_handles borrows the same arena"
+        )]
         for handle in world.agents().iter_handles().collect::<Vec<_>>() {
             world
                 .bind_agent_brain(handle, key)
@@ -369,13 +373,18 @@ fn run_material(
 ) -> Result<Vec<(&'static str, String)>, String> {
     let mut world = WorldState::new(baseline_config(baseline, config))
         .map_err(|e| format!("config rejected: {e:?}"))?;
-    for index in 0..6_u32 {
+    for index in 0..6_u16 {
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "Preserve the witness fixture's separate multiply and add operations so the seeded world layout retains its exact float arithmetic"
+        )]
+        let x = 30.0 + f32::from(index) * 9.0;
         let agent = world
             .try_spawn_agent(baseline_agent(
                 baseline,
-                index,
+                u32::from(index),
                 AgentData {
-                    position: Position::new(30.0 + f32::from(index as u16) * 9.0, 45.0),
+                    position: Position::new(x, 45.0),
                     ..AgentData::default()
                 },
             ))
@@ -1098,6 +1107,7 @@ fn bd_dorx_scientific_witness_coverage_does_not_regress() {
 ///   flattener stops at any non-object node, so each is one leaf on a default world and expands
 ///   only once populated. The deeper paths are real and reachable — just not discoverable from a
 ///   default config. That is the discovery/mutation asymmetry recorded on bd-dorx.
+///
 /// The stale pair that motivated this gate -- `mutation.primary` and `mutation.secondary` -- has
 /// now been REMOVED from `KNOB_RANGES`, so only the legitimate entries remain below. Kept in the
 /// docs because the reasoning is what stops them being reintroduced:

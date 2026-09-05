@@ -1962,7 +1962,7 @@ fn numeric_precision_reproduction_cooldown_does_not_round_down_and_fire_early() 
         spike_radius: f32::MIN_POSITIVE,
         persistence_interval: 0,
         closed: true,
-        rng_seed: Some(0xBD9_2),
+        rng_seed: Some(0xBD92),
         ..ScriptBotsConfig::default()
     })
     .expect("precision-boundary world");
@@ -1990,7 +1990,7 @@ fn numeric_precision_reproduction_cooldown_does_not_round_down_and_fire_early() 
         first.summary.births, 0,
         "an integer cooldown must not round down into an early birth"
     );
-    assert!(first.births.is_empty());
+    assert_eq!(first.births.len(), 0);
     assert_eq!(
         world
             .agent_runtime(parent)
@@ -2091,7 +2091,7 @@ fn numeric_precision_carcass_maturity_ratio_preserves_u32_order() {
         spike_radius: f32::MIN_POSITIVE,
         persistence_interval: 0,
         closed: true,
-        rng_seed: Some(0xCA2C_A55),
+        rng_seed: Some(0x0CA2_CA55),
         ..ScriptBotsConfig::default()
     })
     .expect("carcass precision world");
@@ -2166,7 +2166,7 @@ fn numeric_precision_aging_decay_preserves_u32_elapsed_ticks() {
         spike_radius: f32::MIN_POSITIVE,
         persistence_interval: 0,
         closed: true,
-        rng_seed: Some(0xA61_9),
+        rng_seed: Some(0xA619),
         ..ScriptBotsConfig::default()
     })
     .expect("aging precision world");
