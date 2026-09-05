@@ -644,7 +644,7 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
     inconsistent.close().unwrap();
 
     let bin = env!("CARGO_BIN_EXE_sb-analyze");
-    let execute = |run: RunId, name: &str, arguments: &[&str]| {
+    let execute = |run: RunId, name: &str, arguments: &[&str], refusal: Option<&str>| {
         let output = Command::new(bin)
             .arg(path)
             .arg("--run-id")
@@ -660,12 +660,20 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
             .append(true)
             .open(root.join("cases.jsonl"))
             .unwrap();
+        let expectation_observed = match refusal {
+            None => output.status.success(),
+            Some(reason) => {
+                !output.status.success() && String::from_utf8_lossy(&output.stderr).contains(reason)
+            }
+        };
         writeln!(
             cases,
             "{}",
             serde_json::json!({
                 "case": name, "run_id": run.to_string(), "arguments": arguments,
                 "binary": bin, "database": path, "exit_code": output.status.code(),
+                "expected_refusal": refusal, "expectation_observed": expectation_observed,
+                "first_failure": (!expectation_observed).then_some("CLI exit or refusal reason disagreed"),
                 "stdout_blake3": blake3::hash(&output.stdout).to_hex().to_string(),
                 "stderr_blake3": blake3::hash(&output.stderr).to_hex().to_string(),
             })
@@ -676,6 +684,11 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
             output.status,
             root.display()
         );
+        assert!(
+            expectation_observed,
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         output
     };
     for (name, params, expected) in [
@@ -684,6 +697,11 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
             "window",
             vec!["start_tick=5", "end_tick=7"],
             vec![(5, 0), (5, 1), (6, 0)],
+        ),
+        (
+            "end-boundary",
+            vec!["start_tick=5", "end_tick=6"],
+            vec![(5, 0), (5, 1)],
         ),
         ("recent", vec!["limit=2"], vec![(6, 0), (9, 0)]),
         ("zero", vec!["limit=0"], vec![]),
@@ -703,7 +721,7 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
         for value in &params {
             args.extend(["--params", value]);
         }
-        let output = execute(run_a, name, &args);
+        let output = execute(run_a, name, &args, None);
         assert!(
             output.status.success(),
             "{name}: {}",
@@ -743,20 +761,44 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
             assert_eq!(payload["node_count"], 2, "isolates are explicitly excluded");
         }
     }
-    for (index, params) in [
-        vec!["start_tick=5"],
-        vec!["end_tick=7"],
-        vec!["start_tick=7", "end_tick=5"],
-        vec!["start_tick=5", "end_tick=5"],
-        vec!["start_tick=5", "end_tick=7", "limit=2"],
-        vec!["start_tick=5", "end_tick=7", "limit=0"],
-        vec!["limit=5000"],
-        vec!["max_projected_bytes=0"],
-        vec!["max_graph_work=0"],
-        vec!["sample_k=0"],
-        vec!["fallback=replay"],
-        vec!["deadline_ms=1"],
-        vec!["start_ticks=5"],
+    for (index, (params, reason)) in [
+        (vec!["start_tick=5"], "must be supplied together"),
+        (vec!["end_tick=7"], "must be supplied together"),
+        (
+            vec!["start_tick=7", "end_tick=5"],
+            "expected start_tick < end_tick",
+        ),
+        (
+            vec!["start_tick=5", "end_tick=5"],
+            "expected start_tick < end_tick",
+        ),
+        (
+            vec!["start_tick=5", "end_tick=7", "limit=2"],
+            "complete window exceeds 2 events",
+        ),
+        (
+            vec!["start_tick=5", "end_tick=7", "limit=0"],
+            "complete window exceeds 0 events",
+        ),
+        (
+            vec!["limit=5000"],
+            "row limit exceeds the declared graph work budget",
+        ),
+        (
+            vec!["max_projected_bytes=0"],
+            "interaction_graph.max_projected_bytes",
+        ),
+        (
+            vec!["max_graph_work=0"],
+            "row limit exceeds the declared graph work budget",
+        ),
+        (vec!["sample_k=0"], "bad parameter 'sample_k'"),
+        (vec!["fallback=replay"], "replay fallback is unsupported"),
+        (
+            vec!["deadline_ms=1"],
+            "offline SQL execution has no hard deadline",
+        ),
+        (vec!["start_ticks=5"], "bad parameter 'start_ticks'"),
     ]
     .iter()
     .enumerate()
@@ -765,7 +807,7 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
         for value in params {
             args.extend(["--params", value]);
         }
-        let output = execute(run_a, &format!("refusal-{index}"), &args);
+        let output = execute(run_a, &format!("refusal-{index}"), &args, Some(reason));
         assert!(!output.status.success(), "must refuse {params:?}");
         assert!(!output.stderr.is_empty());
     }
@@ -787,6 +829,7 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
                     "--params",
                     "end_tick=7",
                 ],
+                None,
             );
             assert!(
                 output.status.success(),
@@ -899,7 +942,8 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
         !execute(
             run_c,
             "contradictory-capture-report",
-            &["run", "interaction-centrality"]
+            &["run", "interaction-centrality"],
+            Some("capture accounts for 2 persisted interactions but the run contains 1 rows"),
         )
         .status
         .success(),
@@ -910,7 +954,8 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
             !execute(
                 run_c,
                 &format!("contradictory-capture-{format}"),
-                &["export-graph", "--graph", "interaction", "--format", format,]
+                &["export-graph", "--graph", "interaction", "--format", format,],
+                Some("capture accounts for 2 persisted interactions but the run contains 1 rows"),
             )
             .status
             .success(),
@@ -921,7 +966,8 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
         !execute(
             RunId::from_namespace_sequence(0x1eaf, 4),
             "missing-run",
-            &["run", "interaction-centrality"]
+            &["run", "interaction-centrality"],
+            Some("does not exist"),
         )
         .status
         .success()
