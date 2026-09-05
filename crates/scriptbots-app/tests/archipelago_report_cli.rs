@@ -111,6 +111,17 @@ fn recorded_archipelago_cli_persists_every_island_and_tick()
         3,
         "all island identities must affect the observed science"
     );
+    let energies: std::collections::BTreeSet<_> = result["islands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|island| island["total_energy"].as_f64().unwrap().to_bits())
+        .collect();
+    assert_eq!(
+        energies.len(),
+        3,
+        "the stored-label comparison needs different observed energies on every island"
+    );
     let reader = StorageReader::open(database.to_str().unwrap())?;
     assert_eq!(reader.max_tick()?, Some(4));
     let watermarks = reader.persistence_watermarks()?;

@@ -130,6 +130,14 @@ uname -a > "$proof_dir/host.txt"
 sha256sum Cargo.lock rust-toolchain.toml > "$proof_dir/inputs.sha256"
 mkdir "$proof_dir/tmp"
 export TMPDIR="$proof_dir/tmp"
+# Embed the verified build inputs in the executable itself. Runtime manifests
+# deliberately do not infer a shipped binary's origin from its caller's checkout.
+export SCRIPTBOTS_SOURCE_REVISION="$actual_commit"
+export SCRIPTBOTS_SOURCE_BRANCH="$(git branch --show-current)"
+export SCRIPTBOTS_SOURCE_TREE_CLEAN=true
+export SCRIPTBOTS_SOURCE_STATUS_DIGEST="$(git status --porcelain --untracked-files=all | sha256sum | cut -d ' ' -f 1)"
+export SCRIPTBOTS_SOURCE_DIFF_DIGEST="$(git diff --binary HEAD | sha256sum | cut -d ' ' -f 1)"
+export SCRIPTBOTS_RUSTC_VV="$compiler_identity"
 steps=0
 touch "$proof_dir/commands.jsonl"
 trap 'rc=$?; if (( rc != 0 )); then jq -n --arg source "$actual_commit" --arg lane "$SCRIPTBOTS_VERIFY_LANE" --argjson exit_code "$rc" --argjson completed_steps "$steps" '\''{schema:"scriptbots.verification.v1",status:"failed",source:$source,lane:$lane,exit_code:$exit_code,completed_steps:$completed_steps}'\'' > "$proof_dir/verdict.json"; fi' EXIT
