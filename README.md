@@ -1102,6 +1102,13 @@ That wrapper runs DSR, verifies the typed source-bound verdict and requires actu
 executed documentation and integration test counts. Its scope is the documented
 library recipes; production GUI, PTY and browser journeys remain separate.
 
+For graph selection and attributed exports, select `graphs` (or the combined
+`graphs-and-recipes` lane) and run
+`DSR_CONFIG_DIR=/absolute/path/to/dsr-config scripts/e2e_analytics.sh scriptbots-verify proof-graphs-001`.
+This executes the existing real FrankenSQLite and `sb-analyze` subprocess tests,
+retaining their fixtures and outputs. It covers graph acceptance; the complete
+seeded simulation and report journey remains open under `bd-2z0.11.9`.
+
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.

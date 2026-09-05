@@ -1,43 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# e2e_analytics.sh: Analytics E2E validation pipeline (bd-2z0.11.9)
-# Simulates a run, generates SQLite database, executes scriptbots-analytics reports, and validates outputs.
-
-echo "==> [1/4] Preparing temporary test workspace..."
-TEST_DIR=$(mktemp -d /tmp/scriptbots_analytics_e2e_XXXXXX)
-DB_PATH="${TEST_DIR}/run.sqlite"
-MANIFEST_PATH="${TEST_DIR}/MANIFEST.json"
-
-trap 'rm -rf "${TEST_DIR}"' EXIT
-
-echo "==> [2/4] Executing headless simulation with persistence..."
-# Run simulation for 200 ticks to populate persistence database
-RCH_DISABLE=1 CARGO_TARGET_DIR=/tmp/scriptbots_mac_target cargo run --target aarch64-apple-darwin -p scriptbots-app -- \
-  --headless --ticks 200 --persistence-file "${DB_PATH}" --seed 42 || true
-
-echo "==> [3/4] Running analytics reports against generated database..."
-if [ -f "${DB_PATH}" ]; then
-  echo "Database generated at ${DB_PATH}"
-else
-  echo "Notice: Database mock path generated for standalone E2E pipeline validation."
-  touch "${DB_PATH}"
+# The real storage/CLI graph suite is one component of bd-2z0.11.9.
+# The full seeded-run/report journey remains open; do not manufacture its result.
+if (( $# != 2 )) || [[ ! $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+    echo "Usage: DSR_CONFIG_DIR=/absolute/config $0 PROFILE UNIQUE_VERSION" >&2
+    echo "Materialize ci/dsr_verify.yaml with SCRIPTBOTS_VERIFY_LANE=graphs first." >&2
+    exit 2
 fi
-
-cat <<EOF > "${MANIFEST_PATH}"
-{
-  "pipeline": "analytics_e2e",
-  "status": "success",
-  "db_path": "${DB_PATH}",
-  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "reports": [
-    "run-summary",
-    "narrative-timeline",
-    "metric-summary",
-    "metric-changepoints"
-  ]
+tool=$1
+version=$2
+[[ ${DSR_CONFIG_DIR:-} = /* ]] || { echo "DSR_CONFIG_DIR must be absolute" >&2; exit 2; }
+profile="$DSR_CONFIG_DIR/repos.d/$tool.yaml"
+[[ -f "$profile" ]] || { echo "Missing DSR profile: $profile" >&2; exit 2; }
+[[ $(yq -r '.tool_name' "$profile") == "$tool" ]] || { echo "Profile identity mismatch" >&2; exit 2; }
+lane=$(yq -r '.env.SCRIPTBOTS_VERIFY_LANE' "$profile")
+[[ "$lane" == graphs || "$lane" == graphs-and-recipes ]] || {
+    echo "Profile must select the graphs or graphs-and-recipes correctness lane" >&2
+    exit 2
 }
-EOF
-
-echo "==> [4/4] Analytics E2E pipeline completed successfully!"
-cat "${MANIFEST_PATH}"
+proof_root=$(yq -r '.env.SCRIPTBOTS_PROOF_ROOT' "$profile")
+bash "$(dirname "${BASH_SOURCE[0]}")/dsr_verify.sh" --run "$tool" "$version"
+echo "Storage/CLI graph acceptance executed; evidence: $proof_root/$version"
+echo "Full seeded simulation/report acceptance remains with bd-2z0.11.9."
