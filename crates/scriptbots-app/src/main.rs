@@ -136,14 +136,11 @@ fn persistence_step_driver(
             .map_err(|error| PersistenceSessionError::Unavailable {
                 detail: format!("session mutex poisoned while stepping: {error}"),
             })?;
-        let outcome = session.step(&mut world)?;
-        // Publish the completed summary outside the mutex protocol (bd-134):
-        // control surfaces read this slot wait-free instead of contending on
-        // the world lock the next tick will hold.
-        if let Some(summary) = world.history().next_back() {
-            latest_summary.store(Some(std::sync::Arc::new(summary.clone())));
-        }
-        Ok(outcome)
+        let outcome = session.step(&mut world);
+        // Capture actual status even when the completed step returns a fault.
+        // Readers can serve this boundary while the next admission holds the lock.
+        scriptbots_app::control::publish_world_observation(&latest_summary, &world);
+        outcome
     })
 }
 
@@ -483,8 +480,9 @@ fn main() -> Result<()> {
     )?;
     // The wrap happens HERE now, not inside bootstrap_world. This is the line
     // bd-pcfj replaces with a move into the host thread.
-    let world: SharedWorld = Arc::new(Mutex::new(bootstrapped_world));
     let latest_summary = scriptbots_app::control::empty_latest_summary();
+    scriptbots_app::control::publish_world_observation(&latest_summary, &bootstrapped_world);
+    let world: SharedWorld = Arc::new(Mutex::new(bootstrapped_world));
     let simulation_step = persistence_step_driver(&world, &persistence, &latest_summary);
 
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
@@ -4737,6 +4735,66 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    #[test]
+    fn persistence_step_driver_publishes_actual_status_on_success_and_error() {
+        for wrong_binding in [false, true] {
+            let config = ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                rng_seed: Some(0x513C),
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            };
+            let (mut world, session) = WorldState::with_persistence(
+                config.clone(),
+                Box::new(scriptbots_core::NullPersistence),
+            )
+            .expect("real one-shot persistence session");
+            if wrong_binding {
+                world = WorldState::new(config).expect("distinct world binding");
+            }
+            let world = Arc::new(Mutex::new(world));
+            let session = Arc::new(Mutex::new(session));
+            let slot = scriptbots_app::control::empty_latest_summary();
+            let driver = persistence_step_driver(&world, &session, &slot);
+            let result = driver();
+            if wrong_binding {
+                assert!(matches!(
+                    result,
+                    Err(scriptbots_core::WorldStepError::PersistenceSession(
+                        PersistenceSessionError::WrongWorld
+                    ))
+                ));
+            } else {
+                assert_eq!(
+                    result.expect("matching binding steps").tick,
+                    scriptbots_core::Tick(1)
+                );
+            }
+            let (sender, _receiver) = scriptbots_app::command::create_command_bus(4);
+            let handle =
+                scriptbots_app::control::ControlHandle::new(Arc::clone(&world), sender, slot);
+            let owner = world.lock().expect("retain world lock during status read");
+            let (reply, receipt) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || reply.send(handle.status()));
+            let status = receipt.recv_timeout(std::time::Duration::from_secs(2));
+            drop(owner);
+            reader
+                .join()
+                .expect("reader joins")
+                .expect("reply retained");
+            let status = status
+                .expect("status returns before the owner lock is released")
+                .expect("production driver published the boundary");
+            assert_eq!(status.tick, u64::from(!wrong_binding));
+            assert_eq!(status.agent_count, 0);
+            assert!(status.is_closed);
+            assert_eq!(status.config_revision, 0);
+        }
+    }
 
     /// bd-2z0.14.3.4: the semantic projection path must not touch the GPU.
     ///

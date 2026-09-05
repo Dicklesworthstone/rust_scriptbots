@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 // removed duplicate import
 
 use arc_swap::ArcSwapOption;
@@ -41,12 +41,23 @@ impl ConfigSnapshot {
 }
 
 /// Status summary of the running simulation for control clients.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SimulationStatusDto {
     pub tick: u64,
     pub agent_count: usize,
     pub is_closed: bool,
     pub config_revision: u64,
+}
+
+impl SimulationStatusDto {
+    fn from_world(world: &WorldState) -> Self {
+        Self {
+            tick: world.tick().0,
+            agent_count: world.agent_count(),
+            is_closed: world.is_closed(),
+            config_revision: world.config_revision(),
+        }
+    }
 }
 
 /// Snapshot describing the current hydrology state.
@@ -196,12 +207,24 @@ fn lock_cache<T>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
     cache.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Latest completed tick summary, published by the simulation step drivers
-/// outside the world mutex (bd-134).
-///
-/// Reads are wait-free: control surfaces serve `latest_summary` from this slot
-/// even while the world mutex is held by a long tick — or poisoned outright.
-pub type SharedLatestSummary = Arc<ArcSwapOption<scriptbots_core::TickSummary>>;
+/// Status and completed summary captured together while the owner can read the world.
+/// The status can exist at bootstrap before the first completed tick summary.
+#[derive(Debug, Clone)]
+pub struct PublishedWorldObservation {
+    summary: Option<scriptbots_core::TickSummary>,
+    status: SimulationStatusDto,
+}
+
+/// Latest owner observation; readers load it without acquiring the world mutex.
+pub type SharedLatestSummary = Arc<ArcSwapOption<PublishedWorldObservation>>;
+
+/// Publish the world's actual fields at an owner boundary, including failed steps.
+pub fn publish_world_observation(slot: &SharedLatestSummary, world: &WorldState) {
+    slot.store(Some(Arc::new(PublishedWorldObservation {
+        summary: world.history().next_back().cloned(),
+        status: SimulationStatusDto::from_world(world),
+    })));
+}
 
 /// Fresh, empty published-summary slot.
 #[must_use]
@@ -474,8 +497,10 @@ impl ControlHandle {
         // Wait-free published read first (bd-134): the step drivers store each
         // completed summary here, so a contended — or poisoned — world mutex
         // cannot stall this endpoint or the SSE/NDJSON streams built on it.
-        if let Some(summary) = self.latest_summary.load_full() {
-            return Ok((*summary).clone());
+        if let Some(observation) = self.latest_summary.load_full()
+            && let Some(summary) = &observation.summary
+        {
+            return Ok(summary.clone());
         }
         // Nothing published yet (before the first completed tick, or a driver
         // that does not publish): fall back to the world itself.
@@ -543,14 +568,18 @@ impl ControlHandle {
         Ok(last_status.expect("at least one iteration"))
     }
 
-    /// Retrieve the current status summary of the running simulation.
+    /// Read current status without waiting for a busy world owner.
+    /// During contention, return the last published boundary with its observed tick.
     pub fn status(&self) -> Result<SimulationStatusDto, ControlError> {
-        self.with_world(|world| SimulationStatusDto {
-            tick: world.tick().0,
-            agent_count: world.agent_count(),
-            is_closed: world.is_closed(),
-            config_revision: world.config_revision(),
-        })
+        match self.shared_world.try_lock() {
+            Ok(world) => Ok(SimulationStatusDto::from_world(&world)),
+            Err(TryLockError::WouldBlock) => self
+                .latest_summary
+                .load_full()
+                .map(|observation| observation.status.clone())
+                .ok_or(ControlError::Lock),
+            Err(TryLockError::Poisoned(_)) => Err(ControlError::Lock),
+        }
     }
 
     /// Retrieve a snapshot of the current hydrology state, if available.
@@ -1448,6 +1477,95 @@ mod tests {
         }
     }
 
+    fn read_status_before_releasing_owner(
+        handle: ControlHandle,
+        owner: MutexGuard<'_, WorldState>,
+    ) -> Result<SimulationStatusDto, ControlError> {
+        let (reply, receipt) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || reply.send(handle.status()));
+        let result = receipt.recv_timeout(std::time::Duration::from_secs(2));
+        drop(owner);
+        reader
+            .join()
+            .expect("status reader joins")
+            .expect("reply retained");
+        result.expect("status must return while the owner still holds its lock")
+    }
+
+    #[test]
+    fn status_contention_serves_observed_fields_and_refreshes_after_release() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0x513A),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("status world");
+        world.step().expect("first observed tick");
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("one observed agent");
+        let mut config = world.config().clone();
+        config.closed = false;
+        world.apply_config_update(config).expect("first revision");
+        let expected = SimulationStatusDto {
+            tick: 1,
+            agent_count: 1,
+            is_closed: false,
+            config_revision: 1,
+        };
+        assert_eq!(SimulationStatusDto::from_world(&world), expected);
+        let slot = empty_latest_summary();
+        publish_world_observation(&slot, &world);
+        let shared_world = Arc::new(Mutex::new(world));
+        let (sender, _receiver) = crate::command::create_command_bus(4);
+        let handle = ControlHandle::new(Arc::clone(&shared_world), sender, Arc::clone(&slot));
+
+        let mut owner = shared_world.lock().expect("hold the actual owner mutex");
+        let mut config = owner.config().clone();
+        config.closed = true;
+        owner.apply_config_update(config).expect("second revision");
+        assert!(matches!(
+            shared_world.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        let current = SimulationStatusDto::from_world(&owner);
+        assert_eq!(current.config_revision, 2);
+        assert!(current.is_closed);
+        assert_ne!(
+            current, expected,
+            "the cached observation must actually be stale"
+        );
+        assert_eq!(
+            read_status_before_releasing_owner(handle.clone(), owner)
+                .expect("nonblocking observed status"),
+            expected
+        );
+        assert_eq!(handle.status().expect("current unlocked status"), current);
+
+        let owner = shared_world
+            .lock()
+            .expect("republish the actual owner boundary");
+        publish_world_observation(&slot, &owner);
+        assert_eq!(
+            read_status_before_releasing_owner(handle, owner).expect("refreshed observed status"),
+            current
+        );
+    }
+
+    #[test]
+    fn status_without_an_observation_refuses_a_busy_world() {
+        let (handle, _receiver) = handle();
+        let owner = handle.shared_world.lock().expect("hold unobserved world");
+        assert!(handle.latest_summary.load_full().is_none());
+        assert!(matches!(
+            read_status_before_releasing_owner(handle.clone(), owner),
+            Err(ControlError::Lock)
+        ));
+    }
+
     /// bd-134: a published summary is served wait-free — even a POISONED world
     /// mutex must not take the latest-summary endpoint (and the SSE/NDJSON
     /// streams built on it) down with it.
@@ -1466,10 +1584,10 @@ mod tests {
             .expect("completed tick summary")
             .clone();
 
+        let slot = empty_latest_summary();
+        publish_world_observation(&slot, &world);
         let shared_world: SharedWorld = Arc::new(Mutex::new(world));
         let (sender, _receiver) = crate::command::create_command_bus(4);
-        let slot = empty_latest_summary();
-        slot.store(Some(Arc::new(published.clone())));
         let handle = ControlHandle::new(Arc::clone(&shared_world), sender, slot);
 
         // Poison the world mutex on purpose.
@@ -1491,6 +1609,7 @@ mod tests {
 
         // Endpoints that genuinely need the world still fail typed.
         assert!(matches!(handle.snapshot(), Err(ControlError::Lock)));
+        assert!(matches!(handle.status(), Err(ControlError::Lock)));
     }
 
     /// bd-2t3k: the derived caches are not scientific state, so one unrelated panic

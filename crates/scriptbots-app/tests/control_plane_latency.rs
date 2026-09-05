@@ -27,7 +27,7 @@ use std::{
 
 use scriptbots_app::{
     ControlRuntime, ControlServerConfig, McpTransportConfig, WorldStepDriver,
-    control::empty_latest_summary,
+    control::{empty_latest_summary, publish_world_observation},
 };
 use scriptbots_core::{AgentData, Position, ScriptBotsConfig, WorldState};
 
@@ -84,9 +84,7 @@ fn publishing_step_driver(
     Arc::new(move || {
         let mut world = world.lock().expect("latency world mutex");
         let events = world.step()?;
-        if let Some(summary) = world.history().next_back() {
-            latest.store(Some(Arc::new(summary.clone())));
-        }
+        publish_world_observation(&latest, &world);
         Ok(events)
     })
 }
@@ -112,6 +110,56 @@ fn percentile(sorted: &[Duration], quantile: f64) -> Duration {
     }
     let rank = ((sorted.len() - 1) as f64 * quantile).round() as usize;
     sorted[rank.min(sorted.len() - 1)]
+}
+
+#[test]
+fn status_http_returns_the_published_boundary_while_the_owner_mutex_is_held() {
+    let mut world = WorldState::new(ScriptBotsConfig {
+        world_width: 64,
+        world_height: 64,
+        food_cell_size: 16,
+        rng_seed: Some(0x513B),
+        persistence_interval: 0,
+        closed: true,
+        ..ScriptBotsConfig::default()
+    })
+    .expect("real status world");
+    world.step().expect("actual published tick");
+    let latest = empty_latest_summary();
+    publish_world_observation(&latest, &world);
+    let world = Arc::new(Mutex::new(world));
+    let rest_address = unused_loopback_address();
+    let (runtime, _drain, _submit) = ControlRuntime::launch(
+        Arc::clone(&world),
+        latest,
+        ControlServerConfig {
+            rest_address,
+            rest_enabled: true,
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        },
+    )
+    .expect("real REST startup");
+    let owner = world
+        .lock()
+        .expect("hold the owner mutex through the HTTP read");
+    assert!(matches!(
+        world.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    let response = http_get(rest_address, "/api/status");
+    // Release before asserting so a regressed handler can finish and shutdown can join.
+    drop(owner);
+    runtime.shutdown().expect("REST shutdown");
+    let response = response.expect("status returns before the held owner lock is released");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let (_, body) = response.split_once("\r\n\r\n").expect("HTTP body");
+    let status: scriptbots_app::control::SimulationStatusDto =
+        serde_json::from_str(body).expect("actual status JSON");
+    assert_eq!(status.tick, 1);
+    assert_eq!(status.agent_count, 0);
+    assert!(status.is_closed);
+    assert_eq!(status.config_revision, 0);
 }
 
 #[test]
