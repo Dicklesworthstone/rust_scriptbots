@@ -227,10 +227,13 @@ fn drive_until_journal_state(
     next_nanos: &mut u64,
 ) -> CommandStatus {
     let mut last_status = None;
+    let mut last_drive = None;
     for _ in 0..WORKER_RETRY_LIMIT {
-        frontend
-            .drive_at(core, ManualInstant::from_nanos(*next_nanos))
-            .expect("public frontend drives the matching host");
+        last_drive = Some(
+            frontend
+                .drive_at(core, ManualInstant::from_nanos(*next_nanos))
+                .expect("public frontend drives the matching host"),
+        );
         *next_nanos = next_nanos
             .checked_add(1)
             .expect("test manual clock does not overflow");
@@ -250,7 +253,10 @@ fn drive_until_journal_state(
     assert_eq!(
         status.journal(),
         expected,
-        "command {command_id:?} did not reach journal state {expected:?}"
+        "command {command_id:?} did not reach journal state {expected:?}; \
+         status={status:?}; last drive={last_drive:?}; interest={:?}; health={:?}",
+        core.drive_interest(),
+        core.health()
     );
     status
 }
@@ -324,8 +330,10 @@ fn resolve_authority_submission(
     }
     panic!(
         "durable command authority did not resolve within {WORKER_RETRY_LIMIT} nonblocking polls; \
-         envelope={envelope:?}; snapshot={:?}",
-        core.latest_snapshot()
+         envelope={envelope:?}; tick={:?}; interest={:?}; health={:?}",
+        core.world_tick(),
+        core.drive_interest(),
+        core.health()
     );
 }
 

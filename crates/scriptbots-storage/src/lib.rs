@@ -14030,31 +14030,12 @@ impl Storage {
             });
         }
         if !pre_v13_claim_migration {
-            let command_claim_mismatch = connection.query_with_params(
-                "SELECT command.host_session_id, command.command_id
-                 FROM host_command_records AS command
-                 LEFT JOIN host_command_claims AS claim
-                   ON claim.run_id = command.run_id
-                  AND claim.command_id = command.command_id
-                 WHERE command.run_id = ?1
-                   AND (
-                        claim.command_id IS NULL
-                        OR claim.host_session_id <> command.host_session_id
-                        OR claim.envelope_postcard_hex <> command.envelope_postcard_hex
-                   )
-                 LIMIT 1",
-                &[sqlite_run_id(run_id)],
-            )?;
-            if let Some(row) = command_claim_mismatch.first() {
-                let session: String = decode(row, 0, "host_command_records.host_session_id")?;
-                let command_id: String = decode(row, 1, "host_command_records.command_id")?;
-                return Err(StorageError::InvalidData {
-                    context: "host_command_claims.terminal_binding",
-                    reason: format!(
-                        "command record ({session}, {command_id}) has no exact durable command claim"
-                    ),
-                });
-            }
+            // The session scan above binds every archived command to its exact
+            // claim through require_command_claim_for_connection and compares
+            // the command projection against that same canonical archive. The
+            // orphan checks bind every projection to a scanned archive/session.
+            // Repeating that proof with a LEFT JOIN / OR mismatch query produced
+            // false positives on valid file journals at the pinned engine.
             let claim_orphan = connection.query_with_params(
                 "SELECT claim.host_session_id, claim.command_id
                  FROM host_command_claims AS claim
@@ -27146,6 +27127,45 @@ mod tests {
         connection.close()?;
         assert_recovery_refused_without_database_mutation(
             &missing,
+            "no exact durable pre-admission claim",
+        )?;
+
+        // Also exercise a complete projection: removing the redundant outer
+        // join must not let a terminal command survive loss of its exact claim.
+        let applied = temp_db_path("storage-applied-missing-command-preclaim");
+        let applied_string = applied.to_string_lossy().to_string();
+        let (pipeline, mut core, mut frontend) =
+            fault_test_host(&applied_string, HostSessionId::new(0x518));
+        let mut next_nanos = 0;
+        for command in [HostCommand::Step, HostCommand::Shutdown] {
+            let command = submit_fault_command(&mut frontend, &mut core, command, &mut next_nanos);
+            let status = drive_journal_command_to_terminal(
+                &mut frontend,
+                &mut core,
+                command.command_id(),
+                &mut next_nanos,
+            );
+            assert_eq!(status.journal(), &JournalState::Durable);
+        }
+        drop_fault_host(pipeline, core, frontend);
+        let complete = StorageReader::open_finished(&applied_string)?;
+        drop(complete);
+        let connection = Connection::open(&applied_string)?;
+        let projections: i64 = connection
+            .query_row("SELECT COUNT(*) FROM host_command_records")?
+            .get_typed(0)?;
+        assert_eq!(
+            projections, 2,
+            "the missing-claim control needs terminal records"
+        );
+        assert_eq!(connection.execute("DELETE FROM host_command_claims")?, 2);
+        connection.close()?;
+        assert_recovery_refused_without_database_mutation(
+            &applied,
+            "no exact durable pre-admission claim",
+        )?;
+        assert_finished_reader_refused_without_database_mutation(
+            &applied,
             "no exact durable pre-admission claim",
         )?;
 
