@@ -423,6 +423,8 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|value| value["reason"] == "compiler-artifact")
         .collect::<Vec<_>>();
+    let target = std::env::var("SCRIPTBOTS_VERIFY_TARGET")?;
+    let target_root = PathBuf::from(std::env::var("CARGO_TARGET_DIR")?).join(&target);
     let mut libraries = BTreeMap::new();
     // Cargo may use separate artifact directories for every dependency. Derive
     // search paths from this build's records, including transitive crates and
@@ -443,17 +445,30 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
             .filter_map(|artifact| artifact["filenames"].as_array())
             .flatten()
             .filter_map(serde_json::Value::as_str)
-            .filter(|filename| filename.ends_with(".rlib"))
+            .filter(|filename| Path::new(filename).starts_with(&target_root))
+            .filter(|filename| filename.ends_with(".rlib") || filename.ends_with(".rmeta"))
             .collect::<std::collections::BTreeSet<_>>();
         anyhow::ensure!(
-            files.len() == 1,
-            "expected one exact rlib for {name}, got {files:?}"
+            files
+                .iter()
+                .filter(|filename| filename.ends_with(".rlib"))
+                .count()
+                == 1
+                && files
+                    .iter()
+                    .filter(|filename| filename.ends_with(".rmeta"))
+                    .count()
+                    <= 1,
+            "expected one target library and at most one separate metadata file for {name}, got {files:?}"
         );
-        let path = PathBuf::from(files.first().unwrap());
-        anyhow::ensure!(path.is_file(), "missing library {}", path.display());
-        libraries.insert(name, path);
+        for filename in &files {
+            anyhow::ensure!(
+                Path::new(filename).is_file(),
+                "missing library artifact {filename}"
+            );
+        }
+        libraries.insert(name, files);
     }
-    let target = std::env::var("SCRIPTBOTS_VERIFY_TARGET")?;
     let source_commit = std::env::var("SCRIPTBOTS_EXPECTED_COMMIT")?;
     let evidence = tempfile::Builder::new()
         .prefix("literal-recipes-")
@@ -566,10 +581,12 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
                 "CARGO_MANIFEST_DIR",
                 directory.join("crates/scriptbots-app"),
             );
-        for (name, library) in &libraries {
-            compiler
-                .arg("--extern")
-                .arg(format!("{name}={}", library.display()));
+        for (name, library_files) in &libraries {
+            // Separate-metadata Cargo builds pass both artifacts to rustc.
+            // Embedded-metadata builds provide only the linkable rlib.
+            for filename in library_files {
+                compiler.arg("--extern").arg(format!("{name}={filename}"));
+            }
         }
         for directory in &dependency_directories {
             compiler
