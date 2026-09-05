@@ -18,8 +18,8 @@ use scriptbots_runtime::{
 use scriptbots_storage::{
     CommandJournalCursor, CommandStorageTransitionKind, DomainEventExpectation, DomainEventPayload,
     HostJournalPrefixes, HostJournalRecordState, HostJournalSessionPage, NarrativeInputStreamError,
-    PersistenceGuarantee, StorageError, StorageEventJournalReader, StorageIntegrityCheckResult,
-    StorageJournalOptions, StoragePipeline, StorageReader,
+    PersistenceGuarantee, Storage, StorageError, StorageEventJournalReader,
+    StorageIntegrityCheckResult, StorageJournalOptions, StoragePipeline, StorageReader,
 };
 use std::{
     fs,
@@ -2269,8 +2269,8 @@ fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
         format!("{corrupted_path}.scriptbots-writer.lock"),
     )
     .expect("copy the stable writer-lease companion");
-    StorageReader::open_finished_for_run(&corrupted_path, first_run_id)
-        .expect("copied configuration boundary must validate before mutation")
+    Storage::recover_existing_run(&corrupted_path, first_run_id)
+        .expect("copied configuration boundary must recover before mutation")
         .close()
         .expect("close valid configuration copy");
     let connection = Connection::open(&corrupted_path).expect("open policy mutation fixture");
@@ -2294,7 +2294,7 @@ fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
     assert_eq!(changed, 1);
     connection.close().expect("close policy mutation fixture");
     let before = fs::read(&corrupted_path).expect("read corrupted fixture before validation");
-    let refusal = StorageReader::open_finished_for_run(&corrupted_path, first_run_id);
+    let refusal = Storage::recover_existing_run(&corrupted_path, first_run_id);
     assert_eq!(
         fs::read(&corrupted_path).expect("read after refusal"),
         before
