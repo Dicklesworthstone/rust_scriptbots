@@ -19,8 +19,8 @@ use crate::{Brain, BrainKind, into_runner};
 
 const BRAIN_SIZE: usize = 200;
 const ASSEMBLY_FAMILY_ID: &str = "assembly";
-const ADAPTER_SEMANTIC_VERSION: u32 = 2;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.assembly.adapter-semantics.v2";
+const ADAPTER_SEMANTIC_VERSION: u32 = 3;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.assembly.adapter-semantics.v3";
 const ASSEMBLY_GENOME_SCHEMA_VERSION: u32 = 1;
 const LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR: &[u8] =
     b"scriptbots.assembly.locus-schema.cell-index-ascending:[Cell]";
@@ -413,7 +413,7 @@ impl BrainFamilyCodec for AssemblyFamilyAdapter {
         rates: MutationRates,
         rng: &mut dyn RandomStream,
     ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
-        validate_mutation_probability(rates.primary, &self.family_id)?;
+        validate_primary_mutation_threshold(rates.primary, &self.family_id)?;
         validate_mutation_scale(rates.secondary, &self.family_id)?;
         let mut cells = self.decode_genome(genome)?;
         for cell in &mut cells {
@@ -616,18 +616,21 @@ fn validate_cells_for_family(
     Ok(())
 }
 
-fn validate_mutation_probability(
-    probability: f32,
+fn validate_primary_mutation_threshold(
+    threshold: f32,
     family_id: &BrainFamilyId,
 ) -> Result<(), BrainProtocolError> {
-    if (0.0..=1.0).contains(&probability) {
+    // Core meta-mutation only lower-bounds the inherited primary threshold. The legacy
+    // Assembly gate compares a uniform [0, 1) draw directly with it, so values above one
+    // select every cell without changing the draw order or the stored inherited threshold.
+    if threshold.is_finite() && threshold >= 0.0 {
         Ok(())
     } else {
         Err(invalid_payload(
             BrainEnvelopeKind::Genome,
             family_id,
             format!(
-                "Assembly mutation probability must be finite and in [0, 1], found {probability}"
+                "Assembly primary mutation threshold must be finite and nonnegative, found {threshold}"
             ),
         ))
     }
@@ -734,7 +737,7 @@ mod tests {
     };
 
     #[test]
-    fn adapter_semantic_identity_v2_is_pinned() {
+    fn adapter_semantic_identity_v3_is_pinned() {
         let identity = AssemblyFamilyAdapter::new()
             .expect("canonical Assembly adapter")
             .adapter_identity();
@@ -1161,6 +1164,57 @@ mod tests {
     }
 
     #[test]
+    fn protocol_primary_thresholds_at_or_above_one_match_legacy_bytes_and_rng() {
+        let family = AssemblyFamilyAdapter::new().expect("canonical Assembly family");
+        let cells = [7.0; BRAIN_SIZE];
+        let genome = family
+            .genome(&cells, fixture_provenance())
+            .expect("fixture genome");
+
+        // 1.01 was previously rejected by the protocol even though core meta-mutation can
+        // produce it and the existing Assembly mutation kernel accepts it as an all-cell gate.
+        for primary in [1.0, 1.01, 1.25, f32::MAX] {
+            let rates = MutationRates {
+                primary,
+                secondary: 0.0,
+            };
+            let mut protocol_rng = SmallRngStream::seed_from_u64(91);
+            let mut legacy_rng = SmallRngStream::seed_from_u64(91);
+            let mut legacy = AssemblyBrain { cells };
+            let mutated = family
+                .mutate_genome(&genome, rates, fixture_provenance(), &mut protocol_rng)
+                .expect("finite nonnegative primary threshold");
+            legacy
+                .mutate(&mut legacy_rng, rates.primary, rates.secondary)
+                .expect("legacy Assembly mutation");
+            let expected = family
+                .genome(&legacy.cells, fixture_provenance())
+                .expect("encoded legacy genome");
+
+            assert_eq!(
+                mutated.payload(),
+                expected.payload(),
+                "primary threshold {primary} must preserve every encoded legacy cell byte"
+            );
+            assert_eq!(mutated, expected, "primary threshold {primary}");
+            assert_eq!(
+                protocol_rng.checkpoint(),
+                legacy_rng.checkpoint(),
+                "primary threshold {primary} must preserve the exact legacy RNG continuation"
+            );
+            assert_ne!(mutated.payload(), genome.payload());
+            assert!(
+                family
+                    .decode_genome(&mutated)
+                    .expect("mutated cells")
+                    .iter()
+                    .all(|cell| (-3.0..3.0).contains(cell)),
+                "primary threshold {primary} must replace every initial 7.0 cell"
+            );
+        }
+    }
+
+    #[test]
     fn protocol_rejects_invalid_shapes_nonfinite_cells_rates_and_inputs_transactionally() {
         let family = AssemblyFamilyAdapter::new().expect("canonical Assembly family");
         let genome = family
@@ -1197,8 +1251,9 @@ mod tests {
             family.validate_genome(&nan_genome),
             Err(BrainProtocolError::InvalidPayload { .. })
         ));
-        for invalid_rate in [f32::NAN, -0.01, 1.01] {
+        for invalid_rate in [f32::NAN, -0.01, f32::INFINITY, f32::NEG_INFINITY] {
             let mut rng = SmallRngStream::seed_from_u64(1);
+            let before = rng.checkpoint();
             assert!(matches!(
                 family.mutate_genome(
                     &genome,
@@ -1211,9 +1266,15 @@ mod tests {
                 ),
                 Err(BrainProtocolError::InvalidPayload { .. })
             ));
+            assert_eq!(
+                rng.checkpoint(),
+                before,
+                "invalid primary threshold {invalid_rate} must not consume RNG"
+            );
         }
         for invalid_scale in [f32::NAN, -0.01, f32::INFINITY, f32::NEG_INFINITY] {
             let mut rng = SmallRngStream::seed_from_u64(1);
+            let before = rng.checkpoint();
             assert!(matches!(
                 family.mutate_genome(
                     &genome,
@@ -1226,6 +1287,11 @@ mod tests {
                 ),
                 Err(BrainProtocolError::InvalidPayload { .. })
             ));
+            assert_eq!(
+                rng.checkpoint(),
+                before,
+                "invalid secondary scale {invalid_scale} must not consume RNG"
+            );
         }
 
         let mut rng = SmallRngStream::seed_from_u64(2);

@@ -23,8 +23,10 @@ const CONNECTIONS: usize = 4;
 const BRAIN_SIZE_WIRE: u16 = 200;
 const CONNECTIONS_WIRE: u8 = 4;
 const MLP_FAMILY_ID: &str = "mlp-baseline";
-const ADAPTER_SEMANTIC_VERSION: u32 = 3;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.adapter-semantics.v3";
+// Version 4 admits evolved primary thresholds above one, allowing reproduction to continue
+// through the existing mutation kernel instead of rejecting an otherwise valid genome.
+const ADAPTER_SEMANTIC_VERSION: u32 = 4;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.adapter-semantics.v4";
 const GENOME_SCHEMA_VERSION: u32 = 1;
 const LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.mlp-baseline.locus-schema.node-ascending:[NodeBias,NodeDamping,NodeGain,connection-ascending:[NodeWeight,NodeKind,NodeTarget]]";
 const GENOME_CODEC_VERSION: u16 = 1;
@@ -720,10 +722,12 @@ impl MlpBrainFamily {
     }
 
     fn validate_mutation_rates(&self, rates: MutationRates) -> Result<(), BrainProtocolError> {
-        if !rates.primary.is_finite() || !(0.0..=1.0).contains(&rates.primary) {
+        // Core's inherited meta-mutation has no upper bound. The legacy kernel compares
+        // uniform draws against this raw threshold, so finite values above one are valid.
+        if !rates.primary.is_finite() || rates.primary < 0.0 {
             return Err(self.invalid(
                 BrainEnvelopeKind::Genome,
-                "primary mutation probability must be finite and within [0, 1]",
+                "primary mutation threshold must be finite and nonnegative",
             ));
         }
         if !rates.secondary.is_finite() || rates.secondary < 0.0 {
@@ -1172,7 +1176,7 @@ mod tests {
     };
 
     #[test]
-    fn adapter_semantic_identity_v3_is_pinned() {
+    fn adapter_semantic_identity_v4_is_pinned() {
         let identity = MlpBrainFamily::new().adapter_identity();
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
@@ -1654,6 +1658,120 @@ mod tests {
             checkpoint_before,
             "Inf * 0 must reject without committing any working-state byte"
         );
+    }
+
+    #[test]
+    fn primary_thresholds_at_and_above_one_match_legacy_genome_bytes_and_rng() {
+        let family = MlpBrainFamily::new();
+        let parent = family
+            .genome(&fixture_nodes(), fixture_provenance(4))
+            .expect("parent genome");
+        let provenance = BrainProvenance {
+            parents: [Some(AgentUid(101)), None],
+            parent_genome_hashes: [Some(parent.material_hash()), None],
+            created_at: Tick(7),
+            derivation: BrainGenomeDerivation::MutationOnly,
+        };
+
+        for primary in [1.0, 1.25, f32::MAX] {
+            let mut legacy = MlpBrain {
+                nodes: fixture_nodes(),
+                state: vec![NodeState::default(); BRAIN_SIZE],
+            };
+            let mut legacy_rng = SmallRngStream::seed_from_u64(0xA11C_E5E5);
+            let mut protocol_rng = legacy_rng.clone();
+            let before_rng = protocol_rng.checkpoint();
+            Brain::mutate(&mut legacy, &mut legacy_rng, primary, 0.25).expect("legacy mutation");
+            let expected = family
+                .genome(&legacy.nodes, provenance.clone())
+                .expect("legacy genome");
+            let actual = family
+                .mutate_genome(
+                    &parent,
+                    MutationRates {
+                        primary,
+                        secondary: 0.25,
+                    },
+                    provenance.clone(),
+                    &mut protocol_rng,
+                )
+                .expect("finite nonnegative threshold is admitted");
+            let after_rng = protocol_rng.checkpoint();
+
+            assert_eq!(actual.payload(), expected.payload(), "threshold {primary}");
+            assert_eq!(actual.provenance(), &provenance, "threshold {primary}");
+            assert_ne!(actual.payload(), parent.payload(), "threshold {primary}");
+            assert_eq!(after_rng, legacy_rng.checkpoint(), "threshold {primary}");
+            assert_ne!(after_rng, before_rng, "threshold {primary}");
+        }
+    }
+
+    #[test]
+    fn invalid_primary_thresholds_are_rejected_without_rng_consumption() {
+        let family = MlpBrainFamily::new();
+        let parent = family
+            .genome(&fixture_nodes(), fixture_provenance(4))
+            .expect("parent genome");
+
+        for primary in [-f32::EPSILON, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut rng = SmallRngStream::seed_from_u64(0xA11C_E5E5);
+            let before = rng.checkpoint();
+            let error = family
+                .mutate_genome(
+                    &parent,
+                    MutationRates {
+                        primary,
+                        secondary: 0.25,
+                    },
+                    fixture_provenance(7),
+                    &mut rng,
+                )
+                .expect_err("invalid primary threshold must be refused");
+            let after = rng.checkpoint();
+            assert!(matches!(
+                error,
+                BrainProtocolError::InvalidPayload {
+                    kind: BrainEnvelopeKind::Genome,
+                    ref detail,
+                    ..
+                } if detail == "primary mutation threshold must be finite and nonnegative"
+            ));
+            assert_eq!(after, before, "invalid threshold {primary}");
+        }
+    }
+
+    #[test]
+    fn above_one_primary_threshold_retains_secondary_guards_without_rng_consumption() {
+        let family = MlpBrainFamily::new();
+        let parent = family
+            .genome(&fixture_nodes(), fixture_provenance(4))
+            .expect("parent genome");
+
+        for secondary in [-f32::EPSILON, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut rng = SmallRngStream::seed_from_u64(0xA11C_E5E5);
+            let before = rng.checkpoint();
+            let error = family
+                .mutate_genome(
+                    &parent,
+                    MutationRates {
+                        primary: 1.25,
+                        secondary,
+                    },
+                    fixture_provenance(7),
+                    &mut rng,
+                )
+                .expect_err("invalid secondary scale must be refused");
+            let after = rng.checkpoint();
+            assert!(matches!(
+                error,
+                BrainProtocolError::InvalidPayload {
+                    kind: BrainEnvelopeKind::Genome,
+                    ref detail,
+                    ..
+                } if detail == "secondary mutation scale must be finite and nonnegative"
+            ));
+            assert_eq!(after, before, "invalid scale {secondary}");
+        }
     }
 
     #[test]

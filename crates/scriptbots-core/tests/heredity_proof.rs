@@ -185,6 +185,11 @@ fn drive_until_children(
     let mut children = Vec::new();
     for _ in 0..max_ticks {
         let completion = world.step_outcome().expect("reproduction step");
+        assert!(
+            completion.fault.is_none(),
+            "reproduction must finish without a contained fault: {:?}",
+            completion.fault
+        );
         for birth in &completion.outcome.births {
             if birth.origin != BirthOrigin::Born {
                 continue;
@@ -272,6 +277,109 @@ fn asexual_child_at_zero_mutation_is_bit_identical_to_parent() {
             &genome_of(&world, parent),
             &genome_of(&world, child.id),
             &target.kind,
+        );
+    }
+}
+
+#[test]
+fn production_offspring_preserve_inherited_saturated_mutation_thresholds() {
+    let template = production_world(reproduction_config(0.0));
+    for target in locus_capable_targets(&template) {
+        for primary in [1.25_f32, f32::MAX] {
+            let mut world = production_world(reproduction_config(0.0));
+            let parent = spawn_parent(
+                &mut world,
+                target.key,
+                100.0,
+                100.0,
+                MutationRates {
+                    primary,
+                    secondary: 0.05,
+                },
+            );
+            world
+                .try_update_agent_runtime(parent, |runtime| runtime.reproduction_counter = 1.0)
+                .expect("prepare immediate reproduction");
+            let parent_uid = uid_of(&world, parent);
+            let parent_genome = genome_of(&world, parent);
+            let children = drive_until_children(&mut world, &[parent_uid], 1, 2);
+            let child = &children[0];
+            let child_runtime = world.agent_runtime(child.id).expect("live offspring");
+            assert_eq!(
+                child_runtime.mutation_rates.primary.to_bits(),
+                primary.to_bits()
+            );
+            assert_eq!(
+                world
+                    .agent_runtime(parent)
+                    .expect("live parent")
+                    .mutation_rates
+                    .primary
+                    .to_bits(),
+                primary.to_bits(),
+                "{} must retain the inherited threshold, not clamp the lineage to one",
+                target.kind
+            );
+            let child_genome = genome_of(&world, child.id);
+            assert_ne!(
+                child_genome.payload(),
+                parent_genome.payload(),
+                "{} must execute the saturated mutation gates",
+                target.kind
+            );
+            codec_for(&world, target.key)
+                .validate_genome(&child_genome)
+                .expect("offspring genome remains valid");
+            assert_eq!(child.parent_a, parent_uid);
+            assert!(child.parent_b.is_none());
+        }
+    }
+}
+
+#[test]
+fn production_meta_mutation_can_cross_one_without_stopping_reproduction() {
+    let template = production_world(reproduction_config(0.0));
+    for target in locus_capable_targets(&template) {
+        let mut above_one = 0;
+        for seed in 0..8 {
+            let mut config = reproduction_config(0.0);
+            config.rng_seed = Some(seed);
+            config.reproduction_meta_mutation_chance = 1.0;
+            config.reproduction_meta_mutation_scale = 0.5;
+            let mut world = production_world(config);
+            let parent = spawn_parent(
+                &mut world,
+                target.key,
+                100.0,
+                100.0,
+                MutationRates {
+                    primary: 0.95,
+                    secondary: 0.05,
+                },
+            );
+            world
+                .try_update_agent_runtime(parent, |runtime| runtime.reproduction_counter = 1.0)
+                .expect("prepare immediate reproduction");
+            let parent_uid = uid_of(&world, parent);
+            let children = drive_until_children(&mut world, &[parent_uid], 1, 2);
+            let child = &children[0];
+            let threshold = world
+                .agent_runtime(child.id)
+                .expect("live offspring")
+                .mutation_rates
+                .primary;
+            assert!(threshold.is_finite() && threshold >= 0.0001);
+            if threshold > 1.0 {
+                above_one += 1;
+            }
+            codec_for(&world, target.key)
+                .validate_genome(&genome_of(&world, child.id))
+                .expect("meta-mutated offspring genome remains valid");
+        }
+        assert!(
+            above_one > 0,
+            "{} fixture must observe Gaussian meta-mutation crossing one, not just inherited saturation",
+            target.kind
         );
     }
 }

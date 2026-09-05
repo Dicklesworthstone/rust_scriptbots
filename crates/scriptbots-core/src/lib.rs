@@ -1882,9 +1882,12 @@ fn summarize_food_grid(cells: &[f32]) -> Option<(f64, f64, f64, f32)> {
 /// Per-agent mutation rate configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutationRates {
-    /// Primary per-gene mutation probability.
+    /// Primary inherited mutation-gate threshold. Evolution may raise this above one;
+    /// each family's uniform-draw comparisons then saturate at certain acceptance.
+    /// Protocol adapters require a finite, nonnegative threshold.
     pub primary: f32,
-    /// Secondary large-effect mutation probability.
+    /// Secondary nonnegative mutation magnitude, used as the Gaussian scale by neural brains.
+    /// Assembly preserves this field but does not use it when replacing a cell.
     pub secondary: f32,
 }
 
@@ -24921,8 +24924,8 @@ impl WorldState {
 
     /// The legacy `randf(0,1) < MR*5` per-gene reproduction gate (bd-v69t).
     ///
-    /// `MutationRates::primary` is a probability, not a switch: C++ `Agent::reproduce` decides
-    /// each heritable attribute with its own draw against `MR*5`. A zero (or negative) rate or
+    /// C++ `Agent::reproduce` decides each heritable attribute with its own uniform draw
+    /// against the inherited threshold `MR*5`, which can exceed one. A zero (or negative) rate or
     /// scale is a disabled pass rather than a certain-rejection pass, so it draws nothing and the
     /// offspring mutation stream stays bit-identical to a run in which the gene does not exist.
     fn mutation_event_accepted(rng: &mut dyn RandomStream, rate: f32, scale: f32) -> bool {

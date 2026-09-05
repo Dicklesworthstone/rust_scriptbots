@@ -23,8 +23,8 @@ use crate::{Brain, BrainKind, into_runner};
 const BRAIN_SIZE: usize = 200;
 const CONNECTIONS: usize = 4;
 const DWRAON_FAMILY_NAME: &str = "dwraon-baseline";
-const ADAPTER_SEMANTIC_VERSION: u32 = 2;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.dwraon-baseline.adapter-semantics.v2";
+const ADAPTER_SEMANTIC_VERSION: u32 = 3;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.dwraon-baseline.adapter-semantics.v3";
 const GENOME_SCHEMA_VERSION: u32 = 1;
 const LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.dwraon-baseline.locus-schema.node-ascending:[NodeBias,NodeDamping,NodeKind(operator,conn=4),connection-ascending:[NodeWeight,NodeTarget,NodeKind(inverted)]]";
 const GENOME_CODEC_VERSION: u16 = 1;
@@ -574,11 +574,13 @@ fn state_digest_hex(digest: &[u8; GENOME_DIGEST_BYTES]) -> String {
 }
 
 fn validate_mutation_rates(rates: MutationRates) -> Result<(), BrainProtocolError> {
-    if !rates.primary.is_finite() || !(0.0..=1.0).contains(&rates.primary) {
+    // Core inherits an uncapped primary threshold. As in DWRAONBrain.cpp::mutate,
+    // thresholds above one accept every uniform draw without changing its schedule.
+    if !rates.primary.is_finite() || rates.primary < 0.0 {
         return Err(invalid_payload(
             BrainEnvelopeKind::Genome,
             format!(
-                "DWRAON primary mutation probability {} is outside the finite [0, 1] range",
+                "DWRAON primary mutation threshold {} is not finite and nonnegative",
                 rates.primary
             ),
         ));
@@ -1094,7 +1096,7 @@ mod tests {
     };
 
     #[test]
-    fn adapter_semantic_identity_v2_is_pinned() {
+    fn adapter_semantic_identity_v3_is_pinned() {
         let identity = DwraonFamilyAdapter::default().adapter_identity();
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
@@ -1545,6 +1547,119 @@ mod tests {
             .validate_genome(&first)
             .expect("mutation must return a valid offspring genome");
         assert_eq!(first.provenance(), &child_provenance);
+    }
+
+    #[test]
+    fn protocol_uncapped_mutation_thresholds_match_legacy_genome_bytes_and_rng() {
+        let family = DwraonFamilyAdapter::default();
+        let mut genome_rng = SmallRngStream::seed_from_u64(44);
+        let brain = DwraonBrain::random(&mut genome_rng);
+        let parent = protocol_genome(&brain.nodes, BrainProvenance::default());
+        let child_provenance = BrainProvenance {
+            parents: [Some(AgentUid(77)), None],
+            parent_genome_hashes: [Some(parent.material_hash()), None],
+            created_at: Tick(12),
+            derivation: BrainGenomeDerivation::MutationOnly,
+        };
+
+        for primary in [1.0, 1.25, f32::MAX] {
+            let rates = MutationRates {
+                primary,
+                secondary: 0.05,
+            };
+            let mut protocol_rng = SmallRngStream::seed_from_u64(99);
+            let child = family
+                .mutate_genome(&parent, rates, child_provenance.clone(), &mut protocol_rng)
+                .expect("finite uncapped primary threshold must be admitted");
+            let mut legacy = brain.clone();
+            let mut legacy_rng = SmallRngStream::seed_from_u64(99);
+            Brain::mutate(&mut legacy, &mut legacy_rng, primary, rates.secondary)
+                .expect("existing legacy mutation kernel");
+            let legacy_payload =
+                encode_genome_payload(&legacy.nodes).expect("legacy offspring stays finite");
+
+            assert_eq!(
+                child.payload(),
+                legacy_payload.as_slice(),
+                "primary threshold {primary} must preserve every encoded genome byte"
+            );
+            assert_eq!(
+                protocol_rng.checkpoint(),
+                legacy_rng.checkpoint(),
+                "primary threshold {primary} must preserve the legacy RNG continuation"
+            );
+            assert_ne!(child.payload(), parent.payload());
+            assert_eq!(child.provenance(), &child_provenance);
+            family
+                .validate_genome(&child)
+                .expect("uncapped threshold must still produce a valid finite genome");
+        }
+    }
+
+    #[test]
+    fn protocol_invalid_mutation_rates_and_genomes_preserve_rng_checkpoint() {
+        let family = DwraonFamilyAdapter::default();
+        let parent = protocol_genome(&codec_fixture_nodes(), BrainProvenance::default());
+        let mut rng = SmallRngStream::seed_from_u64(99);
+        let before = rng.checkpoint();
+
+        for invalid in [-f32::EPSILON, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for rates in [
+                MutationRates {
+                    primary: invalid,
+                    secondary: 0.05,
+                },
+                MutationRates {
+                    primary: 1.25,
+                    secondary: invalid,
+                },
+            ] {
+                assert!(matches!(
+                    family.mutate_genome(&parent, rates, BrainProvenance::default(), &mut rng,),
+                    Err(BrainProtocolError::InvalidPayload {
+                        kind: BrainEnvelopeKind::Genome,
+                        ..
+                    })
+                ));
+                assert_eq!(
+                    rng.checkpoint(),
+                    before,
+                    "rejected rates {rates:?} must not consume mutation randomness"
+                );
+            }
+        }
+
+        let mut invalid_source_payload = parent.payload().to_vec();
+        let first_source = GENOME_HEADER_BYTES + 1 + 4 + 4 + 4;
+        invalid_source_payload[first_source..first_source + 2].copy_from_slice(
+            &u16::try_from(BRAIN_SIZE)
+                .expect("brain size fits the source wire field")
+                .to_le_bytes(),
+        );
+        let invalid_source = BrainGenomeEnvelope::new(
+            DWRAON_FAMILY_ID.clone(),
+            GENOME_SCHEMA_VERSION,
+            GENOME_CODEC_VERSION,
+            invalid_source_payload,
+            BrainProvenance::default(),
+        )
+        .expect("generic envelope accepts family-owned malformed bytes");
+        assert!(matches!(
+            family.mutate_genome(
+                &invalid_source,
+                MutationRates {
+                    primary: 1.25,
+                    secondary: 0.05,
+                },
+                BrainProvenance::default(),
+                &mut rng,
+            ),
+            Err(BrainProtocolError::InvalidPayload {
+                kind: BrainEnvelopeKind::Genome,
+                ..
+            })
+        ));
+        assert_eq!(rng.checkpoint(), before);
     }
 
     #[test]
