@@ -514,7 +514,7 @@ impl BrainFamilyCodec for CustomFamily {
     }
     fn genome_loci(&self, genome: &BrainGenomeEnvelope) -> Result<Vec<(Locus, LocusValue)>, BrainProtocolError> {
         Ok(self.genome(genome)?.into_iter().enumerate().map(|(index, value)|
-            (Locus::Hyper(index as u32), LocusValue::Scalar(f32::from(value)))).collect())
+            (Locus::Hyper(u8::try_from(index).unwrap()), LocusValue::Scalar(f32::from(value)))).collect())
     }
     fn validate_evaluator_state(&self, state: &BrainEvaluatorStateEnvelope) -> Result<(), BrainProtocolError> {
         self.state(state).map(|_| ())
@@ -715,7 +715,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     world.step()?;
     let applied = world.applied_interventions().back().expect("meteor application record");
     assert_eq!(applied.kind, "meteor");
-    assert_eq!(applied.tick, Tick(0));
+    assert_eq!(applied.tick, Tick(1));
     assert!(applied.cells_affected > 0);
     assert!(world.enqueue_intervention(Intervention::Meteor {
         region: Region::All, lethality: 1.0, scorch: 2.0,
@@ -755,7 +755,7 @@ use scriptbots_app::{BrainPreset, install_brains, seed_founding_population};
 use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
 use scriptbots_runtime::{
     ApplicationState, CommandEnvelope, CommandId, HostClient, HostCommand, HostCore,
-    HostCoreOptions, HostSessionId, JournalState, ManualInstant, PlaybackSnapshot,
+    HostCoreOptions, HostSessionId, JournalState, ManualHostDriver, ManualInstant, PlaybackSnapshot,
     ProjectionCamera, ProjectionClientId, ProjectionDetail, ProjectionLimits,
     ProjectionRanking, ProjectionRequest, ProjectionSelection, ProjectionViewport, project_snapshot,
 };
@@ -778,7 +778,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let envelope = CommandEnvelope::new(id, HostCommand::Step);
     let admitted = client.submit(envelope.clone())?;
     assert_eq!(admitted.application(), &ApplicationState::Admitted);
-    assert_eq!(initial.tick, Tick(0));
+    assert_eq!(initial.world.tick, Tick(0));
     host.drive(ManualInstant::from_nanos(0))?;
     host.drive(ManualInstant::from_nanos(1))?;
     let receipt = client.command_status(id)?.expect("retained command status");
@@ -789,7 +789,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(receipt.journal(), &JournalState::CommittedVolatile);
     assert_eq!(applied.tick, Tick(1));
     let snapshot = client.poll_snapshot(&mut subscription)?.expect("step publication");
-    assert_eq!(snapshot.tick, applied.tick);
+    assert_eq!(snapshot.world.tick, applied.tick);
     assert_eq!(snapshot.revisions, applied.revisions);
     assert_eq!(snapshot.last_applied_command, Some(id));
     let request = ProjectionRequest {
@@ -804,7 +804,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!projection.visible_agents.is_empty());
     assert_eq!(client.submit(envelope)?, receipt, "retry must preserve the original result");
     host.drive(ManualInstant::from_nanos(2))?;
-    assert_eq!(host.latest_snapshot().tick, Tick(1), "retry must not step twice");
+    assert_eq!(host.latest_snapshot().world.tick, Tick(1), "retry must not step twice");
     assert!(HostCommand::SetSpeed(f32::NAN).validate().is_err());
     let mut invalid_viewport = request;
     invalid_viewport.viewport.width = 0;
