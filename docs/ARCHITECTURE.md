@@ -618,6 +618,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     world.step()?;
     assert_eq!(world.tick(), scriptbots_core::Tick(1));
     println!("{}", serde_json::json!({
+        "schema": "scriptbots.architecture-recipe.v1", "recipe": "brain",
         "family": identity, "bound_founders": founders.len(), "tick": world.tick().0,
         "parent_payload": parent.payload(), "mutated_payload": changed.payload(),
         "before_outputs": before_outputs, "after_outputs": after_outputs,
@@ -718,6 +719,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed_founding_population(world, roster.population())?;
     }
     let mut observed = Vec::new();
+    let mut food_cells = Vec::new();
     for tick in 0..=1000 {
         assert_eq!(drought.tick().0, tick);
         let applied = apply_scenario_interventions(&mut drought, &mut current,
@@ -727,6 +729,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         control.step()?;
         if tick == 499 { assert_eq!(drought.food().cells(), control.food().cells()); }
         if tick == 500 { assert_ne!(drought.food().cells(), control.food().cells()); }
+        if tick == 499 || tick == 500 {
+            let changed = drought.food().cells().iter().zip(control.food().cells())
+                .filter(|(left, right)| left != right).count();
+            food_cells.push(serde_json::json!({"completed_tick": drought.tick().0,
+                "changed_cells": changed, "total_cells": drought.food().cells().len()}));
+        }
     }
     assert_eq!(observed, vec![(500, 1, 0.001_f32), (1000, 1, 0.05_f32)]);
     assert_eq!(drought.tick().0, 1001);
@@ -735,8 +743,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let unknown = text.replacen("food_max", "food_max_typo", 1);
     let invalid = ScenarioDocumentV1::parse_toml(unknown.as_bytes())?;
     assert!(serde_json::from_value::<ScriptBotsConfig>(resolve(&invalid)).is_err());
-    println!("scenario={} input_blake3={} applied={observed:?} final_tick={}",
-        document.id, blake3::hash(text.as_bytes()), drought.tick().0);
+    println!("{}", serde_json::json!({
+        "schema": "scriptbots.architecture-recipe.v1", "recipe": "scenario",
+        "scenario": document.id, "input_blake3": blake3::hash(text.as_bytes()).to_hex().to_string(),
+        "applied": observed, "food_cells": food_cells, "final_tick": drought.tick().0,
+    }));
     Ok(())
 }
 ```
@@ -762,6 +773,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(applied.kind, "meteor");
     assert_eq!(applied.tick, Tick(1));
     assert!(applied.cells_affected > 0);
+    println!("{}", serde_json::json!({
+        "schema": "scriptbots.architecture-recipe.v1", "recipe": "meteor",
+        "kind": applied.kind, "applied_tick": applied.tick.0, "cells_affected": applied.cells_affected,
+    }));
     assert!(world.enqueue_intervention(Intervention::Meteor {
         region: Region::All, lethality: 1.0, scorch: 2.0,
     }).is_err());
@@ -854,8 +869,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut invalid_viewport = request;
     invalid_viewport.viewport.width = 0;
     assert!(project_snapshot(&snapshot, &invalid_viewport, ProjectionLimits::default()).is_err());
-    println!("command={id:?} applied={applied:?} journal={:?} visible={}",
-        receipt.journal(), projection.visible_agents.len());
+    println!("{}", serde_json::json!({
+        "schema": "scriptbots.architecture-recipe.v1", "recipe": "frontend",
+        "command_id": id, "application": receipt.application(), "journal": receipt.journal(),
+        "snapshot_tick": snapshot.world.tick, "snapshot_revisions": snapshot.revisions,
+        "projection_revisions": projection.source.host, "visible_agents": projection.visible_agents.len(),
+        "tick_after_retry": host.latest_snapshot().world.tick,
+    }));
     Ok(())
 }
 ```

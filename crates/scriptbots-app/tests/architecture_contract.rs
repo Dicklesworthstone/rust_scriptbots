@@ -543,6 +543,15 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
             )),
             Some(("runtime", "step did not apply")),
         ),
+        (
+            "missing-observation",
+            "meteor",
+            Some((
+                "println!(\"{}\", serde_json::json!({",
+                "eprintln!(\"{}\", serde_json::json!({",
+            )),
+            Some(("evidence", "missing recipe observation")),
+        ),
     ];
     for (name, recipe, replacement, expected_failure) in cases {
         let body = recipe_block(&guide, recipe, "rust").map_err(anyhow::Error::msg)?;
@@ -616,6 +625,7 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
             "command": {"program": "rustc", "args": arguments},
             "compiler_exit": compiled.status.code(), "expected_failure": expected_failure,
             "compiler_stderr_blake3": blake3::hash(&compiled.stderr).to_hex().to_string(),
+            "recipe_accepted": false,
         });
         let observed = if compiled.status.success() {
             let executed = Command::new(&executable).output()?;
@@ -626,11 +636,31 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
                 serde_json::json!(blake3::hash(&executed.stdout).to_hex().to_string());
             record["runtime_stderr_blake3"] =
                 serde_json::json!(blake3::hash(&executed.stderr).to_hex().to_string());
+            let observation = serde_json::from_slice::<serde_json::Value>(&executed.stdout).ok();
+            let valid_observation = observation.as_ref().is_some_and(|value| {
+                value["schema"] == "scriptbots.architecture-recipe.v1" && value["recipe"] == recipe
+            });
+            if let Some(value) = &observation {
+                record["runtime_observation"] = value.clone();
+            }
+            let recipe_accepted = executed.status.success() && valid_observation;
+            record["recipe_accepted"] = serde_json::json!(recipe_accepted);
             match expected_failure {
-                None => executed.status.success(),
+                None => recipe_accepted,
                 Some(("runtime", message)) => {
                     !executed.status.success()
                         && String::from_utf8_lossy(&executed.stderr).contains(message)
+                }
+                Some(("evidence", "missing recipe observation")) => {
+                    executed.status.success()
+                        && !recipe_accepted
+                        && observation.is_none()
+                        && serde_json::from_slice::<serde_json::Value>(&executed.stderr).is_ok_and(
+                            |value| {
+                                value["schema"] == "scriptbots.architecture-recipe.v1"
+                                    && value["recipe"] == recipe
+                            },
+                        )
                 }
                 _ => false,
             }
