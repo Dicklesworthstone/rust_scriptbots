@@ -413,114 +413,192 @@ Source of truth: `crates/scriptbots-analytics/src/lib.rs` (report registry, `Rea
 
 ---
 
-## 10. Tested extension recipes
+## 10. Executable extension recipes
 
-This section provides source-backed, copy-pasteable extension recipes for the three primary
-developer extension surfaces in ScriptBots: adding a new neural brain family, creating a scenario
-with environmental interventions, and creating an external or custom frontend.
+The Rust blocks in this section are documentation tests of `scriptbots-app`:
+`cargo test -p scriptbots-app --doc`. Each is a complete program using workspace dependencies.
+They exercise the named library boundary; a passing local host example does not prove that the
+application's transitional GUI, TUI and server callers have migrated to that boundary.
 
 ### 10.1 Recipe: Adding a New Brain Family
 
-Adding an agent brain architecture requires implementing the core sensory-motor trait, packaging it
-into a heritable batch runner, proving its heredity contract, and registering it in the application
-brain roster.
+New evolutionary families implement `BrainFamilyCodec` and `BrainEvaluator` from
+`crates/scriptbots-core/src/lib.rs`. `BrainFamilyAdapter` supplies provenance-preserving genome
+creation through its blanket implementation. The legacy `Brain` and `BrainRunner` traits are
+separate APIs; implementing them alone does not install a versioned evolutionary family.
 
-#### 1. Implement the Core Brain Trait (`crates/scriptbots-brain`)
-Create a module (e.g. `crates/scriptbots-brain/src/custom.rs` or inline) implementing `Brain`:
+This small recurrent neuron has two heritable byte parameters and one byte of dynamic state.
+It exposes canonical loci, mutates both parameters through independent primary-rate gates,
+crosses gain from the first parent with bias from the second, and resets offspring state.
+Its inspection method honestly returns unavailable. Batch execution is optional and omitted.
 
-```rust
-use crate::Brain;
-use scriptbots_core::SmallRngStream;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CustomBrain {
-    weights: Vec<f32>,
-    activations: Vec<f32>,
-}
-
-impl Brain for CustomBrain {
-    fn tick(&mut self, inputs: &[f32]) -> &[f32] {
-        // Forward pass: map sensor inputs to actuator outputs
-        &self.activations
-    }
-
-    fn mutate(&mut self, rng: &mut SmallRngStream) {
-        // Perturb parameters in place using deterministic agent-substream RNG
-    }
-
-    fn crossover(&self, partner: &Self, rng: &mut SmallRngStream) -> Self {
-        // Combine parameters from self (primary parent) and partner (secondary parent)
-        self.clone()
-    }
-
-    fn snapshot_activations(&self) -> Vec<f32> {
-        self.activations.clone()
-    }
-}
-```
-
-#### 2. Implement Runner, Codec, and Adapter Identity (`crates/scriptbots-core`)
-Implement `BrainRunner` and `BrainFamilyCodec` for the simulation tick loop:
-
+<!-- recipe:brain -->
 ```rust
 use scriptbots_core::{
-    BrainAdapterIdentityV1, BrainFamilyCodec, BrainRegistryError, BrainRunner,
-    SmallRngStream,
+    BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
+    BrainFamilyAdapter, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope,
+    BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainInspection, BrainInspectionError,
+    BrainInspectionSnapshot, BrainLocusSchemaIdentityV1, BrainMutationTrialGroupV1,
+    BrainProtocolError, BrainProvenance, INPUT_SIZE, MutationRates, OUTPUT_SIZE,
+    OffspringStatePolicy, RandomStream, ScriptBotsConfig, SmallRngStream,
+    WorldState, genome_diff::{Locus, LocusValue},
 };
 
-pub struct CustomBrainRunner {
-    brain: CustomBrain,
+use rand::Rng;
+
+const GENOME_BYTES: usize = 2;
+struct CustomFamily { id: BrainFamilyId }
+struct CustomEvaluator { id: BrainFamilyId, genome: [u8; GENOME_BYTES], previous: u8 }
+
+impl CustomFamily {
+    fn invalid(&self, kind: BrainEnvelopeKind, detail: &str) -> BrainProtocolError {
+        BrainProtocolError::InvalidPayload {
+            kind, family_id: self.id.clone(), detail: detail.into(),
+        }
+    }
+    fn genome(&self, value: &BrainGenomeEnvelope) -> Result<[u8; GENOME_BYTES], BrainProtocolError> {
+        value.require_protocol(&self.id, 1, 1)?;
+        value.payload().try_into()
+            .map_err(|_| self.invalid(BrainEnvelopeKind::Genome, "expected gain and bias bytes"))
+    }
+    fn state(&self, value: &BrainEvaluatorStateEnvelope) -> Result<u8, BrainProtocolError> {
+        value.require_protocol(&self.id, 1, 1)?;
+        match value.payload() {
+            [previous] => Ok(*previous),
+            _ => Err(self.invalid(BrainEnvelopeKind::EvaluatorState, "expected one state byte")),
+        }
+    }
 }
 
-impl BrainRunner for CustomBrainRunner {
-    fn step(&mut self, inputs: &[f32]) -> &[f32] {
-        self.brain.tick(inputs)
+impl BrainEvaluator for CustomEvaluator {
+    fn family_id(&self) -> &BrainFamilyId { &self.id }
+    fn evaluate(&mut self, sensors: &[f32; INPUT_SIZE]) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
+        if sensors.iter().any(|value| !value.is_finite()) {
+            return Err(BrainProtocolError::InvalidPayload {
+                kind: BrainEnvelopeKind::EvaluatorState,
+                family_id: self.id.clone(), detail: "nonfinite sensors".into(),
+            });
+        }
+        let gain = f32::from(self.genome[0]) / 255.0;
+        let bias = f32::from(self.genome[1]) / 255.0;
+        let next = ((sensors[0].clamp(0.0, 1.0) + f32::from(self.previous) / 255.0)
+            * gain + bias) / 3.0;
+        self.previous = (next.clamp(0.0, 1.0) * 255.0) as u8;
+        let mut output = [0.0; OUTPUT_SIZE];
+        output[0] = f32::from(self.previous) / 255.0;
+        output[1] = output[0];
+        Ok(output)
     }
+    fn inspect(&self, _: BrainInspection) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        Ok(None)
+    }
+    fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        BrainEvaluatorStateEnvelope::new(self.id.clone(), 1, 1, vec![self.previous])
+    }
+}
 
-    fn clone_runner(&self) -> Result<Option<Box<dyn BrainRunner>>, BrainRegistryError> {
-        // Returning Ok(Some(...)) declares this family heritable
-        Ok(Some(Box::new(CustomBrainRunner {
-            brain: self.brain.clone(),
-        })))
+impl BrainFamilyCodec for CustomFamily {
+    fn family_id(&self) -> &BrainFamilyId { &self.id }
+    fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
+        BrainAdapterIdentityV1::from_semantic_descriptor(&self.id, 1,
+            b"byte-neuron:v1;gain,bias;recurrent-u8;clamped-input;divide-three;reset;xor-mutation")
     }
+    fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+        BrainHeredityCapabilityV1::locus_capable(
+            BrainLocusSchemaIdentityV1::from_semantic_descriptor(&self.id, 1, b"hyper0=gain;hyper1=bias"),
+            vec![BrainMutationTrialGroupV1::new(u32::try_from(GENOME_BYTES).unwrap(), 1, 1)],
+        )
+    }
+    fn random_genome_material(&self, rng: &mut dyn RandomStream) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        BrainGenomeMaterial::new(1, 1, rng.next_u32().to_le_bytes()[..GENOME_BYTES].to_vec())
+    }
+    fn validate_genome(&self, genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
+        self.genome(genome).map(|_| ())
+    }
+    fn genome_loci(&self, genome: &BrainGenomeEnvelope) -> Result<Vec<(Locus, LocusValue)>, BrainProtocolError> {
+        Ok(self.genome(genome)?.into_iter().enumerate().map(|(index, value)|
+            (Locus::Hyper(index as u32), LocusValue::Scalar(f32::from(value)))).collect())
+    }
+    fn validate_evaluator_state(&self, state: &BrainEvaluatorStateEnvelope) -> Result<(), BrainProtocolError> {
+        self.state(state).map(|_| ())
+    }
+    fn mutate_genome_material(&self, genome: &BrainGenomeEnvelope, rates: MutationRates,
+        rng: &mut dyn RandomStream) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        let mut bytes = self.genome(genome)?;
+        for value in &mut bytes {
+            if rng.random::<f32>() < rates.primary {
+                *value ^= (rng.next_u32() % 255 + 1) as u8;
+            }
+        }
+        BrainGenomeMaterial::new(1, 1, bytes.to_vec())
+    }
+    fn crossover_genomes_material(&self, left: &BrainGenomeEnvelope, right: &BrainGenomeEnvelope,
+        _: &mut dyn RandomStream) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+        BrainGenomeMaterial::new(1, 1, vec![self.genome(left)?[0], self.genome(right)?[1]])
+    }
+    fn initial_state(&self, genome: &BrainGenomeEnvelope, _: &mut dyn RandomStream)
+        -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        self.validate_genome(genome)?;
+        BrainEvaluatorStateEnvelope::new(self.id.clone(), 1, 1, vec![0])
+    }
+    fn offspring_state_policy(&self) -> OffspringStatePolicy { OffspringStatePolicy::Reset }
+    fn offspring_state(&self, child: &BrainGenomeEnvelope, parents: &[&BrainEvaluatorStateEnvelope],
+        rng: &mut dyn RandomStream) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+        for parent in parents { self.validate_evaluator_state(parent)?; }
+        self.initial_state(child, rng)
+    }
+    fn evaluator(&self, genome: &BrainGenomeEnvelope, state: &BrainEvaluatorStateEnvelope)
+        -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+        Ok(Box::new(CustomEvaluator {
+            id: self.id.clone(), genome: self.genome(genome)?, previous: self.state(state)?,
+        }))
+    }
+}
 
-    fn mutate(&mut self, rng: &mut SmallRngStream) -> Result<(), BrainRegistryError> {
-        self.brain.mutate(rng);
-        Ok(())
-    }
-
-    fn state_digest(&self) -> Option<[u8; 32]> {
-        // Stable BLAKE3 hash covering BOTH genome parameters AND evaluator activations
-        let mut hasher = blake3::Hasher::new();
-        // hash weights and activations...
-        Some(*hasher.finalize().as_bytes())
-    }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let family = CustomFamily { id: BrainFamilyId::new("custom-byte-neuron")? };
+    let mut rng = SmallRngStream::seed_from_u64(42);
+    let parent = family.random_genome(BrainProvenance::default(), &mut rng)?;
+    let copied = family.clone_genome(&parent, BrainProvenance::default())?;
+    assert_eq!(copied.payload(), parent.payload());
+    let changed = family.mutate_genome(&parent, MutationRates { primary: 1.0, ..Default::default() },
+        BrainProvenance::default(), &mut rng)?;
+    assert_ne!(changed.payload(), parent.payload());
+    let crossed = family.crossover_genomes(&parent, &changed, BrainProvenance::default(), &mut rng)?;
+    assert_eq!(crossed.payload(), &[parent.payload()[0], changed.payload()[1]]);
+    let initial = family.initial_state(&parent, &mut rng)?;
+    let mut live = family.evaluator(&parent, &initial)?;
+    let input = [1.0; INPUT_SIZE];
+    assert!(live.evaluate(&input)?[0] > 0.0);
+    let checkpoint = family.checkpoint_evaluator_for_genome(&parent, live.as_ref())?;
+    let encoded = serde_json::to_vec(&checkpoint)?;
+    let decoded = serde_json::from_slice(&encoded)?;
+    let mut restored = family.evaluator(&parent, &decoded)?;
+    assert_eq!(live.evaluate(&input)?, restored.evaluate(&input)?);
+    assert_eq!(live.checkpoint_state()?, restored.checkpoint_state()?);
+    assert_eq!(family.offspring_state(&crossed, &[&checkpoint], &mut rng)?.payload(), &[0]);
+    let mut world = WorldState::new(ScriptBotsConfig { rng_seed: Some(42), ..Default::default() })?;
+    let identity = family.id.clone();
+    let key = world.register_brain_family("custom-byte-neuron", Box::new(family))?;
+    assert_eq!(world.brain_registry().family(key).unwrap().family_id(), &identity);
+    scriptbots_app::seed_founding_population(&mut world, &[key])?;
+    world.step()?;
+    assert_eq!(world.tick(), scriptbots_core::Tick(1));
+    Ok(())
 }
 ```
 
-Implement the family's semantic attestation via `BrainFamilyCodec`:
-- Return a stable 256-bit `BrainAdapterIdentityV1`. Any semantic alteration to evaluation or
-  construction requires advancing this identity to prevent silent digest invalidation or false
-  checkpoint compatibility.
+Register through `WorldState::register_brain_family`, then pass the returned keys to
+`seed_founding_population`. This is a library extension path. `BrainPreset` in
+`crates/scriptbots-app/src/brains.rs` is a closed CLI enum; `--brain custom` does not exist.
+Adding a shipped preset requires explicitly wiring that enum, `install_brains`, founder admission
+and the registry-derived heredity proof. Registration validates protocol and locus declarations;
+it does not by itself prove mutation quality, reproduction or ecological usefulness.
 
-#### 3. Register and Verify via Heredity Gate (`crates/scriptbots-app`)
-Register the family inside `install_brains` (`crates/scriptbots-app/src/lib.rs`):
-
-```rust
-registry.register("custom", Box::new(CustomBrainFactory));
-```
-
-The application startup probe (`crates/scriptbots-app/src/lib.rs`) automatically validates:
-1. `clone_runner()` succeeds and produces an identical copy.
-2. `mutate()` perturbs parameters such that `state_digest()` changes.
-If a brain family no-ops its mutation (like the historical placeholder), `install_brains` flags it
-as non-heritable and withholds it from founding populations.
-
-#### 4. Execution & Failure Handling
-- **CLI Selection:** Run `cargo run -p scriptbots-app -- --brain custom`.
-- **Failure Modes:**
-  - `BrainRegistryError::NonHeritableFamily`: Brain failed mutation or clone probe.
-  - `WorldCheckpointError::ForeignCodecIdentity`: Checkpoint carries a different `BrainAdapterIdentityV1`.
+Advance the adapter semantic identity whenever evaluation/construction behavior changes, and
+schema/codec versions when byte interpretation changes. The example checkpoints an evaluator;
+whole-world checkpoints additionally bind the family registry and adapter identity. Foreign family
+IDs, malformed payload lengths and unsupported versions must fail before evaluation.
 
 ---
 
@@ -530,19 +608,25 @@ Scenarios configure initial world terrain, environmental parameters, population 
 timed interventions (such as droughts, floods, meteors, and predator injections).
 
 #### 1. Define a Scenario Document (`ScenarioDocumentV1`)
-Create a scenario specification in TOML or RON (e.g. `scenarios/drought_challenge.toml`):
+Save this document as `scenarios/drought_challenge.toml`, or use it as an input to the
+library example below. Parsing validates the document envelope; configuration composition and
+world construction must still validate the actual fields and ranges.
 
+<!-- recipe:scenario-document -->
 ```toml
 schema = "scriptbots.scenario.v1"
 schema_version = 1
 id = "drought-challenge-v1"
-description = "A harsh desert scenario with scheduled severe droughts and meteor impacts"
+description = "A food-growth drought followed by recovery"
 bootstrap_ticks = 100
 
 [config]
+world_width = 400
+world_height = 400
+food_cell_size = 50
+initial_food = 1.0
 food_max = 5000.0
 food_growth_rate = 0.05
-temperature_penalty = 0.02
 
 [[interventions]]
 tick = 500
@@ -553,33 +637,101 @@ tick = 1000
 set = { food_growth_rate = 0.05 }
 ```
 
-#### 2. Founding Population Grid Seeding
-Founders are seeded via `seed_founding_population(world, &brain_keys)` (`crates/scriptbots-app/src/lib.rs`),
-which spawns a deterministic 4x4 grid (16 agents) evenly distributed across the world, binding each
-founder to an available registered brain family.
+#### 2. Normalize, seed and execute the document
 
-#### 3. Toroidal Interventions (`crates/scriptbots-core/src/interventions.rs`)
-Programmatic interventions can also be queued directly via `WorldState::enqueue_intervention`:
+`seed_founding_population` in `crates/scriptbots-app/src/lib.rs` installs the deterministic founder
+grid using admitted registry keys. Scheduled config patches run at completed-tick boundaries.
+This example reads the literal TOML above, executes both scheduled changes, and compares the
+drought world with a matched-seed world that receives no patches. The changed food cells prove
+that the growth setting has a consumer. The first 100 steps include the declared bootstrap.
 
+<!-- recipe:scenario -->
 ```rust
-use scriptbots_core::interventions::{InterventionAction, InterventionRecord, ToroidalRegion};
-use scriptbots_core::{Position, Tick};
+use scriptbots_app::{
+    BrainPreset, ScenarioDocumentV1, apply_scenario_interventions, install_brains,
+    seed_founding_population, precedence::{ConfigLayerKind, ConfigLayerStatement, resolve_config_layers},
+};
+use scriptbots_core::{ScriptBotsConfig, WorldState};
 
-world.enqueue_intervention(InterventionRecord {
-    tick: Tick(250),
-    action: InterventionAction::Meteor {
-        center: Position { x: 640.0, y: 360.0 },
-        radius: 120.0,
-    },
-    issued_by: "operator".into(),
-});
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let guide = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/ARCHITECTURE.md"));
+    let section = guide.split_once("<!-- recipe:scenario-document -->").unwrap().1;
+    let text = section.split_once("```toml\n").unwrap().1.split_once("\n```").unwrap().0;
+    let document = ScenarioDocumentV1::parse_toml(text.as_bytes())?;
+    let defaults = serde_json::to_value(ScriptBotsConfig::default())?;
+    let resolve = |document: &ScenarioDocumentV1| {
+        resolve_config_layers(&defaults, &[
+            ConfigLayerStatement { kind: ConfigLayerKind::File,
+                label: document.id.clone(), fields: document.config.clone() },
+            ConfigLayerStatement { kind: ConfigLayerKind::Cli,
+                label: "example-seed".into(), fields: serde_json::json!({"rng_seed": 42}) },
+        ]).merged
+    };
+    let mut current = resolve(&document);
+    let config: ScriptBotsConfig = serde_json::from_value(current.clone())?;
+    let mut drought = WorldState::new(config.clone())?;
+    let mut control = WorldState::new(config)?;
+    for world in [&mut drought, &mut control] {
+        let roster = install_brains(world, BrainPreset::Mlp)?;
+        seed_founding_population(world, roster.population())?;
+    }
+    let mut observed = Vec::new();
+    for tick in 0..=1000 {
+        assert_eq!(drought.tick().0, tick);
+        let applied = apply_scenario_interventions(&mut drought, &mut current,
+            &document.interventions, tick)?;
+        if applied != 0 { observed.push((tick, applied, drought.config().food_growth_rate)); }
+        drought.step()?;
+        control.step()?;
+        if tick == 499 { assert_eq!(drought.food().cells(), control.food().cells()); }
+        if tick == 500 { assert_ne!(drought.food().cells(), control.food().cells()); }
+    }
+    assert_eq!(observed, vec![(500, 1, 0.001_f32), (1000, 1, 0.05_f32)]);
+    assert_eq!(drought.tick().0, 1001);
+
+    // Mutate the literal input, then pass it through the same production resolver.
+    let unknown = text.replacen("food_max", "food_max_typo", 1);
+    let invalid = ScenarioDocumentV1::parse_toml(unknown.as_bytes())?;
+    assert!(serde_json::from_value::<ScriptBotsConfig>(resolve(&invalid)).is_err());
+    println!("scenario={} input_blake3={} applied={observed:?} final_tick={}",
+        document.id, blake3::hash(text.as_bytes()), drought.tick().0);
+    Ok(())
+}
+```
+
+#### 3. Toroidal interventions
+
+`WorldState::enqueue_intervention` accepts the production `Intervention` enum from core's
+`src/lib.rs`, and applies it at the next step. The separate record types in
+`crates/scriptbots-core/src/interventions.rs` are not that queue's input type.
+
+<!-- recipe:meteor -->
+```rust
+use scriptbots_core::{Intervention, Region, ScriptBotsConfig, Tick, WorldState};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut world = WorldState::new(ScriptBotsConfig::default())?;
+    world.enqueue_intervention(Intervention::Meteor {
+        region: Region::Disc { x: 640.0, y: 360.0, radius: 120.0 },
+        lethality: 1.0, scorch: 0.5,
+    })?;
+    world.step()?;
+    let applied = world.applied_interventions().back().expect("meteor application record");
+    assert_eq!(applied.kind, "meteor");
+    assert_eq!(applied.tick, Tick(0));
+    assert!(applied.cells_affected > 0);
+    assert!(world.enqueue_intervention(Intervention::Meteor {
+        region: Region::All, lethality: 1.0, scorch: 2.0,
+    }).is_err());
+    Ok(())
+}
 ```
 
 Interventions execute deterministically at the start of the tick in `stage_interventions`, before
 agent senses are evaluated.
 
 #### 4. Execution & Failure Handling
-- **CLI Launch:** `cargo run -p scriptbots-app -- --scenario scenarios/drought_challenge.toml`.
+- **CLI Launch:** after saving the document, `cargo run -p scriptbots-app -- --scenario scenarios/drought_challenge.toml`.
 - **REST Control:** Inspect scenario via `GET /api/scenario` or apply presets via `POST /api/presets/apply`.
 - **Failure Modes:**
   - `ScenarioRunError::EmptyBrainRoster`: Attempted to seed founders without registered brains.
@@ -590,50 +742,88 @@ agent senses are evaluated.
 
 ### 10.3 Recipe: Adding a New Frontend Backend
 
-A new frontend (e.g. WebGPU, VR, or headless streaming bridge) connects to ScriptBots as an
-observer and controller, without directly owning `WorldState`.
+A new frontend consumes a `HostClient` port, subscribes to immutable snapshots, and sends commands
+with stable IDs. `project_snapshot` in `crates/scriptbots-runtime/src/lib.rs` builds a
+`ClientProjection` from a `RenderSnapshot`; it does not produce the source snapshot. Source
+snapshots are shared, while distinct camera/selection requests can incur distinct projection work.
 
-#### 1. Snapshot Projection Loop
-Consume the simulation state using `RenderSnapshot` produced by `project_snapshot` (`crates/scriptbots-runtime/src/lib.rs`):
+This complete example embeds the real same-thread host and explicitly drives its scheduler.
+A threaded frontend uses `HostThread`/`ChannelHostPort` instead. The host owns the world after
+construction; frontend reads and commands go through `HostClient`. The selected journal is
+volatile, so its receipt must say `CommittedVolatile`, never `Durable`.
 
+<!-- recipe:frontend -->
 ```rust
-use scriptbots_runtime::{RenderSnapshot, project_snapshot};
-use std::sync::Arc;
+use scriptbots_app::{BrainPreset, install_brains, seed_founding_population};
+use scriptbots_core::{ScriptBotsConfig, Tick, WorldState};
+use scriptbots_runtime::{
+    ApplicationState, CommandEnvelope, CommandId, HostClient, HostCommand, HostCore,
+    HostCoreOptions, HostSessionId, JournalState, ManualInstant, PlaybackSnapshot,
+    ProjectionCamera, ProjectionClientId, ProjectionDetail, ProjectionLimits,
+    ProjectionRanking, ProjectionRequest, ProjectionSelection, ProjectionViewport, project_snapshot,
+};
 
-fn on_render_frame(snapshot: &Arc<RenderSnapshot>) {
-    println!("Rendering tick {}", snapshot.tick);
-    for agent in &snapshot.agents {
-        // Draw agent at agent.position with agent.heading and agent.spike_length
-    }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut world = WorldState::new(ScriptBotsConfig {
+        world_width: 400, world_height: 400, food_cell_size: 50,
+        rng_seed: Some(42), ..Default::default()
+    })?;
+    let roster = install_brains(&mut world, BrainPreset::Mlp)?;
+    seed_founding_population(&mut world, roster.population())?;
+    let mut host = HostCore::new(HostSessionId::new(42), world, HostCoreOptions {
+        initial_playback: PlaybackSnapshot { paused: true, speed_multiplier: 1.0 },
+        ..Default::default()
+    })?;
+    let mut client = HostClient::new(host.local_port());
+    let mut subscription = client.subscribe_snapshots();
+    let initial = client.poll_snapshot(&mut subscription)?.expect("initial publication");
+    let id = CommandId::new(42);
+    let envelope = CommandEnvelope::new(id, HostCommand::Step);
+    let admitted = client.submit(envelope.clone())?;
+    assert_eq!(admitted.application(), &ApplicationState::Admitted);
+    assert_eq!(initial.tick, Tick(0));
+    host.drive(ManualInstant::from_nanos(0))?;
+    host.drive(ManualInstant::from_nanos(1))?;
+    let receipt = client.command_status(id)?.expect("retained command status");
+    let ApplicationState::Applied(applied) = receipt.application() else {
+        panic!("step did not apply: {receipt:?}");
+    };
+    assert_eq!(receipt.command_id(), id);
+    assert_eq!(receipt.journal(), &JournalState::CommittedVolatile);
+    assert_eq!(applied.tick, Tick(1));
+    let snapshot = client.poll_snapshot(&mut subscription)?.expect("step publication");
+    assert_eq!(snapshot.tick, applied.tick);
+    assert_eq!(snapshot.revisions, applied.revisions);
+    assert_eq!(snapshot.last_applied_command, Some(id));
+    let request = ProjectionRequest {
+        client_id: ProjectionClientId::new(1), viewport: ProjectionViewport { width: 80, height: 36 },
+        camera: ProjectionCamera { center: [200.0, 200.0], zoom: 1.0 },
+        selection: ProjectionSelection::default(), detail: ProjectionDetail::Vitals,
+        chart_window: 1, chart_points: 1, top_k: 4, ranking: ProjectionRanking::Energy,
+    };
+    let projection = project_snapshot(&snapshot, &request, ProjectionLimits::default())?;
+    assert_eq!(projection.source.session_id, snapshot.session_id);
+    assert_eq!(projection.source.host, applied.revisions);
+    assert!(!projection.visible_agents.is_empty());
+    assert_eq!(client.submit(envelope)?, receipt, "retry must preserve the original result");
+    host.drive(ManualInstant::from_nanos(2))?;
+    assert_eq!(host.latest_snapshot().tick, Tick(1), "retry must not step twice");
+    assert!(HostCommand::SetSpeed(f32::NAN).validate().is_err());
+    let mut invalid_viewport = request;
+    invalid_viewport.viewport.width = 0;
+    assert!(project_snapshot(&snapshot, &invalid_viewport, ProjectionLimits::default()).is_err());
+    println!("command={id:?} applied={applied:?} journal={:?} visible={}",
+        receipt.journal(), projection.visible_agents.len());
+    Ok(())
 }
 ```
 
-Snapshots are multi-subscriber and copy-on-write, ensuring N frontends incur only a single projection
-cost per tick.
-
-#### 2. Dispatching Validated Control Commands
-Send commands by packaging them into a `CommandEnvelope`:
-
-```rust
-use scriptbots_runtime::{CommandEnvelope, CommandId, HostCommand};
-
-let command = HostCommand::Step;
-command.validate().expect("command parameters must be valid");
-
-let envelope = CommandEnvelope::new(CommandId::new(42), command);
-```
-
-#### 3. Receipt Polling and Status Verification
-Never discard or fire-and-forget a command receipt (`bd-2z0.4.9`). Frontends must poll the receipt:
-- REST API: `GET /api/control/status/{command_id}` returns execution disposition (`Admitted`,
-  `Applied`, or `Rejected`).
-- CLI tool: `scriptbots-control lookup-status <command_id>`.
-
-#### 4. Failure Modes & Edge Cases
-- `CommandValidationError`: Sent invalid arguments (e.g. `Step { count: 0 }` or negative speed multiplier).
-- `StatusCombinationError`: Host reported conflicting lifecycle combinations.
-- Slow render recovery: If a frontend drops frames, it simply requests `latest()` on its next loop;
-  the simulation never stalls waiting for a slow frontend.
+The REST status route is `GET /api/control/status/{command_id}`. It exposes separate application
+and journal axes. The transitional `ControlHandle` still holds `SharedWorld`; this example does
+not certify that HTTP path or a GUI/PTY/browser session. `HostCommand::Step` has no count field.
+Invalid speed, mismatched session, status contradictions and projection limits return typed
+errors. A slow client polls its snapshot subscription for the newest publication; event-stream
+gaps require the separate cursor/catch-up protocol.
 
 ---
 

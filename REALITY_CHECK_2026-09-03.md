@@ -1,5 +1,88 @@
 # Reality Check — rust_scriptbots — refreshed 2026-09-04
 
+## Execution TODO — started 2026-09-05
+
+This checklist is the operator-requested working memory for the eight added tasks.
+Its consumers are the operator and implementing agent; Beads remains the claim and
+dependency authority. It retires as an active checklist when those tasks are
+implemented and verified. It earns no product-completion credit. No additional
+process machinery is needed; the next useful output is working interaction analysis.
+
+- [ ] **bd-2z0.11.11 — interaction semantics [Currently In Progress], TurquoiseLake.**
+  Validate complete half-open windows versus newest pages; reject one-sided bounds;
+  define zero limits; bound materialized input and graph work before loading;
+  retain repeated-edge count and magnitude; reject invalid magnitudes; share selection
+  between reports and exports; expose selection/capture/algorithm semantics; remove
+  the unbounded, differently ordered replay fallback; update user-facing examples.
+  - [x] Shared canonical storage selection, complete half-open windows, recent pages,
+    zero-limit behavior and pre-load row/projected-byte/work admission implemented.
+  - [x] Directed repeated edges retain count and magnitude in both export formats;
+    invalid magnitudes and unsupported parameters are rejected.
+  - [x] Capture uncertainty, exact selected event identities, algorithm weighting and
+    seeded sampling are exposed. Candidate implementation committed as `428d102`.
+  - [ ] Re-execute the final fixture additions through clean pinned DSR; inspect failures
+    and original acceptance criteria before closing the implementation bead.
+- [ ] **bd-2z0.11.12 — real storage and CLI proof.** Persist a hand-enumerated fixture
+  with repeated/directed/boundary events and two runs; close and reopen it; exercise
+  actual report/export processes; independently parse counts, weights and selection;
+  test missing capture evidence, empty/reversed/one-sided windows, zero limits,
+  over-budget selection, nonfinite data and source isolation; retain execution logs.
+  - [x] Ten tests written, including real file persistence, reopening, both CLI formats,
+    two-run attribution, boundary selection and seeded centrality controls.
+  - [x] Earlier candidate ran 10/10 on RCH; explicitly diagnostic. Subsequent capture
+    truncation, typo rejection and retained subprocess records still need execution.
+  - [ ] Add a persisted capture-counter contradiction control; verify the refusal.
+  - [ ] Claim companion proof after implementation closes; independently re-run at its SHA.
+- [ ] **bd-build-farm-reliability-lb19.1 — usable pinned DSR profile [Currently In Progress], TurquoiseLake.** Inspect installed
+  DSR schema and available hosts; provide a portable reviewed profile/materialization
+  path; bind source, toolchain, target and external evidence; distinguish preflight
+  refusal from test failure; include workspace checks and core economy-fault tests.
+  - [x] Reviewed native correctness profile and runner committed as `d8083c6`.
+  - [x] Fresh isolated configuration on hz4 validates; actual DSR executes its guards.
+    Missing `yq` supplied as an isolated official binary with verified SHA-256.
+  - [x] First clean run retained a real WASM snapshot failure before compilation:
+    `graphs-d8083c6-20260905-01`, external proof root
+    `/data/tmp/scriptbots-dsr-20260905-TmJwOJ/proofs` on hz4.
+  - [ ] Qualify the reviewed snapshot update for existing genome PNG dependencies;
+    repair stale archive and meadow compilation prerequisites without weakening checks.
+  - [ ] Complete nonzero executed test evidence and source/profile immutability checks.
+- [ ] **bd-build-farm-reliability-lb19.2 — actual DSR qualification.** Materialize from
+  an empty configuration; exercise wrong-source/dirty/missing-host negatives; run
+  check, strict Clippy, formatting and tests; retain actual counts and source identity;
+  run performance only on the checked-in golden's exact class through DSR.
+- [ ] **bd-2z0.13.8 — repair extension recipes [Currently In Progress], TurquoiseLake.** Reconcile exact Brain/registry APIs;
+  compile the literal custom-family recipe; normalize and execute the scenario;
+  demonstrate actual host command application and projection; correct architecture
+  claims at their source without removing extension topics.
+  - [x] Confirmed the current tests never execute the advertised custom family,
+    normalized scenario effects, or host command application.
+  - [ ] Make literal Rust recipes compile and run under rustdoc using real protocol APIs.
+  - [ ] Execute the literal scenario document through production config composition.
+  - [ ] Observe command application, journal disposition and matching projection.
+  - [ ] Correct current ownership, supported CLI choices and recipe evidence claims.
+- [ ] **bd-2z0.13.10 — execute extension recipes.** Register/evaluate/mutate/reproduce
+  and checkpoint the documented family; execute both scheduled scenario effects;
+  correlate host application, journal and projection; mutate the real recipe as the
+  negative control; replace tests that only grep names or check disconnected strings.
+- [ ] **bd-2z0.13.9 — compose the Evolution Lab journey.** Reuse production startup,
+  scene inspection, control receipts, durable history, checkpoint continuation,
+  matched-seed experiment and report/bundle paths; bind each stage to predecessor
+  identities; derive required frontend cells from declared support; expose actual
+  subset coverage while required upstream work remains incomplete.
+- [ ] **bd-2z0.13.11 — final journey proof.** Execute the composed journey and its
+  identity/seed/checkpoint/receipt/artifact negative controls after dependency proofs;
+  verify all required frontend cells; keep this open until actual production evidence
+  satisfies every original acceptance condition.
+- [ ] **Existing dependency work:** preserve current owners of bd-pcfj/bd-88yj
+  (host ownership), bd-2z0.10.5 (meadow), and other in-progress leaves; implement
+  unowned ready prerequisites when they become the highest-value next step.
+  Track checkpoint bd-2z0.5.13, scenarios bd-2z0.10.4/.5, analytics bd-2z0.11.9,
+  release bd-1bdd, TUI bd-2z0.6.8, Bevy bd-2z0.7.2 and browser bd-2z0.12.3.
+- [ ] **For each implementation block:** meaningful positive and discriminating
+  negative tests; required compiler/lint/format checks; fresh self-review against the
+  original bead; accurate status and evidence; reviewed exact-path commits and sync.
+  No test weakening, fixture-as-live claims, or closure of unmet positive requirements.
+
 ## Current verdict and evidence boundary
 
 **ScriptBots contains a substantial simulation and research substrate, but it does not yet deliver the complete Evolution Lab journey.** The limiting work is connecting the production host, frontends, checkpoint continuation, scientific reports, and release evidence. Completing components or closing their issues does not prove those connections.
