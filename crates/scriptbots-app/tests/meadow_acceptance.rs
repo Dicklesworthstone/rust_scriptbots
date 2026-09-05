@@ -226,14 +226,14 @@ fn run_gui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> GuiRunR
             world.request_replay_world_digest();
         }
 
-        world.step().expect("step world in GUI path");
+        world.step().expect("step world in CPU PNG helper path");
 
-        // Offscreen GUI rendering at select cadence and final tick
+        // CPU PNG rendering at select cadence and final tick.
         if tick % 50 == 0 || tick == ticks {
             let png = render_png_offscreen(&world, 800, 450);
             assert!(
                 !png.is_empty() && png.starts_with(b"\x89PNG\r\n\x1a\n"),
-                "seed {seed} tick {tick}: GUI offscreen raster must emit valid PNG header"
+                "seed {seed} tick {tick}: CPU raster must emit valid PNG header"
             );
             last_png_bytes = png;
         }
@@ -241,7 +241,7 @@ fn run_gui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> GuiRunR
         if let Some(ref report) = world.resource_ledger().latest {
             assert!(
                 report.reconciliation.reconciled,
-                "seed {seed} tick {tick}: GUI resource reconciliation breach! unexplained={:?}, tol={}",
+                "seed {seed} tick {tick}: CPU PNG path resource reconciliation breach! unexplained={:?}, tol={}",
                 report.reconciliation.unexplained_delta, report.reconciliation.tolerance
             );
             gate.observe(report);
@@ -287,12 +287,12 @@ fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
     for &seed in &document.seeds {
         println!("\n--- Executing Seed {seed} ---");
 
-        // 1. Run TUI path (terminal headless drawing frames into test buffer)
+        // 1. Draw terminal frames through Ratatui TestBackend.
         let tui_result = run_tui_path(&document, seed, ticks);
         assert_eq!(u64::try_from(tui_result.rendered_frames).unwrap(), ticks);
         assert_envelope("meadow-tui", seed, &envelope, &tui_result.world);
         println!(
-            "  [TUI] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
+            "  [Ratatui TestBackend] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
             ticks,
             tui_result.world.agent_count(),
             tui_result
@@ -308,11 +308,11 @@ fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
             tui_result.digest.overall
         );
 
-        // 2. Run GUI path (stepping simulation & rendering offscreen PNG canvas)
+        // 2. Step the same simulation and render the CPU PNG helper.
         let gui_result = run_gui_path(&document, seed, ticks);
         assert_envelope("meadow-gui", seed, &envelope, &gui_result.world);
         println!(
-            "  [GUI] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
+            "  [CPU PNG] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
             ticks,
             gui_result.world.agent_count(),
             gui_result
@@ -331,18 +331,18 @@ fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
         // 3. SCIENTIFIC PARITY ASSERTION
         assert_eq!(
             tui_result.digest.overall, gui_result.digest.overall,
-            "seed {seed}: GUI and TUI scientific digests diverged! TUI={} GUI={}",
+            "seed {seed}: helper-path scientific digests diverged! TestBackend={} CPU-PNG={}",
             tui_result.digest.overall, gui_result.digest.overall
         );
         println!(
-            "  [PARITY] EXACT BIT-FOR-BIT MATCH between GUI and TUI: {}",
+            "  [PARITY] Exact digest match between Ratatui TestBackend and CPU PNG paths: {}",
             tui_result.digest.overall
         );
 
         // Verify PNG canvas output was produced and valid
         assert!(
             gui_result.last_png_bytes.len() > 1000,
-            "seed {seed}: GUI offscreen canvas PNG size must be substantial"
+            "seed {seed}: CPU canvas PNG size must be substantial"
         );
 
         // 4. BALANCED LEDGER: seal the seed verdict
