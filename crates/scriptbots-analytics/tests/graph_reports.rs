@@ -604,6 +604,7 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
     let path = db.to_str().unwrap();
     let run_a = RunId::from_namespace_sequence(0x1eaf, 1);
     let run_b = RunId::from_namespace_sequence(0x1eaf, 2);
+    let run_c = RunId::from_namespace_sequence(0x1eaf, 3);
     let mut first =
         Storage::create_new_file_for_run(path, RunManifestRecord::unattributed(run_a)).unwrap();
     let mut founders = make_tick_batch(0, 0, 0);
@@ -622,6 +623,25 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
     second.persist(&founders).unwrap();
     persist_interaction_tick(&mut second, 5, &[(1, 2, 99.0)], 0, 0, false);
     second.close().unwrap();
+    let mut inconsistent =
+        Storage::append_run(path, RunManifestRecord::unattributed(run_c)).unwrap();
+    inconsistent.persist(&founders).unwrap();
+    persist_interaction_tick(&mut inconsistent, 5, &[(1, 2, 1.0)], 0, 0, true);
+    // The accounting balances internally but claims a second persisted event
+    // absent from the canonical interaction table. A complete-run label must
+    // compare the two observations, not trust the counters alone.
+    let mut extra_counters = make_tick_batch(6, 0, 0);
+    for kind in [
+        scriptbots_core::INTERACTION_EVENTS_OBSERVED_KIND,
+        scriptbots_core::INTERACTION_EVENTS_PERSISTED_KIND,
+    ] {
+        extra_counters.events.push(PersistenceEvent::new(
+            PersistenceEventKind::Custom(kind.into()),
+            1,
+        ));
+    }
+    inconsistent.persist(&extra_counters).unwrap();
+    inconsistent.close().unwrap();
 
     let bin = env!("CARGO_BIN_EXE_sb-analyze");
     let execute = |run: RunId, name: &str, arguments: &[&str]| {
@@ -877,7 +897,29 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
     );
     assert!(
         !execute(
-            RunId::from_namespace_sequence(0x1eaf, 3),
+            run_c,
+            "contradictory-capture-report",
+            &["run", "interaction-centrality"]
+        )
+        .status
+        .success(),
+        "balanced counters cannot claim rows absent from storage"
+    );
+    for format in ["graphml", "edgelist"] {
+        assert!(
+            !execute(
+                run_c,
+                &format!("contradictory-capture-{format}"),
+                &["export-graph", "--graph", "interaction", "--format", format,]
+            )
+            .status
+            .success(),
+            "{format} must share the report's capture validation"
+        );
+    }
+    assert!(
+        !execute(
+            RunId::from_namespace_sequence(0x1eaf, 4),
             "missing-run",
             &["run", "interaction-centrality"]
         )

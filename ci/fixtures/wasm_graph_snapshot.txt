@@ -1,3 +1,4 @@
+adler2
 ahash
 anyhow
 arc-swap
@@ -26,6 +27,7 @@ js-sys
 libc
 libm
 memchr
+miniz_oxide
 num-traits
 num_cpus
 once_cell

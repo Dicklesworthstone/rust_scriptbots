@@ -92,9 +92,11 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
     graphs)
         run_step graph-check check cargo check --locked -p scriptbots-analytics --all-targets
         run_step graph-tests test cargo test --locked -p scriptbots-analytics --test graph_reports -- --nocapture
+        run_step archive-unit test cargo test --locked -p scriptbots-storage --lib test_storage_map_elites_archive_persistence_and_reload -- --nocapture
         run_step archive-integration test cargo test --locked -p scriptbots-storage --test persistence_integration map_elites -- --nocapture
         ;;
     recipes)
+        run_step architecture-doc-examples test cargo test --locked -p scriptbots-app --doc -- --nocapture
         run_step architecture-recipes test cargo test --locked -p scriptbots-app --test architecture_contract -- --nocapture
         ;;
 esac
