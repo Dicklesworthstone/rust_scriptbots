@@ -7568,18 +7568,30 @@ impl Widget for MapWidget<'_> {
             return;
         }
 
-        let width = area.width as usize;
+        // A wide emoji owns two terminal columns. Terrain and agents share this
+        // logical grid so a preceding terrain glyph cannot cover an agent's cell.
+        let columns_per_cell = if self.palette.emoji && !self.palette.is_emoji_narrow() {
+            2
+        } else {
+            1
+        };
+        let width = usize::from(area.width) / columns_per_cell;
         let height = area.height as usize;
 
         // Terrain base layer written directly into the buffer
         for y in 0..height {
+            // Clear continuation columns, an odd trailing column, and styles
+            // left by a previous frame before laying out this row's glyphs.
+            for column in 0..area.width {
+                buf[(area.x + column, area.y + y as u16)].reset();
+            }
             for x in 0..width {
                 let u = (x as f32 + 0.5) / width as f32;
                 let v = (y as f32 + 0.5) / height as f32;
                 let terrain = self.terrain.sample(u, v);
                 let food = self.snapshot.food.sample(u, v);
                 let (glyph, style) = self.palette.terrain_symbol(terrain, food);
-                let cell = &mut buf[(area.x + x as u16, area.y + y as u16)];
+                let cell = &mut buf[(area.x + (x * columns_per_cell) as u16, area.y + y as u16)];
                 cell.set_char(glyph);
                 cell.set_style(style);
             }
@@ -7630,9 +7642,10 @@ impl Widget for MapWidget<'_> {
                 if occupancy[idx].stamp != self.stamp || occupancy[idx].total() == 0 {
                     continue;
                 }
-                let base_style = buf[(area.x + x as u16, area.y + y as u16)].style();
+                let column = area.x + (x * columns_per_cell) as u16;
+                let base_style = buf[(column, area.y + y as u16)].style();
                 let (glyph, style) = self.palette.agent_symbol(&occupancy[idx], base_style);
-                let cell = &mut buf[(area.x + x as u16, area.y + y as u16)];
+                let cell = &mut buf[(column, area.y + y as u16)];
                 cell.set_char(glyph);
                 cell.set_style(style);
             }
@@ -9443,6 +9456,94 @@ mod tests {
         assert_ne!(styles[0].add_modifier, styles[1].add_modifier);
         assert_ne!(styles[1].add_modifier, styles[2].add_modifier);
         assert_ne!(styles[0].add_modifier, styles[2].add_modifier);
+    }
+
+    #[test]
+    fn flat_capability_frames_keep_every_diet_agent_visible() {
+        let palette = Palette::test_backend_evidence();
+        for row in capability_matrix_rows()
+            .into_iter()
+            .filter(|row| row.mode == SubCellMode::Ascii)
+        {
+            for width in [80, 81] {
+                let (buffer, layout, _) =
+                    capability_frame(&row, CuratedThemeId::default(), width, 36);
+                let area = layout.map;
+                for diet in [
+                    DietClass::Herbivore,
+                    DietClass::Omnivore,
+                    DietClass::Carnivore,
+                ] {
+                    let cells: Vec<_> = (area.y..area.bottom())
+                        .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+                        .map(|position| &buffer[position])
+                        .filter(|cell| cell.fg == palette.diet_color(diet))
+                        .collect();
+                    assert_eq!(
+                        cells.len(),
+                        1,
+                        "{}/{width}/{diet:?}: the seeded agent must reach TestBackend",
+                        row.label
+                    );
+                    assert!(!cells[0].symbol().trim().is_empty());
+                    assert_eq!(
+                        cells[0].modifier & (Modifier::BOLD | Modifier::UNDERLINED),
+                        Palette::diet_modifier(diet)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_emoji_flat_map_keeps_edge_agents_and_clears_continuation_columns() {
+        let terrain = canvas_test_terrain();
+        let mut palette = Palette::test_backend_evidence();
+        palette.emoji = true;
+        palette.emoji_narrow = false;
+        for (width, rightmost_tile) in [(2, 0), (3, 0), (4, 2), (5, 2)] {
+            for (position, body_column) in [(0.0, 0), (1.0, rightmost_tile)] {
+                let agent = canvas_test_agent(position, 0.0);
+                let expected_heading = palette.heading_char(agent.heading).to_string();
+                let snapshot = Snapshot {
+                    agents: vec![agent],
+                    ..Snapshot::default()
+                };
+                let backend = ratatui::backend::TestBackend::new(width, 2);
+                let mut terminal = Terminal::new(backend).expect("test backend");
+                let mut scratch = vec![CellOccupancy::default(); usize::from(width) * 2];
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            MapWidget {
+                                snapshot: &snapshot,
+                                terrain: &terrain,
+                                palette: &palette,
+                                scratch: &mut scratch,
+                                stamp: 1,
+                                canvas: None,
+                                day_night: canvas_test_day_night(),
+                                capability: canvas_test_capability(),
+                                motion: MotionPolicy::Full,
+                                density: &mut Vec::new(),
+                                viewport: CanvasViewport::new(1.0, (0.5, 0.5)),
+                            },
+                            frame.area(),
+                        );
+                    })
+                    .expect("draw wide emoji map");
+                let buffer = terminal.backend().buffer();
+                let body = &buffer[(body_column, 0)];
+                assert_eq!(body.symbol(), expected_heading);
+                assert_eq!(body.fg, palette.diet_color(DietClass::Herbivore));
+                assert!(body.modifier.contains(Modifier::UNDERLINED));
+                assert_eq!(buffer[(body_column + 1, 0)].symbol(), " ");
+                if width % 2 != 0 {
+                    assert_eq!(buffer[(width - 1, 0)].symbol(), " ");
+                    assert_eq!(buffer[(width - 1, 1)].symbol(), " ");
+                }
+            }
+        }
     }
 
     #[test]
