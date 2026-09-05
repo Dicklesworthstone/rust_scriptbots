@@ -2040,12 +2040,43 @@ fn refuse_lossy_command_claim_migration(connection: &Connection) -> Result<(), S
     Ok(())
 }
 
+fn refuse_ambiguous_island_attribution_migration(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+    if !(SCRIPTBOTS_SCHEMA_V15_VERSION..SCRIPTBOTS_SCHEMA_V18_VERSION).contains(&version) {
+        return Ok(());
+    }
+    // Before V18 these records did not carry an island identity. A nonzero island in the
+    // same run makes assigning them to island zero a guess, even if only one row survived
+    // the old run-wide uniqueness constraint. Refuse before the migration writes anything.
+    let ambiguous = connection.query(
+        "SELECT run_id FROM genomes
+         UNION SELECT run_id FROM run_events
+         INTERSECT SELECT run_id FROM (
+             SELECT run_id FROM tick_summaries WHERE island_id <> 0
+             UNION SELECT run_id FROM islands WHERE island_id <> 0
+         ) ORDER BY run_id LIMIT 1",
+    )?;
+    if let Some(row) = ambiguous.first() {
+        let run_id: String = decode(row, 0, "storage.migration.island_attribution")?;
+        return Err(StorageError::InvalidData {
+            context: "storage.migration.island_attribution",
+            reason: format!(
+                "refusing pre-v18 run {run_id}: unscoped genomes or narrative events cannot be assigned to an island in a multi-island run; preserve this database for explicit provenance repair"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
     // This preflight must precede MigrationRunner: its ledger, DDL, and user-version writes are
     // intentionally never attempted when old envelope-only archives cannot populate V9 exactly.
     refuse_lossy_command_lifecycle_migration(connection)?;
     refuse_ambiguous_command_claim_migration(connection)?;
     refuse_lossy_command_claim_migration(connection)?;
+    refuse_ambiguous_island_attribution_migration(connection)?;
     let result = scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_VERSION).run(connection)?;
     // Every suffix of the declared chain is a legal lineage. Independently require that
     // declaration to span every version, so deriving the suffix cannot conceal a skipped one.
@@ -27707,6 +27738,94 @@ mod tests {
         install_scriptbots_schema(&connection)?;
         assert_eq!(read_schema_objects(&connection)?, schema);
         connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn pre_v18_ambiguous_island_rows_refuse_before_any_migration_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for narrative in [false, true] {
+            for metadata in [false, true] {
+                let connection = Connection::open(":memory:")?;
+                scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_V17_VERSION)
+                    .run(&connection)?;
+                let run = RunId::new(0x181a);
+                register_bare_run(&connection, run)?;
+                if metadata {
+                    connection.execute_with_params(
+                        "INSERT INTO islands (run_id, island_id, label, config_hash, config_json)
+                         VALUES (?1, 1, 'other island', X'01', '{}')",
+                        &[sqlite_run_id(run)],
+                    )?;
+                } else {
+                    connection.execute_with_params(
+                        "INSERT INTO tick_summaries (run_id, tick, epoch, closed, agent_count,
+                            births, deaths, total_energy, average_energy, average_health, island_id)
+                         VALUES (?1, 1, 0, 0, 1, 0, 0, 1.0, 1.0, 1.0, 1)",
+                        &[sqlite_run_id(run)],
+                    )?;
+                }
+                // An old archipelago with no unscoped rows is unambiguous for this migration.
+                refuse_ambiguous_island_attribution_migration(&connection)?;
+                let preserved_query = if narrative {
+                    connection.execute_with_params(
+                        "INSERT INTO run_events (run_id, tick, kind, severity, magnitude,
+                            window_start, window_end, metric, before_value, after_value, score,
+                            human_text, schema_version)
+                         VALUES (?1, 1, 'population_boom', 0.5, 1.0, 0, 1, 'population',
+                            1.0, 2.0, 1.0, 'unknown island', 1)",
+                        &[sqlite_run_id(run)],
+                    )?;
+                    "SELECT human_text FROM run_events"
+                } else {
+                    connection.execute_with_params(
+                        "INSERT INTO genomes (run_id, genome_id, agent_uid, created_at_tick,
+                            brain_kind, genome_json, genome_digest, provenance_json)
+                         VALUES (?1, 'agent:7:tick:0', 7, 0, 'mlp', '{}', 'unknown', '{}')",
+                        &[sqlite_run_id(run)],
+                    )?;
+                    "SELECT genome_digest FROM genomes"
+                };
+                let payload: String = connection.query_row(preserved_query)?.get_typed(0)?;
+                let schema = read_schema_objects(&connection)?;
+                let ledger: i64 = connection
+                    .query_row("SELECT COUNT(*) FROM _schema_migrations")?
+                    .get_typed(0)?;
+                let error = install_scriptbots_schema(&connection)
+                    .expect_err("pre-v18 records cannot be attributed from a multi-island run");
+                assert!(
+                    matches!(
+                        error,
+                        StorageError::InvalidData {
+                            context: "storage.migration.island_attribution",
+                            ..
+                        }
+                    ),
+                    "narrative={narrative}, metadata={metadata}: {error}"
+                );
+                assert_eq!(read_schema_objects(&connection)?, schema);
+                assert_eq!(
+                    connection
+                        .query_row("PRAGMA user_version")?
+                        .get_typed::<i64>(0)?,
+                    SCRIPTBOTS_SCHEMA_V17_VERSION
+                );
+                assert_eq!(
+                    connection
+                        .query_row("SELECT COUNT(*) FROM _schema_migrations")?
+                        .get_typed::<i64>(0)?,
+                    ledger
+                );
+                assert_eq!(connection.query(preserved_query)?.len(), 1);
+                assert_eq!(
+                    connection
+                        .query_row(preserved_query)?
+                        .get_typed::<String>(0)?,
+                    payload
+                );
+                connection.close()?;
+            }
+        }
         Ok(())
     }
 

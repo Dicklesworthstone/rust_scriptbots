@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fsqlite::compat::RowExt;
 use scriptbots_app::archipelago_report::{ReportArchipelagoArgs, run_archipelago_report};
 use scriptbots_core::{AgentData, PersistenceBatch, ScriptBotsConfig, WorldState};
 use scriptbots_runtime::migrator::EmigrantSelectionRule;
