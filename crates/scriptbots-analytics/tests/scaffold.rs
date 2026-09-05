@@ -423,17 +423,11 @@ fn sb_analyze_list_and_run_use_the_real_fixture_database() {
     );
 }
 
-fn synth_db_with_phenotypes(dir: &tempfile::TempDir) -> String {
+fn phenotype_agents() -> [scriptbots_core::AgentState; 2] {
     use scriptbots_core::{
-        AgentData, AgentId, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin,
-        BirthRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
-        INTERACTION_EVENTS_PERSISTED_KIND, MetricSample, PersistenceBatch, PersistenceEvent,
-        PersistenceEventKind, Position, ReplayEvent, ReplayEventKind, ReplayInteractionKind, Tick,
-        TickSummary, TraitModifiers, Velocity,
+        AgentData, AgentId, AgentIdentity, AgentRuntime, AgentState, AgentUid, Position,
+        TraitModifiers, Velocity,
     };
-
-    let path = dir.path().join("phenotypes.sqlite").display().to_string();
-    let mut storage = Storage::create_unattributed_file(&path).expect("create synth phenotype db");
 
     let agent1 = AgentState {
         id: AgentId::default(),
@@ -488,6 +482,21 @@ fn synth_db_with_phenotypes(dir: &tempfile::TempDir) -> String {
             ..AgentRuntime::default()
         },
     };
+
+    [agent1, agent2]
+}
+
+fn synth_db_with_phenotypes(dir: &tempfile::TempDir) -> String {
+    use scriptbots_core::{
+        AgentUid, BirthOrigin, BirthRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
+        INTERACTION_EVENTS_PERSISTED_KIND, MetricSample, PersistenceBatch, PersistenceEvent,
+        PersistenceEventKind, Position, ReplayEvent, ReplayEventKind, ReplayInteractionKind, Tick,
+        TickSummary,
+    };
+
+    let path = dir.path().join("phenotypes.sqlite").display().to_string();
+    let mut storage = Storage::create_unattributed_file(&path).expect("create synth phenotype db");
+    let [agent1, agent2] = phenotype_agents();
 
     let birth1 = BirthRecord {
         tick: Tick(0),

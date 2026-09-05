@@ -108,8 +108,8 @@ fn assert_envelope(id: &str, seed: u64, envelope: &ScenarioEnvelopeV1, world: &W
             "{id}/seed {seed}: population {agent_count} exceeded ceiling {max}"
         );
     }
-    let total_births = world.history().map(|h| h.births as usize).sum::<usize>();
-    let total_deaths = world.history().map(|h| h.deaths as usize).sum::<usize>();
+    let total_births = world.history().map(|h| h.births).sum::<usize>();
+    let total_deaths = world.history().map(|h| h.deaths).sum::<usize>();
     if let Some(min) = envelope.births_min {
         assert!(
             total_births >= min as usize,
@@ -295,16 +295,8 @@ fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
             "  [Ratatui TestBackend] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
             ticks,
             tui_result.world.agent_count(),
-            tui_result
-                .world
-                .history()
-                .map(|h| h.births as usize)
-                .sum::<usize>(),
-            tui_result
-                .world
-                .history()
-                .map(|h| h.deaths as usize)
-                .sum::<usize>(),
+            tui_result.world.history().map(|h| h.births).sum::<usize>(),
+            tui_result.world.history().map(|h| h.deaths).sum::<usize>(),
             tui_result.digest.overall
         );
 
@@ -315,16 +307,8 @@ fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
             "  [CPU PNG] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
             ticks,
             gui_result.world.agent_count(),
-            gui_result
-                .world
-                .history()
-                .map(|h| h.births as usize)
-                .sum::<usize>(),
-            gui_result
-                .world
-                .history()
-                .map(|h| h.deaths as usize)
-                .sum::<usize>(),
+            gui_result.world.history().map(|h| h.births).sum::<usize>(),
+            gui_result.world.history().map(|h| h.deaths).sum::<usize>(),
             gui_result.digest.overall
         );
 

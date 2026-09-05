@@ -11,7 +11,7 @@ use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
 use scriptbots_storage::Storage;
 
 /// A tick batch carrying a set of named metric samples.
-fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
+const fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
     PersistenceBatch {
         summary: TickSummary {
             tick: Tick(tick),

@@ -252,15 +252,14 @@ fn assert_test_backend_buffer_evidence(report: &HeadlessReportDto) {
     }
 }
 
+type HttpResponse = (u16, Vec<(String, String)>, String);
+
 /// Minimal HTTP/1.1 GET over a real socket.
 ///
 /// Deliberately hand-rolled rather than adding an HTTP client dependency: the
 /// request under test is a bare GET, and a new third-party dev-dependency is an
 /// operator decision this proof does not need. Returns `(status, headers, body)`.
-fn http_get(
-    addr: std::net::SocketAddr,
-    path: &str,
-) -> Result<(u16, Vec<(String, String)>, String)> {
+fn http_get(addr: std::net::SocketAddr, path: &str) -> Result<HttpResponse> {
     use std::io::{Read, Write};
 
     let mut stream = std::net::TcpStream::connect(addr)?;

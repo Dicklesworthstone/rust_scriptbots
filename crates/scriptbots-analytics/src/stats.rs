@@ -734,7 +734,8 @@ mod tests {
                 clippy::suboptimal_flops,
                 reason = "preserve separate product and sum rounding for the seeded AR(1) calibration samples supplied to both bootstrap methods"
             )]
-            prev = phi * prev + draws.normal(0.0, 1.0);
+            let next = phi * prev + draws.normal(0.0, 1.0);
+            prev = next;
             series.push(prev);
         }
 

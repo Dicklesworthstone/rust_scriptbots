@@ -2028,7 +2028,7 @@ mod tests {
         );
 
         assert_eq!(
-            analyze_matched_seed_runs(&[control.clone()], &metrics, params),
+            analyze_matched_seed_runs(std::slice::from_ref(&control), &metrics, params),
             Err(StatsError::InsufficientArms)
         );
         assert_eq!(

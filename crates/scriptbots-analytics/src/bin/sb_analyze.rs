@@ -10,7 +10,7 @@
 //!   sb-analyze runs/scriptbots-123.sqlite export --format parquet --out-dir ./exports --verify
 //!   sb-analyze runs/scriptbots-123.sqlite summarize --epoch-size 100 --rolling-window 10 --md summary.md
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -74,7 +74,7 @@ enum Command {
         #[arg(long)]
         verify: bool,
     },
-    /// Generate per-epoch FrankenPandas summary and rolling metrics report (bd-2z0.11.8).
+    /// Generate per-epoch `FrankenPandas` summary and rolling metrics report (bd-2z0.11.8).
     Summarize {
         /// Epoch tick interval for demographic grouping (default: 100).
         #[arg(long, default_value_t = 100)]
@@ -92,7 +92,7 @@ enum Command {
         #[arg(long)]
         md: Option<PathBuf>,
     },
-    /// Export graph representations to GraphML or Edge-List (bd-2z0.11.7).
+    /// Export graph representations to `GraphML` or Edge-List (bd-2z0.11.7).
     ExportGraph {
         /// Which graph to export: lineage, dynasty, or interaction.
         #[arg(long, value_enum, default_value_t = ExportGraphKind::Lineage)]
@@ -123,7 +123,7 @@ pub enum ExportGraphKind {
 /// Serialization format for exported graphs.
 #[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
 pub enum ExportGraphFormat {
-    /// Standard XML-based GraphML format.
+    /// Standard XML-based `GraphML` format.
     Graphml,
     /// Space-delimited edge list format.
     Edgelist,
@@ -163,13 +163,17 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<(), AnalyticsError> {
     let registry = Registry::builtin();
     let db = cli.db.display().to_string();
-    let open_reader = || match cli.run_id {
-        Some(run_id) => StorageReader::open_finished_for_run(&db, run_id),
-        None => StorageReader::open_finished(&db),
+    let open_reader = || {
+        cli.run_id.map_or_else(
+            || StorageReader::open_finished(&db),
+            |run_id| StorageReader::open_finished_for_run(&db, run_id),
+        )
     };
-    let open_context = || match cli.run_id {
-        Some(run_id) => ReaderCtx::open_for_run(&db, run_id),
-        None => ReaderCtx::open(&db),
+    let open_context = || {
+        cli.run_id.map_or_else(
+            || ReaderCtx::open(&db),
+            |run_id| ReaderCtx::open_for_run(&db, run_id),
+        )
     };
 
     match &cli.command {
@@ -208,45 +212,7 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             verify,
         } => {
             let reader = open_reader()?;
-            let target_tables = if tables.is_empty() {
-                ExportTable::ALL.to_vec()
-            } else {
-                let mut parsed = Vec::new();
-                for t in tables {
-                    match t.to_lowercase().as_str() {
-                        "run" => parsed.push(ExportTable::Run),
-                        "agent" | "agents" => parsed.push(ExportTable::Agent),
-                        "lineage" | "lineage_edges" => parsed.push(ExportTable::Lineage),
-                        "event" | "events" | "replay_events" => parsed.push(ExportTable::Event),
-                        "metric" | "metrics" => parsed.push(ExportTable::Metric),
-                        other => {
-                            return Err(AnalyticsError::BadParam {
-                                name: "tables".into(),
-                                reason: format!("Unknown table '{other}'"),
-                            });
-                        }
-                    }
-                }
-                parsed
-            };
-
-            std::fs::create_dir_all(out_dir)?;
-            println!(
-                "exporting {} table(s) to {:?} format in {}",
-                target_tables.len(),
-                format,
-                out_dir.display()
-            );
-
-            for table in target_tables {
-                let path = export_database_table(&reader, table, *format, out_dir, *verify)?;
-                println!("  ✓ exported {} -> {}", table.as_str(), path.display());
-            }
-
-            if *verify {
-                println!("all exported files verified successfully.");
-            }
-            Ok(())
+            export_tables(&reader, *format, tables, out_dir, *verify)
         }
         Command::Summarize {
             epoch_size,
@@ -291,52 +257,7 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             out,
         } => {
             let cx = open_context()?;
-            if *graph != ExportGraphKind::Interaction && !params.is_empty() {
-                return Err(AnalyticsError::BadParam {
-                    name: "params".to_owned(),
-                    reason: "graph selection parameters apply to interaction exports".to_owned(),
-                });
-            }
-            let text = match (graph, format) {
-                (ExportGraphKind::Lineage, ExportGraphFormat::Graphml) => {
-                    let births = cx.reader.load_ancestry_births()?;
-                    let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
-                    scriptbots_analytics::export_digraph_graphml(&digraph)?
-                }
-                (ExportGraphKind::Lineage, ExportGraphFormat::Edgelist) => {
-                    let births = cx.reader.load_ancestry_births()?;
-                    let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
-                    scriptbots_analytics::export_digraph_edgelist(&digraph)?
-                }
-                (ExportGraphKind::Dynasty, ExportGraphFormat::Graphml) => {
-                    let births = cx.reader.load_ancestry_births()?;
-                    let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
-                    let undirected = digraph.to_undirected();
-                    scriptbots_analytics::export_graph_graphml(&undirected)?
-                }
-                (ExportGraphKind::Dynasty, ExportGraphFormat::Edgelist) => {
-                    let births = cx.reader.load_ancestry_births()?;
-                    let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
-                    let undirected = digraph.to_undirected();
-                    scriptbots_analytics::export_graph_edgelist(&undirected)?
-                }
-                (ExportGraphKind::Interaction, format) => {
-                    let params = ReportParams::from_pairs(params.iter().cloned())?;
-                    let (interactions, evidence) =
-                        scriptbots_analytics::load_interaction_graph_input(&cx, &params)?;
-                    let (digraph, _, _) =
-                        scriptbots_analytics::build_interaction_digraph(&interactions)?;
-                    let format = match format {
-                        ExportGraphFormat::Graphml => {
-                            scriptbots_analytics::InteractionGraphFormat::GraphMl
-                        }
-                        ExportGraphFormat::Edgelist => {
-                            scriptbots_analytics::InteractionGraphFormat::EdgeList
-                        }
-                    };
-                    scriptbots_analytics::export_interaction_graph(&digraph, &evidence, format)?
-                }
-            };
+            let text = graph_export_text(&cx, *graph, *format, params)?;
 
             if let Some(path) = out {
                 std::fs::write(path, &text)?;
@@ -345,6 +266,105 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
                 print!("{text}");
             }
             Ok(())
+        }
+    }
+}
+
+fn export_tables(
+    reader: &StorageReader,
+    format: AnalyticsExportFormat,
+    tables: &[String],
+    out_dir: &Path,
+    verify: bool,
+) -> Result<(), AnalyticsError> {
+    let target_tables = if tables.is_empty() {
+        ExportTable::ALL.to_vec()
+    } else {
+        let mut parsed = Vec::new();
+        for t in tables {
+            match t.to_lowercase().as_str() {
+                "run" => parsed.push(ExportTable::Run),
+                "agent" | "agents" => parsed.push(ExportTable::Agent),
+                "lineage" | "lineage_edges" => parsed.push(ExportTable::Lineage),
+                "event" | "events" | "replay_events" => parsed.push(ExportTable::Event),
+                "metric" | "metrics" => parsed.push(ExportTable::Metric),
+                other => {
+                    return Err(AnalyticsError::BadParam {
+                        name: "tables".into(),
+                        reason: format!("Unknown table '{other}'"),
+                    });
+                }
+            }
+        }
+        parsed
+    };
+
+    std::fs::create_dir_all(out_dir)?;
+    println!(
+        "exporting {} table(s) to {:?} format in {}",
+        target_tables.len(),
+        format,
+        out_dir.display()
+    );
+
+    for table in target_tables {
+        let path = export_database_table(reader, table, format, out_dir, verify)?;
+        println!("  ✓ exported {} -> {}", table.as_str(), path.display());
+    }
+
+    if verify {
+        println!("all exported files verified successfully.");
+    }
+    Ok(())
+}
+
+fn graph_export_text(
+    cx: &ReaderCtx,
+    graph: ExportGraphKind,
+    format: ExportGraphFormat,
+    params: &[String],
+) -> Result<String, AnalyticsError> {
+    if graph != ExportGraphKind::Interaction && !params.is_empty() {
+        return Err(AnalyticsError::BadParam {
+            name: "params".to_owned(),
+            reason: "graph selection parameters apply to interaction exports".to_owned(),
+        });
+    }
+    match (graph, format) {
+        (ExportGraphKind::Lineage, ExportGraphFormat::Graphml) => {
+            let births = cx.reader.load_ancestry_births()?;
+            let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
+            scriptbots_analytics::export_digraph_graphml(&digraph)
+        }
+        (ExportGraphKind::Lineage, ExportGraphFormat::Edgelist) => {
+            let births = cx.reader.load_ancestry_births()?;
+            let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
+            scriptbots_analytics::export_digraph_edgelist(&digraph)
+        }
+        (ExportGraphKind::Dynasty, ExportGraphFormat::Graphml) => {
+            let births = cx.reader.load_ancestry_births()?;
+            let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
+            let undirected = digraph.to_undirected();
+            scriptbots_analytics::export_graph_graphml(&undirected)
+        }
+        (ExportGraphKind::Dynasty, ExportGraphFormat::Edgelist) => {
+            let births = cx.reader.load_ancestry_births()?;
+            let (digraph, _) = scriptbots_analytics::build_lineage_digraph(&births);
+            let undirected = digraph.to_undirected();
+            scriptbots_analytics::export_graph_edgelist(&undirected)
+        }
+        (ExportGraphKind::Interaction, format) => {
+            let params = ReportParams::from_pairs(params.iter().cloned())?;
+            let (interactions, evidence) =
+                scriptbots_analytics::load_interaction_graph_input(cx, &params)?;
+            let (digraph, _, _) = scriptbots_analytics::build_interaction_digraph(&interactions)?;
+            let format = match format {
+                ExportGraphFormat::Graphml => scriptbots_analytics::InteractionGraphFormat::GraphMl,
+                ExportGraphFormat::Edgelist => {
+                    scriptbots_analytics::InteractionGraphFormat::EdgeList
+                }
+            };
+            scriptbots_analytics::export_interaction_graph(&digraph, &evidence, format)
         }
     }
 }

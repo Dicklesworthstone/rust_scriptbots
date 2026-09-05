@@ -1,4 +1,4 @@
-//! Comprehensive integration test suite for FrankenPandas export and summary layer (bd-2z0.11.8).
+//! Comprehensive integration test suite for `FrankenPandas` export and summary layer (bd-2z0.11.8).
 //!
 //! Verifies:
 //! 1. `export_database_table` exports Run, Agent, Lineage, Event, and Metric tables
@@ -32,16 +32,24 @@ fn make_agent(
     brain_kind: &str,
 ) -> AgentState {
     let data = AgentData {
-        position: Position::new(10.0 * uid as f32, 20.0 * tick as f32),
+        position: Position::new(
+            10.0 * f32::from(u16::try_from(uid).expect("fixture UID in 1..=4 fits u16")),
+            20.0 * f32::from(u16::try_from(tick).expect("fixture tick in 0..=9 fits u16")),
+        ),
         velocity: Velocity::new(1.0, 0.0),
         heading: 0.0,
         health: 100.0,
         generation: Generation(agent_gen),
-        age: tick as u32,
+        age: u32::try_from(tick).expect("fixture tick in 0..=9 fits u32"),
         ..AgentData::default()
     };
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "preserve the separate multiplication and addition used by this serialized agent fixture"
+    )]
     let runtime = AgentRuntime {
-        energy: 100.0 + (uid as f32 * 10.0),
+        energy: 100.0
+            + (f32::from(u16::try_from(uid).expect("fixture UID in 1..=4 fits u16")) * 10.0),
         herbivore_tendency: ht,
         brain: BrainBinding::Legacy {
             runner: None,
@@ -87,6 +95,76 @@ fn make_birth(
         generation: Generation(birth_gen),
         position: Position::new(0.0, 0.0),
         is_hybrid: false,
+    }
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserve the separate multiplication and addition in the fixture's exported average_energy metric"
+)]
+fn fixture_batch(
+    tick: u64,
+    agent_count: usize,
+    births_count: usize,
+    agents: Vec<AgentState>,
+    births: Vec<BirthRecord>,
+) -> PersistenceBatch {
+    PersistenceBatch {
+        summary: TickSummary {
+            tick: Tick(tick),
+            agent_count,
+            births: births_count,
+            deaths: 0,
+            total_energy: 100.0
+                * f32::from(
+                    u16::try_from(agent_count).expect("fixture population in 2..=4 fits u16"),
+                ),
+            average_energy: 100.0,
+            average_health: 95.0,
+            max_age: u32::try_from(tick).expect("fixture tick in 0..=9 fits u32"),
+            spike_hits: 0,
+        },
+        epoch: 1,
+        closed: false,
+        metrics: vec![
+            MetricSample::new(
+                "population",
+                f64::from(
+                    u16::try_from(agent_count).expect("fixture population in 2..=4 fits u16"),
+                ),
+            ),
+            MetricSample::new(
+                "average_energy",
+                100.0
+                    + (f64::from(u16::try_from(tick).expect("fixture tick in 0..=9 fits u16"))
+                        * 2.5),
+            ),
+        ],
+        events: if births_count > 0 {
+            vec![PersistenceEvent::new(
+                PersistenceEventKind::Births,
+                births_count,
+            )]
+        } else {
+            Vec::new()
+        },
+        agents,
+        births,
+        deaths: Vec::new(),
+        replay_events: vec![ReplayEvent {
+            agent_uid: Some(AgentUid(1)),
+            position: Some(Position::new(10.0, 20.0)),
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::RngSample {
+                scope: ReplayRngScope::World,
+                range_min: 0.0,
+                range_max: 1.0,
+                value: 0.42,
+            },
+        }],
+        narrative_events: Vec::new(),
+        genomes: Vec::new(),
     }
 }
 
@@ -150,50 +228,7 @@ fn build_fixture_db(dir: &tempfile::TempDir) -> String {
             ),
         };
 
-        let batch = PersistenceBatch {
-            summary: TickSummary {
-                tick: Tick(tick),
-                agent_count,
-                births: births_count,
-                deaths: 0,
-                total_energy: 100.0 * agent_count as f32,
-                average_energy: 100.0,
-                average_health: 95.0,
-                max_age: tick as u32,
-                spike_hits: 0,
-            },
-            epoch: 1,
-            closed: false,
-            metrics: vec![
-                MetricSample::new("population", agent_count as f64),
-                MetricSample::new("average_energy", 100.0 + (tick as f64 * 2.5)),
-            ],
-            events: if births_count > 0 {
-                vec![PersistenceEvent::new(
-                    PersistenceEventKind::Births,
-                    births_count,
-                )]
-            } else {
-                Vec::new()
-            },
-            agents,
-            births,
-            deaths: Vec::new(),
-            replay_events: vec![ReplayEvent {
-                agent_uid: Some(AgentUid(1)),
-                position: Some(Position::new(10.0, 20.0)),
-                counterpart: None,
-                counterpart_position: None,
-                kind: ReplayEventKind::RngSample {
-                    scope: ReplayRngScope::World,
-                    range_min: 0.0,
-                    range_max: 1.0,
-                    value: 0.42,
-                },
-            }],
-            narrative_events: Vec::new(),
-            genomes: Vec::new(),
-        };
+        let batch = fixture_batch(tick, agent_count, births_count, agents, births);
 
         storage.persist(&batch).expect("persist batch");
     }
@@ -219,15 +254,14 @@ fn test_bd_2z0_11_8_export_all_tables_and_verify_roundtrip() {
         for &table in &ExportTable::ALL {
             let out_path = export_database_table(&reader, table, format, dir.path(), true)
                 .unwrap_or_else(|e| {
-                    panic!("failed to export {:?} as {:?}: {e}", table, format);
+                    panic!("failed to export {table:?} as {format:?}: {e}");
                 });
 
             assert!(out_path.exists(), "exported file must exist on disk");
             let metadata = fs::metadata(&out_path).expect("file metadata");
             assert!(
                 metadata.len() > 0,
-                "exported {:?} file must not be empty",
-                format
+                "exported {format:?} file must not be empty"
             );
         }
     }
@@ -303,7 +337,8 @@ fn test_bd_2z0_11_8_summarize_and_sql_conformance_agreement() {
         .filter(|m| m.name == "population")
         .map(|m| m.value)
         .collect();
-    let sql_mean_pop = pop_metrics.iter().sum::<f64>() / pop_metrics.len() as f64;
+    let sql_mean_pop = pop_metrics.iter().sum::<f64>()
+        / f64::from(u16::try_from(pop_metrics.len()).expect("ten fixture metric rows fit u16"));
 
     let pop_df_rows: Vec<f64> = summary
         .rolling_metrics
@@ -311,7 +346,8 @@ fn test_bd_2z0_11_8_summarize_and_sql_conformance_agreement() {
         .filter(|m| m.metric_name == "population")
         .map(|m| m.raw_value)
         .collect();
-    let df_mean_pop = pop_df_rows.iter().sum::<f64>() / pop_df_rows.len() as f64;
+    let df_mean_pop = pop_df_rows.iter().sum::<f64>()
+        / f64::from(u16::try_from(pop_df_rows.len()).expect("ten fixture metric rows fit u16"));
 
     assert_eq!(
         sql_mean_pop, df_mean_pop,

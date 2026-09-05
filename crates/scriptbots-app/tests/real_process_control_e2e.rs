@@ -416,17 +416,14 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     let advance_deadline = Instant::now() + Duration::from_secs(30);
     let mut advanced = false;
     while Instant::now() < advance_deadline {
-        if let Ok((code, body)) = http(rest_addr, "GET", "/api/status") {
-            if code == 200
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
-            {
-                if let Some(t) = v["tick"].as_u64() {
-                    if t > tick_step {
-                        advanced = true;
-                        break;
-                    }
-                }
-            }
+        if let Ok((code, body)) = http(rest_addr, "GET", "/api/status")
+            && code == 200
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(t) = v["tick"].as_u64()
+            && t > tick_step
+        {
+            advanced = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }

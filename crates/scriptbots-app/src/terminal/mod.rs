@@ -7817,8 +7817,10 @@ mod tests {
     /// whisker lands at sub-pixel (2,1), which belongs to the next cell.
     #[test]
     fn sub_cell_canvas_resolves_two_agents_inside_one_terminal_cell() {
-        let mut snapshot = Snapshot::default();
-        snapshot.agents = vec![canvas_test_agent(0.0, 0.0), canvas_test_agent(0.13, 0.13)];
+        let snapshot = Snapshot {
+            agents: vec![canvas_test_agent(0.0, 0.0), canvas_test_agent(0.13, 0.13)],
+            ..Snapshot::default()
+        };
         let terrain = canvas_test_terrain();
         let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
 
@@ -7858,8 +7860,10 @@ mod tests {
     /// what the `B` toggle and the no-color fallback drop back to.
     #[test]
     fn flat_map_path_emits_no_braille_when_canvas_is_absent() {
-        let mut snapshot = Snapshot::default();
-        snapshot.agents = vec![canvas_test_agent(0.0, 0.0)];
+        let snapshot = Snapshot {
+            agents: vec![canvas_test_agent(0.0, 0.0)],
+            ..Snapshot::default()
+        };
         let terrain = canvas_test_terrain();
         let palette = Palette::test_backend_evidence();
         let mut scratch = vec![CellOccupancy::default(); 8];
@@ -7908,8 +7912,10 @@ mod tests {
             let heading = f32::from(step) * (PI / 4.0);
             let mut agent = canvas_test_agent(0.5, 0.5);
             agent.heading = heading;
-            let mut snapshot = Snapshot::default();
-            snapshot.agents = vec![agent];
+            let snapshot = Snapshot {
+                agents: vec![agent],
+                ..Snapshot::default()
+            };
 
             let buf = render_canvas_frame(&snapshot, &terrain, (4, 4), canvas_test_day_night());
 
@@ -7938,8 +7944,10 @@ mod tests {
         let mut leader = canvas_test_agent(0.0, 0.0);
         leader.heading = 0.0;
         let follower = canvas_test_agent(0.13, 0.0);
-        let mut snapshot = Snapshot::default();
-        snapshot.agents = vec![leader, follower];
+        let snapshot = Snapshot {
+            agents: vec![leader, follower],
+            ..Snapshot::default()
+        };
         let with_body = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
 
         let mut lone = Snapshot::default();
@@ -7962,8 +7970,10 @@ mod tests {
         let render = |boosted: bool| {
             let mut agent = canvas_test_agent(0.0, 0.0);
             agent.boosted = boosted;
-            let mut snapshot = Snapshot::default();
-            snapshot.agents = vec![agent];
+            let snapshot = Snapshot {
+                agents: vec![agent],
+                ..Snapshot::default()
+            };
             let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
             luminance(cell_fg(&buf, 0, 0))
         };
@@ -7984,8 +7994,10 @@ mod tests {
         attacker.spike_length = 1.0;
         // A second agent sits exactly where the cue lands; the cue must still win.
         let shield = canvas_test_agent(0.76, 0.5);
-        let mut snapshot = Snapshot::default();
-        snapshot.agents = vec![attacker, shield];
+        let snapshot = Snapshot {
+            agents: vec![attacker, shield],
+            ..Snapshot::default()
+        };
         let armed = render_canvas_frame(&snapshot, &terrain, (4, 4), canvas_test_day_night());
 
         let mut idle_snapshot = Snapshot::default();
@@ -8019,8 +8031,10 @@ mod tests {
         let terrain = canvas_test_terrain();
         let cycle = 1_000_u32;
         let background_at = |tick: u64| {
-            let mut snapshot = Snapshot::default();
-            snapshot.tick = tick;
+            let snapshot = Snapshot {
+                tick,
+                ..Snapshot::default()
+            };
             let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), (cycle, 0.0));
             luminance(cell_bg(&buf, 1, 1))
         };
@@ -8094,8 +8108,10 @@ mod tests {
             water_depth: Vec::new(),
         };
         let frame_at = |tick: u64| {
-            let mut snapshot = Snapshot::default();
-            snapshot.tick = tick;
+            let snapshot = Snapshot {
+                tick,
+                ..Snapshot::default()
+            };
             render_canvas_frame(&snapshot, &water, (4, 2), (0, 0.0))
         };
         // A zero-length day cycle pins daylight to the static value, so the only
@@ -8140,8 +8156,10 @@ mod tests {
             water_depth: Vec::new(),
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
-            let mut snapshot = Snapshot::default();
-            snapshot.tick = tick;
+            let snapshot = Snapshot {
+                tick,
+                ..Snapshot::default()
+            };
             render_canvas_frame_motion(&snapshot, &water, (4, 2), (0, 0.0), motion)
         };
 
@@ -8181,14 +8199,16 @@ mod tests {
             water_depth: Vec::new(),
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
-            let mut snapshot = Snapshot::default();
-            snapshot.tick = tick;
-            snapshot.food = FoodView {
-                width: 1,
-                height: 1,
-                cells: vec![1.0],
-                max: 1.0,
-                mean: 1.0,
+            let snapshot = Snapshot {
+                tick,
+                food: FoodView {
+                    width: 1,
+                    height: 1,
+                    cells: vec![1.0],
+                    max: 1.0,
+                    mean: 1.0,
+                },
+                ..Snapshot::default()
             };
             render_canvas_frame_motion(&snapshot, &land, (4, 2), (0, 0.0), motion)
         };
@@ -8230,8 +8250,10 @@ mod tests {
             water_depth: Vec::new(),
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
-            let mut snapshot = Snapshot::default();
-            snapshot.tick = tick;
+            let snapshot = Snapshot {
+                tick,
+                ..Snapshot::default()
+            };
             render_canvas_frame_motion(&snapshot, &water, (4, 2), (0, 0.0), motion)
         };
 
@@ -8309,8 +8331,10 @@ mod tests {
     fn a_crowded_sub_pixel_reads_differently_from_a_lone_agent() {
         let terrain = canvas_test_terrain();
         let render_pile = |count: usize| {
-            let mut snapshot = Snapshot::default();
-            snapshot.agents = (0..count).map(|_| canvas_test_agent(0.0, 0.0)).collect();
+            let snapshot = Snapshot {
+                agents: (0..count).map(|_| canvas_test_agent(0.0, 0.0)).collect(),
+                ..Snapshot::default()
+            };
             let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
             cell_fg(&buf, 0, 0)
         };
@@ -8331,14 +8355,16 @@ mod tests {
     fn a_crowded_dot_keeps_a_trace_of_its_diet_color() {
         let terrain = canvas_test_terrain();
         let pile_of = |diet: DietClass| {
-            let mut snapshot = Snapshot::default();
-            snapshot.agents = (0..64)
-                .map(|_| {
-                    let mut agent = canvas_test_agent(0.0, 0.0);
-                    agent.diet = diet;
-                    agent
-                })
-                .collect();
+            let snapshot = Snapshot {
+                agents: (0..64)
+                    .map(|_| {
+                        let mut agent = canvas_test_agent(0.0, 0.0);
+                        agent.diet = diet;
+                        agent
+                    })
+                    .collect(),
+                ..Snapshot::default()
+            };
             let buf = render_canvas_frame(&snapshot, &terrain, (4, 2), canvas_test_day_night());
             cell_fg(&buf, 0, 0)
         };
@@ -8377,16 +8403,17 @@ mod tests {
     /// mode was a hardcoded `Braille` regardless of what the terminal could draw.
     #[test]
     fn capability_probe_walks_the_full_degradation_ladder() {
-        let utf8 = "en_us.utf-8";
-        let cases: [(
-            &str,
+        type ProbeCase = (
+            &'static str,
             ColorSupport,
-            &str,
-            &str,
+            &'static str,
+            &'static str,
             bool,
             SubCellMode,
             Option<ColorDepth>,
-        ); 9] = [
+        );
+        let utf8 = "en_us.utf-8";
+        let cases: [ProbeCase; 9] = [
             (
                 "modern truecolor",
                 TRUECOLOR,
@@ -8512,8 +8539,10 @@ mod tests {
     #[test]
     fn every_probed_glyph_mode_paints_its_own_vocabulary() {
         let terrain = canvas_test_terrain();
-        let mut snapshot = Snapshot::default();
-        snapshot.agents = vec![canvas_test_agent(0.0, 0.0)];
+        let snapshot = Snapshot {
+            agents: vec![canvas_test_agent(0.0, 0.0)],
+            ..Snapshot::default()
+        };
 
         let glyph_for = |mode: SubCellMode| {
             let buf = render_canvas_frame_with(
@@ -13033,8 +13062,10 @@ mod tests {
             (0.99, 0.99),
             (0.33, 0.66),
         ] {
-            let mut snapshot = Snapshot::default();
-            snapshot.agents = vec![canvas_test_agent(wx, wy)];
+            let snapshot = Snapshot {
+                agents: vec![canvas_test_agent(wx, wy)],
+                ..Snapshot::default()
+            };
             let buf = render_canvas_frame(
                 &snapshot,
                 &terrain,
@@ -13292,9 +13323,11 @@ mod tests {
     #[test]
     fn agents_outside_the_window_are_not_painted() {
         let terrain = canvas_test_terrain();
-        let mut snapshot = Snapshot::default();
         // Zoomed 4x on the centre, this agent at the far corner is off-window.
-        snapshot.agents = vec![canvas_test_agent(0.02, 0.02)];
+        let snapshot = Snapshot {
+            agents: vec![canvas_test_agent(0.02, 0.02)],
+            ..Snapshot::default()
+        };
         let zoomed = render_canvas_frame_viewport(
             &snapshot,
             &terrain,
@@ -13329,8 +13362,10 @@ mod tests {
         focused.uid = Some(7);
         let mut other = canvas_test_agent(0.05, 0.05);
         other.uid = Some(9);
-        let mut snapshot = Snapshot::default();
-        snapshot.agents = vec![focused, other];
+        let mut snapshot = Snapshot {
+            agents: vec![focused, other],
+            ..Snapshot::default()
+        };
 
         let unfocused_frame =
             render_canvas_frame(&snapshot, &terrain, (4, 4), canvas_test_day_night());

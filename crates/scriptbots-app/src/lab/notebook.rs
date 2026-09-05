@@ -1013,7 +1013,7 @@ mod tests {
             NotebookRenderer::render_markdown(
                 "Test Goal",
                 &[claim(vec![control.clone(), missing])],
-                &[control.clone()],
+                std::slice::from_ref(&control),
             ),
             Err(NotebookRenderError::MissingRunSupport("missing".into()))
         );
@@ -1107,9 +1107,12 @@ mod tests {
             run.summary_path = Some(path.to_string_lossy().into_owned());
         }
         let rendered_claim = claim(runs.clone());
-        let first =
-            NotebookRenderer::render_markdown("Population study", &[rendered_claim.clone()], &runs)
-                .unwrap();
+        let first = NotebookRenderer::render_markdown(
+            "Population study",
+            std::slice::from_ref(&rendered_claim),
+            &runs,
+        )
+        .unwrap();
         let second =
             NotebookRenderer::render_markdown("Population study", &[rendered_claim], &runs)
                 .unwrap();

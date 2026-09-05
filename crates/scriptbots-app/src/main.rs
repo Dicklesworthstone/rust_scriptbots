@@ -2808,14 +2808,11 @@ fn load_config_layer_with_source(path: &Path) -> Result<(JsonValue, Vec<u8>)> {
 }
 
 fn snapshot_exit_requested(cli: &AppCli) -> bool {
-    if cli.dump_png.is_some() {
-        return true;
-    }
     #[cfg(feature = "bevy_render")]
     if cli.dump_semantic_png.is_some() || cli.dump_scene_png.is_some() {
         return true;
     }
-    false
+    cli.dump_png.is_some()
 }
 
 /// `--dump-scene-png SCENE.toml`: render a scene manifest through the REAL
@@ -3276,7 +3273,7 @@ fn resolve_renderer(
     };
     let active = select_renderer_mode(mode, RendererAvailability::compiled(), environment)?;
     let renderer: Box<dyn Renderer> = match active {
-        RendererMode::Server => Box::new(ServerRenderer::default()),
+        RendererMode::Server => Box::new(ServerRenderer),
         RendererMode::Terminal => Box::new(TerminalRenderer::default()),
         RendererMode::Gui => {
             #[cfg(feature = "gui")]
@@ -3369,11 +3366,9 @@ impl Renderer for ServerRenderer {
             }
             let should_step = !server_paused || force_step;
             force_step = false;
-            if should_step {
-                if let Err(error) = (ctx.simulation_step)() {
-                    warn!(%error, "Simulation step failed in server mode; stopping loop");
-                    break;
-                }
+            if should_step && let Err(error) = (ctx.simulation_step)() {
+                warn!(%error, "Simulation step failed in server mode; stopping loop");
+                break;
             }
             let elapsed = start.elapsed();
             if elapsed < target_interval {

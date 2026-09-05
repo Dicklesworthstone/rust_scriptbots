@@ -9,7 +9,7 @@ use scriptbots_analytics::{ReaderCtx, Registry, ReportParams};
 use scriptbots_core::{MetricSample, PersistenceBatch, Tick, TickSummary};
 use scriptbots_storage::Storage;
 
-fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
+const fn batch(tick: u64, metrics: Vec<MetricSample>) -> PersistenceBatch {
     PersistenceBatch {
         summary: TickSummary {
             tick: Tick(tick),

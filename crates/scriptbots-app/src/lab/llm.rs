@@ -1444,10 +1444,9 @@ mod tests {
         let auth_env = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
         if auth_env.is_empty() {
             eprintln!("skipping live provider test: ANTHROPIC_API_KEY is not set");
-            return;
         }
         #[cfg(feature = "llm-anthropic")]
-        {
+        if !auth_env.is_empty() {
             let rng = SmallRng::seed_from_u64(0x1234_5678);
             let client = AnthropicClient::from_env("claude-3-5-haiku-20241022", rng)
                 .expect("client builds from environment");
