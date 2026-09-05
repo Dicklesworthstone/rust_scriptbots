@@ -90,7 +90,7 @@ use crate::{
     ApplicationState, CommandAuthorityLookupFailure, CommandEnvelope, CommandId, CommandStatus,
     HostAccessError, HostBlocker, HostCommand, HostFault, HostHealth, HostPort, HostSessionId,
     JournalPort, ManualHostDriver, ManualInstant, RenderSnapshot,
-    host_core::{HostCore, HostCoreBuildError, HostCoreOptions},
+    host_core::{HostCore, HostCoreBuildError, HostCoreOptions, MigrationArrival},
     migrator::{
         CandidateAgent, EmigrantSelectionRule, MigrationConfig, MigrationError, MigrationTopology,
         checked_island_population, select_emigrants, total_population,
@@ -844,16 +844,41 @@ pub enum ArchipelagoError {
         /// The agent that was supposed to depart.
         agent_uid: u64,
     },
-    /// An organism could not be delivered and could not be returned home.
-    ///
-    /// The one failure this module cannot repair, so it is named exactly rather
-    /// than folded into a generic error: a living organism is held by no world
-    /// and the run's population has genuinely changed.
+    /// A migration failed, but the organism's arrival was observed in a live world.
+    /// Returning home also mints a new identity; this is not an atomic rollback.
     #[error(
-        "organism {origin} could not reach {destination} and could not be \
-         returned home: {detail}"
+        "migration of {origin} toward {destination} interrupted; organism observed at {observed}: {detail}"
     )]
-    MigrationOrganismLost {
+    MigrationInterrupted {
+        /// Where the organism came from.
+        origin: OrganismId,
+        /// Where it was going.
+        destination: IslandId,
+        /// Verified live identity after the interrupted command or return home.
+        observed: OrganismId,
+        /// Exact failure detail; an applied arrival does not imply journal commitment.
+        detail: String,
+    },
+    /// Neither host admitted the organism; the error retains its sole owned payload.
+    /// The caller must recover `migrant` before dropping this error to preserve the organism.
+    #[error(
+        "migration of {origin} toward {destination} refused; organism retained in error: {detail}"
+    )]
+    MigrationRetained {
+        /// Where the organism came from.
+        origin: OrganismId,
+        /// Where it was going.
+        destination: IslandId,
+        /// The actual organism, including its live brain, available for explicit recovery.
+        migrant: Box<MigratingAgent>,
+        /// Exact failure detail.
+        detail: String,
+    },
+    /// Neither a matching retained payload nor a new live arrival could be located.
+    #[error(
+        "migration ownership of {origin} toward {destination} could not be confirmed: {detail}"
+    )]
+    MigrationOwnershipUnconfirmed {
         /// Where the organism came from.
         origin: OrganismId,
         /// Where it was going.
@@ -1714,11 +1739,9 @@ impl Archipelago {
     /// Stage and admit one organism at its destination, returning it home if the
     /// destination refuses.
     ///
-    /// The recovery path is the point. `HostCore` hands a refused organism back
-    /// rather than dropping it, so a destination that cannot admit an arrival
-    /// does not cost the run an agent — it costs the barrier, which is loud.
-    /// Only when the SOURCE also refuses to take it back is an organism
-    /// genuinely lost, and that gets its own named error.
+    /// Application can succeed before journaling fails. Observe a new matching
+    /// live arrival before classifying an error, and retain an unadmitted payload
+    /// if its source also refuses it.
     fn deliver_migrant(
         &mut self,
         to_index: usize,
@@ -1728,6 +1751,7 @@ impl Archipelago {
         migrant: MigratingAgent,
     ) -> Result<AgentUid, ArchipelagoError> {
         let to = self.islands[to_index].meta.id;
+        let origin = OrganismId::new(from, uid);
         if let Err(returned) = self.islands[to_index].core.stage_immigrant(migrant) {
             let detail = "destination already holds a staged organism".to_owned();
             return Err(self.return_migrant_home(from_index, from, uid, to, returned, detail));
@@ -1736,25 +1760,58 @@ impl Archipelago {
             origin_island: from,
             origin_uid: uid,
         };
-        if let Err(error) = Self::apply_island_command(&mut self.islands[to_index], command) {
+        let previous_arrival = self.islands[to_index].core.last_arrival();
+        let result = Self::apply_island_command(&mut self.islands[to_index], command);
+        let observed = Self::observed_arrival(&self.islands[to_index], previous_arrival, origin);
+        if let Err(error) = result {
             let detail = error.to_string();
+            if let Some(observed) = observed {
+                return Err(ArchipelagoError::MigrationInterrupted {
+                    origin,
+                    destination: to,
+                    observed,
+                    detail,
+                });
+            }
             let Some(returned) = self.islands[to_index].core.unstage_immigrant() else {
-                // The destination neither admitted nor retained it.
-                return Err(ArchipelagoError::MigrationOrganismLost {
-                    origin: OrganismId::new(from, uid),
+                return Err(ArchipelagoError::MigrationOwnershipUnconfirmed {
+                    origin,
                     destination: to,
                     detail,
                 });
             };
             return Err(self.return_migrant_home(from_index, from, uid, to, returned, detail));
         }
-        let arrival = self.islands[to_index].core.last_arrival().ok_or(
-            ArchipelagoError::MigrationOrganismMissing {
-                island: to,
-                agent_uid: uid.get(),
-            },
-        )?;
-        Ok(arrival.local_uid)
+        observed.map(|arrival| arrival.uid).ok_or_else(|| {
+            ArchipelagoError::MigrationOwnershipUnconfirmed {
+                origin,
+                destination: to,
+                detail: "command completed without a new matching live arrival".to_owned(),
+            }
+        })
+    }
+
+    fn observed_arrival(
+        island: &Island,
+        previous: Option<MigrationArrival>,
+        origin: OrganismId,
+    ) -> Option<OrganismId> {
+        let arrival = island.core.last_arrival()?;
+        if Some(arrival) == previous
+            || arrival.origin_island != origin.island
+            || arrival.origin_uid != origin.uid
+        {
+            return None;
+        }
+        island
+            .core
+            .with_world(|world| {
+                world
+                    .agents()
+                    .iter_handles()
+                    .any(|handle| world.agent_uid(handle) == Some(arrival.local_uid))
+            })
+            .then_some(OrganismId::new(island.meta.id, arrival.local_uid))
     }
 
     /// Put an undeliverable organism back on the island it came from.
@@ -1772,14 +1829,11 @@ impl Archipelago {
         detail: String,
     ) -> ArchipelagoError {
         let origin = OrganismId::new(from, uid);
-        if self.islands[from_index]
-            .core
-            .stage_immigrant(migrant)
-            .is_err()
-        {
-            return ArchipelagoError::MigrationOrganismLost {
+        if let Err(retained) = self.islands[from_index].core.stage_immigrant(migrant) {
+            return ArchipelagoError::MigrationRetained {
                 origin,
                 destination,
+                migrant: Box::new(retained),
                 detail: format!("{detail}; source could not re-stage it"),
             };
         }
@@ -1787,25 +1841,34 @@ impl Archipelago {
             origin_island: from,
             origin_uid: uid,
         };
-        match Self::apply_island_command(&mut self.islands[from_index], command) {
-            Ok(()) => {
-                tracing::warn!(
-                    origin = %origin,
-                    destination = %destination,
-                    detail = %detail,
-                    "undeliverable organism returned to its source island"
-                );
-                ArchipelagoError::MigrationOrganismLost {
-                    origin,
-                    destination,
-                    detail: format!("{detail}; organism was returned home"),
-                }
-            }
-            Err(error) => ArchipelagoError::MigrationOrganismLost {
+        let previous_arrival = self.islands[from_index].core.last_arrival();
+        let result = Self::apply_island_command(&mut self.islands[from_index], command);
+        let detail = match result {
+            Ok(()) => detail,
+            Err(error) => format!("{detail}; return command failed: {error}"),
+        };
+        if let Some(observed) =
+            Self::observed_arrival(&self.islands[from_index], previous_arrival, origin)
+        {
+            return ArchipelagoError::MigrationInterrupted {
                 origin,
                 destination,
-                detail: format!("{detail}; return home also failed: {error}"),
-            },
+                observed,
+                detail,
+            };
+        }
+        if let Some(retained) = self.islands[from_index].core.unstage_immigrant() {
+            return ArchipelagoError::MigrationRetained {
+                origin,
+                destination,
+                migrant: Box::new(retained),
+                detail,
+            };
+        }
+        ArchipelagoError::MigrationOwnershipUnconfirmed {
+            origin,
+            destination,
+            detail,
         }
     }
 
@@ -2280,6 +2343,223 @@ mod tests {
 
     fn populated_archipelago(config: ArchipelagoConfig) -> Result<Archipelago, ArchipelagoError> {
         Archipelago::with_factories(config, populated_world_factory, |_meta| None)
+    }
+
+    fn migration_recovery_archipelago(destination_capacity: Option<usize>) -> Archipelago {
+        Archipelago::with_factories(
+            archipelago_config(
+                vec![
+                    spec(0, populated_config(None)),
+                    spec(1, populated_config(None)),
+                ],
+                1,
+            ),
+            |meta| {
+                let mut world = populated_world_factory(meta)?;
+                for _ in 0..5 {
+                    world
+                        .step()
+                        .expect("populate real bound organisms before host construction");
+                }
+                assert!(world.agent_count() >= 2);
+                Ok(world)
+            },
+            |meta| {
+                destination_capacity
+                    .filter(|_| meta.id == IslandId(1))
+                    .map(|capacity| {
+                        Box::new(crate::VolatileJournal::with_capacity(capacity))
+                            as Box<dyn JournalPort>
+                    })
+            },
+        )
+        .expect("recovery worlds with the same real fixture brain registry")
+    }
+
+    fn take_recovery_migrant(archipelago: &mut Archipelago) -> MigratingAgent {
+        let uid = archipelago.migration_candidates()[&IslandId(0)][0].uid;
+        Archipelago::apply_island_command(
+            &mut archipelago.islands[0],
+            HostCommand::Emigrate {
+                agent_uid: AgentUid(uid),
+            },
+        )
+        .expect("journaled real departure");
+        let migrant = archipelago.islands[0]
+            .core
+            .take_outbound_migrant()
+            .expect("departed organism");
+        assert_eq!(migrant.brain_kind(), Some(TEST_BRAIN_KIND));
+        migrant
+    }
+
+    #[test]
+    fn migration_refusal_reports_the_live_returned_identity() {
+        let mut archipelago = migration_recovery_archipelago(None);
+        let before = archipelago.organism_census().expect("before census");
+        let migrant = take_recovery_migrant(&mut archipelago);
+        let origin = OrganismId::new(IslandId(0), migrant.origin_uid());
+        archipelago.islands[1].next_command_sequence = u64::MAX;
+        let error = archipelago
+            .deliver_migrant(1, 0, origin.island, origin.uid, migrant)
+            .expect_err("destination command ID exhaustion fails the barrier");
+        let ArchipelagoError::MigrationInterrupted { observed, .. } = error else {
+            panic!("a returned organism must have an observed live identity: {error:?}");
+        };
+        assert_eq!(observed.island, origin.island);
+        assert_ne!(
+            observed.uid, origin.uid,
+            "return is a new arrival, not rollback"
+        );
+        let after = archipelago.organism_census().expect("after census");
+        assert_eq!(after.len(), before.len());
+        assert!(!after.contains(&origin));
+        assert!(after.contains(&observed));
+        let source = &mut archipelago.islands[0];
+        assert_eq!(
+            Archipelago::observed_arrival(source, None, origin),
+            Some(observed)
+        );
+        Archipelago::apply_island_command(
+            source,
+            HostCommand::Emigrate {
+                agent_uid: observed.uid,
+            },
+        )
+        .expect("the returned organism departs again");
+        assert_eq!(
+            Archipelago::observed_arrival(source, None, origin),
+            None,
+            "a historical arrival record does not prove the organism is still alive here"
+        );
+        assert!(source.core.take_outbound_migrant().is_some());
+    }
+
+    #[test]
+    fn migration_refusal_at_both_hosts_returns_a_recoverable_bound_payload() {
+        let mut archipelago = migration_recovery_archipelago(None);
+        let before_count = archipelago.organism_census().expect("before census").len();
+        let migrant = take_recovery_migrant(&mut archipelago);
+        let uid = migrant.origin_uid();
+        let source_sequence = archipelago.islands[0].next_command_sequence;
+        archipelago.islands[0].next_command_sequence = u64::MAX;
+        archipelago.islands[1].next_command_sequence = u64::MAX;
+        let error = archipelago
+            .deliver_migrant(1, 0, IslandId(0), uid, migrant)
+            .expect_err("neither host can allocate its next command identity");
+        let ArchipelagoError::MigrationRetained { migrant, .. } = error else {
+            panic!("unadmitted organism must remain owned by the error: {error:?}");
+        };
+        assert_eq!(migrant.origin_uid(), uid);
+        assert_eq!(migrant.brain_kind(), Some(TEST_BRAIN_KIND));
+        assert_eq!(
+            archipelago
+                .organism_census()
+                .expect("in-transit census")
+                .len()
+                + 1,
+            before_count
+        );
+        assert!(!archipelago.islands[0].core.has_staged_immigrant());
+        assert!(!archipelago.islands[1].core.has_staged_immigrant());
+
+        // The failed command never admitted; restore only the injected controller counter.
+        archipelago.islands[0].next_command_sequence = source_sequence;
+        archipelago.islands[0]
+            .core
+            .stage_immigrant(*migrant)
+            .expect("recover exact payload");
+        Archipelago::apply_island_command(
+            &mut archipelago.islands[0],
+            HostCommand::Immigrate {
+                origin_island: IslandId(0),
+                origin_uid: uid,
+            },
+        )
+        .expect("recovered bound organism arrives");
+        assert_eq!(
+            archipelago
+                .organism_census()
+                .expect("recovered census")
+                .len(),
+            before_count
+        );
+    }
+
+    #[test]
+    fn occupied_return_slot_preserves_both_distinct_migrants() {
+        let mut archipelago = migration_recovery_archipelago(None);
+        let returning = take_recovery_migrant(&mut archipelago);
+        let first_uid = returning.origin_uid();
+        let occupant = take_recovery_migrant(&mut archipelago);
+        let occupant_uid = occupant.origin_uid();
+        assert_ne!(first_uid, occupant_uid);
+        archipelago.islands[0]
+            .core
+            .stage_immigrant(occupant)
+            .expect("existing staged occupant");
+        archipelago.islands[1].next_command_sequence = u64::MAX;
+        let error = archipelago
+            .deliver_migrant(1, 0, IslandId(0), first_uid, returning)
+            .expect_err("source staging slot is already occupied");
+        let ArchipelagoError::MigrationRetained { migrant, .. } = error else {
+            panic!("the rejected payload must not be dropped: {error:?}");
+        };
+        assert_eq!(migrant.origin_uid(), first_uid);
+        assert_eq!(migrant.brain_kind(), Some(TEST_BRAIN_KIND));
+        let staged = archipelago.islands[0]
+            .core
+            .unstage_immigrant()
+            .expect("original occupant remains");
+        assert_eq!(staged.origin_uid(), occupant_uid);
+        assert_eq!(staged.brain_kind(), Some(TEST_BRAIN_KIND));
+    }
+
+    #[test]
+    fn migration_journal_backpressure_reports_applied_arrival_without_claiming_commitment() {
+        // Real bounded VolatileJournal with zero admission capacity, not a successful mock.
+        let mut archipelago = migration_recovery_archipelago(Some(0));
+        let before = archipelago.organism_census().expect("before census");
+        let migrant = take_recovery_migrant(&mut archipelago);
+        let origin = OrganismId::new(IslandId(0), migrant.origin_uid());
+        let error = archipelago
+            .deliver_migrant(1, 0, origin.island, origin.uid, migrant)
+            .expect_err("arrival journal cannot admit a batch");
+        let ArchipelagoError::MigrationInterrupted { observed, .. } = error else {
+            panic!("application before journal refusal must remain visible: {error:?}");
+        };
+        assert_eq!(observed.island, IslandId(1));
+        let after = archipelago.organism_census().expect("after census");
+        assert_eq!(after.len(), before.len());
+        assert!(!after.contains(&origin));
+        assert!(after.contains(&observed));
+        let destination = &archipelago.islands[1];
+        assert!(destination.core.pending_journal_batch().is_some());
+        assert!(matches!(
+            destination.core.health(),
+            HostHealth::Blocked(HostBlocker::JournalFull { .. })
+        ));
+        assert!(!destination.core.has_staged_immigrant());
+
+        let last = destination.core.last_arrival();
+        assert_eq!(
+            Archipelago::observed_arrival(destination, None, origin),
+            Some(observed)
+        );
+        assert_eq!(
+            Archipelago::observed_arrival(destination, last, origin),
+            None,
+            "an earlier arrival cannot witness a later command"
+        );
+        assert_eq!(
+            Archipelago::observed_arrival(
+                destination,
+                None,
+                OrganismId::new(IslandId(7), origin.uid)
+            ),
+            None,
+            "equal bare UIDs on a different island do not identify this organism"
+        );
     }
 
     fn test_config(seed: Option<u64>) -> ScriptBotsConfig {

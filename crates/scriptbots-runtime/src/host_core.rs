@@ -3484,11 +3484,10 @@ impl HostCore {
             )?;
             return Ok(ApplyResult::completed(blocked));
         }
-        let next_scientific = self
-            .revisions
-            .scientific
-            .checked_next()
-            .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+        let Some(next_scientific) = self.revisions.scientific.checked_next() else {
+            self.staged_immigrant = Some(migrant);
+            return Err(protocol_violation("scientific revision exhausted"));
+        };
         let local_uid = match self.world.immigrate(migrant) {
             Ok(local_uid) => local_uid,
             Err(rejected) => {
@@ -5626,6 +5625,72 @@ mod tests {
             source_after_departure + 1,
             "the organism that no world would take must not simply disappear"
         );
+    }
+
+    #[test]
+    fn exhausted_arrival_revision_preserves_the_exact_staged_organism() {
+        let (mut source, mut source_port) = migration_host(0x5019, 2, true);
+        let (mut destination, mut destination_port) = migration_host(0x501a, 1, true);
+        let departing = first_uid(&source);
+        submit(
+            &mut source_port,
+            1,
+            HostCommand::Emigrate {
+                agent_uid: departing,
+            },
+        );
+        source
+            .drive(ManualInstant::from_nanos(1))
+            .expect("departure");
+        let migrant = source
+            .take_outbound_migrant()
+            .expect("actual bound organism");
+        let before_position = migrant.normalized_position();
+        let before_age = migrant.age();
+        destination.stage_immigrant(migrant).expect("staged");
+        let before_digest = destination.scientific_digest_v1().expect("before refusal");
+        destination.revisions.scientific = ScientificRevision::new(u64::MAX);
+        submit(
+            &mut destination_port,
+            1,
+            HostCommand::Immigrate {
+                origin_island: IslandId(0),
+                origin_uid: departing,
+            },
+        );
+        let error = destination
+            .drive(ManualInstant::from_nanos(1))
+            .expect_err("exhausted revision refuses arrival");
+        assert!(error.to_string().contains("scientific revision exhausted"));
+        assert_eq!(destination.last_arrival(), None);
+        assert_eq!(
+            destination.scientific_digest_v1().expect("after refusal"),
+            before_digest
+        );
+        let retained = destination
+            .unstage_immigrant()
+            .expect("refusal retains ownership");
+        assert_eq!(retained.origin_uid(), departing);
+        assert_eq!(retained.normalized_position(), before_position);
+        assert_eq!(retained.age(), before_age);
+        assert_eq!(retained.brain_kind(), Some(MIGRATION_BRAIN_KIND));
+
+        // A different healthy owner can still apply the very same bound organism.
+        let source_count = source.world.agent_count();
+        source.stage_immigrant(retained).expect("return staging");
+        submit(
+            &mut source_port,
+            2,
+            HostCommand::Immigrate {
+                origin_island: IslandId(0),
+                origin_uid: departing,
+            },
+        );
+        source
+            .drive(ManualInstant::from_nanos(2))
+            .expect("return arrival");
+        applied(&status(&mut source_port, 2));
+        assert_eq!(source.world.agent_count(), source_count + 1);
     }
 
     const PROJECTION_BRAIN_DIGEST: u64 = 0x5255_4e54_494d_4501;
