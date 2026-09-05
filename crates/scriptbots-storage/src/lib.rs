@@ -34495,96 +34495,111 @@ mod tests {
     fn test_storage_map_elites_archive_persistence_and_reload()
     -> Result<(), Box<dyn std::error::Error>> {
         use scriptbots_core::map_elites::{
-            ArchiveEntry, BehaviorAxis, BehaviorDescriptor, BehaviorSpaceV0, ContinuousDomain,
-            MapElitesArchive, QualityMetric,
+            ArchiveEntry, ArchiveProvenance, Axis, BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            BehaviorDescriptor, BehaviorSpaceV0, InsertionResult, MapElitesArchive,
+            PhenotypeFeature, QualityMetric,
         };
-        use scriptbots_core::provenance::OrganismProvenance;
-        use scriptbots_core::{AgentUid, Generation, Tick};
+        use scriptbots_core::{
+            AgentUid, BrainFamilyId, BrainGenomeEnvelope, BrainProvenance, Generation, Tick,
+        };
 
         let path = temp_db_path("storage-map-elites-archive");
         let path_string = path.to_string_lossy().to_string();
         let mut storage = Storage::create_unattributed_file(&path_string)?;
+        let run_id = storage.run_id().to_string();
 
         let space = BehaviorSpaceV0::new(
-            0,
+            BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
             vec![
-                BehaviorAxis {
-                    name: "carnivory".into(),
-                    domain: ContinuousDomain::new(0.0, 1.0)?,
-                    num_bins: 5,
-                },
-                BehaviorAxis {
-                    name: "speed".into(),
-                    domain: ContinuousDomain::new(0.0, 10.0)?,
-                    num_bins: 4,
-                },
+                Axis::new("carnivory", PhenotypeFeature::DietTendency, (0.0, 1.0), 5)?,
+                Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 10.0), 4)?,
             ],
-        )?;
+        );
 
         let mut archive = MapElitesArchive::new(space, QualityMetric::default(), 0, 1024 * 1024)?;
 
-        let agent_uid_1 = AgentUid::new(101);
-        let genome_1 = scriptbots_core::BrainGenomeEnvelope::new_v0_mlp(
-            vec![10, 8, 4],
-            vec![0.1; 120],
-            OrganismProvenance::synthetic(agent_uid_1, Generation(1)),
-        );
+        let agent_uid_1 = AgentUid(101);
+        let genome_1 = BrainGenomeEnvelope::new(
+            BrainFamilyId::new("archive-storage-fixture")?,
+            1,
+            1,
+            vec![1; 120],
+            BrainProvenance::default(),
+        )?;
         let entry_1 = ArchiveEntry {
             descriptor: BehaviorDescriptor(vec![0.2, 3.0]),
             quality: 42.5,
             genome: genome_1,
             uid: agent_uid_1,
             tick_inserted: Tick(100),
-            provenance: OrganismProvenance::synthetic(agent_uid_1, Generation(1)),
+            provenance: ArchiveProvenance {
+                run_id: run_id.clone(),
+                parent_uid: None,
+                generation: Generation(1),
+            },
         };
 
-        let agent_uid_2 = AgentUid::new(202);
-        let genome_2 = scriptbots_core::BrainGenomeEnvelope::new_v0_mlp(
-            vec![10, 8, 4],
-            vec![0.2; 120],
-            OrganismProvenance::synthetic(agent_uid_2, Generation(2)),
-        );
+        let agent_uid_2 = AgentUid(202);
+        let genome_2 = BrainGenomeEnvelope::new(
+            BrainFamilyId::new("archive-storage-fixture")?,
+            1,
+            1,
+            vec![2; 120],
+            BrainProvenance::default(),
+        )?;
         let entry_2 = ArchiveEntry {
             descriptor: BehaviorDescriptor(vec![0.8, 8.0]),
             quality: 99.9,
             genome: genome_2,
             uid: agent_uid_2,
             tick_inserted: Tick(200),
-            provenance: OrganismProvenance::synthetic(agent_uid_2, Generation(2)),
+            provenance: ArchiveProvenance {
+                run_id,
+                parent_uid: Some(agent_uid_1),
+                generation: Generation(2),
+            },
         };
 
-        archive.insert(entry_1, 100);
-        archive.insert(entry_2, 200);
+        assert_eq!(archive.insert(entry_1)?, InsertionResult::InsertedNew);
+        assert_eq!(archive.insert(entry_2)?, InsertionResult::InsertedNew);
         assert_eq!(archive.len(), 2);
 
         // Persist to storage
         storage.persist_map_elites_archive(&archive)?;
 
         // Reload from storage
-        let loaded_opt = storage.reload_archive(archive.byte_cap)?;
+        let loaded_opt = storage.reload_archive(archive.max_archive_bytes)?;
         let loaded = loaded_opt.expect("archive should be loaded from storage");
 
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded.space.space_version, 0);
+        assert_eq!(loaded.space.version, BEHAVIOR_SPACE_SCHEMA_VERSION_V0);
         assert_eq!(loaded.space.axes.len(), 2);
         assert_eq!(loaded.space.axes[0].name, "carnivory");
         assert_eq!(loaded.space.axes[1].name, "speed");
 
-        let cell_1 = loaded.space.bin(&BehaviorDescriptor(vec![0.2, 3.0]))?;
+        let cell_1 = loaded
+            .space
+            .cell_index(&BehaviorDescriptor(vec![0.2, 3.0]))?;
         let entry_1_loaded = loaded.get(cell_1).expect("cell 1 present");
         assert_eq!(entry_1_loaded.uid, agent_uid_1);
         assert!((entry_1_loaded.quality - 42.5).abs() < 1e-5);
         assert_eq!(entry_1_loaded.tick_inserted, Tick(100));
         assert_eq!(entry_1_loaded.provenance.generation, Generation(1));
 
-        let cell_2 = loaded.space.bin(&BehaviorDescriptor(vec![0.8, 8.0]))?;
+        let cell_2 = loaded
+            .space
+            .cell_index(&BehaviorDescriptor(vec![0.8, 8.0]))?;
         let entry_2_loaded = loaded.get(cell_2).expect("cell 2 present");
         assert_eq!(entry_2_loaded.uid, agent_uid_2);
         assert!((entry_2_loaded.quality - 99.9).abs() < 1e-5);
         assert_eq!(entry_2_loaded.tick_inserted, Tick(200));
         assert_eq!(entry_2_loaded.provenance.generation, Generation(2));
-
-        let _ = fs::remove_file(path);
+        assert_eq!(
+            loaded.cells, archive.cells,
+            "all genome and provenance bytes must survive"
+        );
+        storage.close()?;
+        eprintln!("retained archive fixture: {}", path.display());
         Ok(())
     }
 

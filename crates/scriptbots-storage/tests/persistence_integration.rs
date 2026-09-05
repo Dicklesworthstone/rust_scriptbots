@@ -1553,10 +1553,11 @@ fn test_bd_2z0_5_6_e2e_real_db_export_roundtrip() {
 #[test]
 fn test_map_elites_archive_persistence_roundtrip() {
     use scriptbots_core::{
-        BrainFamilyId, BrainGenomeEnvelope, BrainProvenance,
+        BrainFamilyId, BrainGenomeEnvelope, BrainProvenance, Generation,
         map_elites::{
-            ArchiveEntry, ArchiveProvenance, Axis, BehaviorDescriptor, BehaviorSpaceV0,
-            MapElitesArchive, PhenotypeFeature, QualityMetric,
+            ArchiveEntry, ArchiveProvenance, Axis, BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            BehaviorDescriptor, BehaviorSpaceV0, InsertionResult, MapElitesArchive,
+            PhenotypeFeature, QualityMetric,
         },
     };
 
@@ -1572,6 +1573,7 @@ fn test_map_elites_archive_persistence_roundtrip() {
     let path_str = path.to_str().expect("utf8 path");
 
     let mut storage = Storage::create_unattributed_file(path_str).expect("create storage");
+    let run_id = storage.run_id().to_string();
 
     // Submit a tick batch to verify standard tables coexist with archive tables
     let tick_summary = TickSummary {
@@ -1586,7 +1588,7 @@ fn test_map_elites_archive_persistence_roundtrip() {
         spike_hits: 3,
     };
     storage
-        .write_batch(&PersistenceBatch {
+        .persist(&PersistenceBatch {
             summary: tick_summary,
             epoch: 1,
             closed: false,
@@ -1602,33 +1604,36 @@ fn test_map_elites_archive_persistence_roundtrip() {
         .expect("write tick batch");
 
     // Build a behavioral archive
-    let space = BehaviorSpaceV0::new(vec![
-        Axis::new("diet", PhenotypeFeature::DietTendency, 0.0, 1.0, 4).unwrap(),
-        Axis::new("speed", PhenotypeFeature::MeanSpeed, 0.0, 10.0, 4).unwrap(),
-    ])
-    .unwrap();
+    let space = BehaviorSpaceV0::new(
+        BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+        vec![
+            Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 4).unwrap(),
+            Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 10.0), 4).unwrap(),
+        ],
+    );
     let mut archive =
         MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 0, 1024 * 1024)
             .unwrap();
 
-    let family_id = BrainFamilyId::new("mlp").expect("family_id");
+    let family_id = BrainFamilyId::new("archive-storage-fixture").expect("family_id");
     let genome_1 = BrainGenomeEnvelope::new(
-        family_id,
+        family_id.clone(),
         1,
         1,
         vec![1, 2, 3, 4],
         BrainProvenance::default(),
-    );
+    )
+    .expect("first genome envelope");
     let entry_1 = ArchiveEntry {
-        uid: AgentUid::new(10),
-        tick_inserted: 50,
+        uid: AgentUid(10),
+        tick_inserted: Tick(50),
         quality: 12.5,
         descriptor: BehaviorDescriptor::new(vec![0.2, 2.5]),
         genome: genome_1,
         provenance: ArchiveProvenance {
-            generation: 1,
-            lineage_depth: 0,
-            origin: "seed".to_string(),
+            run_id: run_id.clone(),
+            generation: Generation(1),
+            parent_uid: None,
         },
     };
 
@@ -1638,26 +1643,33 @@ fn test_map_elites_archive_persistence_roundtrip() {
         1,
         vec![5, 6, 7, 8],
         BrainProvenance::default(),
-    );
+    )
+    .expect("second genome envelope");
     let entry_2 = ArchiveEntry {
-        uid: AgentUid::new(20),
-        tick_inserted: 80,
+        uid: AgentUid(20),
+        tick_inserted: Tick(80),
         quality: 24.0,
         descriptor: BehaviorDescriptor::new(vec![0.8, 8.0]),
         genome: genome_2,
         provenance: ArchiveProvenance {
-            generation: 2,
-            lineage_depth: 1,
-            origin: "born".to_string(),
+            run_id: run_id.clone(),
+            generation: Generation(2),
+            parent_uid: Some(AgentUid(10)),
         },
     };
 
-    assert!(archive.insert(entry_1).unwrap());
-    assert!(archive.insert(entry_2).unwrap());
-    assert_eq!(archive.occupied_cells(), 2);
+    assert_eq!(
+        archive.insert(entry_1).unwrap(),
+        InsertionResult::InsertedNew
+    );
+    assert_eq!(
+        archive.insert(entry_2).unwrap(),
+        InsertionResult::InsertedNew
+    );
+    assert_eq!(archive.len(), 2);
 
-    let space_row = archive.to_space_row().expect("space row");
-    let cell_rows = archive.to_cell_rows().expect("cell rows");
+    let space_row = archive.to_space_row(&run_id).expect("space row");
+    let cell_rows = archive.to_cell_rows(&run_id).expect("cell rows");
 
     // Persist archive snapshot via Storage
     storage
@@ -1681,8 +1693,8 @@ fn test_map_elites_archive_persistence_roundtrip() {
         .reload_archive(1024 * 1024)
         .expect("reload archive")
         .expect("archive exists");
-    assert_eq!(reloaded_archive.occupied_cells(), 2);
-    assert_eq!(reloaded_archive.space(), archive.space());
+    assert_eq!(reloaded_archive.len(), 2);
+    assert_eq!(reloaded_archive.space, archive.space);
 
     // Close storage and verify via StorageReader
     storage.close().expect("close storage");
@@ -1702,12 +1714,12 @@ fn test_map_elites_archive_persistence_roundtrip() {
         .reload_archive(1024 * 1024)
         .expect("reader reload archive")
         .expect("reader archive exists");
-    assert_eq!(reader_reloaded.occupied_cells(), 2);
-    assert_eq!(reader_reloaded.space(), archive.space());
+    assert_eq!(reader_reloaded.len(), 2);
+    assert_eq!(reader_reloaded.space, archive.space);
 
-    for (cell_id, entry) in archive.cells() {
+    for (cell_id, entry) in &archive.cells {
         let reloaded_entry = reader_reloaded
-            .get(cell_id)
+            .get(*cell_id)
             .expect("reloaded entry must exist");
         assert_eq!(reloaded_entry.uid, entry.uid);
         assert_eq!(reloaded_entry.tick_inserted, entry.tick_inserted);
