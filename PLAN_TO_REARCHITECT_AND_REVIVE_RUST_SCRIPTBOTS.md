@@ -257,6 +257,11 @@ Every implementation bead must preserve or establish the following invariants.
 
 ### 4.3 UI invariants
 
+[Completed — bd-j13n, TurquoiseLake, 2026-09-05, pinned DSR37 at 3c3ae1d] Publish observed status fields
+beside the completed summary so REST/MCP status reads can return the last observed boundary
+while persistence holds the legacy world mutex. This is a bounded responsiveness repair;
+the full HostClient ownership transition remains with bd-pcfj / bd-88yj.
+
 1. Frontends consume immutable snapshots and send typed intents.
 2. Frontends do not hold a world mutex and do not query FrankenSQLite during paint.
 3. UI state distinguishes `admitted`, `applied`, `durable`, `rejected`, `failed`, `disconnected`, and `stale`.
@@ -1152,6 +1157,12 @@ Use FrankenTUI `ResponsiveLayout` with declared breakpoints:
 No panel receives fixed heights that silently exceed the viewport. Every size has a golden and a “no content outside bounds” assertion.
 
 ### 8.4 world canvas
+
+[Currently In Progress — `bd-q2w9` reopened, TurquoiseLake, 2026-09-05: the previous
+non-colour diet fix reached only flat glyphs. `61da01c` connects the same modifiers to
+actual canvas body cells, with density/depth, mixed-cell, offscreen and repaint tests.
+Pinned DSR40 execution and review of the separate pre-existing truecolor golden drift
+remain required; the existing golden has not been rebased.]
 
 Use `ftui-extras` directly for:
 
@@ -2509,6 +2520,13 @@ absolute-throughput, snapshot-budget, and noise flag false.
 
 #### 2.7 control/server migration
 
+[Currently In Progress — `bd-2z0.4.11` reopened, TurquoiseLake, 2026-09-05: the existing
+threaded soak test discarded the executed worlds and compared two unticked reference digests.
+`3c3ae1d` restores actual owner-state and receipt-derived counts: DSR37 observed both runs
+reach tick 100 and match independently stepped references, with a planted unticked negative.
+Prior passing runtime suites do not establish that soak claim. Broader long-run CPU/memory/
+latency/fault/trace acceptance and the separate server ownership cutover remain open.]
+
 - API reads snapshot/status, never world lock;
 - mutations await receipt or return explicit accepted status endpoint;
 - monotonic revision replaces audit length;
@@ -2710,6 +2728,10 @@ resume, replay, and first-divergence verification remain separate open work in t
 **Exit:** UI and exported report explain one observed evolutionary change.
 
 #### 4.5 intervention studies
+
+- [Completed — bd-tygg, TurquoiseLake, 2026-09-05, pinned DSR37 at 3c3ae1d] Preserve refused migration
+  payloads and report interrupted transfers from observed ownership. Returning home is a new
+  arrival, not atomic rollback; durable migration persistence and session recovery stay open.
 
 - [Completed — bd-16g.5.5.2, TurquoiseLake, 2026-09-05, pinned DSR21 at a16f27b] Expose a separate
   bounded isolated-island run and atomically persist complete barriers through the existing

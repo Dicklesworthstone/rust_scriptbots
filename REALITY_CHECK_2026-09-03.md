@@ -2,6 +2,222 @@
 
 ## Execution TODO — started 2026-09-05
 
+Current continuation — **2026-09-05, through source `61da01c`, TurquoiseLake**. The earlier entries below retain
+the failure history; these are the current next actions and proof limits.
+
+- [x] Complete and retain DSR26 at `d4cab5d`: full core default 778/778 and economy-fault
+  781/781 passed, including checkpoint/configuration/science/archive controls. Audio 7/7,
+  phylogeny 1/1, MI bounds 1/1, real elite preservation 1/1 and storage config codec 2/2 passed.
+  Workspace all-target compiler check passed. Strict core/workspace Clippy failed; journal 6/8
+  failed on owner-port startup and pending command durability deadlines. Overall run failed.
+- [ ] Finish **bd-vlp7**: `625b122` repaired the 239 reported test diagnostics, but DSR28 caught
+  two author-introduced test compilation errors (expression attribute and ambiguous empty array).
+  `89d907a` repairs those and 14 newly reached clock/archive integration diagnostics plus two
+  scalar/nonparallel core lints. Completed DSR29 `core-89d907a-20260905-29` passed full core
+  default 780/780 and economy-fault 783/783 (eight existing ignored cases per lane), all named
+  controls, workspace compiler check, brain 73/73 and strict brain lint. Strict core lint failed
+  fourteen integration diagnostics, repaired in `4d2b929`. Strict core lint now passed DSR31
+  and DSR32; runtime/Bevy lint remains open. `58916a2` includes the reviewed Bevy candidate;
+  reviewed runtime cleanup `575b29f` preserves authority error order and exact recovery payloads.
+  DSR34 passed all 195 runtime tests and the real rollback-authority recovery test; runtime
+  strict Clippy found two remaining equivalent-expression diagnostics, repaired in `ce4d08f`.
+  DSR35 reaches 20 integration-target diagnostics in `runtime_soak_matrix.rs`; those are
+  being repaired with its actual-observation defect below. Bevy standalone trait depth is
+  corrected in `e0a99ce`; DSR36 workspace compilation passes and reaches the remaining
+  analytics/app/render/storage-test diagnostics. Reviewed `9fc62ad` addresses those plus
+  DSR37's final 101/100-line runtime fixture diagnostic. `dc9ee28` corrects the later authored
+  analytics E0658 and remaining app/analytics target diagnostics. DSR39b now passes workspace
+  all-target compiler and strict Clippy; its full test results and the broader soak remain open.
+- [x] Close **bd-mjkd**, **bd-fb32**, **bd-sknl**, **bd-6xr2**, **bd-3cf0**, **bd-lhrv** after
+  re-reading original acceptance and re-executing at pinned `89d907a`. All required positives
+  and negative guards passed DSR26 and DSR29. This was solo verification, not independent
+  certification. The authored `625b122` compilation regression and its repair remain recorded.
+- [x] Complete DSR27 at `d4cab5d`: normal real-process REST/MCP control test passed 1/1;
+  the two original 600-second scenarios ran and failed 0/2. File mode rejected an evolved MLP
+  primary mutation threshold above one at about 412 seconds (last REST tick 2941). Memory
+  mode's HTTP read failed after last observed tick 541 at 92.9 seconds; retained stderr has no
+  terminal simulation error. Do not identify either as a proved storage-admission timeout.
+- [ ] Complete **bd-1bzg**, the evolved-threshold reproduction fix. `5f44fca` admits finite
+  nonnegative thresholds without clamping inherited values or changing mutation kernels/RNG.
+  DSR28 real heredity 12/12 passed, including actual Gaussian crossing and inherited saturation
+  in all three production families; 70/73 brain tests passed, with only deliberately old adapter
+  identity pins failing. `89d907a` pins the captured, reviewed MLP-v4/DWRAON-v3/Assembly-v3 hashes.
+  Full core/brain now pass DSR29; both 600-second server proofs remain required before closure.
+- [ ] Complete **bd-w1oi** and **bd-s5ou** acceptance. DSR30 at `89d907a` passed normal
+  real-process REST/MCP 1/1, but long file/memory scenarios failed 0/2 after 144.46 seconds total.
+  File HTTP reads failed after last observed tick 1200 at 112.8 seconds, seed
+  `5280383142373791406`; memory stopped after an Assembly cell became infinite, seed
+  `12659881219344128065`. Keep the original time budgets and both storage modes.
+- [ ] Resolve **bd-bfkd**: an evolved Assembly arithmetic overflow must not be papered over
+  with changed scientific arithmetic or weakened finite-state guards. Determine the explicit
+  per-agent fault policy, reproduce the retained seed, then prove healthy world continuation.
+- [ ] Resolve **bd-j8o2** journal latency causally; DSR29 again passed 6/8 with two command
+  durability deadlines missed. Command application is observed; commitment remains pending.
+  DSR34 additionally missed the unchanged owner-client handoff timeout, producing 7/10 total
+  journal passes including the two authored oracle failures. DSR35 passes 10/10; a later pass
+  does not explain or repair the intermittent handoff failure.
+- [x] Complete **bd-nrwx**, checked migration population counts. The bounded migrator candidate
+  uses checked per-island `u32` counts and exact aggregate `u64` totals; valid totals above
+  `u32::MAX` remain admitted. `ef31c5a` includes both writer and reader controls. DSR31 runtime
+  units 186/186 passed including all ten numeric boundary tests and existing live migrations;
+  runtime integrations 3/4 failed the old caller-assisted retry timing assumption. Huge-world
+  allocation and migration rollback are not established by counter-only fixtures.
+  Closed after fresh original-acceptance review and DSR37 runtime 196/196, journal 10/10,
+  workspace compilation, and exact retained hash comparison; no independent certification.
+- [x] Complete **bd-s6nt**, channel retained-journal retry. Source inspection found `JournalFull`
+  leads to `WakeOnly` and an indefinite receive with no caller of the available retry method.
+  `c2f724a` implements bounded maintenance/retry of the exact allocation and paused quiescence.
+  DSR31 passed the three new real bounded volatile-journal tests. Both newly authored worker
+  tests failed before exercising recovery: they incorrectly expected a scientific digest while
+  a persistence batch was retained. The production guard correctly returned `NonContinuable`.
+  `58916a2` now asserts that typed refusal and compares recovered science against an independent
+  two-tick world. It also corrects the old soak test to exercise automatic retry and existing
+  blocked-time discard semantics: tick two at recovery, tick three one full period later.
+  DSR33 passed all 195 runtime tests, but both worker tests still failed in the oracle: I called
+  `WorldState::step` with persistence enabled and no bound session. `ce4d08f` binds the oracle's
+  explicit science-only null sink and steps through its real admission session; the file/memory
+  system under test still uses real storage. Both authored setup mistakes remain recorded.
+  DSR35 at `ac6829d` now passes all ten real storage-journal tests, including both automatic
+  worker recovery/readback controls. DSR37 repeats all positives; fresh source/test/acceptance
+  review and matched retained logs justify the bounded closure. Journal latency remains open.
+- [x] Complete **bd-tygg**, migration ownership recovery. `2cb11f8` preserves staged payloads
+  on revision exhaustion, verifies new live arrivals before reporting them, and returns the
+  actual bound payload in a typed error when neither host can admit it. Five new controls
+  cover recovery, distinct occupied payloads, applied-but-uncommitted arrival, and stale/foreign/
+  departed identity negatives. DSR32 `migration-2cb11f8-20260905-32` passed all five new controls
+  and 191/191 runtime units, with five existing ignored cases. Integrations passed 3/4; the old
+  retry-timing assertion remained the sole failure. Full runtime subsequently passed 195/195
+  at `58916a2` in DSR33 and `575b29f` in DSR34. Closed after fresh original-acceptance review
+  and DSR37 actual runtime 196/196 plus storage/compiler results and matched retained hashes.
+- [x] Retain completed DSR31 and DSR32 proofs, with remote/local verdict and selected log hashes
+  verified identical. DSR31 passed runtime units 186/186, journal originals 8/8, strict core lint
+  and workspace compilation; its overall result failed on the three authored/test-assumption
+  issues above plus runtime/Bevy lint. DSR32 also passed core/workspace compilation and core lint.
+- [x] Finish DSR33 `retry-bevy-58916a2-20260905-33`: runtime 195/195, Bevy 185/186,
+  journal 8/10, compiler/format/core lint pass, strict workspace lint failed. Overall failed.
+  The existing CPU Bevy snapshot legibility guard found luminance spread 15.22 below 40.00;
+  retain the image contract and existing **bd-d26y / bd-2z0.14.3.9**, with no golden rebasing.
+  Bevy's 183 reported lib passes include two explicit software-renderer early returns, so they
+  do not certify live capture pixels. CPU camera smoke and the HDR content canary each passed.
+  Separate HDR-test/readback-example recursion-limit fixes await strict compiler qualification.
+- [x] Review and commit the runtime lint candidate, both boxed-envelope storage consumers,
+  migration ownership boxing, authority cache order and revision rejection order. The
+  old vacuous migrant Clone assertion now uses compiler ambiguity; runtime compilation passed,
+  but no planted Clone counterexample has been compiled.
+- [x] Finish DSR34 `runtime-lint-575b29f-20260905-34`: runtime 195 reported passes, journal
+  7/10, rollback-authority recovery 1/1, core strict lint and workspace compiler pass;
+  runtime/workspace strict lint fail. Overall failed. Complete local proof is retained at
+  `/tmp/scriptbots-runtime-lint-575b29f-proof-20260905`; verdict, runtime, journal and rollback
+  log hashes were compared with the worker and match byte-for-byte.
+- [x] Retain completed DSR35 at `ac6829d`: runtime 195 reported passes, real journal 10/10,
+  control 27/28, actual publisher 1/1, held-lock HTTP status 1/1, normal REST/MCP 1/1,
+  compiler/format pass, strict runtime/workspace lint fail. Overall failed; the authored
+  control fixture error is fixed in `3c3ae1d`. Full local proof and seven remote/local
+  verdict/log hashes match in `/tmp/scriptbots-status-ac6829d-proof-20260905`.
+- [x] Retain completed DSR36 `workspace-e0a99ce-20260905-36`: workspace all-target compiler
+  and format pass, strict lint fails. Bevy standalone recursion fix qualifies compilation.
+  Full proof and three matched hashes are in `/tmp/scriptbots-workspace-e0a99ce-proof-20260905`.
+  This compiler-only lane executes no tests.
+- [x] Finish and retain DSR37 `observed-soak-3c3ae1d-20260905-37`. Observed completed targets:
+  runtime 196/196, journal 10/10, control 28/28, publisher 1/1, held-lock HTTP 1/1, normal
+  REST/MCP 1/1, format pass. Strict runtime lint fails one function-length diagnostic, now
+  corrected in `9fc62ad`; workspace compiler passes and strict workspace lint fails. Overall
+  DSR exits 6. Full proof `/tmp/scriptbots-observed-soak-3c3ae1d-proof-20260905` retained;
+  all nine selected remote/local verdict/log hashes match. No complete-workspace pass.
+- [x] Finish DSR38 `workspace-9fc62ad-20260905-38`, launched on a separate idle DSR worker
+  from clean exact `9fc62ad6c3ba41455aad64132a4418a038640cf3`:
+  - [x] Review all 21 changed files and their test/gate diffs; source hashing body is unchanged,
+    and complete Compositor items are byte-identical apart from the separating blank line.
+  - [x] Re-run formatting/whitespace checks. Root UBS reports 28 existing test panic guards;
+    all critical contexts were inspected. This is not a clean-scanner claim.
+  - [x] Workspace compiler/strict Clippy fail, including the authored analytics E0658 below.
+  - [x] Runtime 196/196, app library 397/398, render library 123/123, genome 8/8;
+    analytics executes no tests because compilation fails. Existing ignored cases retained.
+  - [x] Full proof retained at `/tmp/scriptbots-workspace-9fc62ad-proof-20260905`;
+    eight selected worker/local verdict/log SHA256s match. Overall DSR exit 6, failed.
+  - [x] Re-read original narrow bug acceptance and close status/retry/count/ownership beads
+    from completed DSR37 evidence; leave broad soak, ownership and latency parents open.
+  - [ ] Export tracker, review exact documentation/tracker snapshots, commit and push both refs.
+  This lane does not run the ignored INSERT timing diagnostic, full workspace, macOS captures,
+  performance gate, or either original 600-second server scenario.
+- [ ] Correct and qualify the DSR38 remainder. Workspace compilation caught an authored
+  E0658: the new AR(1) expectation was on an assignment expression. Move it to `let next`,
+  retaining the exact product/sum/random draw, then assign `prev`; do not enable a language
+  feature to conceal the mistake. Runtime 196/196 passes, while strict lint now reaches
+  analytics CLI/integration and app binary/test diagnostics. Candidate scopes:
+  - [x] Root: correct AR(1), three app-binary expressions and four Lab test diagnostics.
+  - [x] Review terminal's 17 Snapshot initializers and unchanged nine-case type alias.
+  - [x] Review six meadow identity casts, HTTP tuple alias and unchanged real-process polling.
+  - [x] Finish analytics seven-file export/helper/fixture review, formatting and UBS triage.
+    All 16 files reviewed; root scanners found nine existing test panic guards, each inspected.
+  - [x] Freeze only reviewed source as `dc9ee28`; exact tree matched before commit.
+  - [ ] Complete and retain clean pinned DSR39b `workspace-dc9ee28-20260905-39b`:
+    workspace all-target compiler/strict lint, complete default runtime/analytics/app tests,
+    render library, genome persistence and ten real journal cases. Initial DSR39 launch
+    refused before compilation because the shell missed the provisioned yq path; exit 4,
+    retained driver log, no suite result. The corrected launch uses existing tools.
+    Workspace all-target compiler and strict Clippy have now passed at exact `dc9ee28`;
+    tests continue. No complete-suite pass, and broad dependent soak acceptance stays open.
+- [ ] Resolve the DSR38 terminal capability golden mismatch without automatic rebasing.
+  App library is 397 passed, one failed, one existing ignored; render library 123 passed,
+  three existing ignored. Only three truecolor canvas map hashes differ; quantized and flat
+  rows and all other panel hashes match. The golden commit `bfa04e1` changed those same three
+  rows despite its code change touching flat glyph modifiers only. Trace actual cell colours
+  and platform arithmetic before choosing a correction; no golden edits yet.
+- [ ] Reopened **bd-q2w9**: the previous diet accessibility closure only tests flat-map
+  `agent_symbol`. The live sub-cell canvas never reads its modifiers. Wire the established
+  BOLD/UNDERLINED/normal vocabulary into actual body cells while preserving glyphs/colours:
+  - [x] Review both writers and consumers; retain the original flat-map positive test.
+  - [x] Author shared vocabulary and body-cell application, combining mixed-cell markers,
+    excluding whiskers/offscreen bodies and clearing the previous frame's markers.
+  - [x] Add real-buffer density/depth/diet, heading, mixed-order and offscreen controls.
+  - [x] Review formatting, scanner findings and actual reused-buffer stale-marker coverage;
+    six existing panic guards inspected, complete source frozen and committed as `61da01c`.
+  - [ ] Finish clean pinned DSR40 `canvas-61da01c-20260905-40`: complete default app tests,
+    workspace all-target compiler and strict Clippy. Inspect every changed golden region
+    before closure; this run deliberately retains the existing golden comparison.
+- [ ] Retain the live-provider evidence gap on open **bd-16g.1**: its ignored Anthropic test
+  can finish without a request when the key or feature is missing. This lint pass preserves
+  the original branches and does not run it or claim provider validation. Live acceptance
+  must require the actual feature/request and distinguish refusal from a completed request.
+- [ ] Repair and requalify **bd-2z0.4.11**, reopened after inspecting the existing soak test.
+  It discarded both real threaded worlds and compared two newly constructed unticked worlds;
+  it also omitted a reached-tick assertion and reported hardcoded tick/command counts. Earlier
+  195/195 runtime passes do not prove soak determinism. Read the actual owner digest and tick,
+  compare with a matching reference advanced to that observed tick, derive command counts
+  from results/receipts, require the unchanged 100-tick target and 10-second bound, and prove
+  the evolved digest differs from initialization. Preserve the automatic threaded soak and
+  all lifecycle/contention/fault controls. Do not substitute another initialization equality.
+  Its original `Step` commands also pause playback, so add an explicitly applied resume
+  before awaiting that target; the previous test could time out near tick five and still pass.
+  `3c3ae1d` now measures the owner state. DSR37 executes two runs to actual tick 100; both
+  actual final digests match independently stepped references and differ from initialization.
+  Each observes 22 submissions/applied commands and 23 admissions including shutdown; unused
+  event consumption is explicitly null. The planted unticked/unreached-target test passes.
+  Keep the original bead open: its broader long-run CPU/memory/latency and complete fault/trace
+  acceptance is not established by this corrected 100-tick test or the aggregate test count.
+- [x] Complete **bd-j13n**: `ac6829d` publishes actual status fields at bootstrap and after
+  production step outcomes. Status uses a nonblocking world read and serves the last published
+  boundary on contention; absent observations and poisoned state remain typed unavailable.
+  New bounded tests hold the real mutex until a response and retain differing revisions.
+  DSR35 passed the real held-mutex HTTP test 1/1 and production publisher success/error test
+  1/1. Control units passed 27/28: my fixture used the tick-zero-only founding API after the
+  first tick. Its `SeededArrivalAfterBootstrap` refusal is correct; the fixture now uses
+  explicit injection, with all nondefault-field/stale-revision assertions retained. DSR37
+  now passes all 28 control tests and repeats publisher/HTTP positives. Closed after exact
+  retention, matched worker/local hashes, and fresh solo original-acceptance review.
+  This does not claim to fix storage throughput, Assembly overflow, or full host ownership.
+- [ ] Keep **bd-bufm** VFX and **bd-16g.11.3** Sankey integration honest: VFX requires a
+  positioned core tick-event carrier; Sankey needs the canonical epoch feed plus Lab caller.
+  `9fc62ad` names these as narrow dead-code expectations, preserving unfinished source without
+  manufacturing a consumer. SceneCost stays in tests; macOS helper gates match existing callers.
+  No production VFX, Sankey display, or macOS-pixel capability is delivered by these lint edits.
+- [ ] Continue **bd-pcfj / bd-88yj** server ownership wiring after that prerequisite. The existing
+  `HostThread` is unwired, control reads still lock the world during persistence, and snapshot
+  projections lack some debug fields. Preserve actual journal receipts, retained faults, shutdown
+  ordering and owner-side summaries; do not substitute fabricated snapshot fields or claim the
+  ownership change itself fixes storage latency. GUI/TUI cutover remains separately unfinished.
+
 Continuation block — **bd-16g.5.5.2, closed after pinned DSR21, TurquoiseLake**:
 
 - [x] Resolve the seven failures from completed DSR16 (`4a1c8e5`) before full-suite acceptance.
