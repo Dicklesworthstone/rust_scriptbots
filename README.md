@@ -1036,6 +1036,56 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 - **macOS codesigning:** configure the signing identity and certificate through DSR's protected release environment. Never put signing credentials in the repository or substitute a hosted workflow's secret store for the pinned DSR release path.
 - DSR imports signing material into an isolated temporary keychain, signs binaries and `.app` bundles, repacks the archives, and retains the resulting checksums in the release evidence. Release operators should verify that exact bundle (`codesign --verify --deep` on macOS and `shasum -a 256` on every platform) before publication.
 
+### Reproducing correctness verification on a fresh Linux host
+
+[`ci/dsr_verify.yaml`](ci/dsr_verify.yaml) and
+[`scripts/dsr_verify.sh`](scripts/dsr_verify.sh) provide a source-pinned correctness
+profile. This is separate from release packaging and the exact-class performance
+golden. It supports `workspace`, `graphs`, and `recipes` lanes; a lane pass only
+certifies that lane. GUI, PTY, browser and performance acceptance require their
+own actual execution.
+
+Use an external DSR configuration directory and a clean `main` checkout. Copy the
+profile into `repos.d/scriptbots-verify.yaml`, then set its `local_path`, full
+reviewed `SCRIPTBOTS_EXPECTED_COMMIT`, `SCRIPTBOTS_VERIFY_PROFILE`,
+`SCRIPTBOTS_PROOF_ROOT`, and `CARGO_TARGET_DIR` to real absolute host paths.
+Create the proof root outside the checkout; each invocation creates a new child
+directory and refuses reuse. Use the toolchain pinned in `rust-toolchain.toml`.
+
+The external `config.yaml` needs `schema_version: "1.0.0"`. For native execution
+on the Linux host where DSR runs, use this external `hosts.yaml`:
+
+```yaml
+schema_version: "1.0.0"
+hosts:
+  scriptbots-linux:
+    platform: linux/amd64
+    connection: local
+    concurrency: 1
+    capabilities: [rust]
+platform_mapping:
+  linux/amd64: scriptbots-linux
+```
+
+Run the profile with a unique proof version:
+
+```bash
+DSR_CONFIG_DIR=/absolute/path/to/dsr-config \
+  dsr build --tool scriptbots-verify --target linux/amd64 \
+  --only-native --no-sync --version proof-20260905-001
+```
+
+The runner checks clean `main`, expected commit, actual host target, external
+output locations and native DSR execution before compiling. It retains the exact
+profile, toolchain and source identity, command lines, full stdout/stderr logs,
+executed-test counts and `verdict.json`. Acceptance requires both a successful DSR
+run and a parsed `status: "pass"` verdict for the expected source and lane.
+The workspace lane runs all-target check, strict Clippy, workspace tests and the
+separate core `economy-faults` tests. Pin/license/WASM dependency guards run in
+every lane. Missing profiles, hosts or toolchains are infrastructure refusals,
+not test outcomes. Relevant ignored native acceptance tests still need explicit
+profiles; this runner does not infer that they ran from a green default suite.
+
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.

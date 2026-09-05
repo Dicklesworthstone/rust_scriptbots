@@ -1,0 +1,34 @@
+# Copy into an external DSR_CONFIG_DIR/repos.d/scriptbots-verify.yaml.
+# Set local_path, expected commit, profile path, evidence root and target directory
+# to actual host paths before use. Keep this materialized profile with its evidence.
+# This profile verifies correctness on Linux; it is not a performance baseline.
+tool_name: scriptbots-verify
+repo: Dicklesworthstone/rust_scriptbots
+local_path: /absolute/path/to/clean/main/checkout
+language: rust
+binary_name: sb-analyze
+build_profile: debug
+linux_glibc_floor: native
+targets:
+  - linux/amd64
+act_job_map:
+  linux/amd64: null
+cross_compile:
+  linux/amd64:
+    host: scriptbots-linux
+build_cmd: bash scripts/dsr_verify.sh "${version}"
+env:
+  SCRIPTBOTS_EXPECTED_COMMIT: REPLACE_WITH_REVIEWED_40_HEX_COMMIT
+  SCRIPTBOTS_VERIFY_PROFILE: /absolute/path/to/dsr/repos.d/scriptbots-verify.yaml
+  SCRIPTBOTS_PROOF_ROOT: /absolute/path/outside/checkout/proofs
+  SCRIPTBOTS_VERIFY_LANE: workspace
+  SCRIPTBOTS_VERIFY_TARGET: x86_64-unknown-linux-gnu
+  CARGO_TARGET_DIR: /absolute/path/outside/checkout/cargo-target
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+artifact_naming: "${name}-${version}-${os}-${arch}"
+archive_format:
+  linux: tar.gz
+include_files:
+  - LICENSE
+  - THIRD-PARTY-LICENSES.md
