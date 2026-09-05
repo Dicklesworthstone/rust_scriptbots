@@ -4,6 +4,36 @@
 
 Continuation block — **bd-16g.5.5.2, in progress, TurquoiseLake**:
 
+- [ ] Resolve the seven failures from completed DSR16 (`4a1c8e5`) before full-suite acceptance.
+  - [x] Retain the completed failed run: storage unit tests 208/208; multi-run 17/19;
+    journal 3/8; other default integration targets passed, including reaper 4/4.
+    Three existing timing tests remained ignored. No full-suite pass is claimed.
+  - [x] Implement tick-zero narrative admission and the typed legacy-schema refusal check
+    in `ec0fe9d`; their runtime qualification remains pending.
+  - [x] Trace `UpdateConfig` corruption to conditional config field omission in positional
+    Postcard. Candidate `c0f2d6c` uses named MessagePack fields inside the existing command
+    envelope, streams sizing before the allocation permit, and leaves scientific digest
+    serialization unchanged. Add round-trip, changed-payload, truncation and float-bit tests.
+  - [x] Correct the combat fixture's invalid zero alignment cosine to 0.5; the victim remains
+    directly ahead. Preserve all required observed lifecycle/combat assertions.
+  - [ ] Diagnose two journal durability timeouts. Candidate adds last status/snapshot evidence;
+    it does not raise polling budgets or claim those failures fixed.
+  - [x] Finish pinned DSR17: codec 2/2 and multi-run 19/19 passed; journal 3/8 passed.
+    Configuration decoding reached real application, then tick two rejected revision 0→1.
+  - [x] Finish pinned DSR18 at `8ce006b`: runtime drain 2/2, codec 2/2, allocation bound 1/1,
+    missing-claim corruption 1/1 and multi-run 19/19 passed. Journal improved to 5/8, including
+    the real concurrent file channel. Two commands remained pending within unchanged polling
+    limits; the other failure was a copied corruption fixture missing its writer-lock companion.
+    Both runs failed overall; copied logs and verdicts have matching remote/local SHA-256 hashes.
+  - [ ] Complete **bd-0wek**, witnessed live narrative configuration boundaries. Authenticate
+    monotonic revisions against applied commands at the preceding tick, require exact policy,
+    and reject unwitnessed jumps/regressions. Candidate extends real GUI replay with changed
+    policy, a planted policy mismatch, and explicit fixed-config offline-reader refusal.
+  - [ ] Qualify the copied-fixture repair and trace journal admission, state transitions,
+    command projection and science persistence with actual worker span timings in DSR19.
+    Instrumentation is diagnostic evidence, not a timeout fix or a performance-gate result.
+  - [ ] Execute the full suite on corrected source, followed by both original 600-second
+    server scenarios. Keep the archipelago bead open until regression acceptance passes.
 - [x] Trace checkpoint replay and archipelago production entry points against current code.
   Checkpoint restore still needs the host/session boundary. The app's archipelago only
   runs inside the determinism self-check; that check must not gain database side effects.
@@ -181,6 +211,16 @@ Continuation block — **bd-16g.5.5.2, in progress, TurquoiseLake**:
     ancestry target then passed all 3 tests (658.29s), including the live-versus-rebuilt
     canonical graph after actual births and deaths. Async integration passed 3/3.
     Durability and later integration targets are still running; no aggregate lane pass yet.
+    Durability passed 11/11 (243.92s), conformance 2/2, database genome browser 1/1
+    (161.88s), genome persistence 8/8, historical golden 1/1, and locus tracing 1/1.
+    Multi-run integration then failed 2 of 19 tests: obsolete legacy-refusal prose and a
+    production tick-zero admission defect. The latter also exists at pre-block `1f3158c`.
+    Candidate `ec0fe9d` allows only an empty narrative prefix at the initial zero boundary;
+    the existing admission matrix now accepts tick zero and still refuses missing tick-one
+    input without advancing watermarks. The legacy test checks file byte identity before
+    the typed Startup/NotAdmitted/schema-version refusal. Full lane16 is still collecting
+    later results with `--no-fail-fast` and cannot pass. A fresh full lane is required;
+    it now runs the multi-run target early as well as in the complete storage suite.
   - [ ] Verify the original `bd-w1oi` server workload for its full 600-second reproduction
     window with live REST tick observations and retained logs. A five-k flush pass alone
     cannot establish long-running server progress. Replace the old bug-observed-is-green
