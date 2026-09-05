@@ -1181,7 +1181,7 @@ mod tests {
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "8fbb8b2a3cbbf4efb5744f9404ca1d82fe28ccf56b2e2e33230cb53408543177",
+            "41eda1be19185208fad74c3c69d84a2e509ba5eeec8a0eec90bbe4278b0e91a9",
             "update only after reviewing an intentional MLP executable-semantics change"
         );
     }

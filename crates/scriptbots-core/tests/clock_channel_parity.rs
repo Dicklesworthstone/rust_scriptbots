@@ -35,6 +35,10 @@ use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
 
 /// The exact legacy expression, kept as a separate literal transcription of World.cpp:298
 /// so the test is checking C++ semantics rather than re-deriving them from the Rust code.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Preserve the oracle's integer-to-f32 division from World.cpp:298; the tested counters 1..=4 are exactly representable"
+)]
 fn legacy_clock_input(modcounter: u64, clock_frequency: f32) -> f32 {
     (modcounter as f32 / clock_frequency.max(1.0)).sin().abs()
 }

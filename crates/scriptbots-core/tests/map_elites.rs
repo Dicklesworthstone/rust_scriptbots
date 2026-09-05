@@ -160,17 +160,20 @@ fn test_mixed_radix_exhaustiveness_and_invertibility() {
     );
     assert_eq!(space.total_cells().expect("total"), 24);
 
-    for a in 0..3 {
-        for b in 0..4 {
-            for c in 0..2 {
-                let desc =
-                    BehaviorDescriptor::new(vec![a as f32 + 0.5, b as f32 + 0.5, c as f32 + 0.5]);
+    for a in 0u8..3 {
+        for b in 0u8..4 {
+            for c in 0u8..2 {
+                let desc = BehaviorDescriptor::new(vec![
+                    f32::from(a) + 0.5,
+                    f32::from(b) + 0.5,
+                    f32::from(c) + 0.5,
+                ]);
                 let cell_id = space.cell_index(&desc).expect("cell_id");
-                let expected_mixed = a as u64 + (b as u64 * 3) + (c as u64 * 3 * 4);
+                let expected_mixed = u64::from(a) + (u64::from(b) * 3) + (u64::from(c) * 3 * 4);
                 assert_eq!(cell_id.get(), expected_mixed);
 
                 let decoded = space.decode_cell_coords(cell_id).expect("decoded");
-                assert_eq!(decoded, vec![a as u8, b as u8, c as u8]);
+                assert_eq!(decoded, vec![a, b, c]);
             }
         }
     }
@@ -234,6 +237,11 @@ fn test_insertion_replacement_semantics() {
         .expect("archive");
 
     let cell0_desc = BehaviorDescriptor::new(vec![1.0]);
+    let provenance = ArchiveProvenance {
+        run_id: "test".to_string(),
+        parent_uid: None,
+        generation: Generation(0),
+    };
 
     // 1. Insert new entry with UID 10, quality 50.0
     let res = archive
@@ -243,11 +251,7 @@ fn test_insertion_replacement_semantics() {
             descriptor: cell0_desc.clone(),
             quality: 50.0,
             genome: sample_genome(1),
-            provenance: ArchiveProvenance {
-                run_id: "test".to_string(),
-                parent_uid: None,
-                generation: Generation(0),
-            },
+            provenance: provenance.clone(),
         })
         .expect("insert");
     assert_eq!(res, InsertionResult::InsertedNew);
@@ -262,11 +266,7 @@ fn test_insertion_replacement_semantics() {
             descriptor: cell0_desc.clone(),
             quality: 40.0,
             genome: sample_genome(2),
-            provenance: ArchiveProvenance {
-                run_id: "test".to_string(),
-                parent_uid: None,
-                generation: Generation(0),
-            },
+            provenance: provenance.clone(),
         })
         .expect("insert");
     assert_eq!(res, InsertionResult::RejectedWorseOrEqual);
@@ -280,11 +280,7 @@ fn test_insertion_replacement_semantics() {
             descriptor: cell0_desc.clone(),
             quality: 50.0,
             genome: sample_genome(3),
-            provenance: ArchiveProvenance {
-                run_id: "test".to_string(),
-                parent_uid: None,
-                generation: Generation(0),
-            },
+            provenance: provenance.clone(),
         })
         .expect("insert");
     assert_eq!(res, InsertionResult::RejectedWorseOrEqual);
@@ -298,11 +294,7 @@ fn test_insertion_replacement_semantics() {
             descriptor: cell0_desc.clone(),
             quality: 50.0,
             genome: sample_genome(4),
-            provenance: ArchiveProvenance {
-                run_id: "test".to_string(),
-                parent_uid: None,
-                generation: Generation(0),
-            },
+            provenance: provenance.clone(),
         })
         .expect("insert");
     assert_eq!(
@@ -322,11 +314,7 @@ fn test_insertion_replacement_semantics() {
             descriptor: cell0_desc,
             quality: 75.0,
             genome: sample_genome(5),
-            provenance: ArchiveProvenance {
-                run_id: "test".to_string(),
-                parent_uid: None,
-                generation: Generation(0),
-            },
+            provenance,
         })
         .expect("insert");
     assert_eq!(

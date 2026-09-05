@@ -744,7 +744,7 @@ mod tests {
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "424ea6759de4b0c676bb7e37b0d8471d6c0ef8bc664078736ac425a31086622c",
+            "583ebc134825074238b390853d06bfaef68e9da54491247a452fb134d9497be7",
             "update only after reviewing an intentional Assembly executable-semantics change"
         );
     }

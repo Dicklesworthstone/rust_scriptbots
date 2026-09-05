@@ -1142,7 +1142,7 @@ fn configure_parallelism() {
 }
 
 #[cfg(all(feature = "parallel", target_arch = "wasm32"))]
-fn configure_parallelism() {
+const fn configure_parallelism() {
     // No-op on WASM: cannot set environment variables or configure rayon
 }
 
@@ -1157,7 +1157,7 @@ const fn default_thread_budget(cpu_count: usize) -> usize {
 }
 
 #[cfg(not(feature = "parallel"))]
-fn configure_parallelism() {}
+const fn configure_parallelism() {}
 
 const fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
@@ -21039,80 +21039,80 @@ impl WorldState {
 
         #[cfg(not(feature = "simd_wide"))]
         let results: Vec<ActuationResult> = collect_handles!(handles, |idx, agent_id| {
-            if let Some(runtime) = runtime.get(*agent_id) {
-                let decoded = decode_outputs(runtime.outputs);
+            runtime
+                .get(*agent_id)
+                .map_or_else(ActuationResult::default, |runtime| {
+                    let decoded = decode_outputs(runtime.outputs);
 
-                let mut left_speed = decoded.left * bot_speed;
-                let mut right_speed = decoded.right * bot_speed;
-                if decoded.boost {
-                    left_speed *= boost_multiplier;
-                    right_speed *= boost_multiplier;
-                }
-
-                let locomotion = Self::actuation_locomotion(
-                    positions_snapshot[idx],
-                    headings_snapshot[idx],
-                    left_speed,
-                    right_speed,
-                    terrain,
-                    locomotion_params,
-                );
-
-                let movement_penalty = movement_drain * locomotion.wheel_effort;
-                let mut drain = metabolism_drain + movement_penalty;
-                let mut ramp_penalty = 0.0;
-                if ramp_rate > 0.0 {
-                    let active_energy = (runtime.energy - ramp_floor).max(0.0);
-                    ramp_penalty = active_energy * ramp_rate;
-                    drain += ramp_penalty;
-                }
-                let boost_drain = if decoded.boost && boost_penalty > 0.0 {
-                    boost_penalty
-                } else {
-                    0.0
-                };
-                drain += boost_drain;
-                let before_topography = drain;
-                if topo_enabled && topo_penalty > 0.0 {
-                    if locomotion.slope_along > 0.0 {
-                        drain += locomotion.slope_along * topo_penalty;
-                    } else if locomotion.slope_along < 0.0 {
-                        drain = (drain + locomotion.slope_along * topo_penalty * 0.5).max(0.0);
+                    let mut left_speed = decoded.left * bot_speed;
+                    let mut right_speed = decoded.right * bot_speed;
+                    if decoded.boost {
+                        left_speed *= boost_multiplier;
+                        right_speed *= boost_multiplier;
                     }
-                }
-                let drain_breakdown = ActuationDrain {
-                    basal: metabolism_drain,
-                    movement: movement_penalty,
-                    ramp: ramp_penalty,
-                    boost: boost_drain,
-                    topography: drain - before_topography,
-                };
-                let health_delta = -drain;
-                let energy = (runtime.energy - drain).max(0.0);
 
-                let mut spike_length = spike_lengths_snapshot[idx];
-                if spike_length < decoded.spike_target {
-                    spike_length = (spike_length + spike_growth).min(decoded.spike_target);
-                } else if spike_length > decoded.spike_target {
-                    spike_length = (spike_length - spike_growth).max(decoded.spike_target);
-                }
-                ActuationResult {
-                    delta: Some(ActuationDelta {
-                        heading: locomotion.heading,
-                        velocity: locomotion.velocity,
-                        position: locomotion.position,
-                        health_delta,
-                    }),
-                    energy,
-                    drain: drain_breakdown,
-                    color: decoded.color,
-                    spike_length,
-                    sound_level: decoded.sound_level,
-                    give_intent: decoded.give_intent,
-                }
-            } else {
-                ActuationResult::default()
-            }
+                    let locomotion = Self::actuation_locomotion(
+                        positions_snapshot[idx],
+                        headings_snapshot[idx],
+                        left_speed,
+                        right_speed,
+                        terrain,
+                        locomotion_params,
+                    );
+
+                    let movement_penalty = movement_drain * locomotion.wheel_effort;
+                    let mut drain = metabolism_drain + movement_penalty;
+                    let mut ramp_penalty = 0.0;
+                    if ramp_rate > 0.0 {
+                        let active_energy = (runtime.energy - ramp_floor).max(0.0);
+                        ramp_penalty = active_energy * ramp_rate;
+                        drain += ramp_penalty;
+                    }
+                    let boost_drain = if decoded.boost && boost_penalty > 0.0 {
+                        boost_penalty
+                    } else {
+                        0.0
+                    };
+                    drain += boost_drain;
+                    let before_topography = drain;
+                    if topo_enabled && topo_penalty > 0.0 {
+                        if locomotion.slope_along > 0.0 {
+                            drain += locomotion.slope_along * topo_penalty;
+                        } else if locomotion.slope_along < 0.0 {
+                            drain = (drain + locomotion.slope_along * topo_penalty * 0.5).max(0.0);
+                        }
+                    }
+                    let drain_breakdown = ActuationDrain {
+                        basal: metabolism_drain,
+                        movement: movement_penalty,
+                        ramp: ramp_penalty,
+                        boost: boost_drain,
+                        topography: drain - before_topography,
+                    };
+                    let health_delta = -drain;
+                    let energy = (runtime.energy - drain).max(0.0);
+
+                    let mut spike_length = spike_lengths_snapshot[idx];
+                    if spike_length < decoded.spike_target {
+                        spike_length = (spike_length + spike_growth).min(decoded.spike_target);
+                    } else if spike_length > decoded.spike_target {
+                        spike_length = (spike_length - spike_growth).max(decoded.spike_target);
+                    }
+                    ActuationResult {
+                        delta: Some(ActuationDelta {
+                            heading: locomotion.heading,
+                            velocity: locomotion.velocity,
+                            position: locomotion.position,
+                            health_delta,
+                        }),
+                        energy,
+                        drain: drain_breakdown,
+                        color: decoded.color,
+                        spike_length,
+                        sound_level: decoded.sound_level,
+                        give_intent: decoded.give_intent,
+                    }
+                })
         });
 
         if self.resource_ledger.enabled {
@@ -39867,7 +39867,7 @@ mod tests {
             BrainBatchArchitectureKey::new(Vec::new())
                 .expect("empty family-owned key")
                 .as_bytes(),
-            []
+            [0_u8; 0]
         );
         assert!(matches!(
             BrainBatchArchitectureKey::new(vec![

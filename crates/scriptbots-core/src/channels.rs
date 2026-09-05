@@ -897,7 +897,8 @@ mod tests {
                 clippy::manual_clamp,
                 reason = "Preserve the fixture's ordered min/max saturation; clamp has different NaN behavior"
             )]
-            heard[b] = sum.min(1.0).max(0.0);
+            let saturated = sum.min(1.0).max(0.0);
+            heard[b] = saturated;
         }
 
         assert_eq!(heard[0], 0.5);

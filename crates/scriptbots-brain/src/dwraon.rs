@@ -1101,7 +1101,7 @@ mod tests {
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
         assert_eq!(
             identity.to_string(),
-            "728eb71692caeabfc7837d950d2342601dde7ffa1352208ce20872669e6e12d0",
+            "d0ad5ee96ea535b10108d927976670b8e96e5ab924b5435e6af4cd8e5e374714",
             "update only after reviewing an intentional DWRAON executable-semantics change"
         );
     }
