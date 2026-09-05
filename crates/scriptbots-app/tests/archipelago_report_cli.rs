@@ -184,6 +184,28 @@ fn recorded_archipelago_cli_persists_every_island_and_tick()
             observations.push(serde_json::json!({"table":table, "tick":tick, "distinct_islands":distinct,"rows":count}));
         }
     }
+    let founders = connection.query(
+        "SELECT island_id, COUNT(*) FROM births WHERE tick = 0 GROUP BY island_id ORDER BY island_id",
+    )?;
+    let genomes = connection.query(
+        "SELECT island_id, COUNT(*), COUNT(DISTINCT agent_uid) FROM genomes
+         WHERE created_at_tick = 0 GROUP BY island_id ORDER BY island_id",
+    )?;
+    assert_eq!(founders.len(), 3);
+    assert_eq!(
+        genomes.len(),
+        founders.len(),
+        "founder genomes must survive local UID collisions"
+    );
+    for (births, genomes) in founders.iter().zip(&genomes) {
+        let island: i64 = births.get_typed(0)?;
+        let count: i64 = births.get_typed(1)?;
+        assert!(count > 0);
+        assert_eq!(genomes.get_typed::<i64>(0)?, island);
+        assert_eq!(genomes.get_typed::<i64>(1)?, count);
+        assert_eq!(genomes.get_typed::<i64>(2)?, count);
+        observations.push(serde_json::json!({"table":"genomes", "tick":0, "island":island, "rows":count, "founder_rows":count}));
+    }
     connection.close()?;
     std::fs::write(
         directory.join("row-observations.json"),
@@ -210,6 +232,17 @@ fn recorded_archipelago_cli_persists_every_island_and_tick()
     assert!(report.conservation_audit.passed);
     assert_eq!(report.conservation_audit.total_islands_checked, 3);
     assert!(report.migrations.is_empty());
+
+    let recovery = retain_cli(
+        &directory,
+        "recover",
+        recorded_cli().arg("--recover-storage").arg(&database),
+    )?;
+    assert!(
+        recovery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
 
     let before = blake3::hash(&std::fs::read(&database)?);
     let duplicate = retain_cli(&directory, "existing-file", &mut command)?;

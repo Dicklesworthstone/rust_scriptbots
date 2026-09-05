@@ -22,6 +22,7 @@ use scriptbots_core::genome_diff::{
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BrainFamilyCodec, ScriptBotsConfig, WorldState,
 };
+use scriptbots_runtime::IslandId;
 use scriptbots_storage::{StoragePipeline, StorageReader, rebuild_ancestry};
 
 static TEST_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -148,12 +149,13 @@ fn test_genome_browser_e2e_seeded_multigen_db_backed() -> Result<(), Box<dyn std
     let parent_uid = selected_newborn.parent_a.expect("parent exists");
 
     // Read persisted genomes for newborn and parent from the DB
-    let newborn_env = reader.read_agent_genome(newborn_uid, Some(selected_newborn.tick))?;
+    let newborn_env =
+        reader.read_agent_genome(IslandId(0), newborn_uid, Some(selected_newborn.tick))?;
     let parent_birth = births
         .iter()
         .find(|b| b.agent_uid == parent_uid)
         .expect("parent birth row");
-    let parent_env = reader.read_agent_genome(parent_uid, Some(parent_birth.tick))?;
+    let parent_env = reader.read_agent_genome(IslandId(0), parent_uid, Some(parent_birth.tick))?;
 
     // Load full lineage history for locus tracing
     let mut lineage_chronological = deepest_path.clone();
@@ -164,7 +166,7 @@ fn test_genome_browser_e2e_seeded_multigen_db_backed() -> Result<(), Box<dyn std
             .iter()
             .find(|x| x.agent_uid == *uid)
             .expect("birth row");
-        let env = reader.read_agent_genome(*uid, Some(b.tick))?;
+        let env = reader.read_agent_genome(IslandId(0), *uid, Some(b.tick))?;
         lineage_history.push((b.generation.0, *uid, b.tick, env));
     }
 

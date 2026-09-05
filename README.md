@@ -32,7 +32,7 @@ The workspace is organized for clear boundaries and fast incremental builds:
 ```
 rust_scriptbots/
 ├── Cargo.toml                # Workspace manifest, shared deps/lints/profiles
-├── rust-toolchain.toml       # Pinned nightly-2026-07-09 toolchain (MSRV 1.89)
+├── rust-toolchain.toml       # Pinned nightly toolchain and required components
 ├── crates/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
 │   ├── scriptbots-runtime    # Sole-owner HostCore, protocol, fixed-deadline lifecycle, null frontend
@@ -448,6 +448,8 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
    `rng_seed` and `persistence_interval=1`. Islands step in ascending order with separate
    derived seeds; the inner Rayon pool defaults to one thread and honors `--threads`.
    Each complete tick is atomically applied and flushed before the next tick begins.
+   Genomes and narrative records retain island IDs; genome read APIs require an explicit
+   island, and narrative search results include it in each event identity.
    This mode currently has no migration, scheduled interventions, bootstrap, or host-session
    checkpoint resume. The JSON result names those limits and the observed durability watermarks.
    The manifest's `archipelago` extension records all island configs and the common root seed;

@@ -128,7 +128,7 @@ fn build_recorded_archipelago(
             Some(Box::new(IslandCaptureJournal {
                 island: meta.id,
                 capture: Rc::clone(capture),
-                journal: VolatileJournal::with_capacity(options.volatile_event_history_capacity),
+                journal: VolatileJournal::default(),
             }))
         },
     );
@@ -229,7 +229,7 @@ pub fn run_recorded_archipelago(
             storage.flush()?;
             let watermarks = storage.persistence_watermarks()?;
             ensure!(
-                watermarks.admitted.is_some()
+                watermarks.admitted.map(|id| id.get()) == Some(expected_tick)
                     && watermarks.admitted == watermarks.applied
                     && watermarks.applied == watermarks.durable,
                 "barrier {expected_tick} has incomplete persistence watermarks: {watermarks:?}"
@@ -422,7 +422,7 @@ mod tests {
             Box::new(IslandCaptureJournal {
                 island: IslandId(7),
                 capture: Rc::clone(&capture),
-                journal: VolatileJournal::with_capacity(options.volatile_event_history_capacity),
+                journal: VolatileJournal::default(),
             }),
         )?;
         let mut port = host.local_port();

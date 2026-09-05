@@ -17,7 +17,7 @@ use scriptbots_core::{
     MetricSample, PersistedGenome, PersistenceBatch, PersistenceEvent, PersistenceEventKind,
     Position, ScriptBotsConfig, Tick, TickSummary, WorldState,
 };
-use scriptbots_runtime::RunId;
+use scriptbots_runtime::{IslandId, RunId};
 use scriptbots_storage::{
     GenomeStorageError, Locus, RunManifestRecord, StorageError, StoragePipeline, StorageReader,
     export_locus_trace_csv, export_locus_trace_png,
@@ -199,7 +199,7 @@ fn test_founder_and_offspring_admission_and_readback() -> Result<(), Box<dyn std
     let reader = StorageReader::open(&path)?;
 
     // 1. Read founder by agent UID and exact tick
-    let read_founder = reader.read_agent_genome(AgentUid(1), Some(Tick(0)))?;
+    let read_founder = reader.read_agent_genome(IslandId(0), AgentUid(1), Some(Tick(0)))?;
     assert_eq!(read_founder.payload(), &founder_payload);
     assert_eq!(read_founder.material_hash(), founder_hash);
     assert_eq!(
@@ -208,11 +208,11 @@ fn test_founder_and_offspring_admission_and_readback() -> Result<(), Box<dyn std
     );
 
     // 2. Read founder by agent UID latest (tick = None)
-    let read_founder_latest = reader.read_agent_genome(AgentUid(1), None)?;
+    let read_founder_latest = reader.read_agent_genome(IslandId(0), AgentUid(1), None)?;
     assert_eq!(read_founder_latest, read_founder);
 
     // 3. Read asexual offspring
-    let read_asexual = reader.read_agent_genome(AgentUid(2), Some(Tick(5)))?;
+    let read_asexual = reader.read_agent_genome(IslandId(0), AgentUid(2), Some(Tick(5)))?;
     assert_eq!(read_asexual.payload(), &asexual_payload);
     assert_eq!(
         read_asexual.provenance().derivation,
@@ -225,7 +225,7 @@ fn test_founder_and_offspring_admission_and_readback() -> Result<(), Box<dyn std
     );
 
     // 4. Read by genome ID
-    let read_by_id = reader.read_genome_by_id("agent:1:tick:0")?;
+    let read_by_id = reader.read_genome_by_id(IslandId(0), "agent:1:tick:0")?;
     assert_eq!(read_by_id, read_founder);
 
     Ok(())
@@ -269,7 +269,7 @@ fn test_bit_exact_float_and_subnormal_payload_preservation()
     pipeline.shutdown()?;
 
     let reader = StorageReader::open(&path)?;
-    let readback = reader.read_agent_genome(AgentUid(42), Some(Tick(10)))?;
+    let readback = reader.read_agent_genome(IslandId(0), AgentUid(42), Some(Tick(10)))?;
 
     assert_eq!(readback.payload(), &payload);
     assert_eq!(readback.material_hash(), env.material_hash());
@@ -312,7 +312,7 @@ fn test_duplicate_and_retry_idempotence() -> Result<(), Box<dyn std::error::Erro
     recovered_pipe.shutdown()?;
 
     let reader = StorageReader::open(&path)?;
-    let readback = reader.read_agent_genome(AgentUid(7), Some(Tick(1)))?;
+    let readback = reader.read_agent_genome(IslandId(0), AgentUid(7), Some(Tick(1)))?;
     assert_eq!(readback.material_hash(), env.material_hash());
 
     // Verify exactly 1 row exists in genomes table
@@ -367,18 +367,18 @@ fn test_multi_run_isolation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reader for Run A
     let reader_a = StorageReader::open_for_run(&path, run_a)?;
-    let read_a = reader_a.read_agent_genome(AgentUid(1), Some(Tick(1)))?;
+    let read_a = reader_a.read_agent_genome(IslandId(0), AgentUid(1), Some(Tick(1)))?;
     assert_eq!(read_a.family_id().as_str(), "mlp");
     assert_eq!(read_a.payload(), &[1, 1, 1]);
 
     // Reader for Run B
     let reader_b = StorageReader::open_for_run(&path, run_b)?;
-    let read_b = reader_b.read_agent_genome(AgentUid(1), Some(Tick(1)))?;
+    let read_b = reader_b.read_agent_genome(IslandId(0), AgentUid(1), Some(Tick(1)))?;
     assert_eq!(read_b.family_id().as_str(), "dwraon");
     assert_eq!(read_b.payload(), &[2, 2, 2, 2]);
 
     // Query for nonexistent agent in Run A
-    let err = reader_a.read_agent_genome(AgentUid(999), None);
+    let err = reader_a.read_agent_genome(IslandId(0), AgentUid(999), None);
     assert!(matches!(
         err,
         Err(StorageError::Genome(GenomeStorageError::NotFound { .. }))
@@ -414,7 +414,7 @@ fn test_error_conditions_and_tamper_detection() -> Result<(), Box<dyn std::error
 
     // 1. NotFound error
     let reader = StorageReader::open(&path)?;
-    let err_not_found = reader.read_agent_genome(AgentUid(100), Some(Tick(1)));
+    let err_not_found = reader.read_agent_genome(IslandId(0), AgentUid(100), Some(Tick(1)));
     assert!(matches!(
         err_not_found,
         Err(StorageError::Genome(GenomeStorageError::NotFound {
@@ -438,7 +438,7 @@ fn test_error_conditions_and_tamper_detection() -> Result<(), Box<dyn std::error
     let reader_tampered = StorageReader::open(&path)?;
 
     // Test CorruptPayload detection
-    let err_corrupt = reader_tampered.read_agent_genome(AgentUid(1), Some(Tick(1)));
+    let err_corrupt = reader_tampered.read_agent_genome(IslandId(0), AgentUid(1), Some(Tick(1)));
     assert!(matches!(
         err_corrupt,
         Err(StorageError::Genome(
@@ -447,7 +447,7 @@ fn test_error_conditions_and_tamper_detection() -> Result<(), Box<dyn std::error
     ));
 
     // Test DigestMismatch detection
-    let err_digest = reader_tampered.read_agent_genome(AgentUid(2), Some(Tick(1)));
+    let err_digest = reader_tampered.read_agent_genome(IslandId(0), AgentUid(2), Some(Tick(1)));
     assert!(matches!(
         err_digest,
         Err(StorageError::Genome(
@@ -501,7 +501,7 @@ fn test_ordered_lineage_and_page_readback() -> Result<(), Box<dyn std::error::Er
     let reader = StorageReader::open(&path)?;
 
     // Lineage readback: request order [AgentUid(3), AgentUid(1)]
-    let lineage = reader.read_lineage_genomes(&[AgentUid(3), AgentUid(1)])?;
+    let lineage = reader.read_lineage_genomes(IslandId(0), &[AgentUid(3), AgentUid(1)])?;
     assert_eq!(lineage.len(), 3);
     assert_eq!(lineage[0].0, AgentUid(3));
     assert_eq!(lineage[0].1, Tick(7));
@@ -516,14 +516,14 @@ fn test_ordered_lineage_and_page_readback() -> Result<(), Box<dyn std::error::Er
     assert_eq!(lineage[2].2.payload(), &[1, 5]);
 
     // Page readback
-    let page_0 = reader.read_genomes_page(0, 2)?;
+    let page_0 = reader.read_genomes_page(IslandId(0), 0, 2)?;
     assert_eq!(page_0.len(), 2);
     assert_eq!(page_0[0].0, AgentUid(1));
     assert_eq!(page_0[0].1, Tick(0));
     assert_eq!(page_0[1].0, AgentUid(2));
     assert_eq!(page_0[1].1, Tick(2));
 
-    let page_1 = reader.read_genomes_page(2, 2)?;
+    let page_1 = reader.read_genomes_page(IslandId(0), 2, 2)?;
     assert_eq!(page_1.len(), 2);
     assert_eq!(page_1[0].0, AgentUid(1));
     assert_eq!(page_1[0].1, Tick(5));
@@ -597,7 +597,7 @@ fn test_live_simulation_multigen_e2e_reopened_db() -> Result<(), Box<dyn std::er
 
     // Verify all live agent genomes exist in the reopened database and match bit-for-bit
     for (uid, expected_envelope) in &live_genomes {
-        let readback = reader.read_agent_genome(*uid, None)?;
+        let readback = reader.read_agent_genome(IslandId(0), *uid, None)?;
         assert_eq!(
             readback.payload(),
             expected_envelope.payload(),
@@ -682,7 +682,7 @@ fn test_db_backed_lineage_locus_tracing_with_csv_and_png_export_and_live_crossch
 
     // 1. Trace a real locus across founders
     let locus = Locus::NodeBias(0);
-    let samples = reader.trace_locus(&codec, &founder_uids, locus)?;
+    let samples = reader.trace_locus(IslandId(0), &codec, &founder_uids, locus)?;
     assert_eq!(samples.len(), founder_uids.len());
 
     // 2. Cross-check DB-traced values against live agent genomes
@@ -702,7 +702,7 @@ fn test_db_backed_lineage_locus_tracing_with_csv_and_png_export_and_live_crossch
 
     // 3. Test explicit gap: query a locus that does NOT exist in the schema
     let absent_locus = Locus::NodeBias(99999);
-    let gap_samples = reader.trace_locus(&codec, &founder_uids, absent_locus)?;
+    let gap_samples = reader.trace_locus(IslandId(0), &codec, &founder_uids, absent_locus)?;
     for s in &gap_samples {
         assert_eq!(
             s.value, None,

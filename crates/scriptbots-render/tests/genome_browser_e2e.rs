@@ -17,6 +17,7 @@ use scriptbots_core::genome_browser::{GenomeBrowserViewModel, MutationDiffStatus
 use scriptbots_core::genome_diff::{
     Locus, LocusValue, export_locus_trace_csv, export_locus_trace_png,
 };
+use scriptbots_core::rng_domains::IslandId;
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BrainFamilyCodec, ScriptBotsConfig, WorldState,
 };
@@ -146,7 +147,7 @@ fn test_genome_browser_ui_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Check DB persistence matches live genome material digest
     let agent_uid = world.agent_uid(first_agent).unwrap();
-    if let Ok(db_envelope) = reader.read_agent_genome(agent_uid, None) {
+    if let Ok(db_envelope) = reader.read_agent_genome(IslandId(0), agent_uid, None) {
         assert_eq!(
             vm.genome_digest,
             db_envelope.material_hash().to_string(),
@@ -209,7 +210,7 @@ fn test_genome_browser_ui_e2e() -> Result<(), Box<dyn std::error::Error>> {
 
     let selected_locus = Locus::NodeBias(0);
     let path = graph.lineage_path(agent_uid, 100);
-    let lineage_genomes = reader.read_lineage_genomes(&path)?;
+    let lineage_genomes = reader.read_lineage_genomes(IslandId(0), &path)?;
 
     let mut lineage_nodes = Vec::new();
     for (uid, tick, env) in lineage_genomes {

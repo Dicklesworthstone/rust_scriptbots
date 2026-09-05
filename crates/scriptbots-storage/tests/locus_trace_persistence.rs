@@ -1,7 +1,7 @@
 //! E2E tests for DB-backed lineage locus tracing with CSV/PNG export (bd-wdyu).
 //!
 //! Covers:
-//! 1. `trace_locus(db, lineage, locus) -> Vec<LocusSample>` reading persisted genomes from the run DB
+//! 1. `trace_locus(db, island, codec, lineage, locus) -> Vec<LocusSample>` reading persisted genomes from the run DB
 //!    and walking the ancestry DAG.
 //! 2. Explicit gaps (never phantom 0.0) for loci absent in an ancestor schema or unresolvable agents.
 //! 3. Live-world vs DB cross-check on overlapping ticks (bit-exact genomes and locus values).
@@ -21,6 +21,7 @@ use scriptbots_core::genome_diff::{
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BrainFamilyCodec, ScriptBotsConfig, WorldState,
 };
+use scriptbots_runtime::IslandId;
 use scriptbots_storage::{StoragePipeline, StorageReader, rebuild_ancestry, trace_locus};
 
 static TEST_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -116,7 +117,7 @@ fn test_db_backed_lineage_locus_tracing_e2e() -> Result<(), Box<dyn std::error::
 
     // Cross-check: every living agent genome must be bit-identical to DB readback
     for (uid, live_envelope) in &live_agents {
-        let db_envelope = reader.read_agent_genome(*uid, None)?;
+        let db_envelope = reader.read_agent_genome(IslandId(0), *uid, None)?;
         assert_eq!(
             db_envelope.payload(),
             live_envelope.payload(),
@@ -206,7 +207,13 @@ fn test_db_backed_lineage_locus_tracing_e2e() -> Result<(), Box<dyn std::error::
         p.reverse();
         p
     };
-    let free_samples = trace_locus(&reader, &codec, &path_chronological, target_locus)?;
+    let free_samples = trace_locus(
+        &reader,
+        IslandId(0),
+        &codec,
+        &path_chronological,
+        target_locus,
+    )?;
     assert_eq!(
         samples, free_samples,
         "reader.trace_locus and top-level trace_locus must yield identical samples"
@@ -214,7 +221,7 @@ fn test_db_backed_lineage_locus_tracing_e2e() -> Result<(), Box<dyn std::error::
 
     // Verify each traced sample matches the persisted genome envelope in DB
     for sample in &samples {
-        let env = reader.read_agent_genome(sample.agent_uid, None)?;
+        let env = reader.read_agent_genome(IslandId(0), sample.agent_uid, None)?;
         let loci = codec.genome_loci(&env)?;
         let expected_val = loci
             .into_iter()
@@ -244,7 +251,7 @@ fn test_db_backed_lineage_locus_tracing_e2e() -> Result<(), Box<dyn std::error::
 
     // A nonexistent agent in a synthetic lineage must produce an explicit gap
     let ghost_lineage = vec![deepest_target, AgentUid(999_999_999)];
-    let ghost_samples = reader.trace_locus(&codec, &ghost_lineage, target_locus)?;
+    let ghost_samples = reader.trace_locus(IslandId(0), &codec, &ghost_lineage, target_locus)?;
     assert_eq!(ghost_samples.len(), 2);
     assert!(ghost_samples[0].value.is_some());
     assert_eq!(

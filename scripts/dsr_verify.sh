@@ -16,7 +16,7 @@ verify_evidence() {
         graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
         graphs-and-recipes) required+=(graph-check graph-tests archive-unit archive-integration architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
-        archipelago) required+=(archipelago-check archipelago-tests capture-tests barrier-tests) ;;
+        archipelago) required+=(archipelago-check archipelago-tests capture-tests storage-tests) ;;
         *) refuse "unknown evidence lane" ;;
     esac
     required+=(analytics-binary)
@@ -173,7 +173,7 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step archipelago-check check cargo check --locked --workspace --all-targets
         run_step archipelago-tests test cargo test --locked -p scriptbots-app --test archipelago_report_cli recorded_archipelago_cli -- --nocapture
         run_step capture-tests test cargo test --locked -p scriptbots-app --lib archipelago_report::tests:: -- --nocapture
-        run_step barrier-tests test cargo test --locked -p scriptbots-storage --lib a_barrier_sink_ -- --nocapture
+        run_step storage-tests test cargo test --locked -p scriptbots-storage -- --nocapture
         ;;
     workspace)
         run_step workspace-check check cargo check --locked --workspace --all-targets

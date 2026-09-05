@@ -235,9 +235,10 @@ const SCRIPTBOTS_SCHEMA_V15_VERSION: i64 = 15;
 const SCRIPTBOTS_SCHEMA_V16_VERSION: i64 = 16;
 /// Schema version introducing MAP-Elites behavioral archive tables (bd-16g.6.1).
 pub const SCRIPTBOTS_SCHEMA_V17_VERSION: i64 = 17;
+const SCRIPTBOTS_SCHEMA_V18_VERSION: i64 = 18;
 
 /// Current schema version for new ScriptBots run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 17;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 19;
 
 /// Historical schema migration alias for MAP-Elites behavioral archive (bd-16g.6.1).
 pub const SCRIPTBOTS_SCHEMA_V3: &str = SCRIPTBOTS_SCHEMA_V17;
@@ -1386,13 +1387,9 @@ const SCRIPTBOTS_SCHEMA_V14: &str = r#"
 /// surface for no correctness gain. Per-island locality for those is a measured decision that
 /// belongs with the reporting work in bd-16g.5.5, not smuggled into a durability migration.
 ///
-/// TABLES DELIBERATELY OUT OF SCOPE, recorded so their absence is a decision rather than an
-/// oversight: `run_events` is per-tick and keyed `(run_id, tick, kind, metric)`, so it has the
-/// same latent collision, but it backs the `run_events_fts` external-content search index whose
-/// `content_rowid` binding does not survive a table rebuild — retiring and rebuilding that FTS
-/// table is its own migration (see the V11/V12 split, which exists for exactly this reason).
-/// `interactions` and `domain_events` are likewise per-tick. None of the three is reachable by
-/// an archipelago write path today. They are tracked on bd-16g.5.5 rather than fixed blind here.
+/// V18/V19 separately partition `run_events`, its plain-content FTS index, and `genomes`.
+/// `interactions` and `domain_events` remain tied to the durable host-session archive;
+/// the recorded isolated-island mode uses volatile host journals and does not populate them.
 const SCRIPTBOTS_SCHEMA_V15: &str = r#"
     ALTER TABLE tick_summaries RENAME TO tick_summaries_pre_v15;
     CREATE TABLE tick_summaries (
@@ -1768,7 +1765,83 @@ pub const SCRIPTBOTS_SCHEMA_V17: &str = r#"
     PRAGMA user_version = 17;
 "#;
 
-const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 12] = [
+/// Island-local agent IDs and narrative identities collide in a fused barrier. Preserve
+/// every row by extending both keys, retaining the frozen column prefixes. As in V11/V12,
+/// the pinned engine requires separate transactions to retire and replace the FTS table.
+const SCRIPTBOTS_SCHEMA_V18: &str = r#"
+    DROP TABLE run_events_fts;
+    ALTER TABLE run_events RENAME TO run_events_pre_v18;
+    CREATE TABLE run_events (
+        run_id TEXT NOT NULL,
+        tick INTEGER NOT NULL CHECK (tick >= 0),
+        kind TEXT NOT NULL CHECK (kind <> ''),
+        severity REAL NOT NULL CHECK (severity >= 0.0 AND severity <= 1.0),
+        magnitude REAL NOT NULL,
+        window_start INTEGER NOT NULL CHECK (window_start >= 0),
+        window_end INTEGER NOT NULL CHECK (window_end >= 0),
+        metric TEXT NOT NULL CHECK (metric <> ''),
+        before_value REAL NOT NULL,
+        after_value REAL NOT NULL,
+        score REAL NOT NULL,
+        subject_ref TEXT,
+        human_text TEXT NOT NULL CHECK (human_text <> ''),
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
+        PRIMARY KEY (run_id, island_id, tick, kind, metric),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO run_events
+        SELECT run_id, tick, kind, severity, magnitude, window_start, window_end,
+               metric, before_value, after_value, score, subject_ref, human_text,
+               schema_version, 0
+        FROM run_events_pre_v18;
+    DROP TABLE run_events_pre_v18;
+    CREATE INDEX run_events_run_kind_tick_index ON run_events (run_id, kind, tick);
+
+    ALTER TABLE genomes RENAME TO genomes_pre_v18;
+    CREATE TABLE genomes (
+        run_id TEXT NOT NULL,
+        genome_id TEXT NOT NULL CHECK (genome_id <> ''),
+        agent_uid INTEGER CHECK (agent_uid IS NULL OR agent_uid >= 0),
+        created_at_tick INTEGER NOT NULL CHECK (created_at_tick >= 0),
+        brain_kind TEXT NOT NULL CHECK (brain_kind <> ''),
+        genome_json TEXT NOT NULL CHECK (genome_json <> ''),
+        genome_digest TEXT NOT NULL CHECK (genome_digest <> ''),
+        provenance_json TEXT NOT NULL CHECK (provenance_json <> ''),
+        island_id INTEGER NOT NULL DEFAULT 0
+            CHECK (island_id >= 0 AND island_id <= 4294967295),
+        PRIMARY KEY (run_id, island_id, genome_id),
+        FOREIGN KEY (run_id) REFERENCES runs (run_id)
+    );
+    INSERT INTO genomes
+        SELECT run_id, genome_id, agent_uid, created_at_tick, brain_kind,
+               genome_json, genome_digest, provenance_json, 0
+        FROM genomes_pre_v18;
+    DROP TABLE genomes_pre_v18;
+    CREATE INDEX genomes_run_agent_tick_index
+        ON genomes (run_id, island_id, agent_uid, created_at_tick);
+    CREATE INDEX genomes_run_digest_index ON genomes (run_id, genome_digest);
+    PRAGMA user_version = 18;
+"#;
+
+const SCRIPTBOTS_SCHEMA_V19: &str = r#"
+    CREATE VIRTUAL TABLE run_events_fts USING fts5(
+        run_id UNINDEXED,
+        kind,
+        human_text,
+        tick UNINDEXED,
+        metric UNINDEXED,
+        island_id UNINDEXED
+    );
+    INSERT INTO run_events_fts(run_id, kind, human_text, tick, metric, island_id)
+        SELECT run_id, kind, human_text, tick, metric, island_id
+        FROM run_events
+        ORDER BY run_id ASC, tick ASC, kind ASC, metric ASC, island_id ASC;
+    PRAGMA user_version = 19;
+"#;
+
+const SCRIPTBOTS_MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         SCRIPTBOTS_SCHEMA_V6_VERSION,
         "create_multi_run_schema",
@@ -1825,15 +1898,25 @@ const SCRIPTBOTS_MIGRATIONS: [(i64, &str, &str); 12] = [
         SCRIPTBOTS_SCHEMA_V16,
     ),
     (
-        SCRIPTBOTS_SCHEMA_VERSION,
+        SCRIPTBOTS_SCHEMA_V17_VERSION,
         "add_map_elites_behavioral_archive",
         SCRIPTBOTS_SCHEMA_V17,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_V18_VERSION,
+        "partition_genomes_and_narratives_by_island",
+        SCRIPTBOTS_SCHEMA_V18,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_VERSION,
+        "index_island_narrative_identities",
+        SCRIPTBOTS_SCHEMA_V19,
     ),
 ];
 
 fn scriptbots_migration_runner_through(version: i64) -> MigrationRunner {
     let mut runner = MigrationRunner::new();
-    for &(migration_version, name, sql) in &SCRIPTBOTS_MIGRATIONS {
+    for &(migration_version, name, sql) in SCRIPTBOTS_MIGRATIONS {
         if migration_version > version {
             break;
         }
@@ -1964,29 +2047,20 @@ fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError
     refuse_ambiguous_command_claim_migration(connection)?;
     refuse_lossy_command_claim_migration(connection)?;
     let result = scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_VERSION).run(connection)?;
-    // Every suffix of the chain is a legal lineage: a database joins at whatever version it
-    // was left at and runs forward from there. Enumerated rather than computed so that adding
-    // a migration without extending this list fails loudly instead of accepting a gap.
-    const LINEAGE: [i64; 12] = [
-        SCRIPTBOTS_SCHEMA_V6_VERSION,
-        SCRIPTBOTS_SCHEMA_V7_VERSION,
-        SCRIPTBOTS_SCHEMA_V8_VERSION,
-        SCRIPTBOTS_SCHEMA_V9_VERSION,
-        SCRIPTBOTS_SCHEMA_V10_VERSION,
-        SCRIPTBOTS_SCHEMA_V11_VERSION,
-        SCRIPTBOTS_SCHEMA_V12_VERSION,
-        SCRIPTBOTS_SCHEMA_V13_VERSION,
-        SCRIPTBOTS_SCHEMA_V14_VERSION,
-        SCRIPTBOTS_SCHEMA_V15_VERSION,
-        SCRIPTBOTS_SCHEMA_V16_VERSION,
-        SCRIPTBOTS_SCHEMA_VERSION,
-    ];
+    // Every suffix of the declared chain is a legal lineage. Independently require that
+    // declaration to span every version, so deriving the suffix cannot conceal a skipped one.
+    let lineage: Vec<_> = SCRIPTBOTS_MIGRATIONS.iter().map(|entry| entry.0).collect();
+    let complete_lineage = lineage.first() == Some(&SCRIPTBOTS_SCHEMA_V6_VERSION)
+        && lineage.last() == Some(&SCRIPTBOTS_SCHEMA_VERSION)
+        && lineage
+            .windows(2)
+            .all(|pair| pair[0].checked_add(1) == Some(pair[1]));
     let applied_is_valid = result.applied.is_empty()
-        || LINEAGE
+        || lineage
             .iter()
             .position(|version| Some(version) == result.applied.first())
-            .is_some_and(|start| result.applied == LINEAGE[start..]);
-    if result.current != SCRIPTBOTS_SCHEMA_VERSION || !applied_is_valid {
+            .is_some_and(|start| result.applied == lineage[start..]);
+    if result.current != SCRIPTBOTS_SCHEMA_VERSION || !complete_lineage || !applied_is_valid {
         return Err(StorageError::InvalidData {
             context: "_schema_migrations",
             reason: format!(
@@ -4591,6 +4665,8 @@ struct RunEventRow {
     subject_ref: Option<String>,
     human_text: String,
     schema_version: i64,
+    #[serde(default)]
+    island_id: i64,
 }
 
 /// Latest metric reading fetched for analytics displays.
@@ -4609,26 +4685,33 @@ pub struct PersistedMetric {
     pub value: f64,
 }
 
-/// Canonical version-1 identity of one narrative event within a run.
+/// Canonical identity of one narrative event within a run and island.
 ///
-/// The enclosing [`StorageReader`] supplies the run identity. These three fields are the
-/// existing `run_events` primary-key suffix, so identity assignment is independent of query
-/// order and survives durable-outbox recovery without a migration or an inferred row number.
+/// The enclosing [`StorageReader`] supplies the run identity. Island identity is required
+/// because separate worlds can emit the same event kind and metric at the same tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunEventIdentity {
     tick: Tick,
     kind: EventKind,
     metric: String,
+    island: IslandId,
 }
 
 impl RunEventIdentity {
+    /// Build the identity for a record from a single-world (island zero) run.
     #[must_use]
     pub fn from_record(record: &EventRecord) -> Self {
         Self {
             tick: record.tick,
             kind: record.kind,
             metric: record.metric.clone(),
+            island: IslandId(0),
         }
+    }
+
+    #[must_use]
+    pub const fn island(&self) -> IslandId {
+        self.island
     }
 
     #[must_use]
@@ -4653,6 +4736,7 @@ impl Ord for RunEventIdentity {
             .cmp(&other.tick)
             .then_with(|| self.kind.as_str().cmp(other.kind.as_str()))
             .then_with(|| self.metric.as_str().cmp(other.metric.as_str()))
+            .then_with(|| self.island.cmp(&other.island))
     }
 }
 
@@ -4666,7 +4750,8 @@ impl std::fmt::Display for RunEventIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "v1/{}/{}/{}:{}",
+            "v2/{}/{}/{}/{}:{}",
+            self.island.0,
             self.tick,
             self.kind.as_str(),
             self.metric.len(),
@@ -5303,6 +5388,8 @@ struct GenomeRow {
     genome_json: String,
     genome_digest: String,
     provenance_json: String,
+    #[serde(default)]
+    island_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5556,11 +5643,12 @@ pub fn rebuild_ancestry(
 /// Trace a locus across an ordered lineage from a run database (bd-wdyu).
 pub fn trace_locus<C: BrainFamilyCodec>(
     reader: &StorageReader,
+    island: IslandId,
     codec: &C,
     lineage: &[AgentUid],
     locus: Locus,
 ) -> Result<Vec<LocusSample>, StorageError> {
-    reader.trace_locus(codec, lineage, locus)
+    reader.trace_locus(island, codec, lineage, locus)
 }
 
 /// Replay event reconstructed from persisted storage.
@@ -7084,6 +7172,16 @@ impl StorageBuffer {
                     .iter()
                     .map(|row| ("events.island_id", row.island_id)),
             )
+            .chain(
+                self.genomes
+                    .iter()
+                    .map(|row| ("genomes.island_id", row.island_id)),
+            )
+            .chain(
+                self.run_events
+                    .iter()
+                    .map(|row| ("run_events.island_id", row.island_id)),
+            )
         {
             if !summaries.contains_key(&island) {
                 return Err(StorageError::InvalidData {
@@ -7810,6 +7908,7 @@ fn run_event_row_from_query_row(row: &Row) -> Result<RunEventRow, StorageError> 
         subject_ref: decode_run_event_value(row, 10, RunEventField::Subject)?,
         human_text: decode_run_event_value(row, 11, RunEventField::HumanText)?,
         schema_version,
+        island_id: decode(row, 13, "run_events.island_id")?,
     })
 }
 
@@ -7912,6 +8011,12 @@ where
         tick: record.tick,
         kind: record.kind,
         metric: clone_preparation_string(&record.metric, observer, stage, progress)?,
+        island: IslandId(u32::try_from(row.island_id).map_err(|error| {
+            StorageError::InvalidData {
+                context: "run_events.island_id",
+                reason: error.to_string(),
+            }
+        })?),
     };
     observer.checkpoint(stage, progress)?;
     Ok(PersistedRunEvent { identity, record })
@@ -10568,7 +10673,7 @@ impl StorageReader {
         Ok(deaths)
     }
 
-    /// Read the exact versioned genome envelope for a specific agent in this run.
+    /// Read the exact versioned genome envelope for a specific agent on one island.
     ///
     /// If `tick` is `Some(t)`, returns the genome envelope recorded at that exact tick.
     /// If `tick` is `None`, returns the latest genome envelope recorded for the agent.
@@ -10581,6 +10686,7 @@ impl StorageReader {
     /// - [`StorageError::Genome(GenomeStorageError::RunMismatch)`] if the stored run_id does not match this reader.
     pub fn read_agent_genome(
         &self,
+        island: IslandId,
         agent_uid: AgentUid,
         tick: Option<Tick>,
     ) -> Result<BrainGenomeEnvelope, StorageError> {
@@ -10591,11 +10697,12 @@ impl StorageReader {
                 let mut rows = conn.query_with_params(
                     "SELECT genome_id, run_id, brain_kind, genome_json, genome_digest, provenance_json
                      FROM genomes
-                     WHERE run_id = ?1 AND agent_uid = ?2 AND created_at_tick = ?3",
+                     WHERE run_id = ?1 AND agent_uid = ?2 AND created_at_tick = ?3 AND island_id = ?4",
                     &[
                         sqlite_run_id(self.run_id),
                         sqlite_optional_i64(Some(encode_u64("genomes.agent_uid", agent_uid.get())?)),
                         encode_u64("genomes.created_at_tick", t.0)?.into(),
+                        i64::from(island.0).into(),
                     ],
                 )?;
                 if rows.is_empty() {
@@ -10610,12 +10717,13 @@ impl StorageReader {
                 let mut rows = conn.query_with_params(
                     "SELECT genome_id, run_id, brain_kind, genome_json, genome_digest, provenance_json
                      FROM genomes
-                     WHERE run_id = ?1 AND agent_uid = ?2
+                     WHERE run_id = ?1 AND agent_uid = ?2 AND island_id = ?3
                      ORDER BY created_at_tick DESC
                      LIMIT 1",
                     &[
                         sqlite_run_id(self.run_id),
                         sqlite_optional_i64(Some(encode_u64("genomes.agent_uid", agent_uid.get())?)),
+                        i64::from(island.0).into(),
                     ],
                 )?;
                 if rows.is_empty() {
@@ -10666,15 +10774,23 @@ impl StorageReader {
         Ok(envelope)
     }
 
-    /// Read the exact versioned genome envelope by its unique `genome_id`.
-    pub fn read_genome_by_id(&self, genome_id: &str) -> Result<BrainGenomeEnvelope, StorageError> {
+    /// Read the exact versioned genome envelope by its island-local `genome_id`.
+    pub fn read_genome_by_id(
+        &self,
+        island: IslandId,
+        genome_id: &str,
+    ) -> Result<BrainGenomeEnvelope, StorageError> {
         let start = Instant::now();
         let conn = self.connection()?;
         let mut rows = conn.query_with_params(
             "SELECT genome_id, run_id, brain_kind, genome_json, genome_digest, provenance_json
              FROM genomes
-             WHERE run_id = ?1 AND genome_id = ?2",
-            &[sqlite_run_id(self.run_id), genome_id.into()],
+             WHERE run_id = ?1 AND genome_id = ?2 AND island_id = ?3",
+            &[
+                sqlite_run_id(self.run_id),
+                genome_id.into(),
+                i64::from(island.0).into(),
+            ],
         )?;
         if rows.is_empty() {
             return Err(StorageError::Genome(GenomeStorageError::NotFound {
@@ -10725,6 +10841,7 @@ impl StorageReader {
     /// chronological order (`created_at_tick` ascending).
     pub fn read_lineage_genomes(
         &self,
+        island: IslandId,
         lineage_uids: &[AgentUid],
     ) -> Result<Vec<(AgentUid, Tick, BrainGenomeEnvelope)>, StorageError> {
         if lineage_uids.is_empty() {
@@ -10737,11 +10854,12 @@ impl StorageReader {
             let rows = conn.query_with_params(
                 "SELECT genome_id, run_id, created_at_tick, genome_json, genome_digest
                  FROM genomes
-                 WHERE run_id = ?1 AND agent_uid = ?2
+                 WHERE run_id = ?1 AND agent_uid = ?2 AND island_id = ?3
                  ORDER BY created_at_tick ASC",
                 &[
                     sqlite_run_id(self.run_id),
                     sqlite_optional_i64(Some(encode_u64("genomes.agent_uid", uid.get())?)),
+                    i64::from(island.0).into(),
                 ],
             )?;
             for row in rows {
@@ -10789,9 +10907,10 @@ impl StorageReader {
         Ok(results)
     }
 
-    /// Read a result-bounded page of recorded genomes for this run.
+    /// Read a result-bounded page of recorded genomes for one island in this run.
     pub fn read_genomes_page(
         &self,
+        island: IslandId,
         offset: usize,
         limit: usize,
     ) -> Result<Vec<(AgentUid, Tick, BrainGenomeEnvelope)>, StorageError> {
@@ -10808,10 +10927,15 @@ impl StorageReader {
         let rows = conn.query_with_params(
             "SELECT genome_id, run_id, agent_uid, created_at_tick, genome_json, genome_digest
              FROM genomes
-             WHERE run_id = ?1
+             WHERE run_id = ?1 AND island_id = ?4
              ORDER BY created_at_tick ASC, agent_uid ASC
              LIMIT ?2 OFFSET ?3",
-            &[sqlite_run_id(self.run_id), limit.into(), offset.into()],
+            &[
+                sqlite_run_id(self.run_id),
+                limit.into(),
+                offset.into(),
+                i64::from(island.0).into(),
+            ],
         )?;
 
         let mut results = Vec::with_capacity(rows.len());
@@ -10897,6 +11021,7 @@ impl StorageReader {
     /// gap (`None`, never phantom 0.0) is recorded.
     pub fn trace_locus<C: BrainFamilyCodec>(
         &self,
+        island: IslandId,
         codec: &C,
         lineage: &[AgentUid],
         locus: Locus,
@@ -10909,8 +11034,8 @@ impl StorageReader {
         let conn = self.connection()?;
         let mut meta_map: BTreeMap<AgentUid, (u32, Tick)> = BTreeMap::new();
         let rows = conn.query_with_params(
-            "SELECT agent_uid, generation, tick FROM births WHERE run_id = ?1",
-            &[sqlite_run_id(self.run_id)],
+            "SELECT agent_uid, generation, tick FROM births WHERE run_id = ?1 AND island_id = ?2",
+            &[sqlite_run_id(self.run_id), i64::from(island.0).into()],
         )?;
         for row in rows {
             let uid = checked_u64(
@@ -10929,7 +11054,7 @@ impl StorageReader {
         }
 
         // 2. Fetch recorded genomes
-        let genomes = self.read_lineage_genomes(lineage)?;
+        let genomes = self.read_lineage_genomes(island, lineage)?;
         let mut genome_map: BTreeMap<AgentUid, BrainGenomeEnvelope> = BTreeMap::new();
         for (uid, _tick, env) in genomes {
             genome_map.entry(uid).or_insert(env);
@@ -10971,6 +11096,16 @@ impl StorageReader {
         locus: Locus,
         max_depth: usize,
     ) -> Result<Vec<LocusSample>, StorageError> {
+        let other_islands = self.connection()?.query_with_params(
+            "SELECT island_id FROM births WHERE run_id = ?1 AND island_id <> 0 LIMIT 1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        if !other_islands.is_empty() {
+            return Err(StorageError::InvalidData {
+                context: "trace_agent_lineage_locus.island",
+                reason: "automatic ancestry reconstruction requires a single island-zero run; use trace_locus with an explicit island and lineage".to_owned(),
+            });
+        }
         let births = self.load_ancestry_births()?;
         let deaths = self.load_ancestry_deaths()?;
         let graph = rebuild_ancestry(&births, &deaths).map_err(|e| StorageError::InvalidData {
@@ -10979,7 +11114,7 @@ impl StorageReader {
         })?;
         let mut path = graph.lineage_path(target, max_depth);
         path.reverse();
-        self.trace_locus(codec, &path, locus)
+        self.trace_locus(IslandId(0), codec, &path, locus)
     }
 
     /// Return replay-event counts grouped by stable event type.
@@ -11049,10 +11184,10 @@ impl StorageReader {
         let rows = self.connection()?.query_with_params(
             "SELECT tick, kind, severity, magnitude, window_start, window_end,
                     metric, before_value, after_value, score, subject_ref, human_text,
-                    schema_version
+                    schema_version, island_id
              FROM run_events
              WHERE run_id = ?1
-             ORDER BY tick DESC, kind DESC, metric DESC
+             ORDER BY tick DESC, kind DESC, metric DESC, island_id DESC
              LIMIT ?2",
             &[sqlite_run_id(self.run_id), bound.into()],
         )?;
@@ -11418,7 +11553,7 @@ impl StorageReader {
             "SELECT events.tick, events.kind, events.severity, events.magnitude,
                     events.window_start, events.window_end, events.metric,
                     events.before_value, events.after_value, events.score,
-                    events.subject_ref, events.human_text, events.schema_version,
+                    events.subject_ref, events.human_text, events.schema_version, events.island_id,
                     bm25(run_events_fts)
              FROM run_events_fts
              JOIN run_events AS events
@@ -11426,12 +11561,13 @@ impl StorageReader {
               AND run_events_fts.tick = CAST(events.tick AS TEXT)
               AND events.kind = run_events_fts.kind
               AND events.metric = run_events_fts.metric
+              AND run_events_fts.island_id = CAST(events.island_id AS TEXT)
              WHERE run_events_fts MATCH ?1
                AND events.run_id = ?2
                AND (?3 IS NULL OR events.tick >= ?3)
                AND (?4 IS NULL OR events.tick < ?4)
              ORDER BY bm25(run_events_fts) ASC,
-                      events.tick ASC, events.kind ASC, events.metric ASC
+                      events.tick ASC, events.kind ASC, events.metric ASC, events.island_id ASC
              LIMIT ?5",
             &[
                 match_query.as_str().into(),
@@ -11443,7 +11579,7 @@ impl StorageReader {
         )?;
         let mut hits = Vec::with_capacity(rows.len());
         for row in rows {
-            let rank: f64 = decode(&row, 13, "run_events_fts.rank")?;
+            let rank: f64 = decode(&row, 14, "run_events_fts.rank")?;
             if !rank.is_finite() {
                 return Err(StorageError::InvalidData {
                     context: "run_events_fts.rank",
@@ -11494,10 +11630,10 @@ impl StorageReader {
         let rows = self.connection()?.query_with_params(
             "SELECT tick, kind, severity, magnitude, window_start, window_end,
                     metric, before_value, after_value, score, subject_ref, human_text,
-                    schema_version
+                    schema_version, island_id
              FROM run_events
              WHERE run_id = ?1 AND tick >= ?2 AND tick <= ?3
-             ORDER BY tick ASC, kind ASC, metric ASC
+             ORDER BY tick ASC, kind ASC, metric ASC, island_id ASC
              LIMIT ?4",
             &[
                 sqlite_run_id(self.run_id),
@@ -14500,9 +14636,31 @@ impl Storage {
         run_id: RunId,
     ) -> Result<(), StorageError> {
         Self::validate_narrative_input_reserved_identities(connection, run_id)?;
-        let terminal_row = connection.query_row_with_params(
-            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+        let islands = connection.query_with_params(
+            "SELECT island_id FROM tick_summaries WHERE run_id = ?1
+             UNION SELECT island_id FROM replay_events WHERE run_id = ?1
+             ORDER BY island_id",
             &[sqlite_run_id(run_id)],
+        )?;
+        for row in islands {
+            let island: i64 = decode(&row, 0, "narrative_input.island_id")?;
+            u32::try_from(island).map_err(|error| StorageError::InvalidData {
+                context: "narrative_input.island_id",
+                reason: error.to_string(),
+            })?;
+            Self::validate_persisted_island_narrative_input_prefix(connection, run_id, island)?;
+        }
+        Ok(())
+    }
+
+    fn validate_persisted_island_narrative_input_prefix(
+        connection: &Connection,
+        run_id: RunId,
+        island: i64,
+    ) -> Result<(), StorageError> {
+        let terminal_row = connection.query_row_with_params(
+            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1 AND island_id = ?2",
+            &[sqlite_run_id(run_id), island.into()],
         )?;
         let terminal_tick =
             decode::<Option<i64>>(&terminal_row, 0, "narrative_input.tick_summaries.max_tick")?
@@ -14523,12 +14681,13 @@ impl Storage {
         let mut expected_contract: Option<(u32, u32, u64, NarrativeInputPolicyV1)> = None;
         loop {
             let rows = connection.query_with_params(
-                NARRATIVE_INPUT_SELECT_AFTER,
+                NARRATIVE_INPUT_SELECT_AFTER_FOR_ISLAND,
                 &[
                     sqlite_run_id(run_id),
                     NARRATIVE_INPUT_EVENT_TYPE.into(),
                     encode_u64("narrative_input.coverage.after_tick", after_tick)?.into(),
                     page_limit.into(),
+                    island.into(),
                 ],
             )?;
             if rows.is_empty() {
@@ -14718,6 +14877,7 @@ impl Storage {
                   AND search.tick = CAST(events.tick AS TEXT)
                   AND search.kind = events.kind
                   AND search.metric = events.metric
+                  AND search.island_id = CAST(events.island_id AS TEXT)
                  WHERE events.run_id = ?1 AND search.rowid IS NULL),
                 (SELECT COUNT(*)
                  FROM run_events_fts AS search
@@ -14726,6 +14886,7 @@ impl Storage {
                   AND search.tick = CAST(events.tick AS TEXT)
                   AND events.kind = search.kind
                   AND events.metric = search.metric
+                  AND search.island_id = CAST(events.island_id AS TEXT)
                  WHERE search.run_id = ?1 AND events.run_id IS NULL),
                 (SELECT COUNT(*)
                  FROM run_events_fts AS search
@@ -14734,6 +14895,7 @@ impl Storage {
                   AND search.tick = CAST(events.tick AS TEXT)
                   AND events.kind = search.kind
                   AND events.metric = search.metric
+                  AND search.island_id = CAST(events.island_id AS TEXT)
                  WHERE search.run_id = ?1
                    AND search.human_text != events.human_text)",
             &[sqlite_run_id(run_id)],
@@ -15186,15 +15348,16 @@ impl Storage {
             let rows = self.connection()?.query_with_params(
                 "SELECT tick, kind, severity, magnitude, window_start, window_end,
                         metric, before_value, after_value, score, subject_ref, human_text,
-                        schema_version
+                        schema_version, island_id
                  FROM run_events
-                 WHERE run_id = ?1 AND tick = ?2 AND kind = ?3 AND metric = ?4
+                 WHERE run_id = ?1 AND tick = ?2 AND kind = ?3 AND metric = ?4 AND island_id = ?5
                  LIMIT 2",
                 &[
                     sqlite_run_id(self.run_id),
                     encode_u64("run_events.tick", identity.tick.0)?.into(),
                     identity.kind.as_str().into(),
                     identity.metric.as_str().into(),
+                    i64::from(identity.island.0).into(),
                 ],
             )?;
             if rows.len() > 1 {
@@ -15265,10 +15428,28 @@ impl Storage {
         enclosing_tick: u64,
     ) -> Result<(), StorageError> {
         let previous_batch_tick = self.previous_storage_batch_tick(batch_id)?;
+        for summary in &prepared.ticks {
+            self.validate_new_island_narrative_input_identities(
+                prepared,
+                summary.island_id,
+                previous_batch_tick,
+                enclosing_tick,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_new_island_narrative_input_identities(
+        &self,
+        prepared: &StorageBuffer,
+        island: i64,
+        previous_batch_tick: u64,
+        enclosing_tick: u64,
+    ) -> Result<(), StorageError> {
         let first_candidate = prepared
             .replay_events
             .iter()
-            .find(|row| row.event_type == NARRATIVE_INPUT_EVENT_TYPE)
+            .find(|row| row.island_id == island && row.event_type == NARRATIVE_INPUT_EVENT_TYPE)
             .map(|row| narrative_input_record_from_row(row, false))
             .transpose()?;
 
@@ -15276,7 +15457,7 @@ impl Storage {
             .buffer
             .replay_events
             .iter()
-            .filter(|row| row.event_type == NARRATIVE_INPUT_EVENT_TYPE)
+            .filter(|row| row.island_id == island && row.event_type == NARRATIVE_INPUT_EVENT_TYPE)
             .max_by_key(|row| row.tick)
             .map(|row| narrative_input_record_from_row(row, false))
             .transpose()?;
@@ -15285,6 +15466,7 @@ impl Storage {
             &[
                 sqlite_run_id(self.run_id),
                 NARRATIVE_INPUT_EVENT_TYPE.into(),
+                island.into(),
             ],
         )?;
         let persisted_tail = match persisted_rows.as_slice() {
@@ -17759,14 +17941,14 @@ impl Storage {
         for event in &payload.narrative_events {
             observer.checkpoint(PreparationStage::Materialize, progress)?;
             prepared.run_events.push(run_event_row_from_record_observed(
-                event, observer, progress,
+                event, island_id, observer, progress,
             )?);
         }
 
         for genome in &payload.genomes {
             observer.checkpoint(PreparationStage::Materialize, progress)?;
             prepared.genomes.push(genome_row_from_persisted_observed(
-                genome, observer, progress,
+                genome, island_id, observer, progress,
             )?);
         }
 
@@ -18299,11 +18481,11 @@ impl Storage {
         let sql = "insert into run_events (
                 run_id, tick, kind, severity, magnitude, window_start, window_end,
                 metric, before_value, after_value, score, subject_ref, human_text,
-                schema_version
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+                schema_version, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
         let search_sql = "insert into run_events_fts (
-                run_id, tick, kind, metric, human_text
-            ) values (?1, ?2, ?3, ?4, ?5)";
+                run_id, tick, kind, metric, human_text, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6)";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -18324,6 +18506,7 @@ impl Storage {
                         .map_or(SqliteValue::Null, Into::into),
                     row.human_text.as_str().into(),
                     row.schema_version.into(),
+                    row.island_id.into(),
                 ],
             )?;
             let indexed = tx.execute_with_params(
@@ -18334,6 +18517,7 @@ impl Storage {
                     row.kind.as_str().into(),
                     row.metric.as_str().into(),
                     row.human_text.as_str().into(),
+                    row.island_id.into(),
                 ],
             )?;
             if indexed != 1 {
@@ -18356,9 +18540,9 @@ impl Storage {
         }
         let sql = "insert into genomes (
                 run_id, genome_id, agent_uid, created_at_tick,
-                brain_kind, genome_json, genome_digest, provenance_json
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            on conflict (run_id, genome_id) do nothing";
+                brain_kind, genome_json, genome_digest, provenance_json, island_id
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            on conflict (run_id, island_id, genome_id) do nothing";
         for row in rows {
             tx.execute_with_params(
                 sql,
@@ -18371,6 +18555,7 @@ impl Storage {
                     row.genome_json.as_str().into(),
                     row.genome_digest.as_str().into(),
                     row.provenance_json.as_str().into(),
+                    row.island_id.into(),
                 ],
             )?;
         }
@@ -18839,7 +19024,8 @@ impl Storage {
                 Ok(()) => {
                     for event in &batch.run_events {
                         let identity = format!(
-                            "v1/{}/{}/{}:{}",
+                            "v2/{}/{}/{}/{}:{}",
+                            event.island_id,
                             event.tick,
                             event.kind,
                             event.metric.len(),
@@ -22083,6 +22269,7 @@ fn scope_label(scope: ReplayRngScope) -> String {
 /// whole batch — including the scientific rows sharing the transaction.
 fn run_event_row_from_record_observed<Observer>(
     record: &EventRecord,
+    island_id: i64,
     observer: &mut Observer,
     progress: PreparationProgress,
 ) -> Result<RunEventRow, StorageError>
@@ -22124,6 +22311,7 @@ where
             progress,
         )?,
         schema_version: i64::from(record.schema_version),
+        island_id,
     };
     let _decoded = persisted_run_event_from_row_observed(
         &row,
@@ -22147,6 +22335,7 @@ where
 
 fn genome_row_from_persisted_observed<Observer>(
     genome: &PersistedGenome,
+    island_id: i64,
     observer: &mut Observer,
     progress: PreparationProgress,
 ) -> Result<GenomeRow, StorageError>
@@ -22182,6 +22371,7 @@ where
         genome_json,
         genome_digest,
         provenance_json,
+        island_id,
     })
 }
 
@@ -22813,6 +23003,15 @@ const NARRATIVE_INPUT_SELECT_AFTER: &str = concat!(
      LIMIT ?4"
 );
 
+const NARRATIVE_INPUT_SELECT_AFTER_FOR_ISLAND: &str = concat!(
+    "SELECT ",
+    replay_event_columns!(),
+    " FROM replay_events
+     WHERE run_id = ?1 AND event_type = ?2 AND tick > ?3 AND island_id = ?5
+     ORDER BY tick ASC, seq ASC
+     LIMIT ?4"
+);
+
 const NARRATIVE_INPUT_SELECT_EXACT: &str = concat!(
     "SELECT ",
     replay_event_columns!(),
@@ -22825,7 +23024,7 @@ const NARRATIVE_INPUT_SELECT_LAST: &str = concat!(
     "SELECT ",
     replay_event_columns!(),
     " FROM replay_events
-     WHERE run_id = ?1 AND event_type = ?2
+     WHERE run_id = ?1 AND event_type = ?2 AND island_id = ?3
      ORDER BY tick DESC, seq DESC
      LIMIT 1"
 );
@@ -26083,7 +26282,14 @@ mod tests {
         );
         assert_eq!(
             table_columns(connection, "run_events_fts")?,
-            ["run_id", "kind", "human_text", "tick", "metric"]
+            [
+                "run_id",
+                "kind",
+                "human_text",
+                "tick",
+                "metric",
+                "island_id"
+            ]
         );
         let shadow_tables = connection
             .query(
@@ -26185,8 +26391,16 @@ mod tests {
                 "migrations_carry_both_organism_identities",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V17_VERSION,
                 "add_map_elites_behavioral_archive",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_V18_VERSION,
+                "partition_genomes_and_narratives_by_island",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "index_island_narrative_identities",
             ),
         ];
         assert_eq!(migrations.len(), expected.len());
@@ -26962,6 +27176,125 @@ mod tests {
     }
 
     #[test]
+    fn island_genomes_narratives_and_recovery_keep_local_identities_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("island-genomes-narratives");
+        let path = path.to_str().ok_or("UTF-8 test path")?;
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(path, 100, 100, 100, 100)?;
+        let run = storage.run_id();
+        let mut batches = Vec::new();
+        let mut hashes = Vec::new();
+        for island in 0_u32..2 {
+            let mut batch = sample_narrative_batch(1, island as f32 + 1.0, 7, 8);
+            let envelope = BrainGenomeEnvelope::new(
+                scriptbots_core::BrainFamilyId::new("mlp")?,
+                1,
+                1,
+                vec![u8::try_from(island)?],
+                scriptbots_core::BrainProvenance {
+                    parents: [None, None],
+                    parent_genome_hashes: [None, None],
+                    created_at: Tick(0),
+                    derivation: scriptbots_core::BrainGenomeDerivation::Founder,
+                },
+            )?;
+            hashes.push(envelope.material_hash());
+            batch.genomes.push(PersistedGenome {
+                agent_uid: AgentUid(7),
+                created_at_tick: Tick(0),
+                envelope,
+            });
+            batch.narrative_events.push(EventRecord {
+                schema_version: EVENT_RECORD_SCHEMA_VERSION,
+                tick: Tick(1),
+                kind: EventKind::PopulationBoom,
+                severity: 0.5,
+                magnitude: f64::from(island + 1),
+                window: (0, 1),
+                metric: "population".to_owned(),
+                before: 1.0,
+                after: f64::from(island + 2),
+                score: 1.0,
+                subject: None,
+                human_text: format!("island {island} population increased"),
+            });
+            batches.push(batch);
+        }
+        assert_ne!(hashes[0], hashes[1]);
+        storage.persist_barrier(&[(IslandId(0), &batches[0]), (IslandId(1), &batches[1])])?;
+        storage.flush()?;
+        let before = storage.persistence_watermarks()?;
+        let next = sample_narrative_batch(2, 2.0, 7, 8);
+        let mut missing = next.clone();
+        missing.replay_events.clear();
+        assert!(
+            matches!(
+                storage.persist_barrier(&[(IslandId(0), &next), (IslandId(1), &missing)]),
+                Err(StorageError::NarrativeInputStream(
+                    NarrativeInputStreamError::MissingEvidence { .. }
+                ))
+            ),
+            "one island's valid narrative input cannot stand in for the missing island"
+        );
+        assert_eq!(storage.persistence_watermarks()?, before);
+        storage.persist_barrier(&[(IslandId(0), &next), (IslandId(1), &next)])?;
+        storage.flush()?;
+        storage.close()?;
+
+        let recovered = Storage::recover_existing_run(path, run)?;
+        assert_eq!(
+            recovered.persistence_watermarks()?.durable.unwrap().get(),
+            2
+        );
+        recovered.close()?;
+        let reader = StorageReader::open(path)?;
+        for (island, hash) in hashes.iter().enumerate() {
+            let island = IslandId(u32::try_from(island)?);
+            assert_eq!(
+                reader
+                    .read_agent_genome(island, AgentUid(7), None)?
+                    .material_hash(),
+                *hash
+            );
+            assert_eq!(
+                reader
+                    .read_genome_by_id(island, "agent:7:tick:0")?
+                    .material_hash(),
+                *hash
+            );
+            assert_eq!(reader.read_genomes_page(island, 0, 10)?.len(), 1);
+            assert_eq!(
+                reader.read_lineage_genomes(island, &[AgentUid(7)])?.len(),
+                1
+            );
+        }
+        let recent = reader.recent_run_events(10)?;
+        assert_eq!(recent.len(), 2);
+        assert_ne!(recent[0].identity(), recent[1].identity());
+        for (island, event) in recent.iter().enumerate() {
+            assert_eq!(event.identity().island().0, u32::try_from(island)?);
+            assert_eq!(event.record(), &batches[island].narrative_events[0]);
+        }
+        let hits = reader.search_narrative("population", None, 10)?;
+        assert_eq!(
+            hits.len(),
+            2,
+            "FTS join must not cross-multiply equal local identities"
+        );
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.event.identity().island())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(reader.narrative_around_tick(1, 0)?.len(), 2);
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn v10_upgrade_replaces_external_fts_with_plain_content_and_backfills()
     -> Result<(), Box<dyn std::error::Error>> {
         let connection = Connection::open(":memory:")?;
@@ -27227,7 +27560,7 @@ mod tests {
 
         let migrations = connection
             .query("SELECT version, name FROM _schema_migrations ORDER BY version ASC")?;
-        assert_eq!(migrations.len(), 12);
+        assert_eq!(migrations.len(), SCRIPTBOTS_MIGRATIONS.len());
         for (index, (expected_version, expected_name)) in [
             (SCRIPTBOTS_SCHEMA_V7_VERSION, "add_host_journal_archive"),
             (
@@ -27264,8 +27597,16 @@ mod tests {
                 "migrations_carry_both_organism_identities",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V17_VERSION,
                 "add_map_elites_behavioral_archive",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_V18_VERSION,
+                "partition_genomes_and_narratives_by_island",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "index_island_narrative_identities",
             ),
         ]
         .into_iter()
@@ -27283,6 +27624,88 @@ mod tests {
         }
         let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
         assert_eq!(user_version, SCRIPTBOTS_SCHEMA_VERSION);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v17_island_identity_migration_preserves_genomes_narratives_and_search()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(":memory:")?;
+        scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_V17_VERSION).run(&connection)?;
+        let run = RunId::new(0x1819);
+        register_bare_run(&connection, run)?;
+        connection.execute_with_params(
+            "INSERT INTO genomes (run_id, genome_id, agent_uid, created_at_tick,
+                brain_kind, genome_json, genome_digest, provenance_json)
+             VALUES (?1, 'agent:7:tick:0', 7, 0, 'mlp', '{\"payload\":7}', 'digest-seven', '{\"founder\":true}')",
+            &[sqlite_run_id(run)],
+        )?;
+        connection.execute_with_params(
+            "INSERT INTO run_events (run_id, tick, kind, severity, magnitude, window_start,
+                window_end, metric, before_value, after_value, score, human_text, schema_version)
+             VALUES (?1, 1, 'population_boom', 0.5, 1.0, 0, 1, 'population', 1.0, 2.0, 1.0,
+                'island founder population increased', 1)",
+            &[sqlite_run_id(run)],
+        )?;
+        connection.execute(
+            "INSERT INTO run_events_fts (run_id, kind, human_text, tick, metric)
+             SELECT run_id, kind, human_text, tick, metric FROM run_events",
+        )?;
+        let genome_before = connection
+            .query_row("SELECT genome_json, genome_digest, provenance_json FROM genomes")?;
+        let narrative_before =
+            connection.query_row("SELECT human_text, metric, magnitude FROM run_events")?;
+        install_scriptbots_schema(&connection)?;
+        let genome = connection.query_row(
+            "SELECT genome_json, genome_digest, provenance_json, island_id FROM genomes",
+        )?;
+        for column in 0..3 {
+            assert_eq!(
+                genome.get_typed::<String>(column)?,
+                genome_before.get_typed::<String>(column)?
+            );
+        }
+        assert_eq!(genome.get_typed::<i64>(3)?, 0);
+        let narrative = connection
+            .query_row("SELECT human_text, metric, magnitude, island_id FROM run_events")?;
+        assert_eq!(
+            narrative.get_typed::<String>(0)?,
+            narrative_before.get_typed::<String>(0)?
+        );
+        assert_eq!(
+            narrative.get_typed::<String>(1)?,
+            narrative_before.get_typed::<String>(1)?
+        );
+        assert_eq!(
+            narrative.get_typed::<f64>(2)?.to_bits(),
+            narrative_before.get_typed::<f64>(2)?.to_bits()
+        );
+        assert_eq!(narrative.get_typed::<i64>(3)?, 0);
+        Storage::validate_run_event_search_index(&connection, run)?;
+        let hit = connection.query_row(
+            "SELECT island_id FROM run_events_fts WHERE run_events_fts MATCH 'population'",
+        )?;
+        assert_eq!(hit.get_typed::<String>(0)?, "0");
+        assert!(
+            connection
+                .execute("INSERT INTO genomes SELECT * FROM genomes")
+                .is_err(),
+            "the same island-local genome identity remains unique"
+        );
+        connection.execute(
+            "INSERT INTO genomes SELECT run_id, genome_id, agent_uid, created_at_tick,
+                brain_kind, genome_json, genome_digest, provenance_json, 1 FROM genomes",
+        )?;
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(DISTINCT island_id) FROM genomes")?
+                .get_typed::<i64>(0)?,
+            2
+        );
+        let schema = read_schema_objects(&connection)?;
+        install_scriptbots_schema(&connection)?;
+        assert_eq!(read_schema_objects(&connection)?, schema);
         connection.close()?;
         Ok(())
     }
@@ -27314,18 +27737,18 @@ mod tests {
         )?;
         connection.execute(
             "INSERT INTO tick_summaries (
-                run_id, tick, agent_count, births, deaths,
+                run_id, tick, epoch, closed, agent_count, births, deaths,
                 total_energy, average_energy, average_health
             ) VALUES (
-                'test_run_mig', 10, 4, 1, 0, 40.0, 10.0, 1.0
+                'test_run_mig', 10, 0, 0, 4, 1, 0, 40.0, 10.0, 1.0
             )",
         )?;
 
-        // Run migration to V17 (HEAD)
-        install_scriptbots_schema(&connection)?;
+        // This test isolates V17; later migrations have their own populated-row proof.
+        scriptbots_migration_runner_through(SCRIPTBOTS_SCHEMA_V17_VERSION).run(&connection)?;
 
         let v17_user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
-        assert_eq!(v17_user_version, SCRIPTBOTS_SCHEMA_VERSION);
+        assert_eq!(v17_user_version, SCRIPTBOTS_SCHEMA_V17_VERSION);
 
         // Verify pre-existing data is intact
         let run_count: i64 = connection
@@ -27354,6 +27777,8 @@ mod tests {
                 "descriptor",
                 "genome",
                 "genome_version",
+                "parent_uid",
+                "generation",
             ]
         );
 
@@ -27875,10 +28300,11 @@ mod tests {
 
     /// Every table a post-V12 migration rebuilt, so the V12 fixture must restore all of them.
     ///
-    /// V15 rebuilt the seven per-tick tables; V16 rebuilt `islands` and `migrations`. A
+    /// V15 rebuilt seven per-tick tables, V16 rebuilt `islands` and `migrations`, and V18
+    /// rebuilt `run_events` and `genomes`. A
     /// downgrade that reverted only one migration's worth would leave a database that is not
     /// V12 and would be asserted to be.
-    const POST_V12_REBUILT_TABLES: [&str; 9] = [
+    const POST_V12_REBUILT_TABLES: [&str; 11] = [
         "tick_summaries",
         "metrics",
         "events",
@@ -27888,6 +28314,8 @@ mod tests {
         "deaths",
         "islands",
         "migrations",
+        "run_events",
+        "genomes",
     ];
 
     /// The per-tick tables V15 partitions by `island_id`, in migration order.
@@ -28015,11 +28443,33 @@ mod tests {
                 }
             }
         }
+        connection.execute("DROP TABLE run_events_fts")?;
+        for object in &canonical {
+            if object.name == "run_events_fts"
+                && let Some(sql) = object.sql.as_deref()
+            {
+                connection.execute(sql)?;
+            }
+        }
+        connection.execute(
+            "INSERT INTO run_events_fts (run_id, kind, human_text, tick, metric)
+             SELECT run_id, kind, human_text, tick, metric FROM run_events",
+        )?;
         Ok(())
     }
 
-    /// Removes everything V13 and V15 added, leaving an exact V12 database.
+    /// Removes later additions, leaving an exact V12 database with retained scientific rows.
     fn downgrade_to_exact_v12(connection: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+        for table in ["archive_cells", "archive_space"] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"))?
+                    .get_typed::<i64>(0)?,
+                0,
+                "the V12 fixture cannot discard populated archive tables"
+            );
+            connection.execute(&format!("DROP TABLE {table}"))?;
+        }
         connection.execute_batch(
             "DROP TABLE host_command_claims;
              DELETE FROM _schema_migrations WHERE version >= 13;
