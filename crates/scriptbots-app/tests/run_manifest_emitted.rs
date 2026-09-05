@@ -37,13 +37,7 @@ fn run_dir(label: &str) -> PathBuf {
 }
 
 fn binary() -> PathBuf {
-    // The integration test binary sits next to the app binary.
-    let mut path = std::env::current_exe().expect("test exe");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("scriptbots-app")
+    PathBuf::from(env!("CARGO_BIN_EXE_scriptbots-app"))
 }
 
 fn launch(dir: &Path) -> std::process::Output {
