@@ -224,7 +224,7 @@ fn recorded_archipelago_cli_persists_every_island_and_tick()
         serde_json::to_vec_pretty(&observations)?,
     )?;
 
-    let report_path = directory.join("report.json");
+    let report_path = directory.join("archipelago-report.json");
     let report = retain_cli(
         &directory,
         "report",
