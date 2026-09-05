@@ -761,6 +761,17 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
             assert_eq!(payload["node_count"], 2, "isolates are explicitly excluded");
         }
     }
+    // The row-cap case must reach that guard: generous byte/work budgets keep
+    // their independent refusals from masking a missing row limit.
+    let oversized_page = format!(
+        "limit={}",
+        scriptbots_storage::InteractionGraphBudget::default()
+            .max_rows
+            .checked_add(1)
+            .unwrap()
+    );
+    let generous_bytes = format!("max_projected_bytes={}", usize::MAX);
+    let generous_work = format!("max_graph_work={}", usize::MAX);
     for (index, (params, reason)) in [
         (vec!["start_tick=5"], "must be supplied together"),
         (vec!["end_tick=7"], "must be supplied together"),
@@ -783,6 +794,14 @@ fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
         (
             vec!["limit=5000"],
             "row limit exceeds the declared graph work budget",
+        ),
+        (
+            vec![
+                oversized_page.as_str(),
+                generous_bytes.as_str(),
+                generous_work.as_str(),
+            ],
+            "interaction_graph.max_rows",
         ),
         (
             vec!["max_projected_bytes=0"],
