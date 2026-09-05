@@ -2,6 +2,202 @@
 
 ## Execution TODO — started 2026-09-05
 
+Continuation block — **bd-16g.5.5.2, in progress, TurquoiseLake**:
+
+- [x] Trace checkpoint replay and archipelago production entry points against current code.
+  Checkpoint restore still needs the host/session boundary. The app's archipelago only
+  runs inside the determinism self-check; that check must not gain database side effects.
+- [x] Add a separate bounded isolated-island CLI run using canonical config, production
+  brain installation and founders, sole-owner hosts, and one complete barrier per tick.
+- [x] Bound journal capture and preserve volatile versus durable receipt semantics.
+- [x] Register run and island provenance before advancing science; atomically persist every
+  island's real batch; stop before another tick if persistence fails; explicitly close storage.
+- [x] Repair duplicate barrier admission so refusal retains the original payload.
+- [x] Repair newly exposed genome/narrative collisions with island-scoped schema keys,
+  outbox rows, search joins, explicit genome readers, and per-island recovery validation.
+  Verify populated V17 migration, same local IDs with different genomes, and missing input
+  on one island without weakening single-world assertions.
+  Implemented beginning at `47c76eb`; the new migration/identity/recovery unit tests passed
+  in the `c012dfc` DSR run. One bounded delegated change updated 27 single-world genome-read
+  callsites; every diff was reviewed. Full storage regression acceptance remains pending.
+  - [x] Refuse ambiguous pre-V18 multi-island genome/narrative migrations before any DDL;
+    exercise both row kinds against metadata and tick evidence and verify unchanged data.
+  - [x] Preserve interaction edges derived from science replay, including equal local event
+    IDs on different islands; require existing graph readers to refuse unsupported cross-island
+    UID conflation. Candidate comment claiming this mode could not write interactions was
+    wrong and has been corrected in `4db83b9` after tracing the actual writer.
+  - [x] Refuse ambiguous retained pre-V18 multi-island outbox payloads before migration;
+    verify when the pending payload is the only island evidence and preserve it unchanged.
+  - [x] Preserve lineage edges derived inside birth insertion; test equal child IDs with
+    different parent ordinals across islands. My previous automatic-projection review was
+    incomplete. Reject general table exports that cannot represent the island dimension.
+  - [x] Wire a same-thread `flush_with_watermarks` barrier through the existing application
+    and finalization stages; retain the assertion requiring admitted/applied/durable equality.
+- [x] Execute the actual CLI, reopen its database, and verify every island at every tick,
+  nonempty agents/replay rows, distinct island digests and durable batch watermarks.
+  Observed at `965ea99`: four tables × four ticks, three islands in all 16 cells;
+  16 genomes per island; distinct final energies match their own stored island summaries.
+- [x] Complete report JSON, explicit recovery and existing-file refusal checks. The report
+  command passed conservation, but the test artifact helper overwrote its JSON with command
+  metadata. Candidate `c012dfc` separates those filenames; no failed artifact is credited.
+  Actual `c012dfc` rerun passed both CLI tests and all ten subprocess checks, including intact
+  JSON with three islands/nine conservation transitions/zero breaches. The capture retry
+  test also passed. Storage-suite and strict-lint qualification are still pending.
+- [x] Exercise existing-file, invalid count/cadence, changed duplicate and incomplete-barrier
+  controls. Preserve original assertions and golden files.
+- [ ] Run formatting, required compiler/lint checks and focused correctness through pinned DSR;
+  retain actual counts/source and perform a fresh self-review before any closure.
+  First candidate `7f73d53` failed the real DSR compiler check (private journal constructor);
+  no tests ran. The next candidate uses the public default and expands the lane from two
+  barrier tests to the complete storage suite because it changes schema and read APIs.
+  Second candidate `47c76eb` also failed compilation: a missing `RowExt` import in the
+  CLI test caused nine diagnostics. Candidate `c7d6d0d` fixes it and adds the pre-V18
+  ownership refusal. Third DSR `archipelago-c7d6d0d-20260905-03` failed compilation on
+  nonexistent `reader.islands()`; corrected to `archipelago_islands()`. All three attempts
+  ran zero tests. DSR `archipelago-4db83b9-20260905-04` then passed the five guards and
+  workspace all-target check; both new CLI tests executed (one passed, one failed). The
+  invalid-run controls passed. The real run applied barrier one but stopped because
+  `Storage::flush` left the durable watermark unset. Candidate `5af2d1b` adds public
+  finalization and lineage attribution. Its DSR run passed compilation and completed four
+  real barriers with reopened admitted/applied/durable watermarks all equal to four, then
+  failed the source assertion: DSR had not embedded the verified commit in the executable.
+  Candidate `965ea99` embeds observed build provenance after validation and asserts that all
+  three final energies differ, so the island-label comparison can detect permutations.
+  DSR `archipelago-965ea99-20260905-06` reached all table checks, then failed parsing the
+  overwritten report artifact. DSR `archipelago-c012dfc-20260905-07` also
+  preserves the recovery fingerprint fixture's intended current-schema forgery and runs
+  all storage targets with `--no-fail-fast`; any failing target still fails the lane.
+  The `c012dfc` run passed CLI/capture and 204 of 206 storage unit tests, then 9 of 11
+  admission-bound integration tests. It was intentionally stopped during ancestry integration
+  after the following corrections were ready; remaining targets did not complete.
+  - [x] Re-execute the forced-termination writer-lease test with recovery/shutdown stage
+    diagnostics. It passed at `ec5c41c`: recovery plus shutdown took 1.81 seconds within
+    the unchanged ten-second limit. The previous timeout's cause remains unresolved.
+  - [x] Re-execute V16-to-V17 migration with a valid run-policy fixture. It passed at
+    `ec5c41c`; the previous row supplied both a bounded tick budget and a live policy,
+    violating the frozen V6 constraint.
+  - [x] Re-execute narrative pressure with 512 distinct event identities and an explicit
+    uniqueness observation. The old fixture repeated one identity; the corruption guard
+    predates this block and remains intact. Both pressure cases passed at `ec5c41c`.
+    My initial production-bug interpretation was wrong.
+  - [x] Verify the original 5k/default-window test, which exceeded its unchanged 600-second
+    flush limit. `a7f3ac6` wires the pinned engine's existing statement-savepoint opt-in only
+    into prevalidated agent insertion; its sole caller rolls back the entire science batch.
+    The existing nine-boundary rollback/recovery matrix passed at `ec5c41c`; the 5k case
+    again exceeded 600 seconds. The insertion change is insufficient, with no speedup claim.
+    Admission integration finished 10/11 passing in 711.21 seconds. Post-failure diagnostics
+    on the separate ancestry worker captured replay insertion doing foreign-key validation
+    through repeated schema metadata reload. Investigate bounded multi-row statements;
+    preserve foreign keys, statement order, the exact engine pin, and all deadlines.
+  - [ ] Complete a passing archipelago DSR lane, graph regression and strict Clippy.
+    Attempt 08 ran zero tests and was cancelled after declaration review caught `Tick`
+    lacking `Hash`; `ec5c41c` hashes the underlying integer. Interrupting metadata alone
+    had not stopped the run because the guard fell back to the lockfile; the isolated DSR
+    process group was then stopped and observed gone before updating source/profile.
+    Current `ec5c41c` has passed all five guards, workspace all-target compilation, both
+    CLI tests (38.53 seconds, ten subprocesses) and the capture retry test. The complete
+    storage unit target passed all 206 tests (zero failures/ignored, 886.95 seconds).
+    Admission integration failed only the 5k deadline. Attempt09 was intentionally stopped
+    during the 600-tick ancestry test after CPU/stack diagnostics and a replacement candidate
+    were ready: DSR process exit 6, typed failed, eight completed steps, 3,856 seconds.
+    Its unfinished ancestry and later targets earn no pass credit.
+  - [ ] Qualify `976bb1d`: bounded multi-row agent/replay/interaction inserts using the
+    original statement savepoints, preserved input order and strict narrative-input policy.
+    New real-engine coverage reads every row across chunks, forces a late CHECK failure
+    through the actual whole-batch rollback, and retains the strict-duplicate guard.
+    UBS ran before commit: 807 critical heuristic matches, 1,618 warnings, 626 info.
+    Inspected critical categories were existing test panics, SQL/tick comparisons, typed SQL
+    decodes, and test SQL fault controls; no clean scan or runtime qualification claim.
+    Actual attempt10 passed all five guards, workspace compilation, both CLI tests (46.31s,
+    ten subprocesses) and capture. The new test read back all 1,025 rows correctly and observed
+    a rolled-back failure, then failed my incorrect expectation of `CheckViolation`. Pinned
+    engine source instead emits an `Internal` VDBE CHECK halt. The assertion also omitted the
+    actual error, so that cause remains source-derived until the corrected test executes.
+    The correction requires the scope CHECK halt specifically and prints unexpected errors;
+    it also requires the narrative uniqueness error. Zero-row rollback and prior-commit
+    preservation assertions are unchanged and have not yet executed in this new test.
+    `18abbec9` also matches the pinned AST's normalization of `<>` to `!=`, caught before
+    a rerun. `9b8490b` applies the same helper to tick summaries, metrics and event counters;
+    the three-island fixture writes 114 metric rows per barrier, formerly 114 statements.
+    All six helper callers retain their original SQL field mapping and the enclosing
+    `flush_attempt` rollback owner. This candidate still needs the actual DSR regression run.
+    Attempt10 admission finished 10/11 passing in 711.61s; the 5k case again exceeded 600s.
+    Its worker had exited before inspection, so no stack from that failure was obtained.
+    The run was intentionally interrupted during ancestry after checking the exact Cargo/test
+    working directories; both exited, DSR process exit 6/typed failed/eight completed steps.
+    Unfinished ancestry and later integration targets receive no pass credit. The source and
+    profiles advanced only after exit. Current `workspace-9b8490b-20260905-11` now executes
+    compiler and strict Clippy checks before graph/storage qualification.
+    That actual workspace run passed all five guards and compilation (3m54s), then failed
+    strict Clippy on 421 core diagnostics. Core source is unchanged from pre-block `1f3158c`.
+    DSR exit 6/typed failed/six completed steps; workspace/economy-faults tests did not run.
+    Logs are retained at `/tmp/scriptbots-workspace-9b8490b-proof-20260905`. The independent
+    graph/archive regression lane `graphs-9b8490b-20260905-12` is now executing.
+  - [x] Re-execute graph/archive regressions at `9b8490b`. Actual DSR lane12 finished with
+    process exit zero, typed pass, ten completed steps and matching source on every command:
+    graph tests 10/10 (51.17s), archive unit 1/1, archive integration 1/1 (15.49s).
+    This does not substitute for the unfinished full storage or workspace suites.
+  - [x] Capture the actual 5k worker stack under a dedicated pinned DSR diagnostic, then
+    choose a measured fix. `storage-diagnostic-9b8490b-20260905-13` first executes the
+    corrected late-chunk rollback test and requires one actual pass, then the exact original
+    5k test. Its verdict is always diagnostic; debugger-assisted timing cannot approve a gate.
+    The original corrected rollback test passed 1/1 in 72.50s, including all 1,025 rows,
+    late CHECK rollback and strict duplicate checks. Two snapshots of the exact five-k
+    worker showed agent inserts entering multi-VALUES replay and fully hydrating the in-memory
+    table contents per replayed row. The named test thread waited in `flush_and_wait`.
+    Both debugger sessions detached and the worker resumed. The diagnostic test failed
+    0/1 at its 600-second limit (601.10s total); typed diagnostic, test exit 101, DSR exit 6.
+    Logs are retained at `/tmp/scriptbots-storage-diagnostic-9b8490b-proof-20260905`.
+  - [x] Implement `4fbde8f`: use bounded `INSERT ... RETURNING 1`, compare returned row
+    count to actual chunk input count, and keep original FK/conflict/transaction semantics.
+    Pinned source selects direct VDBE execution for this SQL and still validates FKs after
+    writing. Add a missing-parent rollback check and an actual two-input/one-returned-row
+    SQL control for the new count guard. These new controls have not yet run.
+  - [ ] Execute `storage-returning-4fbde8f-20260905-14`: both declared `tests::chunked_`
+    cases, then the unchanged five-k workload without debugger attachment. Its scope remains
+    focused storage checks; no full-suite or exact-class performance claim.
+    Actual result: one passed, one failed in 2.56s. The complete 1,025-row/CHECK/FK/uniqueness
+    rollback case passed on the direct path. My count-guard control assumed `OR IGNORE`
+    would return one row, but the helper observed two and returned success; the test failed
+    before its table readback. No claim about the actual ignored write is justified by that
+    result. The replacement uses `INSERT ... SELECT ?1 WHERE 0` and reads the table before
+    interpreting the guard error. The count guard is unchanged; the local variable now names
+    returned rows rather than affected rows. Five-k did not execute, DSR exited 6, and the
+    post-precheck diagnostic verdict was never reached.
+  - [x] Execute corrected `4a1c8e5` under actual pinned DSR attempt15. Both chunk tests
+    passed (2/2, 2.52s), including the independently observed zero-row control. The unchanged
+    five-k workload passed (1/1, 24.09s; raw `flush_ms=22690`) without a debugger, within
+    its unchanged 600-second deadline. Process exit zero, typed diagnostic, test/log exits
+    zero and one executed five-k test. This is focused correctness/liveness evidence,
+    not a full-suite or exact-class performance result.
+  - [ ] Complete actual `archipelago-returning-4a1c8e5-20260905-16`, now running the
+    all-target compiler check, actual CLI, capture retry and complete storage suite.
+    Five guards and compiler passed (4m03s); CLI passed 2/2 (8.37s) and capture 1/1.
+    Readback of retained `recorded-archipelago-WFF8o8` confirms all 16 three-island
+    table/tick cells, 48 founder genomes, distinct per-island energies and watermarks 4/4/4.
+    All 208 storage unit tests then passed (700.22s), followed by all 11 admission integration
+    tests (127.67s), zero failures/ignored. Five-k passed again with `flush_ms=22656`.
+    Child re-execution subtests are not added to the 208-test denominator. The 600-tick
+    ancestry target and later integrations are still running; no aggregate lane pass yet.
+  - [ ] Verify the original `bd-w1oi` server workload for its full 600-second reproduction
+    window with live REST tick observations and retained logs. A five-k flush pass alone
+    cannot establish long-running server progress. Replace the old bug-observed-is-green
+    diagnostic with a positive regression that fails on simulation errors or stalled ticks.
+    Implemented at `70cb3b5`, including both memory and file backends, retained command,
+    stdout/stderr/status observations, the exact Cargo executable, and a server lane in the
+    existing DSR runner. The progress bound derives from the production admission deadline;
+    deliberate test termination is reported as kill/reap. Runtime execution remains pending.
+  - [ ] Complete final-source application/full-storage and graph checks. Strict workspace
+    Clippy remains blocked by the 421 core diagnostics observed at `9b8490b`.
+- [ ] Update Beads and this checklist with observed results and remaining migration, host-session
+  replay and outer-island parallelism limits. The broader archipelago remains incomplete.
+- [ ] **Additional observed gap: bd-16g.13.3, reopened with parent bd-16g.13.** The affected
+  render genome-browser test can skip failed persisted-genome reads and absent newborns,
+  accepts unexpected diff statuses by printing, constructs a view model without rendering,
+  and deletes CSV/PNG artifacts. Re-execute mandatory positive newborn/database comparisons
+  and retain real UI screenshot/CSV/PNG evidence before reclosure. This source finding does
+  not claim the UI implementation is absent, and this block has not executed that UI test.
+
 This checklist is the operator-requested working memory for the eight added tasks.
 Its consumers are the operator and implementing agent; Beads remains the claim and
 dependency authority. It retires as an active checklist when those tasks are
