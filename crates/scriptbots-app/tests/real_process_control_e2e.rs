@@ -20,15 +20,7 @@ use tempfile::tempdir;
 
 /// The shipped binary, following the house convention.
 fn binary() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_scriptbots-app") {
-        return PathBuf::from(path);
-    }
-    let mut path = std::env::current_exe().expect("test exe");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("scriptbots-app")
+    PathBuf::from(env!("CARGO_BIN_EXE_scriptbots-app"))
 }
 
 /// Minimal HTTP/1.1 with optional body over a real socket.
@@ -635,132 +627,147 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     Ok(())
 }
 
-/// DETERMINISTIC REPRODUCTION OF bd-w1oi, not a fix.
-///
-/// bd-w1oi records that `--mode server` stops simulating with
-/// "persistence did not acknowledge completed simulation tick 420 (Indeterminate):
-/// storage Admit timed out during Acknowledgement at :memory: after 120s". It was
-/// observed ONCE, incidentally, while the E2E above was failing for an unrelated
-/// reason. That left the bead's cheapest open question unanswered: is the tick
-/// number STABLE (a capacity boundary) or does it vary (a race)? A stable number
-/// points at a bound to find; a varying one points at a timing bug. This answers
-/// that by driving the shipped binary and reporting the tick it actually dies on.
-///
-/// It is a REPRODUCTION ONLY. The fix belongs to whoever owns the storage/runtime
-/// path — those files are mid-cutover and I have not touched them. What this
-/// contributes is that the next person does not have to reproduce it first.
-///
-/// #[ignore]d because it costs ~5 minutes of wall clock by construction: the
-/// failure is a 120s acknowledgement deadline elapsing after several minutes of
-/// simulation. That is a SLOW test, which is a different reason from the
-/// unverified-test ignore this file used to carry — this one has been observed
-/// doing exactly what it claims.
+/// The original bd-w1oi command must keep advancing for the full 600-second
+/// reproduction window, beyond both observed failure ticks (240 and 420).
+/// Retain stderr and every REST observation, including on failure. This replaces
+/// the former diagnostic whose success meant that the bug had reproduced.
 #[test]
 #[serial]
-#[ignore = "bd-w1oi reproduction: ~5 minutes by construction (a 120s storage deadline \
-            after minutes of simulation). Run explicitly: cargo test -p scriptbots-app \
+#[ignore = "bd-w1oi live server regression: 600 seconds per storage backend. Run explicitly: cargo test -p scriptbots-app \
             --test real_process_control_e2e -- --ignored bd_w1oi --nocapture"]
-fn bd_w1oi_server_mode_stops_simulating_on_a_storage_acknowledgement_timeout() -> Result<()> {
-    reproduce_server_hang("memory")
+fn bd_w1oi_server_mode_keeps_advancing_with_memory_storage() -> Result<()> {
+    verify_server_progress("memory")
 }
 
-/// The same reproduction against --storage file.
-///
-/// The cheap discriminator the bead asks for: if the FILE backend hangs too, the
-/// persistence boundary is the cause and :memory: is incidental; if it survives,
-/// the fault is isolated to the in-memory path. Either answer halves the search
-/// space, and neither needs a product change — only this argument.
+/// Exercise the same progress requirement against the production file backend.
 #[test]
 #[serial]
-#[ignore = "bd-w1oi reproduction (file backend): ~5 minutes by construction. Run explicitly: \
-            cargo test -p scriptbots-app --test real_process_control_e2e -- --ignored \
-            bd_w1oi_server_mode_with_file_storage --nocapture"]
-fn bd_w1oi_server_mode_with_file_storage() -> Result<()> {
-    reproduce_server_hang("file")
+#[ignore = "bd-w1oi live server regression: 600 seconds per storage backend. Run explicitly: cargo test -p scriptbots-app \
+            --test real_process_control_e2e -- --ignored bd_w1oi --nocapture"]
+fn bd_w1oi_server_mode_keeps_advancing_with_file_storage() -> Result<()> {
+    verify_server_progress("file")
 }
 
-/// Drive the shipped binary in server mode until it stops simulating, or until a
-/// bounded deadline. The run directory is a tempdir, so a `file` backend writes its
-/// runs/ database there rather than into the repository.
-fn reproduce_server_hang(storage: &str) -> Result<()> {
-    let run_dir = tempdir()?;
-    let mut child = Command::new(binary())
+/// Observe actual tick progress, not merely a live process or HTTP 200 responses.
+fn verify_server_progress(storage: &str) -> Result<()> {
+    let run_dir = tempfile::Builder::new()
+        .prefix(&format!("server-progress-{storage}-"))
+        .tempdir()?
+        .keep();
+    println!("server progress artifacts: {}", run_dir.display());
+    let stderr_path = run_dir.join("server.stderr");
+    let mut observations = std::fs::File::create(run_dir.join("status.jsonl"))?;
+    let mut command = Command::new(binary());
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"SCRIPTBOTS_")
+            || name.as_encoded_bytes().starts_with(b"SB_")
+        {
+            command.env_remove(name);
+        }
+    }
+    command
         .args(["--mode", "server", "--storage", storage])
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_CONTROL_MCP", "disabled")
         .env("RUST_LOG", "warn,scriptbots_app=info")
-        .current_dir(run_dir.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .current_dir(&run_dir)
+        .stdout(std::fs::File::create(run_dir.join("server.stdout"))?)
+        .stderr(std::fs::File::create(&stderr_path)?);
+    std::fs::write(run_dir.join("command.txt"), format!("{command:?}\n"))?;
+    let child = command
         .spawn()
         .context("failed to spawn the shipped binary")?;
-
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("child stderr was not captured"))?;
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(std::result::Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Generous but bounded: the observed failure was ~5 minutes in, and a run that
-    // does NOT fail is itself a result worth reporting rather than hanging on.
-    let deadline = Instant::now() + Duration::from_secs(600);
-    let mut failure: Option<String> = None;
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining) {
-            Ok(line) => {
-                if line.contains("Simulation step failed in server mode") {
-                    failure = Some(line);
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let Some(failure) = failure else {
-        // NOT a pass. If the defect did not reproduce, the bead needs that recorded
-        // just as much — it would mean the tick number is not stable and the cause
-        // is timing-dependent.
-        panic!(
-            "bd-w1oi did NOT reproduce within 600s with --storage {storage}. That is a RESULT, \
-             not a success, and what it means depends on which backend this was. For `memory`, \
-             which reproduces in ~180s, a clean 600s says the failure is less deterministic than \
-             recorded and the window is narrower than believed. For `file`, a clean 600s is the \
-             expected outcome and ISOLATES the fault to the in-memory acknowledgement path. \
-             Record which backend and which reading on bd-w1oi; do not reuse the other one's \
-             conclusion."
+    let mut guard = ChildGuard(Some(child));
+    let started = Instant::now();
+    let duration = Duration::from_secs(600);
+    let progress_deadline = scriptbots_storage::StorageDeadlines::default().admission_ack;
+    let mut address = None;
+    let mut last_tick = 0;
+    let mut first_tick = None;
+    let mut last_advance = started;
+    let mut samples = 0_u64;
+    loop {
+        assert!(
+            guard.0.as_mut().expect("child held").try_wait()?.is_none(),
+            "server exited early; artifacts: {}",
+            run_dir.display()
         );
-    };
-
-    // Report the tick it actually died on, so a second run's number can be compared
-    // against 420 without re-reading logs.
-    let tick = failure
-        .split("tick ")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split(|c: char| !c.is_ascii_digit())
-                .find(|s| !s.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "unparsed".to_string());
+        let stderr = std::fs::read_to_string(&stderr_path)?;
+        assert!(
+            !stderr.contains("Simulation step failed in server mode"),
+            "server stopped simulating; artifacts: {}\n{stderr}",
+            run_dir.display()
+        );
+        if address.is_none() {
+            address = stderr
+                .lines()
+                .filter(|line| line.contains("REST control server listening"))
+                .find_map(parse_announced_address);
+        }
+        if let Some(address) = address {
+            let (code, body) = http(address, "GET", "/api/status")?;
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            writeln!(
+                observations,
+                "{}",
+                serde_json::json!({
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "http_status": code, "status": status,
+                })
+            )?;
+            observations.flush()?;
+            assert_eq!(code, 200, "status failed: {body}");
+            let tick = status["tick"].as_u64().context("missing live tick")?;
+            assert!(tick >= last_tick, "tick regressed: {last_tick} -> {tick}");
+            first_tick.get_or_insert(tick);
+            if tick > last_tick {
+                last_tick = tick;
+                last_advance = Instant::now();
+            }
+            samples += 1;
+        } else {
+            assert!(
+                started.elapsed() < Duration::from_secs(90),
+                "REST did not bind"
+            );
+        }
+        assert!(
+            last_advance.elapsed() < progress_deadline,
+            "no tick progress for {progress_deadline:?} at tick {last_tick}; artifacts: {}",
+            run_dir.display()
+        );
+        if started.elapsed() >= duration {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert!(
+        last_tick > 420,
+        "did not pass the prior failure tick: {last_tick}"
+    );
+    assert!(samples >= 2 && Some(last_tick) > first_tick);
+    let child = guard.0.as_mut().expect("child held");
+    child.kill()?;
+    let exit = child.wait()?;
+    guard.0 = None;
+    let stderr = std::fs::read_to_string(&stderr_path)?;
+    assert!(
+        !stderr.contains("Simulation step failed in server mode"),
+        "server stopped simulating before termination: {stderr}"
+    );
+    let result = serde_json::json!({
+        "storage": storage, "elapsed_ms": started.elapsed().as_millis(),
+        "first_tick": first_tick, "last_tick": last_tick, "samples": samples,
+        "termination": "killed and reaped by test", "child_exit": exit.to_string(),
+    });
+    std::fs::write(
+        run_dir.join("result.json"),
+        serde_json::to_vec_pretty(&result)?,
+    )?;
     println!(
-        "{{\"schema\":\"scriptbots.bd-w1oi-repro.v1\",\"storage\":\"{storage}\",\"reproduced\":true,\"failure_tick\":\"{tick}\",\
-         \"first_observed_tick\":\"420\",\"stable\":{},\"detail\":{:?}}}",
-        tick == "420",
-        failure.trim()
+        "server progress observed: {result}; artifacts: {}",
+        run_dir.display()
     );
     Ok(())
 }

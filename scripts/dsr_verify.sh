@@ -17,6 +17,7 @@ verify_evidence() {
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
         graphs-and-recipes) required+=(graph-check graph-tests archive-unit archive-integration architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
         archipelago) required+=(archipelago-check archipelago-tests capture-tests storage-tests) ;;
+        server) required+=(server-check server-tests server-storage-tests) ;;
         *) refuse "unknown evidence lane" ;;
     esac
     required+=(analytics-binary)
@@ -96,7 +97,7 @@ fi
 proof_version=${1:-}
 [[ "$proof_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "missing or unsafe proof version"
 [[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned source commit"
-[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago ]] || refuse "unknown correctness lane"
+[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
 [[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || refuse "invoke through the native DSR profile"
 [[ ${SCRIPTBOTS_VERIFY_PROFILE:-} = /* && -f "$SCRIPTBOTS_VERIFY_PROFILE" ]] || refuse "missing materialized DSR profile"
 [[ ${SCRIPTBOTS_PROOF_ROOT:-} = /* && -d "$SCRIPTBOTS_PROOF_ROOT" ]] || refuse "missing external proof root"
@@ -182,6 +183,11 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step archipelago-tests test cargo test --locked -p scriptbots-app --test archipelago_report_cli recorded_archipelago_cli -- --nocapture
         run_step capture-tests test cargo test --locked -p scriptbots-app --lib archipelago_report::tests:: -- --nocapture
         run_step storage-tests test cargo test --locked -p scriptbots-storage --no-fail-fast -- --nocapture
+        ;;
+    server)
+        run_step server-check check cargo check --locked --workspace --all-targets
+        run_step server-tests test cargo test --locked -p scriptbots-app --test real_process_control_e2e -- --nocapture
+        run_step server-storage-tests test cargo test --locked -p scriptbots-app --test real_process_control_e2e bd_w1oi -- --ignored --nocapture
         ;;
     workspace)
         run_step workspace-check check cargo check --locked --workspace --all-targets
