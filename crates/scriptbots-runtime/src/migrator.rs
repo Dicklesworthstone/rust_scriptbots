@@ -1,8 +1,8 @@
 //! Deterministic Migrator for multi-island archipelagos (`bd-16g.5.2`).
 //!
-//! Owns two-phase selection and application of migration barriers across islands.
-//! Guarantees population conservation, deterministic total ordering, and total
-//! tie-breaking (no `partial_cmp().unwrap()`, no HashMap iteration).
+//! Plans migration barriers across islands through two-phase selection.
+//! Checks projected population conservation and uses deterministic total ordering and total
+//! tie-breaking (no `partial_cmp().unwrap()`, no `HashMap` iteration).
 
 use rand::Rng;
 use scriptbots_core::{SmallRngStream, rng_domains::derive_migration_seed};
@@ -18,11 +18,11 @@ pub use scriptbots_core::rng_domains::IslandId;
 pub enum EmigrantSelectionRule {
     /// Select agents at random using a dedicated seeded PRNG stream.
     Random,
-    /// Select agents with highest energy (tie-break by AgentUid ASC).
+    /// Select agents with highest energy (tie-break by `AgentUid` ASC).
     Fittest,
-    /// Select youngest agents by age ASC (tie-break by AgentUid ASC).
+    /// Select youngest agents by age ASC (tie-break by `AgentUid` ASC).
     Youngest,
-    /// Select agents with highest realized speed (tie-break by AgentUid ASC).
+    /// Select agents with highest realized speed (tie-break by `AgentUid` ASC).
     Wanderer,
 }
 
@@ -112,50 +112,91 @@ impl Default for MigrationConfig {
     }
 }
 
-/// Record of a single agent migration event.
+/// One selected organism's planned destination and ranking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmigrantRecord {
+    /// Island from which the candidate was selected.
     pub from_island: IslandId,
+    /// Island to which the candidate is assigned by the migration plan.
     pub to_island: IslandId,
+    /// Candidate identity, scoped to its source island.
     pub agent_uid: u64,
+    /// Rule used to rank this candidate on its source island.
     pub selection_rule: EmigrantSelectionRule,
+    /// Zero-based position in the source island's complete candidate ranking.
     pub rank: usize,
+    /// Reporting projection of energy, age, speed, or the random rank under the selected rule.
+    /// Random ranks are rounded to `f64` here; selection orders their original `u64` values.
     pub key_value: f64,
 }
 
-/// Summary report produced by a migration barrier execution.
+/// Selection plan and projected population counts for one migration barrier.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BarrierReport {
+    /// Barrier index supplied to [`select_emigrants`], despite the historical field name.
     pub tick: u64,
+    /// Rule applied to all candidate rankings in this plan.
     pub selection_rule: EmigrantSelectionRule,
+    /// Planned moves in canonical destination, source, and agent identity order.
     pub moves: Vec<EmigrantRecord>,
+    /// Candidate population of each island before applying the planned moves.
     pub pop_before: BTreeMap<IslandId, u32>,
+    /// Projected population of each island after applying the planned moves.
     pub pop_after: BTreeMap<IslandId, u32>,
+    /// Whether the plan's projected total population equals its initial total.
     pub conserved: bool,
 }
 
 /// Errors occurring during migration processing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum MigrationError {
+    /// Planned population updates changed the archipelago's total population.
     #[error("population not conserved across migration barrier: before={before}, after={after}")]
     PopulationNotConserved {
-        before: u32,
-        after: u32,
+        /// Total population before the planned moves.
+        before: u64,
+        /// Total projected population after the planned moves.
+        after: u64,
+        /// Number of moves in the rejected plan.
         moves_count: usize,
     },
+    /// A planned migration edge has a missing endpoint or refers to the same island twice.
     #[error("invalid edge in topology: from={from}, to={to}")]
-    InvalidEdge { from: IslandId, to: IslandId },
+    InvalidEdge {
+        /// Source island of the invalid edge.
+        from: IslandId,
+        /// Destination island of the invalid edge.
+        to: IslandId,
+    },
+    /// No islands were supplied for migration selection.
     #[error("empty archipelago passed to migrator")]
     EmptyArchipelago,
+    /// An island's candidate or projected population cannot fit the report's `u32` field.
+    #[error("migration population count exceeds u32 capacity for island {island}")]
+    IslandPopulationOverflow {
+        /// Island whose population could not be represented.
+        island: IslandId,
+    },
+    /// A planned emigration would remove an agent from a zero-population island.
+    #[error("migration would subtract an agent from empty island {island}")]
+    IslandPopulationUnderflow {
+        /// Source island whose projected population was already zero.
+        island: IslandId,
+    },
 }
 
 /// Snapshot of a single agent's state for migration selection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateAgent {
+    /// Agent identity, scoped to its containing island.
     pub uid: u64,
+    /// Energy used by [`EmigrantSelectionRule::Fittest`].
     pub energy: f32,
+    /// Health retained in the candidate snapshot; current selection rules do not read it.
     pub health: f32,
+    /// Age in simulation ticks, used by [`EmigrantSelectionRule::Youngest`].
     pub age: u32,
+    /// Realized speed used by [`EmigrantSelectionRule::Wanderer`].
     pub speed: f32,
 }
 
@@ -181,6 +222,56 @@ pub fn compare_candidates(
             .cmp(&random_rank_b)
             .then_with(|| a.uid.cmp(&b.uid)),
     }
+}
+
+pub(crate) fn checked_island_population(
+    island: IslandId,
+    population: usize,
+) -> Result<u32, MigrationError> {
+    u32::try_from(population).map_err(|_| MigrationError::IslandPopulationOverflow { island })
+}
+
+pub(crate) fn total_population(populations: &BTreeMap<IslandId, u32>) -> u64 {
+    // Unique IslandId(u32) keys permit at most u32::MAX + 1 islands, each with
+    // a u32 population. Their aggregate bound is therefore below u64::MAX.
+    populations
+        .values()
+        .map(|&population| u64::from(population))
+        .sum()
+}
+
+fn apply_population_move(
+    populations: &mut BTreeMap<IslandId, u32>,
+    from: IslandId,
+    to: IslandId,
+) -> Result<(), MigrationError> {
+    if from == to {
+        return Err(MigrationError::InvalidEdge { from, to });
+    }
+    let source = populations
+        .get(&from)
+        .ok_or(MigrationError::InvalidEdge { from, to })?;
+    let destination = populations
+        .get(&to)
+        .ok_or(MigrationError::InvalidEdge { from, to })?;
+    let remaining = source
+        .checked_sub(1)
+        .ok_or(MigrationError::IslandPopulationUnderflow { island: from })?;
+    let arriving = destination
+        .checked_add(1)
+        .ok_or(MigrationError::IslandPopulationOverflow { island: to })?;
+    // Validate both counts before changing either endpoint of this planned move.
+    populations.insert(from, remaining);
+    populations.insert(to, arriving);
+    Ok(())
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "key_value is a serialized f64 reporting projection; candidate ordering uses the original u64 rank, and changing this cast would change existing report bytes"
+)]
+const fn random_rank_report_value(rank: u64) -> f64 {
+    rank as f64
 }
 
 /// Selects emigrants across `islands` according to two-phase deterministic rules.
@@ -213,10 +304,12 @@ pub fn select_emigrants(
 
     let pop_before: BTreeMap<IslandId, u32> = islands_candidates
         .iter()
-        .map(|(&id, c)| (id, c.len() as u32))
-        .collect();
+        .map(|(&id, candidates)| {
+            checked_island_population(id, candidates.len()).map(|population| (id, population))
+        })
+        .collect::<Result<_, _>>()?;
 
-    let total_before: u32 = pop_before.values().sum();
+    let total_before = total_population(&pop_before);
 
     // Rank candidates per island
     let mut ranked_candidates: BTreeMap<IslandId, Vec<(CandidateAgent, f64)>> = BTreeMap::new();
@@ -241,11 +334,11 @@ pub fn select_emigrants(
             .into_iter()
             .map(|c| {
                 let val = match config.selection_rule {
-                    EmigrantSelectionRule::Fittest => c.energy as f64,
-                    EmigrantSelectionRule::Youngest => c.age as f64,
-                    EmigrantSelectionRule::Wanderer => c.speed as f64,
+                    EmigrantSelectionRule::Fittest => f64::from(c.energy),
+                    EmigrantSelectionRule::Youngest => f64::from(c.age),
+                    EmigrantSelectionRule::Wanderer => f64::from(c.speed),
                     EmigrantSelectionRule::Random => {
-                        random_ranks.get(&c.uid).copied().unwrap_or(0) as f64
+                        random_rank_report_value(random_ranks.get(&c.uid).copied().unwrap_or(0))
                     }
                 };
                 (c, val)
@@ -294,15 +387,10 @@ pub fn select_emigrants(
     // Compute pop_after
     let mut pop_after = pop_before.clone();
     for rec in &moves {
-        if let Some(c) = pop_after.get_mut(&rec.from_island) {
-            *c = c.saturating_sub(1);
-        }
-        if let Some(c) = pop_after.get_mut(&rec.to_island) {
-            *c = c.saturating_add(1);
-        }
+        apply_population_move(&mut pop_after, rec.from_island, rec.to_island)?;
     }
 
-    let total_after: u32 = pop_after.values().sum();
+    let total_after = total_population(&pop_after);
     let conserved = total_before == total_after;
 
     if !conserved {
@@ -327,6 +415,141 @@ pub fn select_emigrants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn island_population_count_preserves_zero_and_u32_max() {
+        let island = IslandId(7);
+        let maximum = usize::try_from(u32::MAX).expect("population maximum fits target usize");
+        assert_eq!(checked_island_population(island, 0), Ok(0));
+        assert_eq!(checked_island_population(island, maximum), Ok(u32::MAX));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn island_population_count_rejects_value_above_u32_max() {
+        // Exercise the production conversion directly without allocating a huge candidate list.
+        let island = IslandId(7);
+        let maximum = usize::try_from(u32::MAX).expect("population maximum fits target usize");
+        assert_eq!(
+            checked_island_population(island, maximum + 1),
+            Err(MigrationError::IslandPopulationOverflow { island })
+        );
+    }
+
+    #[test]
+    fn total_population_preserves_valid_counts_above_u32_max() {
+        assert_eq!(total_population(&BTreeMap::new()), 0);
+        let mut populations = BTreeMap::from([(IslandId(0), u32::MAX), (IslandId(1), 0)]);
+        assert_eq!(total_population(&populations), u64::from(u32::MAX));
+        populations.insert(IslandId(1), 1);
+        assert_eq!(total_population(&populations), u64::from(u32::MAX) + 1);
+        populations.insert(IslandId(1), u32::MAX);
+        assert_eq!(total_population(&populations), 2 * u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn population_move_preserves_total_when_destination_reaches_u32_max() {
+        let source = IslandId(0);
+        let destination = IslandId(1);
+        let mut populations = BTreeMap::from([(source, 1), (destination, u32::MAX - 1)]);
+        let before = total_population(&populations);
+        apply_population_move(&mut populations, source, destination).expect("bounded move");
+        assert_eq!(
+            populations,
+            BTreeMap::from([(source, 0), (destination, u32::MAX)])
+        );
+        assert_eq!(total_population(&populations), before);
+    }
+
+    #[test]
+    fn population_move_refuses_overflow_and_underflow_without_partial_updates() {
+        let source = IslandId(0);
+        let destination = IslandId(1);
+        // These are direct arithmetic boundary cases, not claims about allocated live worlds.
+        for (source_count, destination_count, expected) in [
+            (
+                0,
+                1,
+                MigrationError::IslandPopulationUnderflow { island: source },
+            ),
+            (
+                1,
+                u32::MAX,
+                MigrationError::IslandPopulationOverflow {
+                    island: destination,
+                },
+            ),
+        ] {
+            let mut populations =
+                BTreeMap::from([(source, source_count), (destination, destination_count)]);
+            let before = populations.clone();
+            assert_eq!(
+                apply_population_move(&mut populations, source, destination),
+                Err(expected)
+            );
+            assert_eq!(
+                populations, before,
+                "a refused move must preserve both endpoint counts"
+            );
+        }
+    }
+
+    #[test]
+    fn population_move_rejects_invalid_edges_without_changing_counts() {
+        let mut populations = BTreeMap::from([(IslandId(0), 1), (IslandId(1), 1)]);
+        let before = populations.clone();
+        for (from, to) in [
+            (IslandId(2), IslandId(1)),
+            (IslandId(0), IslandId(2)),
+            (IslandId(0), IslandId(0)),
+        ] {
+            assert_eq!(
+                apply_population_move(&mut populations, from, to),
+                Err(MigrationError::InvalidEdge { from, to })
+            );
+            assert_eq!(populations, before);
+        }
+    }
+
+    #[test]
+    fn random_selection_orders_exact_ranks_despite_rounded_report_values() {
+        let lower_rank = 1_u64 << f64::MANTISSA_DIGITS;
+        let higher_rank = lower_rank + 1;
+        assert_eq!(
+            random_rank_report_value(lower_rank).to_bits(),
+            random_rank_report_value(higher_rank).to_bits(),
+            "adjacent ranks at this magnitude share the same f64 report projection"
+        );
+        let lower = CandidateAgent {
+            uid: 2,
+            energy: 0.0,
+            health: 1.0,
+            age: 0,
+            speed: 0.0,
+        };
+        let higher = CandidateAgent { uid: 1, ..lower };
+        assert_eq!(
+            compare_candidates(
+                &lower,
+                &higher,
+                EmigrantSelectionRule::Random,
+                lower_rank,
+                higher_rank
+            ),
+            Ordering::Less,
+            "exact random ranks must take precedence over the opposite UID ordering"
+        );
+        assert_eq!(
+            compare_candidates(
+                &higher,
+                &lower,
+                EmigrantSelectionRule::Random,
+                higher_rank,
+                lower_rank
+            ),
+            Ordering::Greater
+        );
+    }
 
     #[test]
     fn test_ring_topology_build_edges() {

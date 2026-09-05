@@ -93,7 +93,7 @@ use crate::{
     host_core::{HostCore, HostCoreBuildError, HostCoreOptions},
     migrator::{
         CandidateAgent, EmigrantSelectionRule, MigrationConfig, MigrationError, MigrationTopology,
-        select_emigrants,
+        checked_island_population, select_emigrants, total_population,
     },
 };
 use scriptbots_core::{
@@ -387,15 +387,27 @@ pub struct MigrationBarrierReport {
 impl MigrationBarrierReport {
     /// Total population across the archipelago before migration.
     #[must_use]
-    pub fn total_before(&self) -> u32 {
-        self.pop_before.values().sum()
+    pub fn total_before(&self) -> u64 {
+        total_population(&self.pop_before)
     }
 
     /// Total population across the archipelago after migration.
     #[must_use]
-    pub fn total_after(&self) -> u32 {
-        self.pop_after.values().sum()
+    pub fn total_after(&self) -> u64 {
+        total_population(&self.pop_after)
     }
+}
+
+fn migration_population_counts(
+    populations: impl IntoIterator<Item = (IslandId, usize)>,
+) -> Result<BTreeMap<IslandId, u32>, ArchipelagoError> {
+    populations
+        .into_iter()
+        .map(|(island, population)| {
+            checked_island_population(island, population).map(|count| (island, count))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|source| ArchipelagoError::MigrationSelection { source })
 }
 
 /// An exact way a migration barrier can have corrupted the population
@@ -818,9 +830,9 @@ pub enum ArchipelagoError {
     )]
     MigrationNotConserved {
         /// Total population before any move was applied.
-        before: u32,
+        before: u64,
         /// Total population after every move was applied.
-        after: u32,
+        after: u64,
         /// Number of moves applied.
         moves: usize,
     },
@@ -1532,11 +1544,13 @@ impl Archipelago {
         // PHASE 1 — freeze. Every candidate list is uid-ascending by
         // construction, never slotmap handle order.
         let candidates = self.migration_candidates();
-        let pop_before: BTreeMap<IslandId, u32> = candidates
-            .iter()
-            .map(|(&id, list)| (id, u32::try_from(list.len()).unwrap_or(u32::MAX)))
-            .collect();
-        let total_before: u32 = pop_before.values().sum();
+        // Count representation is validated before selecting, staging, or removing an organism.
+        let pop_before = migration_population_counts(
+            candidates
+                .iter()
+                .map(|(&island, list)| (island, list.len())),
+        )?;
+        let total_before = total_population(&pop_before);
         // The identity census taken from the SAME frozen snapshot selection
         // reads, so the proof at the end compares like with like.
         let census_before: BTreeSet<OrganismId> = candidates
@@ -1597,18 +1611,13 @@ impl Archipelago {
             });
         }
 
-        let pop_after: BTreeMap<IslandId, u32> = self
-            .islands
-            .iter()
-            .map(|island| {
-                (
-                    island.meta.id,
-                    u32::try_from(island.core.with_world(WorldState::agent_count))
-                        .unwrap_or(u32::MAX),
-                )
-            })
-            .collect();
-        let total_after: u32 = pop_after.values().sum();
+        let pop_after = migration_population_counts(self.islands.iter().map(|island| {
+            (
+                island.meta.id,
+                island.core.with_world(WorldState::agent_count),
+            )
+        }))?;
+        let total_after = total_population(&pop_after);
         if total_before != total_after {
             return Err(ArchipelagoError::MigrationNotConserved {
                 before: total_before,
@@ -2122,6 +2131,51 @@ mod tests {
     use scriptbots_core::AgentUid;
     use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+    #[test]
+    fn migration_population_count_writer_preserves_valid_aggregate_above_u32() {
+        let maximum = usize::try_from(u32::MAX).expect("island maximum fits target usize");
+        let counts = migration_population_counts([(IslandId(0), maximum), (IslandId(1), 1)])
+            .expect("representable per-island counts");
+        assert_eq!(
+            counts,
+            BTreeMap::from([(IslandId(0), u32::MAX), (IslandId(1), 1)])
+        );
+        assert_eq!(total_population(&counts), u64::from(u32::MAX) + 1);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn migration_population_count_writer_returns_typed_island_overflow() {
+        // Numeric input to the production count writer; no giant live world is allocated.
+        let island = IslandId(7);
+        let maximum = usize::try_from(u32::MAX).expect("island maximum fits target usize");
+        let error = migration_population_counts([(island, maximum + 1)])
+            .expect_err("an island count must not saturate into a plausible report");
+        assert!(matches!(
+            error,
+            ArchipelagoError::MigrationSelection {
+                source: MigrationError::IslandPopulationOverflow { island: rejected },
+            } if rejected == island
+        ));
+    }
+
+    #[test]
+    fn migration_report_total_readers_preserve_each_count_map_above_u32() {
+        // Counter-only report fixture: this exercises readers, not a live migration census.
+        let report = MigrationBarrierReport {
+            barrier_tick: Tick(0),
+            rule: EmigrantSelectionRule::Fittest,
+            moves: Vec::new(),
+            pop_before: BTreeMap::from([(IslandId(0), u32::MAX), (IslandId(1), 1)]),
+            pop_after: BTreeMap::from([(IslandId(0), u32::MAX), (IslandId(1), u32::MAX)]),
+            census_before: BTreeSet::new(),
+            census_after: BTreeSet::new(),
+        };
+        assert_eq!(report.total_before(), u64::from(u32::MAX) + 1);
+        assert_eq!(report.total_after(), 2 * u64::from(u32::MAX));
+        assert_ne!(report.total_before(), report.total_after());
+    }
 
     /// Pins the premise of bd-5tyo's parallel-topology rescope: `HostCore` is `!Send`.
     ///
