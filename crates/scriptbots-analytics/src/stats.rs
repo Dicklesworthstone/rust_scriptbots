@@ -730,6 +730,10 @@ mod tests {
         let mut series = Vec::with_capacity(n);
         let mut prev = 0.0;
         for _ in 0..n {
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "preserve separate product and sum rounding for the seeded AR(1) calibration samples supplied to both bootstrap methods"
+            )]
             prev = phi * prev + draws.normal(0.0, 1.0);
             series.push(prev);
         }
@@ -813,7 +817,7 @@ mod tests {
     #[test]
     fn hedges_correction_diverges_at_small_n_and_converges_at_large_n() {
         // Same standardized effect at both sizes, so any difference is the correction alone.
-        let small_before: Vec<f64> = (0..5).map(|i| f64::from(i)).collect();
+        let small_before: Vec<f64> = (0..5).map(f64::from).collect();
         let small_after: Vec<f64> = (0..5).map(|i| f64::from(i) + 4.0).collect();
         let large_before: Vec<f64> = (0..100).map(|i| f64::from(i % 5)).collect();
         let large_after: Vec<f64> = (0..100).map(|i| f64::from(i % 5) + 4.0).collect();

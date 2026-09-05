@@ -1310,13 +1310,13 @@ pub fn load_interaction_graph_input(
     }
     let page = cx.reader.load_interaction_graph(selection, budget)?;
     let capture = cx.reader.load_interaction_capture_evidence()?;
-    if let Some(capture) = capture {
-        if capture.persisted != page.run_persisted_rows {
-            return Err(AnalyticsError::Graph(format!(
-                "capture accounts for {} persisted interactions but the run contains {} rows",
-                capture.persisted, page.run_persisted_rows
-            )));
-        }
+    if let Some(capture) = capture
+        && capture.persisted != page.run_persisted_rows
+    {
+        return Err(AnalyticsError::Graph(format!(
+            "capture accounts for {} persisted interactions but the run contains {} rows",
+            capture.persisted, page.run_persisted_rows
+        )));
     }
     let capture_status = match capture {
         None => "unknown",
@@ -1839,6 +1839,7 @@ impl Report for InteractionCentrality {
 // ---------------------------------------------------------------------------
 
 /// Formats that preserve both interaction edge attributes and selection metadata.
+#[derive(Clone, Copy)]
 pub enum InteractionGraphFormat {
     /// GraphML with typed edge attributes and graph-level JSON evidence.
     GraphMl,

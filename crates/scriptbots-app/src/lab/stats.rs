@@ -45,6 +45,22 @@ pub struct RunSummary {
     analysis_input_digest: String,
 }
 
+/// Crate-private constructor inputs; callers must first verify the source artifact and provenance.
+/// This is neither a verified row nor a deserialization path into [`RunSummary`].
+pub(crate) struct RunSummaryParts {
+    pub(crate) run_id: String,
+    pub(crate) arm_id: u16,
+    pub(crate) seed: u64,
+    pub(crate) config_digest: String,
+    pub(crate) digest: String,
+    pub(crate) ticks: u64,
+    pub(crate) metrics: BTreeMap<String, f64>,
+    pub(crate) summary_artifact_digest: String,
+    pub(crate) summary_path: Option<String>,
+    pub(crate) variant_id: String,
+    pub(crate) config_overrides: BTreeMap<String, serde_json::Value>,
+}
+
 /// Current lab run-summary provenance version (bd-2z0.5.6 policy, per-table versioning).
 ///
 /// Bumped 1 -> 2 when `variant_id` and `config_overrides` were folded INTO the digest.
@@ -84,46 +100,24 @@ impl AnalysisInputVerdict {
 impl RunSummary {
     /// Construct one typed row after its source artifact and run provenance have been verified.
     #[must_use]
-    pub(crate) fn from_verified_parts(
-        run_id: String,
-        arm_id: u16,
-        seed: u64,
-        config_digest: String,
-        digest: String,
-        ticks: u64,
-        metrics: BTreeMap<String, f64>,
-        summary_artifact_digest: String,
-        summary_path: Option<String>,
-        variant_id: String,
-        config_overrides: BTreeMap<String, serde_json::Value>,
-    ) -> Self {
-        let analysis_input_digest = analysis_input_digest(
-            &run_id,
-            arm_id,
-            seed,
-            &config_digest,
-            &digest,
-            ticks,
-            &metrics,
-            &summary_artifact_digest,
-            &variant_id,
-            &config_overrides,
-        );
-        Self {
-            run_id,
-            arm_id,
-            seed,
-            config_digest,
-            digest,
-            ticks,
-            metrics,
-            summary_artifact_digest,
-            summary_path,
-            variant_id,
-            config_overrides,
+    pub(crate) fn from_verified_parts(parts: RunSummaryParts) -> Self {
+        let mut summary = Self {
+            run_id: parts.run_id,
+            arm_id: parts.arm_id,
+            seed: parts.seed,
+            config_digest: parts.config_digest,
+            digest: parts.digest,
+            ticks: parts.ticks,
+            metrics: parts.metrics,
+            summary_artifact_digest: parts.summary_artifact_digest,
+            summary_path: parts.summary_path,
+            variant_id: parts.variant_id,
+            config_overrides: parts.config_overrides,
             provenance_version: LAB_RUN_SUMMARY_VERSION,
-            analysis_input_digest,
-        }
+            analysis_input_digest: String::new(),
+        };
+        summary.analysis_input_digest = analysis_input_digest(&summary);
+        summary
     }
 
     /// Digest binding every typed analysis input to the exact retained summary artifact.
@@ -143,20 +137,7 @@ impl RunSummary {
                 current: LAB_RUN_SUMMARY_VERSION,
             };
         }
-        if self.analysis_input_digest
-            == analysis_input_digest(
-                &self.run_id,
-                self.arm_id,
-                self.seed,
-                &self.config_digest,
-                &self.digest,
-                self.ticks,
-                &self.metrics,
-                &self.summary_artifact_digest,
-                &self.variant_id,
-                &self.config_overrides,
-            )
-        {
+        if self.analysis_input_digest == analysis_input_digest(self) {
             AnalysisInputVerdict::Valid
         } else {
             AnalysisInputVerdict::Mismatch
@@ -174,18 +155,20 @@ fn hash_len_prefixed(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(value);
 }
 
-fn analysis_input_digest(
-    run_id: &str,
-    arm_id: u16,
-    seed: u64,
-    config_digest: &str,
-    digest: &str,
-    ticks: u64,
-    metrics: &BTreeMap<String, f64>,
-    summary_artifact_digest: &str,
-    variant_id: &str,
-    config_overrides: &BTreeMap<String, serde_json::Value>,
-) -> String {
+fn analysis_input_digest(summary: &RunSummary) -> String {
+    let RunSummary {
+        run_id,
+        arm_id,
+        seed,
+        config_digest,
+        digest,
+        ticks,
+        metrics,
+        summary_artifact_digest,
+        variant_id,
+        config_overrides,
+        ..
+    } = summary;
     let mut hasher = blake3::Hasher::new();
     // v2 (bd-16g.1.7): variant_id and config_overrides joined the digest. Per bd-2z0.5.6
     // the new reproduction inputs go INSIDE the digest -- provenance the integrity digest
@@ -1272,25 +1255,25 @@ mod tests {
         seed: u64,
         metrics: impl IntoIterator<Item = (&'static str, f64)>,
     ) -> RunSummary {
-        RunSummary::from_verified_parts(
-            run_id.to_owned(),
+        RunSummary::from_verified_parts(RunSummaryParts {
+            run_id: run_id.to_owned(),
             arm_id,
             seed,
-            format!("config-{arm_id}"),
-            format!("digest-{run_id}"),
-            100,
-            metrics
+            config_digest: format!("config-{arm_id}"),
+            digest: format!("digest-{run_id}"),
+            ticks: 100,
+            metrics: metrics
                 .into_iter()
                 .map(|(name, value)| (name.to_owned(), value))
                 .collect(),
-            format!("summary-{run_id}"),
-            None,
-            format!("arm-{arm_id:03}"),
-            BTreeMap::from([(
+            summary_artifact_digest: format!("summary-{run_id}"),
+            summary_path: None,
+            variant_id: format!("arm-{arm_id:03}"),
+            config_overrides: BTreeMap::from([(
                 "food_regrowth_rate".to_owned(),
                 serde_json::json!(0.1 * f64::from(arm_id + 1)),
             )]),
-        )
+        })
     }
 
     #[test]
@@ -2231,19 +2214,19 @@ mod tests {
         );
 
         let build = |nested: serde_json::Value| {
-            RunSummary::from_verified_parts(
-                "r1".to_owned(),
-                0,
-                7,
-                "config".to_owned(),
-                "digest".to_owned(),
-                100,
-                BTreeMap::from([("alive_agents".to_owned(), 100.0)]),
-                "summary".to_owned(),
-                None,
-                "arm-000".to_owned(),
-                BTreeMap::from([("nested".to_owned(), nested)]),
-            )
+            RunSummary::from_verified_parts(RunSummaryParts {
+                run_id: "r1".to_owned(),
+                arm_id: 0,
+                seed: 7,
+                config_digest: "config".to_owned(),
+                digest: "digest".to_owned(),
+                ticks: 100,
+                metrics: BTreeMap::from([("alive_agents".to_owned(), 100.0)]),
+                summary_artifact_digest: "summary".to_owned(),
+                summary_path: None,
+                variant_id: "arm-000".to_owned(),
+                config_overrides: BTreeMap::from([("nested".to_owned(), nested)]),
+            })
         };
         assert_eq!(
             build(forward).analysis_input_digest(),

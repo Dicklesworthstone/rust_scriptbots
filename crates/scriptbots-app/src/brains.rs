@@ -205,25 +205,25 @@ pub fn install_brains(world: &mut WorldState, preset: BrainPreset) -> Result<Ins
     }
 
     #[cfg(feature = "neuro")]
-    if preset == BrainPreset::Mixed {
-        if let Some(config) = neuro_config {
-            let key = NeuroflowBrain::register(world, config)
-                .context("failed to register configured NeuroFlow brain")?;
-            let label = world
-                .brain_registry()
-                .kind(key)
-                .unwrap_or("neuroflow")
-                .to_owned();
-            warn!(
-                brain = %label,
-                key,
-                "NeuroFlow remains available as an explicitly selected legacy runner, but it \
-                 has no versioned genome/evaluator-state protocol codec and is WITHHELD from \
-                 the founding population. Admitting it would reintroduce an opaque hereditary \
-                 state beside the canonical protocol families."
-            );
-            withheld.push((label, key));
-        }
+    if preset == BrainPreset::Mixed
+        && let Some(config) = neuro_config
+    {
+        let key = NeuroflowBrain::register(world, config)
+            .context("failed to register configured NeuroFlow brain")?;
+        let label = world
+            .brain_registry()
+            .kind(key)
+            .unwrap_or("neuroflow")
+            .to_owned();
+        warn!(
+            brain = %label,
+            key,
+            "NeuroFlow remains available as an explicitly selected legacy runner, but it \
+             has no versioned genome/evaluator-state protocol codec and is WITHHELD from \
+             the founding population. Admitting it would reintroduce an opaque hereditary \
+             state beside the canonical protocol families."
+        );
+        withheld.push((label, key));
     }
 
     let installed = InstalledBrains {

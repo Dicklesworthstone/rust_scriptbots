@@ -8,15 +8,17 @@
 //! - `bigtx`: one transaction around all INSERTs — within-transaction
 //!   accumulation.
 //!
-//! Run with:
+//! Run only inside a pinned DSR repository profile, using this profile test command:
 //! ```text
 //! cargo test -p scriptbots-storage --test insert_scaling_repro -- --ignored --nocapture
 //! ```
 //!
-//! 2026-09-04 baseline (rch worker, release): see bd-w1oi for the recorded
+//! Launch the approved profile with `dsr build --tool <profile> --target darwin/arm64
+//! --no-sync --version <unique-proof-version>`; never invoke the test directly or through RCH.
+//!
+//! 2026-09-04 historical baseline (RCH worker, release): see bd-w1oi for the recorded
 //! curves. Kept `#[ignore]` because it is a timing diagnostic, not a gate.
 
-use fsqlite::SqliteValue;
 use std::time::Instant;
 
 const N: usize = 4000;
@@ -25,7 +27,8 @@ const WINDOW: usize = 500;
 fn measure_mode(conn: &fsqlite::Connection, mode: &str) {
     conn.execute("DELETE FROM t").expect("delete");
     let mut times: Vec<u128> = Vec::with_capacity(N);
-    if mode == "bigtx" {
+    let transaction = mode.starts_with("bigtx");
+    if transaction {
         conn.execute("BEGIN").expect("begin");
     }
     for i in 0..N {
@@ -41,7 +44,7 @@ fn measure_mode(conn: &fsqlite::Connection, mode: &str) {
         .expect("insert");
         times.push(start.elapsed().as_micros());
     }
-    if mode.starts_with("bigtx") {
+    if transaction {
         conn.execute("COMMIT").expect("commit");
     }
     println!("mode={mode}");

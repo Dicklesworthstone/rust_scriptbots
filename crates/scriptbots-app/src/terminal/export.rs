@@ -50,7 +50,7 @@ pub fn buffer_to_plain_text(buffer: &Buffer) -> String {
 /// with an EMPTY symbol — not a space. Emitting that empty string verbatim would
 /// shorten the line by one column and misalign everything after it, which is
 /// exactly the misreading the emoji vocabulary is prone to.
-fn cell_symbol<'a>(buffer: &'a Buffer, x: u16, y: u16) -> &'a str {
+fn cell_symbol(buffer: &Buffer, x: u16, y: u16) -> &str {
     let symbol = buffer[(x, y)].symbol();
     if symbol.is_empty() { "" } else { symbol }
 }

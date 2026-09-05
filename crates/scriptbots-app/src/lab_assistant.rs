@@ -13,7 +13,8 @@ use crate::lab::spec::{
     ExperimentSpec, SpecBudget, SpecError, ValidatedSpec, render_errors, validate_spec,
 };
 use crate::lab::stats::{
-    AnalysisParams, MatchedSeedAnalysis, RunSummary, StatsError, analyze_matched_seed_runs,
+    AnalysisParams, MatchedSeedAnalysis, RunSummary, RunSummaryParts, StatsError,
+    analyze_matched_seed_runs,
 };
 use scriptbots_storage::{
     RunBundleV1, bundle::RunBundleVerificationLimits, bundle::verify_run_bundle_bounded,
@@ -345,19 +346,19 @@ fn completed_run_summaries(
                 )
             })?
             .clone();
-        summaries.push(RunSummary::from_verified_parts(
-            record.run_id.clone(),
+        summaries.push(RunSummary::from_verified_parts(RunSummaryParts {
+            run_id: record.run_id.clone(),
             arm_id,
-            row.seed,
-            bundle.manifest.config_digest.clone(),
-            row.final_digest,
-            row.tick,
-            BTreeMap::from([("alive_agents".to_owned(), f64::from(alive_agents))]),
-            summary_entry.blake3_hex.clone(),
-            Some(summary_path.to_string_lossy().into_owned()),
-            record.variant_id.clone(),
+            seed: row.seed,
+            config_digest: bundle.manifest.config_digest.clone(),
+            digest: row.final_digest,
+            ticks: row.tick,
+            metrics: BTreeMap::from([("alive_agents".to_owned(), f64::from(alive_agents))]),
+            summary_artifact_digest: summary_entry.blake3_hex.clone(),
+            summary_path: Some(summary_path.to_string_lossy().into_owned()),
+            variant_id: record.variant_id.clone(),
             config_overrides,
-        ));
+        }));
     }
     Ok(summaries)
 }
@@ -959,22 +960,22 @@ mod tests {
                         .checked_mul(seed_component + 1)
                         .ok_or_else(|| "synthetic test outcome overflowed u32".to_owned())?;
                     let run_id = format!("{}-arm-{arm_id:03}-seed{seed}", spec.spec_id);
-                    summaries.push(RunSummary::from_verified_parts(
-                        run_id.clone(),
+                    summaries.push(RunSummary::from_verified_parts(RunSummaryParts {
+                        run_id: run_id.clone(),
                         arm_id,
                         seed,
-                        config_digest.clone(),
-                        format!("digest-{arm_id}-{seed}"),
-                        spec.spec.ticks_per_run,
-                        BTreeMap::from([(
+                        config_digest: config_digest.clone(),
+                        digest: format!("digest-{arm_id}-{seed}"),
+                        ticks: spec.spec.ticks_per_run,
+                        metrics: BTreeMap::from([(
                             "alive_agents".to_owned(),
                             f64::from(100 + seed_component + arm_component),
                         )]),
-                        format!("summary-{run_id}"),
-                        None,
-                        format!("arm-{arm_id:03}"),
-                        arm.clone(),
-                    ));
+                        summary_artifact_digest: format!("summary-{run_id}"),
+                        summary_path: None,
+                        variant_id: format!("arm-{arm_id:03}"),
+                        config_overrides: arm.clone(),
+                    }));
                 }
             }
             Ok(ExecutionReceipt {
@@ -1242,23 +1243,25 @@ mod tests {
         *changed_metrics
             .get_mut("alive_agents")
             .expect("reported metric") += 1.0;
-        changed[treatment_index] = RunSummary::from_verified_parts(
-            treatment.run_id.clone(),
-            treatment.arm_id,
-            treatment.seed,
-            treatment.config_digest.clone(),
-            blake3::hash(b"independently changed world fixture")
+        changed[treatment_index] = RunSummary::from_verified_parts(RunSummaryParts {
+            run_id: treatment.run_id.clone(),
+            arm_id: treatment.arm_id,
+            seed: treatment.seed,
+            config_digest: treatment.config_digest.clone(),
+            digest: blake3::hash(b"independently changed world fixture")
                 .to_hex()
                 .to_string(),
-            treatment.ticks,
-            changed_metrics,
-            blake3::hash(b"independently changed verified summary fixture")
-                .to_hex()
-                .to_string(),
-            None,
-            treatment.variant_id.clone(),
-            treatment.config_overrides.clone(),
-        );
+            ticks: treatment.ticks,
+            metrics: changed_metrics,
+            summary_artifact_digest: blake3::hash(
+                b"independently changed verified summary fixture",
+            )
+            .to_hex()
+            .to_string(),
+            summary_path: None,
+            variant_id: treatment.variant_id.clone(),
+            config_overrides: treatment.config_overrides.clone(),
+        });
         assert_ne!(
             render(&changed),
             first.as_str(),

@@ -1371,10 +1371,10 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                 let summary_res = tokio::task::spawn_blocking(move || handle_clone.latest_summary()).await;
                 if let Ok(Ok(summary)) = summary_res {
                     let dto = TickSummaryDto::from(summary);
-                    if let Ok(bytes) = postcard::to_stdvec(&dto) {
-                        if socket.send(WsMessage::Binary(bytes.into())).await.is_err() {
-                            break;
-                        }
+                    if let Ok(bytes) = postcard::to_stdvec(&dto)
+                        && socket.send(WsMessage::Binary(bytes.into())).await.is_err()
+                    {
+                        break;
                     }
                 }
             }

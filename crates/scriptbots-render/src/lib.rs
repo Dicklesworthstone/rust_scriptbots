@@ -1,10 +1,16 @@
 //! GPUI rendering layer for ScriptBots.
 
+#![recursion_limit = "256"]
+
 mod camera;
 /// Headless GPUI HUD capture (bd-abu3). Test-only: it depends on GPUI's
 /// `test-support` feature, which is a dev-dependency and must not reach production.
 #[cfg(test)]
 mod hud_capture;
+#[expect(
+    dead_code,
+    reason = "bd-bufm: projection and paint helpers await the core's positioned tick-event stream; there is no production VFX consumer yet"
+)]
 mod vfx;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
@@ -524,10 +530,7 @@ pub mod world_compositor {
             if self.renderer.is_none() {
                 let adapter = self.adapter.as_ref().unwrap();
                 let future = scriptbots_world_gfx::WorldRenderer::new(adapter, size);
-                let mut renderer = match pollster::block_on(future) {
-                    Ok(renderer) => renderer,
-                    Err(error) => return Err(error),
-                };
+                let mut renderer = pollster::block_on(future)?;
                 renderer.set_camera(self.cam_scale, self.cam_offset);
                 self.renderer = Some(renderer);
             }
@@ -871,6 +874,138 @@ pub mod world_compositor {
         }
     }
 
+    impl Default for Compositor {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    // Headless, one-shot offscreen render to PNG (bytes) using the same snapshot path as the GUI.
+    // This allows verifying the wgpu pipeline without a display server.
+    pub fn render_wgpu_png_offscreen(
+        world: &WorldState,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, scriptbots_world_gfx::ReadbackError> {
+        if width == 0 || height == 0 {
+            return Err(scriptbots_world_gfx::ReadbackError::ZeroDimensions { width, height });
+        }
+        // Build snapshot from world
+        let frame = crate::RenderFrame::from_world(world, crate::ColorPaletteMode::Natural)
+            .ok_or_else(|| scriptbots_world_gfx::ReadbackError::MetadataMismatch {
+                expected: "a finite non-empty world render snapshot".to_owned(),
+                actual: format!(
+                    "world {}x{} at tick {} could not produce a render frame",
+                    world.config().world_width,
+                    world.config().world_height,
+                    world.tick().0
+                ),
+            })?;
+        let world_size = frame.world_size;
+        let dims = frame.terrain.dimensions;
+        let tiles_u32: Vec<u32> = frame
+            .terrain
+            .tiles
+            .iter()
+            .map(|t| match t.kind {
+                TerrainKind::DeepWater => 0,
+                TerrainKind::ShallowWater => 1,
+                TerrainKind::Sand => 2,
+                TerrainKind::Grass => 3,
+                TerrainKind::Bloom => 4,
+                TerrainKind::Rock => 5,
+            })
+            .collect();
+        let elevation: Vec<f32> = frame.terrain.tiles.iter().map(|t| t.elevation).collect();
+        let terrain_colors = canonical_gpu_terrain_colors(&frame);
+        let palette_is_natural = matches!(frame.palette, ColorPaletteMode::Natural);
+        let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = frame
+            .agents
+            .iter()
+            .map(|a| build_gpu_agent_instance(&frame, a, frame.palette, palette_is_natural))
+            .collect();
+
+        let snapshot = GfxSnapshot {
+            world_size,
+            terrain: scriptbots_world_gfx::TerrainView {
+                dims,
+                cell_size: frame.terrain.cell_size,
+                tiles: &tiles_u32,
+                colors: &terrain_colors,
+                elevation: Some(&elevation),
+            },
+            agents: &agents_gpu,
+            anim_seconds: frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
+            tonemap_mode: frame.tonemap_mode,
+        };
+
+        // Fit camera into the requested viewport
+        let mut comp = Compositor::new();
+        let width_px = width as f32;
+        let height_px = height as f32;
+        let base_scale = (width_px / world_size.0)
+            .min(height_px / world_size.1)
+            .max(0.0001);
+        let pad_x = (width_px - world_size.0 * base_scale) * 0.5;
+        let pad_y = (height_px - world_size.1 * base_scale) * 0.5;
+        comp.set_camera_params(base_scale, (pad_x, pad_y));
+
+        comp.render_snapshot(&snapshot, (width, height))?;
+
+        // Extract mapped frame. Geometry must come from the readback view:
+        // render_snapshot may render at a reduced resolution (SB_WGPU_RES_SCALE),
+        // so the actual view size can differ from the requested width/height.
+        // An unmapped frame is a typed Empty failure, never an empty-vector success.
+        let view = comp
+            .renderer
+            .as_mut()
+            .ok_or_else(|| {
+                scriptbots_world_gfx::ReadbackError::Device(
+                    "compositor reported success without a world renderer".to_owned(),
+                )
+            })?
+            .mapped_rgba()?;
+        let view_width = view.width;
+        let view_height = view.height;
+        let stride = view.bytes_per_row as usize;
+        let row_bytes = (view_width as usize) * 4;
+        let src = view.bytes();
+        let mut tight = vec![0u8; row_bytes * view_height as usize];
+        for y in 0..(view_height as usize) {
+            let s = y * stride;
+            let d = y * row_bytes;
+            let end = s + row_bytes;
+            if end > src.len() {
+                return Err(scriptbots_world_gfx::ReadbackError::MetadataMismatch {
+                    expected: format!(
+                        "{} bytes for {} rows at stride {stride}",
+                        stride * view_height as usize,
+                        view_height
+                    ),
+                    actual: format!("{} mapped bytes", src.len()),
+                });
+            }
+            tight[d..d + row_bytes].copy_from_slice(&src[s..end]);
+        }
+        if rgba8_is_visually_blank(&tight) {
+            return Err(scriptbots_world_gfx::ReadbackError::Blank);
+        }
+        let mut png: Vec<u8> = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png);
+        let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
+        image::ImageEncoder::write_image(
+            encoder,
+            &tight,
+            view_width,
+            view_height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| {
+            scriptbots_world_gfx::ReadbackError::Artifact(format!("PNG encode failed: {error}"))
+        })?;
+        Ok(png)
+    }
+
     #[cfg(test)]
     mod capture_policy_tests {
         use super::{Compositor, ReadbackDigest, RenderSnapshotOutcome, rgba8_is_visually_blank};
@@ -1075,138 +1210,6 @@ pub mod world_compositor {
                 "one explicit capture must create only its PNG and metadata artifacts"
             );
         }
-    }
-
-    impl Default for Compositor {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    // Headless, one-shot offscreen render to PNG (bytes) using the same snapshot path as the GUI.
-    // This allows verifying the wgpu pipeline without a display server.
-    pub fn render_wgpu_png_offscreen(
-        world: &WorldState,
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<u8>, scriptbots_world_gfx::ReadbackError> {
-        if width == 0 || height == 0 {
-            return Err(scriptbots_world_gfx::ReadbackError::ZeroDimensions { width, height });
-        }
-        // Build snapshot from world
-        let frame = crate::RenderFrame::from_world(world, crate::ColorPaletteMode::Natural)
-            .ok_or_else(|| scriptbots_world_gfx::ReadbackError::MetadataMismatch {
-                expected: "a finite non-empty world render snapshot".to_owned(),
-                actual: format!(
-                    "world {}x{} at tick {} could not produce a render frame",
-                    world.config().world_width,
-                    world.config().world_height,
-                    world.tick().0
-                ),
-            })?;
-        let world_size = frame.world_size;
-        let dims = frame.terrain.dimensions;
-        let tiles_u32: Vec<u32> = frame
-            .terrain
-            .tiles
-            .iter()
-            .map(|t| match t.kind {
-                TerrainKind::DeepWater => 0,
-                TerrainKind::ShallowWater => 1,
-                TerrainKind::Sand => 2,
-                TerrainKind::Grass => 3,
-                TerrainKind::Bloom => 4,
-                TerrainKind::Rock => 5,
-            })
-            .collect();
-        let elevation: Vec<f32> = frame.terrain.tiles.iter().map(|t| t.elevation).collect();
-        let terrain_colors = canonical_gpu_terrain_colors(&frame);
-        let palette_is_natural = matches!(frame.palette, ColorPaletteMode::Natural);
-        let agents_gpu: Vec<scriptbots_world_gfx::AgentInstance> = frame
-            .agents
-            .iter()
-            .map(|a| build_gpu_agent_instance(&frame, a, frame.palette, palette_is_natural))
-            .collect();
-
-        let snapshot = GfxSnapshot {
-            world_size,
-            terrain: scriptbots_world_gfx::TerrainView {
-                dims,
-                cell_size: frame.terrain.cell_size,
-                tiles: &tiles_u32,
-                colors: &terrain_colors,
-                elevation: Some(&elevation),
-            },
-            agents: &agents_gpu,
-            anim_seconds: frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
-            tonemap_mode: frame.tonemap_mode,
-        };
-
-        // Fit camera into the requested viewport
-        let mut comp = Compositor::new();
-        let width_px = width as f32;
-        let height_px = height as f32;
-        let base_scale = (width_px / world_size.0)
-            .min(height_px / world_size.1)
-            .max(0.0001);
-        let pad_x = (width_px - world_size.0 * base_scale) * 0.5;
-        let pad_y = (height_px - world_size.1 * base_scale) * 0.5;
-        comp.set_camera_params(base_scale, (pad_x, pad_y));
-
-        comp.render_snapshot(&snapshot, (width, height))?;
-
-        // Extract mapped frame. Geometry must come from the readback view:
-        // render_snapshot may render at a reduced resolution (SB_WGPU_RES_SCALE),
-        // so the actual view size can differ from the requested width/height.
-        // An unmapped frame is a typed Empty failure, never an empty-vector success.
-        let view = comp
-            .renderer
-            .as_mut()
-            .ok_or_else(|| {
-                scriptbots_world_gfx::ReadbackError::Device(
-                    "compositor reported success without a world renderer".to_owned(),
-                )
-            })?
-            .mapped_rgba()?;
-        let view_width = view.width;
-        let view_height = view.height;
-        let stride = view.bytes_per_row as usize;
-        let row_bytes = (view_width as usize) * 4;
-        let src = view.bytes();
-        let mut tight = vec![0u8; row_bytes * view_height as usize];
-        for y in 0..(view_height as usize) {
-            let s = y * stride;
-            let d = y * row_bytes;
-            let end = s + row_bytes;
-            if end > src.len() {
-                return Err(scriptbots_world_gfx::ReadbackError::MetadataMismatch {
-                    expected: format!(
-                        "{} bytes for {} rows at stride {stride}",
-                        stride * view_height as usize,
-                        view_height
-                    ),
-                    actual: format!("{} mapped bytes", src.len()),
-                });
-            }
-            tight[d..d + row_bytes].copy_from_slice(&src[s..end]);
-        }
-        if rgba8_is_visually_blank(&tight) {
-            return Err(scriptbots_world_gfx::ReadbackError::Blank);
-        }
-        let mut png: Vec<u8> = Vec::new();
-        let mut cursor = std::io::Cursor::new(&mut png);
-        let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
-        image::ImageEncoder::write_image(
-            encoder,
-            &tight,
-            view_width,
-            view_height,
-            image::ExtendedColorType::Rgba8,
-        )
-        .map_err(|error| {
-            scriptbots_world_gfx::ReadbackError::Artifact(format!("PNG encode failed: {error}"))
-        })?;
-        Ok(png)
     }
 }
 
@@ -4328,6 +4331,10 @@ impl SimulationView {
     /// perform any flow arithmetic, category re-derivation, or aggregation over raw flows.
     /// It consumes only canonical [`scriptbots_core::economy::SankeyGraph`] structs.
     #[must_use]
+    #[expect(
+        dead_code,
+        reason = "bd-16g.11.3: this view awaits a canonical epoch Sankey feed and a Lab caller"
+    )]
     pub fn render_sankey_view(
         &self,
         sankey: Option<&scriptbots_core::economy::SankeyGraph>,
@@ -11582,24 +11589,15 @@ mod chrome {
 }
 
 /// User-controlled diagnostic disclosures in the scrollable Lab Overview.
-#[derive(Clone, Copy)]
+///
+/// The companion Lab window already exposes the primary metrics and controls.
+/// Dense diagnostic panels start closed and remain one-keystroke disclosures;
+/// opening everything by default was the original wall-of-telemetry failure.
+#[derive(Clone, Copy, Default)]
 struct HudLayout {
     stats_open: bool,
     history_open: bool,
     perf_open: bool,
-}
-
-impl Default for HudLayout {
-    fn default() -> Self {
-        // The companion Lab window already exposes the primary metrics and controls.
-        // Dense diagnostic panels start closed and remain one-keystroke disclosures;
-        // opening everything by default was the original wall-of-telemetry failure.
-        Self {
-            stats_open: false,
-            history_open: false,
-            perf_open: false,
-        }
-    }
 }
 
 /// Durable HUD disclosure state (bd-lelp).
@@ -13749,6 +13747,10 @@ struct AgentRenderData {
     indicator: IndicatorState,
     spike_extended: bool,
     spike_struck: bool,
+    #[cfg_attr(
+        all(not(feature = "audio"), not(test)),
+        expect(dead_code, reason = "consumed by audio cues and snapshot tests")
+    )]
     spike_victim: bool,
     reproduction_intent: f32,
 }
@@ -14256,6 +14258,7 @@ fn terrain_accents_are_legible(cell_px: f32) -> bool {
 /// We cannot size this pool ourselves. `InstanceBufferPool` is `pub(crate)` in
 /// `gpui_macos` and the app never constructs one, so the ONLY lever this crate
 /// has over instance-buffer pressure is emitting fewer primitives (bd-2z0.7.12).
+#[cfg(test)]
 const GPUI_DEFAULT_INSTANCE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 /// Primitive counts for one frame, as the Metal renderer would see them.
@@ -14266,12 +14269,14 @@ const GPUI_DEFAULT_INSTANCE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 /// needs a clean tree and an exact-class host, and a budget nobody can check
 /// until then is a budget that silently rots.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg(test)]
 struct SceneCost {
     quads: usize,
     shadows: usize,
     underlines: usize,
 }
 
+#[cfg(test)]
 impl SceneCost {
     /// Instance bytes these primitives occupy.
     ///
@@ -19180,7 +19185,13 @@ mod command_characterization_tests {
     /// newly added toggle should be one line to cover.
     #[test]
     fn every_window_local_toggle_changes_the_state_it_names_and_toggles_back() {
-        let cases: [(&str, &str, bool, fn(&SimulationView) -> bool); 9] = [
+        type ToggleCase = (
+            &'static str,
+            &'static str,
+            bool,
+            fn(&SimulationView) -> bool,
+        );
+        let cases: [ToggleCase; 9] = [
             ("d", "ToggleAgentDraw", true, |view| {
                 view.controls.draw_agents
             }),
@@ -20995,7 +21006,7 @@ mod command_characterization_tests {
             .set_closed(false)
             .expect("set open");
         assert!(!world.lock().expect("world lock").is_closed());
-        assert_eq!(view.world.lock().expect("world lock").is_closed(), false);
+        assert!(!view.world.lock().expect("world lock").is_closed());
     }
 
     #[test]

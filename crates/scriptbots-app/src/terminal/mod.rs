@@ -5716,22 +5716,17 @@ pub fn resolve_motion_policy(
     MotionPolicy::Full
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CuratedThemeId {
     /// bd-9pqz art direction, derived from `visual::BIOLUMINESCENT_DARK_FIELD_V1`.
     /// The default, so terminal mode shares the GUI's look instead of diverging.
+    #[default]
     BioluminescentDarkField,
     CyberpunkAurora,
     Darcula,
     LumenLight,
     NordicFrost,
     HighContrast,
-}
-
-impl Default for CuratedThemeId {
-    fn default() -> Self {
-        Self::BioluminescentDarkField
-    }
 }
 
 impl CuratedThemeId {

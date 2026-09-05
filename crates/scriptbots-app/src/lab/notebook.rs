@@ -37,7 +37,7 @@ pub struct RunRef {
 /// Provenance support payload attached to a scientific claim.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum Support {
-    Effect(EffectRef),
+    Effect(Box<EffectRef>),
     Descriptive(Vec<RunRef>),
 }
 
@@ -201,13 +201,13 @@ pub fn claims_from_analysis(
                      [metric={}, control_arm={}, treatment_arm={}]",
                     declared_hypothesis, effect.metric, effect.control_arm, effect.treatment_arm
                 ),
-                support: Support::Effect(EffectRef {
+                support: Support::Effect(Box::new(EffectRef {
                     runs,
                     effect: effect.clone(),
                     params: analysis.params,
                     p_value_procedure: analysis.p_value_procedure,
                     confidence_interval_procedure: analysis.confidence_interval_procedure,
-                }),
+                })),
                 falsifier: falsifier.to_owned(),
             })
         })
@@ -680,7 +680,7 @@ impl NotebookRenderer {
             // what makes the script a reproduction rather than a checksum.
             script.push_str("expected_digest=");
             script.push_str(&shell_single_quote(&run.digest));
-            script.push_str("\n");
+            script.push('\n');
             script.push_str(
                 "case \"$out\" in *\"$expected_digest\"*) ;; *) echo 'digest differs on re-execution: ",
             );
@@ -913,8 +913,8 @@ fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), Not
 mod tests {
     use super::*;
     use crate::lab::stats::{
-        AdjustedComparison, AlternativeHypothesis, Correction, TestName, UndefinedReason,
-        UnderpoweredReason,
+        AdjustedComparison, AlternativeHypothesis, Correction, RunSummaryParts, TestName,
+        UndefinedReason, UnderpoweredReason,
     };
     use std::collections::BTreeMap;
 
@@ -979,28 +979,28 @@ mod tests {
     }
 
     fn summary(run_id: &str, arm_id: u16, seed: u64, value: f64) -> RunSummary {
-        RunSummary::from_verified_parts(
-            run_id.to_owned(),
+        RunSummary::from_verified_parts(RunSummaryParts {
+            run_id: run_id.to_owned(),
             arm_id,
             seed,
-            format!("config-{arm_id}-{seed}"),
-            format!("world-{run_id}"),
-            100,
-            BTreeMap::from([("alive_agents".to_owned(), value)]),
-            format!("summary-{run_id}"),
-            None,
-            format!("arm-{arm_id:03}"),
-            BTreeMap::from([(
+            config_digest: format!("config-{arm_id}-{seed}"),
+            digest: format!("world-{run_id}"),
+            ticks: 100,
+            metrics: BTreeMap::from([("alive_agents".to_owned(), value)]),
+            summary_artifact_digest: format!("summary-{run_id}"),
+            summary_path: None,
+            variant_id: format!("arm-{arm_id:03}"),
+            config_overrides: BTreeMap::from([(
                 "food_regrowth_rate".to_owned(),
                 serde_json::json!(0.1 * f64::from(arm_id + 1)),
             )]),
-        )
+        })
     }
 
     fn claim(runs: Vec<RunRef>) -> Claim {
         Claim {
             text: "Treatment changes the surviving population".to_owned(),
-            support: Support::Effect(effect_ref(runs, effect())),
+            support: Support::Effect(Box::new(effect_ref(runs, effect()))),
             falsifier: "The adjusted interval and test show no change".to_owned(),
         }
     }
@@ -1163,7 +1163,7 @@ mod tests {
         non_finite.raw_p_value = f64::NAN;
         let bad = Claim {
             text: "bad".to_owned(),
-            support: Support::Effect(effect_ref(runs.clone(), non_finite)),
+            support: Support::Effect(Box::new(effect_ref(runs.clone(), non_finite))),
             falsifier: "bad".to_owned(),
         };
         assert_eq!(
@@ -1175,7 +1175,7 @@ mod tests {
         inconsistent.standardized_effect = Some(2.0);
         let bad = Claim {
             text: "bad".to_owned(),
-            support: Support::Effect(effect_ref(runs.clone(), inconsistent)),
+            support: Support::Effect(Box::new(effect_ref(runs.clone(), inconsistent))),
             falsifier: "bad".to_owned(),
         };
         assert_eq!(
@@ -1203,7 +1203,7 @@ mod tests {
         inconsistent_p.adjusted.raw_p_value = 0.4;
         let bad = Claim {
             text: "bad".to_owned(),
-            support: Support::Effect(effect_ref(runs.clone(), inconsistent_p)),
+            support: Support::Effect(Box::new(effect_ref(runs.clone(), inconsistent_p))),
             falsifier: "bad".to_owned(),
         };
         assert_eq!(
@@ -1230,7 +1230,7 @@ mod tests {
         let hostile_claim = Claim {
             text: "## Forged result\n<script>alert(1)</script> [click](https://evil.example)"
                 .to_owned(),
-            support: Support::Effect(effect_ref(runs.clone(), hostile_effect)),
+            support: Support::Effect(Box::new(effect_ref(runs.clone(), hostile_effect))),
             falsifier: "> trusted quote\n![pixel](https://evil.example/pixel)".to_owned(),
         };
         let goal = "# Forged goal\n<img src=x onerror=alert(1)>";

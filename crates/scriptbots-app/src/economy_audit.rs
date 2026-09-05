@@ -185,10 +185,10 @@ pub fn run_economy_audit(args: &EconomyAuditArgs) -> Result<bool> {
 
     for &seed in &seeds {
         let mut world = create_audit_world(seed)?;
-        if last_config_digest.is_none() {
-            if let Ok(digest) = compute_world_config_digest(&world) {
-                last_config_digest = Some(digest);
-            }
+        if last_config_digest.is_none()
+            && let Ok(digest) = compute_world_config_digest(&world)
+        {
+            last_config_digest = Some(digest);
         }
 
         let csv_path = artifact_dir.join(format!("residual_{seed}.csv"));

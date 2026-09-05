@@ -50,7 +50,7 @@ use scriptbots_storage::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Error types for DataFrame export and summary operations.
+/// Error types for `DataFrame` export and summary operations.
 #[derive(Debug, thiserror::Error)]
 pub enum DataFrameError {
     /// Failure originating in storage reader or SQL queries.
@@ -65,7 +65,7 @@ pub enum DataFrameError {
     /// Standard filesystem IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    /// FrankenPandas frame manipulation error.
+    /// `FrankenPandas` frame manipulation error.
     #[error("Frame error: {0}")]
     Frame(#[from] fp_frame::FrameError),
     /// Column storage or construction error.
@@ -397,7 +397,7 @@ pub fn read_parquet_batch(path: &Path) -> Result<RecordBatch, DataFrameError> {
     let schema = builder.schema().clone();
     let mut reader = builder.build()?;
     let mut batches = Vec::new();
-    while let Some(batch_res) = reader.next() {
+    for batch_res in reader.by_ref() {
         batches.push(batch_res?);
     }
     if batches.is_empty() {
@@ -415,7 +415,7 @@ pub fn read_arrow_batch(path: &Path) -> Result<RecordBatch, DataFrameError> {
     let file = File::open(path)?;
     let mut reader = ArrowFileReader::try_new(file, None)?;
     let mut batches = Vec::new();
-    while let Some(batch_res) = reader.next() {
+    for batch_res in reader.by_ref() {
         batches.push(batch_res?);
     }
     if batches.is_empty() {
@@ -429,10 +429,11 @@ pub fn read_arrow_batch(path: &Path) -> Result<RecordBatch, DataFrameError> {
     Ok(arrow::compute::concat_batches(&schema, &batches)?)
 }
 
+/// Raw provenance JSON, column headers, and cell rows parsed from a CSV export.
+pub type CsvProvenanceRows = (String, Vec<String>, Vec<Vec<String>>);
+
 /// Read CSV with `# PROVENANCE:` header line, returning parsed raw string headers and rows.
-pub fn read_csv_with_provenance(
-    path: &Path,
-) -> Result<(String, Vec<String>, Vec<Vec<String>>), DataFrameError> {
+pub fn read_csv_with_provenance(path: &Path) -> Result<CsvProvenanceRows, DataFrameError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
@@ -721,7 +722,7 @@ pub fn export_database_all(
 // FRANKENPANDAS DATAFRAME BUILDERS & SUMMARY ENGINE
 // ============================================================================
 
-/// Build a FrankenPandas [`DataFrame`] from canonical [`AgentExportRow`] records.
+/// Build a `FrankenPandas` [`DataFrame`] from canonical [`AgentExportRow`] records.
 pub fn build_agents_dataframe(
     rows: &[AgentExportRow],
     epoch_size: u64,
@@ -734,14 +735,14 @@ pub fn build_agents_dataframe(
     let mut uid_vals = Vec::with_capacity(len);
     let mut gen_vals = Vec::with_capacity(len);
     let mut age_vals = Vec::with_capacity(len);
-    let mut px_vals = Vec::with_capacity(len);
-    let mut py_vals = Vec::with_capacity(len);
-    let mut vx_vals = Vec::with_capacity(len);
-    let mut vy_vals = Vec::with_capacity(len);
-    let mut hd_vals = Vec::with_capacity(len);
-    let mut hp_vals = Vec::with_capacity(len);
-    let mut en_vals = Vec::with_capacity(len);
-    let mut ht_vals = Vec::with_capacity(len);
+    let mut horizontal_positions = Vec::with_capacity(len);
+    let mut vertical_positions = Vec::with_capacity(len);
+    let mut horizontal_velocities = Vec::with_capacity(len);
+    let mut vertical_velocities = Vec::with_capacity(len);
+    let mut headings = Vec::with_capacity(len);
+    let mut healths = Vec::with_capacity(len);
+    let mut energies = Vec::with_capacity(len);
+    let mut herbivore_tendencies = Vec::with_capacity(len);
     let mut diet_vals = Vec::with_capacity(len);
     let mut brain_vals = Vec::with_capacity(len);
 
@@ -753,14 +754,14 @@ pub fn build_agents_dataframe(
         uid_vals.push(r.agent_uid as i64);
         gen_vals.push(i64::from(r.generation));
         age_vals.push(i64::from(r.age));
-        px_vals.push(f64::from(r.pos_x));
-        py_vals.push(f64::from(r.pos_y));
-        vx_vals.push(f64::from(r.vel_x));
-        vy_vals.push(f64::from(r.vel_y));
-        hd_vals.push(f64::from(r.heading));
-        hp_vals.push(f64::from(r.health));
-        en_vals.push(f64::from(r.energy));
-        ht_vals.push(f64::from(r.herbivore_tendency));
+        horizontal_positions.push(f64::from(r.pos_x));
+        vertical_positions.push(f64::from(r.pos_y));
+        horizontal_velocities.push(f64::from(r.vel_x));
+        vertical_velocities.push(f64::from(r.vel_y));
+        headings.push(f64::from(r.heading));
+        healths.push(f64::from(r.health));
+        energies.push(f64::from(r.energy));
+        herbivore_tendencies.push(f64::from(r.herbivore_tendency));
 
         let diet = if r.herbivore_tendency >= 0.7 {
             "Herbivore"
@@ -781,43 +782,68 @@ pub fn build_agents_dataframe(
     columns.insert("age".to_string(), Column::from_i64_values(age_vals));
     columns.insert(
         "pos_x".to_string(),
-        Column::from_values(px_vals.into_iter().map(Scalar::Float64).collect())
-            .map_err(DataFrameError::Column)?,
+        Column::from_values(
+            horizontal_positions
+                .into_iter()
+                .map(Scalar::Float64)
+                .collect(),
+        )
+        .map_err(DataFrameError::Column)?,
     );
     columns.insert(
         "pos_y".to_string(),
-        Column::from_values(py_vals.into_iter().map(Scalar::Float64).collect())
-            .map_err(DataFrameError::Column)?,
+        Column::from_values(
+            vertical_positions
+                .into_iter()
+                .map(Scalar::Float64)
+                .collect(),
+        )
+        .map_err(DataFrameError::Column)?,
     );
     columns.insert(
         "vel_x".to_string(),
-        Column::from_values(vx_vals.into_iter().map(Scalar::Float64).collect())
-            .map_err(DataFrameError::Column)?,
+        Column::from_values(
+            horizontal_velocities
+                .into_iter()
+                .map(Scalar::Float64)
+                .collect(),
+        )
+        .map_err(DataFrameError::Column)?,
     );
     columns.insert(
         "vel_y".to_string(),
-        Column::from_values(vy_vals.into_iter().map(Scalar::Float64).collect())
-            .map_err(DataFrameError::Column)?,
+        Column::from_values(
+            vertical_velocities
+                .into_iter()
+                .map(Scalar::Float64)
+                .collect(),
+        )
+        .map_err(DataFrameError::Column)?,
     );
     columns.insert(
         "heading".to_string(),
-        Column::from_values(hd_vals.into_iter().map(Scalar::Float64).collect())
+        Column::from_values(headings.into_iter().map(Scalar::Float64).collect())
             .map_err(DataFrameError::Column)?,
     );
     columns.insert(
         "health".to_string(),
-        Column::from_values(hp_vals.into_iter().map(Scalar::Float64).collect())
+        Column::from_values(healths.into_iter().map(Scalar::Float64).collect())
             .map_err(DataFrameError::Column)?,
     );
     columns.insert(
         "energy".to_string(),
-        Column::from_values(en_vals.into_iter().map(Scalar::Float64).collect())
+        Column::from_values(energies.into_iter().map(Scalar::Float64).collect())
             .map_err(DataFrameError::Column)?,
     );
     columns.insert(
         "herbivore_tendency".to_string(),
-        Column::from_values(ht_vals.into_iter().map(Scalar::Float64).collect())
-            .map_err(DataFrameError::Column)?,
+        Column::from_values(
+            herbivore_tendencies
+                .into_iter()
+                .map(Scalar::Float64)
+                .collect(),
+        )
+        .map_err(DataFrameError::Column)?,
     );
     columns.insert(
         "diet_class".to_string(),
@@ -903,7 +929,7 @@ pub struct RollingMetricRow {
 }
 
 /// One aggregate row for lineage founder contributions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FounderLineageAggregateRow {
     /// Unique agent identifier of the founder.
     pub founder_uid: u64,
@@ -936,6 +962,9 @@ pub struct RunSummaryReport {
     pub markdown_table: String,
 }
 
+/// Health, energy, and herbivore-tendency samples, each in source-row order.
+type DietGroupSamples = (Vec<f64>, Vec<f64>, Vec<f64>);
+
 /// Compute per-epoch groupby aggregates and rolling-window smoothed metric series.
 pub fn summarize_run(
     reader: &StorageReader,
@@ -954,7 +983,7 @@ pub fn summarize_run(
     let (_prov, lineage_rows) = load_lineage_rows(reader)?;
 
     // 1. Groupby Diet: (epoch, diet_class) -> [health, energy, tendency]
-    let mut diet_groups: BTreeMap<(u64, String), (Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    let mut diet_groups: BTreeMap<(u64, String), DietGroupSamples> = BTreeMap::new();
     // 2. Groupby Brain: (epoch, brain_binding) -> [health, energy]
     let mut brain_groups: BTreeMap<(u64, String), (Vec<f64>, Vec<f64>)> = BTreeMap::new();
 

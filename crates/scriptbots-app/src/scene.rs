@@ -437,8 +437,8 @@ pub const SCENE_LOG_FILE: &str = "scene_log.json";
 
 /// Write the structured scene log beside the capture artifacts.
 ///
-/// README advertises that `--dump-scene-png` emits "capture PNGs + provenance JSON
-/// + a JSON scene log"; only the first two were ever written, so the documented
+/// README advertises that `--dump-scene-png` emits capture PNGs, provenance JSON,
+/// and a JSON scene log; only the first two were ever written, so the documented
 /// evidence artifact did not exist (bd-2z0.14.3.5.1). The log is validated before
 /// the write and re-read afterwards, so a run cannot report success while leaving
 /// behind evidence that is absent, truncated, or unparseable.

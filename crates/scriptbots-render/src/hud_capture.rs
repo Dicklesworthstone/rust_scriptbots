@@ -11,6 +11,8 @@
 //! [`SimulationView`] the production windows use, via the same [`GuiSession`] — through
 //! GPUI's headless Metal renderer, and reading the frame back as RGBA. No window server
 //! and no display are involved, so it runs in CI and under an agent session.
+//! Real pixel capture requires macOS: the pinned `gpui_platform::current_headless_renderer`
+//! returns a Metal renderer there and `None` on other platforms (bd-h9ca).
 //!
 //! It lives inside the crate rather than in `tests/` because [`GuiSession`] and
 //! [`SimulationView`] are private to the crate root; a child module can reach them, an
@@ -97,6 +99,7 @@ pub(crate) fn capture_view(
     capture_view_with_overrides(world, role, width, height, CaptureOverrides::default())
 }
 
+#[cfg(target_os = "macos")]
 fn capture_view_with_world_painter(
     world: Arc<Mutex<WorldState>>,
     role: GuiViewRole,
@@ -245,40 +248,21 @@ fn capture_view_with_overrides_and_camera(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::path::PathBuf;
+    //! Required real-pixel tests and their exclusive helpers use `cfg(target_os = "macos")`
+    //! to match GPUI's actual headless-renderer availability (bd-h9ca). This is a compile-time
+    //! platform boundary: no test reports successful pixel capture on an unsupported platform.
+    //! The existing ignored diagnostics keep their explicit-run behavior and also need macOS
+    //! to capture pixels. Platform-independent checks remain available on other targets.
 
-    /// Why every real-pixel capture test in this module is `cfg(target_os = "macos")`
-    /// (bd-h9ca).
-    ///
-    /// GPUI supplies an offscreen renderer on macOS ONLY. `gpui_platform::
-    /// current_headless_renderer` is `Some(MetalHeadlessRenderer)` under
-    /// `cfg(target_os = "macos")` and `None` under `cfg(not(...))`, by upstream design.
-    /// With `None`, `Window::render_to_image` fails with "render_to_image not available:
-    /// no HeadlessRenderer configured" and NOTHING can be captured. That is not a
-    /// misconfiguration on our side — this module already passes
-    /// `current_headless_renderer` to `HeadlessAppContext::with_platform` correctly.
-    ///
-    /// Three tests here were missing this gate while three others already had it, so on
-    /// the Linux rch fleet — which is where every agent runs `cargo test -p
-    /// scriptbots-render` — the crate reported three permanent failures that belonged to
-    /// nobody. A gate that is red everywhere it runs teaches agents to ignore red, which
-    /// is the same instrument defect bd-c7pg was raised to P1 for, one level up.
-    ///
-    /// The gate is COMPILE-TIME on purpose. A runtime skip would let these report as
-    /// passing on a machine that never rendered a pixel, which is exactly the hollow
-    /// coverage this crate's tests exist to refuse. Compiled out, the test count tells
-    /// the truth: on Linux these do not exist, on macOS they run and must pass.
-    ///
-    /// This narrows rather than weakens the assertions — `target_os = "macos"` is
-    /// literally the condition upstream keys the renderer on, so the gate and the
-    /// capability are the same predicate. bd-c7pg established its determinism result on
-    /// aarch64-apple-darwin, which is precisely where these still run.
-    const REAL_PIXEL_CAPTURE_IS_MACOS_ONLY: () = ();
+    use super::*;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
 
     /// Representative logical sizes from the production horizontal split. The World
     /// owns the flexible remainder; the Lab stays within its 380–480 px clamp.
+    #[cfg(target_os = "macos")]
     const WORLD_VIEWPORT: (f32, f32) = (1400.0, 768.0);
+    #[cfg(target_os = "macos")]
     const LAB_VIEWPORTS: [(f32, f32); 2] = [(460.0, 768.0), (380.0, 600.0)];
 
     fn capture_world() -> Arc<Mutex<WorldState>> {
@@ -681,10 +665,12 @@ mod tests {
     /// Pixel tests are side-effect free by default. An explicit external directory
     /// turns on PNG retention for a human visual pass without rewriting checked-in
     /// historical probes during ordinary `cargo test`.
+    #[cfg(target_os = "macos")]
     fn probe_dir() -> Option<PathBuf> {
         std::env::var_os("SCRIPTBOTS_HUD_PROBE_DIR").map(PathBuf::from)
     }
 
+    #[cfg(target_os = "macos")]
     fn save_probe(image: &RgbaImage, name: &str) -> Option<PathBuf> {
         let directory = probe_dir()?;
         std::fs::create_dir_all(&directory).expect("probe output directory");
@@ -700,6 +686,7 @@ mod tests {
     /// run of adjacent columns that each carry many distinct colours. Returning a
     /// measured span rather than a hardcoded rectangle keeps this honest when the layout
     /// changes — which it just did, when the rail was hoisted.
+    #[cfg(target_os = "macos")]
     fn world_canvas_columns(image: &RgbaImage) -> (u32, u32) {
         const DIVERSE: usize = 12;
         let (w, h) = (image.width(), image.height());
@@ -760,8 +747,7 @@ mod tests {
     /// threshold tuned to hide the very noise the bead is about, which is the same
     /// defect wearing a different hat.
     ///
-    /// macOS-gated for the reason given at [`REAL_PIXEL_CAPTURE_IS_MACOS_ONLY`]
-    /// (bd-h9ca).
+    /// macOS-gated for the headless-renderer limitation documented by this module (bd-h9ca).
     #[cfg(target_os = "macos")]
     #[test]
     fn captures_of_one_world_are_byte_identical_when_perf_is_pinned() {

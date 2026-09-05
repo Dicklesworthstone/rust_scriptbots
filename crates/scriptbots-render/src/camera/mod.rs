@@ -592,7 +592,7 @@ fn toroidal_median(values: &mut [f32], extent: f32) -> Option<f32> {
     }
     values.sort_by(f32::total_cmp);
     let midpoint = values.len() / 2;
-    let median = if values.len() % 2 == 0 {
+    let median = if values.len().is_multiple_of(2) {
         let lower = values[midpoint - 1];
         lower + (values[midpoint] - lower) * 0.5
     } else {

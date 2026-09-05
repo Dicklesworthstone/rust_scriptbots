@@ -1396,14 +1396,13 @@ impl TournamentHarness {
             let winner_id = sorted[0].0;
             let loser_id = sorted[1].0;
 
-            if winner_id != loser_id {
-                if let Some(mut winner) = self.ratings.get(winner_id).cloned() {
-                    if let Some(mut loser) = self.ratings.get(loser_id).cloned() {
-                        EloRating::update_elo(&mut winner, &mut loser, 32.0);
-                        self.ratings.insert(winner_id.clone(), winner);
-                        self.ratings.insert(loser_id.clone(), loser);
-                    }
-                }
+            if winner_id != loser_id
+                && let Some(mut winner) = self.ratings.get(winner_id).cloned()
+                && let Some(mut loser) = self.ratings.get(loser_id).cloned()
+            {
+                EloRating::update_elo(&mut winner, &mut loser, 32.0);
+                self.ratings.insert(winner_id.clone(), winner);
+                self.ratings.insert(loser_id.clone(), loser);
             }
         }
         self.match_history.push(result);

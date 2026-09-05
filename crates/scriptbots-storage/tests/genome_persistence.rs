@@ -689,10 +689,7 @@ fn test_db_backed_lineage_locus_tracing_with_csv_and_png_export_and_live_crossch
     for sample in &samples {
         if let Some((_, live_env)) = live_genomes.iter().find(|(u, _)| *u == sample.agent_uid) {
             let live_loci = codec.genome_loci(live_env)?;
-            let expected_val = live_loci
-                .iter()
-                .find(|(l, _)| *l == locus)
-                .map(|(_, v)| v.clone());
+            let expected_val = live_loci.iter().find(|(l, _)| *l == locus).map(|(_, v)| *v);
             assert_eq!(
                 sample.value, expected_val,
                 "Locus trace must match live world genome"

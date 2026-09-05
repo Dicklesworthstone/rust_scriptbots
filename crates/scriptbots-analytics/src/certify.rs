@@ -399,7 +399,7 @@ mod tests {
     fn benjamini_hochberg_rejects_nothing_when_all_null() {
         let p = [0.4, 0.6, 0.8, 0.55, 0.9];
         assert_eq!(benjamini_hochberg(&p, 0.05), vec![false; 5]);
-        assert!(benjamini_hochberg(&[], 0.05).is_empty());
+        assert_eq!(benjamini_hochberg(&[], 0.05), [] as [bool; 0]);
     }
 
     #[test]

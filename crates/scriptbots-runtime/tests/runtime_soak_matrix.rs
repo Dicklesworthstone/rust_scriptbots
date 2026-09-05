@@ -564,13 +564,8 @@ fn assert_drive_completed_at_tick(
     assert_eq!(driver.host().core().world_tick(), tick);
 }
 
-#[test]
-fn test_runtime_journal_fault_injection_matrix() {
-    let start_time = Instant::now();
-    let fault_mode = Arc::new(AtomicU8::new(0)); // Start Normal
-
-    let journal = Box::new(FaultInjectedJournal::new(Arc::clone(&fault_mode)));
-
+fn build_fault_test_host(fault_mode: Arc<AtomicU8>) -> FixedDeadlineHost {
+    let journal = Box::new(FaultInjectedJournal::new(fault_mode));
     let config = ScriptBotsConfig {
         rng_seed: Some(0xfa01_7001),
         population_minimum: 10,
@@ -595,7 +590,14 @@ fn test_runtime_journal_fault_injection_matrix() {
 
     let core = HostCore::with_journal(HostSessionId::new(0xfa01_7001), world, options, journal)
         .expect("host core with fault journal builds");
-    let host = FixedDeadlineHost::new(core);
+    FixedDeadlineHost::new(core)
+}
+
+#[test]
+fn test_runtime_journal_fault_injection_matrix() {
+    let start_time = Instant::now();
+    let fault_mode = Arc::new(AtomicU8::new(0)); // Start Normal
+    let host = build_fault_test_host(Arc::clone(&fault_mode));
 
     let (mut driver, port) =
         ChannelHostDriver::new(host, fast_channel_options()).expect("driver builds");

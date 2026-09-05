@@ -376,11 +376,7 @@ pub fn run_archipelago_report(args: &ReportArchipelagoArgs) -> Result<bool> {
         println!("Wrote archipelago report JSON to {}", json_path.display());
     }
 
-    if args.verify_conservation && !report.conservation_audit.passed {
-        return Ok(false);
-    }
-
-    Ok(true)
+    Ok(!args.verify_conservation || report.conservation_audit.passed)
 }
 
 #[cfg(test)]
