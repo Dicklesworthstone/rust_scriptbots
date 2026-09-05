@@ -22,18 +22,34 @@ process machinery is needed; the next useful output is working interaction analy
     seeded sampling are exposed. Candidate implementation committed as `428d102`.
   - [ ] Re-execute the final fixture additions through clean pinned DSR; inspect failures
     and original acceptance criteria before closing the implementation bead.
-- [ ] **bd-2z0.11.12 — real storage and CLI proof.** Persist a hand-enumerated fixture
+    DSR at `f98a819` executed all ten graph tests successfully; the overall lane
+    failed later in the unrelated archive fixture. Fresh DSR at `3bb1fb4` again
+    passed all ten (106.02 seconds); all 14 combined-lane steps subsequently passed.
+    I prematurely closed this bead, then reopened it when review found the tested
+    window had no event exactly at its exclusive end. Candidate `fe2271d` supplies
+    that discriminator and the independent row-cap control; fresh execution remains.
+- [ ] **bd-2z0.11.12 — real storage and CLI proof [Currently In Progress], TurquoiseLake.** Persist a hand-enumerated fixture
   with repeated/directed/boundary events and two runs; close and reopen it; exercise
   actual report/export processes; independently parse counts, weights and selection;
   test missing capture evidence, empty/reversed/one-sided windows, zero limits,
   over-budget selection, nonfinite data and source isolation; retain execution logs.
   - [x] Ten tests written, including real file persistence, reopening, both CLI formats,
     two-run attribution, boundary selection and seeded centrality controls.
-  - [x] Earlier candidate ran 10/10 on RCH; explicitly diagnostic. Subsequent capture
-    truncation, typo rejection and retained subprocess records still need execution.
-  - [ ] Add a persisted capture-counter contradiction control; verify the refusal.
-  - [ ] Claim companion proof after implementation closes; independently re-run at its SHA.
-- [ ] **bd-build-farm-reliability-lb19.1 — usable pinned DSR profile [Currently In Progress], TurquoiseLake.** Inspect installed
+  - [x] Latest graph candidate ran 10/10 through actual clean DSR, including capture
+    truncation, typo rejection and retained subprocess records.
+  - [x] Persisted a third run with internally balanced counters contradicting actual
+    edge rows; report and both export formats refused it in that DSR run.
+  - [x] Claim companion proof after implementation closes. The implementation was
+    subsequently reopened for missing boundary evidence; both remain in progress.
+  - [ ] Finish clean DSR `combined-c5ac1a9-20260905-06` through the actual analytics
+    E2E wrapper: exclude an actual
+    end-tick event, reach the row cap with generous byte/work budgets, and require
+    each declared refusal cause. Retain expected/observed results and first failure.
+    Solo re-execution is not independent verification.
+  - [x] Replace the analytics E2E wrapper's ignored simulation failure, empty database
+    and unconditional success with the actual pinned DSR graph lane. Full seeded
+    simulation/report acceptance remains open under `bd-2z0.11.9`.
+- [x] **bd-build-farm-reliability-lb19.1 — usable pinned DSR profile, closed.** Inspect installed
   DSR schema and available hosts; provide a portable reviewed profile/materialization
   path; bind source, toolchain, target and external evidence; distinguish preflight
   refusal from test failure; include workspace checks and core economy-fault tests.
@@ -43,32 +59,107 @@ process machinery is needed; the next useful output is working interaction analy
   - [x] First clean run retained a real WASM snapshot failure before compilation:
     `graphs-d8083c6-20260905-01`, external proof root
     `/data/tmp/scriptbots-dsr-20260905-TmJwOJ/proofs` on hz4.
-  - [ ] Qualify the reviewed snapshot update for existing genome PNG dependencies;
-    repair stale archive and meadow compilation prerequisites without weakening checks.
-  - [ ] Complete nonzero executed test evidence and source/profile immutability checks.
+  - [x] DSR accepted the two-line WASM snapshot update for existing genome PNG
+    dependencies (`adler2`, `miniz_oxide`); no performance golden was changed.
+  - [x] Workspace all-target check passed diagnostically after stale archive/meadow
+    interface repairs. Strict Clippy still fails on 421 existing core diagnostics.
+  - [x] Archive unit test passed in DSR. Archive integration exposed contradictory
+    demographic fixture counts. Repair `2c091ef` keeps explicit births/deaths refusal
+    checks and then admits a consistent tick; its diagnostic runtime rerun passed
+    (one executed test, zero failures, eleven unrelated tests filtered).
+  - [x] Clean DSR at `3bb1fb4` passed all 14 named combined-lane steps; process and
+    typed verdict both report zero/pass. Required logs, actual test counts and
+    source/profile/target identity were checked by the runner and launcher.
+  - [x] Seven actual preflight cases parsed and retained at
+    `/tmp/scriptbots-dsr-negatives-20260905/cases.jsonl`: missing config/profile/host,
+    wrong source/target, dirty source and reused proof version. The undeclared-host
+    case exposed DSR's SSH fallback; launcher `dc32bf4` rejects it locally.
+  - [x] Added retained-evidence readback that rechecks required commands, log hashes,
+    actual test counts and source/profile/target identity, plus a combined graph/recipe
+    lane to share dependency compilation. This is verification infrastructure only.
+  - [x] The same checker accepted the real positive bundle and rejected nine altered
+    copies (missing/changed logs, stale source, non-pass verdict, duplicate commands,
+    zero test count, missing profile/source record and wrong target). Parsed index on
+    hz4: `/data/tmp/scriptbots-evidence-readback-20260905-bwl7kzmy/cases.jsonl`.
+    These are retained-record checks, not additional simulation executions.
 - [ ] **bd-build-farm-reliability-lb19.2 — actual DSR qualification.** Materialize from
   an empty configuration; exercise wrong-source/dirty/missing-host negatives; run
   check, strict Clippy, formatting and tests; retain actual counts and source identity;
   run performance only on the checked-in golden's exact class through DSR.
+  - [x] Fresh configuration and seven real preflight controls exercised.
+  - [ ] Workspace check, strict Clippy, workspace tests and explicit economy-fault
+    tests must all execute successfully through DSR. Diagnostic check passed;
+    strict Clippy's 421 existing core diagnostics remain unresolved.
+  - [ ] Locate the checked-in golden's exact M4/macOS/toolchain machine class and
+    run its pinned DSR comparison. No compatible host is available in this session;
+    no performance command, fingerprint change or re-baseline was attempted.
 - [ ] **bd-2z0.13.8 — repair extension recipes [Currently In Progress], TurquoiseLake.** Reconcile exact Brain/registry APIs;
   compile the literal custom-family recipe; normalize and execute the scenario;
   demonstrate actual host command application and projection; correct architecture
   claims at their source without removing extension topics.
   - [x] Confirmed the current tests never execute the advertised custom family,
     normalized scenario effects, or host command application.
-  - [ ] Make literal Rust recipes compile and run under rustdoc using real protocol APIs.
-  - [ ] Execute the literal scenario document through production config composition.
-  - [ ] Observe command application, journal disposition and matching projection.
-  - [ ] Correct current ownership, supported CLI choices and recipe evidence claims.
+  - [x] Four literal Rust recipes compile and run under rustdoc with real protocol APIs;
+    diagnostic run: four passed, zero failed/ignored/filtered.
+  - [x] Literal scenario executes both scheduled effects through production config
+    composition, with matched-seed food-cell change and no-change controls.
+  - [x] Host example observes applied command, volatile journal, matching projection
+    and idempotent retry. It does not certify a production frontend.
+  - [x] Current ownership, supported CLI choices and recipe scope corrected in place.
+  - [x] Strengthened custom-family example checks changed output sequences and actual
+    founder-bound genomes. Added four valid compiler/runtime cases and eight mutations
+    of the actual guide, with retained exact compiler inputs and process outputs.
+  - [x] Complete clean DSR `combined-3bb1fb4-20260905-04` on hz4. The prior
+    `recipes-628cd49-20260905-03` executed four literal programs and nine ordinary
+    integration tests, then was explicitly cancelled during an unnecessary second
+    dependency build. It is not a pass. Candidate `3bb1fb4` uses artifact records
+    from the integration test that already ran. The expensive mutation test is
+    explicitly selected by DSR; ordinary discovery does not execute it.
+  - [x] Latest workspace all-target check passed diagnostically after mutation-test
+    additions. The standalone checker now derives target-specific library, metadata
+    and transitive dependency paths from Cargo records; execute this final revision.
+  - [x] Fresh review found the custom recipe accepted another genome's recurrent
+    checkpoint. Candidate `209d5d4` binds state to the core material hash, advances
+    the state schema/codec and adapter identity, and resets offspring with the
+    child's binding. This is a real correction found after the earlier positives.
+  - [x] Finish `recipes-209d5d4-20260905-05` through the actual recipe wrapper.
+    Its four documentation programs, nine ordinary tests and all eleven standalone
+    cases (four valid, seven mutations) passed; all ten required steps completed
+    with DSR exit zero and typed pass. This verifies the checkpoint binding fix.
+  - [x] Readback found meteor had no saved observation and scenario/frontend used
+    prose. Candidate `c5ac1a9` emits parsed, versioned scientific records from all
+    four literal programs. It retains measured food-cell comparisons, applied
+    meteor cells/tick and actual command/journal/projection states.
+  - [ ] Finish the new combined run at `c5ac1a9`, including its eighth mutation:
+    a successful meteor process whose observation was redirected away from stdout
+    must fail the same acceptance predicate. No recipe closure before this passes.
 - [ ] **bd-2z0.13.10 — execute extension recipes.** Register/evaluate/mutate/reproduce
   and checkpoint the documented family; execute both scheduled scenario effects;
   correlate host application, journal and projection; mutate the real recipe as the
   negative control; replace tests that only grep names or check disconnected strings.
+  - [x] Four literal programs executed under rustdoc in DSR at `628cd49`.
+  - [x] Run those four through the retained standalone compiler/runtime checker at `209d5d4`.
+  - [x] Observe all seven declared mutations fail that same checker at `209d5d4`: broken evaluator
+    method, missing founder installation, disabled genome/state binding, nonexistent
+    CLI preset, unknown literal TOML key, omitted meteor step and admission
+    substituted for application.
+  - [ ] Observe the additional missing-observation mutation and parse all four valid
+    scientific records at `c5ac1a9`; expected total is twelve distinct cases.
+  - [ ] Read the retained compiler diagnostics, scientific outputs and receipt
+    observations; claim and close only after the paired implementation passes.
 - [ ] **bd-2z0.13.9 — compose the Evolution Lab journey.** Reuse production startup,
   scene inspection, control receipts, durable history, checkpoint continuation,
   matched-seed experiment and report/bundle paths; bind each stage to predecessor
   identities; derive required frontend cells from declared support; expose actual
   subset coverage while required upstream work remains incomplete.
+  - [x] Inspect existing consumers and declarations. No canonical versioned product
+    matrix exists yet; `bd-1bdd` owns it. Browser hardware coverage is a different
+    matrix and cannot define release support. The manifest is not implemented.
+  - [ ] Consume the owning product matrix without shrinking its required cells.
+  - [ ] Join startup, inspection, applied/journaled controls, durable run, checkpoint,
+    matched-seed comparison and report/bundle records by their actual identities.
+  - [ ] Require every declared stage/cell and preserve failed/refused/unexecuted
+    dispositions. Component passes cannot satisfy the final product journey.
 - [ ] **bd-2z0.13.11 — final journey proof.** Execute the composed journey and its
   identity/seed/checkpoint/receipt/artifact negative controls after dependency proofs;
   verify all required frontend cells; keep this open until actual production evidence
@@ -78,6 +169,13 @@ process machinery is needed; the next useful output is working interaction analy
   unowned ready prerequisites when they become the highest-value next step.
   Track checkpoint bd-2z0.5.13, scenarios bd-2z0.10.4/.5, analytics bd-2z0.11.9,
   release bd-1bdd, TUI bd-2z0.6.8, Bevy bd-2z0.7.2 and browser bd-2z0.12.3.
+  - [x] Meadow helper test now uses production config composition and actual
+    Ratatui TestBackend frames; CPU PNG and TestBackend scope is explicit.
+  - [ ] Keep full meadow acceptance open: diagnostic cohort failed for seed
+    `20260717` (zero deaths in 300 ticks versus the declared floor of one).
+    Seeds 42 and 137 completed both helper paths with matching digests and no
+    ledger breaches. The third CPU path and later controls were not reached.
+    No seed, horizon, population envelope or demographic floor was weakened.
 - [ ] **For each implementation block:** meaningful positive and discriminating
   negative tests; required compiler/lint/format checks; fresh self-review against the
   original bead; accurate status and evidence; reviewed exact-path commits and sync.
