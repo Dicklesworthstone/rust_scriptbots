@@ -18376,14 +18376,14 @@ impl Storage {
                 return Ok(inserted);
             }
             sql.push_str(" RETURNING 1");
-            let affected = tx.query_with_params(&sql, &parameters)?.len();
+            let returned = tx.query_with_params(&sql, &parameters)?.len();
             let expected = parameters.len() / WIDTH;
-            if affected != expected {
+            if returned != expected {
                 return Err(FrankenError::Internal(format!(
-                    "scientific insert returned {affected} rows for {expected} inputs"
+                    "scientific insert returned {returned} rows for {expected} inputs"
                 )));
             }
-            inserted += affected;
+            inserted += returned;
         }
     }
 
@@ -25160,17 +25160,22 @@ mod tests {
         connection.execute("CREATE TABLE receipt_probe (id INTEGER PRIMARY KEY)")?;
         connection.execute("INSERT INTO receipt_probe (id) VALUES (1)")?;
         let mut transaction = connection.transaction()?;
-        let error = Storage::execute_bounded_insert(
+        let result = Storage::execute_bounded_insert(
             &transaction,
-            "INSERT OR IGNORE INTO receipt_probe (id) VALUES (?1)",
-            [[1_i64.into()], [2_i64.into()]].into_iter(),
-        )
-        .expect_err("one ignored input must not satisfy the two-row count guard");
+            "INSERT INTO receipt_probe (id) SELECT ?1 WHERE 0",
+            [[2_i64.into()]].into_iter(),
+        );
+        // Establish that this SQL control really wrote no row before interpreting
+        // its returned-row count. An unobserved conflict-policy assumption is insufficient.
+        let rows = transaction.query("SELECT id FROM receipt_probe ORDER BY id")?;
+        assert_eq!(rows.len(), 1, "the zero-row SQL control inserted a row");
+        assert_eq!(rows[0].get_typed::<i64>(0)?, 1);
+        let error = result.expect_err("zero returned rows must fail the one-input count guard");
         assert!(
             matches!(
                 &error,
                 FrankenError::Internal(detail)
-                    if detail == "scientific insert returned 1 rows for 2 inputs"
+                    if detail == "scientific insert returned 0 rows for 1 inputs"
             ),
             "expected the returned-row count mismatch, observed {error:?}"
         );
