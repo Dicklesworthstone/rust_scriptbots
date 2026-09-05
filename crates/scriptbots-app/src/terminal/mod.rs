@@ -2710,10 +2710,13 @@ impl<'a> TerminalApp<'a> {
             )]),
             Line::raw(" Terrain: 🌊 deep water, 💧 shallow, 🏜 sand, 🌿 grass, 🌺 bloom, 🪨 rock"),
             Line::raw("          lush/barren variants may appear: 🐟, 🌴, 🌾, 🥀"),
-            Line::raw(
-                " Agents:  single 🐇 herb, 🦝 omni, 🦊 carn; small groups 🐑/🐻/🐺; large 👥",
-            ),
-            Line::raw("          boosted 🚀; spike peak ⚔ (underlined)"),
+            Line::raw(" Agents: arrows show heading."),
+            Line::raw(" Diet: underlined herb; normal omni;"),
+            Line::raw("       bold carn."),
+            Line::raw(" Fallbacks: 🐇 herb, 🦝 omni, 🦊 carn;"),
+            Line::raw("            groups 🐑/🐻/🐺 or 👥"),
+            Line::raw(" Boost/groups: italic; boost 🚀; spike ⚔/!"),
+            Line::raw(" Spike/large groups: reversed."),
             Line::raw(" Narrow:  width-1 symbols: ≈ ~ · \" * ^; agents h/H, o/O, c/C; groups @"),
         ];
 
@@ -6771,9 +6774,12 @@ impl Palette {
 
         let mut style = base
             .fg(self.diet_color(class))
+            // Diet owns these two channels, independent of terrain, boost or
+            // spike emphasis. Otherwise a boosted omnivore looks carnivorous.
+            .remove_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             .add_modifier(Self::diet_modifier(class));
         if occupancy.boosted || total > 1 {
-            style = style.add_modifier(Modifier::BOLD);
+            style = style.add_modifier(Modifier::ITALIC);
         }
         if total > 3 {
             style = style.add_modifier(Modifier::REVERSED);
@@ -6791,7 +6797,7 @@ impl Palette {
             } else {
                 '!'
             };
-            style = style.add_modifier(Modifier::UNDERLINED);
+            style = style.add_modifier(Modifier::REVERSED);
         }
         if let Some(tendency) = occupancy.mean_tendency() {
             if tendency < 0.25 {
@@ -9469,15 +9475,17 @@ mod tests {
                 let (buffer, layout, _) =
                     capability_frame(&row, CuratedThemeId::default(), width, 36);
                 let area = layout.map;
-                for diet in [
-                    DietClass::Herbivore,
-                    DietClass::Omnivore,
-                    DietClass::Carnivore,
+                // These agents have tendencies 0, 0.5 and 1. The extremes
+                // intentionally use ANSI green/red instead of theme colours.
+                for (diet, expected_color) in [
+                    (DietClass::Herbivore, Color::Green),
+                    (DietClass::Omnivore, palette.diet_color(DietClass::Omnivore)),
+                    (DietClass::Carnivore, Color::Red),
                 ] {
                     let cells: Vec<_> = (area.y..area.bottom())
                         .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
                         .map(|position| &buffer[position])
-                        .filter(|cell| cell.fg == palette.diet_color(diet))
+                        .filter(|cell| cell.fg == expected_color)
                         .collect();
                     assert_eq!(
                         cells.len(),
@@ -9490,6 +9498,50 @@ mod tests {
                         cells[0].modifier & (Modifier::BOLD | Modifier::UNDERLINED),
                         Palette::diet_modifier(diet)
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_diet_markers_remain_distinct_under_terrain_and_action_emphasis() {
+        let palette = Palette::test_backend_evidence();
+        let base =
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::DIM);
+        for count in [1, 2, 4] {
+            for boosted in [false, true] {
+                for spike in [0.0, 1.0] {
+                    let mut observed = Vec::new();
+                    for (diet, expected) in [
+                        (DietClass::Herbivore, Modifier::UNDERLINED),
+                        (DietClass::Omnivore, Modifier::empty()),
+                        (DietClass::Carnivore, Modifier::BOLD),
+                    ] {
+                        let mut occupancy = CellOccupancy::default();
+                        for _ in 0..count {
+                            occupancy.add(diet, boosted, 1.0, 0.0, spike, 0.5, 1);
+                        }
+                        let (glyph, style) = palette.agent_symbol(&occupancy, base);
+                        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+                        let cell = &mut buffer[(0, 0)];
+                        cell.set_style(base);
+                        cell.set_char(glyph).set_style(style);
+                        let marker = cell.modifier & (Modifier::BOLD | Modifier::UNDERLINED);
+                        assert_eq!(marker, expected, "{diet:?}/{count}/{boosted}/{spike}");
+                        assert!(cell.modifier.contains(Modifier::DIM));
+                        assert_eq!(
+                            cell.modifier.contains(Modifier::ITALIC),
+                            boosted || count > 1
+                        );
+                        assert_eq!(
+                            cell.modifier.contains(Modifier::REVERSED),
+                            spike > 0.6 || count > 3
+                        );
+                        observed.push(marker);
+                    }
+                    assert_ne!(observed[0], observed[1]);
+                    assert_ne!(observed[1], observed[2]);
+                    assert_ne!(observed[0], observed[2]);
                 }
             }
         }
@@ -9535,7 +9587,7 @@ mod tests {
                 let buffer = terminal.backend().buffer();
                 let body = &buffer[(body_column, 0)];
                 assert_eq!(body.symbol(), expected_heading);
-                assert_eq!(body.fg, palette.diet_color(DietClass::Herbivore));
+                assert_eq!(body.fg, Color::Green);
                 assert!(body.modifier.contains(Modifier::UNDERLINED));
                 assert_eq!(buffer[(body_column + 1, 0)].symbol(), " ");
                 if !width.is_multiple_of(2) {
