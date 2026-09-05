@@ -1,6 +1,6 @@
 # ScriptBots Analytics: Lineage & Interaction Graph Reports
 
-**Tracking Bead:** `bd-2z0.11.7`  
+**Tracking Beads:** `bd-2z0.11.7`, `bd-2z0.11.11`, `bd-2z0.11.12`
 **Applies to:** `scriptbots-analytics`, `scriptbots-storage`, `sb-analyze`, `fnx` ecosystem (`fnx-classes`, `fnx-algorithms`, `fnx-readwrite`).
 
 ---
@@ -24,7 +24,7 @@ Evolutionary simulations in `ScriptBots` generate rich relational structures: di
 3. **`interaction-centrality` (`INTERACTION_CENTRALITY_SCHEMA_ID_V1`)**:
    - Evaluates social and combat interaction networks between agents.
    - Calculates directed in-degree, out-degree, betweenness centrality (via Brandes' shortest-path algorithm), and PageRank.
-   - Documents the pairwise interaction persistence gap between full replay event logs and relational SQLite tables.
+   - Reports canonical interaction selection, repeated-edge attributes and run-wide capture accounting.
 4. **Graph Export & Interoperability (`sb-analyze export-graph`)**:
    - Exports lineage, dynasty, and interaction graphs to standard formats: GraphML (`.graphml`) and strict Edge-List (`.edgelist`).
 
@@ -45,7 +45,10 @@ Evolutionary simulations in `ScriptBots` generate rich relational structures: di
   - Undirected projection generated via `digraph.to_undirected()` preserving bidirectional topological connectivity for community detection.
 - **Interaction Graph (`DiGraph`)**:
   - Directed edge $(S, T)$ signifies actor $S \to \text{target } T$.
-  - Edge attributes: `weight` (f64, cumulative interaction magnitude), `count` (u64, interaction frequency).
+  - Edge attributes: `weight` (f64, sum of selected magnitudes), `count` (integer, selected event multiplicity).
+  - Combat damage and food-share energy retain their recorded magnitudes; their sum is not a normalized physical quantity.
+  - Nodes are the actors and targets of selected events. Agents with no selected interactions are excluded.
+  - Missing/nonfinite magnitudes and nonfinite aggregate weights are errors.
 
 ### 2.2 The String-Key Performance Tax
 
@@ -88,40 +91,51 @@ The `dynasty-communities` report characterizes sub-family clustering and speciat
 
 ### 3.3 Interaction Centrality
 
-Interactions reflect competition, predation, mating attempts, and sensor collisions:
+The canonical interaction events currently record completed combat hits and food sharing.
+All three centrality algorithms use the unweighted simple directed graph. The count and
+weight attributes are preserved for export; they do not change these centrality scores.
 
 - **Degree Centrality**:
-  - Out-degree: Initiated encounters (aggression/activity).
-  - In-degree: Targeted encounters (vulnerability/attractiveness).
+  - Out-degree: Number of distinct selected targets.
+  - In-degree: Number of distinct selected actors targeting this agent.
 - **Betweenness Centrality**:
   - Directed betweenness computed via `fnx_algorithms::betweenness_centrality_directed(digraph)`.
   - Identifies bridge agents that connect otherwise isolated social clusters.
+  - Above 1,000 nodes, defaults to 100 source nodes; `sample_k` explicitly requests a
+    positive source count. Sources are ordered by BLAKE3(seed, node identity), making
+    the declared seed effective. The report records the exact source UIDs and seed.
 - **PageRank**:
-  - Directed PageRank computed via `fnx_algorithms::pagerank_directed_with_params(digraph, alpha, max_iter, tol)`.
+  - Directed PageRank computed via `fnx_algorithms::pagerank_directed(digraph)`.
   - Measures steady-state influence within the interaction network.
 
 ---
 
-## 4. Pairwise Persistence Gap Analysis
+## 4. Selection, Bounds and Capture Evidence
 
-### 4.1 The Divergence
+Reports and interaction exports call the same finished-run reader over `interactions`.
+The writer projects these rows from typed replay interaction events under the same
+run/tick/sequence identity. Empty canonical results do not trigger a replay fallback.
 
-During simulation execution, agent interactions occur at high frequency (thousands per tick). Two recording paths exist in the architecture:
+| Parameter | Contract |
+| :--- | :--- |
+| Neither tick bound | `recent_page`: newest `limit` events, returned in ascending `(tick, seq)` order. |
+| `start_tick` and `end_tick` | `complete_window`: every persisted event in `[start_tick, end_tick)`. Both bounds are required and start must be less than end. |
+| `limit` | Maximum selected rows, default and maximum 4,096. A complete window exceeding it fails. Zero produces an empty recent page, or accepts only an empty complete window. |
+| `max_projected_bytes` | Bounds fixed-width `InteractionGraphEvent` values, including one overflow sentinel. Default derives from the Rust type's size and maximum row count. Narrative payloads and coordinates are not loaded. |
+| `max_graph_work` | Conservative all-source betweenness node/edge visit budget, checked from the requested row cap before loading. Default is `6 × 4096²`. It is not a wall-clock or whole-process memory bound. |
+| `deadline_ms`, `fallback` | Refused: the synchronous offline SQL reader has no hard deadline, and replay selection is a different population. |
 
-1. **Replay Event Stream (`replay_events` table)**:
-   - Serialized stream of `ReplayEventKind::Interaction { tick, ordinal, kind, magnitude }`.
-   - Captures actor ordinal, target ordinal, interaction category (combat, feeding, mating, collision), and scalar magnitude.
-   - Complete, chronological, but requires linear parsing and decoding of compressed payload chunks.
-2. **Relational Interaction Store (`interactions` table)**:
-   - Planned normalized relational schema: `(tick, actor_uid, target_uid, interaction_kind, magnitude)`.
-   - Currently omitted or sparse in standard storage workloads to conserve I/O bandwidth during high-tick runs.
+The report's `input` identifies the run, selection, ordering, budgets, selected
+event IDs, total canonical run rows, and whether a recent page omitted older rows.
+SQL execution time and the engine's working memory remain unbounded; result bounds
+must not be interpreted as a hard database execution budget.
 
-### 4.2 Fallback Strategy in `scriptbots-analytics`
-
-To provide robust reporting across both storage modes:
-- `analyze_interaction_centrality` first queries the relational `interactions` table if present.
-- When `interactions` contains zero records, it transparently falls back to extracting interaction events from the `replay_events` stream.
-- When neither source contains pairwise interaction data, the report completes cleanly with `nodes: 0`, `edges: 0`, empty centralities, and notes the persistence gap in report diagnostics.
+Capture counters describe the **whole run**: observed, persisted, sampled-out and
+truncated events. Their accounting identity and agreement with the canonical row
+count are checked. Missing counters mean `unknown`; an empty selection alone never
+proves there were no encounters. Run-wide omissions cannot be localized to a tick
+sub-window from these counters. Capture completeness is separate from page truncation
+and from the algorithms' unweighted semantics.
 
 ---
 
@@ -133,19 +147,32 @@ The analytics binary exposes direct graph export functionality:
 
 ```bash
 # Export lineage DAG to GraphML format
-sb-analyze export-graph --db ./simulation.db --kind lineage --format graphml --output ./lineage.graphml
+sb-analyze ./simulation.db export-graph --graph lineage --format graphml --out ./lineage.graphml
 
 # Export dynasty undirected projection to edge-list format
-sb-analyze export-graph --db ./simulation.db --kind dynasty --format edgelist --output ./dynasty.edgelist
+sb-analyze ./simulation.db export-graph --graph dynasty --format edgelist --out ./dynasty.edgelist
 
 # Export interaction network to GraphML format
-sb-analyze export-graph --db ./simulation.db --kind interaction --format graphml --output ./interactions.graphml
+sb-analyze ./simulation.db export-graph --graph interaction --format graphml \
+  --params start_tick=100 --params end_tick=200 --out ./interactions.graphml
+
+# The report selects exactly the same complete window
+sb-analyze ./simulation.db run interaction-centrality \
+  --params start_tick=100 --params end_tick=200 --json ./interactions.json
 ```
+
+For databases containing multiple runs, supply `--run-id <canonical-128-bit-hex-id>`.
+Omitting it on an ambiguous database fails; run IDs do not alter agent identities.
 
 ### 5.2 Supported Formats
 
 - **GraphML (`.graphml`)**: Full XML specification including node and edge attributes (`birth_tick`, `generation`, `weight`, `count`). Compatible with Gephi, Cytoscape, and NetworkX.
-- **Strict Edge-List (`.edgelist`)**: Plaintext space-delimited format (`source target [weight]`) generated via `fnx_readwrite::EdgeListEngine::strict()`.
+- **Strict Edge-List (`.edgelist`)**: fnx attributed syntax: `source target count=2;weight=5.5`. Both attributes survive parsing; this is not a two-column or weight-only edge list.
+
+Interaction GraphML embeds JSON selection evidence in the graph attribute
+`scriptbots_interaction_evidence`. Interaction edge lists carry the same JSON in
+their first comment line, `# scriptbots.interaction-edgelist.v1 <JSON>`. Preserve
+that header when exchanging files so the selected population remains identifiable.
 
 ---
 
@@ -158,9 +185,6 @@ All graph analysis functions emit structured microsecond/millisecond timings in 
 - `analysis_time_ms`: Execution time for `fnx-algorithms` graph procedures (WCC, SCC, longest path, Louvain, betweenness, PageRank).
 - `total_duration_ms`: Wall-clock end-to-end execution.
 
-### Benchmark Smoke Results (100,000-Edge Synthetic Lineage DAG)
-- Graph construction (100,000 edges, 100,001 nodes): ~450 ms.
-- Weakly Connected Components: ~120 ms.
-- Strongly Connected Components (Acyclicity proof): ~180 ms.
-- Longest path generation chain: ~210 ms.
-- Total processing time: $\approx 1.2$ seconds.
+The 100,000-edge lineage smoke test records its actual stage timings and enforces
+its existing 15-second budget. Earlier example timings here had no retained source
+or host identity and are withdrawn. Performance claims require the pinned DSR lane.

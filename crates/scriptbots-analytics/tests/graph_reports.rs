@@ -25,7 +25,8 @@ use scriptbots_core::{
     PersistenceEvent, PersistenceEventKind, Position, Tick, TickSummary,
 };
 use scriptbots_storage::{
-    PersistedAncestryBirth, PersistedAncestryDeath, PersistedInteraction, Storage,
+    InteractionGraphBudget, InteractionGraphEvent, InteractionGraphSelection,
+    PersistedAncestryBirth, PersistedAncestryDeath, Storage,
 };
 
 fn sample_birth(
@@ -281,64 +282,45 @@ fn graph_export_graphml_and_edgelist_roundtrip() {
 #[test]
 fn interaction_centrality_on_synthetic_interactions() {
     let interactions = vec![
-        PersistedInteraction {
+        InteractionGraphEvent {
             tick: 1,
             seq: 1,
-            kind: "combat".to_owned(),
             actor: AgentUid(1),
             target: AgentUid(2),
-            value: Some(10.0),
-            actor_position: None,
-            target_position: None,
-            payload: String::new(),
+            magnitude: Some(10.0),
         },
-        PersistedInteraction {
+        InteractionGraphEvent {
             tick: 2,
             seq: 2,
-            kind: "combat".to_owned(),
             actor: AgentUid(1),
             target: AgentUid(3),
-            value: Some(15.0),
-            actor_position: None,
-            target_position: None,
-            payload: String::new(),
+            magnitude: Some(15.0),
         },
-        PersistedInteraction {
+        InteractionGraphEvent {
             tick: 3,
             seq: 3,
-            kind: "combat".to_owned(),
             actor: AgentUid(1),
             target: AgentUid(4),
-            value: Some(20.0),
-            actor_position: None,
-            target_position: None,
-            payload: String::new(),
+            magnitude: Some(20.0),
         },
-        PersistedInteraction {
+        InteractionGraphEvent {
             tick: 4,
             seq: 4,
-            kind: "food_share".to_owned(),
             actor: AgentUid(2),
             target: AgentUid(3),
-            value: Some(5.0),
-            actor_position: None,
-            target_position: None,
-            payload: String::new(),
+            magnitude: Some(5.0),
         },
-        PersistedInteraction {
+        InteractionGraphEvent {
             tick: 5,
             seq: 5,
-            kind: "combat".to_owned(),
             actor: AgentUid(3),
             target: AgentUid(4),
-            value: Some(25.0),
-            actor_position: None,
-            target_position: None,
-            payload: String::new(),
+            magnitude: Some(25.0),
         },
     ];
 
-    let (digraph, format_ms, bulk_ms) = build_interaction_digraph(&interactions);
+    let (digraph, format_ms, bulk_ms) =
+        build_interaction_digraph(&interactions).expect("build graph");
     assert_eq!(digraph.node_count(), 4);
     assert_eq!(digraph.edge_count(), 5);
 
@@ -353,11 +335,8 @@ fn interaction_centrality_on_synthetic_interactions() {
 
     let payload = analyze_interaction_centrality(
         &digraph,
-        "interactions",
-        interactions.len(),
+        synthetic_interaction_evidence(&interactions),
         10,
-        None,
-        None,
         None,
         0x114_EA9E,
         timings,
@@ -379,12 +358,531 @@ fn interaction_centrality_on_synthetic_interactions() {
     assert!(!payload.top_by_betweenness.is_empty());
     assert!(!payload.top_by_pagerank.is_empty());
 
-    // Persistence gap documented
+    assert_eq!(payload.input.capture_status, "unknown");
+    assert_eq!(payload.input.run_capture, None);
+    assert_eq!(payload.input.selected_event_ids.len(), 5);
+    assert_eq!(payload.betweenness_source_uids.len(), 4);
+}
+
+fn synthetic_interaction_evidence(
+    events: &[InteractionGraphEvent],
+) -> scriptbots_analytics::InteractionGraphEvidence {
+    scriptbots_analytics::InteractionGraphEvidence {
+        run_id: "synthetic-unit-fixture".to_owned(),
+        selection: InteractionGraphSelection::RecentPage,
+        budget: InteractionGraphBudget::default(),
+        max_graph_work: 6 * events.len() * events.len(),
+        sql_execution_bound: "no_database_in_unit_test".to_owned(),
+        ordering: "tick_ascending_then_seq_ascending".to_owned(),
+        source_table: "synthetic_unit_fixture".to_owned(),
+        selected_event_ids: events.iter().map(|event| (event.tick, event.seq)).collect(),
+        omitted_older_rows: false,
+        run_persisted_rows: events.len() as u64,
+        run_capture: None,
+        capture_scope: "no_capture_evidence_in_unit_fixture".to_owned(),
+        capture_status: "unknown".to_owned(),
+        centrality_semantics: "unweighted_simple_directed_graph".to_owned(),
+        edge_semantics: "count=event multiplicity; weight=sum of magnitudes".to_owned(),
+    }
+}
+
+#[test]
+fn repeated_interactions_preserve_multiplicity_magnitude_and_direction_in_both_exports() {
+    let events = [
+        InteractionGraphEvent {
+            tick: 1,
+            seq: 0,
+            actor: AgentUid(1),
+            target: AgentUid(2),
+            magnitude: Some(2.0),
+        },
+        InteractionGraphEvent {
+            tick: 1,
+            seq: 1,
+            actor: AgentUid(1),
+            target: AgentUid(2),
+            magnitude: Some(3.5),
+        },
+        InteractionGraphEvent {
+            tick: 2,
+            seq: 0,
+            actor: AgentUid(2),
+            target: AgentUid(1),
+            magnitude: Some(7.0),
+        },
+    ];
+    let (graph, _, _) = build_interaction_digraph(&events).expect("build attributed graph");
+    let assert_edges = |graph: &fnx_classes::digraph::DiGraph| {
+        assert_eq!(graph.node_count(), 2);
+        assert_eq!(graph.edge_count(), 2);
+        let ab = graph.edge_attrs("agent_1", "agent_2").expect("A->B");
+        let ba = graph.edge_attrs("agent_2", "agent_1").expect("B->A");
+        assert_eq!(ab["count"].as_str().parse::<u64>().unwrap(), 2);
+        assert_eq!(ab["weight"].as_str().parse::<f64>().unwrap(), 5.5);
+        assert_eq!(ba["count"].as_str().parse::<u64>().unwrap(), 1);
+        assert_eq!(ba["weight"].as_str().parse::<f64>().unwrap(), 7.0);
+    };
+    assert_edges(&graph);
+    let mut parser = fnx_readwrite::EdgeListEngine::strict();
+    let xml = export_digraph_graphml(&graph).expect("GraphML export");
+    assert_edges(
+        &parser
+            .read_digraph_graphml(&xml)
+            .expect("GraphML parse")
+            .graph,
+    );
+    let list = export_digraph_edgelist(&graph).expect("attributed fnx edge-list export");
+    assert_edges(
+        &parser
+            .read_digraph_edgelist(&list)
+            .expect("edge-list parse")
+            .graph,
+    );
+    let mut changed = events;
+    changed[1].magnitude = Some(4.5);
+    let (different, _, _) = build_interaction_digraph(&changed).unwrap();
+    assert_ne!(
+        graph.edge_attrs("agent_1", "agent_2"),
+        different.edge_attrs("agent_1", "agent_2")
+    );
+}
+
+#[test]
+fn interaction_graph_refuses_missing_nonfinite_and_overflowed_magnitudes() {
+    let event = InteractionGraphEvent {
+        tick: 1,
+        seq: 0,
+        actor: AgentUid(1),
+        target: AgentUid(2),
+        magnitude: Some(1.0),
+    };
+    for magnitude in [
+        None,
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+    ] {
+        assert!(
+            build_interaction_digraph(&[InteractionGraphEvent { magnitude, ..event }]).is_err()
+        );
+    }
+    let huge = InteractionGraphEvent {
+        magnitude: Some(f64::MAX),
+        ..event
+    };
+    assert!(build_interaction_digraph(&[huge, huge]).is_err());
     assert!(
-        payload
-            .persistence_gap
-            .documented_gap
-            .contains("bd-2z0.5.9")
+        build_interaction_digraph(&[event]).is_ok(),
+        "finite positive control"
+    );
+}
+
+#[test]
+fn interaction_sampling_uses_seed_and_centralities_ignore_export_weights() {
+    let events: Vec<_> = (1..=12)
+        .map(|actor| InteractionGraphEvent {
+            tick: actor,
+            seq: 0,
+            actor: AgentUid(actor),
+            target: AgentUid(actor % 12 + 1),
+            magnitude: Some(1.0),
+        })
+        .collect();
+    let (graph, _, _) = build_interaction_digraph(&events).unwrap();
+    let analyze = |graph: &fnx_classes::digraph::DiGraph, seed| {
+        analyze_interaction_centrality(
+            graph,
+            synthetic_interaction_evidence(&events),
+            12,
+            Some(3),
+            seed,
+            scriptbots_analytics::InteractionCentralityTimings {
+                load_interactions_ms: 0.0,
+                bulk_build_ms: 0.0,
+                degree_centrality_ms: 0.0,
+                betweenness_centrality_ms: 0.0,
+                pagerank_ms: 0.0,
+                total_ms: 0.0,
+            },
+        )
+    };
+    let first = analyze(&graph, 1);
+    let repeated = analyze(&graph, 1);
+    let other_seed = analyze(&graph, 2);
+    assert_eq!(first.betweenness_source_uids.len(), 3);
+    assert_eq!(
+        first.betweenness_source_uids,
+        repeated.betweenness_source_uids
+    );
+    assert_eq!(first.top_by_betweenness, repeated.top_by_betweenness);
+    assert_ne!(
+        first.betweenness_source_uids,
+        other_seed.betweenness_source_uids
+    );
+    let mut changed = events.clone();
+    changed[0].magnitude = Some(100.0);
+    let (weighted_differently, _, _) = build_interaction_digraph(&changed).unwrap();
+    assert_ne!(
+        graph.edge_attrs("agent_1", "agent_2"),
+        weighted_differently.edge_attrs("agent_1", "agent_2")
+    );
+    let changed_report = analyze(&weighted_differently, 1);
+    assert_eq!(
+        first.top_by_degree_centrality,
+        changed_report.top_by_degree_centrality
+    );
+    assert_eq!(first.top_by_betweenness, changed_report.top_by_betweenness);
+    assert_eq!(first.top_by_pagerank, changed_report.top_by_pagerank);
+    assert_eq!(first.pagerank_converged, Some(true));
+}
+
+fn persist_interaction_tick(
+    storage: &mut Storage,
+    tick: u64,
+    pairs: &[(u64, u64, f32)],
+    sampled_out: usize,
+    truncated: usize,
+    capture: bool,
+) {
+    let mut batch = make_tick_batch(tick, 0, 0);
+    for (ordinal, &(actor, target, magnitude)) in pairs.iter().enumerate() {
+        batch.replay_events.push(scriptbots_core::ReplayEvent {
+            agent_uid: Some(AgentUid(actor)),
+            position: None,
+            counterpart: Some(AgentUid(target)),
+            counterpart_position: None,
+            kind: scriptbots_core::ReplayEventKind::Interaction {
+                tick: Tick(tick),
+                ordinal: ordinal as u64,
+                kind: if ordinal % 2 == 0 {
+                    scriptbots_core::ReplayInteractionKind::Combat
+                } else {
+                    scriptbots_core::ReplayInteractionKind::FoodShare
+                },
+                magnitude,
+            },
+        });
+    }
+    if capture {
+        for (kind, count) in [
+            (
+                scriptbots_core::INTERACTION_EVENTS_OBSERVED_KIND,
+                pairs.len() + sampled_out + truncated,
+            ),
+            (
+                scriptbots_core::INTERACTION_EVENTS_PERSISTED_KIND,
+                pairs.len(),
+            ),
+            (
+                scriptbots_core::INTERACTION_EVENTS_SAMPLED_OUT_KIND,
+                sampled_out,
+            ),
+            (
+                scriptbots_core::INTERACTION_EVENTS_TRUNCATED_KIND,
+                truncated,
+            ),
+        ] {
+            batch.events.push(PersistenceEvent::new(
+                PersistenceEventKind::Custom(kind.into()),
+                count,
+            ));
+        }
+    }
+    storage
+        .persist(&batch)
+        .expect("persist real interaction batch");
+}
+
+#[test]
+fn interaction_selection_and_exports_use_real_multi_run_storage_and_cli() {
+    use scriptbots_runtime::RunId;
+    use scriptbots_storage::RunManifestRecord;
+
+    // Retain the actual database and CLI artifacts for inspection after this test.
+    let root = tempfile::tempdir().expect("evidence directory").keep();
+    let db = root.join("interactions.sqlite");
+    let path = db.to_str().unwrap();
+    let run_a = RunId::from_namespace_sequence(0x1eaf, 1);
+    let run_b = RunId::from_namespace_sequence(0x1eaf, 2);
+    let mut first =
+        Storage::create_new_file_for_run(path, RunManifestRecord::unattributed(run_a)).unwrap();
+    let mut founders = make_tick_batch(0, 0, 0);
+    for uid in [1, 2, 3, 99] {
+        founders
+            .births
+            .push(birth_rec(0, uid, None, None, 0, BirthOrigin::Seeded));
+    }
+    first.persist(&founders).unwrap();
+    persist_interaction_tick(&mut first, 1, &[(3, 1, 100.0)], 0, 0, true);
+    persist_interaction_tick(&mut first, 5, &[(1, 2, 2.0), (1, 2, 3.5)], 0, 0, true);
+    persist_interaction_tick(&mut first, 6, &[(2, 1, 7.0)], 1, 0, true);
+    persist_interaction_tick(&mut first, 9, &[(2, 3, 11.0)], 0, 2, true);
+    first.close().unwrap();
+    let mut second = Storage::append_run(path, RunManifestRecord::unattributed(run_b)).unwrap();
+    second.persist(&founders).unwrap();
+    persist_interaction_tick(&mut second, 5, &[(1, 2, 99.0)], 0, 0, false);
+    second.close().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_sb-analyze");
+    let execute = |run: RunId, name: &str, arguments: &[&str]| {
+        let output = Command::new(bin)
+            .arg(path)
+            .arg("--run-id")
+            .arg(run.to_string())
+            .args(arguments)
+            .output()
+            .expect("execute sb-analyze");
+        std::fs::write(root.join(format!("{name}.stdout")), &output.stdout).unwrap();
+        std::fs::write(root.join(format!("{name}.stderr")), &output.stderr).unwrap();
+        use std::io::Write;
+        let mut cases = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("cases.jsonl"))
+            .unwrap();
+        writeln!(
+            cases,
+            "{}",
+            serde_json::json!({
+                "case": name, "run_id": run.to_string(), "arguments": arguments,
+                "binary": bin, "database": path, "exit_code": output.status.code(),
+                "stdout_blake3": blake3::hash(&output.stdout).to_hex().to_string(),
+                "stderr_blake3": blake3::hash(&output.stderr).to_hex().to_string(),
+            })
+        )
+        .unwrap();
+        eprintln!(
+            "interaction_cli case={name} run={run} status={} evidence={}",
+            output.status,
+            root.display()
+        );
+        output
+    };
+    for (name, params, expected) in [
+        ("all", vec![], vec![(1, 0), (5, 0), (5, 1), (6, 0), (9, 0)]),
+        (
+            "window",
+            vec!["start_tick=5", "end_tick=7"],
+            vec![(5, 0), (5, 1), (6, 0)],
+        ),
+        ("recent", vec!["limit=2"], vec![(6, 0), (9, 0)]),
+        ("zero", vec!["limit=0"], vec![]),
+        (
+            "empty",
+            vec!["start_tick=7", "end_tick=8", "limit=0"],
+            vec![],
+        ),
+    ] {
+        let json_path = root.join(format!("{name}.json"));
+        let mut args = vec![
+            "run",
+            "interaction-centrality",
+            "--json",
+            json_path.to_str().unwrap(),
+        ];
+        for value in &params {
+            args.extend(["--params", value]);
+        }
+        let output = execute(run_a, name, &args);
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(json_path).unwrap()).unwrap();
+        let payload = &report["machine"];
+        // Fixture ordinals are encoded in storage's declared interaction namespace.
+        // Keep the expected population hand-enumerated, independent of the reader.
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(tick, ordinal)| {
+                (
+                    tick,
+                    scriptbots_storage::INTERACTION_REPLAY_SEQ_BASE + ordinal,
+                )
+            })
+            .collect();
+        assert_eq!(
+            payload["input"]["selected_event_ids"],
+            serde_json::json!(expected),
+            "{name}"
+        );
+        assert_eq!(payload["input"]["run_id"], run_a.to_string());
+        assert_eq!(payload["input"]["run_persisted_rows"], 5);
+        assert_eq!(payload["input"]["run_capture"]["observed"], 8);
+        assert_eq!(payload["input"]["run_capture"]["persisted"], 5);
+        assert_eq!(payload["input"]["run_capture"]["sampled_out"], 1);
+        assert_eq!(payload["input"]["run_capture"]["truncated"], 2);
+        assert_eq!(payload["input"]["capture_status"], "sampled_and_truncated");
+        assert_eq!(
+            payload["input"]["omitted_older_rows"],
+            matches!(name, "recent" | "zero")
+        );
+        if name == "window" {
+            assert_eq!(payload["node_count"], 2, "isolates are explicitly excluded");
+        }
+    }
+    for (index, params) in [
+        vec!["start_tick=5"],
+        vec!["end_tick=7"],
+        vec!["start_tick=7", "end_tick=5"],
+        vec!["start_tick=5", "end_tick=5"],
+        vec!["start_tick=5", "end_tick=7", "limit=2"],
+        vec!["start_tick=5", "end_tick=7", "limit=0"],
+        vec!["limit=5000"],
+        vec!["max_projected_bytes=0"],
+        vec!["max_graph_work=0"],
+        vec!["sample_k=0"],
+        vec!["fallback=replay"],
+        vec!["deadline_ms=1"],
+        vec!["start_ticks=5"],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut args = vec!["run", "interaction-centrality"];
+        for value in params {
+            args.extend(["--params", value]);
+        }
+        let output = execute(run_a, &format!("refusal-{index}"), &args);
+        assert!(!output.status.success(), "must refuse {params:?}");
+        assert!(!output.stderr.is_empty());
+    }
+
+    let mut parser = fnx_readwrite::EdgeListEngine::strict();
+    for format in ["graphml", "edgelist"] {
+        for (run, expected_count, expected_weight) in [(run_a, 2, 5.5), (run_b, 1, 99.0)] {
+            let output = execute(
+                run,
+                &format!("{format}-{run}"),
+                &[
+                    "export-graph",
+                    "--graph",
+                    "interaction",
+                    "--format",
+                    format,
+                    "--params",
+                    "start_tick=5",
+                    "--params",
+                    "end_tick=7",
+                ],
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            let (graph, metadata) = if format == "graphml" {
+                let parsed = parser.read_digraph_graphml(&text).unwrap();
+                let metadata: serde_json::Value = serde_json::from_str(
+                    &parsed.graph_attrs["scriptbots_interaction_evidence"].as_str(),
+                )
+                .unwrap();
+                (parsed.graph, metadata)
+            } else {
+                let metadata: serde_json::Value = serde_json::from_str(
+                    text.lines()
+                        .next()
+                        .unwrap()
+                        .strip_prefix("# scriptbots.interaction-edgelist.v1 ")
+                        .unwrap(),
+                )
+                .unwrap();
+                (parser.read_digraph_edgelist(&text).unwrap().graph, metadata)
+            };
+            let ab = graph.edge_attrs("agent_1", "agent_2").unwrap();
+            assert_eq!(ab["count"].as_str().parse::<u64>().unwrap(), expected_count);
+            assert_eq!(
+                ab["weight"].as_str().parse::<f64>().unwrap(),
+                expected_weight
+            );
+            assert_eq!(metadata["run_id"], run.to_string());
+            assert_eq!(metadata["selection"]["mode"], "complete_window");
+            assert_eq!(
+                metadata["capture_status"],
+                if run == run_a {
+                    "sampled_and_truncated"
+                } else {
+                    "unknown"
+                }
+            );
+            let count_sum: u64 = graph
+                .edges_ordered_borrowed()
+                .iter()
+                .map(|(_, _, attrs)| attrs["count"].as_str().parse::<u64>().unwrap())
+                .sum();
+            assert_eq!(count_sum, if run == run_a { 3 } else { 1 });
+            // Apply the same independent oracle to damaged, parsed exports. These
+            // controls ensure a lost reverse edge, weight, run or capture qualifier
+            // cannot satisfy the positive checks above.
+            if run == run_a {
+                let matches_fixture =
+                    |candidate: &fnx_classes::digraph::DiGraph, evidence: &serde_json::Value| {
+                        let mut edges: Vec<_> = candidate
+                            .edges_ordered_borrowed()
+                            .iter()
+                            .map(|(source, target, attrs)| {
+                                (
+                                    source.to_string(),
+                                    target.to_string(),
+                                    attrs
+                                        .get("count")
+                                        .and_then(|v| v.as_str().parse::<u64>().ok()),
+                                    attrs
+                                        .get("weight")
+                                        .and_then(|v| v.as_str().parse::<f64>().ok()),
+                                )
+                            })
+                            .collect();
+                        edges.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+                        edges
+                            == vec![
+                                ("agent_1".into(), "agent_2".into(), Some(2), Some(5.5)),
+                                ("agent_2".into(), "agent_1".into(), Some(1), Some(7.0)),
+                            ]
+                            && evidence["run_id"] == run_a.to_string()
+                            && evidence["capture_status"] == "sampled_and_truncated"
+                    };
+                assert!(matches_fixture(&graph, &metadata));
+                let mut dropped = graph.clone();
+                assert!(dropped.remove_edge("agent_2", "agent_1"));
+                assert!(!matches_fixture(&dropped, &metadata));
+                let mut lost_weight = graph.clone();
+                let mut attributes = fnx_classes::AttrMap::new();
+                attributes.insert("count".into(), 2_i64.into());
+                attributes.insert("weight".into(), 0.0_f64.into());
+                lost_weight
+                    .add_edge_with_attrs("agent_1", "agent_2", attributes)
+                    .unwrap();
+                assert!(!matches_fixture(&lost_weight, &metadata));
+                let mut swapped_run = metadata.clone();
+                swapped_run["run_id"] = run_b.to_string().into();
+                assert!(!matches_fixture(&graph, &swapped_run));
+                let mut false_complete = metadata.clone();
+                false_complete["capture_status"] = "counters_report_complete_run".into();
+                assert!(!matches_fixture(&graph, &false_complete));
+            }
+        }
+    }
+    let ambiguous = Command::new(bin)
+        .arg(path)
+        .args(["run", "interaction-centrality"])
+        .output()
+        .unwrap();
+    assert!(
+        !ambiguous.status.success(),
+        "multi-run input requires explicit run selection"
+    );
+    assert!(
+        !execute(
+            RunId::from_namespace_sequence(0x1eaf, 3),
+            "missing-run",
+            &["run", "interaction-centrality"]
+        )
+        .status
+        .success()
     );
 }
 

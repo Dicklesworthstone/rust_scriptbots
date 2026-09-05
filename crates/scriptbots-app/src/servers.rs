@@ -2402,7 +2402,10 @@ async fn handle_mcp_http_request(
                         "Unsupported protocol version; supported versions: [\"2024-11-05\"]",
                     )
                 } else {
-                    (-32600, "Invalid Request: unhandled or rejected by MCP server")
+                    (
+                        -32600,
+                        "Invalid Request: unhandled or rejected by MCP server",
+                    )
                 };
                 let err_response = serde_json::json!({
                     "jsonrpc": "2.0",

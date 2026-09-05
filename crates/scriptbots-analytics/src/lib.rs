@@ -582,6 +582,17 @@ pub struct ReaderCtx {
 }
 
 impl ReaderCtx {
+    /// Open one explicitly selected finished run in a multi-run database.
+    pub fn open_for_run(
+        db_path: &str,
+        run_id: scriptbots_runtime::RunId,
+    ) -> Result<Self, AnalyticsError> {
+        Ok(Self {
+            reader: StorageReader::open_finished_for_run(db_path, run_id)?,
+            db_path: db_path.to_owned(),
+        })
+    }
+
     /// Opens a finished run database read-only.
     ///
     /// Fails (rather than creating anything) when the path does not exist —
@@ -1416,6 +1427,22 @@ pub fn compute_lineage_phenotype_shifts(
 pub struct ReportParams(BTreeMap<String, String>);
 
 impl ReportParams {
+    /// Reject misspelled or unsupported options before choosing a scientific population.
+    pub fn validate_keys(&self, allowed: &[&str]) -> Result<(), AnalyticsError> {
+        for key in self.0.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(AnalyticsError::BadParam {
+                    name: key.clone(),
+                    reason: format!(
+                        "unsupported parameter; expected one of {}",
+                        allowed.join(", ")
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Builds parameters from `key=value` pairs, rejecting malformed input.
     pub fn from_pairs<I: IntoIterator<Item = String>>(pairs: I) -> Result<Self, AnalyticsError> {
         let mut map = BTreeMap::new();

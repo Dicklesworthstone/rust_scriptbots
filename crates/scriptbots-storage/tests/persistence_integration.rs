@@ -1608,11 +1608,17 @@ fn test_map_elites_archive_persistence_roundtrip() {
     ])
     .unwrap();
     let mut archive =
-        MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 0, 1024 * 1024).unwrap();
+        MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 0, 1024 * 1024)
+            .unwrap();
 
     let family_id = BrainFamilyId::new("mlp").expect("family_id");
-    let genome_1 =
-        BrainGenomeEnvelope::new(family_id, 1, 1, vec![1, 2, 3, 4], BrainProvenance::default());
+    let genome_1 = BrainGenomeEnvelope::new(
+        family_id,
+        1,
+        1,
+        vec![1, 2, 3, 4],
+        BrainProvenance::default(),
+    );
     let entry_1 = ArchiveEntry {
         uid: AgentUid::new(10),
         tick_inserted: 50,
@@ -1626,8 +1632,13 @@ fn test_map_elites_archive_persistence_roundtrip() {
         },
     };
 
-    let genome_2 =
-        BrainGenomeEnvelope::new(family_id, 1, 1, vec![5, 6, 7, 8], BrainProvenance::default());
+    let genome_2 = BrainGenomeEnvelope::new(
+        family_id,
+        1,
+        1,
+        vec![5, 6, 7, 8],
+        BrainProvenance::default(),
+    );
     let entry_2 = ArchiveEntry {
         uid: AgentUid::new(20),
         tick_inserted: 80,
@@ -1654,7 +1665,10 @@ fn test_map_elites_archive_persistence_roundtrip() {
         .expect("persist archive snapshot");
 
     // Query on open storage
-    let retrieved_space = storage.archive_space().expect("query space").expect("space exists");
+    let retrieved_space = storage
+        .archive_space()
+        .expect("query space")
+        .expect("space exists");
     assert_eq!(retrieved_space.space_version, space_row.space_version);
     assert_eq!(retrieved_space.axes_json, space_row.axes_json);
 
@@ -1674,7 +1688,10 @@ fn test_map_elites_archive_persistence_roundtrip() {
     storage.close().expect("close storage");
 
     let reader = StorageReader::open(path_str).expect("open reader");
-    let reader_space = reader.archive_space().expect("query reader space").expect("space exists");
+    let reader_space = reader
+        .archive_space()
+        .expect("query reader space")
+        .expect("space exists");
     assert_eq!(reader_space.space_version, space_row.space_version);
     assert_eq!(reader_space.axes_json, space_row.axes_json);
 

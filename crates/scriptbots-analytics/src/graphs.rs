@@ -29,14 +29,17 @@
     clippy::similar_names
 )]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use fnx_classes::Graph;
 use fnx_classes::digraph::DiGraph;
-use scriptbots_core::{AgentUid, ReplayEventKind, ReplayInteractionKind};
-use scriptbots_storage::{PersistedAncestryBirth, PersistedAncestryDeath, PersistedInteraction};
+use fnx_classes::{AttrMap, Graph};
+use scriptbots_core::AgentUid;
+use scriptbots_storage::{
+    InteractionGraphBudget, InteractionGraphEvent, InteractionGraphSelection,
+    PersistedAncestryBirth, PersistedAncestryDeath, PersistedInteractionCapture,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -1200,6 +1203,146 @@ pub struct InteractionPersistenceGap {
     pub documented_gap: String,
 }
 
+/// Selection and capture evidence shared verbatim by reports and graph exports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InteractionGraphEvidence {
+    /// Canonical run identity carried by the finished reader.
+    pub run_id: String,
+    /// Effective population selection, including half-open bounds when requested.
+    pub selection: InteractionGraphSelection,
+    /// Requested limits checked before materializing graph events.
+    pub budget: InteractionGraphBudget,
+    /// Conservative node/edge visits for all-source unweighted betweenness.
+    /// This bounds graph input work, not SQL execution time or total process memory.
+    pub max_graph_work: usize,
+    /// Explicit absence of a hard bound on synchronous offline SQL execution.
+    pub sql_execution_bound: String,
+    /// Ordering of selected event identities.
+    pub ordering: String,
+    /// Canonical table actually queried.
+    pub source_table: String,
+    /// Exact selected (tick, sequence) keys within this run.
+    pub selected_event_ids: Vec<(u64, u64)>,
+    /// An additional older row was observed outside the requested recent page.
+    pub omitted_older_rows: bool,
+    /// Count of all canonical interaction rows in the selected run.
+    pub run_persisted_rows: u64,
+    /// Run-wide accounting; not a fabricated count for the selected sub-window.
+    pub run_capture: Option<PersistedInteractionCapture>,
+    /// Scope over which the persisted counters were accumulated.
+    pub capture_scope: String,
+    /// Observed omissions, a consistent complete counter set, or missing evidence.
+    pub capture_status: String,
+    /// Whether centrality algorithms consume edge weights or simple topology.
+    pub centrality_semantics: String,
+    /// Meaning and units of the count and weight attributes.
+    pub edge_semantics: String,
+}
+
+/// Validate selection and allocation/work bounds before any graph-input query.
+pub fn load_interaction_graph_input(
+    cx: &ReaderCtx,
+    params: &ReportParams,
+) -> Result<(Vec<InteractionGraphEvent>, InteractionGraphEvidence), AnalyticsError> {
+    params.validate_keys(&[
+        "start_tick",
+        "end_tick",
+        "limit",
+        "max_projected_bytes",
+        "max_graph_work",
+        "sample_k",
+        "seed",
+        "fallback",
+        "deadline_ms",
+    ])?;
+    let bad = |name: &str, reason: &str| AnalyticsError::BadParam {
+        name: name.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let selection = match (params.get_u64("start_tick")?, params.get_u64("end_tick")?) {
+        (None, None) => InteractionGraphSelection::RecentPage,
+        (Some(start_tick), Some(end_tick)) if start_tick < end_tick => {
+            InteractionGraphSelection::CompleteWindow {
+                start_tick,
+                end_tick,
+            }
+        }
+        (Some(_), Some(_)) => return Err(bad("window", "expected start_tick < end_tick")),
+        _ => {
+            return Err(bad(
+                "window",
+                "start_tick and end_tick must be supplied together",
+            ));
+        }
+    };
+    if params.get("fallback").is_some() {
+        return Err(bad(
+            "fallback",
+            "replay fallback is unsupported: it selects a different population",
+        ));
+    }
+    if params.get("deadline_ms").is_some() {
+        return Err(bad(
+            "deadline_ms",
+            "offline SQL execution has no hard deadline",
+        ));
+    }
+    let defaults = InteractionGraphBudget::default();
+    let budget = InteractionGraphBudget {
+        max_rows: params.get_usize("limit")?.unwrap_or(defaults.max_rows),
+        max_projected_bytes: params
+            .get_usize("max_projected_bytes")?
+            .unwrap_or(defaults.max_projected_bytes),
+    };
+    let max_graph_work = params
+        .get_usize("max_graph_work")?
+        .unwrap_or(6 * defaults.max_rows * defaults.max_rows);
+    let required_work = budget
+        .max_rows
+        .checked_mul(budget.max_rows)
+        .and_then(|value| value.checked_mul(6))
+        .ok_or_else(|| bad("limit", "graph work bound overflows usize"))?;
+    if required_work > max_graph_work {
+        return Err(bad(
+            "max_graph_work",
+            "row limit exceeds the declared graph work budget",
+        ));
+    }
+    let page = cx.reader.load_interaction_graph(selection, budget)?;
+    let capture = cx.reader.load_interaction_capture_evidence()?;
+    if let Some(capture) = capture {
+        if capture.persisted != page.run_persisted_rows {
+            return Err(AnalyticsError::Graph(format!(
+                "capture accounts for {} persisted interactions but the run contains {} rows",
+                capture.persisted, page.run_persisted_rows
+            )));
+        }
+    }
+    let capture_status = match capture {
+        None => "unknown",
+        Some(c) if c.sampled_out > 0 && c.truncated > 0 => "sampled_and_truncated",
+        Some(c) if c.sampled_out > 0 => "sampled",
+        Some(c) if c.truncated > 0 => "truncated",
+        Some(_) => "counters_report_complete_run",
+    };
+    let evidence = InteractionGraphEvidence {
+        run_id: cx.reader.run_id().to_string(),
+        selection, budget, max_graph_work,
+        sql_execution_bound: "unbounded_offline_query".to_owned(),
+        ordering: "tick_ascending_then_seq_ascending".to_owned(),
+        source_table: "interactions".to_owned(),
+        selected_event_ids: page.events.iter().map(|row| (row.tick, row.seq)).collect(),
+        omitted_older_rows: page.omitted_older_rows,
+        run_persisted_rows: page.run_persisted_rows,
+        run_capture: capture,
+        capture_scope: "whole_run; counters do not localize omissions to a sub-window".to_owned(),
+        capture_status: capture_status.to_owned(),
+        centrality_semantics: "unweighted_simple_directed_graph; only interacting agents are nodes".to_owned(),
+        edge_semantics: "count=selected event multiplicity; weight=sum of recorded magnitudes (combat damage plus food-share energy); not a normalized physical quantity".to_owned(),
+    };
+    Ok((page.events, evidence))
+}
+
 /// Machine-readable payload for `interaction-centrality`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InteractionCentralityPayload {
@@ -1229,98 +1372,87 @@ pub struct InteractionCentralityPayload {
     pub top_by_pagerank: Vec<AgentCentralityScore>,
     /// Storage persistence gap evidence and description.
     pub persistence_gap: InteractionPersistenceGap,
+    /// Selection, capture and budget evidence from the actual reader.
+    pub input: InteractionGraphEvidence,
+    /// Exact source UIDs used by betweenness (all nodes for an exact calculation).
+    pub betweenness_source_uids: Vec<u64>,
+    /// Seed used to rank candidate betweenness source nodes.
+    pub betweenness_seed: u64,
+    /// None for an empty graph; otherwise the observed fnx convergence result.
+    pub pagerank_converged: Option<bool>,
     /// Wall-clock timings for audit.
     pub timings: InteractionCentralityTimings,
 }
 
-/// Builds a directed interaction [`DiGraph`] from pairwise interaction rows.
-pub fn build_interaction_digraph(interactions: &[PersistedInteraction]) -> (DiGraph, f64, f64) {
-    let t_start = Instant::now();
-    let mut pairs: Vec<(String, String)> = Vec::with_capacity(interactions.len());
-    let mut all_nodes: BTreeSet<String> = BTreeSet::new();
-
+/// Build one attributed edge per directed pair without losing event multiplicity.
+/// Missing/nonfinite magnitudes and nonfinite aggregate weights are errors.
+pub fn build_interaction_digraph(
+    interactions: &[InteractionGraphEvent],
+) -> Result<(DiGraph, f64, f64), AnalyticsError> {
     let t_fmt = Instant::now();
+    let mut aggregates: BTreeMap<(AgentUid, AgentUid), (i64, f64)> = BTreeMap::new();
     for row in interactions {
-        let actor_key = agent_uid_to_node_id(row.actor);
-        let target_key = agent_uid_to_node_id(row.target);
-        all_nodes.insert(actor_key.clone());
-        all_nodes.insert(target_key.clone());
-        pairs.push((actor_key, target_key));
+        let magnitude = row
+            .magnitude
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                AnalyticsError::Graph(format!(
+                    "missing or nonfinite magnitude at ({}, {})",
+                    row.tick, row.seq
+                ))
+            })?;
+        let (count, weight) = aggregates.entry((row.actor, row.target)).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| AnalyticsError::Graph("edge count overflow".to_owned()))?;
+        *weight += magnitude;
+        if !weight.is_finite() {
+            return Err(AnalyticsError::Graph(format!(
+                "nonfinite aggregate magnitude at ({}, {})",
+                row.tick, row.seq
+            )));
+        }
     }
     let format_ms = t_fmt.elapsed().as_secs_f64() * 1000.0;
-
     let t_bulk = Instant::now();
     let mut digraph = DiGraph::strict();
-    let _ = digraph.extend_edges_unrecorded(pairs);
-
-    for node in all_nodes {
-        if !digraph.has_node(&node) {
-            digraph.add_node(node);
-        }
+    for ((actor, target), (count, weight)) in aggregates {
+        let attrs = AttrMap::from([
+            ("count".to_owned(), count.into()),
+            ("weight".to_owned(), weight.into()),
+        ]);
+        digraph
+            .add_edge_with_attrs(
+                agent_uid_to_node_id(actor),
+                agent_uid_to_node_id(target),
+                attrs,
+            )
+            .map_err(|error| AnalyticsError::Graph(error.to_string()))?;
     }
     let bulk_ms = t_bulk.elapsed().as_secs_f64() * 1000.0;
-    let _ = t_start;
-
-    (digraph, format_ms, bulk_ms)
-}
-
-/// Fallback extraction of directed interactions from narrative / replay events.
-pub fn extract_interactions_from_replay(
-    cx: &ReaderCtx,
-    limit: usize,
-) -> Result<Vec<PersistedInteraction>, AnalyticsError> {
-    let events = cx.reader.load_replay_events()?;
-    let mut interactions = Vec::new();
-
-    for ev in events {
-        let (kind, value) = match ev.event.kind {
-            ReplayEventKind::Interaction {
-                kind, magnitude, ..
-            } => {
-                let name = match kind {
-                    ReplayInteractionKind::Combat => "combat",
-                    ReplayInteractionKind::FoodShare => "food_share",
-                };
-                (name.to_owned(), Some(magnitude as f64))
-            }
-            _ => continue,
-        };
-
-        if let (Some(actor), Some(target)) = (ev.event.agent_uid, ev.event.counterpart) {
-            interactions.push(PersistedInteraction {
-                tick: ev.tick,
-                seq: ev.seq,
-                kind,
-                actor,
-                target,
-                value,
-                actor_position: ev.event.position,
-                target_position: ev.event.counterpart_position,
-                payload: String::new(),
-            });
-            if interactions.len() >= limit {
-                break;
-            }
-        }
-    }
-    Ok(interactions)
+    Ok((digraph, format_ms, bulk_ms))
 }
 
 /// Computes interaction centrality metrics over the directed interaction network.
 pub fn analyze_interaction_centrality(
     digraph: &DiGraph,
-    source_table: &str,
-    rows_read: usize,
+    input: InteractionGraphEvidence,
     latest_tick: u64,
-    start_tick: Option<u64>,
-    end_tick: Option<u64>,
     sample_k: Option<usize>,
-    _seed: u64,
+    seed: u64,
     mut timings: InteractionCentralityTimings,
 ) -> InteractionCentralityPayload {
     let t_start = Instant::now();
     let node_count = digraph.node_count();
     let edge_count = digraph.edge_count();
+    let rows_read = input.selected_event_ids.len();
+    let (start_tick, end_tick) = match input.selection {
+        InteractionGraphSelection::RecentPage => (None, None),
+        InteractionGraphSelection::CompleteWindow {
+            start_tick,
+            end_tick,
+        } => (Some(start_tick), Some(end_tick)),
+    };
 
     let density = if node_count > 1 {
         edge_count as f64 / (node_count * (node_count - 1)) as f64
@@ -1344,10 +1476,14 @@ pub fn analyze_interaction_centrality(
             top_by_betweenness: Vec::new(),
             top_by_pagerank: Vec::new(),
             persistence_gap: InteractionPersistenceGap {
-                source_table: source_table.to_owned(),
+                source_table: input.source_table.clone(),
                 interaction_rows_read: rows_read,
-                documented_gap: "No interaction edges observed in specified window".to_owned(),
+                documented_gap: "No persisted interaction rows selected; this alone does not establish absence of encounters.".to_owned(),
             },
+            input,
+            betweenness_source_uids: Vec::new(),
+            betweenness_seed: seed,
+            pagerank_converged: None,
             timings,
         };
     }
@@ -1411,12 +1547,25 @@ pub fn analyze_interaction_centrality(
 
     // 2. Betweenness Centrality
     let t_bet = Instant::now();
-    let bet_result = if node_count > 1000 || sample_k.is_some() {
+    let mut sources = digraph.nodes_ordered();
+    let sampled = node_count > 1000 || sample_k.is_some();
+    if sampled {
         let k = sample_k.unwrap_or(100).min(node_count);
-        let nodes: Vec<&str> = digraph.nodes_ordered();
-        let sample: Vec<&str> = nodes.into_iter().take(k).collect();
+        sources.sort_by_cached_key(|node| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&seed.to_le_bytes());
+            hasher.update(node.as_bytes());
+            (*hasher.finalize().as_bytes(), *node)
+        });
+        sources.truncate(k);
+    }
+    let betweenness_source_uids = sources
+        .iter()
+        .filter_map(|node| node_id_to_agent_uid(node).map(|uid| uid.0))
+        .collect();
+    let bet_result = if sampled {
         fnx_algorithms::betweenness_centrality_sampled_directed_with_params(
-            digraph, &sample, true, false,
+            digraph, &sources, true, false,
         )
     } else {
         fnx_algorithms::betweenness_centrality_directed(digraph)
@@ -1448,6 +1597,7 @@ pub fn analyze_interaction_centrality(
     // 3. PageRank
     let t_pr = Instant::now();
     let pr_result = fnx_algorithms::pagerank_directed(digraph);
+    let pagerank_converged = Some(pr_result.converged);
     timings.pagerank_ms = t_pr.elapsed().as_secs_f64() * 1000.0;
 
     let mut pr_scores: Vec<AgentCentralityScore> = pr_result
@@ -1475,10 +1625,10 @@ pub fn analyze_interaction_centrality(
     timings.total_ms += t_start.elapsed().as_secs_f64() * 1000.0;
 
     let documented_gap = format!(
-        "Persisted interaction records loaded from '{source_table}' (n={rows_read}). \
-        While pairwise combat/food-share edges are persisted in SQLite (bd-2z0.5.9), tick sampling strides \
-        and capacity caps limit continuous temporal edge extraction. A dedicated streaming interaction \
-        log would unlock unbroken temporal network analytics without stride or window subsampling."
+        "Selected {rows_read} canonical persisted interaction records. Run capture: {}. \
+        Older rows omitted by selection: {}. Capture counters describe the whole run; \
+        degree, betweenness and PageRank use unweighted unique directed edges.",
+        input.capture_status, input.omitted_older_rows
     );
 
     InteractionCentralityPayload {
@@ -1495,10 +1645,14 @@ pub fn analyze_interaction_centrality(
         top_by_betweenness: bet_scores,
         top_by_pagerank: pr_scores,
         persistence_gap: InteractionPersistenceGap {
-            source_table: source_table.to_owned(),
+            source_table: input.source_table.clone(),
             interaction_rows_read: rows_read,
             documented_gap,
         },
+        input,
+        betweenness_source_uids,
+        betweenness_seed: seed,
+        pagerank_converged,
         timings,
     }
 }
@@ -1514,6 +1668,23 @@ pub fn render_interaction_centrality_md(payload: &InteractionCentralityPayload) 
     );
 
     let _ = writeln!(out, "\n## Interaction Network Overview");
+    let _ = writeln!(
+        out,
+        "\nSelection: `{:?}`; ordering: `{}`. Capture: `{}` (whole run).",
+        payload.input.selection, payload.input.ordering, payload.input.capture_status
+    );
+    let _ = writeln!(
+        out,
+        "\n{}\n\n{}",
+        payload.input.centrality_semantics, payload.input.edge_semantics
+    );
+    let _ = writeln!(
+        out,
+        "\nInput budgets: {} events, {} projected bytes, {} graph-work units. SQL execution has no hard deadline.",
+        payload.input.budget.max_rows,
+        payload.input.budget.max_projected_bytes,
+        payload.input.max_graph_work
+    );
     let _ = writeln!(out, "| Metric | Value | Interpretation |");
     let _ = writeln!(out, "| :--- | :--- | :--- |");
     let _ = writeln!(
@@ -1622,34 +1793,21 @@ impl Report for InteractionCentrality {
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
         let read_start = Instant::now();
-        let max_tick = cx.reader.max_tick()?.unwrap_or(0);
-
-        let start_tick = params.get_u64("start_tick")?;
-        let end_tick = params.get_u64("end_tick")?;
-        let limit = params.get_usize("limit")?.unwrap_or(4096);
         let sample_k = params.get_usize("sample_k")?;
+        if sample_k == Some(0) {
+            return Err(AnalyticsError::BadParam {
+                name: "sample_k".to_owned(),
+                reason: "must be positive when supplied".to_owned(),
+            });
+        }
         let seed = params.get_u64("seed")?.unwrap_or(0x0114_EA9E);
-
-        // First attempt: read from `interactions` table
-        let (interactions, source_table) = if let (Some(s), Some(e)) = (start_tick, end_tick) {
-            (
-                cx.reader.load_interactions_window(s, e)?,
-                "interactions_window",
-            )
-        } else {
-            let rec = cx.reader.recent_interactions(limit)?;
-            if rec.is_empty() {
-                let fallback = extract_interactions_from_replay(cx, limit)?;
-                (fallback, "replay_events")
-            } else {
-                (rec, "interactions")
-            }
-        };
+        let (interactions, evidence) = load_interaction_graph_input(cx, params)?;
+        let max_tick = cx.reader.max_tick()?.unwrap_or(0);
 
         let load_interactions_ms = read_start.elapsed().as_secs_f64() * 1000.0;
         log_report_stage("read_interactions", &read_start, interactions.len());
 
-        let (digraph, format_ms, bulk_ms) = build_interaction_digraph(&interactions);
+        let (digraph, format_ms, bulk_ms) = build_interaction_digraph(&interactions)?;
 
         let timings = InteractionCentralityTimings {
             load_interactions_ms,
@@ -1657,20 +1815,11 @@ impl Report for InteractionCentrality {
             degree_centrality_ms: 0.0,
             betweenness_centrality_ms: 0.0,
             pagerank_ms: 0.0,
-            total_ms: 0.0,
+            total_ms: load_interactions_ms + format_ms + bulk_ms,
         };
 
-        let payload = analyze_interaction_centrality(
-            &digraph,
-            source_table,
-            interactions.len(),
-            max_tick,
-            start_tick,
-            end_tick,
-            sample_k,
-            seed,
-            timings,
-        );
+        let payload =
+            analyze_interaction_centrality(&digraph, evidence, max_tick, sample_k, seed, timings);
 
         let md = render_interaction_centrality_md(&payload);
         let machine = serde_json::to_value(&payload)?;
@@ -1688,6 +1837,40 @@ impl Report for InteractionCentrality {
 // ---------------------------------------------------------------------------
 // 4. GraphML and Edge-List Export Functions
 // ---------------------------------------------------------------------------
+
+/// Formats that preserve both interaction edge attributes and selection metadata.
+pub enum InteractionGraphFormat {
+    /// GraphML with typed edge attributes and graph-level JSON evidence.
+    GraphMl,
+    /// fnx attributed edge-list syntax with a JSON evidence comment header.
+    EdgeList,
+}
+
+/// Export attributed interactions with the exact selection/capture provenance.
+pub fn export_interaction_graph(
+    digraph: &DiGraph,
+    evidence: &InteractionGraphEvidence,
+    format: InteractionGraphFormat,
+) -> Result<String, AnalyticsError> {
+    let metadata = serde_json::to_string(evidence)?;
+    match format {
+        InteractionGraphFormat::GraphMl => {
+            let attrs = AttrMap::from([(
+                "scriptbots_interaction_evidence".to_owned(),
+                metadata.into(),
+            )]);
+            fnx_readwrite::EdgeListEngine::strict()
+                .write_digraph_graphml_with_graph_attrs(digraph, &attrs)
+                .map_err(|error| AnalyticsError::Graph(error.to_string()))
+        }
+        InteractionGraphFormat::EdgeList => {
+            let body = export_digraph_edgelist(digraph)?;
+            Ok(format!(
+                "# scriptbots.interaction-edgelist.v1 {metadata}\n{body}\n"
+            ))
+        }
+    }
+}
 
 /// Serializes a directed graph to standard `GraphML` format using [`fnx_readwrite::EdgeListEngine`].
 pub fn export_digraph_graphml(digraph: &DiGraph) -> Result<String, AnalyticsError> {

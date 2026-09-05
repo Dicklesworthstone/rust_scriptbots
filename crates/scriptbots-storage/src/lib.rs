@@ -60,7 +60,6 @@ use scriptbots_core::{
     PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase,
     ReplayEvent, ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
-    map_elites::{ArchiveCellRow, ArchiveSpaceRow, BehaviorSpaceV0, MapElitesArchive},
     narrative::{
         EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord,
         NARRATIVE_INPUT_RECORD_V1_SCHEMA_VERSION, NARRATIVE_INPUT_V1_SCHEMA_VERSION,
@@ -5597,6 +5596,53 @@ pub struct PersistedInteraction {
     pub payload: String,
 }
 
+/// Fixed-width scientific graph input. Narrative payloads and coordinates are
+/// deliberately excluded so a small graph request cannot load large replay blobs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct InteractionGraphEvent {
+    pub tick: u64,
+    pub seq: u64,
+    pub actor: AgentUid,
+    pub target: AgentUid,
+    pub magnitude: Option<f64>,
+}
+
+/// The population selected from one finished run's canonical interaction table.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum InteractionGraphSelection {
+    /// Newest events, returned in ascending tick/sequence order.
+    RecentPage,
+    /// All persisted events in [start_tick, end_tick); overflow is an error.
+    CompleteWindow { start_tick: u64, end_tick: u64 },
+}
+
+/// Bounds on materialized graph input, including one overflow sentinel row.
+/// These do not bound SQL execution time or the database engine's working memory.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteractionGraphBudget {
+    pub max_rows: usize,
+    pub max_projected_bytes: usize,
+}
+
+impl Default for InteractionGraphBudget {
+    fn default() -> Self {
+        Self {
+            max_rows: MAX_STORAGE_QUERY_PAGE,
+            max_projected_bytes: (MAX_STORAGE_QUERY_PAGE + 1)
+                * std::mem::size_of::<InteractionGraphEvent>(),
+        }
+    }
+}
+
+/// A bounded canonical selection, with explicit evidence of page truncation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InteractionGraphPage {
+    pub events: Vec<InteractionGraphEvent>,
+    pub omitted_older_rows: bool,
+    pub run_persisted_rows: u64,
+}
+
 /// One immutable per-agent observation from the canonical `agents` table.
 ///
 /// The reader that returns this row is bound to exactly one [`RunId`]. Keeping
@@ -8119,11 +8165,13 @@ fn load_archive_space(
     let row = &rows[0];
     let space_version: i64 = decode(row, 0, "archive_space.space_version")?;
     let axes_json: String = decode(row, 1, "archive_space.axes_json")?;
-    let space_version = u32::try_from(space_version).map_err(|error| StorageError::InvalidData {
-        context: "archive_space.space_version",
-        reason: error.to_string(),
-    })?;
+    let space_version =
+        u16::try_from(space_version).map_err(|error| StorageError::InvalidData {
+            context: "archive_space.space_version",
+            reason: error.to_string(),
+        })?;
     Ok(Some(ArchiveSpaceRow {
+        run_id: run_id.to_string(),
         space_version,
         axes_json,
     }))
@@ -8134,7 +8182,7 @@ fn load_archive_cells(
     run_id: RunId,
 ) -> Result<Vec<ArchiveCellRow>, StorageError> {
     let rows = connection.query_with_params(
-        "SELECT cell_id, uid, tick_inserted, quality, descriptor, genome, genome_version
+        "SELECT cell_id, uid, tick_inserted, quality, descriptor, genome, genome_version, parent_uid, generation
          FROM archive_cells
          WHERE run_id = ?1
          ORDER BY cell_id ASC",
@@ -8150,7 +8198,7 @@ fn load_archive_cells(
         let genome: Vec<u8> = decode(row, 5, "archive_cells.genome")?;
         let genome_version_i64: i64 = decode(row, 6, "archive_cells.genome_version")?;
 
-        let cell_id = usize::try_from(cell_id_i64).map_err(|error| StorageError::InvalidData {
+        let cell_id = u64::try_from(cell_id_i64).map_err(|error| StorageError::InvalidData {
             context: "archive_cells.cell_id",
             reason: error.to_string(),
         })?;
@@ -8170,6 +8218,7 @@ fn load_archive_cells(
             })?;
 
         cells.push(ArchiveCellRow {
+            run_id: run_id.to_string(),
             cell_id,
             uid,
             tick_inserted,
@@ -8177,6 +8226,13 @@ fn load_archive_cells(
             descriptor,
             genome,
             genome_version,
+            parent_uid: decode::<Option<i64>>(row, 7, "archive_cells.parent_uid")?
+                .map(|uid| checked_u64("archive_cells.parent_uid", uid))
+                .transpose()?,
+            generation: checked_u32(
+                "archive_cells.generation",
+                decode(row, 8, "archive_cells.generation")?,
+            )?,
         });
     }
     Ok(cells)
@@ -10156,6 +10212,89 @@ impl StorageReader {
         rows.iter().map(persisted_interaction_from_row).collect()
     }
 
+    /// Read bounded, fixed-width interaction inputs from a finished run.
+    ///
+    /// A complete window is never silently truncated. A recent page uses one
+    /// extra row to establish whether older events were omitted, including for
+    /// a zero-row request. All returned events are ordered by (tick, seq).
+    /// Missing canonical edges are never replaced by a different replay sample.
+    pub fn load_interaction_graph(
+        &self,
+        selection: InteractionGraphSelection,
+        budget: InteractionGraphBudget,
+    ) -> Result<InteractionGraphPage, StorageError> {
+        let bound = checked_query_limit("interaction_graph.max_rows", budget.max_rows)?;
+        let projected_bytes = (budget.max_rows + 1) * std::mem::size_of::<InteractionGraphEvent>();
+        if projected_bytes > budget.max_projected_bytes {
+            return Err(StorageError::InvalidData {
+                context: "interaction_graph.max_projected_bytes",
+                reason: format!(
+                    "{} rows plus sentinel require {projected_bytes} projected bytes; budget is {}",
+                    budget.max_rows, budget.max_projected_bytes
+                ),
+            });
+        }
+        let (start, end) = match selection {
+            InteractionGraphSelection::RecentPage => (0, i64::MAX),
+            InteractionGraphSelection::CompleteWindow {
+                start_tick,
+                end_tick,
+            } => checked_tick_window("interaction_graph.window", start_tick, end_tick)?,
+        };
+        let rows = self.finished_connection()?.query_with_params(
+            "SELECT tick, seq, actor_agent_uid, target_agent_uid, value
+             FROM interactions
+             WHERE run_id = ?1 AND tick >= ?2 AND (?3 = 1 OR tick < ?4)
+             ORDER BY tick DESC, seq DESC LIMIT ?5",
+            &[
+                sqlite_run_id(self.run_id),
+                start.into(),
+                i64::from(matches!(selection, InteractionGraphSelection::RecentPage)).into(),
+                end.into(),
+                (bound + 1).into(),
+            ],
+        )?;
+        let omitted_older_rows = rows.len() > budget.max_rows;
+        if omitted_older_rows
+            && matches!(selection, InteractionGraphSelection::CompleteWindow { .. })
+        {
+            return Err(StorageError::InvalidData {
+                context: "interaction_graph.max_rows",
+                reason: format!("complete window exceeds {} events", budget.max_rows),
+            });
+        }
+        let mut events = Vec::with_capacity(rows.len().min(budget.max_rows));
+        for row in rows.iter().take(budget.max_rows) {
+            events.push(InteractionGraphEvent {
+                tick: checked_u64("interactions.tick", decode(row, 0, "interactions.tick")?)?,
+                seq: checked_u64("interactions.seq", decode(row, 1, "interactions.seq")?)?,
+                actor: AgentUid(checked_u64(
+                    "interactions.actor_agent_uid",
+                    decode(row, 2, "interactions.actor_agent_uid")?,
+                )?),
+                target: AgentUid(checked_u64(
+                    "interactions.target_agent_uid",
+                    decode(row, 3, "interactions.target_agent_uid")?,
+                )?),
+                magnitude: decode(row, 4, "interactions.value")?,
+            });
+        }
+        events.reverse();
+        let count = self.finished_connection()?.query_row_with_params(
+            "SELECT COUNT(*) FROM interactions WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let run_persisted_rows = checked_u64(
+            "interactions.count",
+            decode(&count, 0, "interactions.count")?,
+        )?;
+        Ok(InteractionGraphPage {
+            events,
+            omitted_older_rows,
+            run_persisted_rows,
+        })
+    }
+
     /// Load run-wide interaction-capture accounting.
     ///
     /// These counters are persisted at the enclosing batch boundary, while
@@ -10165,6 +10304,16 @@ impl StorageReader {
     /// corrupt database cannot turn omitted interactions into apparent zero
     /// behavior.
     pub fn load_interaction_capture(&self) -> Result<PersistedInteractionCapture, StorageError> {
+        Ok(self
+            .load_interaction_capture_evidence()?
+            .unwrap_or_default())
+    }
+
+    /// Run-wide capture counters, preserving absence of accounting evidence.
+    /// No counter rows means unknown capture, not proof that no encounters occurred.
+    pub fn load_interaction_capture_evidence(
+        &self,
+    ) -> Result<Option<PersistedInteractionCapture>, StorageError> {
         let rows = self.finished_connection()?.query_with_params(
             "SELECT kind, SUM(count)
              FROM events
@@ -10179,6 +10328,9 @@ impl StorageReader {
                 INTERACTION_EVENTS_TRUNCATED_KIND.into(),
             ],
         )?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
         let mut capture = PersistedInteractionCapture::default();
         for row in rows {
             let kind: String = decode(&row, 0, "events.kind")?;
@@ -10208,7 +10360,7 @@ impl StorageReader {
                 ),
             });
         }
-        Ok(capture)
+        Ok(Some(capture))
     }
 
     /// Load a bounded page of the newest interaction edges in chronological order.
@@ -12557,95 +12709,25 @@ impl Storage {
         &mut self,
         archive: &MapElitesArchive,
     ) -> Result<(), StorageError> {
+        let run_id = self.run_id.to_string();
         let space_row = archive
-            .to_space_row(self.run_id.as_str())
+            .to_space_row(&run_id)
             .map_err(|e| StorageError::InvalidData {
                 context: "archive_space",
                 reason: e.to_string(),
             })?;
         let cell_rows = archive
-            .to_cell_rows(self.run_id.as_str())
+            .to_cell_rows(&run_id)
             .map_err(|e| StorageError::InvalidData {
                 context: "archive_cells",
                 reason: e.to_string(),
             })?;
         let conn = self.connection()?;
-        let tx = conn.transaction().map_err(StorageError::from)?;
+        let mut tx = conn.transaction().map_err(StorageError::from)?;
         Self::insert_archive_space(&tx, self.run_id, &[space_row]).map_err(StorageError::from)?;
         Self::insert_archive_cells(&tx, self.run_id, &cell_rows).map_err(StorageError::from)?;
         tx.commit().map_err(StorageError::from)?;
         Ok(())
-    }
-
-    /// Load the MAP-Elites behavioral archive for this run, if present.
-    pub fn load_map_elites_archive(
-        &self,
-        byte_cap: usize,
-    ) -> Result<Option<MapElitesArchive>, StorageError> {
-        let conn = self.connection()?;
-        let space_query = "SELECT space_version, axes_json FROM archive_space WHERE run_id = ?1 ORDER BY space_version DESC LIMIT 1";
-        let space_rows = conn.query_with_params(space_query, &[sqlite_run_id(self.run_id)])?;
-        let Some(space_row_first) = space_rows.first() else {
-            return Ok(None);
-        };
-        let space_version: i64 = decode(space_row_first, 0, "archive_space.space_version")?;
-        let axes_json: String = decode(space_row_first, 1, "archive_space.axes_json")?;
-        let space_row = ArchiveSpaceRow {
-            run_id: self.run_id.to_string(),
-            space_version: u16::try_from(space_version).map_err(|e| StorageError::InvalidData {
-                context: "archive_space.space_version",
-                reason: e.to_string(),
-            })?,
-            axes_json,
-        };
-
-        let space = BehaviorSpaceV0::from_space_row(&space_row).map_err(|e| StorageError::InvalidData {
-            context: "archive_space",
-            reason: e.to_string(),
-        })?;
-
-        let cells_query = "SELECT cell_id, uid, tick_inserted, quality, descriptor, genome, genome_version, parent_uid, generation
-                           FROM archive_cells WHERE run_id = ?1 ORDER BY cell_id ASC";
-        let cell_db_rows = conn.query_with_params(cells_query, &[sqlite_run_id(self.run_id)])?;
-        let mut cell_rows = Vec::with_capacity(cell_db_rows.len());
-        for row in &cell_db_rows {
-            let cell_id: i64 = decode(row, 0, "archive_cells.cell_id")?;
-            let uid: i64 = decode(row, 1, "archive_cells.uid")?;
-            let tick_inserted: i64 = decode(row, 2, "archive_cells.tick_inserted")?;
-            let quality: f64 = decode(row, 3, "archive_cells.quality")?;
-            let descriptor: Vec<u8> = decode(row, 4, "archive_cells.descriptor")?;
-            let genome: Vec<u8> = decode(row, 5, "archive_cells.genome")?;
-            let genome_version: i64 = decode(row, 6, "archive_cells.genome_version")?;
-            let parent_uid_opt: Option<i64> = decode(row, 7, "archive_cells.parent_uid")?;
-            let generation: i64 = decode(row, 8, "archive_cells.generation")?;
-
-            cell_rows.push(ArchiveCellRow {
-                run_id: self.run_id.to_string(),
-                cell_id: cell_id as u64,
-                uid: uid as u64,
-                tick_inserted: tick_inserted as u64,
-                quality,
-                descriptor,
-                genome,
-                genome_version: u32::try_from(genome_version).map_err(|e| StorageError::InvalidData {
-                    context: "archive_cells.genome_version",
-                    reason: e.to_string(),
-                })?,
-                parent_uid: parent_uid_opt.map(|p| p as u64),
-                generation: u32::try_from(generation).map_err(|e| StorageError::InvalidData {
-                    context: "archive_cells.generation",
-                    reason: e.to_string(),
-                })?,
-            });
-        }
-
-        let archive = MapElitesArchive::from_rows(space, &cell_rows, byte_cap).map_err(|e| {
-            StorageError::InvalidData {
-                context: "MapElitesArchive::from_rows",
-                reason: e.to_string(),
-            }
-        })?;
-        Ok(Some(archive))
     }
 
     /// Atomically reserve and create an unattributed file-backed database.
@@ -17592,6 +17674,8 @@ impl Storage {
             run_events: Vec::with_capacity(payload.narrative_events.len()),
             genomes: Vec::with_capacity(payload.genomes.len()),
             migrations: Vec::new(),
+            archive_spaces: Vec::new(),
+            archive_cells: Vec::new(),
         };
         observer.checkpoint(PreparationStage::Materialize, progress)?;
 
@@ -34409,10 +34493,10 @@ mod tests {
 
     #[test]
     fn test_storage_map_elites_archive_persistence_and_reload()
-        -> Result<(), Box<dyn std::error::Error>> {
+    -> Result<(), Box<dyn std::error::Error>> {
         use scriptbots_core::map_elites::{
-            ArchiveEntry, BehaviorAxis, BehaviorDescriptor, BehaviorSpaceV0,
-            ContinuousDomain, MapElitesArchive, QualityMetric,
+            ArchiveEntry, BehaviorAxis, BehaviorDescriptor, BehaviorSpaceV0, ContinuousDomain,
+            MapElitesArchive, QualityMetric,
         };
         use scriptbots_core::provenance::OrganismProvenance;
         use scriptbots_core::{AgentUid, Generation, Tick};
@@ -34477,7 +34561,7 @@ mod tests {
         storage.persist_map_elites_archive(&archive)?;
 
         // Reload from storage
-        let loaded_opt = storage.load_map_elites_archive(archive.byte_cap)?;
+        let loaded_opt = storage.reload_archive(archive.byte_cap)?;
         let loaded = loaded_opt.expect("archive should be loaded from storage");
 
         assert_eq!(loaded.len(), 2);

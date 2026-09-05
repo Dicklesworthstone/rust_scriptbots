@@ -70,10 +70,12 @@ fn insert_latency_scaling_repro() {
     ] {
         match mode {
             "bigtx-concurrent-on" => {
-                conn.execute("PRAGMA fsqlite.concurrent_mode=ON").expect("pragma on");
+                conn.execute("PRAGMA fsqlite.concurrent_mode=ON")
+                    .expect("pragma on");
             }
             "bigtx-concurrent-off" => {
-                conn.execute("PRAGMA fsqlite.concurrent_mode=OFF").expect("pragma off");
+                conn.execute("PRAGMA fsqlite.concurrent_mode=OFF")
+                    .expect("pragma off");
             }
             _ => {}
         }

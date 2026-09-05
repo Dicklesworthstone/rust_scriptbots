@@ -10770,6 +10770,7 @@ dependencies = [
  "libc",
  "parquet",
  "scriptbots-core",
+ "scriptbots-runtime",
  "scriptbots-storage",
  "serde",
  "serde_json",

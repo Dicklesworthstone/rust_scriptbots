@@ -29,6 +29,10 @@ struct Cli {
     /// Path to the finished run database (never opened writable).
     db: PathBuf,
 
+    /// Select the canonical run ID in a multi-run database.
+    #[arg(long, global = true)]
+    run_id: Option<scriptbots_runtime::RunId>,
+
     /// Increase log verbosity (-v info, -vv debug); `RUST_LOG` overrides.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
@@ -96,6 +100,9 @@ enum Command {
         /// Export format: graphml or edgelist.
         #[arg(long, value_enum, default_value_t = ExportGraphFormat::Graphml)]
         format: ExportGraphFormat,
+        /// Interaction selection/budgets as key=value (same parameters as the report).
+        #[arg(long = "params", value_name = "K=V")]
+        params: Vec<String>,
         /// Optional destination file path (stdout if omitted).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -156,6 +163,14 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<(), AnalyticsError> {
     let registry = Registry::builtin();
     let db = cli.db.display().to_string();
+    let open_reader = || match cli.run_id {
+        Some(run_id) => StorageReader::open_finished_for_run(&db, run_id),
+        None => StorageReader::open_finished(&db),
+    };
+    let open_context = || match cli.run_id {
+        Some(run_id) => ReaderCtx::open_for_run(&db, run_id),
+        None => ReaderCtx::open(&db),
+    };
 
     match &cli.command {
         Command::List => {
@@ -171,7 +186,7 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             json,
             md,
         } => {
-            let cx = ReaderCtx::open(&db)?;
+            let cx = open_context()?;
             let params = ReportParams::from_pairs(params.iter().cloned())?;
             let output = registry.run(report, &cx, &params)?;
 
@@ -192,7 +207,7 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             tables,
             verify,
         } => {
-            let reader = StorageReader::open_finished(&db)?;
+            let reader = open_reader()?;
             let target_tables = if tables.is_empty() {
                 ExportTable::ALL.to_vec()
             } else {
@@ -240,7 +255,7 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             json,
             md,
         } => {
-            let reader = StorageReader::open_finished(&db)?;
+            let reader = open_reader()?;
             let summary = summarize_run(&reader, *epoch_size, *rolling_window)?;
 
             if let Some(dir) = out_dir {
@@ -269,8 +284,19 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             println!("{}", summary.markdown_table);
             Ok(())
         }
-        Command::ExportGraph { graph, format, out } => {
-            let cx = ReaderCtx::open(&db)?;
+        Command::ExportGraph {
+            graph,
+            format,
+            params,
+            out,
+        } => {
+            let cx = open_context()?;
+            if *graph != ExportGraphKind::Interaction && !params.is_empty() {
+                return Err(AnalyticsError::BadParam {
+                    name: "params".to_owned(),
+                    reason: "graph selection parameters apply to interaction exports".to_owned(),
+                });
+            }
             let text = match (graph, format) {
                 (ExportGraphKind::Lineage, ExportGraphFormat::Graphml) => {
                     let births = cx.reader.load_ancestry_births()?;
@@ -294,27 +320,21 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
                     let undirected = digraph.to_undirected();
                     scriptbots_analytics::export_graph_edgelist(&undirected)?
                 }
-                (ExportGraphKind::Interaction, ExportGraphFormat::Graphml) => {
-                    let rec = cx.reader.recent_interactions(4096)?;
-                    let interactions = if rec.is_empty() {
-                        scriptbots_analytics::extract_interactions_from_replay(&cx, 4096)?
-                    } else {
-                        rec
-                    };
+                (ExportGraphKind::Interaction, format) => {
+                    let params = ReportParams::from_pairs(params.iter().cloned())?;
+                    let (interactions, evidence) =
+                        scriptbots_analytics::load_interaction_graph_input(&cx, &params)?;
                     let (digraph, _, _) =
-                        scriptbots_analytics::build_interaction_digraph(&interactions);
-                    scriptbots_analytics::export_digraph_graphml(&digraph)?
-                }
-                (ExportGraphKind::Interaction, ExportGraphFormat::Edgelist) => {
-                    let rec = cx.reader.recent_interactions(4096)?;
-                    let interactions = if rec.is_empty() {
-                        scriptbots_analytics::extract_interactions_from_replay(&cx, 4096)?
-                    } else {
-                        rec
+                        scriptbots_analytics::build_interaction_digraph(&interactions)?;
+                    let format = match format {
+                        ExportGraphFormat::Graphml => {
+                            scriptbots_analytics::InteractionGraphFormat::GraphMl
+                        }
+                        ExportGraphFormat::Edgelist => {
+                            scriptbots_analytics::InteractionGraphFormat::EdgeList
+                        }
                     };
-                    let (digraph, _, _) =
-                        scriptbots_analytics::build_interaction_digraph(&interactions);
-                    scriptbots_analytics::export_digraph_edgelist(&digraph)?
+                    scriptbots_analytics::export_interaction_graph(&digraph, &evidence, format)?
                 }
             };
 
