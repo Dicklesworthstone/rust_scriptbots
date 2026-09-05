@@ -181,7 +181,7 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step archipelago-check check cargo check --locked --workspace --all-targets
         run_step archipelago-tests test cargo test --locked -p scriptbots-app --test archipelago_report_cli recorded_archipelago_cli -- --nocapture
         run_step capture-tests test cargo test --locked -p scriptbots-app --lib archipelago_report::tests:: -- --nocapture
-        run_step storage-tests test cargo test --locked -p scriptbots-storage -- --nocapture
+        run_step storage-tests test cargo test --locked -p scriptbots-storage --no-fail-fast -- --nocapture
         ;;
     workspace)
         run_step workspace-check check cargo check --locked --workspace --all-targets

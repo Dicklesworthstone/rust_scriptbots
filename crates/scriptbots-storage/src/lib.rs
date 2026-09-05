@@ -29563,19 +29563,6 @@ mod tests {
                 name TEXT NOT NULL,
                 applied_at TEXT NOT NULL
              );
-             INSERT INTO _schema_migrations (version, name, applied_at) VALUES
-                (6, 'create_multi_run_schema', 'forged'),
-                (7, 'add_host_journal_archive', 'forged'),
-                (8, 'add_host_domain_event_projection', 'forged'),
-                (9, 'add_host_command_lifecycle_projection', 'forged'),
-                (10, 'add_replay_event_interaction_edges', 'forged'),
-                (11, 'drop_external_content_narrative_search', 'forged'),
-                (12, 'create_plain_content_narrative_search', 'forged'),
-                (13, 'add_durable_command_claims', 'forged'),
-                (14, 'add_narrative_input_replay_contract', 'forged'),
-                (15, 'partition_per_tick_tables_by_island', 'forged'),
-                (16, 'migrations_carry_both_organism_identities', 'forged'),
-                (17, 'add_map_elites_behavioral_archive', 'forged');
              CREATE TABLE storage_progress (
                 run_id TEXT NOT NULL,
                 singleton INTEGER NOT NULL,
@@ -29584,9 +29571,19 @@ mod tests {
                 durable_batch_id INTEGER NOT NULL,
                 PRIMARY KEY (run_id, singleton)
              );
-             INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);
-             PRAGMA user_version = 17;",
+             INSERT INTO storage_progress VALUES ('forged', 1, 0, 0, 0);",
         )?;
+        // Forge the current ledger without installing any of its real tables or constraints.
+        // The refusal must come from the structural fingerprint, not a stale version label.
+        for &(version, name, _) in SCRIPTBOTS_MIGRATIONS {
+            connection.execute_with_params(
+                "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 'forged')",
+                &[version.into(), name.into()],
+            )?;
+        }
+        connection.execute(&format!(
+            "PRAGMA user_version = {SCRIPTBOTS_SCHEMA_VERSION}"
+        ))?;
         connection.close()?;
 
         // The forgery must claim the CURRENT head version, and this asserts it does. At any
