@@ -25204,12 +25204,13 @@ mod tests {
         assert_eq!(failure.commit_state, FailureCommitState::RolledBack);
         // The pinned engine reports SQL CHECK failures through its VDBE halt
         // error, rather than constructing the public CheckViolation variant.
+        // Its AST display normalizes the schema's <> operator to !=.
         assert!(
             matches!(
                 &failure.source,
                 FrankenError::Internal(detail)
                     if detail.starts_with("VDBE halted with code 19: CHECK constraint failed:")
-                        && detail.contains("scope <> ''")
+                        && detail.contains("scope != ''")
             ),
             "expected the empty scope CHECK failure, observed {:?}",
             failure.source
