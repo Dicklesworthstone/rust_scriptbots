@@ -603,7 +603,7 @@ fn main() -> Result<()> {
         // bd-2z0.4.13: the app entrypoint owns an AppRoot whose regions tear down in
         // reverse dependency order with explicit budgets and per-region outcomes.
         // Control closes first (stop accepting), storage drains last (every producer
-        // quiesced before the durable watermark advances).
+        // quiesced before the final storage receipt is validated).
         let mut root = AppRoot::new();
         let world_for_storage = Arc::clone(&world);
         let persistence_for_storage = Arc::clone(&persistence);
@@ -615,7 +615,7 @@ fn main() -> Result<()> {
                 &persistence_for_storage,
                 &mut storage_pipeline,
             ) {
-                Ok(()) => Outcome::ok("storage drained to the durable watermark".to_owned()),
+                Ok(()) => Outcome::ok("storage shutdown acknowledged".to_owned()),
                 Err(error) => Outcome::Err(format!("{error:#}")),
             },
         ));

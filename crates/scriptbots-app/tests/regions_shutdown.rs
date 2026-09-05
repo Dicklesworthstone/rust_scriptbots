@@ -89,7 +89,7 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
                     .map(|_receipt| ())
                     .map_err(|error| anyhow::anyhow!("{error:#}"))
             }) {
-                Ok(()) => Outcome::ok("storage drained to the durable watermark".to_owned()),
+                Ok(()) => Outcome::ok("storage shutdown acknowledged".to_owned()),
                 Err(error) => Outcome::Err(format!("{error:#}")),
             }
         },
