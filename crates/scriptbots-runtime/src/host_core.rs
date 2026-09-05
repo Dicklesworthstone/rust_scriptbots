@@ -2516,13 +2516,10 @@ impl HostCore {
             return HostDriveInterest::ReadyNow;
         }
         drop(shared);
-        let journal_drain_required = self.inflight_journal.values().any(|entry| {
-            !entry.committed_volatile
-                || matches!(
-                    entry.shutdown_requirement,
-                    Some(ShutdownCommitRequirement::Durable)
-                )
-        });
+        // Receipt polling removes entries only at this journal's terminal
+        // commitment. A file batch remains inflight after CommittedVolatile;
+        // parking a paused host then would leave its Durable receipt unread.
+        let journal_drain_required = !self.inflight_journal.is_empty();
         if self.lifecycle == HostLifecycle::Stopping
             || (journal_drain_required
                 && (self.playback.paused || speed_units(self.playback.speed_multiplier) == 0))
@@ -8657,6 +8654,51 @@ mod tests {
             status(&mut port, 1).journal(),
             &JournalState::CommittedVolatile
         );
+    }
+
+    #[test]
+    fn paused_durable_adapter_keeps_polling_after_a_volatile_step_receipt() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState {
+            suppress_receipts: true,
+            ..FakeJournalState::default()
+        }));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(0x1201),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("paused host with controlled two-stage receipts");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("explicit step application");
+        let batch_id = journal_state.borrow().attempts[0].id();
+        for (nanos, receipt, interest) in [
+            (
+                1,
+                JournalReceiptState::CommittedVolatile,
+                HostDriveInterest::Draining,
+            ),
+            (2, JournalReceiptState::Durable, HostDriveInterest::WakeOnly),
+        ] {
+            journal_state
+                .borrow_mut()
+                .receipts
+                .push_back(JournalReceipt::new(batch_id, receipt));
+            core.drive(ManualInstant::from_nanos(nanos))
+                .expect("receipt maintenance");
+            assert_eq!(core.drive_interest(), interest);
+            assert_eq!(
+                core.world_tick(),
+                Tick(1),
+                "maintenance must not step science"
+            );
+            assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Running);
+        }
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Durable);
     }
 
     #[test]

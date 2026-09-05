@@ -3851,6 +3851,28 @@ mod tests {
             Err(xchan::TryRecvError::Empty)
         ));
 
+        let oversized_config =
+            CommandEnvelope::new(CommandId::new(3), HostCommand::UpdateConfig(Box::default()));
+        let config_bytes = command_envelope_postcard_size("config bound test", &oversized_config)
+            .expect("stream configuration size without materializing its encoding");
+        assert!(config_bytes > 32);
+        assert_eq!(
+            reader.resolve_for_submit(
+                &oversized_config,
+                [2; blake3::OUT_LEN],
+                CommandClaimPolicy::ReserveIfAbsent,
+            ),
+            CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Oversized {
+                bytes: config_bytes,
+                limit: 32,
+            })
+        );
+        assert_eq!(inflight_bytes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Err(xchan::TryRecvError::Empty)
+        ));
+
         let step = CommandEnvelope::new(CommandId::new(2), HostCommand::Step);
         let step_bytes =
             command_envelope_postcard_size("host_command_claims.envelope_postcard_hex", &step)
@@ -4942,15 +4964,17 @@ mod tests {
     #[test]
     fn configuration_command_wire_round_trips_optional_fields_and_rejects_damage() {
         let default = ScriptBotsConfig::default();
-        let configured = ScriptBotsConfig {
+        let mut configured = ScriptBotsConfig {
             archive_enabled: true,
             archive_interval: 17,
             archive_min_lifetime_ticks: 3,
             archive_max_cells: 256,
             archive_max_bytes: 1 << 20,
+            archive_quality_metric: scriptbots_core::QualityMetric::AgeAtEvaluation,
             interaction_event_tick_stride: 7,
             ..default.clone()
         };
+        configured.archive_space.axes[0].bins = 3;
         assert_ne!(
             default, configured,
             "the codec matrix must vary its payload"
