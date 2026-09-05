@@ -2111,7 +2111,7 @@ mod tests {
                 }
             );
             let series: Vec<f64> = (0..minimum_samples)
-                .map(|i| if i % 2 == 0 { 0.25 } else { 0.75 })
+                .map(|i| if i.is_multiple_of(2) { 0.25 } else { 0.75 })
                 .collect();
             let estimate = compute_mi(&series, &series, &params).expect("valid bin endpoint");
             assert_eq!(estimate.bins, bins);

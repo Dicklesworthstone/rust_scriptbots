@@ -514,6 +514,76 @@ fn test_config_validate_rejects_past_cell_cap_with_cap_named() {
 }
 
 #[test]
+fn config_updates_preserve_real_elites_until_archive_meaning_changes() {
+    let config = ScriptBotsConfig {
+        world_width: 200,
+        world_height: 200,
+        closed: true,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        reproduction_attempt_chance: 0.0,
+        persistence_interval: 0,
+        archive_enabled: true,
+        archive_interval: 1,
+        archive_min_lifetime_ticks: 1,
+        archive_quality_metric: QualityMetric::AgeAtEvaluation,
+        archive_space: BehaviorSpaceV0::new(
+            0,
+            vec![
+                Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 2)
+                    .expect("bounded axis"),
+            ],
+        ),
+        rng_seed: Some(0x00A2_C41E),
+        ..ScriptBotsConfig::default()
+    };
+    let mut world = WorldState::new(config).expect("archive world");
+    let key = world
+        .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+        .expect("register production MLP");
+    let agent = world
+        .try_spawn_agent(AgentData::default())
+        .expect("spawn agent");
+    assert!(world.bind_agent_brain(agent, key).expect("bind MLP"));
+    world.step().expect("collect a real elite");
+    let archive = world.archive().expect("enabled archive").clone();
+    assert_eq!(archive.coverage_count(), 1);
+    assert!(archive.current_bytes > 0);
+    assert!(world.config().archive_max_cells > archive.max_archive_cells);
+
+    let unchanged = world.config().clone();
+    let mut cadence = unchanged.clone();
+    cadence.archive_interval = 2;
+    let mut capacity = cadence.clone();
+    capacity.archive_max_cells = archive
+        .space
+        .total_cells()
+        .expect("actual grid cardinality");
+    let mut chart_cadence = capacity.clone();
+    chart_cadence.chart_flush_interval = unchanged.chart_flush_interval + 1;
+    for updated in [unchanged, cadence, capacity, chart_cadence] {
+        world
+            .apply_config_update(updated)
+            .expect("valid operational update");
+        assert_eq!(
+            world.archive(),
+            Some(&archive),
+            "preserve every elite and byte count"
+        );
+    }
+
+    let mut changed = world.config().clone();
+    changed.archive_quality_metric = QualityMetric::LifetimeIntake;
+    world
+        .apply_config_update(changed)
+        .expect("new archive quality definition");
+    let rebuilt = world.archive().expect("rebuilt archive");
+    assert_eq!(rebuilt.quality_metric, QualityMetric::LifetimeIntake);
+    assert_eq!(rebuilt.coverage_count(), 0);
+    assert_eq!(rebuilt.current_bytes, 0);
+}
+
+#[test]
 fn test_archive_eligibility_filter_rejects_young_agents() {
     let config = ScriptBotsConfig {
         population_minimum: 10,

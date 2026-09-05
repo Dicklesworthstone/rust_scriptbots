@@ -52,8 +52,10 @@ pub const WORLD_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.world-checkpoint.v1.3";
 /// requires a codec bump. A change to future-state coverage or field meaning requires a new
 /// checkpoint schema. Never rebless the representative V1 wire golden without reviewing both
 /// version identities.
-pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 7;
-const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v7";
+// Codec 8 includes every trailing recording/configuration field. Codec 7's conditional
+// omissions left holes in the positional payload; the science-state coverage is unchanged.
+pub const WORLD_CHECKPOINT_V1_CODEC_VERSION: u16 = 8;
+const WORLD_CHECKPOINT_V1_CODEC: &str = "postcard+blake3-v8";
 
 /// Maximum complete checkpoint wire accepted by the decoder.
 ///
@@ -2918,6 +2920,19 @@ mod tests {
             "the representative wire must remain canonical and idempotent"
         );
         let actual = blake3::hash(&wire).to_hex().to_string();
+        if let Some(directory) = std::env::var_os("SCRIPTBOTS_CHECKPOINT_WIRE_PROOF_DIR") {
+            use std::io::Write as _;
+            let path = std::path::PathBuf::from(directory)
+                .join(format!("checkpoint-codec-8-{}.bin", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .expect("reserve unique checkpoint wire evidence");
+            file.write_all(&wire)
+                .expect("retain checkpoint wire evidence");
+            file.sync_all().expect("flush checkpoint wire evidence");
+        }
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
@@ -3243,12 +3258,12 @@ mod tests {
         let mut wire: WorldCheckpointWireV1 =
             postcard::from_bytes(&encoded).expect("decode private wire fixture");
         assert_eq!(
-            wire.codec_version, 7,
-            "bd-16g.2.9.2.1 checkpoint codec bump"
+            wire.codec_version, 8,
+            "bd-6xr2 complete configuration payload codec"
         );
         assert_eq!(
-            wire.codec, "postcard+blake3-v7",
-            "bd-yw1j checkpoint codec identity bump"
+            wire.codec, "postcard+blake3-v8",
+            "bd-6xr2 complete configuration payload codec identity"
         );
 
         wire.schema = "scriptbots.world-checkpoint.v1.2".to_owned();

@@ -34,12 +34,9 @@
 //! that. Extending it to the maximal surface needs a config with every `Option` populated, which
 //! is tracked as remaining bd-dorx work rather than pretended away here.
 //!
-//! There is a SECOND and sharper form of the same problem: `interaction_event_tick_stride` carries
-//! `skip_serializing_if`, so it disappears from the published surface when it holds its sentinel
-//! value. A knob can therefore be present or absent depending on its VALUE, not merely on the
-//! shape of the config -- which means "the set of published knobs" is not even a function of the
-//! config type. Any completeness claim is necessarily relative to a particular config instance,
-//! and this registry's is relative to [`ScriptBotsConfig::default`].
+//! Completeness remains relative to a particular config instance, and this registry's is relative
+//! to [`ScriptBotsConfig::default`]. The exact published-path and no-stale-spec gates below must
+//! continue to agree when configuration serialization changes.
 
 use crate::ScriptBotsConfig;
 use serde_json::Value;
@@ -201,6 +198,19 @@ pub static KNOB_ROLES: &[KnobSpec] = &[
     spec("analytics_stride.behavior_metrics", Operational),
     spec("analytics_stride.lifecycle_events", Operational),
     spec("analytics_stride.macro_metrics", Operational),
+    // MAP-Elites is an observer: construction/update configures the archive, bookkeeping reads
+    // enable/cadence, and maintenance reads lifetime eligibility, descriptors, quality and byte
+    // capacity. The cell cap is consumed by config validation; the space version is consumed by
+    // archive row export/import. These settings do not select parents or feed brain evaluation,
+    // and `world_digest_v1` excludes them from scientific configuration.
+    spec("archive_enabled", Operational),
+    spec("archive_interval", Operational),
+    spec("archive_max_bytes", Operational),
+    spec("archive_max_cells", Operational),
+    spec("archive_min_lifetime_ticks", Operational),
+    spec("archive_quality_metric", Operational),
+    spec("archive_space.axes", Operational),
+    spec("archive_space.version", Operational),
     spec("chart_flush_interval", Operational),
     spec("control.auto_pause_age_above", Operational),
     spec("control.auto_pause_on_spike_hit", Operational),
@@ -281,6 +291,8 @@ pub fn published_knob_paths() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map_elites::{Axis, BehaviorSpaceV0, PhenotypeFeature, QualityMetric};
+    use crate::{AgentData, Position, WorldState, WorldStateError};
     use std::collections::BTreeSet;
 
     /// THE FAIL-CLOSED GATE (bd-dorx): a config field nobody classified fails the build.
@@ -355,6 +367,149 @@ mod tests {
         assert!(KnobRole::ScientificTransition.is_scientific());
         assert!(!KnobRole::Operational.is_scientific());
         assert!(!KnobRole::Presentation.is_scientific());
+    }
+
+    fn archive_witness_config() -> ScriptBotsConfig {
+        ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            rng_seed: Some(0x00A2_C41E),
+            closed: true,
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_attempt_chance: 0.0,
+            archive_enabled: true,
+            archive_interval: 1,
+            archive_min_lifetime_ticks: 1,
+            archive_max_cells: 2,
+            archive_quality_metric: QualityMetric::AgeAtEvaluation,
+            archive_space: BehaviorSpaceV0::new(
+                0,
+                vec![
+                    Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 2)
+                        .expect("bounded archive axis"),
+                ],
+            ),
+            ..ScriptBotsConfig::default()
+        }
+    }
+
+    fn archive_witness_world(config: ScriptBotsConfig) -> WorldState {
+        let mut world = WorldState::new(config).expect("valid archive witness world");
+        world
+            .try_spawn_agent(AgentData {
+                position: Position::new(100.0, 100.0),
+                ..AgentData::default()
+            })
+            .expect("witness agent");
+        world
+    }
+
+    #[test]
+    fn archive_policy_changes_telemetry_but_preserves_each_scientific_boundary() {
+        let config = archive_witness_config();
+        let mut baseline = archive_witness_world(config.clone());
+        let mut disabled = archive_witness_world(ScriptBotsConfig {
+            archive_enabled: false,
+            ..config.clone()
+        });
+        let mut slower = archive_witness_world(ScriptBotsConfig {
+            archive_interval: 2,
+            ..config.clone()
+        });
+        let mut ineligible = archive_witness_world(ScriptBotsConfig {
+            archive_min_lifetime_ticks: 5,
+            ..config
+        });
+        let initial = baseline
+            .world_digest_v1()
+            .expect("initial baseline science");
+        for world in [&disabled, &slower, &ineligible] {
+            assert_eq!(
+                world.world_digest_v1().expect("initial candidate science"),
+                initial
+            );
+        }
+
+        for _ in 0..4 {
+            baseline.step().expect("baseline tick");
+            let expected = baseline.world_digest_v1().expect("baseline science");
+            for world in [&mut disabled, &mut slower, &mut ineligible] {
+                world.step().expect("archive policy tick");
+                assert_eq!(
+                    world.world_digest_v1().expect("candidate science"),
+                    expected,
+                    "archive policy must preserve all science lanes, including RNG and config"
+                );
+            }
+        }
+
+        assert_eq!(
+            baseline.agent_count(),
+            1,
+            "the witness must retain its agent"
+        );
+        assert_eq!(baseline.archive_evaluations, baseline.tick().0);
+        assert!(baseline.archive_evaluations > slower.archive_evaluations);
+        assert!(
+            slower.archive_evaluations > 0,
+            "slower maintenance must run"
+        );
+        assert_eq!(disabled.archive_evaluations, 0);
+        assert!(disabled.archive().is_none());
+        assert!(disabled.agent_stats().is_empty());
+        assert_eq!(baseline.agent_stats().len(), baseline.agent_count());
+        for stats in baseline.agent_stats().values() {
+            assert_eq!(u64::from(stats.ticks_observed), baseline.tick().0);
+        }
+        assert!(
+            !baseline
+                .archive()
+                .expect("enabled archive")
+                .logged_eligibility_warning
+        );
+        assert!(
+            ineligible
+                .archive()
+                .expect("ineligible archive")
+                .logged_eligibility_warning
+        );
+        // This unbound agent witnesses maintenance and eligibility, not elite insertion.
+        // The real MLP insertion path is exercised by tests/map_elites.rs.
+        assert_eq!(
+            baseline
+                .archive()
+                .expect("enabled archive")
+                .coverage_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn archive_cell_capacity_refusal_preserves_the_existing_world() {
+        let mut world = archive_witness_world(archive_witness_config());
+        world.step().expect("populate archive observations");
+        let science = world.world_digest_v1().expect("science before refusal");
+        let archive = world.archive().expect("existing archive").clone();
+        let statistics = world.agent_stats().clone();
+        let revision = world.config_revision();
+        let mut rejected = world.config().clone();
+        rejected.archive_max_cells = archive.space.total_cells().expect("grid cells") - 1;
+
+        assert!(matches!(
+            world.apply_config_update(rejected),
+            Err(WorldStateError::InvalidConfig(
+                "archive_space exceeds max cell capacity (1000000)"
+            ))
+        ));
+        assert_eq!(
+            world.world_digest_v1().expect("science after refusal"),
+            science
+        );
+        assert_eq!(world.archive(), Some(&archive));
+        assert_eq!(world.agent_stats(), &statistics);
+        assert_eq!(world.config_revision(), revision);
     }
 
     /// The Option-gated render subtrees are known to be under-classified, and that is recorded

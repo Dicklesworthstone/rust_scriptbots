@@ -13,8 +13,8 @@
 
 use scriptbots_core::knob_roles::KNOB_ROLES;
 use scriptbots_core::{
-    AgentData, BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig,
-    WorldDigestV1, WorldState,
+    AgentData, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, WorldDigestV1,
+    WorldState,
 };
 use serde_json::Value;
 

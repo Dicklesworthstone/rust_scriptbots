@@ -8208,21 +8208,6 @@ const fn default_interaction_event_tick_stride() -> u32 {
     DEFAULT_INTERACTION_EVENT_TICK_STRIDE
 }
 
-const DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE: u32 = u32::MAX;
-
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
-)]
-const fn interaction_event_tick_stride_is_digest_sentinel(value: &u32) -> bool {
-    *value == DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE
-}
-
-const DIGEST_NEUTRAL_ARCHIVE_INTERVAL: u64 = u64::MAX;
-const DIGEST_NEUTRAL_ARCHIVE_MIN_LIFETIME_TICKS: u32 = u32::MAX;
-const DIGEST_NEUTRAL_ARCHIVE_MAX_CELLS: u64 = u64::MAX;
-const DIGEST_NEUTRAL_ARCHIVE_MAX_BYTES: usize = usize::MAX;
-
 const fn default_archive_enabled() -> bool {
     false
 }
@@ -8243,52 +8228,6 @@ const fn default_archive_quality_metric() -> QualityMetric {
 }
 fn default_archive_space() -> BehaviorSpaceV0 {
     BehaviorSpaceV0::default()
-}
-
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
-)]
-const fn archive_enabled_is_digest_sentinel(value: &bool) -> bool {
-    !*value
-}
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
-)]
-const fn archive_interval_is_digest_sentinel(value: &u64) -> bool {
-    *value == DIGEST_NEUTRAL_ARCHIVE_INTERVAL
-}
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
-)]
-const fn archive_min_lifetime_is_digest_sentinel(value: &u32) -> bool {
-    *value == DIGEST_NEUTRAL_ARCHIVE_MIN_LIFETIME_TICKS
-}
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
-)]
-const fn archive_max_cells_is_digest_sentinel(value: &u64) -> bool {
-    *value == DIGEST_NEUTRAL_ARCHIVE_MAX_CELLS
-}
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
-)]
-const fn archive_max_bytes_is_digest_sentinel(value: &usize) -> bool {
-    *value == DIGEST_NEUTRAL_ARCHIVE_MAX_BYTES
-}
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "Serde skip_serializing_if callbacks receive borrowed fields"
-)]
-fn archive_metric_is_digest_sentinel(value: &QualityMetric) -> bool {
-    *value == QualityMetric::LifetimeIntake
-}
-const fn archive_space_is_digest_sentinel(value: &BehaviorSpaceV0) -> bool {
-    value.axes.is_empty()
 }
 
 /// Persistence event kind recording pairwise interactions observed by the simulation.
@@ -12628,6 +12567,43 @@ pub enum LocomotionModel {
     Differential,
 }
 
+// Keep the public configuration and the historical scientific field sequence under one
+// declaration. Public serialization always includes every field. The digest view excludes
+// trailing recording fields structurally, without value-dependent holes in positional codecs.
+macro_rules! define_scriptbots_config {
+    (
+        $(#[$config_meta:meta])*
+        pub struct ScriptBotsConfig {
+            digest_v1_fields {
+                $($(#[$field_meta:meta])* pub $field:ident: $field_type:ty,)*
+            }
+            recording_fields {
+                $($(#[$recording_meta:meta])* pub $recording:ident: $recording_type:ty,)*
+            }
+        }
+    ) => {
+        $(#[$config_meta])*
+        pub struct ScriptBotsConfig {
+            $($(#[$field_meta])* pub $field: $field_type,)*
+            $($(#[$recording_meta])* pub $recording: $recording_type,)*
+        }
+
+        #[derive(Serialize)]
+        struct ScientificConfigV1<'a> {
+            $($(#[$field_meta])* $field: &'a $field_type,)*
+        }
+
+        impl ScriptBotsConfig {
+            const fn scientific_config_v1(&self) -> ScientificConfigV1<'_> {
+                ScientificConfigV1 {
+                    $($field: &self.$field,)*
+                }
+            }
+        }
+    };
+}
+
+define_scriptbots_config! {
 /// Static configuration for a `ScriptBots` world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -12636,6 +12612,7 @@ pub enum LocomotionModel {
     reason = "Topography, population closure, economy diagnostics and archive enablement are independent serialized configuration switches"
 )]
 pub struct ScriptBotsConfig {
+    digest_v1_fields {
     /// Width of the world in world units.
     pub world_width: u32,
     /// Height of the world in world units.
@@ -12870,60 +12847,40 @@ pub struct ScriptBotsConfig {
     /// Renderer configuration shared across front-ends.
     #[serde(default)]
     pub render: RenderSettings,
+    }
+    recording_fields {
     /// Tick cadence for pairwise interaction persistence.
     ///
     /// `1` records every tick, `N` in `2..u32::MAX` records ticks divisible by `N`, and `0`
-    /// selects the aggregates-only fallback. `u32::MAX` is reserved for digest compatibility.
+    /// selects the aggregates-only fallback. `u32::MAX` is reserved and rejected by validation.
     /// The per-tick cap remains a hard ceiling on selected ticks.
     /// This trailing field is serialized with the run configuration so offline graph consumers
     /// can distinguish complete windows from deliberate sampling.
-    #[serde(
-        default = "default_interaction_event_tick_stride",
-        skip_serializing_if = "interaction_event_tick_stride_is_digest_sentinel"
-    )]
+    #[serde(default = "default_interaction_event_tick_stride")]
     pub interaction_event_tick_stride: u32,
     /// Whether MAP-Elites behavioral archive evaluation is enabled (bd-16g.6.1).
-    #[serde(
-        default = "default_archive_enabled",
-        skip_serializing_if = "archive_enabled_is_digest_sentinel"
-    )]
+    #[serde(default = "default_archive_enabled")]
     pub archive_enabled: bool,
     /// Cadence in ticks for evaluating live agents into the MAP-Elites archive (default 500).
-    #[serde(
-        default = "default_archive_interval",
-        skip_serializing_if = "archive_interval_is_digest_sentinel"
-    )]
+    #[serde(default = "default_archive_interval")]
     pub archive_interval: u64,
     /// Minimum lifetime in ticks an agent must have survived to be evaluated (default 200).
-    #[serde(
-        default = "default_archive_min_lifetime_ticks",
-        skip_serializing_if = "archive_min_lifetime_is_digest_sentinel"
-    )]
+    #[serde(default = "default_archive_min_lifetime_ticks")]
     pub archive_min_lifetime_ticks: u32,
     /// Maximum allowed grid cells in the MAP-Elites archive (default `100_000`, max `1_000_000`).
-    #[serde(
-        default = "default_archive_max_cells",
-        skip_serializing_if = "archive_max_cells_is_digest_sentinel"
-    )]
+    #[serde(default = "default_archive_max_cells")]
     pub archive_max_cells: u64,
     /// Maximum memory consumption in bytes for the archive (default 64MB).
-    #[serde(
-        default = "default_archive_max_bytes",
-        skip_serializing_if = "archive_max_bytes_is_digest_sentinel"
-    )]
+    #[serde(default = "default_archive_max_bytes")]
     pub archive_max_bytes: usize,
     /// Quality metric for elite replacement in MAP-Elites (default `LifetimeIntake`).
-    #[serde(
-        default = "default_archive_quality_metric",
-        skip_serializing_if = "archive_metric_is_digest_sentinel"
-    )]
+    #[serde(default = "default_archive_quality_metric")]
     pub archive_quality_metric: QualityMetric,
     /// Behavioral space definition for MAP-Elites grid discretization.
-    #[serde(
-        default = "default_archive_space",
-        skip_serializing_if = "archive_space_is_digest_sentinel"
-    )]
+    #[serde(default = "default_archive_space")]
     pub archive_space: BehaviorSpaceV0,
+    }
+}
 }
 
 // `f32::cos` is supplied by each target's math runtime and may round the last bit
@@ -21498,12 +21455,10 @@ impl WorldState {
         live_agents.sort_unstable_by_key(|(uid, _)| uid.0);
 
         let total_pop = live_agents.len();
-        let min_lifetime = archive.min_lifetime_ticks;
 
         let mut rejected_count = 0usize;
         let mut evaluated_candidates = Vec::new();
-        let num_axes = archive.space.axes.len();
-        let mut axis_bins: Vec<Vec<u8>> = vec![Vec::new(); num_axes];
+        let mut axis_bins: Vec<Vec<u8>> = vec![Vec::new(); archive.space.axes.len()];
 
         for (uid, handle) in live_agents {
             let Some(data) = self.agents.snapshot(handle) else {
@@ -21512,7 +21467,7 @@ impl WorldState {
             let Some(stats) = self.agent_stats.get(&uid) else {
                 continue;
             };
-            if stats.ticks_observed < min_lifetime {
+            if stats.ticks_observed < archive.min_lifetime_ticks {
                 rejected_count = rejected_count.saturating_add(1);
                 continue;
             }
@@ -21549,23 +21504,18 @@ impl WorldState {
                 }
             }
 
-            let quality = archive.quality_metric.compute(runtime, &data, stats);
-            let provenance = ArchiveProvenance {
-                run_id: String::new(),
-                parent_uid: runtime.lineage[0],
-                generation: data.generation,
-            };
-
-            let entry = ArchiveEntry {
+            evaluated_candidates.push(ArchiveEntry {
                 uid,
                 tick_inserted: next_tick,
                 descriptor,
-                quality,
+                quality: archive.quality_metric.compute(runtime, &data, stats),
                 genome: genome.clone(),
-                provenance,
-            };
-
-            evaluated_candidates.push(entry);
+                provenance: ArchiveProvenance {
+                    run_id: String::new(),
+                    parent_uid: runtime.lineage[0],
+                    generation: data.generation,
+                },
+            });
         }
 
         Self::report_archive_eligibility(
@@ -26457,12 +26407,6 @@ impl WorldState {
         // cannot match the production run it exists to verify, which defeats the anchor.
         scientific_config.replay_event_tick_cap = 0;
         scientific_config.interaction_event_tick_cap = 0;
-        // This impossible runtime value is skipped only for the digest clone. Keeping the new
-        // field trailing and absent here preserves the canonical V1.7 postcard field sequence,
-        // while every real value (including explicit aggregates-only zero) remains serialized
-        // in run configuration and provenance.
-        scientific_config.interaction_event_tick_stride =
-            DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE;
         scientific_config.analytics_stride = AnalyticsStride {
             macro_metrics: 0,
             behavior_metrics: 0,
@@ -26471,16 +26415,14 @@ impl WorldState {
         scientific_config.neuroflow = NeuroflowSettings::default();
         scientific_config.control = ControlSettings::default();
         scientific_config.render = RenderSettings::default();
-        scientific_config.archive_enabled = false;
-        scientific_config.archive_interval = DIGEST_NEUTRAL_ARCHIVE_INTERVAL;
-        scientific_config.archive_min_lifetime_ticks = DIGEST_NEUTRAL_ARCHIVE_MIN_LIFETIME_TICKS;
-        scientific_config.archive_max_cells = DIGEST_NEUTRAL_ARCHIVE_MAX_CELLS;
-        scientific_config.archive_max_bytes = DIGEST_NEUTRAL_ARCHIVE_MAX_BYTES;
-        scientific_config.archive_quality_metric = QualityMetric::LifetimeIntake;
-        scientific_config.archive_space = BehaviorSpaceV0::new(0, Vec::new());
         let mut config_encoder =
             CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "config");
-        config_encoder.postcard("scientific ScriptBotsConfig", &scientific_config)?;
+        // The explicit view preserves the V1.7 field sequence while full run configuration
+        // remains round-trippable through positional serializers such as Postcard.
+        config_encoder.postcard(
+            "scientific ScriptBotsConfig",
+            &scientific_config.scientific_config_v1(),
+        )?;
         let config = config_encoder.finish();
 
         let mut effects_encoder =
@@ -26961,12 +26903,13 @@ impl WorldState {
         }
 
         if new_config.archive_enabled {
+            // archive_max_cells was validated as a ceiling above the grid cardinality. A
+            // different valid ceiling does not change stored descriptors or elite quality.
             let space_changed = match &self.archive {
                 Some(existing) => {
                     existing.space != new_config.archive_space
                         || existing.quality_metric != new_config.archive_quality_metric
                         || existing.min_lifetime_ticks != new_config.archive_min_lifetime_ticks
-                        || existing.max_archive_cells != new_config.archive_max_cells
                         || existing.max_archive_bytes != new_config.archive_max_bytes
                 }
                 None => true,
@@ -28763,6 +28706,79 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering as AtomicUsizeOrdering},
     };
+
+    #[test]
+    fn complete_config_roundtrips_recording_fields_without_positional_holes() {
+        let default = ScriptBotsConfig::default();
+        let configured = ScriptBotsConfig {
+            interaction_event_tick_stride: 7,
+            archive_enabled: true,
+            archive_interval: 23,
+            archive_min_lifetime_ticks: 11,
+            archive_max_cells: 3,
+            archive_max_bytes: 1_024,
+            archive_quality_metric: QualityMetric::AgeAtEvaluation,
+            archive_space: BehaviorSpaceV0::new(
+                0,
+                vec![
+                    map_elites::Axis::new(
+                        "diet",
+                        map_elites::PhenotypeFeature::DietTendency,
+                        (0.0, 1.0),
+                        3,
+                    )
+                    .expect("bounded archive axis"),
+                ],
+            ),
+            ..default.clone()
+        };
+        for config in [default, configured] {
+            config.validate().expect("valid complete configuration");
+            let bytes = postcard::to_allocvec(&config).expect("encode complete config");
+            let (decoded, tail): (ScriptBotsConfig, _) =
+                postcard::take_from_bytes(&bytes).expect("decode complete config");
+            assert!(tail.is_empty(), "all serialized fields must be consumed");
+            assert_eq!(decoded, config);
+            assert_eq!(
+                postcard::to_allocvec(&decoded).expect("re-encode config"),
+                bytes
+            );
+            let json = serde_json::to_value(&config).expect("encode config JSON");
+            assert_eq!(json["archive_enabled"], config.archive_enabled);
+            assert_eq!(
+                json["archive_quality_metric"],
+                serde_json::to_value(config.archive_quality_metric).expect("metric JSON")
+            );
+            assert_eq!(
+                serde_json::from_value::<ScriptBotsConfig>(json).expect("decode config JSON"),
+                config
+            );
+        }
+    }
+
+    #[test]
+    fn complete_config_postcard_preserves_float_bits_before_validation() {
+        for bits in [0_u32, 0x8000_0000, 0x3f00_0001, 0x7fc0_0042] {
+            let config = ScriptBotsConfig {
+                food_growth_rate: f32::from_bits(bits),
+                ..ScriptBotsConfig::default()
+            };
+            let encoded = postcard::to_allocvec(&config).expect("encode raw config");
+            let decoded: ScriptBotsConfig =
+                postcard::from_bytes(&encoded).expect("decode raw config");
+            assert_eq!(decoded.food_growth_rate.to_bits(), bits);
+            assert_eq!(
+                postcard::to_allocvec(&decoded).expect("re-encode raw config"),
+                encoded
+            );
+            if !config.food_growth_rate.is_finite() {
+                assert!(
+                    decoded.validate().is_err(),
+                    "serialization must not sanitize invalid input"
+                );
+            }
+        }
+    }
 
     #[test]
     fn sensory_bearing_is_bit_exact_for_cross_libc_regression_geometry() {
