@@ -580,26 +580,42 @@ fn test_runtime_journal_fault_injection_matrix() {
         HostHealth::Blocked(HostBlocker::JournalFull { .. })
     ));
     verified_faults.push("admission_full_backpressure".to_owned());
+    let retained = driver
+        .host()
+        .core()
+        .pending_journal_batch()
+        .expect("retained batch");
 
     // While blocked, elapsed time cannot bypass retained journal work:
     let _ = driver.step(ManualInstant::from_nanos(25_000_000));
     assert_eq!(driver.host().core().world_tick(), Tick(2));
+    assert!(Arc::ptr_eq(
+        &retained,
+        &driver
+            .host()
+            .core()
+            .pending_journal_batch()
+            .expect("a refused automatic retry keeps the same allocation")
+    ));
 
-    // Restore normal admission: retry retained journal succeeds, clearing blocker!
+    // Restore admission, then let the production channel perform its bounded retry.
+    // HostCore discards elapsed time at blocked boundaries. The recovery boundary
+    // therefore admits the retained tick, and a full later period earns the next tick.
     fault_mode.store(0, Ordering::SeqCst);
-    let retry_res = driver
-        .retry_retained_journal()
-        .expect("retry call")
-        .expect("had retained work");
-    assert!(retry_res.is_accepted());
+    let retry = driver
+        .step(ManualInstant::from_nanos(30_000_000))
+        .expect("automatic retry");
+    assert!(retry.drove);
+    assert_eq!(driver.host().core().world_tick(), Tick(2));
+    assert!(driver.host().core().pending_journal_batch().is_none());
     assert!(!matches!(
         driver.host().core().health(),
         HostHealth::Blocked(HostBlocker::JournalFull { .. })
     ));
 
-    // Next deadline at t=30_000_000 advances cleanly to Tick(3)
+    // One full automatic period after recovery advances exactly one tick.
     let step_recovered = driver
-        .step(ManualInstant::from_nanos(30_000_000))
+        .step(ManualInstant::from_nanos(40_000_000))
         .expect("step after recovery");
     assert!(step_recovered.drove);
     assert_eq!(driver.host().core().world_tick(), Tick(3));
@@ -608,7 +624,7 @@ fn test_runtime_journal_fault_injection_matrix() {
     // 3. FAULT INJECTION B: DelayReceipts
     fault_mode.store(3, Ordering::SeqCst);
     let step_delayed = driver
-        .step(ManualInstant::from_nanos(40_000_000))
+        .step(ManualInstant::from_nanos(50_000_000))
         .expect("step with delayed receipts");
     assert!(step_delayed.drove);
     assert_eq!(driver.host().core().world_tick(), Tick(4));
@@ -618,7 +634,7 @@ fn test_runtime_journal_fault_injection_matrix() {
     // Release delayed receipts
     fault_mode.store(0, Ordering::SeqCst);
     let step_caught_up = driver
-        .step(ManualInstant::from_nanos(50_000_000))
+        .step(ManualInstant::from_nanos(60_000_000))
         .expect("step catching up receipts");
     assert!(step_caught_up.drove);
     assert_eq!(driver.host().core().world_tick(), Tick(5));
@@ -626,7 +642,7 @@ fn test_runtime_journal_fault_injection_matrix() {
 
     // 4. FAULT INJECTION C: FailReceipts (Terminal Storage Failure)
     fault_mode.store(4, Ordering::SeqCst);
-    let _ = driver.step(ManualInstant::from_nanos(60_000_000));
+    let _ = driver.step(ManualInstant::from_nanos(70_000_000));
     // Host transitions to Faulted health when journal receipt fails
     let health = driver.host().core().health();
     assert!(

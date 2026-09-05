@@ -1,5 +1,8 @@
 //! Bevy renderer integration for ScriptBots.
 
+// Capture queries require deeper auto-trait evaluation through Bevy/wgpu attachment types.
+#![recursion_limit = "256"]
+
 pub mod capture;
 pub mod creature_meshes;
 pub mod particles;
@@ -7,8 +10,8 @@ pub mod particles;
 use anyhow::{Context, Result, anyhow};
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::RenderTarget;
 use bevy::camera::prelude::*;
-use bevy::camera::{ManualTextureViewHandle, RenderTarget};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
@@ -3570,7 +3573,7 @@ mod visual_authority_consumer_guard {
             .next()
             .cloned()
             .expect("core exposes at least one authority");
-        let synthetic = vec![(
+        let synthetic = [(
             authority.clone(),
             "crates/scriptbots-bevy/src/fake.rs".to_string(),
         )];
@@ -4068,7 +4071,7 @@ mod quality_tier_consumer_tests {
     fn offscreen_cameras_have_no_pointer_window() {
         let primary = Entity::from_raw_u32(1).expect("entity index 1 is valid");
         for target in [
-            RenderTarget::TextureView(ManualTextureViewHandle(0)),
+            RenderTarget::TextureView(bevy::camera::ManualTextureViewHandle(0)),
             RenderTarget::None {
                 size: UVec2::splat(4),
             },
@@ -4681,9 +4684,9 @@ mod hud_history_sparkline_tests {
     #[test]
     fn fewer_than_two_samples_yields_no_history() {
         assert!(HudHistory::from_history([].iter()).is_empty());
-        let one = vec![summary(1, 10, 0, 0)];
+        let one = [summary(1, 10, 0, 0)];
         assert!(HudHistory::from_history(one.iter()).is_empty());
-        let two = vec![summary(1, 10, 0, 0), summary(2, 11, 1, 0)];
+        let two = [summary(1, 10, 0, 0), summary(2, 11, 1, 0)];
         assert!(!HudHistory::from_history(two.iter()).is_empty());
     }
 
@@ -4775,7 +4778,7 @@ mod hud_event_feed_tests {
     /// recent thing that happened is the first thing shown.
     #[test]
     fn feed_is_newest_first() {
-        let history = vec![
+        let history = [
             summary(1, 1, 0, 0),
             summary(2, 0, 1, 0),
             summary(3, 0, 0, 2),
@@ -4791,7 +4794,7 @@ mod hud_event_feed_tests {
     /// quiet ticks cannot push real events out of a bounded feed.
     #[test]
     fn quiet_ticks_produce_no_entries() {
-        let history = vec![summary(1, 0, 0, 0), summary(2, 0, 0, 0)];
+        let history = [summary(1, 0, 0, 0), summary(2, 0, 0, 0)];
         assert!(HudEvent::recent_from_history(history.iter()).is_empty());
     }
 
@@ -4799,7 +4802,7 @@ mod hud_event_feed_tests {
     /// tick always reads the same way.
     #[test]
     fn one_tick_orders_births_deaths_then_spikes() {
-        let history = vec![summary(7, 3, 2, 1)];
+        let history = [summary(7, 3, 2, 1)];
         let events = HudEvent::recent_from_history(history.iter());
         let kinds: Vec<HudEventKind> = events.iter().map(|e| e.kind).collect();
         assert_eq!(
@@ -4986,8 +4989,7 @@ fn camera_target_window(target: &RenderTarget, primary: Option<Entity>) -> Optio
 }
 
 fn handle_selection_input(
-    buttons: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
+    (buttons, keys): (Res<ButtonInput<MouseButton>>, Res<ButtonInput<KeyCode>>),
     windows: Query<&Window>,
     primary_window: Query<Entity, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<PrimaryCamera>>,
@@ -5270,10 +5272,10 @@ fn handle_playback_shortcuts(
             command.paused = Some(true);
             command.step_once = true;
         });
-        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command)) {
-            if !submit_simulation_command(submitter, command) {
-                controls.update(enqueue_step_request);
-            }
+        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command))
+            && !submit_simulation_command(submitter, command)
+        {
+            controls.update(enqueue_step_request);
         }
     }
 
@@ -8747,8 +8749,7 @@ mod tests {
             Interaction::Pressed,
         ));
         app.update();
-        let state = controls.0.lock().expect("simulation controls").clone();
-        state
+        controls.0.lock().expect("simulation controls").clone()
     }
 
     #[test]
@@ -9089,8 +9090,10 @@ mod tests {
             let _ = world.step();
         }
         let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
-        let mut snapshot_state = SnapshotState::default();
-        snapshot_state.latest = Some(snapshot);
+        let snapshot_state = SnapshotState {
+            latest: Some(snapshot),
+            ..SnapshotState::default()
+        };
         app.insert_resource(snapshot_state);
         app.insert_resource(AgentRegistry::default());
         app.insert_resource(TerrainChunkRegistry::default());

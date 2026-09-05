@@ -2074,9 +2074,7 @@ mod tests {
         };
         let golden = [10u8, 20, 30, 40].repeat(2);
         let mut candidate = golden.clone();
-        for channel in 0..4 {
-            candidate[channel] = 200;
-        }
+        candidate[..4].fill(200);
         let stats = compare_frames(&golden, &candidate, 2, 1, &thresholds).expect("shape matches");
         assert_eq!(
             stats.differing_pixels, 1,
@@ -2568,23 +2566,28 @@ mod tests {
             return;
         }
 
-        let lock_digest =
-            option_env!("SCRIPTBOTS_LOCK_DIGEST").expect("build.rs must inject the lock digest");
+        // These values stay optional at compile time because build.rs permits vendored
+        // builds without a workspace lock. This branch must still reject missing injection.
+        let Some(lock_digest) = option_env!("SCRIPTBOTS_LOCK_DIGEST") else {
+            panic!("build.rs must inject the lock digest");
+        };
         assert_eq!(lock_digest.len(), 16, "FNV-1a-64 renders as 16 hex digits");
         assert!(
             lock_digest.chars().all(|c| c.is_ascii_hexdigit()),
             "lock digest must be hex, got {lock_digest}"
         );
 
-        let rustc = option_env!("SCRIPTBOTS_RUSTC_VERSION")
-            .expect("build.rs must inject the toolchain identity");
+        let Some(rustc) = option_env!("SCRIPTBOTS_RUSTC_VERSION") else {
+            panic!("build.rs must inject the toolchain identity");
+        };
         assert!(
             !rustc.trim().is_empty(),
             "the blank-rustc_version hole must stay closed"
         );
 
-        let target =
-            option_env!("SCRIPTBOTS_TARGET_TRIPLE").expect("build.rs must inject the true target");
+        let Some(target) = option_env!("SCRIPTBOTS_TARGET_TRIPLE") else {
+            panic!("build.rs must inject the true target");
+        };
         assert!(
             !target.trim().is_empty() && target.contains('-'),
             "target triple must be cargo's resolved TARGET, got {target}"

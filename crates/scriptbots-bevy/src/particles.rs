@@ -1368,7 +1368,7 @@ mod tests {
         const CAPACITY: usize = 16;
         // Deterministic LCG: no rand dependency, and a failure is reproducible
         // from the seed printed in the assertion.
-        let mut state: u64 = 0x1419_5EED_2026_07_26;
+        let mut state: u64 = 0x1419_5EED_2026_0726;
         let mut next = move || {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)

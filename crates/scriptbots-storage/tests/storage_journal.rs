@@ -2,9 +2,10 @@
 
 use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
-    AgentData, AgentUid, BrainRunner, ControlCommand, INPUT_SIZE, OUTPUT_SIZE, Position,
-    ReplayEventKind, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, Tick,
-    WorldDigestV1, WorldState, channels::OutputChannel,
+    AgentData, AgentUid, BrainRunner, CharacterizationError, ControlCommand, INPUT_SIZE,
+    OUTPUT_SIZE, Position, ReplayEventKind, ScriptBotsConfig, SelectionMode, SelectionState,
+    SelectionUpdate, Tick, WorldContinuationBlocker, WorldDigestV1, WorldState,
+    channels::OutputChannel,
 };
 use scriptbots_runtime::{
     ApplicationState, CommandAuthorityLookupFailure, CommandEnvelope, CommandId, CommandStatus,
@@ -3432,7 +3433,19 @@ fn verify_channel_capacity_recovery(
     let retained = core
         .pending_journal_batch()
         .expect("actual second batch retained");
-    let before_retry = core.scientific_digest_v1().expect("blocked science digest");
+    assert!(
+        matches!(
+            core.scientific_digest_v1(),
+            Err(CharacterizationError::NonContinuable {
+                blocker: WorldContinuationBlocker::RetainedPersistenceBatch,
+            })
+        ),
+        "a blocked world must not claim a continuable scientific digest"
+    );
+    let mut oracle = compact_world();
+    for _ in 0..2 {
+        oracle.step().expect("independent science-only oracle step");
+    }
     let (mut driver, _port) = ChannelHostDriver::new(
         FixedDeadlineHost::new(core),
         ChannelHostOptions {
@@ -3461,7 +3474,9 @@ fn verify_channel_capacity_recovery(
             .core()
             .scientific_digest_v1()
             .expect("retry science digest"),
-        before_retry,
+        oracle
+            .world_digest_v1()
+            .expect("independent two-tick digest"),
         "journal recovery must not repeat either scientific transition"
     );
 
@@ -3480,10 +3495,7 @@ fn verify_channel_capacity_recovery(
         Tick(3),
         "fresh Step advances exactly once"
     );
-    let mut oracle = compact_world();
-    for _ in 0..3 {
-        oracle.step().expect("independent science-only oracle step");
-    }
+    oracle.step().expect("independent third science transition");
     assert_eq!(
         driver
             .host()
