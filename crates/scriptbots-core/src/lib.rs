@@ -13138,7 +13138,7 @@ impl ScriptBotsConfig {
         reject_unless!(self.world_height != 0, "world_height must be non-zero");
         reject_unless!(self.food_cell_size != 0, "food_cell_size must be non-zero");
         reject_unless!(
-            self.interaction_event_tick_stride != DIGEST_NEUTRAL_INTERACTION_EVENT_TICK_STRIDE,
+            self.interaction_event_tick_stride < u32::MAX,
             "interaction_event_tick_stride must be less than u32::MAX"
         );
         reject_unless!(
@@ -13722,12 +13722,10 @@ impl ScriptBotsConfig {
             "history_capacity must be at least 1"
         );
         self.render.validate()?;
-        if self.archive_max_cells != u64::MAX {
-            reject_unless!(
-                self.archive_max_cells <= MAX_ARCHIVE_CELLS,
-                "archive_max_cells must not exceed 1000000"
-            );
-        }
+        reject_unless!(
+            self.archive_max_cells <= MAX_ARCHIVE_CELLS,
+            "archive_max_cells must not exceed 1000000"
+        );
         if self.archive_enabled {
             reject_unless!(
                 self.archive_interval > 0,
@@ -28776,6 +28774,30 @@ mod tests {
                     decoded.validate().is_err(),
                     "serialization must not sanitize invalid input"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn archive_capacity_validation_has_no_digest_sentinel_exception() {
+        for archive_enabled in [false, true] {
+            let config = ScriptBotsConfig {
+                archive_enabled,
+                archive_max_cells: MAX_ARCHIVE_CELLS,
+                ..ScriptBotsConfig::default()
+            };
+            config.validate().expect("supported maximum cell ceiling");
+            for archive_max_cells in [MAX_ARCHIVE_CELLS + 1, u64::MAX] {
+                let invalid = ScriptBotsConfig {
+                    archive_max_cells,
+                    ..config.clone()
+                };
+                assert!(matches!(
+                    invalid.validate(),
+                    Err(WorldStateError::InvalidConfig(
+                        "archive_max_cells must not exceed 1000000"
+                    ))
+                ));
             }
         }
     }
