@@ -15,6 +15,7 @@ verify_evidence() {
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
         graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-link-artifacts recipe-dependencies architecture-mutations) ;;
+        graphs-and-recipes) required+=(graph-check graph-tests archive-unit archive-integration architecture-doc-examples architecture-recipes recipe-link-artifacts recipe-dependencies architecture-mutations) ;;
         *) refuse "unknown evidence lane" ;;
     esac
     required+=(analytics-binary)
@@ -94,7 +95,7 @@ fi
 proof_version=${1:-}
 [[ "$proof_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "missing or unsafe proof version"
 [[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned source commit"
-[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes ]] || refuse "unknown correctness lane"
+[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes ]] || refuse "unknown correctness lane"
 [[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || refuse "invoke through the native DSR profile"
 [[ ${SCRIPTBOTS_VERIFY_PROFILE:-} = /* && -f "$SCRIPTBOTS_VERIFY_PROFILE" ]] || refuse "missing materialized DSR profile"
 [[ ${SCRIPTBOTS_PROOF_ROOT:-} = /* && -d "$SCRIPTBOTS_PROOF_ROOT" ]] || refuse "missing external proof root"
@@ -173,13 +174,15 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step workspace-tests test cargo test --locked --workspace -- --nocapture
         run_step core-economy-faults test cargo test --locked -p scriptbots-core --features economy-faults -- --nocapture
         ;;
-    graphs)
+    graphs|graphs-and-recipes)
         run_step graph-check check cargo check --locked -p scriptbots-analytics --all-targets
         run_step graph-tests test cargo test --locked -p scriptbots-analytics --test graph_reports -- --nocapture
         run_step archive-unit test cargo test --locked -p scriptbots-storage --lib test_storage_map_elites_archive_persistence_and_reload -- --nocapture
         run_step archive-integration test cargo test --locked -p scriptbots-storage --test persistence_integration map_elites -- --nocapture
         ;;
-    recipes)
+esac
+case "$SCRIPTBOTS_VERIFY_LANE" in
+    recipes|graphs-and-recipes)
         run_step architecture-doc-examples test cargo test --locked -p scriptbots-app --doc -- --nocapture
         run_step architecture-recipes test cargo test --locked -p scriptbots-app --test architecture_contract -- --nocapture
         run_step recipe-link-artifacts check cargo build --locked -p scriptbots-app --lib --message-format=json

@@ -1041,7 +1041,8 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 [`ci/dsr_verify.yaml`](ci/dsr_verify.yaml) and
 [`scripts/dsr_verify.sh`](scripts/dsr_verify.sh) provide a source-pinned correctness
 profile. This is separate from release packaging and the exact-class performance
-golden. It supports `workspace`, `graphs`, and `recipes` lanes; a lane pass only
+golden. It supports `workspace`, `graphs`, `recipes`, and `graphs-and-recipes`
+lanes (the last shares one dependency build for both focused suites); a lane pass only
 certifies that lane. GUI, PTY, browser and performance acceptance require their
 own actual execution.
 
