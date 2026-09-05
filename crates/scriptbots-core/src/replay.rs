@@ -325,7 +325,12 @@ mod tests {
     fn seed_agents(world: &mut WorldState, count: usize) -> Vec<AgentUid> {
         (0..count)
             .map(|index| {
-                let offset = 40.0 + (index as f32) * 60.0;
+                let index = u16::try_from(index).expect("fixture seed index fits exactly in f32");
+                #[expect(
+                    clippy::suboptimal_flops,
+                    reason = "These seeded positions define interaction separation; preserve the fixture's multiply-then-add coordinate order"
+                )]
+                let offset = 40.0 + f32::from(index) * 60.0;
                 let id = world
                     .try_spawn_agent(AgentData {
                         position: Position::new(offset, offset),
@@ -401,6 +406,7 @@ mod tests {
                 "agent {uid:?} survived the whole window and must appear once per tick"
             );
         }
+        drop(batches);
     }
 
     /// The cap is a per-tick budget, so a cap below the population truncates each tick
@@ -428,6 +434,7 @@ mod tests {
             CAP * INTERVAL as usize,
             "every tick spends its own budget of {CAP}"
         );
+        drop(batches);
     }
 
     /// An explicit zero action cap must suppress optional action and digest records without
@@ -449,7 +456,7 @@ mod tests {
         let batch = batches
             .last()
             .expect("the window boundary projected a batch");
-        assert!(action_events(batch).is_empty());
+        assert_eq!(action_events(batch), Vec::<&ReplayEvent>::new());
         assert!(
             !batch
                 .replay_events
@@ -470,6 +477,7 @@ mod tests {
             vec![Tick(1), Tick(2)],
             "mandatory detector inputs must cover every completed tick"
         );
+        drop(batches);
     }
 
     /// Emission is documented as a read-only projection. Two identically seeded runs that
@@ -528,14 +536,13 @@ mod tests {
         let batch = batches
             .last()
             .expect("the window boundary projected a batch");
-        let digests: Vec<_> = batch
+        let digest_count = batch
             .replay_events
             .iter()
             .filter(|event| matches!(event.kind, ReplayEventKind::WorldDigest { .. }))
-            .collect();
+            .count();
         assert_eq!(
-            digests.len(),
-            1,
+            digest_count, 1,
             "the requested digest anchor must ride the batch even with a full action budget"
         );
         assert_eq!(
@@ -543,6 +550,7 @@ mod tests {
             AGENTS * INTERVAL as usize,
             "the anchor must not displace any action event"
         );
+        drop(batches);
     }
 
     /// Determinism rests on the canonical ascending-`AgentUid` layout; the recorded stream
@@ -561,6 +569,7 @@ mod tests {
             .into_iter()
             .filter_map(|event| event.agent_uid)
             .collect();
+        drop(batches);
         assert_eq!(uids.len(), 5, "every live agent is recorded");
         assert!(
             uids.windows(2).all(|pair| pair[0] < pair[1]),
@@ -695,7 +704,7 @@ mod tests {
             observations.push((kinds, digest, world.replay_interaction_events_dropped()));
         }
 
-        assert!(observations[0].0.is_empty());
+        assert_eq!(observations[0].0, Vec::<ReplayInteractionKind>::new());
         assert_eq!(observations[1].0, vec![ReplayInteractionKind::FoodShare]);
         assert_eq!(
             observations[2].0,
@@ -717,18 +726,23 @@ mod tests {
 
     #[test]
     fn interaction_edges_keep_stable_uids_when_slotmap_storage_recycles() {
-        let (mut world, actor_id, removed_id, actor_uid, removed_uid) = pairwise_world(8);
+        let (mut world, actor_handle, removed_handle, actor_uid, removed_uid) = pairwise_world(8);
         world
-            .remove_agent(removed_id)
+            .remove_agent(removed_handle)
             .expect("remove the original target");
-        let replacement_id = world
+        let replacement_handle = world
             .try_spawn_agent(AgentData::default())
             .expect("spawn replacement target");
-        let replacement_uid = world.agent_uid(replacement_id).expect("replacement uid");
-        assert_ne!(removed_id, replacement_id, "slot generation must advance");
+        let replacement_uid = world
+            .agent_uid(replacement_handle)
+            .expect("replacement uid");
+        assert_ne!(
+            removed_handle, replacement_handle,
+            "slot generation must advance"
+        );
         assert_eq!(
-            removed_id.raw() & u64::from(u32::MAX),
-            replacement_id.raw() & u64::from(u32::MAX),
+            removed_handle.raw() & u64::from(u32::MAX),
+            replacement_handle.raw() & u64::from(u32::MAX),
             "the test premise requires the replacement to reuse the removed slot"
         );
         assert_ne!(
@@ -736,10 +750,10 @@ mod tests {
             "stable UIDs must never recycle"
         );
 
-        let actor_index = world.agents.index_of(actor_id).expect("actor index");
+        let actor_index = world.agents.index_of(actor_handle).expect("actor index");
         let replacement_index = world
             .agents
-            .index_of(replacement_id)
+            .index_of(replacement_handle)
             .expect("replacement index");
         {
             let columns = world.agents.columns_mut();
@@ -750,7 +764,7 @@ mod tests {
             columns.health_mut()[replacement_index] = 2.0;
         }
         {
-            let actor = world.runtime.get_mut(actor_id).expect("actor runtime");
+            let actor = world.runtime.get_mut(actor_handle).expect("actor runtime");
             actor.energy = 1.0;
             actor.give_intent = 1.0;
             actor.herbivore_tendency = 0.1;
@@ -759,7 +773,7 @@ mod tests {
         {
             let replacement = world
                 .runtime
-                .get_mut(replacement_id)
+                .get_mut(replacement_handle)
                 .expect("replacement runtime");
             replacement.energy = 1.0;
             replacement.give_intent = 0.0;
@@ -928,8 +942,14 @@ mod tests {
         for pair in 0..PAIRS {
             let grid_x = u16::try_from(pair % 50).expect("2k grid x fits u16");
             let grid_y = u16::try_from(pair / 50).expect("2k grid y fits u16");
-            let x = 50.0 + f32::from(grid_x) * 100.0;
-            let y = 50.0 + f32::from(grid_y) * 100.0;
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "The 2k fixture's exact pair spacing is part of its interaction-accounting premise; retain the existing coordinate evaluation order"
+            )]
+            let (x, y) = (
+                50.0 + f32::from(grid_x) * 100.0,
+                50.0 + f32::from(grid_y) * 100.0,
+            );
             let giver = world
                 .try_spawn_agent(AgentData {
                     position: Position::new(x, y),

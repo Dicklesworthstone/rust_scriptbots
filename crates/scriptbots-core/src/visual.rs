@@ -2152,6 +2152,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the contrast oracle retains the original ordered f32 luminance products and sums"
+    )]
     fn luminance(rgb: [f32; 3]) -> f32 {
         0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
     }
@@ -2341,6 +2345,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "these legacy matrix reference values must retain separate product rounding and left-to-right addition"
+    )]
     fn cvd_matrices_match_legacy_constants() {
         // Golden vectors computed from the legacy GPUI/Bevy matrices: identical
         // constants must produce identical outputs forever.
@@ -2713,8 +2721,8 @@ mod tests {
         assert_rgb_close(food_density_color(1.0), FOOD_DENSE_RGB, "dense");
         assert_rgb_close(food_density_color(0.5), FOOD_MID_RGB, "mid");
         let mut previous = food_visual_params(0.0);
-        for i in 1..=10 {
-            let d = i as f32 / 10.0;
+        for i in 1_u16..=10 {
+            let d = f32::from(i) / 10.0;
             let current = food_visual_params(d);
             assert_eq!(
                 current.core_srgb, previous.core_srgb,
@@ -2942,7 +2950,15 @@ mod tests {
         for (i, px) in a.as_chunks::<4>().0.iter().enumerate().take(256) {
             for c in 0..3 {
                 let v = f32::from(px[c]) / 255.0;
+                #[expect(
+                    clippy::suboptimal_flops,
+                    reason = "retain the original lower texture tolerance endpoint, including its separate product rounding"
+                )]
                 let lo = base[c] * (1.0 - spec_grass.grain_amplitude) - 0.02;
+                #[expect(
+                    clippy::suboptimal_flops,
+                    reason = "retain the original upper texture tolerance endpoint, including its separate product rounding"
+                )]
                 let hi = base[c] * (1.0 + spec_grass.grain_amplitude) + 0.02;
                 assert!(
                     (lo..=hi).contains(&v),
@@ -2974,8 +2990,8 @@ mod tests {
     )]
     fn noise_is_bounded_and_deterministic() {
         for seed in [0_u64, 1, 42, u64::MAX] {
-            for i in 0..64 {
-                let v = value_noise_2d(seed, i as f32 * 0.37, i as f32 * 0.91);
+            for i in 0_u16..64 {
+                let v = value_noise_2d(seed, f32::from(i) * 0.37, f32::from(i) * 0.91);
                 assert!(v.is_finite() && (-1.0..=1.0).contains(&v));
             }
         }
@@ -3109,11 +3125,15 @@ mod tests {
         );
 
         // Both vectors stay unit length and perpendicular right around the circle.
-        for step in 0..16 {
-            input.heading = step as f32 * core::f32::consts::TAU / 16.0;
+        for step in 0_u16..16 {
+            input.heading = f32::from(step) * core::f32::consts::TAU / 16.0;
             let p = agent_visual_params(&input);
             let fl = p.facing[0].hypot(p.facing[1]);
             let rl = p.right[0].hypot(p.right[1]);
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "the perpendicularity oracle rounds its two products separately before applying the existing tolerance"
+            )]
             let dot = p.facing[0] * p.right[0] + p.facing[1] * p.right[1];
             assert!((fl - 1.0).abs() < 1e-5, "facing not unit at step {step}");
             assert!((rl - 1.0).abs() < 1e-5, "right not unit at step {step}");
@@ -3138,13 +3158,15 @@ mod tests {
         assert!((p.spike_tip_offset[1] - 3.0).abs() < 1e-5);
     }
 
-    fn ramp_fields() -> (Vec<TerrainKind>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    type RampFields = (Vec<TerrainKind>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+    fn ramp_fields() -> RampFields {
         let kinds = vec![TerrainKind::Grass; 16];
         let moisture = vec![0.5; 16];
         let mut elevation = vec![0.0; 16];
-        for y in 0..4 {
-            for x in 0..4 {
-                elevation[y * 4 + x] = x as f32 / 3.0;
+        for y in 0_u16..4 {
+            for x in 0_u16..4 {
+                elevation[usize::from(y) * 4 + usize::from(x)] = f32::from(x) / 3.0;
             }
         }
         (kinds, moisture, elevation, vec![0.25; 16], vec![0.0; 16])
@@ -3224,7 +3246,7 @@ mod tests {
     }
 
     /// Terrain kind is categorical, so it is nearest-sampled rather than blended: interpolating
-    /// an enum discriminant would be meaningless. splat_weights is the smooth-transition path.
+    /// an enum discriminant would be meaningless. `splat_weights` is the smooth-transition path.
     #[test]
     fn terrain_kind_is_nearest_not_interpolated() {
         let (mut kinds, moisture, elevation, slope, water) = ramp_fields();

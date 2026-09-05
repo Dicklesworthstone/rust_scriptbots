@@ -536,8 +536,91 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_table_driven_view_model_goldens_delta_kinds() {
+    struct DynamicMockCodec {
+        family: BrainFamilyId,
+        parent_loci: Vec<(Locus, LocusValue)>,
+        child_loci: Vec<(Locus, LocusValue)>,
+    }
+
+    impl BrainFamilyCodec for DynamicMockCodec {
+        fn family_id(&self) -> &BrainFamilyId {
+            &self.family
+        }
+        fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
+            BrainAdapterIdentityV1::from_semantic_descriptor(&self.family, 1, b"mock")
+        }
+        fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
+            BrainHeredityCapabilityV1::excluded(BrainHeredityExclusionV1::NoCanonicalLocusSchema)
+        }
+        fn random_genome_material(
+            &self,
+            _rng: &mut dyn RandomStream,
+        ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+            BrainGenomeMaterial::new(1, 1, vec![0])
+        }
+        fn validate_genome(&self, _genome: &BrainGenomeEnvelope) -> Result<(), BrainProtocolError> {
+            Ok(())
+        }
+        fn genome_loci(
+            &self,
+            env: &BrainGenomeEnvelope,
+        ) -> Result<Vec<(Locus, LocusValue)>, BrainProtocolError> {
+            if env.payload() == [1, 2, 3] {
+                Ok(self.parent_loci.clone())
+            } else {
+                Ok(self.child_loci.clone())
+            }
+        }
+        fn validate_evaluator_state(
+            &self,
+            _state: &BrainEvaluatorStateEnvelope,
+        ) -> Result<(), BrainProtocolError> {
+            Ok(())
+        }
+        fn mutate_genome_material(
+            &self,
+            _genome: &BrainGenomeEnvelope,
+            _rates: MutationRates,
+            _rng: &mut dyn RandomStream,
+        ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+            BrainGenomeMaterial::new(1, 1, vec![0])
+        }
+        fn crossover_genomes_material(
+            &self,
+            _left: &BrainGenomeEnvelope,
+            _right: &BrainGenomeEnvelope,
+            _rng: &mut dyn RandomStream,
+        ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+            BrainGenomeMaterial::new(1, 1, vec![0])
+        }
+        fn initial_state(
+            &self,
+            _genome: &BrainGenomeEnvelope,
+            _rng: &mut dyn RandomStream,
+        ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+            BrainEvaluatorStateEnvelope::new(self.family.clone(), 1, 1, vec![0])
+        }
+        fn offspring_state_policy(&self) -> OffspringStatePolicy {
+            OffspringStatePolicy::Reset
+        }
+        fn offspring_state(
+            &self,
+            _child: &BrainGenomeEnvelope,
+            _parents: &[&BrainEvaluatorStateEnvelope],
+            _rng: &mut dyn RandomStream,
+        ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+            BrainEvaluatorStateEnvelope::new(self.family.clone(), 1, 1, vec![0])
+        }
+        fn evaluator(
+            &self,
+            _genome: &BrainGenomeEnvelope,
+            _state: &BrainEvaluatorStateEnvelope,
+        ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+            unimplemented!()
+        }
+    }
+
+    fn delta_kind_fixture() -> (DynamicMockCodec, BrainGenomeEnvelope, BrainGenomeEnvelope) {
         let family = BrainFamilyId::new("mock_family").expect("family id");
         let parent_loci = vec![
             (Locus::NodeBias(0), LocusValue::Scalar(1.0)),
@@ -574,102 +657,17 @@ mod tests {
         let child_env =
             BrainGenomeEnvelope::new(family.clone(), 1, 1, vec![1, 2, 4], founder_provenance())
                 .expect("envelope");
-
-        struct DynamicMockCodec {
-            family: BrainFamilyId,
-            parent_loci: Vec<(Locus, LocusValue)>,
-            child_loci: Vec<(Locus, LocusValue)>,
-        }
-
-        impl BrainFamilyCodec for DynamicMockCodec {
-            fn family_id(&self) -> &BrainFamilyId {
-                &self.family
-            }
-            fn adapter_identity(&self) -> BrainAdapterIdentityV1 {
-                BrainAdapterIdentityV1::from_semantic_descriptor(&self.family, 1, b"mock")
-            }
-            fn heredity_capability(&self) -> BrainHeredityCapabilityV1 {
-                BrainHeredityCapabilityV1::excluded(
-                    BrainHeredityExclusionV1::NoCanonicalLocusSchema,
-                )
-            }
-            fn random_genome_material(
-                &self,
-                _rng: &mut dyn RandomStream,
-            ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
-                BrainGenomeMaterial::new(1, 1, vec![0])
-            }
-            fn validate_genome(
-                &self,
-                _genome: &BrainGenomeEnvelope,
-            ) -> Result<(), BrainProtocolError> {
-                Ok(())
-            }
-            fn genome_loci(
-                &self,
-                env: &BrainGenomeEnvelope,
-            ) -> Result<Vec<(Locus, LocusValue)>, BrainProtocolError> {
-                if env.payload() == &[1, 2, 3] {
-                    Ok(self.parent_loci.clone())
-                } else {
-                    Ok(self.child_loci.clone())
-                }
-            }
-            fn validate_evaluator_state(
-                &self,
-                _state: &BrainEvaluatorStateEnvelope,
-            ) -> Result<(), BrainProtocolError> {
-                Ok(())
-            }
-            fn mutate_genome_material(
-                &self,
-                _genome: &BrainGenomeEnvelope,
-                _rates: MutationRates,
-                _rng: &mut dyn RandomStream,
-            ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
-                BrainGenomeMaterial::new(1, 1, vec![0])
-            }
-            fn crossover_genomes_material(
-                &self,
-                _left: &BrainGenomeEnvelope,
-                _right: &BrainGenomeEnvelope,
-                _rng: &mut dyn RandomStream,
-            ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
-                BrainGenomeMaterial::new(1, 1, vec![0])
-            }
-            fn initial_state(
-                &self,
-                _genome: &BrainGenomeEnvelope,
-                _rng: &mut dyn RandomStream,
-            ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
-                BrainEvaluatorStateEnvelope::new(self.family.clone(), 1, 1, vec![0])
-            }
-            fn offspring_state_policy(&self) -> OffspringStatePolicy {
-                OffspringStatePolicy::Reset
-            }
-            fn offspring_state(
-                &self,
-                _child: &BrainGenomeEnvelope,
-                _parents: &[&BrainEvaluatorStateEnvelope],
-                _rng: &mut dyn RandomStream,
-            ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
-                BrainEvaluatorStateEnvelope::new(self.family.clone(), 1, 1, vec![0])
-            }
-            fn evaluator(
-                &self,
-                _genome: &BrainGenomeEnvelope,
-                _state: &BrainEvaluatorStateEnvelope,
-            ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
-                unimplemented!()
-            }
-        }
-
         let codec = DynamicMockCodec {
             family,
             parent_loci,
             child_loci,
         };
+        (codec, parent_env, child_env)
+    }
 
+    #[test]
+    fn test_table_driven_view_model_goldens_delta_kinds() {
+        let (codec, parent_env, child_env) = delta_kind_fixture();
         let vm = GenomeBrowserViewModel::build(
             &codec,
             AgentUid(42),
@@ -703,7 +701,8 @@ mod tests {
         assert_eq!(vm.deltas.len(), 3);
         assert!(matches!(
             vm.delta_for_locus(&Locus::NodeBias(0)),
-            Some(GenomeDelta::Scalar { before, after, .. }) if *before == 1.0 && *after == 1.5
+            Some(GenomeDelta::Scalar { before, after, .. })
+                if before.to_bits() == 1.0_f32.to_bits() && after.to_bits() == 1.5_f32.to_bits()
         ));
         assert!(matches!(
             vm.delta_for_locus(&Locus::NodeTarget { node: 0, conn: 0 }),
@@ -770,7 +769,7 @@ mod tests {
         assert_eq!(vm.paging.total_loci, 0);
         assert!(!vm.paging.is_truncated);
         assert_eq!(vm.mutation_diff, MutationDiffStatus::FounderNoParent);
-        assert!(vm.deltas.is_empty());
+        assert_eq!(vm.deltas.len(), 0);
         assert!(vm.locus_plot.is_none());
     }
 
@@ -778,8 +777,10 @@ mod tests {
     fn test_browser_long_genomes_paging_and_lod() {
         let family = BrainFamilyId::new("large_net").expect("family id");
         let mut loci = Vec::new();
-        for node in 0..50 {
-            loci.push((Locus::NodeBias(node), LocusValue::Scalar(node as f32 * 0.1)));
+        for node in 0_u16..50 {
+            let scalar = f32::from(node) * 0.1;
+            let node = u32::from(node);
+            loci.push((Locus::NodeBias(node), LocusValue::Scalar(scalar)));
             loci.push((Locus::NodeWeight { node, conn: 0 }, LocusValue::Scalar(1.0)));
             loci.push((
                 Locus::NodeTarget { node, conn: 0 },
@@ -854,7 +855,7 @@ mod tests {
         )
         .expect("build zero diff view model");
 
-        assert!(vm.deltas.is_empty());
+        assert_eq!(vm.deltas.len(), 0);
         match &vm.mutation_diff {
             MutationDiffStatus::Computed {
                 total_deltas,

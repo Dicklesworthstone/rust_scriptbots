@@ -369,7 +369,7 @@ mod tests {
         let cfg = AudioConfig::default();
         let pcm = render_offline_pcm(&frames, &cfg, 60).expect("bounded PCM buffer");
 
-        assert!(!pcm.is_empty());
+        assert_ne!(pcm.len(), 0);
         assert_eq!(pcm.len(), (48_000 / 60) * 2);
         for &sample in &pcm {
             assert!(
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn test_empty_frames_renders_empty_pcm() {
         let pcm = render_offline_pcm(&[], &AudioConfig::default(), 60).expect("empty PCM buffer");
-        assert!(pcm.is_empty());
+        assert_eq!(pcm.len(), 0);
     }
 
     #[test]
@@ -463,10 +463,11 @@ mod tests {
         let frames = [AudioFrame::default()];
         let config = AudioConfig::default();
         for tick_rate in [0, u64::from(config.sample_rate) + 1, u64::MAX] {
-            assert!(
+            assert_eq!(
                 render_offline_pcm(&frames, &config, tick_rate)
                     .expect("empty PCM for this tick rate")
-                    .is_empty()
+                    .len(),
+                0
             );
         }
     }

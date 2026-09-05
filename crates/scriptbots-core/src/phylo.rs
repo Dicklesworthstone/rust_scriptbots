@@ -2407,7 +2407,7 @@ mod tests {
                     && node.y <= y_range.end
             })
             .collect::<Vec<_>>();
-        visible.sort_by(|left, right| lod_rank(right).cmp(&lod_rank(left)));
+        visible.sort_by_key(|node| std::cmp::Reverse(lod_rank(node)));
         visible
             .into_iter()
             .take(budget)
@@ -2581,7 +2581,7 @@ mod tests {
         let scratch_report = scratch_layout.extend(&PhyloDelta {
             updates: updates.iter().rev().cloned().collect(),
         });
-        assert!(scratch_report.issues.is_empty());
+        assert_eq!(scratch_report.issues, Vec::<LayoutIssue>::new());
         assert_same_coordinates(&inc_layout, &scratch_layout);
 
         let by_key = updates
@@ -2612,7 +2612,7 @@ mod tests {
         let report = layout.extend(&PhyloDelta {
             updates: vec![species(10, ParentRef::Pruned, 42, 50, None, 15)],
         });
-        assert!(report.issues.is_empty());
+        assert_eq!(report.issues, Vec::<LayoutIssue>::new());
         let node = layout
             .get_node(&PhyloKey::Species(10))
             .expect("pruned child exists");
@@ -2629,7 +2629,7 @@ mod tests {
         let pending = layout.extend(&PhyloDelta {
             updates: vec![child.clone()],
         });
-        assert!(pending.issues.is_empty());
+        assert_eq!(pending.issues, Vec::<LayoutIssue>::new());
         assert_eq!(
             layout
                 .get_node(&PhyloKey::Species(2))
@@ -2656,9 +2656,9 @@ mod tests {
         let duplicate = layout.extend(&PhyloDelta {
             updates: vec![child.clone(), child],
         });
-        assert!(duplicate.added.is_empty());
-        assert!(duplicate.moved.is_empty());
-        assert!(duplicate.issues.is_empty());
+        assert_eq!(duplicate.added, Vec::<LayoutIdx>::new());
+        assert_eq!(duplicate.moved, Vec::<LayoutIdx>::new());
+        assert_eq!(duplicate.issues, Vec::<LayoutIssue>::new());
         assert_eq!(duplicate.allocated_bytes, 0);
         assert_eq!(layout.memory_report().total_retained_bytes, retained);
 
@@ -2710,7 +2710,7 @@ mod tests {
         updates.push(species(10_001, ParentRef::Root, 900, 120, Some(220), 700));
         updates.push(species(10_002, ParentRef::Root, 800, 120, Some(220), 700));
         let update = layout.extend(&PhyloDelta { updates });
-        assert!(update.issues.is_empty());
+        assert_eq!(update.issues, Vec::<LayoutIssue>::new());
 
         let queries = [
             (
@@ -2739,8 +2739,8 @@ mod tests {
             ),
         ];
         for (viewport, y_range, budget) in queries {
-            let indexed = layout.lod_report(viewport, y_range.start..y_range.end, budget);
-            let repeated = layout.lod_report(viewport, y_range.start..y_range.end, budget);
+            let indexed = layout.lod_report(viewport, y_range.clone(), budget);
+            let repeated = layout.lod_report(viewport, y_range.clone(), budget);
             let expected = brute_force_keys(&layout, viewport, y_range, budget);
             assert_eq!(indexed_keys(&indexed), expected);
             assert_eq!(indexed_keys(&repeated), expected);
@@ -2795,8 +2795,8 @@ mod tests {
             0.0..10_000.0,
             10,
         );
-        assert!(before.nodes.is_empty());
-        assert!(after.nodes.is_empty());
+        assert_eq!(before.nodes, Vec::<&LayoutNode>::new());
+        assert_eq!(after.nodes, Vec::<&LayoutNode>::new());
         assert_eq!(before.index_nodes_visited, 0);
         assert_eq!(after.index_nodes_visited, 0);
     }
@@ -2857,7 +2857,7 @@ mod tests {
             updates: vec![leaf_update],
         });
         assert_eq!(mutable_report.ancestor_steps, 0);
-        assert!(mutable_report.moved.is_empty());
+        assert_eq!(mutable_report.moved, Vec::<LayoutIdx>::new());
         assert!(!mutable_report.full_relayout);
 
         let balanced_len = 1_023_u64;
@@ -3036,10 +3036,10 @@ mod tests {
         let mut graph = AncestryGraph::new();
         for &uid in members {
             let mut record = make_birth(uid, None, None);
-            if let Some(bkeys) = brain_keys {
-                if let Some(&(_, bk)) = bkeys.iter().find(|(u, _)| *u == uid) {
-                    record.brain_key = Some(bk);
-                }
+            if let Some(bkeys) = brain_keys
+                && let Some(&(_, bk)) = bkeys.iter().find(|(u, _)| *u == uid)
+            {
+                record.brain_key = Some(bk);
             }
             let _ = graph.apply_birth(&record);
         }
@@ -3050,8 +3050,10 @@ mod tests {
     /// THIS IS THE TEST THAT STOPS THE FEATURE FROM LYING; write it first.
     #[test]
     fn test_bd_16g_3_3_c_high_cross_mating_is_rejected_as_interbreeding() {
-        let mut table = SpeciesTable::default();
-        table.tick = Tick(10);
+        let mut table = SpeciesTable {
+            tick: Tick(10),
+            ..SpeciesTable::default()
+        };
         table
             .species
             .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
@@ -3145,16 +3147,16 @@ mod tests {
             &table,
             &ancestry,
             &births,
-            &[hint.clone()],
+            std::slice::from_ref(&hint),
             &params,
             &mut state,
         );
-        assert!(out1.events.is_empty());
+        assert_eq!(out1.events, Vec::<(EventId, PhyloEvent)>::new());
 
         // Sample 2: held for 2 samples
         table.tick = Tick(20);
         let out2 = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
-        assert!(out2.events.is_empty());
+        assert_eq!(out2.events, Vec::<(EventId, PhyloEvent)>::new());
 
         // Sample 3: reaches K=3 -> speciation confirmed!
         table.tick = Tick(30);
@@ -3306,8 +3308,10 @@ mod tests {
         let _ = step_phylo_events(&table, &ancestry, &births, &[], &params, &mut state);
 
         // Sample 3: species 2 vanished / merged back!
-        let mut reverted_table = SpeciesTable::default();
-        reverted_table.tick = Tick(30);
+        let mut reverted_table = SpeciesTable {
+            tick: Tick(30),
+            ..SpeciesTable::default()
+        };
         reverted_table
             .species
             .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
@@ -3330,7 +3334,7 @@ mod tests {
                 assert_eq!(*reason, RejectReason::Transient);
                 assert_eq!(evidence.hint_id, HintId(77));
             }
-            _ => panic!("expected Rejected{{Transient}}"),
+            HintVerdict::Confirmed(_) => panic!("expected Rejected{{Transient}}"),
         }
     }
 
@@ -3429,7 +3433,7 @@ mod tests {
         );
     }
 
-    /// (f) Sub-cluster below min_size -> Rejected{BelowMinSize}.
+    /// (f) Sub-cluster below `min_size` -> Rejected{BelowMinSize}.
     #[test]
     fn test_bd_16g_3_3_f_sub_cluster_below_min_size_rejected() {
         let mut table = SpeciesTable::default();
@@ -3471,14 +3475,16 @@ mod tests {
     }
 
     /// (g) Species size -> 0 -> exactly ONE Extinction, and no further events ever emitted
-    /// for that SpeciesId (idempotence of extinction).
+    /// for that `SpeciesId` (idempotence of extinction).
     #[test]
     fn test_bd_16g_3_3_g_species_size_zero_extinction_idempotence() {
         let mut ancestry = build_test_ancestry(&(1..=5).collect::<Vec<_>>(), None);
 
         // Step 1: species 1 has 5 members alive
-        let mut table1 = SpeciesTable::default();
-        table1.tick = Tick(10);
+        let mut table1 = SpeciesTable {
+            tick: Tick(10),
+            ..SpeciesTable::default()
+        };
         table1
             .species
             .push(make_test_species(1, &(1..=5).collect::<Vec<_>>()));
@@ -3486,7 +3492,7 @@ mod tests {
         let params = PhyloEventParams::default();
         let mut state = PhyloEngineState::default();
         let out1 = step_phylo_events(&table1, &ancestry, &[], &[], &params, &mut state);
-        assert!(out1.events.is_empty());
+        assert_eq!(out1.events, Vec::<(EventId, PhyloEvent)>::new());
 
         // Now all members die:
         let _ = ancestry.apply_death(&make_death(1, DeathCause::CombatCarnivore, Tick(20)));
@@ -3496,8 +3502,10 @@ mod tests {
         let _ = ancestry.apply_death(&make_death(5, DeathCause::Aging, Tick(30))); // last member!
 
         // Step 2: species 1 has 0 members and is absent from clustering table
-        let mut table2 = SpeciesTable::default();
-        table2.tick = Tick(35);
+        let table2 = SpeciesTable {
+            tick: Tick(35),
+            ..SpeciesTable::default()
+        };
         let out2 = step_phylo_events(&table2, &ancestry, &[], &[], &params, &mut state);
 
         assert_eq!(out2.events.len(), 1, "exactly ONE Extinction event");
@@ -3522,8 +3530,10 @@ mod tests {
         }
 
         // Step 3: subsequent step with species 1 still absent
-        let mut table3 = SpeciesTable::default();
-        table3.tick = Tick(40);
+        let table3 = SpeciesTable {
+            tick: Tick(40),
+            ..SpeciesTable::default()
+        };
         let out3 = step_phylo_events(&table3, &ancestry, &[], &[], &params, &mut state);
 
         assert!(
@@ -3544,16 +3554,20 @@ mod tests {
         let mut state = PhyloEngineState::default();
 
         // Step 1: species 1 has 5 members
-        let mut table1 = SpeciesTable::default();
-        table1.tick = Tick(10);
+        let mut table1 = SpeciesTable {
+            tick: Tick(10),
+            ..SpeciesTable::default()
+        };
         table1
             .species
             .push(make_test_species(1, &(1..=5).collect::<Vec<_>>()));
         let _ = step_phylo_events(&table1, &ancestry, &[], &[], &params, &mut state);
 
         // Step 2: species 1 doubles to 12 members
-        let mut table2 = SpeciesTable::default();
-        table2.tick = Tick(20);
+        let mut table2 = SpeciesTable {
+            tick: Tick(20),
+            ..SpeciesTable::default()
+        };
         table2
             .species
             .push(make_test_species(1, &(1..=12).collect::<Vec<_>>()));
@@ -3605,8 +3619,10 @@ mod tests {
         let mut state = PhyloEngineState::default();
 
         // Step 1: species 1 has 5 members
-        let mut table1 = SpeciesTable::default();
-        table1.tick = Tick(10);
+        let mut table1 = SpeciesTable {
+            tick: Tick(10),
+            ..SpeciesTable::default()
+        };
         table1
             .species
             .push(make_test_species(1, &(1..=5).collect::<Vec<_>>()));
@@ -3614,8 +3630,10 @@ mod tests {
 
         // Members 1..=5 are still ALIVE in ancestry (no death records)
         // Step 2: clustering table drops species 1!
-        let mut table2 = SpeciesTable::default();
-        table2.tick = Tick(20);
+        let table2 = SpeciesTable {
+            tick: Tick(20),
+            ..SpeciesTable::default()
+        };
         let out2 = step_phylo_events(&table2, &ancestry, &[], &[], &params, &mut state);
 
         // Must NOT emit Extinction! Must record anomaly!
@@ -3644,8 +3662,10 @@ mod tests {
             };
             let mut state = PhyloEngineState::default();
 
-            let mut table1 = SpeciesTable::default();
-            table1.tick = Tick(10);
+            let mut table1 = SpeciesTable {
+                tick: Tick(10),
+                ..SpeciesTable::default()
+            };
             table1
                 .species
                 .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));
@@ -3654,8 +3674,10 @@ mod tests {
                 .push(make_test_species(2, &(11..=20).collect::<Vec<_>>()));
             let out1 = step_phylo_events(&table1, &ancestry, &births, &[], &params, &mut state);
 
-            let mut table2 = SpeciesTable::default();
-            table2.tick = Tick(20);
+            let mut table2 = SpeciesTable {
+                tick: Tick(20),
+                ..SpeciesTable::default()
+            };
             table2
                 .species
                 .push(make_test_species(1, &(1..=10).collect::<Vec<_>>()));

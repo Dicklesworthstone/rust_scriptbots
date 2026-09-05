@@ -551,6 +551,10 @@ impl SensorsExt for [f32; INPUT_SIZE] {
 mod tests {
     use super::*;
 
+    fn fixture_channel_value(index: usize) -> f32 {
+        f32::from(u16::try_from(index).expect("fixture channel index fits exactly in f32"))
+    }
+
     #[test]
     fn output_channels_cover_every_index_exactly_once() {
         let mut seen = [false; OUTPUT_SIZE];
@@ -595,7 +599,7 @@ mod tests {
         for (index, slot) in sensors.iter_mut().enumerate() {
             // Distinct, exactly representable, and never 0.0 so a slot that was
             // silently skipped is distinguishable from one that holds zero.
-            *slot = (index as f32) + 0.5;
+            *slot = fixture_channel_value(index) + 0.5;
         }
 
         let labelled = sensors.labelled();
@@ -630,7 +634,7 @@ mod tests {
     fn the_decode_check_would_catch_a_transposed_pair() {
         let mut sensors = [0.0_f32; INPUT_SIZE];
         for (index, slot) in sensors.iter_mut().enumerate() {
-            *slot = (index as f32) + 0.5;
+            *slot = fixture_channel_value(index) + 0.5;
         }
         let labelled = sensors.labelled();
 
@@ -676,7 +680,7 @@ mod tests {
         for (i, c) in sensor_layout().iter().enumerate() {
             assert_eq!(c.index, i);
             assert_eq!(c.range(), (0.0, 1.0));
-            assert!(!c.short().is_empty());
+            assert_ne!(c.short(), "");
             assert_eq!(c.short(), c.short);
             assert_eq!(c.source(), c.source);
             assert_eq!(c.eye_index(), c.eye);
@@ -757,18 +761,24 @@ mod tests {
     fn accessors_read_the_slot_they_name() {
         let mut outputs = [0.0f32; OUTPUT_SIZE];
         for channel in OutputChannel::ALL {
-            outputs[channel.index()] = channel.index() as f32;
+            outputs[channel.index()] = fixture_channel_value(channel.index());
         }
         for channel in OutputChannel::ALL {
-            assert!((outputs.channel(channel) - channel.index() as f32).abs() < f32::EPSILON);
+            assert!(
+                (outputs.channel(channel) - fixture_channel_value(channel.index())).abs()
+                    < f32::EPSILON
+            );
         }
 
         let mut sensors = [0.0f32; INPUT_SIZE];
         for (i, slot) in sensors.iter_mut().enumerate() {
-            *slot = i as f32;
+            *slot = fixture_channel_value(i);
         }
         for channel in &SENSOR_LAYOUT {
-            assert!((sensors.sensor(channel) - channel.index as f32).abs() < f32::EPSILON);
+            assert!(
+                (sensors.sensor(channel) - fixture_channel_value(channel.index)).abs()
+                    < f32::EPSILON
+            );
         }
         let labelled = sensors.labelled();
         assert_eq!(labelled.len(), INPUT_SIZE);
@@ -850,7 +860,7 @@ mod tests {
                 assert_eq!(actual_inputs, 25);
                 assert_eq!(actual_outputs, 9);
             }
-            _ => panic!("unexpected error variant"),
+            IoLayoutError::InvalidBands(_) => panic!("unexpected error variant"),
         }
     }
 
@@ -862,14 +872,14 @@ mod tests {
         let mut work_sound_emitters = vec![0.0f32; num_agents * bands];
 
         // Agent 0 emits on band 0: [1.0, 0.0, 0.0]
-        work_sound_emitters[0 * bands + 0] = 1.0;
-        work_sound_emitters[0 * bands + 1] = 0.0;
-        work_sound_emitters[0 * bands + 2] = 0.0;
+        work_sound_emitters[0] = 1.0;
+        work_sound_emitters[1] = 0.0;
+        work_sound_emitters[2] = 0.0;
 
         // Agent 1 emits on band 1: [0.0, 1.0, 0.0]
-        work_sound_emitters[1 * bands + 0] = 0.0;
-        work_sound_emitters[1 * bands + 1] = 1.0;
-        work_sound_emitters[1 * bands + 2] = 0.0;
+        work_sound_emitters[bands] = 0.0;
+        work_sound_emitters[bands + 1] = 1.0;
+        work_sound_emitters[bands + 2] = 0.0;
 
         // Agent 2 is listener, dist_factor = 0.5 to Agent 0 and 0.5 to Agent 1
         let dist_factor_0 = 0.5f32;
@@ -877,8 +887,16 @@ mod tests {
 
         let mut heard = vec![0.0f32; bands];
         for b in 0..bands {
-            let sum = dist_factor_0 * work_sound_emitters[0 * bands + b]
-                + dist_factor_1 * work_sound_emitters[1 * bands + b];
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Keep this isolation fixture's separate products and sum in the original sensor arithmetic order while changing only index notation"
+            )]
+            let sum = dist_factor_0 * work_sound_emitters[b]
+                + dist_factor_1 * work_sound_emitters[bands + b];
+            #[expect(
+                clippy::manual_clamp,
+                reason = "Preserve the fixture's ordered min/max saturation; clamp has different NaN behavior"
+            )]
             heard[b] = sum.min(1.0).max(0.0);
         }
 

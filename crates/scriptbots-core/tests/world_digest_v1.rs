@@ -146,7 +146,7 @@ fn v1_reports_honestly_how_much_of_the_world_it_can_see() {
     );
     assert_eq!(digest.algorithm, scriptbots_core::WORLD_DIGEST_V1_ALGORITHM);
     assert!(digest.factory_state_covered);
-    assert!(digest.uncovered_factory_families.is_empty());
+    assert_eq!(digest.uncovered_factory_families.len(), 0);
 }
 
 #[test]

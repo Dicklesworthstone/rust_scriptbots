@@ -1,4 +1,4 @@
-//! Canonical sensor layout exhaustiveness, properties, and stage_sense drift tests (bd-16g.4.1).
+//! Canonical sensor layout exhaustiveness, properties, and `stage_sense` drift tests (bd-16g.4.1).
 
 use scriptbots_core::{
     AgentData, INPUT_SIZE, NUM_EYES, Position, SENSOR_LAYOUT, SENSOR_LAYOUT_DIGEST,
@@ -111,7 +111,8 @@ fn sensor_layout_blake3_digest_pinned_and_sensitive() {
 fn sensors_ext_roundtrip_with_sensor_layout() {
     let mut raw = [0.0f32; INPUT_SIZE];
     for (i, val) in raw.iter_mut().enumerate() {
-        *val = (i as f32) * 0.04;
+        let index = u16::try_from(i).expect("sensor fixture index fits u16");
+        *val = f32::from(index) * 0.04;
     }
 
     for channel in sensor_layout() {
@@ -126,8 +127,7 @@ fn sensors_ext_roundtrip_with_sensor_layout() {
     }
 }
 
-#[test]
-fn stage_sense_drift_test_channel_by_channel() {
+fn lone_observer_sensors() -> [f32; INPUT_SIZE] {
     let mut world = WorldState::new(ScriptBotsConfig {
         world_width: 200,
         world_height: 200,
@@ -161,7 +161,12 @@ fn stage_sense_drift_test_channel_by_channel() {
 
     world.step().expect("step 1");
     let rt = world.agent_runtime(observer).expect("runtime");
-    let sensors = rt.sensors;
+    rt.sensors
+}
+
+#[test]
+fn stage_sense_drift_test_channel_by_channel() {
+    let sensors = lone_observer_sensors();
 
     // 1. Lone agent: all neighbor channels MUST be exactly 0.0
     for c in sensor_layout() {

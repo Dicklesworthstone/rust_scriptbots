@@ -282,14 +282,14 @@ mod tests {
             after: 50.0,
             score: 0.8,
             subject: None,
-            human_text: format!("{:?} at tick {tick}", kind),
+            human_text: format!("{kind:?} at tick {tick}"),
         }
     }
 
     #[test]
     fn test_empty_events_returns_empty_reel() {
         let clips = select_clips(&[], 1000, &SelectionConfig::default());
-        assert!(clips.is_empty());
+        assert_eq!(clips.len(), 0);
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
         events.push(sample_event(500, EventKind::Extinction, 0.5));
 
         let clips = select_clips(&events, 1000, &SelectionConfig::default());
-        assert!(!clips.is_empty());
+        assert_ne!(clips.len(), 0);
         let has_extinction = clips
             .iter()
             .any(|c| c.events.iter().any(|e| e.kind == "Extinction"));
@@ -333,7 +333,7 @@ mod tests {
         let config = SelectionConfig::default();
         let clips1 = select_clips(&events, 1000, &config);
 
-        let mut shuffled = events.clone();
+        let mut shuffled = events;
         shuffled.reverse();
         let clips2 = select_clips(&shuffled, 1000, &config);
 

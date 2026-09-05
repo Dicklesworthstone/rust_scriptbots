@@ -15613,7 +15613,7 @@ pub mod narrative {
             );
         }
 
-        /// A species dying out is NOT EventKind::Extinction.
+        /// A species dying out is NOT `EventKind::Extinction`.
         #[test]
         fn bd_ji3a_species_level_lineage_events_do_not_borrow_population_extinction() {
             for kind in [
@@ -29345,7 +29345,7 @@ mod tests {
         assert_eq!(record.generation, Generation(6));
         assert!(record.is_hybrid);
         assert_eq!(world.last_births, 0);
-        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(world.pending_lifecycle_birth_metrics.len(), 0);
         assert_eq!(world.identity_sequence_state(), (4, 3, 0));
 
         let state_before_rewrites = world.snapshot_agent(child_id).expect("crossover child");
@@ -29642,7 +29642,7 @@ mod tests {
         assert_eq!(world.identity_sequence_state(), identity_before);
         assert_eq!(world.pending_birth_records, records_before);
         assert_eq!(world.agent_count(), agent_count_before);
-        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(world.pending_lifecycle_birth_metrics.len(), 0);
         assert_eq!(world.last_births, 0);
     }
 
@@ -29679,7 +29679,7 @@ mod tests {
                 })
             );
             assert_eq!(rejected.agent_count(), 0);
-            assert!(rejected.pending_birth_records.is_empty());
+            assert_eq!(rejected.pending_birth_records.len(), 0);
             assert_eq!(rejected.random_streams_checkpoint(), before_rng);
             assert_eq!(rejected.identity_sequence_state(), before_identity);
             assert_eq!(
@@ -31321,7 +31321,7 @@ mod tests {
         assert_eq!(world.agent_count(), 1);
         assert!(world.agents().contains(id));
         let runtime = world.agent_runtime(id).expect("runtime");
-        assert!(runtime.mutation_log.is_empty());
+        assert_eq!(runtime.mutation_log, [] as [String; 0]);
         assert_eq!(runtime.sensors, [0.0; INPUT_SIZE]);
         let snapshot = world.snapshot_agent(id).expect("snapshot");
         assert_eq!(snapshot.runtime.indicator.intensity, 0.0);
@@ -32213,8 +32213,8 @@ mod tests {
             .expect("empty stream is valid");
         assert!(empty.history().is_empty());
         assert!(empty.events().is_empty());
-        assert!(empty.emission_watermarks().is_empty());
-        assert!(empty.pending_persistence().is_empty());
+        assert_eq!(empty.emission_watermarks().len(), 0);
+        assert_eq!(empty.pending_persistence().len(), 0);
 
         let input = |tick| {
             narrative::NarrativeInputV1::new(Tick(tick), 100, 1.0, 0)
@@ -32226,7 +32226,7 @@ mod tests {
         )
         .expect("sub-eight stream");
         assert!(partial.events().is_empty());
-        assert!(partial.emission_watermarks().is_empty());
+        assert_eq!(partial.emission_watermarks().len(), 0);
 
         let disabled = narrative::NarrativeReplay::from_inputs(
             narrative::NarrativeReplayPolicyV1::new(0, 3, 8).expect("valid policy"),
@@ -32257,7 +32257,7 @@ mod tests {
         )
         .expect("zero output capacity is a supported disabled policy");
         assert!(output_disabled.events().is_empty());
-        assert!(output_disabled.emission_watermarks().is_empty());
+        assert_eq!(output_disabled.emission_watermarks().len(), 0);
     }
 
     #[test]
@@ -32345,7 +32345,7 @@ mod tests {
         // The table is the ONLY kind-to-presentation mapping: both rails read it.
         for kind in kinds {
             assert!(kind.rail_glyph() != ' ');
-            assert!(!kind.as_str().is_empty());
+            assert_ne!(kind.as_str(), "");
         }
     }
 
@@ -33939,7 +33939,7 @@ mod tests {
         // An unlisted, finite knob is not range-checked here; validate() still
         // governs it. Absence from the table is a gap, not a licence.
         let unlisted = vec![("some_unlisted_knob".to_owned(), 1234.0)];
-        assert!(check_knob_ranges(&unlisted).is_empty());
+        assert_eq!(check_knob_ranges(&unlisted).len(), 0);
     }
 
     #[test]
@@ -34047,7 +34047,7 @@ mod tests {
             .hearing = 1.25;
 
         assert!(!world.realized_hearing_capture_enabled());
-        assert!(world.latest_realized_hearing_observations().is_empty());
+        assert_eq!(world.latest_realized_hearing_observations().len(), 0);
         world.stage_sense();
         assert!(
             world.latest_realized_hearing_observations().is_empty(),
@@ -34244,7 +34244,7 @@ mod tests {
                 ..AgentData::default()
             },
         ] {
-            control.spawn_agent(agent.clone());
+            control.spawn_agent(agent);
             instrumented.spawn_agent(agent);
         }
         instrumented.set_realized_hearing_capture_enabled(true);
@@ -34280,11 +34280,7 @@ mod tests {
         }
 
         instrumented.set_realized_hearing_capture_enabled(false);
-        assert!(
-            instrumented
-                .latest_realized_hearing_observations()
-                .is_empty()
-        );
+        assert_eq!(instrumented.latest_realized_hearing_observations().len(), 0);
     }
 
     #[test]
@@ -34456,7 +34452,7 @@ mod tests {
             contributions: vec![sample_contribution(AgentUid(1), 0, 0.4, [0.1, 0.0, 0.0])],
         };
         let empty = attribution.for_eye(2).expect("eye 2 in range");
-        assert!(empty.contributions.is_empty());
+        assert_eq!(empty.contributions.len(), 0);
         assert_eq!(empty.filtered_out, 1);
         assert!(attribution.for_eye(NUM_EYES).is_none());
     }
@@ -34595,7 +34591,7 @@ mod tests {
         });
 
         let attribution = world.explain_sensors(lone, 8).expect("lone agent exists");
-        assert!(attribution.contributions.is_empty());
+        assert_eq!(attribution.contributions.len(), 0);
         assert_eq!(attribution.truncated, 0);
         // Self-state channels still carry values; an empty contributor list must
         // never be read as "this agent senses nothing".
@@ -34822,13 +34818,15 @@ mod tests {
     /// Parent used by the bd-v69t fixtures: five distinct in-range sensory modifiers so a lost
     /// bit is attributable to a specific gene rather than to a shared default.
     fn v69t_parent(primary_rate: f32) -> AgentRuntime {
-        let mut parent = AgentRuntime::default();
-        parent.trait_modifiers = TraitModifiers {
-            smell: 0.3,
-            sound: 0.4,
-            hearing: 1.0,
-            eye: 1.5,
-            blood: 1.25,
+        let mut parent = AgentRuntime {
+            trait_modifiers: TraitModifiers {
+                smell: 0.3,
+                sound: 0.4,
+                hearing: 1.0,
+                eye: 1.5,
+                blood: 1.25,
+            },
+            ..AgentRuntime::default()
         };
         parent.mutation_rates.primary = primary_rate;
         parent.mutation_rates.secondary = 1.0;
@@ -35177,12 +35175,16 @@ mod tests {
             ..ScriptBotsConfig::default()
         })
         .expect("world");
-        let mut primary = AgentRuntime::default();
-        primary.eye_fov = [0.25, 0.5, 0.75, 1.0];
-        primary.eye_direction = [0.1, 0.2, 0.3, 0.4];
-        let mut secondary = AgentRuntime::default();
-        secondary.eye_fov = [1.25, 1.5, 1.75, 2.0];
-        secondary.eye_direction = [1.1, 1.2, 1.3, 1.4];
+        let primary = AgentRuntime {
+            eye_fov: [0.25, 0.5, 0.75, 1.0],
+            eye_direction: [0.1, 0.2, 0.3, 0.4],
+            ..AgentRuntime::default()
+        };
+        let secondary = AgentRuntime {
+            eye_fov: [1.25, 1.5, 1.75, 2.0],
+            eye_direction: [1.1, 1.2, 1.3, 1.4],
+            ..AgentRuntime::default()
+        };
         let primary_fov = primary.eye_fov.map(f32::to_bits);
         let secondary_fov = secondary.eye_fov.map(f32::to_bits);
         let primary_direction = primary.eye_direction.map(f32::to_bits);
@@ -35238,12 +35240,16 @@ mod tests {
             ..ScriptBotsConfig::default()
         })
         .expect("world");
-        let mut primary = AgentRuntime::default();
-        primary.eye_fov = [0.25, 0.5, 0.75, 1.0];
-        primary.eye_direction = [0.1, 0.2, 0.3, 0.4];
-        let mut secondary = AgentRuntime::default();
-        secondary.eye_fov = [1.25, 1.5, 1.75, 2.0];
-        secondary.eye_direction = [1.1, 1.2, 1.3, 1.4];
+        let primary = AgentRuntime {
+            eye_fov: [0.25, 0.5, 0.75, 1.0],
+            eye_direction: [0.1, 0.2, 0.3, 0.4],
+            ..AgentRuntime::default()
+        };
+        let secondary = AgentRuntime {
+            eye_fov: [1.25, 1.5, 1.75, 2.0],
+            eye_direction: [1.1, 1.2, 1.3, 1.4],
+            ..AgentRuntime::default()
+        };
         let mut crossover_rng = SmallRngStream::seed_from_u64(0xC205_50A8);
         let mut mutation_rng = SmallRngStream::seed_from_u64(0xC205_50A9);
         let child = world.build_child_runtime(
@@ -35283,12 +35289,16 @@ mod tests {
             ..ScriptBotsConfig::default()
         })
         .expect("world");
-        let mut primary = AgentRuntime::default();
-        primary.eye_fov = [0.25, 0.5, 0.75, 1.0];
-        primary.eye_direction = [0.1, 0.2, 0.3, 0.4];
-        let mut secondary = AgentRuntime::default();
-        secondary.eye_fov = [1.25, 1.5, 1.75, 2.0];
-        secondary.eye_direction = [1.1, 1.2, 1.3, 1.4];
+        let primary = AgentRuntime {
+            eye_fov: [0.25, 0.5, 0.75, 1.0],
+            eye_direction: [0.1, 0.2, 0.3, 0.4],
+            ..AgentRuntime::default()
+        };
+        let secondary = AgentRuntime {
+            eye_fov: [1.25, 1.5, 1.75, 2.0],
+            eye_direction: [1.1, 1.2, 1.3, 1.4],
+            ..AgentRuntime::default()
+        };
         let seed = 1;
         let mut expected_rng = SmallRngStream::seed_from_u64(seed);
         let _: f32 = expected_rng.random_range(0.35_f32..0.65_f32);
@@ -35763,9 +35773,10 @@ mod tests {
             canonical.0[0] == 0.25_f32.to_bits() && canonical.0[1] == 0.5_f32.to_bits(),
             "the +x eye must see the red antipodal neighbour at the exact expected intensity"
         );
-        for index in 5..=8 {
+        for (offset, channel) in canonical.0[5..=8].iter().enumerate() {
+            let index = 5 + offset;
             assert_eq!(
-                canonical.0[index],
+                *channel,
                 0.0_f32.to_bits(),
                 "the -x eye must stay blind at channel {index}"
             );
@@ -36014,7 +36025,7 @@ mod tests {
         );
         assert_eq!(bounded.activations.layers.len(), 1);
         assert_eq!(bounded.activations.layers[0].name, "ok");
-        assert!(bounded.activations.connections.is_empty());
+        assert_eq!(bounded.activations.connections.len(), 0);
         assert!(bounded.build.retained_layers <= limits.max_layers());
         assert!(bounded.build.retained_name_bytes <= limits.max_name_bytes());
         assert!(bounded.build.retained_values <= limits.max_values());
@@ -38164,7 +38175,7 @@ mod tests {
         handles: &[AgentId],
         source_for_destination: &[usize],
     ) {
-        assert!(world.pending_deaths.is_empty());
+        assert_eq!(world.pending_deaths.len(), 0);
         assert!(world.pending_spawns.is_empty());
         assert!(world.pending_persistence_runtime_tail.is_empty());
         assert_eq!(handles.len(), source_for_destination.len());
@@ -38872,7 +38883,7 @@ mod tests {
         let empty = BrainRegistry::new()
             .heredity_capabilities()
             .expect("empty registry projection");
-        assert!(empty.descriptors.is_empty());
+        assert_eq!(empty.descriptors.len(), 0);
         assert_eq!(
             empty.capability_version,
             BRAIN_HEREDITY_CAPABILITY_VERSION_V1
@@ -39058,6 +39069,22 @@ mod tests {
 
     #[test]
     fn heredity_projection_diagnostics_are_stable_and_schema_is_family_bound() {
+        fn first_rejected_identity(reverse: bool) -> String {
+            let mut registry = BrainRegistry::new();
+            let ids = if reverse {
+                ["fixture-zeta-invalid", "fixture-alpha-invalid"]
+            } else {
+                ["fixture-alpha-invalid", "fixture-zeta-invalid"]
+            };
+            for id in ids {
+                registry.register(id, |_rng| Ok(Box::new(StubBrain)));
+            }
+            match registry.heredity_capabilities() {
+                Err(BrainProtocolError::InvalidHeredityCapability { identity, .. }) => identity,
+                other => panic!("expected deterministic capability rejection, found {other:?}"),
+            }
+        }
+
         let registered_id =
             BrainFamilyId::new("fixture-schema-owner").expect("valid registered family");
         let other_id = BrainFamilyId::new("fixture-other-schema").expect("valid other family");
@@ -39081,21 +39108,6 @@ mod tests {
                     && detail.contains("fixture-other-schema")
         ));
 
-        fn first_rejected_identity(reverse: bool) -> String {
-            let mut registry = BrainRegistry::new();
-            let ids = if reverse {
-                ["fixture-zeta-invalid", "fixture-alpha-invalid"]
-            } else {
-                ["fixture-alpha-invalid", "fixture-zeta-invalid"]
-            };
-            for id in ids {
-                registry.register(id, |_rng| Ok(Box::new(StubBrain)));
-            }
-            match registry.heredity_capabilities() {
-                Err(BrainProtocolError::InvalidHeredityCapability { identity, .. }) => identity,
-                other => panic!("expected deterministic capability rejection, found {other:?}"),
-            }
-        }
         assert_eq!(
             first_rejected_identity(false),
             "legacy:fixture-alpha-invalid"
@@ -39332,8 +39344,8 @@ mod tests {
         let right_digest = right.world_digest_v1().expect("right identity digest");
         assert!(left_digest.factory_state_covered);
         assert!(right_digest.factory_state_covered);
-        assert!(left_digest.uncovered_factory_families.is_empty());
-        assert!(right_digest.uncovered_factory_families.is_empty());
+        assert_eq!(left_digest.uncovered_factory_families, [] as [String; 0]);
+        assert_eq!(right_digest.uncovered_factory_families, [] as [String; 0]);
         assert_ne!(left_digest.brain_registry, right_digest.brain_registry);
         assert_ne!(left_digest.overall, right_digest.overall);
         assert_eq!(left_digest.agents, right_digest.agents);
@@ -39537,7 +39549,7 @@ mod tests {
             .step_outcome()
             .expect("an evaluator fault must still return its completed containment boundary");
         assert_eq!(completion.outcome.events.tick, Tick(1));
-        assert!(completion.outcome.births.is_empty());
+        assert_eq!(completion.outcome.births.len(), 0);
         let fault = completion
             .fault
             .expect("protocol evaluation failure must produce a completed fault");
@@ -39848,11 +39860,11 @@ mod tests {
         let maximum = vec![0x5a; MAX_BRAIN_BATCH_ARCHITECTURE_KEY_BYTES];
         let key = BrainBatchArchitectureKey::new(maximum.clone()).expect("maximum key");
         assert_eq!(key.as_bytes(), maximum);
-        assert!(
+        assert_eq!(
             BrainBatchArchitectureKey::new(Vec::new())
                 .expect("empty family-owned key")
-                .as_bytes()
-                .is_empty()
+                .as_bytes(),
+            []
         );
         assert!(matches!(
             BrainBatchArchitectureKey::new(vec![
@@ -40883,11 +40895,11 @@ mod tests {
                 .iter()
                 .any(|metric| metric.name == "carcass_reproduction_bonus")
         );
-        assert!(world.pending_birth_records.is_empty());
-        assert!(world.pending_death_records.is_empty());
-        assert!(world.pending_lifecycle_birth_metrics.is_empty());
-        assert!(world.pending_lifecycle_death_metrics.is_empty());
-        assert!(world.replay_events.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
+        assert_eq!(world.pending_death_records.len(), 0);
+        assert_eq!(world.pending_lifecycle_birth_metrics.len(), 0);
+        assert_eq!(world.pending_lifecycle_death_metrics.len(), 0);
+        assert_eq!(world.replay_events.len(), 0);
         assert!(world.pending_persistence_runtime_tail.is_empty());
         assert_eq!(world.pending_birth_events, 0);
         assert_eq!(world.pending_death_events, 0);
@@ -41415,7 +41427,7 @@ mod tests {
                 .expect("idempotent second finalization")
         );
 
-        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
         assert_eq!(session.last_admitted_tick(), Some(Tick::zero()));
         assert!(!session.has_pending_batch());
         assert!(session.fault().is_none());
@@ -41627,7 +41639,7 @@ mod tests {
         assert_eq!(world.random_streams_checkpoint(), before_rng);
         assert_eq!(world.identity_sequence_state(), before_identity);
         assert_eq!(world.agent_count(), 0);
-        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
         assert_eq!(world.history().cloned().collect::<Vec<_>>(), before_history);
         assert_eq!(
             world
@@ -41751,7 +41763,7 @@ mod tests {
         assert_eq!(world.random_streams_checkpoint(), before_rng);
         assert_eq!(world.identity_sequence_state(), before_identity);
         assert_eq!(world.agent_count(), 0);
-        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
         assert_eq!(session.fault(), Some(&fault_before));
         assert_same_staged_batch(&session, &retained_before);
         let retained_after = session.pending_batch().expect("unchanged retained batch");
@@ -42133,6 +42145,7 @@ mod tests {
                 ..
             }] if record.input.tick == Tick(1)
         ));
+        drop(logs);
     }
 
     #[test]
@@ -42157,7 +42170,7 @@ mod tests {
             projection if projection.status() == PersistenceProjectionStatus::Disabled
         ));
         assert_eq!(origin_world.persistence_discarded_records_at, Some(Tick(7)));
-        assert!(origin_world.pending_birth_records.is_empty());
+        assert_eq!(origin_world.pending_birth_records.len(), 0);
 
         let mut death_world = make_world();
         death_world.pending_death_records.push(lifecycle_death(3));
@@ -42166,7 +42179,7 @@ mod tests {
             projection if projection.status() == PersistenceProjectionStatus::Disabled
         ));
         assert_eq!(death_world.persistence_discarded_records_at, Some(Tick(8)));
-        assert!(death_world.pending_death_records.is_empty());
+        assert_eq!(death_world.pending_death_records.len(), 0);
 
         let mut replay_world = make_world();
         replay_world.replay_events.push(ReplayEvent {
@@ -42183,7 +42196,7 @@ mod tests {
             projection if projection.status() == PersistenceProjectionStatus::Disabled
         ));
         assert_eq!(replay_world.persistence_discarded_records_at, Some(Tick(9)));
-        assert!(replay_world.replay_events.is_empty());
+        assert_eq!(replay_world.replay_events.len(), 0);
     }
 
     #[test]
@@ -42222,9 +42235,9 @@ mod tests {
             ..ScriptBotsConfig::default()
         })
         .expect("world");
-        assert!(world.pending_birth_records.is_empty());
-        assert!(world.pending_death_records.is_empty());
-        assert!(world.replay_events.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
+        assert_eq!(world.pending_death_records.len(), 0);
+        assert_eq!(world.replay_events.len(), 0);
         world.step().expect("disabled persistence step");
         assert_eq!(world.persistence_discarded_records_at, Some(Tick(1)));
 
@@ -42385,7 +42398,7 @@ mod tests {
         let insertion_record = world.pending_birth_records[0].clone();
         assert!(insertion_record.brain_key.is_none());
         assert!(session.finalize(&mut world).expect("origin admission"));
-        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
 
         assert!(
             world
@@ -42448,7 +42461,7 @@ mod tests {
                 .expect("post-rejection digest"),
             digest_before
         );
-        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
         assert!(
             !session
                 .finalize(&mut world)
@@ -42631,7 +42644,7 @@ mod tests {
         );
         assert_eq!(outcome.summary.agent_count, 0);
         assert_eq!(outcome.summary.deaths, 1);
-        assert!(outcome.births.is_empty());
+        assert_eq!(outcome.births.len(), 0);
         assert_eq!(outcome.deaths.len(), 1);
         assert_eq!(outcome.deaths[0].agent_uid, doomed_uid);
         assert_eq!(
@@ -43140,9 +43153,9 @@ mod tests {
         assert_eq!(summary.births, 1);
         assert_eq!(summary.deaths, 1);
         assert_eq!(summary.spike_hits, 3);
-        assert!(world.pending_birth_records.is_empty());
-        assert!(world.pending_death_records.is_empty());
-        assert!(world.replay_events.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
+        assert_eq!(world.pending_death_records.len(), 0);
+        assert_eq!(world.replay_events.len(), 0);
         assert_eq!(world.pending_birth_events, 0);
         assert_eq!(world.pending_death_events, 0);
         assert_eq!(world.pending_spike_attempt_events, 0);
@@ -43810,7 +43823,7 @@ mod tests {
         let ticks_a = reproduction_tick_sequence(base.clone(), 24);
         let ticks_b = reproduction_tick_sequence(base, 24);
         assert_eq!(ticks_a, ticks_b);
-        assert!(!ticks_a.is_empty());
+        assert_ne!(ticks_a, [] as [u64; 0]);
     }
 
     #[test]
@@ -45702,7 +45715,7 @@ mod tests {
                 && record.parent_b.is_none()
                 && record.birth_ordinal.is_none()
         }));
-        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(world.pending_lifecycle_birth_metrics.len(), 0);
         assert_eq!(world.last_births, 0);
 
         let mut graph = ancestry::AncestryGraph::new();
@@ -45714,7 +45727,7 @@ mod tests {
 
         world.rollback_population_spawns(receipt);
         assert_eq!(world.agent_count(), 0);
-        assert!(world.pending_birth_records.is_empty());
+        assert_eq!(world.pending_birth_records.len(), 0);
         assert_eq!(world.identity_sequence_state(), (1, 0, 0));
         assert_eq!(world.random_streams_checkpoint(), rng_before);
     }
@@ -45771,7 +45784,7 @@ mod tests {
             world.snapshot_agent(child).unwrap().data.generation,
             Generation(6)
         );
-        assert!(world.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(world.pending_lifecycle_birth_metrics.len(), 0);
         assert_eq!(world.last_births, 0);
 
         let mut graph = ancestry::AncestryGraph::new();
@@ -45992,7 +46005,7 @@ mod tests {
         assert!(world.agent_runtime(ids[1]).is_none());
         assert!(world.agent_runtime(ids[3]).is_none());
         assert_eq!(world.agent_count(), 2);
-        assert!(world.pending_deaths.is_empty());
+        assert_eq!(world.pending_deaths.len(), 0);
         assert_eq!(world.last_deaths, 2);
     }
 
@@ -47813,6 +47826,10 @@ mod tests {
     /// This is injected through the same public `set_tail_clock` seam production uses, so it
     /// changes no struct layout and no statement sequence in the code under test (bd-dz37).
     #[derive(Debug, Default)]
+    #[expect(
+        clippy::struct_field_names,
+        reason = "the clock state and both independent increments explicitly carry nanosecond units"
+    )]
     struct SyntheticTailClock {
         now_ns: u64,
         staging_advance_ns: u64,
@@ -47935,7 +47952,7 @@ mod tests {
         );
     }
 
-    /// bd-b09u: combat's wrap_delta had the same one-correction defect as `toroidal_delta`,
+    /// bd-b09u: combat's `wrap_delta` had the same one-correction defect as `toroidal_delta`,
     /// so spike targeting inherited the same antipodal flip.
     #[test]
     fn combat_wrap_delta_agrees_with_the_minimum_image_at_any_distance() {
@@ -47958,7 +47975,7 @@ mod tests {
 
     /// bd-drhs: the legacy clock counter must reproduce C++'s reset-at-10000 sequence.
     ///
-    /// The integration test in tests/clock_channel_parity.rs covers the off-by-one from a real
+    /// The integration test in `tests/clock_channel_parity.rs` covers the off-by-one from a real
     /// world, but observing the epoch reset that way would need a 10,000-tick run. This pins the
     /// arithmetic directly, including the wrap that World.cpp:54-56 performs.
     #[test]
@@ -48125,6 +48142,7 @@ mod tests {
             "brain population family missing from {} emitted metrics",
             names.len()
         );
+        drop(batches);
     }
 
     /// bd-mv2j: byte-level capture of every projected batch over a deterministic run.
@@ -48191,6 +48209,7 @@ mod tests {
             !batches.is_empty(),
             "the proof harness must project at least one batch or it proves nothing"
         );
+        drop(batches);
 
         // A simulated run does not reach every projection branch. Measured on the run above:
         // `births.*` never fires (no reproduction), `hydrology.*` never fires (default config
@@ -48211,34 +48230,33 @@ mod tests {
     /// row streams are reduced to digests so the dump stays diffable; a digest still fails
     /// loudly, it just does not say which row moved.
     fn render_projected_batch(out: &mut String, batch: &PersistenceBatch) {
+        use std::fmt::Write as _;
+
         let digest = |value: String| blake3::hash(value.as_bytes()).to_hex().to_string();
-        out.push_str(&format!(
-            "== tick {} epoch {} closed {}\n",
+        writeln!(
+            out,
+            "== tick {} epoch {} closed {}",
             batch.summary.tick.0, batch.epoch, batch.closed
-        ));
-        out.push_str(&format!("summary {:?}\n", batch.summary));
-        out.push_str(&format!("metrics {:?}\n", batch.metrics));
-        out.push_str(&format!("events {:?}\n", batch.events));
-        out.push_str(&format!(
-            "agents {}\n",
-            digest(format!("{:?}", batch.agents))
-        ));
-        out.push_str(&format!(
-            "births {}\n",
-            digest(format!("{:?}", batch.births))
-        ));
-        out.push_str(&format!(
-            "deaths {}\n",
-            digest(format!("{:?}", batch.deaths))
-        ));
-        out.push_str(&format!(
-            "replay {}\n",
+        )
+        .expect("write to String");
+        writeln!(out, "summary {:?}", batch.summary).expect("write to String");
+        writeln!(out, "metrics {:?}", batch.metrics).expect("write to String");
+        writeln!(out, "events {:?}", batch.events).expect("write to String");
+        writeln!(out, "agents {}", digest(format!("{:?}", batch.agents))).expect("write to String");
+        writeln!(out, "births {}", digest(format!("{:?}", batch.births))).expect("write to String");
+        writeln!(out, "deaths {}", digest(format!("{:?}", batch.deaths))).expect("write to String");
+        writeln!(
+            out,
+            "replay {}",
             digest(format!("{:?}", batch.replay_events))
-        ));
-        out.push_str(&format!(
-            "narrative {}\n",
+        )
+        .expect("write to String");
+        writeln!(
+            out,
+            "narrative {}",
             digest(format!("{:?}", batch.narrative_events))
-        ));
+        )
+        .expect("write to String");
     }
 
     /// Project one batch with every metric family forced on, for the bd-mv2j seam proof.
@@ -49181,7 +49199,7 @@ mod tests {
         assert_ne!(left.brain_registry, right.brain_registry);
         assert_ne!(left.overall, right.overall);
         assert!(left.factory_state_covered);
-        assert!(left.uncovered_factory_families.is_empty());
+        assert_eq!(left.uncovered_factory_families, [] as [String; 0]);
 
         let mut opaque =
             WorldState::new(quiet_trace_config(2_821, 0)).expect("opaque factory world");
@@ -50446,7 +50464,7 @@ mod tests {
             let mapping = map_legacy_render_env(name, value);
             assert!(mapping.is_some(), "{name} must map from {value}");
             let mapping = mapping.expect("advertised legacy mapping was asserted present");
-            assert!(!mapping.assignments.is_empty());
+            assert_ne!(mapping.assignments.len(), 0);
             assert!(mapping.note.len() > 8);
         }
 

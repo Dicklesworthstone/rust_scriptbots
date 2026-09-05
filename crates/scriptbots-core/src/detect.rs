@@ -1679,17 +1679,19 @@ mod tests {
     fn detectors_survive_degenerate_series() {
         for len in 0..3usize {
             let series: Vec<Sample> = (0..len).map(|i| Sample::new(i as u64, 1.0)).collect();
-            assert!(
+            assert_eq!(
                 change_points_cusum(&series, CusumParams::default())
-                    .expect("degenerate series is valid, just uninteresting")
-                    .is_empty()
+                    .expect("degenerate series is valid, just uninteresting"),
+                Vec::<ChangePoint>::new()
             );
-            assert!(
-                regimes(&series, RegimeParams::default())
-                    .expect("valid")
-                    .is_empty()
+            assert_eq!(
+                regimes(&series, RegimeParams::default()).expect("valid"),
+                Vec::<RegimeWindow>::new()
             );
-            assert!(threshold_crossings(&series, &[]).expect("valid").is_empty());
+            assert_eq!(
+                threshold_crossings(&series, &[]).expect("valid"),
+                Vec::<Crossing>::new()
+            );
         }
     }
 
@@ -2133,7 +2135,7 @@ mod tests {
     /// Large n must not grow working memory, and must still agree with the oracle.
     ///
     /// The bound this pins is the one the bead cares about: bins are fixed, so the
-    /// histogram cost is identical at n = 100 and n = 200_000.
+    /// histogram cost is identical at `n = 100` and `n = 200_000`.
     #[test]
     fn bd_16g_2_11_large_sample_stays_bounded_and_correct() {
         let params = BimodalityParams::default();
@@ -2152,14 +2154,8 @@ mod tests {
 
     // ---- bd-16g.2.11 item 2: the evidence envelope ----
 
-    /// Every primitive must produce evidence, and every required field must be populated.
-    ///
-    /// This is the completeness gate the bead asks for. It is written as an exhaustive
-    /// `match` on [`DetectionKind`] so that ADDING A PRIMITIVE WITHOUT GIVING IT EVIDENCE
-    /// FAILS THE BUILD rather than silently shipping a detector no consumer can explain --
-    /// the same fail-closed shape that caught an unclassified knob in bd-dorx.
-    #[test]
-    fn bd_16g_2_11_every_primitive_emits_complete_evidence() {
+    /// Runs the four series primitives over the same deterministic step fixture.
+    fn primitive_evidence_fixture() -> [DetectionEvidence; 4] {
         let series: Vec<Sample> = (0..200)
             .map(|i| Sample::new(i as u64, if i < 100 { 0.0 } else { 10.0 }))
             .collect();
@@ -2191,13 +2187,23 @@ mod tests {
         let values: Vec<f64> = series.iter().map(|s| s.value).collect();
         let bimodal = bimodality(&values, bimodal_params).expect("valid");
 
-        let all = [
+        [
             change.evidence("agents.energy", series.len(), cusum),
             crossing.evidence("agents.energy", series.len()),
             regime.evidence("agents.energy", series.len()),
             bimodal.evidence("agents.energy", 0, 199, bimodal_params),
-        ];
+        ]
+    }
 
+    /// Every primitive must produce evidence, and every required field must be populated.
+    ///
+    /// This is the completeness gate the bead asks for. It is written as an exhaustive
+    /// `match` on [`DetectionKind`] so that ADDING A PRIMITIVE WITHOUT GIVING IT EVIDENCE
+    /// FAILS THE BUILD rather than silently shipping a detector no consumer can explain --
+    /// the same fail-closed shape that caught an unclassified knob in bd-dorx.
+    #[test]
+    fn bd_16g_2_11_every_primitive_emits_complete_evidence() {
+        let all = primitive_evidence_fixture();
         let mut seen = Vec::new();
         for evidence in &all {
             assert_eq!(
@@ -2361,8 +2367,8 @@ mod tests {
         let mut rng = Lcg(0x5EED_1234_ABCD_0001);
         for case in 0..200 {
             let n = 8 + (case % 91);
-            let gap = (case % 7) as f64;
-            let spread = 0.25 + (case % 4) as f64 * 0.5;
+            let gap = f64::from(case % 7);
+            let spread = 0.25 + f64::from(case % 4) * 0.5;
             let values: Vec<f64> = (0..n)
                 .map(|i| {
                     let noise = (rng.next_f64() - 0.5) * spread;
@@ -2722,7 +2728,7 @@ mod tests {
                 let v = if i < 100 {
                     50.0
                 } else {
-                    50.0 + (i - 100) as f64 * 0.25
+                    50.0 + f64::from(i - 100) * 0.25
                 };
                 Sample::new(i as u64, v)
             })
@@ -2767,7 +2773,7 @@ mod tests {
     /// MEASURE the threshold detector's chatter on noise straddling its level.
     ///
     /// bd-16g.2 requires the false-positive budget to be measured explicitly rather than
-    /// hoped for: "a detector that cries wolf gets ignored". threshold_crossings is a bare
+    /// hoped for: "a detector that cries wolf gets ignored". `threshold_crossings` is a bare
     /// transition test (`was_above` vs `is_above`) with NO HYSTERESIS, so a series
     /// hovering at the level crosses on essentially every sample. That is not a bug in the
     /// primitive — it faithfully reports transitions — but it IS a property any consumer
@@ -2992,7 +2998,7 @@ mod tests {
         assert!(!first.is_empty(), "the fixture must produce a timeline");
 
         // Order of collection must not matter.
-        let mut shuffled = evidence.clone();
+        let mut shuffled = evidence;
         shuffled.reverse();
         assert_eq!(
             narrate_timeline(&shuffled),
@@ -3011,6 +3017,6 @@ mod tests {
     /// would put a row in every diff and defeat the budget this bead measures elsewhere.
     #[test]
     fn bd_16g_2_a_quiet_timeline_is_empty() {
-        assert!(narrate_timeline(&[]).is_empty());
+        assert_eq!(narrate_timeline(&[]), Vec::<String>::new());
     }
 }

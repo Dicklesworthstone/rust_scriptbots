@@ -533,7 +533,7 @@ mod tests {
             no_act.method,
             AttributionMethod::Unavailable(AttributionUnavailable::NoActivations)
         );
-        assert!(no_act.inputs.is_empty());
+        assert_eq!(no_act.inputs, Vec::<InputAttribution>::new());
 
         let layers_only = fixture(vec![fixture_layer(&[0.0; INPUT_SIZE + 16])], Vec::new());
         let no_conn = attribute_output(&layers_only, 0, 3).expect("no-connections explanation");
@@ -542,7 +542,7 @@ mod tests {
             AttributionMethod::Unavailable(AttributionUnavailable::NoConnections),
             "an empty top-k here would read as 'nothing drives this output'"
         );
-        assert!(no_conn.inputs.is_empty());
+        assert_eq!(no_conn.inputs, Vec::<InputAttribution>::new());
     }
 
     #[test]
@@ -628,7 +628,7 @@ mod tests {
             explanation.method,
             AttributionMethod::Unavailable(AttributionUnavailable::UnsupportedTopology)
         );
-        assert!(explanation.inputs.is_empty());
+        assert_eq!(explanation.inputs, Vec::<InputAttribution>::new());
     }
 
     #[test]
@@ -678,8 +678,8 @@ mod tests {
             explanation.method,
             AttributionMethod::Unavailable(AttributionUnavailable::IdentityPassthrough)
         );
-        assert!(explanation.inputs.is_empty());
-        assert!(!explanation.output_name.is_empty());
+        assert_eq!(explanation.inputs, Vec::<InputAttribution>::new());
+        assert_ne!(explanation.output_name, "");
         assert!(
             AttributionUnavailable::IdentityPassthrough
                 .reason()
@@ -725,7 +725,7 @@ mod tests {
         // The panel's response to this agent is the passthrough explanation, not
         // an attribution over the identity mapping.
         let explanation = OutputExplanation::identity_passthrough(0, runtime.outputs[0]);
-        assert!(explanation.inputs.is_empty());
+        assert_eq!(explanation.inputs, Vec::<InputAttribution>::new());
         assert_eq!(
             explanation.method,
             AttributionMethod::Unavailable(AttributionUnavailable::IdentityPassthrough)

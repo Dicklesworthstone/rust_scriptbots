@@ -798,7 +798,10 @@ mod tests {
         // and C has no children.
         assert_eq!(graph.parents_of(b_uid), [Some(a_uid), None]);
         assert_eq!(graph.parents_of(c_uid), [None, None]);
-        assert!(graph.node(c_uid).expect("C").children.is_empty());
+        assert_eq!(
+            graph.node(c_uid).expect("C").children,
+            Vec::<AgentUid>::new()
+        );
         assert_eq!(graph.node(a_uid).expect("A").children, vec![b_uid]);
 
         // THE FOIL. Build the same log keyed on the slot handle, as a naive
@@ -1004,7 +1007,7 @@ mod tests {
         // ends here because we pruned it" rather than "this agent has no parents".
         for node in graph.nodes.values().filter(|node| node.pruned) {
             assert_eq!(node.parents, [None, None]);
-            assert!(node.children.is_empty());
+            assert_eq!(node.children, Vec::<AgentUid>::new());
         }
     }
 
@@ -1099,7 +1102,10 @@ mod tests {
         let path = graph.lineage_path(AgentUid(5_000), 32);
         assert_eq!(path.len(), 32, "the walk must stop at max_depth");
         // And an unknown uid walks nowhere rather than panicking.
-        assert!(graph.lineage_path(AgentUid(123_456), 32).is_empty());
+        assert_eq!(
+            graph.lineage_path(AgentUid(123_456), 32),
+            Vec::<AgentUid>::new()
+        );
     }
 
     #[test]

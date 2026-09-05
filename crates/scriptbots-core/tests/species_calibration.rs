@@ -150,8 +150,7 @@ fn test_calibrate_speciation_persistence_sweep() {
     );
 }
 
-#[test]
-fn test_calibrate_reproductive_separation_cross_mating_rate() {
+fn reproductive_separation_table() -> SpeciesTable {
     let mut table = SpeciesTable::default();
     table.species.push(scriptbots_core::species::Species {
         id: scriptbots_core::species::SpeciesId(1),
@@ -173,6 +172,12 @@ fn test_calibrate_reproductive_separation_cross_mating_rate() {
         first_tick: Tick(0),
         last_seen_tick: Tick(100),
     });
+    table
+}
+
+#[test]
+fn test_calibrate_reproductive_separation_cross_mating_rate() {
+    let table = reproductive_separation_table();
 
     // 1. Panmictic null distribution:
     // Parents are drawn uniformly from the combined population (no reproductive barrier)

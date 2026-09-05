@@ -1799,7 +1799,7 @@ mod tests {
             gate.observe(&clean_tick(tick));
         }
         let seed = gate.finish(7);
-        assert!(seed.breaches.is_empty());
+        assert_eq!(seed.breaches, Vec::<ConservationBreach>::new());
         let verdict = evaluate_conservation(&[seed]);
         assert!(verdict.pass, "clean run must pass: {:?}", verdict.failures);
     }
@@ -1901,7 +1901,7 @@ mod tests {
             },
         );
         assert_eq!(graph.nodes.len(), 7);
-        assert!(!graph.links.is_empty());
+        assert_ne!(graph.links, Vec::<SankeyLink>::new());
         let total_value: f64 = graph.links.iter().map(|l| l.value).sum();
         assert!(total_value > 0.0);
     }
@@ -2090,7 +2090,7 @@ mod tests {
         assert!(verdict.summary_line(None).contains("breaches=4900"));
     }
 
-    /// Test helper for building an EpochStockResidual.
+    /// Test helper for building an `EpochStockResidual`.
     fn test_residual(
         stock: EconomyStock,
         residual_sum: f64,
@@ -2169,7 +2169,7 @@ mod tests {
         );
 
         // Negative Kirchhoff assertion: dropping the Unaccounted link MUST fail Kirchhoff test
-        let mut dropped_sankey = sankey.clone();
+        let mut dropped_sankey = sankey;
         dropped_sankey.links.retain(|l| l.to != 6);
         let dropped_res = dropped_sankey.verify_kirchhoff(1e-6);
         assert!(
@@ -2285,7 +2285,7 @@ mod tests {
         ));
     }
 
-    /// FoodWebSummaryReport build, JSON serialization, and roundtrip (bd-16g.11.3).
+    /// `FoodWebSummaryReport` build, JSON serialization, and roundtrip (bd-16g.11.3).
     #[test]
     fn bd_16g_11_3_food_web_summary_report_roundtrip() {
         let epoch = EpochFlows {

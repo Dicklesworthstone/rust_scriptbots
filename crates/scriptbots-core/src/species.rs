@@ -2031,8 +2031,14 @@ mod tests {
             table2.species[0].name, sp1_name,
             "species name must be preserved"
         );
-        assert!(report2.new_species_minted.is_empty());
-        assert!(report2.extinct_species_dropped.is_empty());
+        assert_eq!(
+            report2.new_species_minted,
+            Vec::<(SpeciesId, String, AgentUid)>::new()
+        );
+        assert_eq!(
+            report2.extinct_species_dropped,
+            Vec::<(SpeciesId, String)>::new()
+        );
     }
 
     #[test]
@@ -2041,7 +2047,7 @@ mod tests {
         let prev = SpeciesTable::default();
 
         let (empty_table, report) = segment_species(Tick(10), &[], &prev, &params);
-        assert!(empty_table.species.is_empty());
+        assert_eq!(empty_table.species, Vec::<Species>::new());
         assert_eq!(report.total_agents_segmented, 0);
 
         let singleton = vec![(AgentUid(1), vec![0.5, 0.5, 0.5])];
@@ -2313,7 +2319,7 @@ mod tests {
 
         // Asking for no cohorts is the ONE honest empty case.
         let empty = compute_phenotype_analysis("run-test", Tick(100), &cohort_a, &[]);
-        assert!(empty.comparisons.is_empty());
+        assert_eq!(empty.comparisons, Vec::<PhenotypeClusterComparison>::new());
 
         // Three cohorts produce all three unordered pairs, in input order.
         let three = compute_phenotype_analysis(
@@ -2503,9 +2509,9 @@ mod tests {
         let after = table(5, vec![sp(3, "Gamma-3", 4, 5), sp(4, "Delta-4", 4, 5)]);
         let first = diff_species_tables(&before, &after);
 
-        let mut reordered_before = before.clone();
+        let mut reordered_before = before;
         reordered_before.species.reverse();
-        let mut reordered_after = after.clone();
+        let mut reordered_after = after;
         reordered_after.species.reverse();
         let second = diff_species_tables(&reordered_before, &reordered_after);
 
@@ -2513,7 +2519,7 @@ mod tests {
             first, second,
             "event order must not depend on table iteration order"
         );
-        assert!(!first.is_empty());
+        assert_ne!(first, Vec::<PhylogenyEvent>::new());
     }
 
     /// THE GATE: every hint is confirmed or explicitly rejected, never dropped.
@@ -2830,7 +2836,9 @@ mod tests {
                         assert_eq!(first_seen, Tick(10), "the streak started at first sight");
                         assert_eq!(confirmed_at, Tick(30), "third consecutive sample");
                     }
-                    other => panic!("unexpected verdict: {other:?}"),
+                    other @ SpeciationVerdict::Transient { .. } => {
+                        panic!("unexpected verdict: {other:?}")
+                    }
                 }
             }
         }
@@ -3153,8 +3161,10 @@ mod tests {
 
     #[test]
     fn test_bd_16g_3_6_adapter_rejects_insufficient_lifetime_coverage() {
-        let mut config = SpeciesPhenotypeAdapterConfig::default();
-        config.min_lifetime_observations = 10;
+        let config = SpeciesPhenotypeAdapterConfig {
+            min_lifetime_observations: 10,
+            ..SpeciesPhenotypeAdapterConfig::default()
+        };
 
         let inputs = vec![TypedPhenotypeInput::new(
             AgentUid(1),
@@ -3180,7 +3190,7 @@ mod tests {
 
         // Empty
         let empty_samples = adapt_phenotype_samples(&[], &config).unwrap();
-        assert!(empty_samples.is_empty());
+        assert_eq!(empty_samples, Vec::<(AgentUid, Vec<f32>)>::new());
         let (empty_table, empty_rep) = segment_species(Tick(10), &empty_samples, &prev, &params);
         assert_eq!(empty_table.species.len(), 0);
         assert_eq!(empty_rep.total_agents_segmented, 0);
@@ -3310,8 +3320,10 @@ mod tests {
             reconstruct_species_table_offline(Tick(100), &clean_samples, &prev, &params);
 
         // Fault injected: PerturbFeatures
-        let mut fault_config = SpeciesPhenotypeAdapterConfig::default();
-        fault_config.fault = SpeciesAdapterFault::PerturbFeatures;
+        let fault_config = SpeciesPhenotypeAdapterConfig {
+            fault: SpeciesAdapterFault::PerturbFeatures,
+            ..SpeciesPhenotypeAdapterConfig::default()
+        };
         let fault_samples = adapt_phenotype_samples(&inputs, &fault_config).unwrap();
         let (fault_table, _, fault_digest) =
             reconstruct_species_table_offline(Tick(100), &fault_samples, &prev, &params);
@@ -3326,8 +3338,10 @@ mod tests {
         );
 
         // Fault injected: SchemaIdDrift
-        let mut drift_config = SpeciesPhenotypeAdapterConfig::default();
-        drift_config.fault = SpeciesAdapterFault::SchemaIdDrift;
+        let drift_config = SpeciesPhenotypeAdapterConfig {
+            fault: SpeciesAdapterFault::SchemaIdDrift,
+            ..SpeciesPhenotypeAdapterConfig::default()
+        };
         let err_drift = adapt_phenotype_samples(&inputs, &drift_config).unwrap_err();
         assert!(matches!(
             err_drift,
@@ -3335,8 +3349,10 @@ mod tests {
         ));
 
         // Fault injected: InjectNonFinite
-        let mut nan_config = SpeciesPhenotypeAdapterConfig::default();
-        nan_config.fault = SpeciesAdapterFault::InjectNonFinite;
+        let nan_config = SpeciesPhenotypeAdapterConfig {
+            fault: SpeciesAdapterFault::InjectNonFinite,
+            ..SpeciesPhenotypeAdapterConfig::default()
+        };
         let err_nan = adapt_phenotype_samples(&inputs, &nan_config).unwrap_err();
         assert!(matches!(
             err_nan,

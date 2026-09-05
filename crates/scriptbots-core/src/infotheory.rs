@@ -1485,7 +1485,7 @@ mod tests {
         let mut e = Vec::with_capacity(n);
         let mut r = Vec::with_capacity(n);
         for i in 0..n {
-            let val = (i % 2) as f64;
+            let val = f64::from(u8::from(!i.is_multiple_of(2)));
             e.push(val);
             r.push(val);
         }
@@ -1771,9 +1771,9 @@ mod tests {
         // The forbidden null, rebuilt here solely to show why it is forbidden.
         let (_, observed) = calc_mi_mm(&e, &r, bins);
         let mut shuffle_rng = SmallRngStream::seed_from_u64(params.seed);
-        let mut shuffled = e.clone();
-        let runs = 100usize;
-        let mut ge = 0usize;
+        let mut shuffled = e;
+        let runs = 100_u32;
+        let mut ge = 0_u32;
         for _ in 0..runs {
             for i in (1..n).rev() {
                 let j = shuffle_rng.random_range(0..=i);
@@ -1784,7 +1784,7 @@ mod tests {
                 ge += 1;
             }
         }
-        let shuffle_p = (1.0 + ge as f64) / (runs as f64 + 1.0);
+        let shuffle_p = (1.0 + f64::from(ge)) / (f64::from(runs) + 1.0);
 
         assert!(
             shuffle_p < 0.05,
@@ -1806,7 +1806,9 @@ mod tests {
 
     /// Midpoint of bin `k` under [`discretize`], so a fixture lands in the bin it intends.
     fn bin_center(k: usize, bins: usize) -> f64 {
-        (k as f64 + 0.5) / bins as f64
+        let index = u32::try_from(k).expect("fixture bin index fits u32");
+        let count = u32::try_from(bins).expect("fixture bin count fits u32");
+        (f64::from(index) + 0.5) / f64::from(count)
     }
 
     /// A noiseless 8-symbol channel carries exactly `log2(8) = 3` bits (bd-r4ja).
@@ -1828,7 +1830,7 @@ mod tests {
 
         let est = compute_mi(&e, &r, &params).expect("eight-symbol channel");
 
-        let expected = (bins as f64).log2();
+        let expected = f64::from(u32::try_from(bins).expect("eight fixture bins fit u32")).log2();
         assert!(
             (est.bits_corrected - expected).abs() < 0.05,
             "a noiseless {bins}-symbol channel carries {expected} bits, got {}",
@@ -1869,6 +1871,10 @@ mod tests {
         let est = compute_mi(&e, &r, &params).expect("binary symmetric channel");
 
         let p = 0.2_f64;
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "retain the independently calculated entropy oracle's separate product and subtraction rounding"
+        )]
         let entropy = -p * p.log2() - (1.0 - p) * (1.0 - p).log2();
         let expected = 1.0 - entropy;
         assert!(
@@ -2247,9 +2253,9 @@ mod tests {
             }
         }
 
-        let mean_uncorrected = uncorrected_sum / runs as f64;
-        let mean_corrected = corrected_sum / runs as f64;
-        let mean_unclamped = unclamped_sum / runs as f64;
+        let mean_uncorrected = uncorrected_sum / f64::from(runs);
+        let mean_corrected = corrected_sum / f64::from(runs);
+        let mean_unclamped = unclamped_sum / f64::from(runs);
 
         // Self-reporting, visible under `--nocapture` (bd-270k). Both means are facts about a
         // fully seeded fixture, so the only way to observe them used to be tightening a bound
@@ -2264,8 +2270,7 @@ mod tests {
 
         assert!(
             mean_uncorrected > 0.05,
-            "Uncorrected MI on noise should be positively biased, got {}",
-            mean_uncorrected
+            "Uncorrected MI on noise should be positively biased, got {mean_uncorrected}"
         );
         // This fixture is fully deterministic (seed 12345, 100 runs, fixed MiParams), so this
         // bound is a fact about one fixed number, not a flakiness allowance. Measured value:
@@ -2282,8 +2287,7 @@ mod tests {
         // If this value drifts again, investigate calc_mi_mm before moving the bound (bd-270k).
         assert!(
             mean_corrected < 0.05,
-            "Corrected MI on noise should be near zero, got {}",
-            mean_corrected
+            "Corrected MI on noise should be near zero, got {mean_corrected}"
         );
 
         // bd-r4ja: the guard that actually measures BIAS asserts on the untruncated statistic.
@@ -2312,6 +2316,10 @@ mod tests {
 
         let mut e = vec![0.0f64; n];
         let mut r = vec![0.0f64; n];
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "the seeded AR(1) fixture uses separately rounded products and sums; FMA can change its samples and downstream significance result"
+        )]
         for t in 1..n {
             e[t] = 0.95 * e[t - 1] + 0.05 * rng.random_range(-1.0..1.0);
             r[t] = 0.95 * r[t - 1] + 0.05 * rng.random_range(-1.0..1.0);
@@ -2349,12 +2357,10 @@ mod tests {
         let mut e = vec![0.0f64; n];
         let mut r = vec![0.0f64; n];
 
-        for t in 0..n {
-            e[t] = rng.random_range(0.0..1.0);
+        for value in &mut e {
+            *value = rng.random_range(0.0..1.0);
         }
-        for t in 1..n {
-            r[t] = e[t - 1]; // Lagged copy
-        }
+        r[1..n].copy_from_slice(&e[..n - 1]); // Lagged copy
 
         let params = MiParams {
             bins: 4,

@@ -3901,7 +3901,7 @@ mod tests {
         let checkpoint = original.checkpoint_v1().expect("capture custom root");
         let restored = WorldState::restore_checkpoint_v1(&checkpoint, BrainRegistry::new())
             .expect("restore custom root");
-        assert!(restored.pending_lifecycle_birth_metrics.is_empty());
+        assert_eq!(restored.pending_lifecycle_birth_metrics.len(), 0);
         assert_eq!(
             restored
                 .checkpoint_v1()

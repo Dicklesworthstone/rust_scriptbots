@@ -1849,11 +1849,11 @@ mod tests {
     #[test]
     fn migration_derivation_never_collides_with_plain_domain_derivation() {
         for domain in RngDomain::ALL {
-            let plain = derive_domain_seed(0xC0FF_EE, domain);
+            let plain = derive_domain_seed(0x00C0_FFEE, domain);
             for barrier in 0..64_u64 {
                 assert_ne!(
                     plain,
-                    derive_migration_seed(0xC0FF_EE, barrier),
+                    derive_migration_seed(0x00C0_FFEE, barrier),
                     "barrier {barrier} aliased the single-world stream for domain {domain:?}"
                 );
             }
