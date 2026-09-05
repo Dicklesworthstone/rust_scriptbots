@@ -495,30 +495,52 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         "MCP must negotiate protocolVersion: {init_body}"
     );
 
-    // MCP initialize with unsupported protocol version -> JSON-RPC error -32602
-    let bad_version_payload = br#"{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
-    let (bad_ver_code, bad_ver_body) = http_with_body(
+    // MCP 2024-11-05 lifecycle, Version Negotiation: an unsupported requested version
+    // receives a server-supported alternative, not an echo of the unsupported value.
+    // https://modelcontextprotocol.io/specification/2024-11-05/basic/lifecycle
+    let future_version_payload = br#"{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
+    let (future_version_code, future_version_body) = http_with_body(
         mcp_addr,
         "POST",
         "/mcp",
-        bad_version_payload,
+        future_version_payload,
         Some("application/json"),
     )?;
     assert_eq!(
-        bad_ver_code, 200,
-        "MCP unsupported protocol version returns JSON-RPC error response"
+        future_version_code, 200,
+        "MCP version negotiation must return a response: {future_version_body}"
     );
-    let bad_ver_json: serde_json::Value = serde_json::from_str(&bad_ver_body)?;
+    let future_version: serde_json::Value = serde_json::from_str(&future_version_body)?;
+    assert_eq!(future_version["id"], 99);
+    assert!(future_version.get("error").is_none());
     assert_eq!(
-        bad_ver_json["error"]["code"], -32602,
-        "MCP unsupported protocol version must return -32602: {bad_ver_body}"
+        future_version["result"]["protocolVersion"], "2024-11-05",
+        "MCP must choose its supported version: {future_version_body}"
+    );
+
+    // A malformed version TYPE is invalid initialize input, regardless of negotiation.
+    let invalid_version_payload = br#"{"jsonrpc":"2.0","id":100,"method":"initialize","params":{"protocolVersion":42,"capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
+    let (invalid_version_code, invalid_version_body) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        invalid_version_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(invalid_version_code, 200);
+    let invalid_version: serde_json::Value = serde_json::from_str(&invalid_version_body)?;
+    assert_eq!(invalid_version["id"], 100);
+    assert!(invalid_version.get("result").is_none());
+    assert_eq!(
+        invalid_version["error"]["code"], -32602,
+        "MCP malformed initialize parameters must be rejected: {invalid_version_body}"
     );
     assert!(
-        bad_ver_json["error"]["message"]
+        !invalid_version["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("Unsupported protocol version"),
-        "MCP error message must name unsupported protocol version: {bad_ver_body}"
+            .is_empty(),
+        "MCP malformed-input refusal must include a diagnostic: {invalid_version_body}"
     );
 
     // MCP notifications/initialized

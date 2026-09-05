@@ -2936,21 +2936,14 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_549,
-                "3318ac675fa65c5ac33f18128f86c7342974ba1e9fc127066eef7991fbfc609f",
+                8_698,
+                "4ae2dd65753a6af8534179c5abc6263504a9cfc966063d1b0b19085e137b19f5",
             ),
-            "the reviewed V1.3/codec-7 wire must remain byte-identical: re-pinned in \
-             bd-2i1 after the locomotion model was bound, then re-pinned in \
-             bd-2z0.14.3.1 after RenderSettings v2 added presentation-only fields \
-             (quality tier, post stack, day/night, theme, palette) to the serialized \
-             config tree (+7 bytes of Option discriminants), and re-pinned in \
-             bd-2z0.8.9.8 after replay_event_tick_cap (a persistence-recording knob, \
-             default 0) joined the serialized config tree (+1 byte of usize varint). \
-             Re-pinned in bd-yw1j from the reviewed four-thread arm64 macOS DSR lane \
-             after ActiveEffect gained its kind discriminant, Region gained Rect, and \
-             the orphaned positional sense_max_neighbors field was retired. Re-pinned \
-             in bd-16g.2.9.2.1 after interaction-event retention controls joined the \
-             config tree and mandatory narrative inputs advanced the checkpoint codec"
+            "the reviewed V1.3/codec-8 wire must remain byte-identical. bd-6xr2 makes \
+             configuration serialization complete: the seven archive fields add exactly \
+             149 bytes, including the six declared behavioral axes. Pinned DSR25 at \
+             6c89bef produced identical canonical wires in default and economy-fault builds. \
+             Science digest goldens and checkpoint tamper/continuation guards remain unchanged"
         );
     }
 

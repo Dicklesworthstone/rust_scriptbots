@@ -12607,10 +12607,6 @@ define_scriptbots_config! {
 /// Static configuration for a `ScriptBots` world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "Topography, population closure, economy diagnostics and archive enablement are independent serialized configuration switches"
-)]
 pub struct ScriptBotsConfig {
     digest_v1_fields {
     /// Width of the world in world units.
