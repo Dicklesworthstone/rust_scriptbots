@@ -18392,10 +18392,11 @@ impl Storage {
                 run_id, tick, epoch, closed, agent_count, births, deaths,
                 total_energy, average_energy, average_health, island_id
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.epoch.into(),
@@ -18407,10 +18408,10 @@ impl Storage {
                     row.average_energy.into(),
                     row.average_health.into(),
                     row.island_id.into(),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            }),
+        )
+        .map(|_| ())
     }
 
     fn insert_metrics(
@@ -18423,19 +18424,20 @@ impl Storage {
         }
         let sql = "insert or replace into metrics (run_id, tick, name, value, island_id)
                    values (?1, ?2, ?3, ?4, ?5)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.name.as_str().into(),
                     row.value.into(),
                     row.island_id.into(),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            }),
+        )
+        .map(|_| ())
     }
 
     fn insert_events(
@@ -18448,19 +18450,20 @@ impl Storage {
         }
         let sql = "insert or replace into events (run_id, tick, kind, count, island_id)
                    values (?1, ?2, ?3, ?4, ?5)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.kind.as_str().into(),
                     row.count.into(),
                     row.island_id.into(),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            }),
+        )
+        .map(|_| ())
     }
 
     /// Insert snapshots inside `flush_attempt`'s whole-batch transaction.
