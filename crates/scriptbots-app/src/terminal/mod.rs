@@ -9538,7 +9538,7 @@ mod tests {
                 assert_eq!(body.fg, palette.diet_color(DietClass::Herbivore));
                 assert!(body.modifier.contains(Modifier::UNDERLINED));
                 assert_eq!(buffer[(body_column + 1, 0)].symbol(), " ");
-                if width % 2 != 0 {
+                if !width.is_multiple_of(2) {
                     assert_eq!(buffer[(width - 1, 0)].symbol(), " ");
                     assert_eq!(buffer[(width - 1, 1)].symbol(), " ");
                 }
