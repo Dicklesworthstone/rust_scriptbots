@@ -160,7 +160,7 @@ fn a_narration_burst_cannot_starve_simulation_admission_through_the_real_path() 
     assert_eq!(
         loud.narrative_events
             .iter()
-            .map(|event| (&event.tick, &event.kind, &event.metric))
+            .map(|event| (event.tick.0, event.kind, &event.metric))
             .collect::<std::collections::HashSet<_>>()
             .len(),
         loud.narrative_events.len(),
