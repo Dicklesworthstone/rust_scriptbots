@@ -314,7 +314,7 @@ fn retryable_authority_envelope(error: NullFrontendSubmissionError) -> CommandEn
                         | CommandAuthorityLookupFailure::Capacity { .. },
                     ..
                 },
-        } => envelope,
+        } => *envelope,
         other => panic!("fresh durable command returned a terminal submission error: {other:?}"),
     }
 }

@@ -92,8 +92,8 @@ use crate::{
     JournalPort, ManualHostDriver, ManualInstant, RenderSnapshot,
     host_core::{HostCore, HostCoreBuildError, HostCoreOptions, MigrationArrival},
     migrator::{
-        CandidateAgent, EmigrantSelectionRule, MigrationConfig, MigrationError, MigrationTopology,
-        checked_island_population, select_emigrants, total_population,
+        CandidateAgent, EmigrantRecord, EmigrantSelectionRule, MigrationConfig, MigrationError,
+        MigrationTopology, checked_island_population, select_emigrants, total_population,
     },
 };
 use scriptbots_core::{
@@ -1223,7 +1223,6 @@ impl Archipelago {
     }
 
     /// Per-island construction records in ascending island-id order.
-    #[must_use]
     pub fn islands(&self) -> impl ExactSizeIterator<Item = &IslandMeta> {
         self.islands.iter().map(|island| &island.meta)
     }
@@ -1591,50 +1590,7 @@ impl Archipelago {
             .map_err(|source| ArchipelagoError::MigrationSelection { source })?;
 
         // PHASE 3 — apply in the plan's canonical (to, from, uid) order.
-        let mut moves = Vec::with_capacity(plan.moves.len());
-        for record in &plan.moves {
-            let from = record.from_island;
-            let to = record.to_island;
-            let uid = AgentUid(record.agent_uid);
-            let from_index = self
-                .island_index(from)
-                .ok_or(ArchipelagoError::UnknownIsland { island: from })?;
-            let to_index = self
-                .island_index(to)
-                .ok_or(ArchipelagoError::UnknownIsland { island: to })?;
-
-            Self::apply_island_command(
-                &mut self.islands[from_index],
-                HostCommand::Emigrate { agent_uid: uid },
-            )?;
-            let migrant = self.islands[from_index]
-                .core
-                .take_outbound_migrant()
-                .ok_or(ArchipelagoError::MigrationOrganismMissing {
-                    island: from,
-                    agent_uid: record.agent_uid,
-                })?;
-
-            let arrival = self.deliver_migrant(to_index, from_index, from, uid, migrant)?;
-            tracing::info!(
-                barrier_tick = barrier_tick.0,
-                from = %from,
-                to = %to,
-                origin_uid = uid.get(),
-                local_uid = arrival.get(),
-                rule = ?record.selection_rule,
-                rank = record.rank,
-                key_value = record.key_value,
-                "migrated one organism"
-            );
-            moves.push(AppliedMigration {
-                from: OrganismId::new(from, uid),
-                to: OrganismId::new(to, arrival),
-                rule: record.selection_rule,
-                rank: record.rank,
-                key_value: record.key_value,
-            });
-        }
+        let moves = self.apply_migration_plan(&plan.moves, barrier_tick)?;
 
         let pop_after = migration_population_counts(self.islands.iter().map(|island| {
             (
@@ -1697,6 +1653,59 @@ impl Archipelago {
         }))
     }
 
+    /// Apply the already-selected records in their canonical order, preserving sole ownership.
+    fn apply_migration_plan(
+        &mut self,
+        records: &[EmigrantRecord],
+        barrier_tick: Tick,
+    ) -> Result<Vec<AppliedMigration>, ArchipelagoError> {
+        let mut moves = Vec::with_capacity(records.len());
+        for record in records {
+            let from = record.from_island;
+            let to = record.to_island;
+            let uid = AgentUid(record.agent_uid);
+            let from_index = self
+                .island_index(from)
+                .ok_or(ArchipelagoError::UnknownIsland { island: from })?;
+            let to_index = self
+                .island_index(to)
+                .ok_or(ArchipelagoError::UnknownIsland { island: to })?;
+
+            Self::apply_island_command(
+                &mut self.islands[from_index],
+                HostCommand::Emigrate { agent_uid: uid },
+            )?;
+            let migrant = self.islands[from_index]
+                .core
+                .take_outbound_migrant()
+                .ok_or(ArchipelagoError::MigrationOrganismMissing {
+                    island: from,
+                    agent_uid: record.agent_uid,
+                })?;
+
+            let arrival = self.deliver_migrant(to_index, from_index, from, uid, migrant)?;
+            tracing::info!(
+                barrier_tick = barrier_tick.0,
+                from = %from,
+                to = %to,
+                origin_uid = uid.get(),
+                local_uid = arrival.get(),
+                rule = ?record.selection_rule,
+                rank = record.rank,
+                key_value = record.key_value,
+                "migrated one organism"
+            );
+            moves.push(AppliedMigration {
+                from: OrganismId::new(from, uid),
+                to: OrganismId::new(to, arrival),
+                rule: record.selection_rule,
+                rank: record.rank,
+                key_value: record.key_value,
+            });
+        }
+        Ok(moves)
+    }
+
     /// Per-island emigration candidates in ascending `AgentUid` order.
     ///
     /// Ordering is the contract, not a convenience. Slotmap handle order is an
@@ -1754,7 +1763,7 @@ impl Archipelago {
         let origin = OrganismId::new(from, uid);
         if let Err(returned) = self.islands[to_index].core.stage_immigrant(migrant) {
             let detail = "destination already holds a staged organism".to_owned();
-            return Err(self.return_migrant_home(from_index, from, uid, to, returned, detail));
+            return Err(self.return_migrant_home(from_index, from, uid, to, *returned, detail));
         }
         let command = HostCommand::Immigrate {
             origin_island: from,
@@ -1833,7 +1842,7 @@ impl Archipelago {
             return ArchipelagoError::MigrationRetained {
                 origin,
                 destination,
-                migrant: Box::new(retained),
+                migrant: retained,
                 detail: format!("{detail}; source could not re-stage it"),
             };
         }
@@ -2030,7 +2039,7 @@ impl Archipelago {
         }
     }
 
-    fn transient_authority_lookup(error: &HostAccessError) -> bool {
+    const fn transient_authority_lookup(error: &HostAccessError) -> bool {
         matches!(
             error,
             HostAccessError::CommandAuthorityLookup {
@@ -2668,10 +2677,11 @@ mod tests {
 
         let pair = normalized_edges(&Topology::Ring, &ids[..2]).expect("two-island ring");
         assert_eq!(pair, vec![(IslandId(0), IslandId(1))]);
-        assert!(
+        assert_eq!(
             normalized_edges(&Topology::Ring, &ids[..1])
                 .expect("single-island ring")
-                .is_empty()
+                .len(),
+            0
         );
 
         let full = normalized_edges(&Topology::FullyConnected, &ids).expect("full edges");
@@ -3023,34 +3033,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn transient_journal_full_retries_same_barrier_without_duplicate_science() {
-        let state = Rc::new(RefCell::new(FullOnceJournalState::default()));
-        let journal_state = Rc::clone(&state);
-        let islands = vec![spec(0, test_config(None)), spec(1, test_config(None))];
-        let mut archipelago = Archipelago::with_factories(
-            archipelago_config(islands, 5),
-            |meta| WorldState::new(meta.effective_config.clone()),
-            move |meta| {
-                (meta.id == IslandId(1)).then(|| {
-                    Box::new(FullOnceJournal {
-                        state: Rc::clone(&journal_state),
-                    }) as Box<dyn JournalPort>
-                })
-            },
-        )
-        .expect("archipelago with transient journal backpressure");
-
-        let first_error = archipelago
-            .step_to_barrier()
-            .expect_err("the first admission attempt is full");
-        assert!(matches!(
-            first_error,
-            ArchipelagoError::JournalBlocked {
-                island: IslandId(1),
-                ..
-            }
-        ));
+    fn assert_partial_barrier_stays_private(archipelago: &Archipelago) {
         assert_eq!(archipelago.barrier_tick(), Tick(0));
         assert_eq!(archipelago.epoch(), 0);
         assert!(
@@ -3084,6 +3067,37 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn transient_journal_full_retries_same_barrier_without_duplicate_science() {
+        let state = Rc::new(RefCell::new(FullOnceJournalState::default()));
+        let journal_state = Rc::clone(&state);
+        let islands = vec![spec(0, test_config(None)), spec(1, test_config(None))];
+        let mut archipelago = Archipelago::with_factories(
+            archipelago_config(islands, 5),
+            |meta| WorldState::new(meta.effective_config.clone()),
+            move |meta| {
+                (meta.id == IslandId(1)).then(|| {
+                    Box::new(FullOnceJournal {
+                        state: Rc::clone(&journal_state),
+                    }) as Box<dyn JournalPort>
+                })
+            },
+        )
+        .expect("archipelago with transient journal backpressure");
+
+        let first_error = archipelago
+            .step_to_barrier()
+            .expect_err("the first admission attempt is full");
+        assert!(matches!(
+            first_error,
+            ArchipelagoError::JournalBlocked {
+                island: IslandId(1),
+                ..
+            }
+        ));
+        assert_partial_barrier_stays_private(&archipelago);
 
         let first_batch = {
             let state = state.borrow();
@@ -3362,7 +3376,7 @@ mod tests {
     /// bd-16g.5.3 names this as the second half of its independence proof, and says
     /// explicitly that the first half misses it: `test_island_independence_across_
     /// archipelago_sizes` varies the island COUNT while island 0 stays first in the
-    /// config, so a seeding rule that keyed off POSITION rather than IslandId would pass
+    /// config, so a seeding rule that keyed off POSITION rather than `IslandId` would pass
     /// it. This test moves island 0 to the back and asserts nothing about it changed.
     ///
     /// The failure it exists to catch is quiet: position-keyed seeding still yields a
@@ -4091,16 +4105,14 @@ mod tests {
     /// emigration fails to remove the organism from its source.
     #[test]
     fn bd_tfso_double_delivery_is_prevented_by_ownership_not_by_checking() {
-        fn assert_not_clone<T>() {
-            // Compiles for any T; the point is the negative trait bound below.
+        // As in storage's thread-confinement assertion: if MigratingAgent gains Clone,
+        // both implementations apply and the inferred marker type becomes ambiguous.
+        trait AmbiguousIfClone<Marker> {
+            fn check() {}
         }
-        assert_not_clone::<MigratingAgent>();
-        // If `MigratingAgent` ever gains `Clone`, this stops compiling and the
-        // reviewer is forced to think about why it was not `Clone`.
-        trait NotClone {}
-        impl<T: ?Sized> NotClone for T {}
-        fn requires_no_clone<T: NotClone>() {}
-        requires_no_clone::<MigratingAgent>();
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+        let _ = <MigratingAgent as AmbiguousIfClone<_>>::check;
 
         // The real evidence is structural and is asserted by the type system at
         // every call site: `deliver_migrant` takes the organism by value and
@@ -4148,6 +4160,40 @@ mod tests {
         fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
             ShutdownCommitRequirement::CommittedVolatile
         }
+    }
+
+    fn journal_population_terms(journal: &RecordingJournal) -> (i64, i64, i64, i64) {
+        let mut births = 0i64;
+        let mut deaths = 0i64;
+        let mut emigrations = 0i64;
+        let mut immigrations = 0i64;
+
+        for batch in journal.batches.borrow().iter() {
+            if let Some(scientific) = batch.scientific() {
+                // The RECORDS, not `summary.births`. That counter is
+                // Born-only by design, so it omits population-floor
+                // injections AND arrivals; reconstructing from it gave 0
+                // against a live population of 36, which is how I found
+                // that. The record list carries every origin.
+                births += i64::try_from(scientific.births().len()).expect("births fit i64");
+                deaths += i64::try_from(scientific.deaths().len()).expect("deaths fit i64");
+            }
+            let Some(lifecycle) = batch.command_lifecycle() else {
+                continue;
+            };
+            if !lifecycle.was_applied() {
+                continue;
+            }
+            let Some(envelope) = batch.command() else {
+                continue;
+            };
+            match &envelope.command {
+                HostCommand::Emigrate { .. } => emigrations += 1,
+                HostCommand::Immigrate { .. } => immigrations += 1,
+                _ => {}
+            }
+        }
+        (births, deaths, emigrations, immigrations)
     }
 
     /// THE JOURNAL IS A RECORD, NOT A LOG: replaying it reconstructs every
@@ -4231,36 +4277,8 @@ mod tests {
 
         for (index, &id) in islands.iter().enumerate() {
             let mut population = initial[index];
-            let mut births = 0i64;
-            let mut deaths = 0i64;
-            let mut emigrations = 0i64;
-            let mut immigrations = 0i64;
-
-            for batch in journals[index].batches.borrow().iter() {
-                if let Some(scientific) = batch.scientific() {
-                    // The RECORDS, not `summary.births`. That counter is
-                    // Born-only by design, so it omits population-floor
-                    // injections AND arrivals; reconstructing from it gave 0
-                    // against a live population of 36, which is how I found
-                    // that. The record list carries every origin.
-                    births += i64::try_from(scientific.births().len()).expect("births fit i64");
-                    deaths += i64::try_from(scientific.deaths().len()).expect("deaths fit i64");
-                }
-                let Some(lifecycle) = batch.command_lifecycle() else {
-                    continue;
-                };
-                if !lifecycle.was_applied() {
-                    continue;
-                }
-                let Some(envelope) = batch.command() else {
-                    continue;
-                };
-                match &envelope.command {
-                    HostCommand::Emigrate { .. } => emigrations += 1,
-                    HostCommand::Immigrate { .. } => immigrations += 1,
-                    _ => {}
-                }
-            }
+            let (births, deaths, emigrations, immigrations) =
+                journal_population_terms(&journals[index]);
 
             // *** ARRIVALS ARE INSIDE `births`, AND THAT IS THE bd-it29 FIX. ***
             // `immigrate` records the arrival as an Injected BirthRecord in the
@@ -4314,7 +4332,9 @@ mod tests {
                     .borrow()
                     .iter()
                     .filter(|batch| {
-                        batch.command_lifecycle().is_some_and(|l| l.was_applied())
+                        batch
+                            .command_lifecycle()
+                            .is_some_and(crate::CommandLifecycleEvidence::was_applied)
                             && batch.command().is_some_and(|e| {
                                 matches!(&e.command, HostCommand::Immigrate { .. })
                             })
@@ -4372,7 +4392,7 @@ mod tests {
         for _ in 0..4 {
             let report = archipelago.step_to_barrier().expect("barrier steps");
             if let Some(migration) = report.migration {
-                expected.extend(last_barrier.drain(..));
+                expected.append(&mut last_barrier);
                 last_barrier = migration.moves.clone();
                 final_verify = Some(migration);
             }
@@ -4443,14 +4463,14 @@ mod tests {
     /// world, where the food and terrain grids have no cell for them.
     #[test]
     fn bd_tfso_migrants_between_differently_sized_islands_land_in_bounds() {
-        let sizes = [(600u32, 300u32), (1200, 600), (300, 150)];
+        let sizes = [(600u16, 300u16), (1200, 600), (300, 150)];
         let specs: Vec<IslandSpec> = sizes
             .iter()
             .enumerate()
             .map(|(index, &(width, height))| {
                 let mut config = populated_config(None);
-                config.world_width = width;
-                config.world_height = height;
+                config.world_width = u32::from(width);
+                config.world_height = u32::from(height);
                 spec(u32::try_from(index).expect("index fits u32"), config)
             })
             .collect();
@@ -4488,8 +4508,8 @@ mod tests {
                             !(x.is_finite() && y.is_finite())
                                 || x < 0.0
                                 || y < 0.0
-                                || x >= width as f32
-                                || y >= height as f32
+                                || x >= f32::from(width)
+                                || y >= f32::from(height)
                         })
                         .count()
                 })

@@ -4568,7 +4568,7 @@ pub enum NullFrontendSubmissionError {
     #[error("null frontend command submission failed: {source}")]
     HostAccess {
         /// Exact envelope whose admission may be indeterminate.
-        envelope: CommandEnvelope,
+        envelope: Box<CommandEnvelope>,
         /// Port failure observed by the frontend.
         #[source]
         source: HostAccessError,
@@ -4590,7 +4590,7 @@ impl NullFrontendSubmissionError {
     pub fn into_envelope(self) -> Option<CommandEnvelope> {
         match self {
             Self::CommandIdExhausted => None,
-            Self::HostAccess { envelope, .. } => Some(envelope),
+            Self::HostAccess { envelope, .. } => Some(*envelope),
         }
     }
 }
@@ -5159,7 +5159,7 @@ impl<P: HostPort> NullFrontend<P> {
         self.client
             .submit(envelope)
             .map_err(|source| NullFrontendSubmissionError::HostAccess {
-                envelope: retry_envelope,
+                envelope: Box::new(retry_envelope),
                 source,
             })
     }
@@ -6436,7 +6436,7 @@ mod tests {
                 EventPoll::Gap(_) => None,
             }
             .expect("tip cursor must remain contiguous");
-            assert!(page.events.is_empty());
+            assert_eq!(page.events, Vec::<JournaledScientificEvent>::new());
         }
 
         let cursors = vec![tip_cursor; CONSUMERS];
@@ -8097,11 +8097,11 @@ mod tests {
                 &JournalState::Durable
             );
         }
-        assert!(
-            !frontend
+        assert_ne!(
+            frontend
                 .read_protocol_events(128)
-                .expect("event observation")
-                .is_empty()
+                .expect("event observation"),
+            Vec::<HostEvent>::new()
         );
         assert!(matches!(
             frontend

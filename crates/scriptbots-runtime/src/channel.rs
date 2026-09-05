@@ -924,6 +924,8 @@ mod tests {
         RejectionReason, ShutdownCommitRequirement, VolatileJournal,
     };
     use scriptbots_core::ScriptBotsConfig;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
     use std::sync::Mutex;
 
     fn test_host(paused: bool) -> FixedDeadlineHost {
@@ -1299,7 +1301,7 @@ mod tests {
         FixedDeadlineHost::new(core)
     }
 
-    /// Spawn the !Send driver on its owner thread and hand the port back.
+    /// Spawn the `!Send` driver on its owner thread and hand the port back.
     /// This is the exact production deployment shape: the host is constructed
     /// and driven on its own thread; only the cross-thread port travels.
     fn spawn_driver(
@@ -1315,7 +1317,11 @@ mod tests {
             port_tx.send(port).expect("port handoff");
             let start = std::time::Instant::now();
             driver.run(move || {
-                ManualInstant::from_nanos(1_000_000 + start.elapsed().as_nanos() as u64)
+                ManualInstant::from_nanos(
+                    1_000_000
+                        + u64::try_from(start.elapsed().as_nanos())
+                            .expect("test elapsed nanoseconds fit u64"),
+                )
             })
         });
         let port = port_rx.recv().expect("port handoff");
@@ -1326,10 +1332,10 @@ mod tests {
     fn wait_resolved(port: &mut ChannelHostPort, command_id: CommandId) -> CommandStatus {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(status) = port.command_status(command_id).expect("status lookup") {
-                if !matches!(status.application(), ApplicationState::Admitted) {
-                    return status;
-                }
+            if let Some(status) = port.command_status(command_id).expect("status lookup")
+                && !matches!(status.application(), ApplicationState::Admitted)
+            {
+                return status;
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1621,7 +1627,7 @@ mod tests {
         let wrong = snapshot.revisions.control.checked_next().expect("next");
         let envelope = CommandEnvelope::new(
             CommandId::new(31),
-            HostCommand::UpdateConfig(Box::new(ScriptBotsConfig::default())),
+            HostCommand::UpdateConfig(Box::default()),
         )
         .expecting_control_revision(wrong);
         port.submit(envelope).expect("submit");
@@ -1709,57 +1715,66 @@ mod tests {
         assert_eq!(receipt.outcome, ChannelRunOutcome::Stopped);
     }
 
+    #[derive(Default)]
+    struct DeferredJournalState {
+        suppress_receipts: bool,
+        attempts: Vec<crate::JournalBatchId>,
+        receipts: VecDeque<crate::JournalReceipt>,
+    }
+
+    struct DeferredJournal {
+        state: Rc<RefCell<DeferredJournalState>>,
+        dropped: Rc<Cell<bool>>,
+    }
+
+    impl Drop for DeferredJournal {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
+    impl crate::JournalPort for DeferredJournal {
+        fn try_admit(
+            &mut self,
+            batch: &std::sync::Arc<crate::JournalBatch>,
+        ) -> crate::JournalAdmission {
+            let mut state = self.state.borrow_mut();
+            let batch_id = batch.id();
+            state.attempts.push(batch_id);
+            if !state.suppress_receipts {
+                state.receipts.push_back(crate::JournalReceipt::new(
+                    batch_id,
+                    crate::JournalReceiptState::Durable,
+                ));
+            }
+            crate::JournalAdmission::Accepted { batch_id }
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<crate::JournalReceipt> {
+            let mut state = self.state.borrow_mut();
+            let count = limit.min(state.receipts.len());
+            state.receipts.drain(..count).collect()
+        }
+
+        fn command_authority_mode(&self) -> crate::CommandAuthorityMode {
+            crate::CommandAuthorityMode::ProcessLocal
+        }
+    }
+
+    fn assert_step_applied_with_pending_journal(port: &mut ChannelHostPort, command_id: CommandId) {
+        let pending = port
+            .command_status(command_id)
+            .expect("status lookup")
+            .expect("step status retained");
+        assert!(matches!(
+            pending.application(),
+            ApplicationState::Applied(_)
+        ));
+        assert_eq!(pending.journal(), &crate::JournalState::Pending);
+    }
+
     #[test]
     fn run_error_preserves_driver_and_pending_journal_work() {
-        use std::cell::{Cell, RefCell};
-        use std::rc::Rc;
-
-        #[derive(Default)]
-        struct DeferredJournalState {
-            suppress_receipts: bool,
-            attempts: Vec<crate::JournalBatchId>,
-            receipts: VecDeque<crate::JournalReceipt>,
-        }
-
-        struct DeferredJournal {
-            state: Rc<RefCell<DeferredJournalState>>,
-            dropped: Rc<Cell<bool>>,
-        }
-
-        impl Drop for DeferredJournal {
-            fn drop(&mut self) {
-                self.dropped.set(true);
-            }
-        }
-
-        impl crate::JournalPort for DeferredJournal {
-            fn try_admit(
-                &mut self,
-                batch: &std::sync::Arc<crate::JournalBatch>,
-            ) -> crate::JournalAdmission {
-                let mut state = self.state.borrow_mut();
-                let batch_id = batch.id();
-                state.attempts.push(batch_id);
-                if !state.suppress_receipts {
-                    state.receipts.push_back(crate::JournalReceipt::new(
-                        batch_id,
-                        crate::JournalReceiptState::Durable,
-                    ));
-                }
-                crate::JournalAdmission::Accepted { batch_id }
-            }
-
-            fn poll_receipts(&mut self, limit: usize) -> Vec<crate::JournalReceipt> {
-                let mut state = self.state.borrow_mut();
-                let count = limit.min(state.receipts.len());
-                state.receipts.drain(..count).collect()
-            }
-
-            fn command_authority_mode(&self) -> crate::CommandAuthorityMode {
-                crate::CommandAuthorityMode::ProcessLocal
-            }
-        }
-
         let journal_state = Rc::new(RefCell::new(DeferredJournalState {
             suppress_receipts: true,
             ..DeferredJournalState::default()
@@ -1821,15 +1836,7 @@ mod tests {
 
         let (mut port, admitted) = client.join().expect("client thread");
         assert_eq!(admitted.journal(), &crate::JournalState::Pending);
-        let pending = port
-            .command_status(CommandId::new(82))
-            .expect("status lookup")
-            .expect("step status retained");
-        assert!(matches!(
-            pending.application(),
-            ApplicationState::Applied(_)
-        ));
-        assert_eq!(pending.journal(), &crate::JournalState::Pending);
+        assert_step_applied_with_pending_journal(&mut port, CommandId::new(82));
         assert!(
             !journal_dropped.get(),
             "run error dropped the sole-owner host and its pending journal work"
@@ -1878,7 +1885,13 @@ mod tests {
         drop(port);
         let start = std::time::Instant::now();
         let receipt = driver
-            .run(move || ManualInstant::from_nanos(1_000_000 + start.elapsed().as_nanos() as u64))
+            .run(move || {
+                ManualInstant::from_nanos(
+                    1_000_000
+                        + u64::try_from(start.elapsed().as_nanos())
+                            .expect("test elapsed nanoseconds fit u64"),
+                )
+            })
             .expect("run");
         assert_eq!(receipt.outcome, ChannelRunOutcome::ControllerDisconnected);
         assert_eq!(receipt.commands_admitted, 1);
@@ -2027,7 +2040,7 @@ mod tests {
 
     #[test]
     fn enqueue_cannot_restart_an_expired_outer_submission_deadline() {
-        let (mut driver, port) =
+        let (driver, port) =
             ChannelHostDriver::new(test_host(false), fast_options()).expect("driver");
         let expired = Instant::now()
             .checked_sub(port.submit_deadline)
@@ -2254,6 +2267,8 @@ mod tests {
             .expect("refilled command reply")
             .expect("authoritative validation rejection");
         assert_eq!(status.command_id(), CommandId::new(20_000));
+        // Keep the controller connected through both flooded drive boundaries.
+        drop(port);
     }
 
     #[test]
@@ -2290,15 +2305,6 @@ mod tests {
 
     #[test]
     fn archived_retry_cannot_strand_a_retained_admitted_status() {
-        let (mut driver, mut port) = ChannelHostDriver::new(
-            test_host(false),
-            ChannelHostOptions {
-                status_board_capacity: 1,
-                ..fast_options()
-            },
-        )
-        .expect("driver");
-
         fn process(driver: &mut ChannelHostDriver, envelope: CommandEnvelope) -> CommandStatus {
             let (reply, receipt) = std::sync::mpsc::channel();
             driver.process_ingress(IngressMessage::Command { envelope, reply });
@@ -2307,6 +2313,15 @@ mod tests {
                 .expect("authoritative admission reply")
                 .expect("host remains available")
         }
+
+        let (mut driver, mut port) = ChannelHostDriver::new(
+            test_host(false),
+            ChannelHostOptions {
+                status_board_capacity: 1,
+                ..fast_options()
+            },
+        )
+        .expect("driver");
 
         let archived_id = CommandId::new(74);
         let archived_envelope = CommandEnvelope::new(archived_id, HostCommand::Pause);

@@ -648,12 +648,16 @@ mod tests {
         let mut candidates = BTreeMap::new();
         for id in 0..4 {
             let agents: Vec<CandidateAgent> = (0..20)
-                .map(|i| CandidateAgent {
-                    uid: (id * 100 + i) as u64,
-                    energy: (i as f32) * 0.1,
-                    health: 1.0,
-                    age: i * 5,
-                    speed: (i as f32) * 0.05,
+                .map(|i| {
+                    let scalar_index =
+                        f32::from(u16::try_from(i).expect("fixture index in 0..20 fits u16"));
+                    CandidateAgent {
+                        uid: u64::from(id * 100 + i),
+                        energy: scalar_index * 0.1,
+                        health: 1.0,
+                        age: i * 5,
+                        speed: scalar_index * 0.05,
+                    }
                 })
                 .collect();
             candidates.insert(IslandId(id), agents);
@@ -761,7 +765,8 @@ mod tests {
             (0..6u64)
                 .map(|i| CandidateAgent {
                     uid: base + i,
-                    energy: 1.0 + i as f32,
+                    energy: 1.0
+                        + f32::from(u16::try_from(i).expect("fixture index in 0..6 fits u16")),
                     health: 1.0,
                     age: 10,
                     speed: 1.0,

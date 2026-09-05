@@ -839,9 +839,9 @@ impl SharedHostState {
         }
     }
 
-    fn poll_pending_command_authority(&mut self) -> Result<bool, HostAccessError> {
+    fn poll_pending_command_authority(&mut self) -> bool {
         let Some(pending) = self.pending_command_authority.clone() else {
-            return Ok(false);
+            return false;
         };
         let command_id = pending.envelope.command_id;
         let Some(reader) = self.command_authority_reader.as_ref().map(Arc::clone) else {
@@ -855,7 +855,7 @@ impl SharedHostState {
                     },
                 },
             );
-            return Ok(false);
+            return false;
         };
         match reader.resolve_for_submit(&pending.envelope, pending.envelope_digest, pending.policy)
         {
@@ -863,7 +863,7 @@ impl SharedHostState {
                 if let Err(error) = Self::validate_journaled_authority(command_id, &authority) {
                     self.pending_command_authority = None;
                     self.retain_authority_failure(&pending, error);
-                    return Ok(false);
+                    return false;
                 }
                 let status = authority.status().clone();
                 let prior_digest = authority.envelope_digest();
@@ -875,7 +875,7 @@ impl SharedHostState {
                         HostAccessError::CommandIdCollision { command_id },
                     );
                 }
-                Ok(false)
+                false
             }
             CommandAuthorityLookup::Claimed => {
                 self.pending_command_authority = None;
@@ -888,7 +888,7 @@ impl SharedHostState {
                 if let Err(error) = result {
                     self.retain_authority_failure(&pending, error);
                 }
-                Ok(false)
+                false
             }
             CommandAuthorityLookup::Absent if pending.policy == CommandClaimPolicy::CompareOnly => {
                 self.pending_command_authority = None;
@@ -898,7 +898,7 @@ impl SharedHostState {
                         lifecycle: self.admission_lifecycle,
                     },
                 );
-                Ok(false)
+                false
             }
             CommandAuthorityLookup::Absent => {
                 self.pending_command_authority = None;
@@ -908,7 +908,7 @@ impl SharedHostState {
                         "durable command authority proved {command_id} absent without reserving it"
                     )),
                 );
-                Ok(false)
+                false
             }
             CommandAuthorityLookup::Collision => {
                 self.pending_command_authority = None;
@@ -916,13 +916,13 @@ impl SharedHostState {
                     &pending,
                     HostAccessError::CommandIdCollision { command_id },
                 );
-                Ok(false)
+                false
             }
             CommandAuthorityLookup::Failed(
                 crate::CommandAuthorityLookupFailure::Pending
                 | crate::CommandAuthorityLookupFailure::Busy
                 | crate::CommandAuthorityLookupFailure::Capacity { .. },
-            ) => Ok(true),
+            ) => true,
             CommandAuthorityLookup::Failed(failure) => {
                 self.pending_command_authority = None;
                 self.retain_authority_failure(
@@ -932,7 +932,7 @@ impl SharedHostState {
                         failure,
                     },
                 );
-                Ok(false)
+                false
             }
         }
     }
@@ -1240,7 +1240,7 @@ impl SharedHostState {
                     failure: crate::CommandAuthorityLookupFailure::Busy,
                 });
             }
-            if self.poll_pending_command_authority()? {
+            if self.poll_pending_command_authority() {
                 trace_decision!("miss", "pending", None, "retry_pending");
                 return Err(HostAccessError::CommandAuthorityLookup {
                     command_id: envelope.command_id,
@@ -1257,47 +1257,8 @@ impl SharedHostState {
                 return Err(error);
             }
         }
-        if let Some(authority) = self.commands.get(&envelope.command_id) {
-            if authority.envelope_digest == envelope_digest {
-                trace_decision!(
-                    "live",
-                    "not_consulted",
-                    Some(authority.status.application()),
-                    "exact_replay"
-                );
-                return Ok(authority.status.clone());
-            }
-            trace_decision!(
-                "live",
-                "not_consulted",
-                Some(authority.status.application()),
-                "collision"
-            );
-            return Err(HostAccessError::CommandIdCollision {
-                command_id: envelope.command_id,
-            });
-        }
-        if let Some(archived) = self.archived_idempotency.get(&envelope.command_id) {
-            // The command is durably archived: an exact retry replays the archived
-            // terminal status, a changed payload collides (bd-2z0.5.2.1).
-            if archived.envelope_digest == envelope_digest {
-                trace_decision!(
-                    "archive",
-                    "not_consulted",
-                    Some(archived.status.application()),
-                    "exact_replay"
-                );
-                return Ok(archived.status.clone());
-            }
-            trace_decision!(
-                "archive",
-                "not_consulted",
-                Some(archived.status.application()),
-                "collision"
-            );
-            return Err(HostAccessError::CommandIdCollision {
-                command_id: envelope.command_id,
-            });
+        if let Some(result) = self.cached_submission(envelope.command_id, envelope_digest) {
+            return result;
         }
         let resolution = match self.resolve_durable_submission(
             &envelope,
@@ -1327,6 +1288,37 @@ impl SharedHostState {
                 durable_lookup,
             ),
         }
+    }
+
+    fn cached_submission(
+        &self,
+        command_id: CommandId,
+        envelope_digest: [u8; blake3::OUT_LEN],
+    ) -> Option<Result<CommandStatus, HostAccessError>> {
+        let (cache, prior_digest, status) = if let Some(authority) = self.commands.get(&command_id)
+        {
+            ("live", authority.envelope_digest, &authority.status)
+        } else if let Some(archived) = self.archived_idempotency.get(&command_id) {
+            // Durable archive retries replay terminal status only for the exact payload.
+            ("archive", archived.envelope_digest, &archived.status)
+        } else {
+            return None;
+        };
+        let exact = prior_digest == envelope_digest;
+        trace_command_authority_decision(
+            command_id,
+            envelope_digest,
+            cache,
+            "not_consulted",
+            self.admission_lifecycle,
+            Some(status.application()),
+            if exact { "exact_replay" } else { "collision" },
+        );
+        Some(if exact {
+            Ok(status.clone())
+        } else {
+            Err(HostAccessError::CommandIdCollision { command_id })
+        })
     }
 
     fn submit_fresh(
@@ -2410,7 +2402,7 @@ impl HostCore {
     /// owns the only copy of a living organism** — dropping it deletes an agent
     /// from the run with no death record, which is why the host refuses a second
     /// emigration while this slot is occupied rather than overwriting it.
-    pub fn take_outbound_migrant(&mut self) -> Option<MigratingAgent> {
+    pub const fn take_outbound_migrant(&mut self) -> Option<MigratingAgent> {
         self.outbound_migrant.take()
     }
 
@@ -2433,9 +2425,9 @@ impl HostCore {
     /// Silently replacing it would destroy a living agent, so the refusal hands
     /// ownership to the caller rather than making the host the place an organism
     /// can vanish.
-    pub fn stage_immigrant(&mut self, migrant: MigratingAgent) -> Result<(), MigratingAgent> {
+    pub fn stage_immigrant(&mut self, migrant: MigratingAgent) -> Result<(), Box<MigratingAgent>> {
         if self.staged_immigrant.is_some() {
-            return Err(migrant);
+            return Err(Box::new(migrant));
         }
         self.staged_immigrant = Some(migrant);
         Ok(())
@@ -2451,7 +2443,7 @@ impl HostCore {
     ///
     /// Exists so a mover that fails a barrier between staging and commanding can
     /// return the organism to its source instead of leaking it.
-    pub fn unstage_immigrant(&mut self) -> Option<MigratingAgent> {
+    pub const fn unstage_immigrant(&mut self) -> Option<MigratingAgent> {
         self.staged_immigrant.take()
     }
 
@@ -3167,67 +3159,12 @@ impl HostCore {
         // preflight. Once crossed, any later error may follow command-visible
         // mutation and must retain this boundary as indeterminate.
         self.active_command_started = true;
-        let revision_conflict = if let Some(expected) = envelope.expected_control_revision
-            && expected != self.revisions.control
-        {
-            Some(RejectionReason::ControlRevisionConflict {
-                expected,
-                actual: self.revisions.control,
-            })
-        } else if let Some(expected) = envelope.expected_scientific_revision
-            && expected != self.revisions.scientific
-        {
-            Some(RejectionReason::ScientificRevisionConflict {
-                expected,
-                actual: self.revisions.scientific,
-            })
-        } else if let Some(expected) = envelope.expected_config_revision
-            && expected != self.revisions.config
-        {
-            Some(RejectionReason::ConfigRevisionConflict {
-                expected,
-                actual: self.revisions.config,
-            })
-        } else {
-            None
-        };
-        if let Some(reason) = revision_conflict {
-            if matches!(&envelope.command, HostCommand::Shutdown) {
-                let mut shared = self.shared.borrow_mut();
-                shared.admission_lifecycle = HostLifecycle::Running;
-                shared.shutdown_command_id = None;
-            }
-            let status = CommandStatus::try_new(
-                envelope.command_id,
-                Some(admission),
-                ApplicationState::Rejected(reason),
-                JournalState::Pending,
-            )
-            .map_err(status_violation)?;
-            self.complete_status(status)?;
-            let blocked = self.offer_terminal_command_audit(envelope.command_id)?;
-            return Ok(ApplyResult::completed(blocked));
+        if let Some(result) = self.reject_revision_conflict(admission, &envelope)? {
+            return Ok(result);
         }
 
-        if self.latched_fault.is_some()
-            && matches!(
-                &envelope.command,
-                HostCommand::Step
-                    | HostCommand::UpdateConfig(_)
-                    | HostCommand::AdjustAgentMutationRates { .. }
-                    | HostCommand::SpawnAgent { .. }
-                    | HostCommand::SpawnCrossover { .. }
-                    | HostCommand::Emigrate { .. }
-                    | HostCommand::Immigrate { .. }
-            )
-        {
-            let blocked = self.complete_failed(
-                envelope.command_id,
-                admission,
-                "science_blocked",
-                "host science is stopped by a latched fault".to_owned(),
-            )?;
-            return Ok(ApplyResult::completed(blocked));
+        if let Some(result) = self.reject_fault_blocked_science(admission, &envelope)? {
+            return Ok(result);
         }
 
         let next_control = self
@@ -3239,24 +3176,15 @@ impl HostCore {
         match envelope.command {
             HostCommand::Pause => {
                 self.playback.paused = true;
-                self.revisions.control = next_control;
-                self.complete_applied(retry_envelope.command_id, admission)?;
-                let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
-                Ok(ApplyResult::completed(blocked))
+                self.complete_playback_command(admission, &retry_envelope, next_control)
             }
             HostCommand::Resume => {
                 self.playback.paused = false;
-                self.revisions.control = next_control;
-                self.complete_applied(retry_envelope.command_id, admission)?;
-                let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
-                Ok(ApplyResult::completed(blocked))
+                self.complete_playback_command(admission, &retry_envelope, next_control)
             }
             HostCommand::SetSpeed(speed) => {
                 self.playback.speed_multiplier = speed;
-                self.revisions.control = next_control;
-                self.complete_applied(retry_envelope.command_id, admission)?;
-                let blocked = self.offer_terminal_command_audit(retry_envelope.command_id)?;
-                Ok(ApplyResult::completed(blocked))
+                self.complete_playback_command(admission, &retry_envelope, next_control)
             }
             HostCommand::UpdateConfig(config) => {
                 self.apply_config_command(admission, &retry_envelope, config, next_control)
@@ -3315,6 +3243,92 @@ impl HostCore {
                 self.apply_shutdown_command(admission, &retry_envelope, next_control)
             }
         }
+    }
+
+    fn reject_revision_conflict(
+        &mut self,
+        admission: AdmissionSequence,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<ApplyResult>, HostAccessError> {
+        let reason = if let Some(expected) = envelope.expected_control_revision
+            && expected != self.revisions.control
+        {
+            RejectionReason::ControlRevisionConflict {
+                expected,
+                actual: self.revisions.control,
+            }
+        } else if let Some(expected) = envelope.expected_scientific_revision
+            && expected != self.revisions.scientific
+        {
+            RejectionReason::ScientificRevisionConflict {
+                expected,
+                actual: self.revisions.scientific,
+            }
+        } else if let Some(expected) = envelope.expected_config_revision
+            && expected != self.revisions.config
+        {
+            RejectionReason::ConfigRevisionConflict {
+                expected,
+                actual: self.revisions.config,
+            }
+        } else {
+            return Ok(None);
+        };
+        if matches!(&envelope.command, HostCommand::Shutdown) {
+            let mut shared = self.shared.borrow_mut();
+            shared.admission_lifecycle = HostLifecycle::Running;
+            shared.shutdown_command_id = None;
+        }
+        let status = CommandStatus::try_new(
+            envelope.command_id,
+            Some(admission),
+            ApplicationState::Rejected(reason),
+            JournalState::Pending,
+        )
+        .map_err(status_violation)?;
+        self.complete_status(status)?;
+        let blocked = self.offer_terminal_command_audit(envelope.command_id)?;
+        Ok(Some(ApplyResult::completed(blocked)))
+    }
+
+    fn reject_fault_blocked_science(
+        &mut self,
+        admission: AdmissionSequence,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<ApplyResult>, HostAccessError> {
+        if self.latched_fault.is_none()
+            || !matches!(
+                &envelope.command,
+                HostCommand::Step
+                    | HostCommand::UpdateConfig(_)
+                    | HostCommand::AdjustAgentMutationRates { .. }
+                    | HostCommand::SpawnAgent { .. }
+                    | HostCommand::SpawnCrossover { .. }
+                    | HostCommand::Emigrate { .. }
+                    | HostCommand::Immigrate { .. }
+            )
+        {
+            return Ok(None);
+        }
+        let blocked = self.complete_failed(
+            envelope.command_id,
+            admission,
+            "science_blocked",
+            "host science is stopped by a latched fault".to_owned(),
+        )?;
+        Ok(Some(ApplyResult::completed(blocked)))
+    }
+
+    fn complete_playback_command(
+        &mut self,
+        admission: AdmissionSequence,
+        envelope: &CommandEnvelope,
+        next_control: ControlRevision,
+    ) -> Result<ApplyResult, HostAccessError> {
+        self.revisions.control = next_control;
+        self.complete_applied(envelope.command_id, admission)?;
+        let blocked = self.offer_terminal_command_audit(envelope.command_id)?;
+        Ok(ApplyResult::completed(blocked))
     }
 
     fn apply_config_command(
@@ -4005,7 +4019,7 @@ impl ManualHostDriver for HostCore {
         let events_before = self.events.published_total();
         let event_was_pressured = self.event_pressure.is_some();
         self.poll_journal_receipts()?;
-        let authority_blocked = self.shared.borrow_mut().poll_pending_command_authority()?;
+        let authority_blocked = self.shared.borrow_mut().poll_pending_command_authority();
         if self.event_pressure.is_some() {
             self.prepare_scientific_event_slot()?;
         }
@@ -5106,7 +5120,7 @@ mod tests {
                     f32::from(client % 32) * 25.0,
                     f32::from(client / 32) * 200.0,
                 ],
-                zoom: 1.0 + f32::from(client % 4) * 0.5,
+                zoom: f32::from(client % 4).mul_add(0.5, 1.0),
             },
             selection: ProjectionSelection {
                 focused: Some(AgentUid(uid)),
@@ -5278,6 +5292,16 @@ mod tests {
             .expect("live agent has an identity")
     }
 
+    fn assert_migration_journal_committed(core: &mut HostCore, port: &mut LocalHostPort) {
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("migration journal receipts");
+        assert_eq!(
+            status(port, 1).journal(),
+            &JournalState::CommittedVolatile,
+            "the migration must be committed to the journal, not merely applied"
+        );
+    }
+
     /// One organism crosses two hosts through the command pipeline, and BOTH
     /// halves are journaled (bd-emcv).
     ///
@@ -5335,14 +5359,7 @@ mod tests {
             "the organism must be parked for the mover, not dropped"
         );
 
-        source
-            .drive(ManualInstant::from_nanos(2))
-            .expect("departure journal receipts");
-        assert_eq!(
-            status(&mut source_port, 1).journal(),
-            &JournalState::CommittedVolatile,
-            "the departure must be committed to the journal, not merely applied"
-        );
+        assert_migration_journal_committed(&mut source, &mut source_port);
 
         // --- HAND-OFF ------------------------------------------------------
         let migrant = source
@@ -5401,14 +5418,7 @@ mod tests {
              source uid would name a different organism that already lives here"
         );
 
-        destination
-            .drive(ManualInstant::from_nanos(2))
-            .expect("arrival journal receipts");
-        assert_eq!(
-            status(&mut destination_port, 1).journal(),
-            &JournalState::CommittedVolatile,
-            "the arrival must be committed to the journal, not merely applied"
-        );
+        assert_migration_journal_committed(&mut destination, &mut destination_port);
 
         assert_eq!(
             source.world.agent_count() + destination.world.agent_count(),
@@ -6777,7 +6787,7 @@ mod tests {
                 ]),
             )])),
         });
-        let mut core = HostCore::with_journal(
+        let core = HostCore::with_journal(
             HostSessionId::new(0x5151),
             world(0),
             options(true),
@@ -6811,8 +6821,7 @@ mod tests {
         );
 
         assert_eq!(
-            port.submit(envelope.clone())
-                .expect("resolved exact durable retry"),
+            port.submit(envelope).expect("resolved exact durable retry"),
             authority.status().clone()
         );
         assert_eq!(port.queue_depth(), 0);
@@ -6946,7 +6955,7 @@ mod tests {
     fn durable_required_journal_without_authority_reader_fails_closed() {
         let session_id = HostSessionId::new(0x525f);
         let command_id = CommandId::from_client_sequence(0x52, 0xff);
-        let mut core = HostCore::with_journal(
+        let core = HostCore::with_journal(
             session_id,
             world(0),
             options(true),
@@ -8141,7 +8150,7 @@ mod tests {
         else {
             panic!("tip poll must remain contiguous");
         };
-        assert!(duplicate.events.is_empty());
+        assert_eq!(duplicate.events, Vec::<JournaledScientificEvent>::new());
         assert_eq!(slow.last_seen(), EventSequence::new(3));
 
         let mut wrong_session = crate::EventCursor::beginning(HostSessionId::new(71));
