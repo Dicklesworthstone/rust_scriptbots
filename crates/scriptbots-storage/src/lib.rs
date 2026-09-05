@@ -2289,6 +2289,9 @@ const AGENT_COLUMNS: &[&str] = &[
     "island_id",
 ];
 
+/// Working-set budget for one multi-row scientific INSERT, not the engine's maximum.
+const MAX_SCIENCE_INSERT_BINDINGS: usize = 1_024;
+
 /// Number of values bound by [`scriptbots_agent_insert_sql`].
 #[cfg(test)]
 const SCRIPTBOTS_AGENT_COLUMN_COUNT: usize = AGENT_COLUMNS.len();
@@ -18335,6 +18338,48 @@ impl Storage {
         Ok(false)
     }
 
+    /// Preserve input order while amortizing statement setup and FK schema refreshes.
+    /// The binding budget bounds each statement's temporary storage; the enclosing
+    /// `flush_attempt` transaction remains responsible for rolling back every chunk.
+    fn execute_bounded_insert<const WIDTH: usize>(
+        tx: &Transaction<'_>,
+        one_row_sql: &str,
+        rows: impl Iterator<Item = [SqliteValue; WIDTH]>,
+    ) -> Result<usize, FrankenError> {
+        if WIDTH == 0 || WIDTH > MAX_SCIENCE_INSERT_BINDINGS {
+            return Err(FrankenError::Internal(format!(
+                "insert binding width {WIDTH} exceeds the nonzero statement budget"
+            )));
+        }
+        let mut sql = one_row_sql.to_owned();
+        let mut parameters = Vec::with_capacity(MAX_SCIENCE_INSERT_BINDINGS);
+        let mut inserted = 0;
+        for values in rows {
+            if parameters.len() + WIDTH > MAX_SCIENCE_INSERT_BINDINGS {
+                tx.execute_with_params(&sql, &parameters)?;
+                inserted += parameters.len() / WIDTH;
+                parameters.clear();
+                sql.truncate(one_row_sql.len());
+            }
+            if !parameters.is_empty() {
+                sql.push_str(", (");
+                for column in 0..WIDTH {
+                    if column != 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("?{}", parameters.len() + column + 1));
+                }
+                sql.push(')');
+            }
+            parameters.extend(values);
+        }
+        if !parameters.is_empty() {
+            tx.execute_with_params(&sql, &parameters)?;
+            inserted += parameters.len() / WIDTH;
+        }
+        Ok(inserted)
+    }
+
     fn insert_ticks(
         tx: &Transaction<'_>,
         run_id: RunId,
@@ -18418,9 +18463,7 @@ impl Storage {
         Ok(())
     }
 
-    /// Insert prevalidated rows only inside `flush_attempt`'s whole-batch transaction.
-    /// Any error must propagate to that caller's explicit rollback; no caller may keep
-    /// using or commit the transaction after a failed insert.
+    /// Insert snapshots inside `flush_attempt`'s whole-batch transaction.
     fn insert_agents(
         tx: &Transaction<'_>,
         run_id: RunId,
@@ -18429,10 +18472,11 @@ impl Storage {
         if rows.is_empty() {
             return Ok(());
         }
-        for row in rows {
-            tx.execute_with_params_skip_statement_savepoint(
-                scriptbots_agent_insert_sql(),
-                &[
+        Self::execute_bounded_insert(
+            tx,
+            scriptbots_agent_insert_sql(),
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.agent_uid.into(),
@@ -18474,10 +18518,10 @@ impl Storage {
                     sqlite_bool(row.hit_by_carnivore),
                     sqlite_bool(row.hit_by_herbivore),
                     row.island_id.into(),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            }),
+        )
+        .map(|_| ())
     }
 
     fn insert_births(
@@ -18717,31 +18761,40 @@ impl Storage {
                 position_x, position_y,
                 counterpart_uid, counterpart_position_x, counterpart_position_y, island_id
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
-        for row in rows {
-            let sql = if row.event_type == NARRATIVE_INPUT_EVENT_TYPE {
+        // Keep strict narrative-input inserts distinct from replaceable replay rows,
+        // and keep their original order across every policy boundary.
+        for group in rows.chunk_by(|left, right| {
+            (left.event_type == NARRATIVE_INPUT_EVENT_TYPE)
+                == (right.event_type == NARRATIVE_INPUT_EVENT_TYPE)
+        }) {
+            let sql = if group[0].event_type == NARRATIVE_INPUT_EVENT_TYPE {
                 insert_sql
             } else {
                 replace_sql
             };
-            let (position_x, position_y) = split_optional_position(row.position);
-            let (counterpart_x, counterpart_y) = split_optional_position(row.counterpart_position);
-            tx.execute_with_params(
+            Self::execute_bounded_insert(
+                tx,
                 sql,
-                &[
-                    sqlite_run_id(run_id),
-                    row.tick.into(),
-                    row.seq.into(),
-                    sqlite_optional_i64(row.agent_uid),
-                    row.scope.as_str().into(),
-                    row.event_type.as_str().into(),
-                    row.payload.as_str().into(),
-                    position_x,
-                    position_y,
-                    sqlite_optional_i64(row.counterpart),
-                    counterpart_x,
-                    counterpart_y,
-                    row.island_id.into(),
-                ],
+                group.iter().map(|row| {
+                    let (position_x, position_y) = split_optional_position(row.position);
+                    let (counterpart_x, counterpart_y) =
+                        split_optional_position(row.counterpart_position);
+                    [
+                        sqlite_run_id(run_id),
+                        row.tick.into(),
+                        row.seq.into(),
+                        sqlite_optional_i64(row.agent_uid),
+                        row.scope.as_str().into(),
+                        row.event_type.as_str().into(),
+                        row.payload.as_str().into(),
+                        position_x,
+                        position_y,
+                        sqlite_optional_i64(row.counterpart),
+                        counterpart_x,
+                        counterpart_y,
+                        row.island_id.into(),
+                    ]
+                }),
             )?;
         }
         Ok(())
@@ -18772,14 +18825,14 @@ impl Storage {
         let sql = "insert or replace into interactions (
                 run_id, tick, seq, actor_agent_uid, target_agent_uid, kind, value, payload_json, island_id
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
-        let mut inserted = 0usize;
-        for row in rows {
-            let (Some(actor), Some(target)) = (row.agent_uid, row.counterpart) else {
-                continue;
-            };
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert(
+            tx,
+            sql,
+            rows.iter().filter_map(|row| {
+                let (Some(actor), Some(target)) = (row.agent_uid, row.counterpart) else {
+                    return None;
+                };
+                Some([
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.seq.into(),
@@ -18789,11 +18842,9 @@ impl Storage {
                     row.interaction_value.map_or(SqliteValue::Null, Into::into),
                     row.payload.as_str().into(),
                     row.island_id.into(),
-                ],
-            )?;
-            inserted += 1;
-        }
-        Ok(inserted)
+                ])
+            }),
+        )
     }
 
     fn insert_migrations(
@@ -25089,6 +25140,101 @@ mod tests {
 
         production_connection.close()?;
         connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn chunked_replay_inserts_preserve_rows_and_roll_back_late_sql_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Storage::unattributed_memory()?;
+        let connection = storage.connection()?;
+        // More rows than the entire binding budget necessarily crosses statement
+        // boundaries, independently of the replay row's current binding width.
+        let mut rows: Vec<ReplayEventRow> = (0..=MAX_SCIENCE_INSERT_BINDINGS)
+            .map(|index| ReplayEventRow {
+                tick: 1,
+                seq: i64::try_from(index).expect("bounded test ordinal"),
+                agent_uid: Some(7),
+                scope: "agent".to_owned(),
+                event_type: "action".to_owned(),
+                payload: format!("row-{index}"),
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                interaction_value: None,
+                island_id: 0,
+            })
+            .collect();
+        let middle = rows.len() / 2;
+        rows[middle].event_type = NARRATIVE_INPUT_EVENT_TYPE.to_owned();
+        let mut transaction = connection.transaction()?;
+        Storage::insert_replay_events(&transaction, storage.run_id, &[])?;
+        Storage::insert_replay_events(&transaction, storage.run_id, &rows)?;
+        transaction.commit()?;
+        drop(transaction);
+
+        let read_rows = || -> Result<Vec<(i64, String, String)>, FrankenError> {
+            connection
+                .query_with_params(
+                    "SELECT seq, event_type, payload FROM replay_events
+                     WHERE run_id = ?1 AND tick = 1 ORDER BY seq",
+                    &[sqlite_run_id(storage.run_id)],
+                )?
+                .into_iter()
+                .map(|row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)))
+                .collect()
+        };
+        let expected: Vec<_> = rows
+            .iter()
+            .map(|row| (row.seq, row.event_type.clone(), row.payload.clone()))
+            .collect();
+        assert_eq!(read_rows()?, expected, "chunk boundary changed stored rows");
+
+        let mut invalid = rows.clone();
+        for row in &mut invalid {
+            row.tick = 2;
+        }
+        invalid.last_mut().expect("nonempty fixture").scope.clear();
+        let buffer = StorageBuffer {
+            replay_events: invalid,
+            ..StorageBuffer::default()
+        };
+        let failure = Storage::flush_attempt(connection, ":memory:", storage.run_id, &buffer, &[])
+            .expect_err("the final row's real CHECK constraint must fail");
+        assert_eq!(failure.commit_state, FailureCommitState::RolledBack);
+        assert!(matches!(
+            failure.source,
+            FrankenError::CheckViolation { .. }
+        ));
+        let count_new_rows = || -> Result<i64, FrankenError> {
+            connection
+                .query_row_with_params(
+                    "SELECT COUNT(*) FROM replay_events WHERE run_id = ?1 AND tick = 2",
+                    &[sqlite_run_id(storage.run_id)],
+                )?
+                .get_typed(0)
+        };
+        assert_eq!(
+            count_new_rows()?,
+            0,
+            "earlier chunks escaped batch rollback"
+        );
+        assert_eq!(read_rows()?, expected, "rollback changed the prior commit");
+
+        // A strict narrative input must still reject an existing identity even
+        // when preceded by a replaceable replay group in the same science batch.
+        let mut fresh = rows[0].clone();
+        fresh.tick = 2;
+        let buffer = StorageBuffer {
+            replay_events: vec![fresh, rows[middle].clone()],
+            ..StorageBuffer::default()
+        };
+        let failure = Storage::flush_attempt(connection, ":memory:", storage.run_id, &buffer, &[])
+            .expect_err("narrative inputs must never become replaceable");
+        assert_eq!(failure.commit_state, FailureCommitState::RolledBack);
+        assert_eq!(count_new_rows()?, 0);
+        assert_eq!(read_rows()?, expected);
+        storage.close()?;
         Ok(())
     }
 
