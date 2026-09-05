@@ -2,7 +2,7 @@
 
 ## Execution TODO — started 2026-09-05
 
-Current continuation — **2026-09-05, through source `61da01c`, TurquoiseLake**. The earlier entries below retain
+Current continuation — **2026-09-05, through source `0e930be`, TurquoiseLake**. The earlier entries below retain
 the failure history; these are the current next actions and proof limits.
 
 - [x] Complete and retain DSR26 at `d4cab5d`: full core default 778/778 and economy-fault
@@ -137,7 +137,9 @@ the failure history; these are the current next actions and proof limits.
     eight selected worker/local verdict/log SHA256s match. Overall DSR exit 6, failed.
   - [x] Re-read original narrow bug acceptance and close status/retry/count/ownership beads
     from completed DSR37 evidence; leave broad soak, ownership and latency parents open.
-  - [ ] Export tracker, review exact documentation/tracker snapshots, commit and push both refs.
+  - [x] Export tracker, review exact documentation/tracker snapshots, commit and push both refs.
+    `7676992` records the review and `d385457` retains its byte-identical tracker merge base;
+    both remote branch tips were verified at `d385457` before the next source changes.
   This lane does not run the ignored INSERT timing diagnostic, full workspace, macOS captures,
   performance gate, or either original 600-second server scenario.
 - [ ] Correct and qualify the DSR38 remainder. Workspace compilation caught an authored
@@ -151,13 +153,17 @@ the failure history; these are the current next actions and proof limits.
   - [x] Finish analytics seven-file export/helper/fixture review, formatting and UBS triage.
     All 16 files reviewed; root scanners found nine existing test panic guards, each inspected.
   - [x] Freeze only reviewed source as `dc9ee28`; exact tree matched before commit.
-  - [ ] Complete and retain clean pinned DSR39b `workspace-dc9ee28-20260905-39b`:
+  - [x] Complete and retain clean pinned DSR39b `workspace-dc9ee28-20260905-39b`:
     workspace all-target compiler/strict lint, complete default runtime/analytics/app tests,
     render library, genome persistence and ten real journal cases. Initial DSR39 launch
     refused before compilation because the shell missed the provisioned yq path; exit 4,
     retained driver log, no suite result. The corrected launch uses existing tools.
     Workspace all-target compiler and strict Clippy have now passed at exact `dc9ee28`;
-    tests continue. No complete-suite pass, and broad dependent soak acceptance stays open.
+    runtime 196/196, analytics 99/99 (metric_summary 3/3), render 123/123, genome 8/8 and journal
+    10/10 pass. The completed app suite fails five targets; overall DSR exit 6. No complete-suite
+    pass; the earlier metric-summary SIGKILL cause and broad dependent soak acceptance stay
+    open. No fixture shrink or new ignore was needed for this analytics run. Full proof is
+    `/tmp/scriptbots-workspace-dc9ee28-proof-20260905`; all nine selected worker/local hashes match.
 - [ ] Resolve the DSR38 terminal capability golden mismatch without automatic rebasing.
   App library is 397 passed, one failed, one existing ignored; render library 123 passed,
   three existing ignored. Only three truecolor canvas map hashes differ; quantized and flat
@@ -173,9 +179,102 @@ the failure history; these are the current next actions and proof limits.
   - [x] Add real-buffer density/depth/diet, heading, mixed-order and offscreen controls.
   - [x] Review formatting, scanner findings and actual reused-buffer stale-marker coverage;
     six existing panic guards inspected, complete source frozen and committed as `61da01c`.
-  - [ ] Finish clean pinned DSR40 `canvas-61da01c-20260905-40`: complete default app tests,
-    workspace all-target compiler and strict Clippy. Inspect every changed golden region
-    before closure; this run deliberately retains the existing golden comparison.
+  - [x] Finish clean pinned DSR40 `canvas-61da01c-20260905-40`: formatting, workspace
+    all-target compiler and strict Clippy pass. The complete app suite fails five targets:
+    capability golden, archipelago source input, meadow envelope, manifest binary lookup and
+    real catalog storage shutdown. Full proof `/tmp/scriptbots-canvas-61da01c-proof-20260905`
+    retained; verdict/app/compiler/Clippy worker/local hashes all four match. Overall exit 6.
+  - [x] Observe all three new canvas controls pass in DSR40. App library 400 passed, one
+    failed (the capability golden), one existing ignored. No full app success implied.
+  - [x] Add opt-in raw-cell capture in the existing golden test, commit `a2e6c3f`, for the
+    concrete review of glyphs, colours and modifiers that hashes alone cannot supply.
+  - [x] Execute the capture at pinned `3e83b8f`; inspect all eight actual capability rows.
+    Independently recompute every full-frame FNV from the raw cells. Removing only the new
+    body modifiers from each canvas restores all five pre-`bfa04e1` frame hashes exactly;
+    glyphs/colours/positions have no additional drift. The provenance of `bfa04e1`'s three
+    unrelated truecolor hash changes remains unknown. Wide-emoji agents are absent below.
+  - [ ] Review intended marker deltas separately from the older unexplained truecolor drift;
+    use the existing deliberate golden workflow only after review, then verify the committed
+    result in a second clean DSR run. Preserve every original golden/negative control.
+  - [x] Inspect flat-map terrain/action style merging. Inherited BOLD/UNDERLINED, boost BOLD
+    and spike UNDERLINED can collapse different diets. Commit `fabbc67` reserves those two
+    channels for diet and uses ITALIC for boost/groups and REVERSED for spike/large groups;
+    update the actual heading/diet/action legend without changing glyph/colour decisions.
+  - [x] Add a real Cell style-merge test covering all three diets, single/small/large groups,
+    boost and spike states with planted inherited terrain modifiers and pairwise distinctions.
+  - [x] Execute the action-style guard in clean DSR43: it passes, alongside all three canvas
+    controls and workspace compiler/strict Clippy. Full library402/404 still fails the
+    authored full-frame theme mismatch and unchanged capability golden below.
+  - [ ] Review and qualify both existing goldens after the corrected full-frame guard passes.
+- [ ] Finish real-binary test repair under **bd-vlp7**:
+  - [x] DSR40 reached eleven manifest tests; all failed before app startup with ENOENT.
+    `current_exe` sibling lookup does not locate Cargo's app binary in its relocated layout.
+  - [x] Commit `3e83b8f`: use compile-time `CARGO_BIN_EXE_scriptbots-app` in the manifest
+    and catalog helpers, preserving every launch argument and assertion. Root reviewed both
+    hunks and four existing UBS test panic guards; formatting and frozen equality passed.
+  - [x] Trace archipelago source `None` to the diagnostic profiles' omitted compile-time
+    provenance fields. The app correctly reports unknown. Prepare the next profile to derive
+    all fields from its verified clean checkout, as `scripts/dsr_verify.sh` already does.
+  - [x] Complete DSR41 at `3e83b8f`: all eleven repaired real-binary manifest tests and all
+    three archipelago source-provenance tests pass. App library 400/401, one existing ignore,
+    with only the old capability golden failing. Format/compiler/strict Clippy pass.
+  - [x] Retain complete DSR40/41 proofs and compare local/worker hashes: four for DSR40;
+    fourteen for DSR41 (verdict, five logs, eight raw-cell files), all match. DSR41 proof is
+    `/tmp/scriptbots-app-3e83b8f-proof-20260905`; overall exit 6, not a full app success.
+  - [x] Retain complete DSR39b and compare all nine selected local/worker artifact hashes.
+  - [x] Record the repeated meadow seed `20260717` zero-death envelope failure on original
+    **bd-2z0.10.5**. The real-binary catalog separately reaches seed137 tick300 with population80,
+    births60/deaths5 and digest `1e8bb483bd90f1be`, then misses the unchanged120s storage
+    Shutdown acknowledgement. Record that distinct failure on **bd-w1oi**; later seeds/scenarios
+    did not execute. No envelope, timeout or production GUI/PTY acceptance was weakened.
+- [ ] Complete **bd-2z0.14.2.7**, wide-emoji flat-map visibility:
+  - [x] Raw DSR41 TestBackend cells falsify visibility: all three agent-colour counts are zero
+    in the wide-emoji row, versus one each in the narrow/no-emoji rows. Terrain glyphs consume
+    the adjacent columns where agents were drawn. This blocks the pending golden promotion.
+  - [x] Commit two-column logical tile placement and continuation/odd-edge clearing in
+    `7740aab`; `e46f59d` expresses the test's parity guard with the unsigned integer API.
+  - [x] Add actual full-frame diet visibility controls at80/81 columns and left/right-edge
+    controls at2/3/4/5 columns. Root reviews all hunks, exact frozen equality, formatting and
+    six unchanged UBS critical test-panic contexts. DSR42 exposes the oracle error below.
+  - [x] Complete DSR42 `emoji-e46f59d-20260905-42`: format/compiler/strict Clippy and main65/65
+    pass; flat3/5 and app400/403 fail. Both authored controls incorrectly expect theme RGB
+    for the tendency0 fixture, which intentionally renders ANSI Green. `fabbc67` corrects the
+    expected extreme-diet colours while preserving count/heading/style/edge assertions.
+    The old golden remains a third failure; the profile correctly refuses regeneration.
+  - [x] Retain `/tmp/scriptbots-emoji-e46f59d-proof-20260905`, with all15 selected remote/local
+    hashes identical. Actual wide-emoji cells now show all three agents at columns3/37/11,
+    with heading arrows and their diet modifiers. All seven other raw capability files are
+    byte-identical to DSR41. This proves the bounded layout change, not the corrected tests.
+  - [x] Complete DSR43 `flat-fabbc67-20260905-43`: flat5/6, app402/404, main65/65;
+    format/compiler/strict Clippy pass. The full-frame test still looks up the omnivore
+    colour under CyberpunkAurora while rendering BioluminescentDarkField. `486dab8` uses
+    one explicit theme on both sides. No assertion was dropped; generation again refused.
+  - [x] Retain `/tmp/scriptbots-flat-fabbc67-proof-20260905`; all15 selected remote/local
+    hashes match. Its eight raw capability files are byte-identical to DSR42.
+  - [x] Strengthen the continuation/odd-edge guard in `ca0918d`: render nonblank Paragraph
+    content beneath MapWidget, so omitting the clear leaves junk and fails the assertions.
+    A blank initial buffer could not discriminate a missing clear. Root reviewed the
+    complete frozen diff, formatting and six unchanged UBS test-only panic findings.
+  - [x] Complete DSR44 `flat-ca0918d-20260905-44` on a separate idle worker: corrected
+    visibility/edge/action controls, full app library/main and workspace compiler/strict
+    Clippy, followed only on success by the existing two-golden candidate workflow.
+    Flat6/6, main65/65 and all quality gates pass; library403/404 has only the expected old
+    capability-golden failure. Both deliberate generations fail after writing as required.
+  - [x] Retain `/tmp/scriptbots-flat-ca0918d-proof-20260905`; all22 selected local/worker
+    hashes match, including both golden candidates. All eight raw cell files match42/43.
+  - [x] Review all six changed world-map/full-frame hash pairs. Other panels, both remaining
+    flat rows and the entire theme golden are unchanged. Commit `0e930be` materializes the
+    reviewed capability candidate exactly; both golden files compare byte-identical to the
+    DSR44 outputs. UBS has no text scanner and correctly exits3; no scanner-pass claim.
+  - [ ] Complete clean DSR45 `tui-0e930be-20260905-45`: committed goldens, full app library/main,
+    terminal TestBackend/control/HTTP integrations, storage region shutdown, real archipelago
+    provenance/manifest launches, workspace compiler and strict Clippy. No regeneration.
+  - [ ] Fresh original-acceptance review and exact-source evidence retention, then close
+    **bd-2z0.14.2.7** before its dependent **bd-q2w9** only if all their conditions are met.
+- [x] Correct the observed memory-storage shutdown claim in `b9a4082`: the enclosing region
+  now says shutdown was acknowledged; the existing detailed receipt reports Durable versus
+  CommittedVolatile and all three watermarks. The previous text incorrectly promised a durable
+  watermark for memory storage. Recorded on open **bd-0oro**; this does not close that class.
 - [ ] Retain the live-provider evidence gap on open **bd-16g.1**: its ignored Anthropic test
   can finish without a request when the key or feature is missing. This lint pass preserves
   the original branches and does not run it or claim provider validation. Live acceptance
