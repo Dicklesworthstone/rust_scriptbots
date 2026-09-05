@@ -17,23 +17,8 @@ profile="$DSR_CONFIG_DIR/repos.d/$tool.yaml"
     echo "Profile must select the recipes correctness lane" >&2
     exit 2
 }
-expected=$(yq -r '.env.SCRIPTBOTS_EXPECTED_COMMIT' "$profile")
 proof_root=$(yq -r '.env.SCRIPTBOTS_PROOF_ROOT' "$profile")
-target=$(yq -r '.targets[0]' "$profile")
-profile_hash=$(sha256sum "$profile" | cut -d ' ' -f 1)
-
-dsr build --tool "$tool" --target "$target" --only-native --no-sync --version "$version"
-
-[[ $(sha256sum "$profile" | cut -d ' ' -f 1) == "$profile_hash" ]] || {
-    echo "Profile changed during execution" >&2
-    exit 1
-}
+bash "$(dirname "${BASH_SOURCE[0]}")/dsr_verify.sh" --run "$tool" "$version"
 proof="$proof_root/$version"
-jq -e --arg source "$expected" \
-    '.status == "pass" and .source == $source and .lane == "recipes" and .exit_code == 0' \
-    "$proof/verdict.json"
-jq -e '.passed > 0' "$proof/architecture-doc-examples.tests.json"
-jq -e '.passed > 0' "$proof/architecture-recipes.tests.json"
-jq -e '.passed > 0' "$proof/architecture-mutations.tests.json"
 echo "Literal Rust recipes and scenario controls executed; evidence: $proof"
 echo "This verifies the named library recipes, not production GUI/PTY/browser migration."

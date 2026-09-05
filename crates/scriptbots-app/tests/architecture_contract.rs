@@ -424,6 +424,16 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
         .filter(|value| value["reason"] == "compiler-artifact")
         .collect::<Vec<_>>();
     let mut libraries = BTreeMap::new();
+    // Cargo may use separate artifact directories for every dependency. Derive
+    // search paths from this build's records, including transitive crates and
+    // proc-macros, instead of assuming one shared target/debug/deps directory.
+    let dependency_directories = artifacts
+        .iter()
+        .filter_map(|artifact| artifact["filenames"].as_array())
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|filename| Path::new(filename).parent())
+        .collect::<std::collections::BTreeSet<_>>();
     for (name, package) in packages {
         let files = artifacts
             .iter()
@@ -560,10 +570,11 @@ fn literal_recipe_compiler_and_runtime_mutations() -> anyhow::Result<()> {
             compiler
                 .arg("--extern")
                 .arg(format!("{name}={}", library.display()));
-            compiler.arg("-L").arg(format!(
-                "dependency={}",
-                library.parent().unwrap().display()
-            ));
+        }
+        for directory in &dependency_directories {
+            compiler
+                .arg("-L")
+                .arg(format!("dependency={}", directory.display()));
         }
         let arguments = compiler
             .get_args()

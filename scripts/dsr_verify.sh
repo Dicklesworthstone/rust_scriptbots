@@ -7,6 +7,90 @@ refuse() {
     exit 2
 }
 
+verify_evidence() {
+    local directory=$1 expected=$2 lane=$3 record name kind log expected_hash passed recorded_passed target
+    [[ "$expected" =~ ^[0-9a-f]{40}$ ]] || refuse "invalid evidence source identity"
+    local required=(formatting fsqlite-pin franken-licenses asupersync-universe wasm-graph)
+    case "$lane" in
+        workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
+        graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
+        recipes) required+=(architecture-doc-examples architecture-recipes recipe-link-artifacts recipe-dependencies architecture-mutations) ;;
+        *) refuse "unknown evidence lane" ;;
+    esac
+    required+=(analytics-binary)
+    jq -e --arg source "$expected" --arg lane "$lane" --argjson count "${#required[@]}" \
+        '.schema == "scriptbots.verification.v1" and .status == "pass" and .exit_code == 0 and .source == $source and .lane == $lane and .completed_steps == $count' \
+        "$directory/verdict.json" >/dev/null || refuse "missing, stale or non-pass verdict"
+    jq -s -e --arg source "$expected" --argjson count "${#required[@]}" \
+        'length == $count and ([.[].name] | unique | length) == $count and all(.[]; .source == $source and .command_exit == 0 and .log_exit == 0)' \
+        "$directory/commands.jsonl" >/dev/null || refuse "missing, duplicate or failed command evidence"
+    for name in "${required[@]}"; do
+        record=$(jq -c --arg name "$name" 'select(.name == $name)' "$directory/commands.jsonl")
+        [[ -n "$record" ]] || refuse "missing required command: $name"
+        log="$directory/$name.log"
+        [[ -f "$log" && $(jq -r '.log' <<< "$record") == "$name.log" ]] || refuse "missing command log: $name"
+        expected_hash=$(jq -r '.log_sha256' <<< "$record")
+        [[ $(sha256sum "$log" | cut -d ' ' -f 1) == "$expected_hash" ]] || refuse "changed command log: $name"
+        [[ -f "$directory/$name.command" && $(cat "$directory/$name.command") == "$(jq -r '.command' <<< "$record")" ]] || refuse "missing or changed command arguments: $name"
+        kind=$(jq -r '.kind' <<< "$record")
+        case "$name" in
+            *-tests|core-economy-faults|archive-unit|archive-integration|architecture-doc-examples|architecture-recipes|architecture-mutations)
+                [[ "$kind" == test ]] || refuse "test classified as compile-only: $name"
+                passed=$(sed -nE 's/^test result: ok\. ([0-9]+) passed;.*/\1/p' "$log" | awk '{n += $1} END {print n+0}')
+                recorded_passed=$(jq -er --arg name "$name" 'select(.name == $name) | .passed' "$directory/$name.tests.json") || refuse "missing executed-test evidence: $name"
+                [[ "$passed" -gt 0 && "$recorded_passed" == "$passed" ]] || refuse "zero or inconsistent executed-test count: $name"
+                ;;
+            *) [[ "$kind" == check ]] || refuse "wrong command kind: $name" ;;
+        esac
+    done
+    [[ -f "$directory/profile.yaml" && -f "$directory/profile.sha256" ]] || refuse "missing pinned profile evidence"
+    [[ $(sha256sum "$directory/profile.yaml" | cut -d ' ' -f 1) == "$(cut -d ' ' -f 1 "$directory/profile.sha256")" ]] || refuse "changed profile evidence"
+    [[ $(yq -r '.env.SCRIPTBOTS_EXPECTED_COMMIT' "$directory/profile.yaml") == "$expected" && $(yq -r '.env.SCRIPTBOTS_VERIFY_LANE' "$directory/profile.yaml") == "$lane" ]] || refuse "profile source or lane mismatch"
+    target=$(yq -r '.env.SCRIPTBOTS_VERIFY_TARGET' "$directory/profile.yaml")
+    jq -e --arg target "$target" '.target == $target' "$directory/verdict.json" >/dev/null || refuse "verdict target mismatch"
+    jq -s -e --arg target "$target" 'all(.[]; .target == $target)' "$directory/commands.jsonl" >/dev/null || refuse "command target mismatch"
+    for name in source.txt rustc.txt cargo.txt host.txt inputs.sha256; do
+        [[ -s "$directory/$name" ]] || refuse "missing source/toolchain evidence: $name"
+    done
+    [[ $(head -n 1 "$directory/source.txt") == "commit $expected" ]] || refuse "source record mismatch"
+    [[ $(sed -n 's/^host: //p' "$directory/rustc.txt") == "$target" ]] || refuse "compiler target mismatch"
+}
+
+if [[ ${1:-} == --verify-evidence ]]; then
+    [[ $# == 4 ]] || refuse "usage: --verify-evidence DIRECTORY EXPECTED_COMMIT LANE"
+    verify_evidence "$2" "$3" "$4"
+    exit 0
+fi
+
+if [[ ${1:-} == --run ]]; then
+    [[ $# == 3 && $2 =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ && $3 =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "usage: --run PROFILE UNIQUE_VERSION"
+    [[ ${DSR_CONFIG_DIR:-} = /* && -f "$DSR_CONFIG_DIR/config.yaml" ]] || refuse "missing DSR configuration"
+    profile="$DSR_CONFIG_DIR/repos.d/$2.yaml"
+    [[ -f "$profile" ]] || refuse "missing DSR repository profile"
+    command -v yq >/dev/null || refuse "missing yq prerequisite"
+    [[ $(yq -r '.tool_name' "$profile") == "$2" ]] || refuse "DSR profile identity mismatch"
+    [[ $(yq -r '.targets | length' "$profile") == 1 ]] || refuse "correctness profile must declare one explicit target"
+    target=$(yq -r '.targets[0]' "$profile")
+    host=$(SCRIPTBOTS_DSR_TARGET="$target" yq -r '.cross_compile[strenv(SCRIPTBOTS_DSR_TARGET)].host' "$profile")
+    [[ -n "$host" && "$host" != null && -f "$DSR_CONFIG_DIR/hosts.yaml" ]] || refuse "missing DSR host configuration"
+    SCRIPTBOTS_DSR_HOST="$host" yq -e '.hosts[strenv(SCRIPTBOTS_DSR_HOST)] != null' "$DSR_CONFIG_DIR/hosts.yaml" >/dev/null || refuse "undeclared DSR host: $host"
+    dsr config validate || refuse "invalid DSR configuration"
+    checkout=$(yq -r '.local_path' "$profile")
+    expected=$(yq -r '.env.SCRIPTBOTS_EXPECTED_COMMIT' "$profile")
+    lane=$(yq -r '.env.SCRIPTBOTS_VERIFY_LANE' "$profile")
+    proof_root=$(yq -r '.env.SCRIPTBOTS_PROOF_ROOT' "$profile")
+    [[ "$checkout" = /* && -d "$checkout" && "$expected" =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned DSR source"
+    [[ $(git -C "$checkout" branch --show-current) == main ]] || refuse "source must be on main"
+    [[ $(git -C "$checkout" rev-parse HEAD) == "$expected" ]] || refuse "source commit mismatch"
+    [[ -z $(git -C "$checkout" status --porcelain --untracked-files=all) ]] || refuse "dirty source checkout"
+    [[ "$proof_root" = /* && -d "$proof_root" && ! -e "$proof_root/$3" ]] || refuse "missing proof root or reused proof version"
+    profile_hash=$(sha256sum "$profile" | cut -d ' ' -f 1)
+    dsr build --tool "$2" --target "$target" --only-native --no-sync --version "$3"
+    [[ $(sha256sum "$profile" | cut -d ' ' -f 1) == "$profile_hash" ]] || refuse "DSR profile changed during execution"
+    verify_evidence "$proof_root/$3" "$expected" "$lane"
+    exit 0
+fi
+
 proof_version=${1:-}
 [[ "$proof_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "missing or unsafe proof version"
 [[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned source commit"
@@ -112,3 +196,4 @@ jq -n --arg source "$actual_commit" --arg lane "$SCRIPTBOTS_VERIFY_LANE" --arg t
     '{schema:"scriptbots.verification.v1",status:"pass",source:$source,lane:$lane,target:$target,exit_code:0,completed_steps:$completed_steps,scope:"named correctness lane only; no GUI, PTY, browser or performance claim"}' > "$proof_dir/verdict.json"
 jq -e --arg source "$SCRIPTBOTS_EXPECTED_COMMIT" --arg lane "$SCRIPTBOTS_VERIFY_LANE" \
     '.status == "pass" and .exit_code == 0 and .source == $source and .lane == $lane and .completed_steps > 0' "$proof_dir/verdict.json"
+verify_evidence "$proof_dir" "$SCRIPTBOTS_EXPECTED_COMMIT" "$SCRIPTBOTS_VERIFY_LANE"

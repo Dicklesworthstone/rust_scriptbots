@@ -1075,15 +1075,19 @@ Run the profile with a unique proof version:
 
 ```bash
 DSR_CONFIG_DIR=/absolute/path/to/dsr-config \
-  dsr build --tool scriptbots-verify --target linux/amd64 \
-  --only-native --no-sync --version proof-20260905-001
+  bash scripts/dsr_verify.sh --run scriptbots-verify proof-20260905-001
 ```
 
-The runner checks clean `main`, expected commit, actual host target, external
+The launcher rejects undeclared hosts and calls `dsr build` with the profile's
+explicit target, `--only-native`, `--no-sync` and the unique version. The runner
+checks clean `main`, expected commit, actual host target, external
 output locations and native DSR execution before compiling. It retains the exact
 profile, toolchain and source identity, command lines, full stdout/stderr logs,
 executed-test counts and `verdict.json`. Acceptance requires both a successful DSR
 run and a parsed `status: "pass"` verdict for the expected source and lane.
+The same runner's `--verify-evidence DIRECTORY EXPECTED_COMMIT LANE` mode rechecks
+the required commands, log hashes, executed-test counts, profile and source/target
+identity. It refuses missing or changed evidence even if the verdict says `pass`.
 The workspace lane runs all-target check, strict Clippy, workspace tests and the
 separate core `economy-faults` tests. Pin/license/WASM dependency guards run in
 every lane. Missing profiles, hosts or toolchains are infrastructure refusals,
