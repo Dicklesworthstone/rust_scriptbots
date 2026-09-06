@@ -1,9 +1,68 @@
-# Reality Check — rust_scriptbots — execution refreshed 2026-09-05
+# Reality Check — rust_scriptbots — execution refreshed 2026-09-06
 
 ## Execution TODO — started 2026-09-05
 
-Current continuation — **2026-09-05, through source `0e930be`, TurquoiseLake**. The earlier entries below retain
+Current continuation — **2026-09-06, through source `e84ff10`, TurquoiseLake**. The earlier entries below retain
 the failure history; these are the current next actions and proof limits.
+
+- [ ] **bd-bfkd — Assembly execution-fault containment, resumed 2026-09-06.**
+  - [x] Re-read the original C++ interpreter, transactional adapter, world fault latch,
+    death cleanup, mortality projection and retained DSR30 failure. No arithmetic change.
+  - [x] Implement the distinction between a non-finite execution result and malformed
+    sensors/genomes/state in `8a2a410`. Exact rollback and terminal-error tests await DSR46.
+  - [x] Implement the failed agent's containment tick with zero outputs, then remove it at the
+    ordinary death boundary with an explicit brain-execution cause and deterministic details.
+    Wire lifecycle storage/readback, ancestry digest details and mortality totals; forbid dying
+    agents from receiving another corpse reward. Runtime proof remains pending.
+  - [x] Bind the changed execution policy to Assembly adapter v4. Preserve the old identity
+    encoding pin and explicitly assert the new policy descriptor. Genome/state codecs and
+    arithmetic remain unchanged; exact fault bits enter the existing lifecycle stream.
+  - [x] Implement GUI/TUI cause consumers, with compact terminal rows at constrained heights
+    (`876b31c`). Add actual nonzero buffer and overflow controls; no golden regenerated.
+  - [ ] Exercise the retained seed, ordinary finite and corrupt-input controls, real bound
+    mixed-brain continuation, persistence/readback and thread-count determinism.
+    - [x] DSR46 at `876b31c`: 60 brain and 704 core library tests pass, with five preexisting
+      core ignores. Real mixed Assembly continuation, Inf/NaN rollback, false-fault classification,
+      terminal malformed-error behavior and mortality totals pass.
+    - [x] Actual one/four-thread continuations both pass with digest `08d0751779236316`.
+    - [x] Actual storage fault tests pass3/3, including file reopen with exact bits and ancestry,
+      finite-bit refusal without admission, and 21 corrupt encodings rejected by readers/outbox.
+    - [x] GUI mortality projection passes2/2; native pixels remain outside these tests.
+    - [x] DSR46 executes all four new TUI projection, compact resize, style and count-overflow
+      controls successfully. Full app library: 407 passed, one resize-storm golden failed,
+      one preexisting ignore. Only 200x60 and 300x100 hashes changed; raw-cell review is pending.
+    - [x] Inspect actual resize-storm geometry and styles before promoting any golden.
+      DSR48 captures all12 frames; independent full-cell hash recomputation matches all12.
+      Redistributing only sidebar empty rows to the old panel heights restores both old hashes
+      exactly, accounting for the changed geometry without glyph/style substitutions. All
+      panels remain present. `e84ff10` manually updates only the two reviewed hashes.
+    - [ ] Verify the committed golden in the final app run.
+    - [x] DSR47 at `a24c682`: exact seed `12659881219344128065` reproduces cell197 positive
+      infinity at tick88, then passes the original progress/HTTP deadlines for the full600s
+      observation period: 402 status samples, first tick14, last tick1199, 617862ms including
+      termination. The log observes scheduling for death cleanup, not database persistence.
+    - [ ] Complete both original600s server scenarios, preserving failure traces. DSR47 file
+      mode failed the unchanged120s progress guard at REST tick599. Child stderr confirms
+      an actual storage **Admit** acknowledgement timeout at completed tick600, Indeterminate,
+      seed `2227158220202299814`; this is the original `bd-w1oi` failure class in file mode.
+      The unseeded memory test is still running. Keep `bd-bfkd` open with unmet acceptance.
+  - [ ] Run clean pinned DSR focused/full affected tests and required compiler/lint/format
+    checks, then both original 600-second server scenarios with their original budgets.
+    DSR46 completed with typed failure on clean `876b31cd1127edc11d221ccb6b35c67ca4b242ae`; its nine-command
+    scope includes core/brain library tests, one/four-thread real Assembly continuation, actual
+    storage fault tests, GUI projection, full app library and workspace compiler/Clippy. No
+    whole-lane pass claim: the resize golden failed and Clippy rejected the new empty-vector
+    assertion. Both compiler checks passed. DSR47 runs all three long server tests at clean `a24c682`;
+    its workspace all-target compiler check and normal real-process REST/MCP test passed. Strict Clippy and final-source
+    reruns remain required. The new five-agent carcass test also exercises SIMD lanes and the
+    scalar remainder; `a24c682` removes the observed economy-feature unused test import.
+    DSR48 now runs at clean `a665f07`: full core/brain suites (including integrations), scalar
+    core library, both thread controls, storage/GUI/app and required check/Clippy/format. Raw
+    resize cells are retained for review; the old golden intentionally remains unchanged in
+    that pinned source. Its full core/brain command passed860/860 executed tests; scalar core
+    and remaining compiler/lint checks are running. Final app proof will pin `e84ff10`.
+  - [ ] Retain exact-source evidence, review original acceptance afresh, update this bead
+    honestly, commit and publish verified work. Broader ownership/storage tasks remain open.
 
 - [x] Complete DSR45 and close **bd-2z0.14.2.7**, then **bd-q2w9**, against their original
   acceptance. All 488 selected app tests pass; formatting, workspace all-target compilation

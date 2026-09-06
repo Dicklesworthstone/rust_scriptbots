@@ -778,6 +778,13 @@ Before a family can enter a scenario it must prove:
 
 MLP, DWRAON, and Assembly should be the first honest families. Their recurrent/working state receives family-specific checkpoint and offspring tests. NeuroFlow remains optional until its genome/evaluator-state reconstruction and introspection cost are acceptable. Candle/Tract/Tch adapters remain disabled from default scenarios until they load actual models and define reproduction semantics. `ml.placeholder` is removed from production registration.
 
+[Currently In Progress — `bd-bfkd`, TurquoiseLake, 2026-09-06: retain the Assembly arithmetic
+and atomic evaluator rollback, but distinguish an execution-produced non-finite state from
+invalid protocol input. The faulting agent completes a zero-output containment tick and is
+removed at its normal death boundary with explicit cause/evidence; healthy agents continue.
+Malformed sensors/envelopes and other protocol failures stay terminal. Adapter identity,
+real seeded continuation, persistence and both original long-server proofs are required.]
+
 MLP and DWRAON now preflight the requested limits before allocating their
 activation layer; Assembly reports introspection as explicitly unsupported;
 and NeuroFlow preflights source-scalar and payload budgets before any JSON
