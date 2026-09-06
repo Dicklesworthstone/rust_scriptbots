@@ -5,6 +5,7 @@ use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::archipelago_report::{self, ReportArchipelagoArgs};
 use scriptbots_app::economy_audit::{self, EconomyAuditArgs};
+use scriptbots_app::host_thread::HostThread;
 #[cfg(feature = "neuro")]
 use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
@@ -33,6 +34,8 @@ use scriptbots_core::{
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
 use scriptbots_runtime::RunId;
+use scriptbots_runtime::channel::ChannelHostOptions;
+use scriptbots_runtime::{HostCoreOptions, HostPort, HostSessionId, PlaybackSnapshot};
 use scriptbots_storage::{
     INTERACTION_REPLAY_SEQ_BASE, NARRATIVE_INPUT_REPLAY_SEQ, PersistedReplayEvent,
     PersistenceGuarantee, ShutdownReceipt, StoragePipeline, StorageReader,
@@ -466,24 +469,87 @@ fn main() -> Result<()> {
 
     // Apply OS-level priority niceness where supported.
     apply_process_niceness(cli.low_power)?;
-    let (bootstrapped_world, persistence, analytics, mut storage_pipeline) = bootstrap_world(
-        config,
-        BootstrapRequest {
-            brain_preset: cli.brain,
-            storage_mode: cli.storage,
-            thresholds,
-            bootstrap_ticks: effective_bootstrap_ticks,
-            thread_policy: policy,
-            scenario: launch_scenario,
-            config_overrides,
+    let (mut bootstrapped_world, mut persistence, analytics, mut storage_pipeline) =
+        bootstrap_world(
+            config,
+            BootstrapRequest {
+                brain_preset: cli.brain,
+                storage_mode: cli.storage,
+                thresholds,
+                bootstrap_ticks: effective_bootstrap_ticks,
+                thread_policy: policy,
+                scenario: launch_scenario,
+                config_overrides,
+            },
+        )?;
+    #[cfg(feature = "bevy_render")]
+    if cli.dump_semantic_png.is_some() || cli.dump_scene_png.is_some() {
+        let operation = (|| -> Result<()> {
+            if let Some(path) = &cli.dump_semantic_png {
+                let (w, h) = cli
+                    .png_size
+                    .as_deref()
+                    .and_then(parse_png_size)
+                    .unwrap_or((1600, 900));
+                let bytes = render_bevy_png(&bootstrapped_world, w, h)?;
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, bytes)?;
+                println!(
+                    "Wrote semantic projection {} ({w}x{h}; CPU reference raster, NOT GPU-rendered)",
+                    path.display()
+                );
+                Ok(())
+            } else {
+                run_scene_capture_cli(cli.dump_scene_png.as_ref().expect("capture path selected"))
+            }
+        })();
+        let result = finish_with_storage(operation, "scene capture", || {
+            let finalization =
+                finalize_world_persistence(&mut bootstrapped_world, &mut persistence);
+            finalize_then_shutdown_storage(finalization, &mut storage_pipeline)
+        });
+        emit_sense_run_end(
+            SenseRunSummary::capture(&bootstrapped_world),
+            result.is_ok(),
+        );
+        return result;
+    }
+    let session_id = HostSessionId::new(rand::random());
+    let journal = match storage_pipeline.journal_port(session_id, Default::default()) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return finish_with_storage(Err(error.into()), "host journal startup", || {
+                let finalization =
+                    finalize_world_persistence(&mut bootstrapped_world, &mut persistence);
+                finalize_then_shutdown_storage(finalization, &mut storage_pipeline)
+            });
+        }
+    };
+    let host = match HostThread::spawn(
+        session_id,
+        bootstrapped_world,
+        persistence,
+        Box::new(journal),
+        HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            },
+            capture_agent_visuals: true,
+            ..Default::default()
         },
-    )?;
-    // The wrap happens HERE now, not inside bootstrap_world. This is the line
-    // bd-pcfj replaces with a move into the host thread.
-    let latest_summary = scriptbots_app::control::empty_latest_summary();
-    scriptbots_app::control::publish_world_observation(&latest_summary, &bootstrapped_world);
-    let world: SharedWorld = Arc::new(Mutex::new(bootstrapped_world));
-    let simulation_step = persistence_step_driver(&world, &persistence, &latest_summary);
+        ChannelHostOptions::default(),
+    ) {
+        Ok(host) => host,
+        Err(error) => {
+            return finish_with_storage(Err(error), "host startup", || {
+                shutdown_storage(&mut storage_pipeline).map(|_| ())
+            });
+        }
+    };
+    let host_port = host.port();
 
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
     // finalized and the worker is acknowledged before this function returns.
@@ -499,18 +565,18 @@ fn main() -> Result<()> {
                     .unwrap_or((1600, 900));
 
                 let bytes = {
-                    let guard = world.lock().map_err(|error| {
-                        anyhow::anyhow!("world mutex poisoned while rendering PNG: {error}")
-                    })?;
+                    let snapshot = host_port.snapshot_hub().latest();
                     // Prefer wgpu compositor path if requested via env; otherwise fallback CPU raster
                     if matches!(
                         std::env::var("SB_WGPU_DUMP").ok().as_deref(),
                         Some("1" | "true" | "yes" | "on")
                     ) {
-                        scriptbots_render::world_compositor::render_wgpu_png_offscreen(&guard, w, h)
-                            .map_err(|error| anyhow::anyhow!("wgpu snapshot failed: {error}"))?
+                        scriptbots_render::world_compositor::render_wgpu_png_offscreen(
+                            &snapshot, w, h,
+                        )
+                        .map_err(|error| anyhow::anyhow!("wgpu snapshot failed: {error}"))?
                     } else {
-                        render_png_offscreen(&guard, w, h)
+                        render_png_offscreen(&snapshot, w, h)
                     }
                 };
                 if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -533,57 +599,13 @@ fn main() -> Result<()> {
                 bail!("--dump-png requires GUI feature; recompile with --features gui");
             }
         }
-        #[cfg(feature = "bevy_render")]
-        if let Some(path) = cli.dump_semantic_png.as_ref() {
-            // Semantic projection only: this CPU rasterizer does NOT exercise the
-            // GPU pipeline (bd-2z0.14.3.4 renamed it to make the dishonesty
-            // impossible to miss); --dump-scene-png owns real GPU captures.
-            //
-            // Deliberately NO probe_gpu_capability() call here. It used to log a
-            // capability report, which meant a command documented as CPU-only
-            // built a wgpu instance and requested an adapter — real GPU work,
-            // and a report describing hardware this path never uses. That made
-            // the semantic reference lane unable to prove it is GPU-free, and
-            // on a headless host it charged adapter enumeration for a raster
-            // that cannot use one (bd-2z0.14.3.4 round-1 audit). The
-            // no_gpu_touch alarm below pins this.
-            let (w, h) = cli
-                .png_size
-                .as_deref()
-                .and_then(parse_png_size)
-                .unwrap_or((1600, 900));
-            let bytes = {
-                let guard = world.lock().map_err(|error| {
-                    anyhow::anyhow!("world mutex poisoned while rendering Bevy PNG: {error}")
-                })?;
-                render_bevy_png(&guard, w, h)?
-            };
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(path, &bytes)?;
-            println!(
-                "{} Wrote semantic projection {} ({}x{}; CPU reference raster, NOT GPU-rendered)",
-                "\u{2714}".green().bold(),
-                path.display(),
-                w,
-                h
-            );
-            return Ok(());
-        }
-        #[cfg(feature = "bevy_render")]
-        if let Some(scene_path) = cli.dump_scene_png.as_ref() {
-            return run_scene_capture_cli(scene_path);
-        }
-
         let (active_mode, renderer) = resolved_renderer.ok_or_else(|| {
             anyhow::anyhow!("interactive renderer was not resolved before startup")
         })?;
         let control_reservation = control_reservation.ok_or_else(|| {
             anyhow::anyhow!("control listeners were not reserved before runtime startup")
         })?;
-        let (control_runtime, command_drain, command_submit) =
-            control_reservation.launch(world.clone(), latest_summary.clone())?;
+        let (control_runtime, command_submit) = control_reservation.launch(host_port.clone())?;
         info!(
             requested_mode = cli.mode.as_str(),
             active_mode = active_mode.as_str(),
@@ -591,34 +613,15 @@ fn main() -> Result<()> {
             "Starting ScriptBots simulation shell"
         );
         let context = RendererContext {
-            world: Arc::clone(&world),
+            host: host_port.clone(),
             analytics: analytics.clone(),
-            simulation_step: Arc::clone(&simulation_step),
             control_runtime: &control_runtime,
-            command_drain,
             command_submit,
             scenario: Arc::clone(&launch_scenario_shared),
         };
         let render_result = renderer.run(context);
-        // bd-2z0.4.13: the app entrypoint owns an AppRoot whose regions tear down in
-        // reverse dependency order with explicit budgets and per-region outcomes.
-        // Control closes first (stop accepting), storage drains last (every producer
-        // quiesced before the final storage receipt is validated).
+        // Stop network producers before disconnecting the owner's final port.
         let mut root = AppRoot::new();
-        let world_for_storage = Arc::clone(&world);
-        let persistence_for_storage = Arc::clone(&persistence);
-        root.register(ServiceRegion::new(
-            "storage-pipeline",
-            Budget::with_deadline_at_secs(30),
-            move |_budget| match finalize_and_shutdown_storage(
-                &world_for_storage,
-                &persistence_for_storage,
-                &mut storage_pipeline,
-            ) {
-                Ok(()) => Outcome::ok("storage shutdown acknowledged".to_owned()),
-                Err(error) => Outcome::Err(format!("{error:#}")),
-            },
-        ));
         root.register(ServiceRegion::new(
             "control-server",
             Budget::with_deadline_at_secs(15),
@@ -629,22 +632,30 @@ fn main() -> Result<()> {
         ));
         let outcomes = root.close();
         let control_result = region_result(&outcomes, "control-server");
-        let storage_result = region_result(&outcomes, "storage-pipeline");
-        prefer_storage_failure(
-            match (render_result, control_result) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(render_error), Ok(())) => Err(render_error),
-                (Ok(()), Err(control_error)) => Err(control_error),
-                (Err(render_error), Err(control_error)) => Err(render_error).context(format!(
-                    "control runtime shutdown also failed: {control_error:#}"
-                )),
-            },
-            storage_result,
-            "runtime",
-        )
+        match (render_result, control_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(render_error), Ok(())) => Err(render_error),
+            (Ok(()), Err(control_error)) => Err(control_error),
+            (Err(render_error), Err(control_error)) => Err(render_error).context(format!(
+                "control runtime shutdown also failed: {control_error:#}"
+            )),
+        }
     })();
-    let result = runtime_result;
-    emit_sense_run_end(capture_shared_sense_run_summary(&world), result.is_ok());
+    drop(host_port);
+    let host_result = host.join();
+    let sense_summary = host_result.as_ref().ok().map(|receipt| SenseRunSummary {
+        tick: receipt.snapshot.tick.0,
+        saturations_total: receipt.sense_saturations_total,
+    });
+    let finalization = host_result.map(|receipt| StorageFinalization {
+        admitted_tail: false,
+        required_tick: receipt.required_persistence_tick,
+    });
+    let storage_result = finalize_then_shutdown_storage(finalization, &mut storage_pipeline);
+    let result = prefer_storage_failure(runtime_result, storage_result, "runtime");
+    if let Some(summary) = sense_summary {
+        emit_sense_run_end(summary, result.is_ok());
+    }
     result
 }
 
@@ -1757,13 +1768,12 @@ struct BootstrapRequest {
 /// that handover at one visible line instead of buried behind a wrap this
 /// function performed for the caller's convenience.
 ///
-/// Callers still wrap it today. Nothing else changes yet.
 fn bootstrap_world(
     mut config: ScriptBotsConfig,
     request: BootstrapRequest,
 ) -> Result<(
     WorldState,
-    SharedPersistenceAdmission,
+    PersistenceAdmissionSession,
     SharedAnalytics,
     StoragePipeline,
 )> {
@@ -1926,12 +1936,7 @@ fn bootstrap_world(
         return result;
     }
 
-    Ok((
-        world,
-        Arc::new(Mutex::new(persistence)),
-        analytics,
-        pipeline,
-    ))
+    Ok((world, persistence, analytics, pipeline))
 }
 
 fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
@@ -3325,67 +3330,18 @@ impl ServerRenderer {
         control_health: impl Fn() -> std::result::Result<(), String>,
     ) -> Result<()> {
         info!("ScriptBots server mode starting (headless background simulation with REST/MCP API)");
-        let target_interval = std::time::Duration::from_millis(16);
-        let reporter = ctx.control_runtime.command_reporter();
-        let mut server_paused = false;
-        let mut force_step = false;
         loop {
             control_health()
                 .map_err(anyhow::Error::msg)
                 .context("server control runtime failed")?;
-            let start = std::time::Instant::now();
-            // Server mode APPLIES the commands it admits. This loop previously
-            // stepped the world and never drained the bus, so every command a
-            // REST, MCP, CLI or websocket client submitted was admitted and then
-            // ignored: receipts stayed at `admitted` forever, and once the
-            // bounded queue filled at capacity everything after it was rejected
-            // as queue-full. The one frontend with no UI to hide it was the one
-            // that never applied anything (bd-88yj).
-            match ctx.world.lock() {
-                Ok(mut world) => {
-                    for bus in (ctx.command_drain.as_ref())() {
-                        let outcome = match scriptbots_core::apply_control_command(
-                            &mut world,
-                            bus.command,
-                        ) {
-                            Ok(scriptbots_core::ControlDisposition::WorldApplied) => {
-                                scriptbots_app::CommandOutcome::Applied
-                            }
-                            Ok(scriptbots_core::ControlDisposition::Playback(cmd)) => {
-                                if let Some(paused) = cmd.paused {
-                                    server_paused = paused;
-                                }
-                                if cmd.step_once {
-                                    force_step = true;
-                                    server_paused = true;
-                                }
-                                scriptbots_app::CommandOutcome::Applied
-                            }
-                            Err(error) => {
-                                warn!(%error, receipt = %bus.id, "server rejected a drained control command");
-                                scriptbots_app::CommandOutcome::Rejected
-                            }
-                        };
-                        reporter(&bus.id, outcome);
-                    }
-                }
-                Err(error) => {
-                    warn!(%error, "world mutex poisoned in server mode; stopping loop");
-                    return Err(anyhow!("world mutex poisoned in server mode: {error}"));
-                }
+            let snapshot = ctx.host.snapshot_hub().latest();
+            if let Some(fault) = snapshot.health.fault() {
+                bail!("server simulation host failed: {fault:?}");
             }
-            let should_step = !server_paused || force_step;
-            force_step = false;
-            if should_step && let Err(error) = (ctx.simulation_step)() {
-                warn!(%error, "Simulation step failed in server mode; stopping loop");
-                // The entrypoint still owns orderly control/storage teardown. Preserve this
-                // cause even when both finalizers succeed after a late admission resolves.
-                return Err(error).context("server simulation step failed");
+            if snapshot.lifecycle == scriptbots_runtime::HostLifecycle::Stopped {
+                return Ok(());
             }
-            let elapsed = start.elapsed();
-            if elapsed < target_interval {
-                std::thread::sleep(target_interval - elapsed);
-            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
         }
     }
 }
@@ -3404,36 +3360,9 @@ impl Renderer for GuiRenderer {
         prepare_linux_gui_backend();
         let control_health: scriptbots_render::GuiHealthProbe =
             Arc::new(ctx.control_runtime.health_probe());
-        // The renderer does not depend on scriptbots-app, so the bus envelope
-        // is adapted here rather than leaking the type across the boundary: the
-        // id travels as a plain String and the renderer's outcome is mapped
-        // back onto the ledger's (bd-tgfz).
-        let drain = Arc::clone(&ctx.command_drain);
-        let gui_drain: scriptbots_render::GuiCommandDrain = Arc::new(move || {
-            (drain)()
-                .into_iter()
-                .map(|bus| (bus.id, bus.command))
-                .collect()
-        });
-        let reporter = ctx.control_runtime.command_reporter();
-        let gui_reporter: scriptbots_render::GuiCommandReporter =
-            Arc::new(move |command_id, outcome| {
-                let outcome = match outcome {
-                    scriptbots_render::GuiCommandOutcome::Applied => {
-                        scriptbots_app::CommandOutcome::Applied
-                    }
-                    scriptbots_render::GuiCommandOutcome::Rejected => {
-                        scriptbots_app::CommandOutcome::Rejected
-                    }
-                };
-                reporter(command_id, outcome);
-            });
         run_demo(
-            Arc::clone(&ctx.world),
-            Arc::clone(&ctx.simulation_step),
+            ctx.host,
             ctx.analytics.clone(),
-            gui_drain,
-            gui_reporter,
             Arc::clone(&ctx.command_submit),
             control_health,
         )
@@ -3456,10 +3385,8 @@ impl Renderer for BevyRenderer {
         let control_health: scriptbots_bevy::ControlHealthFn =
             Arc::new(ctx.control_runtime.health_probe());
         let bevy_ctx = BevyRendererContext {
-            world: Arc::clone(&ctx.world),
-            simulation_step: Arc::clone(&ctx.simulation_step),
+            host: ctx.host,
             command_submit: Arc::clone(&ctx.command_submit),
-            command_drain: Arc::clone(&ctx.command_drain),
             control_health: Some(control_health),
         };
         scriptbots_bevy::run_renderer(bevy_ctx)

@@ -34,16 +34,17 @@ use scriptbots_core::visual::{
     WorldVisualEvent,
 };
 use scriptbots_core::{
-    AccessibilityPalette, ActivationEdge, ActivationLayer, AgentColumns, AgentId, AgentRuntime,
-    AgentUid, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
-    BrainInspectionRevision, BrainInspectionUnavailable, ControlCommand, ControlDisposition,
-    FoodGrid, Generation, IndicatorState, MutationRates, NUM_EYES, OutputChannel, OutputsExt,
-    Position, RenderFogMode, RenderQuality, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
-    SelectedBrainTelemetryOutcome, SelectionMode, SelectionState, SelectionUpdate,
-    SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile,
-    TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver, apply_control_command,
-    tier_features, toroidal_delta,
+    AccessibilityPalette, ActivationEdge, ActivationLayer, AgentId, AgentUid, BrainActivations,
+    BrainInspectionClientId, BrainInspectionRevision, BrainInspectionUnavailable, ControlCommand,
+    ControlDisposition, Generation, IndicatorState, MutationRates, NUM_EYES, OutputChannel,
+    OutputsExt, Position, RenderFogMode, RenderQuality, RenderTonemapMode, SENSOR_LAYOUT,
+    ScriptBotsConfig, SelectedBrainTelemetryOutcome, SelectionMode, SelectionState,
+    SelectionUpdate, SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer,
+    TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver,
+    apply_control_command, tier_features, toroidal_delta,
 };
+use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
+use scriptbots_runtime::{HostPort, channel::ChannelHostPort};
 use scriptbots_storage::{AnalyticsSnapshotProvider, MetricReading};
 use std::{
     cmp::Ordering,
@@ -70,7 +71,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(feature = "world_wgpu")]
 pub mod world_compositor {
     use super::*;
-    use scriptbots_core::{TerrainKind, WorldState};
+    use scriptbots_core::TerrainKind;
     use scriptbots_world_gfx::{
         ReadbackError, ReadbackView, WorldRenderer, WorldSnapshot as GfxSnapshot,
     };
@@ -883,24 +884,21 @@ pub mod world_compositor {
     // Headless, one-shot offscreen render to PNG (bytes) using the same snapshot path as the GUI.
     // This allows verifying the wgpu pipeline without a display server.
     pub fn render_wgpu_png_offscreen(
-        world: &WorldState,
+        snapshot: &RenderSnapshot,
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, scriptbots_world_gfx::ReadbackError> {
         if width == 0 || height == 0 {
             return Err(scriptbots_world_gfx::ReadbackError::ZeroDimensions { width, height });
         }
-        // Build snapshot from world
-        let frame = crate::RenderFrame::from_world(world, crate::ColorPaletteMode::Natural)
+        let frame = crate::RenderFrame::from_snapshot(snapshot, crate::ColorPaletteMode::Natural)
             .ok_or_else(|| scriptbots_world_gfx::ReadbackError::MetadataMismatch {
-                expected: "a finite non-empty world render snapshot".to_owned(),
-                actual: format!(
-                    "world {}x{} at tick {} could not produce a render frame",
-                    world.config().world_width,
-                    world.config().world_height,
-                    world.tick().0
-                ),
-            })?;
+            expected: "a finite non-empty world render snapshot".to_owned(),
+            actual: format!(
+                "world {}x{} at tick {} could not produce a render frame",
+                snapshot.config.world_width, snapshot.config.world_height, snapshot.world.tick
+            ),
+        })?;
         let world_size = frame.world_size;
         let dims = frame.terrain.dimensions;
         let tiles_u32: Vec<u32> = frame
@@ -2124,6 +2122,117 @@ struct SimulationDriveSnapshot {
     simulation_fault: Option<String>,
 }
 
+/// Real owner-thread fixture with a caller-controlled monotonic clock. Keeping
+/// the clock still permits repeated paint observations without scientific ticks.
+#[cfg(test)]
+struct TestHost {
+    port: ChannelHostPort,
+    clock: Arc<AtomicU64>,
+    next_command: AtomicU64,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl TestHost {
+    fn new(world: WorldState) -> Self {
+        let clock = Arc::new(AtomicU64::new(0));
+        let owner_clock = Arc::clone(&clock);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let core = scriptbots_runtime::HostCore::new(
+                scriptbots_runtime::HostSessionId::new(1),
+                world,
+                scriptbots_runtime::HostCoreOptions {
+                    capture_agent_visuals: true,
+                    snapshot_interval_ticks: 1,
+                    ..scriptbots_runtime::HostCoreOptions::default()
+                },
+            )
+            .expect("GUI fixture owner");
+            let (mut driver, port) = scriptbots_runtime::channel::ChannelHostDriver::new(
+                scriptbots_runtime::FixedDeadlineHost::new(core),
+                scriptbots_runtime::channel::ChannelHostOptions::default(),
+            )
+            .expect("GUI fixture channel");
+            ready_tx.send(port).expect("publish GUI fixture port");
+            driver
+                .run(|| {
+                    scriptbots_runtime::ManualInstant::from_nanos(
+                        owner_clock.load(AtomicOrdering::Acquire),
+                    )
+                })
+                .expect("GUI fixture owner shutdown");
+        });
+        Self {
+            port: ready_rx.recv().expect("GUI fixture startup"),
+            clock,
+            next_command: AtomicU64::new(1),
+            worker: Some(worker),
+        }
+    }
+
+    fn snapshot(&self) -> Arc<RenderSnapshot> {
+        self.port
+            .clone()
+            .snapshot_after(None)
+            .expect("GUI fixture snapshot access")
+            .expect("GUI fixture initial publication")
+    }
+
+    fn submit(
+        &self,
+        command: scriptbots_runtime::HostCommand,
+    ) -> scriptbots_runtime::CommandStatus {
+        let id = scriptbots_runtime::CommandId::from_client_sequence(
+            1,
+            self.next_command.fetch_add(1, AtomicOrdering::Relaxed),
+        );
+        self.port
+            .clone()
+            .submit(scriptbots_runtime::CommandEnvelope::new(id, command))
+            .expect("GUI fixture admission")
+    }
+
+    fn apply(&self, command: scriptbots_runtime::HostCommand) -> scriptbots_runtime::CommandStatus {
+        let mut status = self.submit(command);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(
+            status.application(),
+            scriptbots_runtime::ApplicationState::Admitted
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "GUI fixture command did not apply: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            status = self
+                .port
+                .clone()
+                .command_status(status.command_id())
+                .expect("GUI fixture status access")
+                .expect("GUI fixture admitted command status");
+        }
+        assert!(
+            matches!(
+                status.application(),
+                scriptbots_runtime::ApplicationState::Applied(_)
+            ),
+            "GUI fixture command failed application: {status:?}"
+        );
+        status
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHost {
+    fn drop(&mut self) {
+        self.submit(scriptbots_runtime::HostCommand::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("GUI fixture owner join");
+        }
+    }
+}
+
 struct GuiSimulationDriver {
     world: Arc<Mutex<WorldState>>,
     simulation_step: WorldStepDriver,
@@ -2537,7 +2646,7 @@ mod gui_window_layout_tests {
 }
 
 struct GuiSession {
-    simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
+    host: ChannelHostPort,
     analytics: AnalyticsSnapshotProvider,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     /// Focus and hover describe one experiment, not one window. Sharing the
@@ -2553,28 +2662,20 @@ struct GuiSession {
 
 impl GuiSession {
     fn new(
-        world: Arc<Mutex<WorldState>>,
-        simulation_step: WorldStepDriver,
+        host: ChannelHostPort,
         analytics: AnalyticsSnapshotProvider,
-        command_drain: GuiCommandDrain,
-        command_reporter: GuiCommandReporter,
         command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     ) -> Self {
         let mut inspector_state = InspectorState::default();
-        if let Ok(world_guard) = world.lock() {
-            let interval = world_guard.config().persistence_interval;
+        if let Ok(Some(snapshot)) = host.clone().snapshot_after(None) {
+            let interval = snapshot.config.persistence_interval;
             if interval > 0 {
                 inspector_state.persistence_last_enabled = interval;
             }
         }
 
         Self {
-            simulation_driver: Arc::new(Mutex::new(GuiSimulationDriver::new(
-                world,
-                simulation_step,
-                command_drain,
-                command_reporter,
-            ))),
+            host,
             analytics,
             command_submit,
             inspector: Arc::new(Mutex::new(inspector_state)),
@@ -2586,7 +2687,7 @@ impl GuiSession {
 
     fn new_view(&self, role: GuiViewRole, focus_handle: FocusHandle) -> SimulationView {
         let mut view = SimulationView::new(
-            Arc::clone(&self.simulation_driver),
+            self.host.clone(),
             self.analytics.clone(),
             role.view_title(),
             Arc::clone(&self.command_submit),
@@ -2608,7 +2709,6 @@ impl GuiSession {
     ) -> std::result::Result<GuiWindowHandles, GuiWindowLaunchFailure> {
         let windows = open_gui_session_windows(app, self)?;
         app.on_window_closed(|app, _window_id| app.quit()).detach();
-        start_gui_simulation_driver(app, Arc::clone(&self.simulation_driver));
         Ok(windows)
     }
 }
@@ -2683,16 +2783,13 @@ pub enum GuiCommandOutcome {
 pub type GuiCommandReporter = Arc<dyn Fn(&str, GuiCommandOutcome) + Send + Sync + 'static>;
 
 pub fn run_demo(
-    world: Arc<Mutex<WorldState>>,
-    simulation_step: WorldStepDriver,
+    host: ChannelHostPort,
     analytics: AnalyticsSnapshotProvider,
-    command_drain: GuiCommandDrain,
-    command_reporter: GuiCommandReporter,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
     health_probe: GuiHealthProbe,
 ) -> Result<(), GuiRunError> {
-    if let Ok(world) = world.lock()
-        && let Some(summary) = world.history().last()
+    if let Ok(Some(snapshot)) = host.clone().snapshot_after(None)
+        && let Some(summary) = snapshot.summary_history.last()
     {
         info!(
             tick = summary.tick.0,
@@ -2704,14 +2801,7 @@ pub fn run_demo(
         );
     }
 
-    let session = Arc::new(GuiSession::new(
-        Arc::clone(&world),
-        simulation_step,
-        analytics,
-        command_drain,
-        command_reporter,
-        command_submit,
-    ));
+    let session = Arc::new(GuiSession::new(host, analytics, command_submit));
     let session_for_app = Arc::clone(&session);
     let run_error = Arc::new(Mutex::new(None));
     let run_error_for_app = Arc::clone(&run_error);
@@ -2771,9 +2861,27 @@ enum DashboardTab {
     Timeline,
 }
 
+fn snapshot_selection(snapshot: &RenderSnapshot) -> (u64, Vec<AgentId>, Vec<AgentId>) {
+    let live: Vec<_> = snapshot
+        .world
+        .agents
+        .iter()
+        .map(|agent| AgentId::from(slotmap::KeyData::from_ffi(agent.id)))
+        .collect();
+    let mut selected: Vec<_> = live
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            matches!(snapshot.agent_selection(index), SelectionState::Selected).then_some(id)
+        })
+        .collect();
+    selected.sort_unstable_by_key(|id| id.raw());
+    (snapshot.world.tick, selected, live)
+}
+
 struct SimulationView {
-    world: Arc<Mutex<WorldState>>,
-    simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
+    host: ChannelHostPort,
     analytics_provider: AnalyticsSnapshotProvider,
     title: SharedString,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
@@ -2847,31 +2955,23 @@ struct SimulationView {
 }
 impl SimulationView {
     fn new(
-        simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
+        host: ChannelHostPort,
         analytics_provider: AnalyticsSnapshotProvider,
         title: SharedString,
         command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
         selection_projection: Arc<Mutex<Option<Vec<AgentId>>>>,
         selection_submission: Arc<Mutex<()>>,
     ) -> Self {
-        let world = {
-            let driver = match simulation_driver.lock() {
-                Ok(driver) => driver,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            Arc::clone(&driver.world)
-        };
         let mut inspector_state = InspectorState::default();
-        if let Ok(world_guard) = world.lock() {
-            let interval = world_guard.config().persistence_interval;
+        if let Ok(Some(snapshot)) = host.clone().snapshot_after(None) {
+            let interval = snapshot.config.persistence_interval;
             if interval > 0 {
                 inspector_state.persistence_last_enabled = interval;
             }
         }
 
         Self {
-            world,
-            simulation_driver,
+            host,
             analytics_provider,
             title,
             command_submit,
@@ -2934,20 +3034,19 @@ impl SimulationView {
 
     fn submit_control_command(&self, command: ControlCommand) -> bool {
         let tick = self
-            .world
-            .lock()
-            .map(|world| world.tick().0)
-            .unwrap_or_default();
+            .read_snapshot()
+            .ok()
+            .map(|snapshot| snapshot.world.tick);
         // The submitter now hands back the identity the command was admitted
         // under, so the GPUI layer can finally NAME what it submitted instead
         // of only knowing that something was accepted (bd-k7nq).
         let admitted = (self.command_submit.as_ref())(command.clone());
         match admitted.as_deref() {
             Some(command_id) => {
-                debug!(tick, source = "gui", %command_id, payload = ?command, "GPUI control command enqueued");
+                debug!(?tick, source = "gui", %command_id, payload = ?command, "GPUI control command enqueued");
             }
             None => {
-                warn!(tick, source = "gui", payload = ?command, "failed to enqueue GPUI control command");
+                warn!(?tick, source = "gui", payload = ?command, "failed to enqueue GPUI control command");
             }
         }
         admitted.is_some()
@@ -2976,11 +3075,29 @@ impl SimulationView {
     }
 
     fn simulation_drive_snapshot(&self) -> SimulationDriveSnapshot {
-        let driver = match self.simulation_driver.lock() {
-            Ok(driver) => driver,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        driver.snapshot()
+        match self.read_snapshot() {
+            Ok(snapshot) => SimulationDriveSnapshot {
+                paused: snapshot.playback.paused,
+                speed_multiplier: snapshot.playback.speed_multiplier,
+                simulation_fault: match &snapshot.health {
+                    scriptbots_runtime::HostHealth::Healthy => None,
+                    health => Some(format!("{health:?}")),
+                },
+            },
+            Err(error) => SimulationDriveSnapshot {
+                paused: true,
+                speed_multiplier: 0.0,
+                simulation_fault: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn read_snapshot(&self) -> Result<Arc<RenderSnapshot>, scriptbots_runtime::HostAccessError> {
+        self.host.clone().snapshot_after(None)?.ok_or_else(|| {
+            scriptbots_runtime::HostAccessError::ProtocolViolation {
+                message: "GUI host returned no initial publication".to_owned(),
+            }
+        })
     }
 
     /// Submit a config edit, reporting whether it was actually enqueued.
@@ -2999,12 +3116,11 @@ impl SimulationView {
     where
         F: FnOnce(&mut ScriptBotsConfig),
     {
-        let Ok(world) = self.world.lock() else {
-            warn!("failed to acquire world lock for config update");
+        let Ok(snapshot) = self.read_snapshot() else {
+            warn!("failed to read host publication for config update");
             return false;
         };
-        let mut new_config = world.config().clone();
-        drop(world);
+        let mut new_config = snapshot.config.as_ref().clone();
         update(&mut new_config);
         self.submit_control_command(ControlCommand::UpdateConfig(Box::new(new_config)))
     }
@@ -3080,8 +3196,8 @@ impl SimulationView {
         }
     }
 
-    fn selection_pick_radius(&self, world: &WorldState) -> f32 {
-        (world.config().bot_radius * 3.0).max(24.0)
+    fn selection_pick_radius(&self, snapshot: &RenderSnapshot) -> f32 {
+        (snapshot.config.bot_radius * 3.0).max(24.0)
     }
 
     fn effective_selected_agents(
@@ -3106,26 +3222,23 @@ impl SimulationView {
 
     fn pick_agent_near(
         &self,
-        world: &WorldState,
+        snapshot: &RenderSnapshot,
         point: (f32, f32),
         radius: f32,
     ) -> Option<AgentId> {
-        let arena = world.agents();
-        let columns = arena.columns();
-        let positions = columns.positions();
         let radius_sq = radius * radius;
-        let extent_x = world.config().world_width as f32;
-        let extent_y = world.config().world_height as f32;
+        let extent_x = snapshot.config.world_width as f32;
+        let extent_y = snapshot.config.world_height as f32;
         let mut best: Option<(AgentId, f32)> = None;
 
-        for (idx, agent_id) in arena.iter_handles().enumerate() {
-            let pos = positions[idx];
+        for agent in &snapshot.world.agents {
+            let agent_id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
             // Argument order swapped versus the removed private copy: that
             // computed target - origin, core computes a - b. Both feed dist_sq
             // below, so the sign is unused, but the swap keeps the value
             // identical rather than relying on that (bd-ikts.4).
-            let dx = toroidal_delta(pos.x, point.0, extent_x);
-            let dy = toroidal_delta(pos.y, point.1, extent_y);
+            let dx = toroidal_delta(agent.position[0], point.0, extent_x);
+            let dy = toroidal_delta(agent.position[1], point.1, extent_y);
             let dist_sq = dx.mul_add(dx, dy * dy);
             if dist_sq <= radius_sq && best.is_none_or(|(_, best_dist)| dist_sq < best_dist) {
                 best = Some((agent_id, dist_sq));
@@ -3140,18 +3253,8 @@ impl SimulationView {
         let Ok(_submission_guard) = submission.lock() else {
             return false;
         };
-        let (tick, canonical_selection, live_agents) = match self.world.lock() {
-            Ok(world) => (
-                world.tick().0,
-                world
-                    .runtime()
-                    .iter()
-                    .filter_map(|(id, entry)| {
-                        matches!(entry.selection, SelectionState::Selected).then_some(id)
-                    })
-                    .collect::<Vec<_>>(),
-                world.agents().iter_handles().collect::<Vec<_>>(),
-            ),
+        let (tick, canonical_selection, live_agents) = match self.read_snapshot() {
+            Ok(snapshot) => snapshot_selection(&snapshot),
             Err(_) => return false,
         };
         let selected = self.effective_selected_agents(&canonical_selection, &live_agents);
@@ -3200,23 +3303,14 @@ impl SimulationView {
             .map(|state| state.focused_agent)
             .unwrap_or(None);
 
-        let world = match self.world.lock() {
-            Ok(world) => world,
+        let snapshot = match self.read_snapshot() {
+            Ok(snapshot) => snapshot,
             Err(_) => return false,
         };
 
-        let pick_radius = self.selection_pick_radius(&world);
-        let candidate = self.pick_agent_near(&world, world_point, pick_radius);
-        let tick = world.tick().0;
-        let live_agents = world.agents().iter_handles().collect::<Vec<_>>();
-        let canonical_selection = world
-            .runtime()
-            .iter()
-            .filter_map(|(id, entry)| {
-                matches!(entry.selection, SelectionState::Selected).then_some(id)
-            })
-            .collect::<Vec<_>>();
-        drop(world);
+        let pick_radius = self.selection_pick_radius(&snapshot);
+        let candidate = self.pick_agent_near(&snapshot, world_point, pick_radius);
+        let (tick, canonical_selection, live_agents) = snapshot_selection(&snapshot);
         let selected_before = self.effective_selected_agents(&canonical_selection, &live_agents);
         let was_selected = candidate.is_some_and(|id| selected_before.contains(&id));
 
@@ -3325,9 +3419,9 @@ impl SimulationView {
 
     fn update_hover_from_point(&mut self, position: Point<Pixels>) -> bool {
         let hovered = if let Some(world_point) = self.canvas_to_world(position) {
-            if let Ok(world) = self.world.lock() {
-                let radius = self.selection_pick_radius(&world);
-                self.pick_agent_near(&world, world_point, radius)
+            if let Ok(snapshot) = self.read_snapshot() {
+                let radius = self.selection_pick_radius(&snapshot);
+                self.pick_agent_near(&snapshot, world_point, radius)
             } else {
                 None
             }
@@ -3349,18 +3443,10 @@ impl SimulationView {
         }
 
         let desired = if let Some(curr) = hovered {
-            let Ok(world) = self.world.lock() else {
+            let Ok(snapshot) = self.read_snapshot() else {
                 return false;
             };
-            let live_agents = world.agents().iter_handles().collect::<Vec<_>>();
-            let canonical_selection = world
-                .runtime()
-                .iter()
-                .filter_map(|(id, entry)| {
-                    matches!(entry.selection, SelectionState::Selected).then_some(id)
-                })
-                .collect::<Vec<_>>();
-            drop(world);
+            let (_, canonical_selection, live_agents) = snapshot_selection(&snapshot);
             (!self
                 .effective_selected_agents(&canonical_selection, &live_agents)
                 .contains(&curr))
@@ -3379,22 +3465,14 @@ impl SimulationView {
     }
     fn snapshot(&mut self) -> HudSnapshot {
         let mut snapshot = HudSnapshot::default();
-        let (canonical_selection, live_agents) = self
-            .world
-            .lock()
-            .map(|world| {
-                (
-                    world
-                        .runtime()
-                        .iter()
-                        .filter_map(|(id, entry)| {
-                            matches!(entry.selection, SelectionState::Selected).then_some(id)
-                        })
-                        .collect::<Vec<_>>(),
-                    world.agents().iter_handles().collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or_default();
+        let published = match self.read_snapshot() {
+            Ok(published) => published,
+            Err(error) => {
+                snapshot.simulation_fault = Some(error.to_string());
+                return snapshot;
+            }
+        };
+        let (_, canonical_selection, live_agents) = snapshot_selection(&published);
         let _ = self.effective_selected_agents(&canonical_selection, &live_agents);
         let inspector_state = self
             .inspector
@@ -3417,74 +3495,66 @@ impl SimulationView {
             (self.brain_client_id, BrainInspectionRevision::new(revision))
         });
         let cached_brain_inspection = self.brain_inspection_cache.clone();
-        let mut next_brain_inspection_cache = cached_brain_inspection.clone();
-        let mut brain_request_issued = false;
         let accessibility = self.accessibility_snapshot();
 
-        let analytics_trigger = {
-            let mut trigger: Option<(u64, usize)> = None;
-            if let Ok(world) = self.world.lock() {
-                snapshot.tick = world.tick().0;
-                snapshot.epoch = world.epoch();
-                snapshot.is_closed = world.is_closed();
-                snapshot.agent_count = world.agent_count();
+        let (next_brain_inspection_cache, brain_request_issued) = {
+            snapshot.tick = published.world.tick;
+            snapshot.epoch = published.world.epoch;
+            snapshot.is_closed = published.world.world.closed;
+            snapshot.agent_count = published.world.agents.len();
 
-                let config = world.config();
-                snapshot.world_size = (config.world_width, config.world_height);
-                snapshot.history_capacity = config.history_capacity;
-                snapshot.narrative = world.narrative_events().iter().cloned().collect();
-                snapshot.narrative_dropped = world.narrative_dropped_events();
-                snapshot.narrative_capacity = config.narrative_capacity;
-                snapshot.render_frame = RenderFrame::from_world(&world, accessibility.palette);
-                if let Some(frame) = snapshot.render_frame.as_mut() {
-                    for agent in &mut frame.agents {
-                        agent.selection = if selection_projection
-                            .as_ref()
-                            .is_some_and(|selected| selected.contains(&agent.agent_id))
-                            || (selection_projection.is_none()
-                                && matches!(agent.selection, SelectionState::Selected))
-                        {
-                            SelectionState::Selected
-                        } else {
-                            SelectionState::None
-                        };
-                    }
-                    if let Some(hovered_agent) = inspector_state.hovered_agent
-                        && let Some(agent) = frame
-                            .agents
-                            .iter_mut()
-                            .find(|agent| agent.agent_id == hovered_agent)
-                        && !matches!(agent.selection, SelectionState::Selected)
+            let config = &published.config;
+            snapshot.world_size = (config.world_width, config.world_height);
+            snapshot.history_capacity = config.history_capacity;
+            snapshot.narrative = published.narrative_events.as_ref().clone();
+            snapshot.narrative_dropped = published.narrative_dropped_events;
+            snapshot.narrative_capacity = config.narrative_capacity;
+            snapshot.render_frame = RenderFrame::from_snapshot(&published, accessibility.palette);
+            if let Some(frame) = snapshot.render_frame.as_mut() {
+                for agent in &mut frame.agents {
+                    agent.selection = if selection_projection
+                        .as_ref()
+                        .is_some_and(|selected| selected.contains(&agent.agent_id))
+                        || (selection_projection.is_none()
+                            && matches!(agent.selection, SelectionState::Selected))
                     {
-                        agent.selection = SelectionState::Hovered;
-                    }
+                        SelectionState::Selected
+                    } else {
+                        SelectionState::None
+                    };
                 }
-
-                let mut ring: VecDeque<TickSummary> = VecDeque::with_capacity(12);
-                for summary in world.history() {
-                    if ring.len() == 12 {
-                        ring.pop_front();
-                    }
-                    ring.push_back(summary.clone());
+                if let Some(hovered_agent) = inspector_state.hovered_agent
+                    && let Some(agent) = frame
+                        .agents
+                        .iter_mut()
+                        .find(|agent| agent.agent_id == hovered_agent)
+                    && !matches!(agent.selection, SelectionState::Selected)
+                {
+                    agent.selection = SelectionState::Hovered;
                 }
-                if let Some(latest) = ring.back() {
-                    snapshot.summary = Some(HudMetrics::from(latest));
-                }
-                snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
-                let (inspector, cache, issued) = InspectorSnapshot::from_world(
-                    &world,
-                    &inspector_state,
-                    selection_projection.as_deref(),
-                    cached_brain_inspection.as_ref(),
-                    brain_request,
-                );
-                snapshot.inspector = inspector;
-                next_brain_inspection_cache = cache;
-                brain_request_issued = issued;
-
-                trigger = Some((snapshot.tick, snapshot.agent_count));
             }
-            trigger
+
+            let mut ring: VecDeque<TickSummary> = VecDeque::with_capacity(12);
+            for summary in published.summary_history.iter() {
+                if ring.len() == 12 {
+                    ring.pop_front();
+                }
+                ring.push_back(summary.clone());
+            }
+            if let Some(latest) = ring.back() {
+                snapshot.summary = Some(HudMetrics::from(latest));
+            }
+            snapshot.recent_history = ring.into_iter().map(HudHistoryEntry::from).collect();
+            let (inspector, cache, issued) = InspectorSnapshot::from_snapshot(
+                &published,
+                &self.host,
+                &inspector_state,
+                selection_projection.as_deref(),
+                cached_brain_inspection.as_ref(),
+                brain_request,
+            );
+            snapshot.inspector = inspector;
+            (cache, issued)
         };
 
         self.brain_inspection_cache = next_brain_inspection_cache;
@@ -3493,19 +3563,20 @@ impl SimulationView {
         }
         self.maybe_log_brain_panel(&snapshot);
 
-        if let Some((tick, count)) = analytics_trigger {
-            self.maybe_refresh_analytics(tick, count);
-        }
+        self.maybe_refresh_analytics(snapshot.tick, snapshot.agent_count);
 
         snapshot.analytics = self.analytics_cache.clone();
         snapshot.storage = self.analytics_status.clone();
-        let simulation = self.simulation_drive_snapshot();
-        snapshot.simulation_fault = simulation.simulation_fault;
+        snapshot.simulation_fault = match &published.health {
+            scriptbots_runtime::HostHealth::Healthy => None,
+            health => Some(format!("{health:?}")),
+        };
 
         snapshot.perf = self.last_perf;
-        snapshot.controls = self
-            .controls
-            .snapshot(simulation.paused, simulation.speed_multiplier);
+        snapshot.controls = self.controls.snapshot(
+            published.playback.paused,
+            published.playback.speed_multiplier,
+        );
 
         self.playback.record(&snapshot);
 
@@ -4817,18 +4888,17 @@ impl SimulationView {
     /// Select a rail event by index, clamped to the retained events. A fresh
     /// selection clears the aged-out marker (bd-16g.2.4).
     fn select_rail_event(&mut self, index: usize) {
-        let events_len = {
-            let world = self.world.lock().expect("world mutex poisoned");
-            world.narrative_events().len()
+        let Ok(snapshot) = self.read_snapshot() else {
+            return;
         };
+        let events_len = snapshot.narrative_events.len();
         if events_len == 0 {
             self.rail_selection = None;
             return;
         }
         let clamped = index.min(events_len - 1);
         let (tick, kind) = {
-            let world = self.world.lock().expect("world mutex poisoned");
-            let event = &world.narrative_events()[clamped];
+            let event = &snapshot.narrative_events[clamped];
             (event.tick.0, event.kind)
         };
         self.rail_selection = Some((clamped, tick, kind));
@@ -5306,18 +5376,8 @@ impl SimulationView {
         let Ok(_submission_guard) = submission.lock() else {
             return;
         };
-        let (tick, ids, canonical_selection) = match self.world.lock() {
-            Ok(world) => (
-                world.tick().0,
-                world.agents().iter_handles().collect::<Vec<_>>(),
-                world
-                    .runtime()
-                    .iter()
-                    .filter_map(|(id, entry)| {
-                        matches!(entry.selection, SelectionState::Selected).then_some(id)
-                    })
-                    .collect::<Vec<_>>(),
-            ),
+        let (tick, canonical_selection, ids) = match self.read_snapshot() {
+            Ok(snapshot) => snapshot_selection(&snapshot),
             Err(_) => return,
         };
         let selected_before = self.effective_selected_agents(&canonical_selection, &ids);
@@ -5350,18 +5410,8 @@ impl SimulationView {
     }
 
     fn focus_first_selected(&mut self, cx: &mut Context<Self>) {
-        let (tick, canonical_selection, live_agents) = match self.world.lock() {
-            Ok(world) => (
-                world.tick().0,
-                world
-                    .runtime()
-                    .iter()
-                    .filter_map(|(id, entry)| {
-                        matches!(entry.selection, SelectionState::Selected).then_some(id)
-                    })
-                    .collect::<Vec<_>>(),
-                world.agents().iter_handles().collect::<Vec<_>>(),
-            ),
+        let (tick, canonical_selection, live_agents) = match self.read_snapshot() {
+            Ok(snapshot) => snapshot_selection(&snapshot),
             Err(_) => return,
         };
         let selected = self.effective_selected_agents(&canonical_selection, &live_agents);
@@ -5389,9 +5439,8 @@ impl SimulationView {
             });
         } else {
             let current_interval = self
-                .world
-                .lock()
-                .map(|world| world.config().persistence_interval)
+                .read_snapshot()
+                .map(|snapshot| snapshot.config.persistence_interval)
                 .unwrap_or(0);
 
             if current_interval > 0
@@ -5410,8 +5459,8 @@ impl SimulationView {
 
     fn adjust_persistence_interval(&mut self, delta: i32, cx: &mut Context<Self>) {
         let (current_interval, was_enabled) = {
-            if let Ok(world) = self.world.lock() {
-                let interval = world.config().persistence_interval;
+            if let Ok(snapshot) = self.read_snapshot() {
+                let interval = snapshot.config.persistence_interval;
                 (interval, interval > 0)
             } else {
                 (0, false)
@@ -5451,12 +5500,14 @@ impl SimulationView {
         delta_secondary: f32,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_uid) = self
-            .world
-            .lock()
-            .ok()
-            .and_then(|world| world.agent_uid(agent_id))
-        else {
+        let Some(agent_uid) = self.read_snapshot().ok().and_then(|snapshot| {
+            snapshot
+                .world
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id.raw())
+                .map(|agent| agent.uid)
+        }) else {
             warn!(
                 agent = agent_id.raw(),
                 "Mutation-rate edit target is no longer live"
@@ -5669,11 +5720,10 @@ impl SimulationView {
             return true; // No search - show all categories
         }
 
-        let config = if let Ok(world) = self.world.lock() {
-            world.config().clone()
-        } else {
-            scriptbots_core::ScriptBotsConfig::default()
+        let Ok(snapshot) = self.read_snapshot() else {
+            return false;
         };
+        let config = &snapshot.config;
 
         // Special handling for Topography (has toggle + readonly params)
         if matches!(category, ConfigCategory::Topography) {
@@ -6320,23 +6370,24 @@ impl SimulationView {
             warn!("failed to acquire selection submission lock for crossover command");
             return;
         };
-        let (canonical_selection, live_agents, live_uids) = match self.world.lock() {
-            Ok(world) => {
-                let canonical_selection = world
-                    .runtime()
+        let (canonical_selection, live_agents, live_uids) = match self.read_snapshot() {
+            Ok(snapshot) => {
+                let (_, canonical_selection, live_agents) = snapshot_selection(&snapshot);
+                let live_uids = snapshot
+                    .world
+                    .agents
                     .iter()
-                    .filter(|(_, runtime)| matches!(runtime.selection, SelectionState::Selected))
-                    .map(|(agent_id, _)| agent_id)
-                    .collect::<Vec<_>>();
-                let live_agents = world.agents().iter_handles().collect::<Vec<_>>();
-                let live_uids = live_agents
-                    .iter()
-                    .filter_map(|agent_id| world.agent_uid(*agent_id).map(|uid| (*agent_id, uid)))
+                    .map(|agent| {
+                        (
+                            AgentId::from(slotmap::KeyData::from_ffi(agent.id)),
+                            agent.uid,
+                        )
+                    })
                     .collect::<HashMap<_, _>>();
                 (canonical_selection, live_agents, live_uids)
             }
             Err(_) => {
-                warn!("failed to acquire world lock for crossover command");
+                warn!("failed to read host publication for crossover command");
                 return;
             }
         };
@@ -8937,12 +8988,11 @@ impl SimulationView {
         category_div
     }
     fn render_category_parameters(&self, category: ConfigCategory, cx: &mut Context<Self>) -> Div {
-        // Read current config from world
-        let config = if let Ok(world) = self.world.lock() {
-            world.config().clone()
-        } else {
-            scriptbots_core::ScriptBotsConfig::default()
+        let snapshot = match self.read_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return div().child(format!("Configuration unavailable: {error}")),
         };
+        let config = &snapshot.config;
 
         // Match on category and return filtered params directly - ULTRA CLEAN data-driven approach!
         // ONE central filter loop in render_filtered_params handles ALL 60+ parameters!
@@ -10283,19 +10333,17 @@ fn paint_brain_radar(
 /// This is a coarse, deterministic rasterization intended for REST exports.
 /// Render-relevant world state for the offscreen PNG snapshot (bd-134).
 ///
-/// Captured from the world in one cheap pass so that rasterization — the
-/// expensive part — can run with **no world lock held at all**. Callers that
-/// serve a live, contended world must capture under a short lock and then
-/// rasterize the scene outside it; callers with exclusive worlds may use the
-/// [`render_png_offscreen`] convenience composition.
+/// Captured from one immutable host publication. Terrain and food remain
+/// shared with that publication, so neither scene capture nor rasterization
+/// acquires the simulation owner or a database lock.
 pub struct OffscreenScene {
     tonemap_mode: RenderTonemapMode,
     exposure_factor: f32,
     world_size: (f32, f32),
     cell_size: f32,
     bot_radius: f32,
-    terrain: TerrainLayer,
-    food: FoodGrid,
+    terrain: Arc<TerrainLayerSnapshot>,
+    food: Arc<FoodLayerSnapshot>,
     agents: Vec<OffscreenAgent>,
 }
 
@@ -10310,24 +10358,18 @@ struct OffscreenAgent {
 impl OffscreenScene {
     /// Copy everything the offscreen renderer reads, in one pass.
     #[must_use]
-    pub fn capture(world: &WorldState) -> Self {
-        let config = world.config();
+    pub fn capture(snapshot: &RenderSnapshot) -> Self {
+        let config = &snapshot.config;
         let tonemap_settings = &config.render;
-        let columns = world.agents().columns();
-        let positions = columns.positions();
-        let agents = world
-            .agents()
-            .iter_handles()
-            .enumerate()
-            .map(|(idx, handle)| {
-                let position = positions[idx];
-                let runtime = world.runtime().get(handle);
-                OffscreenAgent {
-                    x: position.x,
-                    y: position.y,
-                    energy: runtime.map(|rt| rt.energy).unwrap_or(0.5),
-                    herbivore_tendency: runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5),
-                }
+        let agents = snapshot
+            .world
+            .agents
+            .iter()
+            .map(|agent| OffscreenAgent {
+                x: agent.position[0],
+                y: agent.position[1],
+                energy: agent.energy,
+                herbivore_tendency: agent.herbivore_tendency,
             })
             .collect();
         Self {
@@ -10341,16 +10383,16 @@ impl OffscreenScene {
             world_size: (config.world_width as f32, config.world_height as f32),
             cell_size: config.food_cell_size as f32,
             bot_radius: config.bot_radius,
-            terrain: world.terrain().clone(),
-            food: world.food().clone(),
+            terrain: Arc::clone(&snapshot.layers.terrain),
+            food: Arc::clone(&snapshot.layers.food),
             agents,
         }
     }
 }
 
-/// Capture-and-render composition for callers with an uncontended world.
-pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Vec<u8> {
-    render_offscreen_scene(&OffscreenScene::capture(world), width, height)
+/// Capture and rasterize one immutable host publication.
+pub fn render_png_offscreen(snapshot: &RenderSnapshot, width: u32, height: u32) -> Vec<u8> {
+    render_offscreen_scene(&OffscreenScene::capture(snapshot), width, height)
 }
 
 /// Rasterize a captured scene. Holds no world reference and takes no lock.
@@ -10388,17 +10430,20 @@ pub fn render_offscreen_scene(scene: &OffscreenScene, width: u32, height: u32) -
             let rgba = if let Some((world_x, world_y)) = world_point {
                 let tx = (world_x / cell_size).floor() as i32;
                 let ty = (world_y / cell_size).floor() as i32;
-                if tx >= 0
-                    && ty >= 0
-                    && (tx as u32) < terrain.width()
-                    && (ty as u32) < terrain.height()
+                if tx >= 0 && ty >= 0 && (tx as u32) < terrain.width && (ty as u32) < terrain.height
                 {
                     let tile = terrain
-                        .tile(tx as u32, ty as u32)
-                        .copied()
-                        .unwrap_or(default_tile);
-                    let food_val = food.get(tx as u32, ty as u32).unwrap_or(0.0);
-                    let base = match tile.kind {
+                        .tiles
+                        .get(ty as usize * terrain.width as usize + tx as usize);
+                    let food_val = if (tx as u32) < food.width && (ty as u32) < food.height {
+                        food.cells
+                            .get(ty as usize * food.width as usize + tx as usize)
+                            .copied()
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let base = match tile.map_or(default_tile.kind, |tile| tile.kind) {
                         TerrainKind::DeepWater => (30u8, 63u8, 102u8),
                         TerrainKind::ShallowWater => (47, 115, 179),
                         TerrainKind::Sand => (177, 78, 7),
@@ -12339,49 +12384,51 @@ impl SelectionEventKind {
     }
 }
 impl InspectorSnapshot {
-    fn from_world(
-        world: &WorldState,
+    fn from_snapshot(
+        published: &RenderSnapshot,
+        host: &ChannelHostPort,
         inspector: &InspectorState,
         selection_projection: Option<&[AgentId]>,
         cached_brain: Option<&BrainInspectorCapture>,
         brain_request: Option<(BrainInspectionClientId, BrainInspectionRevision)>,
     ) -> (Self, Option<BrainInspectorCapture>, bool) {
         let mut snapshot = InspectorSnapshot {
-            total_agents: world.agent_count(),
+            total_agents: published.world.agents.len(),
             persistence_cached_interval: inspector.persistence_last_enabled,
             ..InspectorSnapshot::default()
         };
 
-        let config = world.config();
+        let config = &published.config;
         snapshot.persistence_interval = config.persistence_interval;
         snapshot.persistence_enabled = config.persistence_interval > 0;
         if !snapshot.persistence_enabled && snapshot.persistence_interval > 0 {
             snapshot.persistence_cached_interval = snapshot.persistence_interval.max(1);
         }
 
-        let arena = world.agents();
-        let runtime = world.runtime();
-        let columns = arena.columns();
-
         let mut selected = Vec::new();
         let mut hovered: Option<AgentListEntry> = None;
 
-        for (row, agent_id) in arena.iter_handles().enumerate() {
-            if let Some(agent_runtime) = runtime.get(agent_id) {
-                let entry = AgentListEntry::from_world(row, agent_id, agent_runtime, columns);
-                let is_selected = selection_projection.map_or_else(
-                    || matches!(agent_runtime.selection, SelectionState::Selected),
-                    |projected| projected.contains(&agent_id),
-                );
-                if is_selected {
-                    selected.push(entry);
-                } else if inspector.hovered_agent.is_some_and(|id| id == agent_id) {
-                    hovered = Some(entry);
-                }
+        for (row, agent) in published.world.agents.iter().enumerate() {
+            let agent_id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
+            let entry = AgentListEntry::from_snapshot(row, agent);
+            let is_selected = selection_projection.map_or_else(
+                || matches!(published.agent_selection(row), SelectionState::Selected),
+                |projected| projected.contains(&agent_id),
+            );
+            if is_selected {
+                selected.push(entry);
+            } else if inspector.hovered_agent.is_some_and(|id| id == agent_id) {
+                hovered = Some(entry);
             }
         }
 
-        let mut focus_candidate = inspector.focused_agent.filter(|id| arena.contains(*id));
+        let mut focus_candidate = inspector.focused_agent.filter(|id| {
+            published
+                .world
+                .agents
+                .iter()
+                .any(|agent| agent.id == id.raw())
+        });
 
         if focus_candidate.is_none() {
             focus_candidate = selected.first().map(|entry| entry.agent_id);
@@ -12394,25 +12441,48 @@ impl InspectorSnapshot {
 
         let mut request_issued = false;
         let brain_capture = focus_id.and_then(|agent_id| {
-            let agent_uid = world.agent_uid(agent_id)?;
+            let agent_uid = published
+                .world
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id.raw())?
+                .uid;
             let (client_id, revision) = brain_request?;
             if let Some(cached) = cached_brain
                 && cached.agent_uid == agent_uid
-                && cached.source_tick == world.tick().0
+                && cached.source_tick == published.world.tick
+                && cached.source_revision == Some(published.revision)
             {
                 return Some(cached.clone());
             }
 
             request_issued = true;
-            let response = match world.inspect_brains(&BrainInspectionRequest::single(
-                client_id, revision, agent_uid,
-            )) {
-                Ok(response) => response,
+            let request = scriptbots_runtime::BrainProjectionRequest::focused(
+                scriptbots_runtime::ProjectionClientId::new(client_id.get()),
+                scriptbots_runtime::ProjectionRequestRevision::new(revision.get()),
+                agent_uid,
+            );
+            let response = match host.project_brain(&request) {
+                Ok(response) if response.source.matches_snapshot(published) => response.inspection,
+                Ok(_) => {
+                    return Some(BrainInspectorCapture {
+                        agent_uid,
+                        source_tick: published.world.tick,
+                        source_revision: None,
+                        request_revision: revision.get(),
+                        retained_payload_bytes: 0,
+                        status: BrainInspectorCaptureStatus::Refused(
+                            "host advanced beyond the displayed frame; inspection will retry"
+                                .to_owned(),
+                        ),
+                    });
+                }
                 Err(error) => {
                     warn!(%error, agent_uid = agent_uid.get(), "brain inspection request refused");
                     return Some(BrainInspectorCapture {
                         agent_uid,
-                        source_tick: world.tick().0,
+                        source_tick: published.world.tick,
+                        source_revision: None,
                         request_revision: revision.get(),
                         retained_payload_bytes: 0,
                         status: BrainInspectorCaptureStatus::Refused(error.to_string()),
@@ -12440,13 +12510,33 @@ impl InspectorSnapshot {
             Some(BrainInspectorCapture {
                 agent_uid,
                 source_tick,
+                source_revision: Some(published.revision),
                 request_revision,
                 retained_payload_bytes,
                 status,
             })
         });
         let focused = focus_id.and_then(|agent_id| {
-            AgentInspectorDetails::from_world(world, agent_id, brain_capture.clone())
+            let agent = published
+                .world
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id.raw())?;
+            match host.inspect_agent(agent.uid, SENSE_PROBE_MAX_CONTRIBUTORS) {
+                Ok(Some(detail)) if detail.source.matches_snapshot(published) => {
+                    AgentInspectorDetails::from_snapshot(
+                        published,
+                        agent_id,
+                        detail,
+                        brain_capture.clone(),
+                    )
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(%error, agent_uid = agent.uid.get(), "focused agent inspection refused");
+                    None
+                }
+            }
         });
 
         for entry in &mut selected {
@@ -12917,30 +13007,18 @@ struct AgentListEntry {
 }
 
 impl AgentListEntry {
-    fn from_world(
-        row: usize,
-        agent_id: AgentId,
-        runtime: &AgentRuntime,
-        columns: &AgentColumns,
-    ) -> Self {
-        let generation = columns.generations()[row];
-        let age = columns.ages()[row];
-        let health = columns.health()[row];
-        let color = columns.colors()[row];
-        let position = columns.positions()[row];
-
-        let label = format!("#{row} · {:?} · Gen {}", agent_id, generation.0);
-
+    fn from_snapshot(row: usize, agent: &scriptbots_core::DynamicAgentSnapshot) -> Self {
+        let agent_id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
         Self {
             agent_id,
-            label,
-            color,
-            energy: runtime.energy,
-            health,
-            generation,
-            age,
+            label: format!("#{row} · {:?} · Gen {}", agent_id, agent.generation.0),
+            color: agent.color,
+            energy: agent.energy,
+            health: agent.health,
+            generation: agent.generation,
+            age: agent.age,
             is_focused: false,
-            position,
+            position: Position::new(agent.position[0], agent.position[1]),
         }
     }
 }
@@ -12986,6 +13064,7 @@ pub struct AgentInspectorDetails {
 pub struct BrainInspectorCapture {
     pub agent_uid: AgentUid,
     pub source_tick: u64,
+    pub source_revision: Option<scriptbots_runtime::SnapshotRevision>,
     pub request_revision: u64,
     pub retained_payload_bytes: usize,
     pub status: BrainInspectorCaptureStatus,
@@ -12999,6 +13078,75 @@ pub enum BrainInspectorCaptureStatus {
 }
 
 impl AgentInspectorDetails {
+    fn from_snapshot(
+        snapshot: &RenderSnapshot,
+        agent_id: AgentId,
+        detail: scriptbots_runtime::channel::AgentInspectorData,
+        brain_capture: Option<BrainInspectorCapture>,
+    ) -> Option<Self> {
+        let agent = snapshot
+            .world
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id.raw())?;
+        if detail.uid != agent.uid || !detail.source.matches_snapshot(snapshot) {
+            return None;
+        }
+        let (
+            brain_activations,
+            brain_source_tick,
+            brain_request_revision,
+            brain_payload_bytes,
+            brain_inspection_status,
+        ) = brain_capture.map_or((None, None, None, None, None), |capture| {
+            let (activations, status) = match capture.status {
+                BrainInspectorCaptureStatus::Ready(activations) => {
+                    (Some(activations), "ready".to_owned())
+                }
+                BrainInspectorCaptureStatus::Unavailable(reason) => {
+                    (None, format!("unavailable: {reason:?}"))
+                }
+                BrainInspectorCaptureStatus::Refused(error) => (None, format!("refused: {error}")),
+            };
+            (
+                activations,
+                Some(capture.source_tick),
+                Some(capture.request_revision),
+                Some(capture.retained_payload_bytes),
+                Some(status),
+            )
+        });
+        Some(Self {
+            agent_id,
+            label: format!(
+                "Agent {:?} · Gen {} · Age {}",
+                agent_id, agent.generation.0, agent.age
+            ),
+            color: agent.color,
+            position: Position::new(agent.position[0], agent.position[1]),
+            energy: agent.energy,
+            health: agent.health,
+            age: agent.age,
+            generation: agent.generation,
+            brain_descriptor: detail.brain_descriptor,
+            mutation_rates: detail.mutation_rates,
+            trait_modifiers: detail.trait_modifiers,
+            spike_length: agent.spike_length,
+            sensors: detail.sensors.to_vec(),
+            outputs: detail.outputs.to_vec(),
+            brain_bound: detail.brain_bound,
+            brain_activations,
+            brain_source_tick,
+            brain_request_revision,
+            brain_payload_bytes,
+            brain_inspection_status,
+            sense_attribution: detail.sensor_attribution,
+            eye_directions: detail.eye_direction,
+            eye_fovs: detail.eye_fov,
+            genome_browser: detail.genome_browser,
+        })
+    }
+
     pub fn from_world(
         world: &WorldState,
         agent_id: AgentId,
@@ -13543,6 +13691,7 @@ fn color_swatch(color: [f32; 3]) -> Div {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct RenderFrame {
     tick: u64,
     tonemap_mode: Option<RenderTonemapMode>,
@@ -13563,6 +13712,7 @@ struct RenderFrame {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct TerrainFrame {
     dimensions: (u32, u32),
     cell_size: u32,
@@ -13570,6 +13720,7 @@ struct TerrainFrame {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct TerrainTileVisual {
     kind: TerrainKind,
     elevation: f32,
@@ -13644,10 +13795,12 @@ struct WorldRasterPixels {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct PostProcessStack {
     passes: Vec<PostProcessPass>,
 }
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum PostProcessPass {
     Exposure {
         factor: f32,
@@ -13679,16 +13832,32 @@ enum PostProcessPass {
 }
 
 fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> PostProcessStack {
-    let tick = world.tick().0;
-    let render = &world.config().render;
+    post_process_stack(
+        world.tick().0,
+        world.config(),
+        world.is_closed(),
+        world.agent_count(),
+        world.history().last(),
+        palette,
+    )
+}
+
+fn post_process_stack(
+    tick: u64,
+    config: &ScriptBotsConfig,
+    closed: bool,
+    agent_count: usize,
+    latest: Option<&TickSummary>,
+    palette: ColorPaletteMode,
+) -> PostProcessStack {
+    let render = &config.render;
     let quality = render.requested_quality();
     let features = tier_features(quality);
     let (cycle_ticks, start_phase) = render.resolved_day_night();
     let daylight = visual::daylight_factor(tick, cycle_ticks, start_phase);
     let night = 1.0 - daylight;
-    let closed_bonus = if world.is_closed() { 0.18 } else { 0.0 };
-    let agent_count = world.agent_count().max(1) as f32;
-    let latest = world.history().last();
+    let closed_bonus = if closed { 0.18 } else { 0.0 };
+    let agent_count = agent_count.max(1) as f32;
     let (births_ratio, deaths_ratio) = latest
         .map(|summary| {
             (
@@ -13809,6 +13978,7 @@ fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> Po
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct AgentRenderData {
     agent_id: AgentId,
     position: Position,
@@ -13861,6 +14031,112 @@ struct CanvasState {
 }
 
 impl RenderFrame {
+    fn from_snapshot(snapshot: &RenderSnapshot, palette: ColorPaletteMode) -> Option<Self> {
+        let food = &snapshot.layers.food;
+        if food.width == 0 || food.height == 0 || !snapshot.agent_visuals_complete() {
+            return None;
+        }
+        let config = &snapshot.config;
+        let agents = snapshot
+            .world
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| {
+                let visual = snapshot.agent_visuals(index)?;
+                Some(AgentRenderData {
+                    agent_id: AgentId::from(slotmap::KeyData::from_ffi(agent.id)),
+                    position: Position::new(agent.position[0], agent.position[1]),
+                    color: agent.color,
+                    spike_length: agent.spike_length,
+                    velocity: Velocity {
+                        vx: agent.velocity[0],
+                        vy: agent.velocity[1],
+                    },
+                    heading: agent.heading,
+                    health: agent.health,
+                    age: agent.age,
+                    boost: if agent.boost { 1.0 } else { 0.0 },
+                    wheel_left: visual.wheel_left,
+                    wheel_right: visual.wheel_right,
+                    herbivore_tendency: agent.herbivore_tendency.clamp(0.0, 1.0),
+                    temperature_preference: visual.temperature_preference,
+                    food_delta: visual.food_delta,
+                    sound_level: visual.sound_level,
+                    sound_output: visual.sound_output,
+                    sound_multiplier: visual.sound_multiplier,
+                    trait_smell: visual.trait_smell,
+                    trait_sound: visual.trait_sound,
+                    trait_hearing: visual.trait_hearing,
+                    trait_eye: visual.trait_eye,
+                    trait_blood: visual.trait_blood,
+                    eye_dirs: visual.eye_direction,
+                    eye_fov: visual.eye_fov,
+                    selection: snapshot.agent_selection(index),
+                    indicator: visual.indicator,
+                    spike_extended: visual.spike_extended,
+                    spike_struck: visual.spike_struck,
+                    spike_victim: visual.spike_victim,
+                    reproduction_intent: visual.reproduction_intent,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let source = &snapshot.layers.terrain;
+        let terrain = TerrainLayer::from_tiles(
+            source.width,
+            source.height,
+            source.cell_size,
+            source
+                .tiles
+                .iter()
+                .map(|tile| TerrainTile {
+                    kind: tile.kind,
+                    elevation: tile.elevation,
+                    moisture: tile.moisture,
+                    accent: tile.accent,
+                    fertility_bias: tile.fertility_bias,
+                    temperature_bias: tile.temperature_bias,
+                    palette_index: tile.palette_index,
+                })
+                .collect(),
+        )
+        .ok()?;
+        let terrain = build_terrain_frame(
+            &terrain,
+            snapshot
+                .layers
+                .hydrology
+                .as_ref()
+                .map(|layer| layer.water_depth.as_slice()),
+        );
+        let (day_night_cycle_ticks, day_night_start_phase) = config.render.resolved_day_night();
+        Some(Self {
+            tick: snapshot.world.tick,
+            tonemap_mode: config.render.tonemap_mode,
+            day_night_cycle_ticks,
+            day_night_start_phase,
+            world_size: (config.world_width as f32, config.world_height as f32),
+            terrain,
+            food_dimensions: (food.width, food.height),
+            food_cell_size: config.food_cell_size,
+            food_cells: food.cells.clone(),
+            food_max: config.food_max,
+            agents,
+            agent_reference_age: u64::from(config.aging_health_decay_start.max(1)),
+            agent_base_radius: config.bot_radius.max(1.0),
+            sense_radius: config.sense_radius,
+            post_stack: post_process_stack(
+                snapshot.world.tick,
+                config,
+                snapshot.world.world.closed,
+                snapshot.world.agents.len(),
+                snapshot.summary_history.last(),
+                palette,
+            ),
+            palette,
+        })
+    }
+
     fn from_world(world: &WorldState, palette: ColorPaletteMode) -> Option<Self> {
         let food = world.food();
         let width = food.width();
@@ -17846,6 +18122,71 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn host_render_projection_preserves_every_frame_field_and_refuses_missing_visuals() {
+        use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(77),
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("projection parity world");
+        for (index, x) in [120.0, 360.0].into_iter().enumerate() {
+            let id = world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(x, 180.0),
+                    heading: 0.37 + index as f32,
+                    ..AgentData::default()
+                })
+                .expect("projection parity agent");
+            assert!(
+                world
+                    .try_update_agent_runtime(id, |runtime| {
+                        runtime.herbivore_tendency = 0.2 + index as f32 * 0.6;
+                        runtime.food_delta = 0.13 + index as f32 * 0.07;
+                        runtime.sound_multiplier = 1.2 + index as f32;
+                        runtime.indicator.intensity = 0.4;
+                        runtime.selection = if index == 0 {
+                            SelectionState::Selected
+                        } else {
+                            SelectionState::None
+                        };
+                    })
+                    .expect("set contrasting visual metadata")
+            );
+        }
+        let expected = ColorPaletteMode::ALL.map(|palette| {
+            RenderFrame::from_world(&world, palette).expect("owner-side reference frame")
+        });
+        assert_ne!(
+            expected[0].agents[0].food_delta,
+            expected[0].agents[1].food_delta
+        );
+        let host = HostCore::new(
+            HostSessionId::new(77),
+            world,
+            HostCoreOptions {
+                capture_agent_visuals: true,
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("projection parity host");
+        let snapshot = host.snapshot_hub().latest();
+        for (palette, expected) in ColorPaletteMode::ALL.into_iter().zip(expected) {
+            let actual = RenderFrame::from_snapshot(&snapshot, palette).expect("published frame");
+            assert_eq!(
+                actual, expected,
+                "every frame field must survive host publication for {palette:?}"
+            );
+        }
+        let mut missing_visuals = snapshot.as_ref().clone();
+        missing_visuals.agent_visuals = Arc::new(Vec::new());
+        assert!(RenderFrame::from_snapshot(&missing_visuals, ColorPaletteMode::Natural).is_none());
+    }
+
+    #[test]
     fn production_render_frame_layout_is_legible_at_both_supported_viewports() {
         let config = ScriptBotsConfig {
             world_width: 6_000,
@@ -18416,10 +18757,8 @@ mod command_characterization_tests {
     /// carrying two distinct parent UIDs, and explicitly NOT the `SpawnAgent`
     /// fallback. That is a claim the degenerate path cannot satisfy.
     ///
-    /// Reaching it needs `drain_into_world`, because selection is intent-based
-    /// (bd-37m): ctrl-a only submits an intent, so without a drain the world still
-    /// has zero selected agents when 'a' is pressed and crossover takes the
-    /// fallback every time.
+    /// Reaching it requires the real owner to apply selection first. Receipt
+    /// assertions keep a view-local highlight from satisfying that precondition.
     #[test]
     fn crossover_shortcut_submits_a_real_crossover_of_two_selected_parents() {
         let mut fixture = ShortcutFixture::install_with_agents(2);
@@ -18430,12 +18769,9 @@ mod command_characterization_tests {
         // Without this the whole test passes its intent assertions and then dies
         // at the population check, which reads exactly like a broken control —
         // this is a contract of the heredity bookkeeping, not a defect.
-        {
-            let mut world = fixture.world.lock().expect("shortcut world lock");
-            let _ = world.step();
-        }
+        fixture.world.apply(scriptbots_runtime::HostCommand::Step);
         assert_eq!(
-            fixture.world.lock().expect("world lock").agent_count(),
+            fixture.world.snapshot().world.agents.len(),
             2,
             "both seeded parents must survive the commit step, or the crossover below \
              has nothing to cross and would fail for an unrelated reason"
@@ -18450,14 +18786,15 @@ mod command_characterization_tests {
         );
 
         fixture.press("ctrl-a");
-        assert_eq!(
-            fixture.selected_agents(),
-            0,
-            "selection is intent-based (bd-37m): the renderer must NOT write selection \
-             directly, so the world must still show nothing selected before the drain"
+        let selection_receipts = fixture.applied_receipts();
+        assert_eq!(selection_receipts.len(), 1, "Ctrl-A must produce one host receipt");
+        assert!(
+            selection_receipts.iter().all(|status| matches!(
+                status.application(),
+                scriptbots_runtime::ApplicationState::Applied(_)
+            )),
+            "selection must have a real owner application receipt"
         );
-
-        fixture.drain_into_world();
         assert_eq!(
             fixture.selected_agents(),
             2,
@@ -18466,6 +18803,7 @@ mod command_characterization_tests {
         );
 
         let before = fixture.submitted().len();
+        let before_agents = fixture.world.snapshot().world.agents.len();
         fixture.press("a");
         let new_commands = fixture.submitted().split_off(before);
 
@@ -18504,14 +18842,14 @@ mod command_characterization_tests {
 
         // Close the chain to the world, exactly as the spawn shortcuts do: an
         // intent the world would reject is not a working control.
-        let before_agents = fixture.world.lock().expect("world lock").agent_count();
-        let dispositions = fixture.drain_into_world();
-        let after_agents = fixture.world.lock().expect("world lock").agent_count();
+        let dispositions = fixture.applied_receipts();
+        let after_agents = fixture.world.snapshot().world.agents.len();
 
         assert!(
-            dispositions
-                .iter()
-                .any(|disposition| matches!(disposition, ControlDisposition::WorldApplied)),
+            dispositions.iter().any(|status| matches!(
+                status.application(),
+                scriptbots_runtime::ApplicationState::Applied(_)
+            )),
             "the crossover intent must be applied by the world, got {dispositions:?}"
         );
         assert_eq!(
@@ -19046,12 +19384,10 @@ mod command_characterization_tests {
         app: gpui::TestApp,
         hud: gpui::WindowHandle<SimulationView>,
         canvas: gpui::WindowHandle<SimulationView>,
-        world: Arc<Mutex<WorldState>>,
+        world: Arc<TestHost>,
         submitted: Arc<Mutex<Vec<ControlCommand>>>,
-        /// The undrained queue, i.e. exactly what a real driver would pick up.
-        /// Held so `drain_into_world` can close the loop for controls whose
-        /// effect is only observable after intents are applied (bd-fjs5).
-        pending: Arc<Mutex<Vec<ControlCommand>>>,
+        /// Actual terminal receipts returned by the scientific owner.
+        applied: Arc<Mutex<Vec<scriptbots_runtime::CommandStatus>>>,
     }
 
     impl ShortcutFixture {
@@ -19071,37 +19407,38 @@ mod command_characterization_tests {
                         .expect("default agent is finite");
                 }
             }
-            // Two separate logs: `pending` is what the driver would drain, while
-            // `submitted` retains every intent for assertions. Draining must not
-            // erase the evidence a test is about to read.
-            let pending: Arc<Mutex<Vec<ControlCommand>>> = Arc::new(Mutex::new(Vec::new()));
+            let world = Arc::new(TestHost::new(
+                Arc::try_unwrap(world)
+                    .unwrap_or_else(|_| {
+                        panic!("shortcut fixture world still shared before ownership transfer")
+                    })
+                    .into_inner()
+                    .expect("shortcut fixture world"),
+            ));
+            let applied = Arc::new(Mutex::new(Vec::new()));
             let submitted: Arc<Mutex<Vec<ControlCommand>>> = Arc::new(Mutex::new(Vec::new()));
-            let drain = Arc::clone(&pending);
-            let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
-                Arc::new(move || {
-                    let mut commands = drain.lock().expect("shortcut command queue");
-                    std::mem::take(&mut *commands)
-                });
             let record = Arc::clone(&submitted);
-            let submit = Arc::clone(&pending);
+            let receipts = Arc::clone(&applied);
+            let command_host = Arc::clone(&world);
             let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
                 Arc::new(move |command| {
                     record
                         .lock()
                         .expect("shortcut submitted log")
                         .push(command.clone());
-                    submit.lock().expect("shortcut command queue").push(command);
-                    Some("test-cmd".to_owned())
+                    let command = scriptbots_runtime::HostCommand::try_from(command)
+                        .expect("shortcut host command");
+                    let status = command_host.apply(command);
+                    let id = status.command_id().to_string();
+                    receipts
+                        .lock()
+                        .expect("shortcut applied receipts")
+                        .push(status);
+                    Some(id)
                 });
-            let step_world = Arc::clone(&world);
-            let simulation_step: WorldStepDriver =
-                Arc::new(move || step_world.lock().expect("shortcut world lock").step());
             let session = Arc::new(GuiSession::new(
-                Arc::clone(&world),
-                simulation_step,
+                world.port.clone(),
                 AnalyticsSnapshotProvider::empty(),
-                identified(command_drain),
-                Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
                 command_submit,
             ));
             let mut app = gpui::TestApp::new();
@@ -19118,42 +19455,20 @@ mod command_characterization_tests {
                 canvas: windows.canvas,
                 world,
                 submitted,
-                pending,
+                applied,
             }
         }
 
-        /// Apply every queued intent to the world, then repaint — the step a real
-        /// driver performs and that this fixture deliberately omitted.
-        ///
-        /// Needed because selection is intent-based by design (bd-37m): the
-        /// renderer submits an intent and never writes selection itself, so a
-        /// control whose behaviour DEPENDS on current selection cannot be
-        /// exercised at all until something applies that intent. Draining takes
-        /// from `pending` only, so `submitted()` keeps the full evidence trail.
-        ///
-        /// Returns the dispositions in order, so a caller can assert the world
-        /// actually accepted the intents rather than trusting that a drain which
-        /// applied nothing was a drain that worked.
-        fn drain_into_world(&mut self) -> Vec<ControlDisposition> {
-            let commands = {
-                let mut queue = self.pending.lock().expect("shortcut command queue");
-                std::mem::take(&mut *queue)
-            };
-            let dispositions = {
-                let mut world = self.world.lock().expect("shortcut world lock");
-                commands
-                    .into_iter()
-                    .map(|command| {
-                        let label = format!("{command:?}");
-                        apply_control_command(&mut world, command).unwrap_or_else(|error| {
-                            panic!("drained intent {label} rejected: {error}")
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            };
+        /// Read real host application receipts and repaint both consumers.
+        fn applied_receipts(&mut self) -> Vec<scriptbots_runtime::CommandStatus> {
+            let receipts = self
+                .applied
+                .lock()
+                .expect("shortcut applied receipts")
+                .clone();
             force_production_repaint(&mut self.app, self.hud);
             force_production_repaint(&mut self.app, self.canvas);
-            dispositions
+            receipts
         }
 
         /// Step the world and repaint until the playback timeline holds
@@ -19168,10 +19483,7 @@ mod command_characterization_tests {
                 if self.read(|view| view.playback.timeline.len()) >= frames {
                     return;
                 }
-                {
-                    let mut world = self.world.lock().expect("shortcut world lock");
-                    let _ = world.step();
-                }
+                self.world.apply(scriptbots_runtime::HostCommand::Step);
                 force_production_repaint(&mut self.app, self.hud);
             }
             let recorded = self.read(|view| view.playback.timeline.len());
@@ -19196,11 +19508,10 @@ mod command_characterization_tests {
         /// of it would look correct here while the simulation disagreed.
         fn selected_agents(&self) -> usize {
             self.world
-                .lock()
-                .expect("shortcut world lock")
-                .runtime()
+                .snapshot()
+                .agent_selection
                 .iter()
-                .filter(|(_, entry)| matches!(entry.selection, SelectionState::Selected))
+                .filter(|selection| matches!(selection, SelectionState::Selected))
                 .count()
         }
 

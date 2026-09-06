@@ -32,26 +32,33 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Widget},
 };
+#[cfg(test)]
+use scriptbots_core::{AgentId, ControlDisposition, TerrainLayer, WorldState};
 use scriptbots_core::{
-    AgentId, BrainActivations, BrainInspectionClientId, BrainInspectionRequest,
-    BrainInspectionRevision, ControlCommand, ControlDisposition, ControlSettings, NUM_EYES,
-    SENSOR_LAYOUT, SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer,
-    TickSummary, WorldState, apply_control_command,
+    BrainActivations, BrainInspectionClientId, BrainInspectionRevision, ControlCommand,
+    ControlSettings, NUM_EYES, SENSOR_LAYOUT, SensorAttribution, SensorKind, SimulationCommand,
+    TerrainKind, TickSummary,
     attribution::{AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs},
     narrative::{EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord},
     visual,
+};
+use scriptbots_runtime::{
+    BrainProjectionRequest, HostPort, ProjectionClientId, ProjectionRequestRevision,
+    RenderSnapshot, channel::ChannelHostPort,
 };
 #[cfg(test)]
 use scriptbots_storage::AnalyticsSnapshotProvider;
 use scriptbots_storage::MetricReading;
 use serde::Serialize;
+#[cfg(test)]
 use slotmap::Key;
 use supports_color::{ColorLevel, Stream, on_cached};
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+use crate::SharedWorld;
 use crate::{
-    CommandDrain, CommandOutcome, CommandReporter, CommandSubmit, ControlRuntime,
-    ScenarioIdentityV0, SharedAnalytics, SharedWorld, WorldStepDriver,
+    CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics,
     renderer::{Renderer, RendererContext},
 };
 
@@ -83,7 +90,6 @@ use canvas_ramps::HeadingSector;
 const PROBE_CONE_ROWS: usize = 6;
 
 const TARGET_SIM_HZ: f32 = 60.0;
-const MAX_STEPS_PER_FRAME: usize = 240;
 const UI_TICK_MILLIS: u64 = 100;
 const DEFAULT_HEADLESS_FRAMES: usize = 12;
 const MAX_HEADLESS_FRAMES: usize = 360;
@@ -377,12 +383,10 @@ impl TerminalRenderer {
             // bd-2z0.8.9.8: ask the final tick's batch to carry the canonical world digest
             // so replay verification can compare final science state.
             if frame_index + 1 == frames {
-                app.world
-                    .lock()
-                    .expect("terminal world mutex poisoned")
-                    .request_replay_world_digest();
+                app.host.request_replay_world_digest()?;
             }
-            app.step_once();
+            app.submit_and_wait(ControlCommand::Step)?;
+            app.refresh_snapshot();
             terminal.draw(|frame| app.draw(frame))?;
             let backend_buffer = terminal.backend().buffer();
             // The layout is read back from the app AFTER the draw, so the regions
@@ -397,22 +401,19 @@ impl TerminalRenderer {
             report.record(app.snapshot(), evidence);
         }
 
-        let world_digest = match app.world.lock() {
-            Ok(world) => match world.world_digest_v1() {
-                Ok(digest) => {
-                    tracing::info!(
-                        tick = app.snapshot().tick,
-                        world_digest = %digest.overall,
-                        "captured final world digest for the replay stream"
-                    );
-                    Some(digest.overall)
-                }
-                Err(error) => {
-                    tracing::warn!("failed to capture final world digest: {error}");
-                    None
-                }
-            },
-            Err(_) => None,
+        let world_digest = match app.host.scientific_digest_v1() {
+            Ok(digest) => {
+                tracing::info!(
+                    tick = app.snapshot().tick,
+                    world_digest = %digest.overall,
+                    "captured final world digest for the replay stream"
+                );
+                Some(digest.overall)
+            }
+            Err(error) => {
+                tracing::warn!("failed to capture final world digest: {error}");
+                None
+            }
         };
 
         report.finalize(world_digest);
@@ -447,12 +448,9 @@ enum FocusLockMode {
 }
 
 struct TerminalApp<'a> {
-    world: SharedWorld,
-    simulation_step: WorldStepDriver,
+    host: ChannelHostPort,
     analytics_provider: SharedAnalytics,
     control: &'a ControlRuntime,
-    command_drain: CommandDrain,
-    command_reporter: CommandReporter,
     command_submit: CommandSubmit,
     scenario: Arc<ScenarioIdentityV0>,
     tick_interval: Duration,
@@ -460,7 +458,6 @@ struct TerminalApp<'a> {
     speed_multiplier: f32,
     paused: bool,
     help_visible: bool,
-    sim_accumulator: f32,
     last_tick: Instant,
     last_draw: Instant,
     palette: Palette,
@@ -572,6 +569,12 @@ struct TerminalApp<'a> {
 
 impl<'a> TerminalApp<'a> {
     fn new(renderer: &TerminalRenderer, ctx: RendererContext<'a>) -> Self {
+        let snapshot = ctx
+            .host
+            .clone()
+            .snapshot_after(None)
+            .expect("host snapshot access")
+            .expect("host publishes its initial snapshot before starting a renderer");
         let mut palette = Palette::detect();
         // Adopt the run's configured chrome theme. bd-2z0.14.2.2's V11 reopen
         // recorded that core's TuiThemeId was declared but never consumed, so a
@@ -579,11 +582,7 @@ impl<'a> TerminalApp<'a> {
         // painted. Read from the world's own config rather than plumbing a new
         // field through RendererContext, which every renderer implements.
         {
-            let configured = ctx
-                .world
-                .lock()
-                .map(|world| world.config().render.theme)
-                .unwrap_or_default();
+            let configured = snapshot.config.render.theme;
             palette.apply_config_theme(configured);
             info!(
                 theme = palette.theme_label(),
@@ -600,13 +599,9 @@ impl<'a> TerminalApp<'a> {
             "terminal sub-cell canvas capability probed"
         );
         let (terrain, day_night, config_reduced_motion, quality) = {
-            let world = ctx
-                .world
-                .lock()
-                .expect("world mutex poisoned while capturing terrain");
-            let render = &world.config().render;
+            let render = &snapshot.config.render;
             (
-                TerrainView::from_layers(world.terrain(), world.hydrology()),
+                TerrainView::from_snapshot(&snapshot),
                 render.resolved_day_night(),
                 render.reduced_motion,
                 render.quality,
@@ -633,12 +628,9 @@ impl<'a> TerminalApp<'a> {
             "terminal motion policy resolved"
         );
         let mut app = Self {
-            world: Arc::clone(&ctx.world),
-            simulation_step: Arc::clone(&ctx.simulation_step),
+            host: ctx.host.clone(),
             analytics_provider: ctx.analytics.clone(),
             control: ctx.control_runtime,
-            command_drain: Arc::clone(&ctx.command_drain),
-            command_reporter: ctx.control_runtime.command_reporter(),
             command_submit: Arc::clone(&ctx.command_submit),
             scenario: Arc::clone(&ctx.scenario),
             tick_interval: renderer.tick_interval,
@@ -646,7 +638,6 @@ impl<'a> TerminalApp<'a> {
             speed_multiplier: 1.0,
             paused: false,
             help_visible: false,
-            sim_accumulator: 0.0,
             last_tick: Instant::now(),
             last_draw: Instant::now(),
             palette,
@@ -708,15 +699,62 @@ impl<'a> TerminalApp<'a> {
             .map_err(|detail| anyhow!("control runtime failed while the TUI was active: {detail}"))
     }
 
-    fn submit_simulation_command(&self, command: SimulationCommand) {
+    fn submit_simulation_command(&mut self, command: ControlCommand) {
         // `CommandSubmit` now yields the receipt id on admission rather than a
         // bare bool, so a rejection is `None` and a success carries something an
         // operator can correlate with the command ledger.
-        match (self.command_submit.as_ref())(ControlCommand::UpdateSimulation(command)) {
+        match (self.command_submit.as_ref())(command) {
             Some(receipt) => {
                 debug!(%receipt, "simulation command enqueued");
             }
-            None => warn!("terminal renderer failed to enqueue simulation command"),
+            None => {
+                warn!("terminal renderer failed to enqueue simulation command");
+                if let Ok(Some(snapshot)) = self.host.snapshot_after(None) {
+                    self.paused = snapshot.playback.paused;
+                    self.speed_multiplier = snapshot.playback.speed_multiplier;
+                }
+            }
+        }
+    }
+
+    /// Explicit batch-mode command barrier. Repainting never invokes this;
+    /// only a requested headless science step waits for its own receipt.
+    fn submit_and_wait(&mut self, command: ControlCommand) -> Result<()> {
+        let receipt = (self.command_submit)(command)
+            .ok_or_else(|| anyhow!("terminal host rejected command submission"))?;
+        let command_id = receipt
+            .parse::<scriptbots_runtime::CommandId>()
+            .context("terminal command receipt is not a host command identity")?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            self.ensure_control_runtime_running()?;
+            let status = self
+                .host
+                .command_status(command_id)?
+                .ok_or_else(|| anyhow!("terminal command {receipt} lost its admitted identity"))?;
+            match status.application() {
+                scriptbots_runtime::ApplicationState::Applied(applied) => {
+                    if self.host.snapshot_after(None)?.is_some_and(|snapshot| {
+                        snapshot.world.tick >= applied.tick.0
+                            && snapshot.revisions.control >= applied.revisions.control
+                            && snapshot.revisions.config >= applied.revisions.config
+                            && snapshot.revisions.scientific >= applied.revisions.scientific
+                    }) {
+                        return Ok(());
+                    }
+                }
+                scriptbots_runtime::ApplicationState::Admitted => {}
+                failure => {
+                    return Err(anyhow!(
+                        "terminal command {receipt} did not apply: {failure:?}"
+                    ));
+                }
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "terminal command {receipt} remained admitted beyond the 30-second wait"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
         }
     }
 
@@ -738,19 +776,22 @@ impl<'a> TerminalApp<'a> {
     /// every other setting in the run — world size, seed, thresholds — which is a
     /// far worse bug than the one being fixed, and it would look like a theme
     /// change in the journal.
-    fn persist_theme_choice(&self, theme: CuratedThemeId) {
-        let mut config = match self.world.lock() {
-            Ok(world) => world.config().clone(),
-            Err(_) => {
-                warn!("terminal world mutex poisoned; chrome theme not persisted");
-                return;
+    fn persist_theme_choice(&self, theme: CuratedThemeId) -> Option<String> {
+        let mut config = match self.host.clone().snapshot_after(None) {
+            Ok(Some(snapshot)) => snapshot.config.as_ref().clone(),
+            outcome => {
+                warn!(
+                    ?outcome,
+                    "terminal host snapshot unavailable; chrome theme not submitted"
+                );
+                return None;
             }
         };
         if config.render.theme == Some(theme.to_config()) {
             // Already recorded. Skipping keeps the journal free of no-op config
             // rows, which matter here: a replay reader counting interventions
             // should not see one per keypress that changed nothing.
-            return;
+            return None;
         }
         config.render.theme = Some(theme.to_config());
         if let Some(receipt) =
@@ -778,6 +819,7 @@ impl<'a> TerminalApp<'a> {
                 %receipt,
                 "chrome theme change enqueued for the run config"
             );
+            Some(receipt)
         } else {
             // Surfaced rather than swallowed: a theme that silently fails to
             // persist is exactly the bug this method exists to fix, wearing a
@@ -786,48 +828,8 @@ impl<'a> TerminalApp<'a> {
                 theme = theme.label(),
                 "terminal renderer failed to enqueue the chrome theme config update"
             );
+            None
         }
-    }
-
-    /// Drain the command bus and hand back what this surface submitted.
-    ///
-    /// Test-only. Draining is destructive by nature, so production must never
-    /// call this — the tick loop owns the real drain and would lose commands to a
-    /// competing reader.
-    #[cfg(test)]
-    fn drain_submitted_control_commands(&self) -> Vec<ControlCommand> {
-        // The bus now carries `BusCommand { id, command }` so an applier can
-        // report against the admitted identity. These tests assert on the command
-        // itself, so the id is dropped here rather than threaded through every
-        // assertion.
-        (self.command_drain.as_ref())()
-            .into_iter()
-            .map(|bus| bus.command)
-            .collect()
-    }
-
-    fn apply_simulation_commands(&mut self, commands: Vec<SimulationCommand>) -> bool {
-        if commands.is_empty() {
-            return false;
-        }
-
-        let mut force_step = false;
-        for command in commands {
-            if let Some(paused) = command.paused {
-                self.paused = paused;
-                if paused {
-                    self.sim_accumulator = 0.0;
-                }
-            }
-            if let Some(speed) = command.speed_multiplier {
-                self.speed_multiplier = speed;
-            }
-            if command.step_once {
-                force_step = true;
-                self.paused = true;
-            }
-        }
-        force_step
     }
 
     fn maybe_step_simulation(&mut self, now: Instant) {
@@ -835,104 +837,14 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn advance_simulation(&mut self, now: Instant, single_step: bool) {
-        let delta = now - self.last_tick;
         self.last_tick = now;
-
-        let mut force_step = single_step;
-        let mut latched_fault = None;
-        let mut playback = Vec::new();
-        if let Ok(mut world) = self.world.lock() {
-            // Drain commands unconditionally so receipts always advance past admitted,
-            // even if a simulation fault or latched step error is present (bd-brvp).
-            for bus in (self.command_drain.as_ref())() {
-                let receipt = bus.id;
-                match apply_control_command(&mut world, bus.command) {
-                    Ok(ControlDisposition::WorldApplied) => {
-                        (self.command_reporter)(&receipt, CommandOutcome::Applied);
-                    }
-                    Ok(ControlDisposition::Playback(command)) => {
-                        (self.command_reporter)(&receipt, CommandOutcome::Applied);
-                        playback.push(command);
-                    }
-                    Err(error) => {
-                        (self.command_reporter)(&receipt, CommandOutcome::Rejected);
-                        warn!(%error, %receipt, "terminal rejected a drained control command");
-                    }
-                }
-            }
-            if let Some(error) = world.latched_step_error() {
-                latched_fault = Some(Arc::<str>::from(error.to_string()));
-            }
-        }
-        if self.apply_simulation_commands(playback) {
-            force_step = true;
-        }
-        if let Some(error) = latched_fault {
-            self.simulation_fault = Some(error);
-            if !force_step && self.paused {
-                self.sim_accumulator = 0.0;
-                self.refresh_snapshot();
-                return;
-            }
-        }
-
         if single_step {
-            self.paused = true;
-            self.sim_accumulator = 0.0;
+            self.submit_simulation_command(ControlCommand::Step);
         }
-
-        let mut steps = 0usize;
-
-        let effective_speed = if self.paused {
-            0.0
-        } else {
-            self.speed_multiplier.max(0.0)
-        };
-
-        let step_interval = self.tick_interval.as_secs_f32();
-        if effective_speed > f32::EPSILON && step_interval > f32::EPSILON {
-            self.sim_accumulator += delta.as_secs_f32() * effective_speed;
-            let max_accumulator = step_interval * MAX_STEPS_PER_FRAME as f32;
-            if self.sim_accumulator > max_accumulator {
-                self.sim_accumulator = max_accumulator;
-            }
-            steps = (self.sim_accumulator / step_interval).floor() as usize;
-            if steps > MAX_STEPS_PER_FRAME {
-                steps = MAX_STEPS_PER_FRAME;
-            }
-            if steps > 0 {
-                self.sim_accumulator -= step_interval * steps as f32;
-            }
-        }
-
-        if force_step {
-            steps = steps.max(1);
-            self.paused = true;
-        }
-
-        let mut step_error = None;
-        for _ in 0..steps {
-            if !self.scenario.interventions.is_empty() {
-                self.apply_due_interventions();
-                // After the world has stepped, report anything core actually
-                // applied or expired — including interventions this surface did
-                // not issue, such as a scripted scenario or another surface.
-                self.report_applied_interventions();
-            }
-            if let Err(error) = (self.simulation_step)() {
-                step_error = Some(Arc::<str>::from(error.to_string()));
-                break;
-            }
-        }
-
+        // The owner thread advances science at its own deadlines. Reading a
+        // publication or repainting this surface never creates another tick.
         self.refresh_snapshot();
-        if let Some(error) = step_error {
-            self.paused = true;
-            self.sim_accumulator = 0.0;
-            self.simulation_fault = Some(error);
-        } else if steps > 0 {
-            self.simulation_fault = None;
-        }
+        self.report_applied_interventions();
     }
 
     fn step_once(&mut self) {
@@ -1030,12 +942,12 @@ impl<'a> TerminalApp<'a> {
     /// draw from a resilience experiment.
     fn report_applied_interventions(&mut self) {
         let fresh: Vec<(u64, String, EventKind)> = {
-            let world = match self.world.lock() {
-                Ok(world) => world,
-                Err(_) => return,
+            let world = match self.host.clone().snapshot_after(None) {
+                Ok(Some(world)) => world,
+                _ => return,
             };
             world
-                .applied_interventions()
+                .applied_interventions
                 .iter()
                 .filter(|record| record.seq > self.intervention_watermark)
                 .map(|record| {
@@ -2980,6 +2892,17 @@ impl<'a> TerminalApp<'a> {
         match action {
             CommandPaletteAction::TogglePause => {
                 self.paused = !self.paused;
+                self.submit_simulation_command(ControlCommand::UpdateSimulation(
+                    SimulationCommand {
+                        paused: Some(self.paused),
+                        speed_multiplier: Some(if self.paused {
+                            0.0
+                        } else {
+                            self.speed_multiplier.max(1.0)
+                        }),
+                        step_once: false,
+                    },
+                ));
                 self.push_toast(if self.paused { "Paused" } else { "Resumed" });
             }
             CommandPaletteAction::StepOnce => {
@@ -2989,10 +2912,24 @@ impl<'a> TerminalApp<'a> {
             }
             CommandPaletteAction::SpeedUp => {
                 self.speed_multiplier = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
+                self.submit_simulation_command(ControlCommand::UpdateSimulation(
+                    SimulationCommand {
+                        paused: Some(false),
+                        speed_multiplier: Some(self.speed_multiplier),
+                        step_once: false,
+                    },
+                ));
                 self.push_toast(format!("Speed: {:.1}x", self.speed_multiplier));
             }
             CommandPaletteAction::SpeedDown => {
                 self.speed_multiplier = (self.speed_multiplier - 0.5).max(0.0);
+                self.submit_simulation_command(ControlCommand::UpdateSimulation(
+                    SimulationCommand {
+                        paused: Some(self.speed_multiplier == 0.0),
+                        speed_multiplier: Some(self.speed_multiplier),
+                        step_once: false,
+                    },
+                ));
                 self.push_toast(format!("Speed: {:.1}x", self.speed_multiplier));
             }
             CommandPaletteAction::CycleTheme => {
@@ -3195,22 +3132,26 @@ impl<'a> TerminalApp<'a> {
                     self.speed_multiplier = 1.0;
                 }
                 self.push_toast(if self.paused { "Paused" } else { "Resumed" });
-                self.submit_simulation_command(SimulationCommand {
-                    paused: Some(self.paused),
-                    speed_multiplier: Some(self.speed_multiplier),
-                    step_once: false,
-                });
+                self.submit_simulation_command(ControlCommand::UpdateSimulation(
+                    SimulationCommand {
+                        paused: Some(self.paused),
+                        speed_multiplier: Some(self.speed_multiplier),
+                        step_once: false,
+                    },
+                ));
             }
             (KeyCode::Char('+') | KeyCode::Char('='), _) => {
                 self.speed_multiplier = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
                 if self.speed_multiplier > 0.0 {
                     self.paused = false;
                 }
-                self.submit_simulation_command(SimulationCommand {
-                    paused: Some(self.paused),
-                    speed_multiplier: Some(self.speed_multiplier),
-                    step_once: false,
-                });
+                self.submit_simulation_command(ControlCommand::UpdateSimulation(
+                    SimulationCommand {
+                        paused: Some(self.paused),
+                        speed_multiplier: Some(self.speed_multiplier),
+                        step_once: false,
+                    },
+                ));
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,
@@ -3222,11 +3163,13 @@ impl<'a> TerminalApp<'a> {
                 if self.speed_multiplier <= 0.0 {
                     self.paused = true;
                 }
-                self.submit_simulation_command(SimulationCommand {
-                    paused: Some(self.paused),
-                    speed_multiplier: Some(self.speed_multiplier),
-                    step_once: false,
-                });
+                self.submit_simulation_command(ControlCommand::UpdateSimulation(
+                    SimulationCommand {
+                        paused: Some(self.paused),
+                        speed_multiplier: Some(self.speed_multiplier),
+                        step_once: false,
+                    },
+                ));
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,
@@ -3544,45 +3487,62 @@ impl<'a> TerminalApp<'a> {
         let cached_inspection = self.brain_inspection_cache.clone();
         let mut next_inspection_cache = None;
         let mut request_issued = false;
-        let new_snapshot = match self.world.lock() {
-            Ok(world) => {
-                let mut snap = Snapshot::from_world(&world);
+        let new_snapshot = match self.host.clone().snapshot_after(None) {
+            Ok(Some(world)) => {
+                self.paused = world.playback.paused;
+                self.speed_multiplier = world.playback.speed_multiplier;
+                self.terrain = TerrainView::from_snapshot(&world);
+                let mut snap = Snapshot::from_render(&world);
                 // Determine focused agent id
-                let agent_id_opt = match self.focus_lock {
-                    FocusLockMode::Manual => {
-                        if snap.agent_count > 0 {
-                            world
-                                .agents()
-                                .iter_handles()
-                                .nth(self.focused_agent_cursor % snap.agent_count)
-                        } else {
-                            None
+                let agent_id_opt =
+                    match self.focus_lock {
+                        FocusLockMode::Manual => {
+                            if snap.agent_count > 0 {
+                                world
+                                    .world
+                                    .agents
+                                    .get(self.focused_agent_cursor % snap.agent_count)
+                            } else {
+                                None
+                            }
                         }
-                    }
-                    FocusLockMode::TopPredator => snap.leaderboard.first().and_then(|e| {
-                        world
-                            .agents()
-                            .iter_handles()
-                            .find(|h| h.data().as_ffi() == e.handle)
-                    }),
-                    FocusLockMode::Oldest => snap.oldest.first().and_then(|e| {
-                        world
-                            .agents()
-                            .iter_handles()
-                            .find(|h| h.data().as_ffi() == e.handle)
-                    }),
-                };
-                if let Some(agent_uid) = agent_id_opt.and_then(|id| world.agent_uid(id)) {
+                        FocusLockMode::TopPredator => snap.leaderboard.first().and_then(|e| {
+                            world.world.agents.iter().find(|agent| agent.id == e.handle)
+                        }),
+                        FocusLockMode::Oldest => snap.oldest.first().and_then(|e| {
+                            world.world.agents.iter().find(|agent| agent.id == e.handle)
+                        }),
+                    };
+                if let Some(agent_uid) = agent_id_opt.map(|agent| agent.uid) {
                     snap.focused_agent_uid = Some(agent_uid.get());
-                    if let Some(id) = agent_id_opt
-                        && let Some(runtime) = world.agent_runtime(id)
-                    {
-                        snap.focused_brain_bound = runtime.brain.is_bound();
-                        snap.focused_outputs = Some(runtime.outputs);
+                    match self.host.inspect_agent(
+                        agent_uid,
+                        if self.probe_enabled {
+                            PROBE_MAX_CONTRIBUTORS
+                        } else {
+                            0
+                        },
+                    ) {
+                        Ok(Some(detail)) if detail.source.matches_snapshot(&world) => {
+                            snap.focused_brain_bound = detail.brain_bound;
+                            snap.focused_outputs = Some(detail.outputs);
+                            if self.probe_enabled {
+                                snap.probe =
+                                    detail.sensor_attribution.map(|attribution| ProbeSnapshot {
+                                        agent_uid: agent_uid.get(),
+                                        attribution,
+                                    });
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(%error, agent_uid = agent_uid.get(), "terminal agent inspection failed")
+                        }
                     }
                     if let Some(cached) = cached_inspection.as_ref().filter(|cached| {
                         cached.metadata.agent_uid == agent_uid.get()
-                            && cached.metadata.source_tick == world.tick().0
+                            && cached.metadata.source_tick == world.world.tick
+                            && cached.source_revision == world.revision
                     }) {
                         snap.brain_layers.clone_from(&cached.layers);
                         snap.brain_inspection = Some(cached.metadata);
@@ -3590,13 +3550,15 @@ impl<'a> TerminalApp<'a> {
                         next_inspection_cache = Some(cached.clone());
                     } else {
                         request_issued = true;
-                        let request = BrainInspectionRequest::single(
-                            TERMINAL_BRAIN_INSPECTION_CLIENT_ID,
-                            next_request_revision,
+                        let request = BrainProjectionRequest::focused(
+                            ProjectionClientId::new(TERMINAL_BRAIN_INSPECTION_CLIENT_ID.get()),
+                            ProjectionRequestRevision::new(next_request_revision.get()),
                             agent_uid,
                         );
-                        let cache = match world.inspect_brains(&request) {
-                            Ok(response) => {
+                        let cache = match self.host.project_brain(&request) {
+                            Ok(projection) => {
+                                let coherent = projection.source.matches_snapshot(&world);
+                                let response = projection.inspection;
                                 let mut metadata = BrainInspectionViewMetadata {
                                     agent_uid: agent_uid.get(),
                                     source_tick: response.source_tick.0,
@@ -3615,10 +3577,15 @@ impl<'a> TerminalApp<'a> {
                                         convert_layers(&telemetry.inspection.activations)
                                     },
                                 );
-                                let activations = response
-                                    .ready_for(agent_uid)
-                                    .map(|telemetry| telemetry.inspection.activations.clone());
+                                let activations = coherent
+                                    .then(|| {
+                                        response.ready_for(agent_uid).map(|telemetry| {
+                                            telemetry.inspection.activations.clone()
+                                        })
+                                    })
+                                    .flatten();
                                 TerminalBrainInspectionCache {
+                                    source_revision: projection.source.published_snapshot,
                                     metadata,
                                     layers,
                                     activations,
@@ -3632,9 +3599,10 @@ impl<'a> TerminalApp<'a> {
                                     "terminal brain inspection failed"
                                 );
                                 TerminalBrainInspectionCache {
+                                    source_revision: world.revision,
                                     metadata: BrainInspectionViewMetadata {
                                         agent_uid: agent_uid.get(),
-                                        source_tick: world.tick().0,
+                                        source_tick: world.world.tick,
                                         request_revision: next_request_revision.get(),
                                         truncated: false,
                                         retained_payload_bytes: 0,
@@ -3651,25 +3619,13 @@ impl<'a> TerminalApp<'a> {
                         next_inspection_cache = Some(cache);
                     }
                 }
-                // Egocentric sense probe (bd-16g.4.2): attribution is computed
-                // in core under this same lock; the panel renders it verbatim.
-                snap.probe = if self.probe_enabled {
-                    agent_id_opt.and_then(|agent_id| {
-                        world.agent_uid(agent_id).and_then(|agent_uid| {
-                            world.explain_sensors(agent_id, PROBE_MAX_CONTRIBUTORS).map(
-                                |attribution| ProbeSnapshot {
-                                    agent_uid: agent_uid.get(),
-                                    attribution,
-                                },
-                            )
-                        })
-                    })
-                } else {
-                    None
-                };
                 snap
             }
-            Err(_) => return,
+            Ok(None) => return,
+            Err(error) => {
+                self.simulation_fault = Some(Arc::from(error.to_string()));
+                return;
+            }
         };
         self.brain_inspection_cache = next_inspection_cache;
         if request_issued {
@@ -3802,6 +3758,7 @@ impl<'a> TerminalApp<'a> {
             }
             self.paused = true;
             self.speed_multiplier = 0.0;
+            self.submit_simulation_command(ControlCommand::Pause);
         }
     }
 }
@@ -4090,6 +4047,7 @@ struct BrainInspectionViewMetadata {
 
 #[derive(Clone, Debug)]
 struct TerminalBrainInspectionCache {
+    source_revision: scriptbots_runtime::SnapshotRevision,
     metadata: BrainInspectionViewMetadata,
     layers: Vec<BrainLayerView>,
     /// The raw bounded activation snapshot the layer views were converted from;
@@ -4254,11 +4212,46 @@ struct TerrainView {
 }
 
 impl TerrainView {
+    fn from_snapshot(snapshot: &RenderSnapshot) -> Self {
+        let terrain = &snapshot.layers.terrain;
+        let water_depth = match snapshot.layers.hydrology.as_ref() {
+            Some(hydro) if hydro.width == terrain.width && hydro.height == terrain.height => {
+                let raw = &hydro.water_depth;
+                let max_depth = raw.iter().copied().fold(0.0_f32, f32::max);
+                raw.iter()
+                    .map(|&depth| {
+                        if max_depth > 0.0 {
+                            (depth / max_depth).clamp(0.0, 1.0)
+                        } else {
+                            depth.clamp(0.0, 1.0)
+                        }
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        Self {
+            width: terrain.width,
+            height: terrain.height,
+            kinds: terrain.tiles.iter().map(|tile| tile.kind).collect(),
+            elevations: terrain.tiles.iter().map(|tile| tile.elevation).collect(),
+            moisture: terrain.tiles.iter().map(|tile| tile.moisture).collect(),
+            fertility: terrain
+                .tiles
+                .iter()
+                .map(|tile| tile.fertility_bias)
+                .collect(),
+            water_depth,
+        }
+    }
+
+    #[cfg(test)]
     #[allow(dead_code)]
     fn from(terrain: &TerrainLayer) -> Self {
         Self::from_layers(terrain, None)
     }
 
+    #[cfg(test)]
     fn from_layers(
         terrain: &TerrainLayer,
         hydrology: Option<&scriptbots_core::HydrologyState>,
@@ -4623,18 +4616,17 @@ impl MortalityCause {
 }
 
 impl Snapshot {
-    fn from_world(world: &WorldState) -> Self {
-        let config = world.config();
-        let agent_count = world.agent_count();
+    fn from_render(snapshot: &RenderSnapshot) -> Self {
+        let config = snapshot.config.as_ref();
+        let agent_count = snapshot.world.agents.len();
         let world_width = config.world_width.max(1) as f32;
         let world_height = config.world_height.max(1) as f32;
 
-        let summary = world
-            .history()
-            .next_back()
-            .cloned()
+        let summary = snapshot
+            .completed_summary
+            .clone()
             .unwrap_or_else(|| TickSummary {
-                tick: world.tick(),
+                tick: scriptbots_core::Tick(snapshot.world.tick),
                 agent_count,
                 births: 0,
                 deaths: 0,
@@ -4644,8 +4636,9 @@ impl Snapshot {
                 max_age: 0,
                 spike_hits: 0,
             });
-        let history: Vec<HistoryEntry> = world
-            .history()
+        let history: Vec<HistoryEntry> = snapshot
+            .summary_history
+            .iter()
             .rev()
             .take(32)
             .map(|entry| HistoryEntry {
@@ -4657,43 +4650,30 @@ impl Snapshot {
             })
             .collect();
 
-        let handles: Vec<AgentId> = world.agents().iter_handles().collect();
-        let columns = world.agents().columns();
-        let runtimes = world.runtime();
-
-        let mut agents = Vec::with_capacity(handles.len());
+        let mut agents = Vec::with_capacity(agent_count);
         let mut diet_split = DietSplit::default();
         let mut boosted_count = 0usize;
-        let mut hybrid_count = 0usize;
         let mut energy_min = f32::INFINITY;
         let mut energy_max = f32::NEG_INFINITY;
         let mut health_acc = 0.0_f32;
         let mut age_acc = 0.0_f64;
         let mut max_age = 0u32;
 
-        for (idx, id) in handles.iter().enumerate() {
-            let position = columns.positions()[idx];
-            let heading = columns.headings()[idx];
-            let health = columns.health()[idx];
-            let age = columns.ages()[idx];
-            let generation = columns.generations()[idx].0;
-            let runtime = runtimes.get(*id);
-
-            let energy = runtime.map(|rt| rt.energy).unwrap_or(0.0);
-            let diet = runtime
-                .map(|rt| DietClass::from_tendency(rt.herbivore_tendency))
-                .unwrap_or(DietClass::Omnivore);
-            let boosted = columns.boosts()[idx];
-            let hybrid = runtime.map(|rt| rt.hybrid).unwrap_or(false);
-            let spike_length = columns.spike_lengths()[idx];
-            let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
+        for agent in &snapshot.world.agents {
+            let position = agent.position;
+            let heading = agent.heading;
+            let health = agent.health;
+            let age = agent.age;
+            let generation = agent.generation.0;
+            let energy = agent.energy;
+            let diet = DietClass::from_tendency(agent.herbivore_tendency);
+            let boosted = agent.boost;
+            let spike_length = agent.spike_length;
+            let tendency = agent.herbivore_tendency;
 
             diet_split.increment(diet);
             if boosted {
                 boosted_count += 1;
-            }
-            if hybrid {
-                hybrid_count += 1;
             }
 
             energy_min = energy_min.min(energy);
@@ -4702,16 +4682,16 @@ impl Snapshot {
             age_acc += f64::from(age);
             max_age = max_age.max(age);
 
-            let normalized_x = (position.x / world_width)
+            let normalized_x = (position[0] / world_width)
                 .rem_euclid(1.0)
                 .clamp(0.0, 0.9999);
-            let normalized_y = (position.y / world_height)
+            let normalized_y = (position[1] / world_height)
                 .rem_euclid(1.0)
                 .clamp(0.0, 0.9999);
 
             agents.push(AgentViz {
-                id: id.data().as_ffi(),
-                uid: world.agent_uid(*id).map(|uid| uid.get()),
+                id: agent.id,
+                uid: Some(agent.uid.get()),
                 position: (normalized_x, normalized_y),
                 heading,
                 diet,
@@ -4782,8 +4762,8 @@ impl Snapshot {
         oldest.sort_by_key(|entry| Reverse(entry.age));
         oldest.truncate(LEADERBOARD_LIMIT);
 
-        let food_grid = world.food();
-        let food_cells = food_grid.cells().to_vec();
+        let food_grid = &snapshot.layers.food;
+        let food_cells = food_grid.cells.clone();
         let food_max = food_cells
             .iter()
             .fold(0.0_f32, |acc, value| acc.max(*value));
@@ -4795,7 +4775,7 @@ impl Snapshot {
 
         Self {
             tick: summary.tick.0,
-            epoch: world.epoch(),
+            epoch: snapshot.world.epoch,
             agent_count,
             births: summary.births,
             deaths: summary.deaths,
@@ -4804,7 +4784,7 @@ impl Snapshot {
             avg_age,
             max_age,
             boosted_count,
-            hybrid_count,
+            hybrid_count: snapshot.hybrid_count,
             energy_min,
             energy_max,
             history,
@@ -4814,8 +4794,8 @@ impl Snapshot {
             leaderboard,
             oldest,
             food: FoodView {
-                width: food_grid.width(),
-                height: food_grid.height(),
+                width: food_grid.width,
+                height: food_grid.height,
                 cells: food_cells,
                 max: food_max,
                 mean: food_mean,
@@ -4825,8 +4805,8 @@ impl Snapshot {
             brain_layers: Vec::new(),
             brain_inspection: None,
             probe: None,
-            narrative: world.narrative_events().iter().cloned().collect(),
-            narrative_dropped: world.narrative_dropped_events(),
+            narrative: snapshot.narrative_events.as_ref().clone(),
+            narrative_dropped: snapshot.narrative_dropped_events,
             narrative_capacity: config.narrative_capacity,
             focused_agent_uid: None,
             focused_brain_bound: false,
@@ -8793,28 +8773,16 @@ mod tests {
             }
         }
 
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         // Step once BEFORE probing. `runtime.sensors` is written by stage_sense,
         // so on an unstepped world it is still all zeros while the probe computes
         // its attribution from live state — comparing them then would report a
         // drift that is really just "the sim has not sensed yet".
-        {
-            let mut guard = world.lock().expect("probe world");
-            guard.step().expect("step the probe world");
-        }
+        app.submit_and_wait(ControlCommand::Step)
+            .expect("step the real probe host");
 
         app.paused = true;
         app.probe_enabled = true;
@@ -8979,20 +8947,10 @@ mod tests {
     #[test]
     fn cone_selection_cycles_through_every_eye_and_wraps_both_ways() {
         let world = command_characterization_world();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         assert_eq!(app.selected_eye, None, "starts showing all cones");
 
         // Forward: All -> 0 -> 1 -> .. -> NUM_EYES-1 -> All
@@ -9031,20 +8989,10 @@ mod tests {
     #[test]
     fn the_cone_shortcuts_are_reachable_from_the_keyboard() {
         let world = command_characterization_world();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
             .expect("dot selects a cone");
@@ -9063,20 +9011,10 @@ mod tests {
     /// app needs it.
     fn with_shortcut_app(probe: impl FnOnce(&mut TerminalApp)) {
         let world = command_characterization_world();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         probe(&mut app);
     }
 
@@ -10452,9 +10390,6 @@ mod tests {
     #[test]
     fn ctrl_t_persists_the_chosen_theme_through_the_config_command_path() {
         with_shortcut_app(|app| {
-            // Clear anything startup enqueued so the assertion sees only this
-            // keypress.
-            let _ = app.drain_submitted_control_commands();
             let before = app.palette.theme_id;
 
             app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
@@ -10462,17 +10397,7 @@ mod tests {
             let after = app.palette.theme_id;
             assert_ne!(after, before, "Ctrl+T must advance the theme");
 
-            let persisted = app
-                .drain_submitted_control_commands()
-                .into_iter()
-                .find_map(|command| match command {
-                    ControlCommand::UpdateConfig(config) => Some(config.render.theme),
-                    _ => None,
-                })
-                .expect(
-                    "Ctrl+T must submit an UpdateConfig so the theme survives a restart; \
-                     without one the choice lives only in this session",
-                );
+            let persisted = wait_for_theme(app, after).config.render.theme;
 
             assert_eq!(
                 persisted,
@@ -10480,6 +10405,25 @@ mod tests {
                 "the persisted theme must be the one now displayed, not the previous one"
             );
         });
+    }
+
+    fn wait_for_theme(app: &mut TerminalApp<'_>, theme: CuratedThemeId) -> Arc<RenderSnapshot> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = app
+                .host
+                .snapshot_after(None)
+                .expect("host theme snapshot")
+                .expect("publication");
+            if snapshot.config.render.theme == Some(theme.to_config()) {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "theme command must reach the real owner"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
     }
 
     /// The persisted config must preserve every OTHER setting.
@@ -10490,24 +10434,20 @@ mod tests {
     #[test]
     fn persisting_a_theme_preserves_the_rest_of_the_config() {
         with_shortcut_app(|app| {
-            let _ = app.drain_submitted_control_commands();
             let (width, height, seed) = {
-                let world = app.world.lock().expect("world lock");
-                let config = world.config();
+                let world = app
+                    .host
+                    .snapshot_after(None)
+                    .expect("config snapshot")
+                    .expect("publication");
+                let config = &world.config;
                 (config.world_width, config.world_height, config.rng_seed)
             };
 
             app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
                 .expect("ctrl-t is handled");
 
-            let config = app
-                .drain_submitted_control_commands()
-                .into_iter()
-                .find_map(|command| match command {
-                    ControlCommand::UpdateConfig(config) => Some(config),
-                    _ => None,
-                })
-                .expect("an UpdateConfig must have been submitted");
+            let config = wait_for_theme(app, app.palette.theme_id).config.clone();
 
             assert_eq!(
                 (config.world_width, config.world_height, config.rng_seed),
@@ -10518,50 +10458,33 @@ mod tests {
         });
     }
 
-    /// Submitting alone must NOT change the run config.
-    ///
-    /// This pins the distinction a log line was blurring (bd-0s7x). `command_submit`
-    /// returning true is queue ADMISSION — `try_send(..) => Ok(())` — and nothing
-    /// more. Until something drains and applies the command the world config is
-    /// untouched, so any surface that reports "persisted" on a true return is
-    /// asserting an outcome it never observed.
-    ///
-    /// Deliberately the complement of
-    /// `a_persisted_theme_reaches_the_world_config_and_does_not_re_enqueue`, which
-    /// proves the config DOES change once the command is applied. One test without
-    /// the other cannot tell "the write works" apart from "the write happens at
-    /// submit time".
+    /// An immutable publication stays unchanged when another thread applies a
+    /// theme command. Application is established by its own typed receipt;
+    /// submission does not grant callers mutable access to the retained frame.
     #[test]
-    fn submitting_a_theme_change_does_not_by_itself_reach_the_run_config() {
+    fn theme_submission_keeps_retained_snapshot_immutable_and_has_an_application_receipt() {
         with_shortcut_app(|app| {
-            let before = {
-                let world = app.world.lock().expect("world lock");
-                world.config().render.theme
-            };
-
-            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
-                .expect("ctrl-t is handled");
-
-            let after = {
-                let world = app.world.lock().expect("world lock");
-                world.config().render.theme
-            };
-            assert_eq!(
-                after, before,
-                "the run config must be unchanged until the queued command is drained \
-                 and applied; a surface claiming persistence at submit time would be \
-                 reporting this state as though it had already changed"
-            );
-
-            // And the command really was enqueued, so this is proving ordering
-            // rather than that nothing happened at all.
-            assert!(
-                app.drain_submitted_control_commands()
-                    .iter()
-                    .any(|command| matches!(command, ControlCommand::UpdateConfig(_))),
-                "the config update must have been enqueued; otherwise this test would \
-                 pass against a Ctrl+T that submitted nothing"
-            );
+            let before = app
+                .host
+                .snapshot_after(None)
+                .expect("before")
+                .expect("publication");
+            let chosen = app.palette.theme_id.next();
+            let receipt = app
+                .persist_theme_choice(chosen)
+                .expect("theme admission identity");
+            let after = wait_for_theme(app, chosen);
+            assert_ne!(before.config.render.theme, after.config.render.theme);
+            assert!(after.revisions.config > before.revisions.config);
+            let status = app
+                .host
+                .command_status(receipt.parse().expect("host identity"))
+                .expect("authoritative command lookup")
+                .expect("retained receipt");
+            assert!(matches!(
+                status.application(),
+                scriptbots_runtime::ApplicationState::Applied(_)
+            ));
         });
     }
 
@@ -10577,26 +10500,11 @@ mod tests {
     #[test]
     fn a_persisted_theme_reaches_the_world_config_and_does_not_re_enqueue() {
         with_shortcut_app(|app| {
-            let _ = app.drain_submitted_control_commands();
-
             app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
                 .expect("ctrl-t is handled");
             let chosen = app.palette.theme_id;
 
-            // Apply what was submitted, exactly as the tick loop would.
-            let submitted = app.drain_submitted_control_commands();
-            {
-                let mut world = app.world.lock().expect("world lock");
-                for command in submitted {
-                    apply_control_command(&mut world, command)
-                        .expect("the config update must be accepted");
-                }
-            }
-
-            let stored = {
-                let world = app.world.lock().expect("world lock");
-                world.config().render.theme
-            };
+            let stored = wait_for_theme(app, chosen).config.render.theme;
             assert_eq!(
                 stored,
                 Some(chosen.to_config()),
@@ -10604,9 +10512,8 @@ mod tests {
             );
 
             // Now the guard has something to compare against.
-            app.persist_theme_choice(chosen);
             assert!(
-                app.drain_submitted_control_commands().is_empty(),
+                app.persist_theme_choice(chosen).is_none(),
                 "persisting a theme the config already holds must not enqueue a second \
                  identical config update"
             );
@@ -11005,25 +10912,20 @@ mod tests {
                 .expect("default agent is finite");
         }
         let before = world.lock().expect("tick").tick().0;
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         for _ in 0..(NUM_EYES * 3) {
             app.cycle_eye_selection(true);
         }
         assert_eq!(
-            world.lock().expect("tick").tick().0,
+            app.host
+                .snapshot_after(None)
+                .expect("snapshot query")
+                .expect("publication")
+                .world
+                .tick,
             before,
             "cone selection must not step the world"
         );
@@ -11507,18 +11409,10 @@ mod tests {
     #[test]
     fn narrow_insights_panel_keeps_brain_provenance_and_clipping_visible() {
         let world = command_characterization_world();
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world,
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
         app.snapshot.tick = 100;
         app.snapshot.brain_inspection = Some(BrainInspectionViewMetadata {
@@ -11678,14 +11572,81 @@ mod tests {
         ))
     }
 
-    fn disabled_persistence_step_driver(world: &SharedWorld) -> WorldStepDriver {
-        let world = Arc::clone(world);
-        Arc::new(move || {
-            world
-                .lock()
-                .expect("world mutex poisoned while executing test simulation step")
-                .step()
-        })
+    struct TerminalTestHost {
+        owner: Option<crate::host_thread::HostThread>,
+    }
+
+    impl TerminalTestHost {
+        fn take(world: SharedWorld) -> Self {
+            let world = Arc::try_unwrap(world)
+                .unwrap_or_else(|_| panic!("terminal fixture must transfer sole world ownership"))
+                .into_inner()
+                .expect("test world mutex");
+            let persistence = world
+                .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+                .expect("bind real host persistence session");
+            let owner = crate::host_thread::HostThread::spawn(
+                scriptbots_runtime::HostSessionId::new(0x5455_4954),
+                world,
+                persistence,
+                Box::new(scriptbots_runtime::VolatileJournal::default()),
+                scriptbots_runtime::HostCoreOptions {
+                    initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    capture_agent_visuals: true,
+                    ..scriptbots_runtime::HostCoreOptions::default()
+                },
+                scriptbots_runtime::channel::ChannelHostOptions::default(),
+            )
+            .expect("start real terminal host");
+            Self { owner: Some(owner) }
+        }
+
+        fn port(&self) -> ChannelHostPort {
+            self.owner
+                .as_ref()
+                .expect("terminal host not yet joined")
+                .port()
+        }
+
+        fn context<'a>(&self, runtime: &'a ControlRuntime) -> RendererContext<'a> {
+            let host = self.port();
+            let submit_port = host.clone();
+            let next_id = std::sync::atomic::AtomicU64::new(1);
+            RendererContext {
+                host,
+                analytics: AnalyticsSnapshotProvider::empty(),
+                control_runtime: runtime,
+                command_submit: Arc::new(move |command| {
+                    let command = scriptbots_runtime::HostCommand::try_from(command).ok()?;
+                    let id = scriptbots_runtime::CommandId::new(u128::from(
+                        next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    ));
+                    let status = submit_port
+                        .clone()
+                        .submit(scriptbots_runtime::CommandEnvelope::new(id, command))
+                        .ok()?;
+                    (!matches!(
+                        status.application(),
+                        scriptbots_runtime::ApplicationState::Rejected(_)
+                    ))
+                    .then(|| id.to_string())
+                }),
+                scenario: test_scenario(),
+            }
+        }
+    }
+
+    impl Drop for TerminalTestHost {
+        fn drop(&mut self) {
+            if let Some(owner) = self.owner.take() {
+                owner
+                    .join()
+                    .expect("terminal host joins after all client ports drop");
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -11736,18 +11697,10 @@ mod tests {
                     .expect("bind probe brain");
             }
         }
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
         app.paused = true;
         assert!(
@@ -11903,18 +11856,10 @@ mod tests {
             .expect("pre-inspection world lock")
             .world_digest_v1()
             .expect("pre-inspection digest");
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
         app.paused = true;
         let first = app
@@ -11946,10 +11891,8 @@ mod tests {
         assert_ne!(first.agent_uid, second.agent_uid);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(
-            world
-                .lock()
-                .expect("post-inspection world lock")
-                .world_digest_v1()
+            app.host
+                .scientific_digest_v1()
                 .expect("post-inspection digest"),
             digest_before
         );
@@ -11958,32 +11901,41 @@ mod tests {
     #[test]
     fn terminal_app_key_handler_single_step_advances_exactly_once_and_stays_paused() {
         let world = command_characterization_world();
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
-        let mut app = TerminalApp::new(&renderer, ctx);
-        let before = world.lock().expect("world lock").tick().0;
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        let before = app.snapshot.tick;
 
         let exit = app
             .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
             .expect("single-step key");
 
-        let guard = world.lock().expect("world lock");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.snapshot.tick == before {
+            assert!(Instant::now() < deadline, "single-step command must apply");
+            app.refresh_snapshot();
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
         assert!(!exit);
-        assert_eq!(guard.tick().0, before + 1);
-        drop(guard);
-        assert!((app.command_drain)().is_empty());
+        assert_eq!(app.snapshot.tick, before + 1);
+        for _ in 0..10 {
+            app.maybe_step_simulation(Instant::now());
+            assert_eq!(
+                app.snapshot.tick,
+                before + 1,
+                "repeated UI polling must not advance a paused host"
+            );
+        }
         assert!(app.paused);
-        assert_eq!(app.speed_multiplier, 0.0);
+        assert!(
+            host.port()
+                .snapshot_after(None)
+                .expect("host snapshot")
+                .expect("publication")
+                .playback
+                .paused
+        );
     }
 
     /// Render one production frame at a chosen theme, palette and viewport.
@@ -12000,20 +11952,10 @@ mod tests {
         height: u16,
     ) -> HeadlessBufferEvidence {
         let world = command_characterization_world();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
         app.palette.theme_id = theme;
         app.palette.mode = mode;
@@ -12036,20 +11978,10 @@ mod tests {
     /// one the widgets painted into, not a second guess at it.
     fn matrix_frame_buffer(width: u16, height: u16) -> (Buffer, FrameLayout, u64) {
         let world = command_characterization_world();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
 
         let backend = ratatui::backend::TestBackend::new(width, height);
@@ -12143,20 +12075,10 @@ mod tests {
         height: u16,
     ) -> Buffer {
         let world = command_characterization_world();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
         app.palette.theme_id = theme;
         app.palette.mode = mode;
@@ -12260,18 +12182,10 @@ mod tests {
     #[test]
     fn headless_test_backend_frame_proves_buffer_semantics_and_current_tick() {
         let world = command_characterization_world();
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
 
         let report = renderer
             .run_headless_frames(ctx, 1)
@@ -12367,21 +12281,19 @@ mod tests {
             evidence.regions
         );
         assert_eq!(
-            world.lock().expect("world lock").tick().0,
+            host.port()
+                .snapshot_after(None)
+                .expect("host snapshot")
+                .expect("publication")
+                .world
+                .tick,
             report.initial.tick + 1
         );
 
         let repeat_world = command_characterization_world();
-        let (repeat_runtime, repeat_drain, repeat_submit) = crate::servers::ControlRuntime::dummy();
-        let repeat_ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&repeat_world),
-            world: repeat_world,
-            analytics: AnalyticsSnapshotProvider::empty(),
-            control_runtime: &repeat_runtime,
-            command_drain: repeat_drain,
-            command_submit: repeat_submit,
-            scenario: test_scenario(),
-        };
+        let repeat_host = TerminalTestHost::take(repeat_world);
+        let (repeat_runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let repeat_ctx = repeat_host.context(&repeat_runtime);
         let repeat = renderer
             .run_headless_frames(repeat_ctx, 1)
             .expect("repeat deterministic headless frame");
@@ -13033,20 +12945,13 @@ mod tests {
                 );
             }
         }
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(
-            &renderer,
-            crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&world),
-                world: Arc::clone(&world),
-                analytics: AnalyticsSnapshotProvider::empty(),
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            },
-        );
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        // Freeze the running chrome exercised by this pure capability matrix;
+        // the fixture owner remains paused so rendering cannot mutate its input.
+        app.paused = false;
         app.palette = Palette::test_backend_evidence();
         app.palette.theme_id = theme;
         app.palette.emoji = row.emoji;
@@ -13588,14 +13493,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "KNOWN DEFECT bd-2z0.4.1: rejected TUI command leaves optimistic playback state"
-    )]
     fn target_queue_full_rejection_does_not_change_tui_playback_state() {
         let world = command_characterization_world();
-        let analytics = AnalyticsSnapshotProvider::empty();
+        let host = TerminalTestHost::take(world);
         let (runtime, _unused_drain, _unused_submit) = crate::servers::ControlRuntime::dummy();
-        let (sender, receiver) = crate::command::create_command_bus(1);
+        let (sender, _receiver) = crate::command::create_command_bus(1);
         sender
             // The bus now admits under an explicit identity so an applier can
             // report against it; this fixture only needs the queue full, so the
@@ -13606,24 +13508,17 @@ mod tests {
             )
             .expect("fill command queue");
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world,
-            analytics,
-            control_runtime: &runtime,
-            command_drain: crate::command::make_command_drain(receiver),
-            command_submit: crate::command::make_command_submit(sender),
-            scenario: test_scenario(),
-        };
+        let mut ctx = host.context(&runtime);
+        ctx.command_submit = crate::command::make_command_submit(sender);
         let mut app = TerminalApp::new(&renderer, ctx);
-        assert!(!app.paused);
+        assert!(app.paused);
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
             .expect("pause key");
 
         assert!(
-            !app.paused,
-            "KNOWN DEFECT bd-2z0.4.1: rejected TUI command leaves optimistic playback state"
+            app.paused,
+            "a rejected resume must retain the real host's paused playback state"
         );
     }
 
@@ -13635,12 +13530,31 @@ mod tests {
             .try_spawn_agent(AgentData::default())
             .expect("default agent is finite");
 
-        let snapshot = Snapshot::from_world(&world);
-
-        assert_eq!(snapshot.agent_count, world.agent_count());
-        assert_eq!(snapshot.tick, world.tick().0);
-        assert_eq!(snapshot.agents.len(), world.agent_count());
-        assert_eq!(snapshot.world_size.0, world.config().world_width);
+        let host = scriptbots_runtime::HostCore::new(
+            scriptbots_runtime::HostSessionId::new(1),
+            world,
+            scriptbots_runtime::HostCoreOptions::default(),
+        )
+        .expect("real snapshot owner");
+        let published = host
+            .snapshot_hub()
+            .snapshot_after(None)
+            .expect("initial publication");
+        let snapshot = Snapshot::from_render(&published);
+        host.with_world(|world| {
+            assert_eq!(snapshot.agent_count, world.agent_count());
+            assert_eq!(snapshot.tick, world.tick().0);
+            assert_eq!(snapshot.agents.len(), world.agent_count());
+            assert_eq!(snapshot.world_size.0, world.config().world_width);
+            assert_eq!(snapshot.food.cells, world.food().cells());
+            let terrain = TerrainView::from_snapshot(&published);
+            let expected = TerrainView::from_layers(world.terrain(), world.hydrology());
+            assert_eq!(terrain.kinds, expected.kinds);
+            assert_eq!(terrain.elevations, expected.elevations);
+            assert_eq!(terrain.moisture, expected.moisture);
+            assert_eq!(terrain.fertility, expected.fertility);
+            assert_eq!(terrain.water_depth, expected.water_depth);
+        });
     }
 
     /// Moisture and fertility must reach the screen. Two tiles of the SAME biome
@@ -14148,33 +14062,45 @@ mod tests {
                 .expect("default agent is finite");
         }
 
-        let snapshot = Snapshot::from_world(&world);
-        let handles: Vec<AgentId> = world.agents().iter_handles().collect();
-        assert_eq!(snapshot.agents.len(), handles.len());
+        let host = scriptbots_runtime::HostCore::new(
+            scriptbots_runtime::HostSessionId::new(2),
+            world,
+            scriptbots_runtime::HostCoreOptions::default(),
+        )
+        .expect("real identity snapshot owner");
+        let published = host
+            .snapshot_hub()
+            .snapshot_after(None)
+            .expect("initial publication");
+        let snapshot = Snapshot::from_render(&published);
+        host.with_world(|world| {
+            let handles: Vec<AgentId> = world.agents().iter_handles().collect();
+            assert_eq!(snapshot.agents.len(), handles.len());
 
-        for (viz, handle) in snapshot.agents.iter().zip(&handles) {
-            let expected = world.agent_uid(*handle).map(|uid| uid.get());
-            assert_eq!(viz.uid, expected, "AgentViz must carry the arena's own uid");
-            assert_eq!(
-                viz.id,
-                handle.data().as_ffi(),
-                "the arena handle stays available for lookups"
-            );
-        }
+            for (viz, handle) in snapshot.agents.iter().zip(&handles) {
+                let expected = world.agent_uid(*handle).map(|uid| uid.get());
+                assert_eq!(viz.uid, expected, "AgentViz must carry the arena's own uid");
+                assert_eq!(
+                    viz.id,
+                    handle.data().as_ffi(),
+                    "the arena handle stays available for lookups"
+                );
+            }
 
-        // The leaderboard is the surface that both DISPLAYS an identity and
-        // RESOLVES rows back to live agents, so it must keep the two separate.
-        for entry in snapshot.oldest.iter().chain(&snapshot.leaderboard) {
-            let resolved = handles
-                .iter()
-                .find(|handle| handle.data().as_ffi() == entry.handle)
-                .expect("every row must resolve to a live handle");
-            assert_eq!(
-                entry.uid,
-                world.agent_uid(*resolved).map(|uid| uid.get()),
-                "the displayed uid must belong to the agent the row resolves to"
-            );
-        }
+            // The leaderboard is the surface that both DISPLAYS an identity and
+            // RESOLVES rows back to live agents, so it must keep the two separate.
+            for entry in snapshot.oldest.iter().chain(&snapshot.leaderboard) {
+                let resolved = handles
+                    .iter()
+                    .find(|handle| handle.data().as_ffi() == entry.handle)
+                    .expect("every row must resolve to a live handle");
+                assert_eq!(
+                    entry.uid,
+                    world.agent_uid(*resolved).map(|uid| uid.get()),
+                    "the displayed uid must belong to the agent the row resolves to"
+                );
+            }
+        });
     }
 
     /// A missing identity must be visible as `?`, never substituted with a
@@ -14196,47 +14122,36 @@ mod tests {
         let world = Arc::new(std::sync::Mutex::new(
             WorldState::new(ScriptBotsConfig::default()).expect("world"),
         ));
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
-        let app = TerminalApp::new(&renderer, ctx);
-
-        app.submit_simulation_command(SimulationCommand {
-            paused: Some(false),
-            speed_multiplier: Some(f32::NAN),
-            step_once: false,
-        });
-
+        let ctx = host.context(&runtime);
+        let mut app = TerminalApp::new(&renderer, ctx);
+        let before = app
+            .host
+            .snapshot_after(None)
+            .expect("before")
+            .expect("publication");
         assert!(
-            (app.command_drain)().is_empty(),
+            (app.command_submit)(ControlCommand::SetSpeed(f32::NAN)).is_none(),
             "terminal admitted a non-finite speed command"
         );
+        let after = app
+            .host
+            .snapshot_after(None)
+            .expect("after")
+            .expect("publication");
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.playback, before.playback);
     }
 
     #[test]
     fn simulation_fault_survives_storage_health_refresh() {
         let world = command_characterization_world();
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world,
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
         let fault = Arc::<str>::from("deliberate brain construction failure");
         app.simulation_fault = Some(Arc::clone(&fault));
@@ -14255,18 +14170,10 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
 
         let mut app = TerminalApp::new(&renderer, ctx);
         app.snapshot.spike_hits = 3;
@@ -14282,18 +14189,10 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
         app.snapshot.max_age = 12;
         app.paused = false;
@@ -14323,18 +14222,10 @@ mod tests {
 
     macro_rules! rail_test_app {
         ($world:expr, $app:ident, $backend:ident) => {
-            let analytics = AnalyticsSnapshotProvider::empty();
-            let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+            let host = TerminalTestHost::take($world);
+            let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
             let renderer = TerminalRenderer::default();
-            let ctx = crate::renderer::RendererContext {
-                simulation_step: disabled_persistence_step_driver(&$world),
-                world: Arc::clone(&$world),
-                analytics,
-                control_runtime: &runtime,
-                command_drain: drain,
-                command_submit: submit,
-                scenario: test_scenario(),
-            };
+            let ctx = host.context(&runtime);
             let mut $app = TerminalApp::new(&renderer, ctx);
             $app.palette = Palette::test_backend_evidence();
             $app.paused = true;
@@ -14533,7 +14424,7 @@ mod tests {
         let world = command_characterization_world();
         let before = {
             let guard = world.lock().expect("world lock");
-            guard.characterization_digest_v0().expect("digest before")
+            guard.world_digest_v1().expect("digest before")
         };
         rail_test_app!(world, app, backend);
         app.snapshot.narrative = vec![
@@ -14551,10 +14442,10 @@ mod tests {
         terminal
             .draw(|frame| app.draw(frame))
             .expect("selection render");
-        let after = {
-            let guard = world.lock().expect("world lock");
-            guard.characterization_digest_v0().expect("digest after")
-        };
+        let after = app
+            .host
+            .scientific_digest_v1()
+            .expect("digest after real host rendering");
         assert_eq!(
             before, after,
             "rendering and navigating the rail must not perturb the world: an \
@@ -14774,10 +14665,8 @@ mod tests {
                 .expect("spawn unbound agent");
         }
         rail_test_app!(world, app, backend);
-        {
-            let mut guard = world.lock().expect("step lock");
-            guard.step().expect("one tick");
-        }
+        app.submit_and_wait(ControlCommand::Step)
+            .expect("passthrough host step");
         app.refresh_snapshot();
         assert!(
             !app.snapshot.focused_brain_bound,
@@ -14842,18 +14731,10 @@ mod tests {
         }
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
         app.refresh_snapshot();
         app.paused = false;
@@ -14871,18 +14752,10 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
 
         let initial_events = app.event_log.len();
@@ -14905,18 +14778,10 @@ mod tests {
         let config = ScriptBotsConfig::default();
         let world = WorldState::new(config).expect("world");
         let world = Arc::new(std::sync::Mutex::new(world));
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
 
         // Initial snapshot tick parity
@@ -14933,7 +14798,9 @@ mod tests {
         );
 
         // 2. Single step advances science by exactly 1 tick
-        app.step_once();
+        app.submit_and_wait(ControlCommand::Step)
+            .expect("explicit host step applies");
+        app.refresh_snapshot();
         assert_eq!(
             app.snapshot().tick,
             1,
@@ -15240,20 +15107,15 @@ mod tests {
         let config = ScriptBotsConfig::default();
         let world = WorldState::new(config).expect("world");
         let world = Arc::new(std::sync::Mutex::new(world));
-        let analytics = AnalyticsSnapshotProvider::empty();
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
+        let host = TerminalTestHost::take(world);
+        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let ctx = crate::renderer::RendererContext {
-            simulation_step: disabled_persistence_step_driver(&world),
-            world: Arc::clone(&world),
-            analytics,
-            control_runtime: &runtime,
-            command_drain: drain,
-            command_submit: submit,
-            scenario: test_scenario(),
-        };
+        let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
 
+        app.submit_and_wait(ControlCommand::Resume)
+            .expect("resume real host");
+        app.refresh_snapshot();
         assert!(!app.paused);
         app.execute_palette_action(CommandPaletteAction::TogglePause);
         assert!(app.paused, "TogglePause action must set app.paused to true");

@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf};
 use scriptbots_brain::MlpBrain;
 use scriptbots_core::{AgentData, ScriptBotsConfig, WorldState};
 use scriptbots_render::render_png_offscreen;
+use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId};
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -63,7 +64,15 @@ fn scriptbots_render_cpu_surrogate_raster_matches_semantic_golden() -> Result<()
         world.step().expect("snapshot fixture simulation step");
     }
 
-    let png = render_png_offscreen(&world, 1600, 900);
+    let host = HostCore::new(
+        HostSessionId::new(424_242),
+        world,
+        HostCoreOptions::default(),
+    )
+    .expect("snapshot export host");
+    let snapshot = host.snapshot_hub().latest();
+    assert_eq!(snapshot.world.tick, 120);
+    let png = render_png_offscreen(&snapshot, 1600, 900);
     let golden_path = golden_dir().join("rust_default.png");
     let regenerate = std::env::var("RUST_REGEN_GOLDEN")
         .map(|value| value == "1")

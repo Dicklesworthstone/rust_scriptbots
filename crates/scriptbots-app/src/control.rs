@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 // removed duplicate import
 
 use arc_swap::ArcSwapOption;
@@ -10,17 +10,18 @@ use thiserror::Error;
 
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
-    HydrologyState, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind,
-    Tick, WorldState,
+    ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind, Tick,
+    WorldState,
 };
 
-use crate::SharedWorld;
-use crate::command::{CommandSendError, CommandSender};
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::check_knob_ranges;
 #[cfg(feature = "gui")]
 use scriptbots_render::{OffscreenScene, render_offscreen_scene};
-use slotmap::Key; // offscreen PNG renderer
+use scriptbots_runtime::{
+    ApplicationState, CommandEnvelope, CommandId, HostCommand, HostPort, JournalState,
+    RenderSnapshot, channel::ChannelHostPort,
+};
 use smallvec::SmallVec;
 
 /// Snapshot of configuration state returned to external clients.
@@ -87,15 +88,22 @@ impl HydrologySnapshot {
     const SHALLOW_THRESHOLD: f32 = 0.05;
     const DEEP_THRESHOLD: f32 = 0.2;
 
-    fn from_state(state: &HydrologyState) -> Self {
-        let total_water_depth = state.total_water_depth();
-        let cell_count = state.cell_count().max(1) as f32;
-        let (shallow, deep) =
-            state.flooded_cell_counts(Self::SHALLOW_THRESHOLD, Self::DEEP_THRESHOLD);
+    fn from_snapshot(state: &scriptbots_runtime::HydrologyLayerSnapshot) -> Self {
+        let total_water_depth: f32 = state.water_depth.iter().sum();
+        let cell_count = state.water_depth.len().max(1) as f32;
+        let shallow = state
+            .water_depth
+            .iter()
+            .filter(|&&depth| depth >= Self::SHALLOW_THRESHOLD)
+            .count();
+        let deep = state
+            .water_depth
+            .iter()
+            .filter(|&&depth| depth >= Self::DEEP_THRESHOLD)
+            .count();
 
         let flow_directions = state
-            .field()
-            .flow_directions()
+            .flow_directions
             .iter()
             .map(|direction| {
                 match direction {
@@ -110,19 +118,19 @@ impl HydrologySnapshot {
             .collect();
 
         Self {
-            width: state.width(),
-            height: state.height(),
+            width: state.width,
+            height: state.height,
             total_water_depth,
             mean_water_depth: total_water_depth / cell_count,
             flooded_shallow_count: saturating_u32(shallow),
             flooded_deep_count: saturating_u32(deep),
             shallow_threshold: Self::SHALLOW_THRESHOLD,
             deep_threshold: Self::DEEP_THRESHOLD,
-            water_depth: state.water_depth().to_vec(),
+            water_depth: state.water_depth.clone(),
             flow_directions,
-            basin_ids: state.field().basin_ids().to_vec(),
-            accumulation: state.field().accumulation().to_vec(),
-            spill_elevation: state.field().spill_elevation().to_vec(),
+            basin_ids: state.basin_ids.clone(),
+            accumulation: state.accumulation.clone(),
+            spill_elevation: state.spill_elevation.clone(),
         }
     }
 }
@@ -165,6 +173,8 @@ pub struct KnobUpdate {
 /// Errors produced by the control domain when mutating configuration.
 #[derive(Debug, Error)]
 pub enum ControlError {
+    #[error(transparent)]
+    Host(#[from] scriptbots_runtime::HostAccessError),
     #[error("failed to lock world state")]
     Lock,
     #[error("{0}")]
@@ -410,27 +420,20 @@ pub struct SpeedRequest {
 /// Shared handle used by REST, CLI, and MCP surfaces to access the running world.
 #[derive(Clone)]
 pub struct ControlHandle {
-    shared_world: SharedWorld,
-    commands: CommandSender,
+    host: ChannelHostPort,
     knobs_cache: KnobsCache,
-    latest_summary: SharedLatestSummary,
-    status_cache: std::sync::Arc<Mutex<CommandLedger>>,
     command_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    command_namespace: u64,
 }
 
 impl ControlHandle {
-    pub fn new(
-        shared_world: SharedWorld,
-        commands: CommandSender,
-        latest_summary: SharedLatestSummary,
-    ) -> Self {
+    pub fn new(host: ChannelHostPort) -> Self {
+        static NEXT_NAMESPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
-            shared_world,
-            commands,
+            host,
             knobs_cache: std::sync::Arc::new(Mutex::new(None)),
-            latest_summary,
-            status_cache: std::sync::Arc::new(Mutex::new(CommandLedger::default())),
             command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            command_namespace: NEXT_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -444,14 +447,8 @@ impl ControlHandle {
                     "requested image too large".into(),
                 ));
             }
-            // Capture the render-relevant state under a short lock, then
-            // rasterize with no lock held at all (bd-134): a slow PNG render
-            // must never stall the simulation or other control reads.
-            // Capture inside the seam, rasterize outside it. The short-lock
-            // discipline recorded here for bd-134 is now structural rather than
-            // conventional: the borrow ends at the closure boundary, so a slow
-            // PNG render cannot regain the lock by accident (bd-88yj).
-            let scene = self.with_world(OffscreenScene::capture)?;
+            // Rasterization holds an immutable publication, never the owner.
+            let scene = OffscreenScene::capture(&self.read_snapshot()?);
             Ok(render_offscreen_scene(&scene, width, height))
         }
         #[cfg(not(feature = "gui"))]
@@ -464,63 +461,37 @@ impl ControlHandle {
         }
     }
 
-    /// The ONE place a control read reaches world state.
-    ///
-    /// bd-88yj retires `SharedWorld` from `ControlHandle` in favour of a
-    /// HostClient port. Fourteen production call sites each took the lock
-    /// directly, so "reads go through the port" would have meant fourteen
-    /// simultaneous edits with nothing working until the last one landed. This
-    /// is the seam that makes the port a one-place change instead: every read
-    /// now borrows the world through here, so swapping the body for a snapshot
-    /// poll does not touch a single caller.
-    ///
-    /// It is a read seam on purpose. Nothing here hands out `&mut WorldState` -
-    /// mutation belongs to the applier behind the command bus, which is the
-    /// distinction bd-tgfz established and which cannot hold while any control
-    /// surface can still reach in and write.
-    fn with_world<R>(&self, read: impl FnOnce(&WorldState) -> R) -> Result<R, ControlError> {
-        let world = self.lock_world()?;
-        Ok(read(&world))
-    }
-
-    fn lock_world(&self) -> Result<MutexGuard<'_, WorldState>, ControlError> {
-        self.shared_world.lock().map_err(|err| err.into())
+    pub fn read_snapshot(&self) -> Result<Arc<RenderSnapshot>, ControlError> {
+        self.host
+            .clone()
+            .snapshot_after(None)?
+            .ok_or(ControlError::Lock)
     }
 
     /// Retrieve the current configuration snapshot.
     pub fn snapshot(&self) -> Result<ConfigSnapshot, ControlError> {
-        self.with_world(|world| ConfigSnapshot::from_world(world.config(), world.tick()))?
+        let snapshot = self.read_snapshot()?;
+        ConfigSnapshot::from_world(&snapshot.config, Tick(snapshot.world.tick))
     }
 
     /// Retrieve the latest tick summary from the running world.
     pub fn latest_summary(&self) -> Result<scriptbots_core::TickSummary, ControlError> {
-        // Wait-free published read first (bd-134): the step drivers store each
-        // completed summary here, so a contended — or poisoned — world mutex
-        // cannot stall this endpoint or the SSE/NDJSON streams built on it.
-        if let Some(observation) = self.latest_summary.load_full()
-            && let Some(summary) = &observation.summary
-        {
-            return Ok(summary.clone());
-        }
-        // Nothing published yet (before the first completed tick, or a driver
-        // that does not publish): fall back to the world itself.
-        self.with_world(|world| {
-            world
-                .history()
-                .last()
-                .cloned()
-                .unwrap_or_else(|| scriptbots_core::TickSummary {
-                    tick: world.tick(),
-                    agent_count: world.agent_count(),
-                    births: 0,
-                    deaths: 0,
-                    total_energy: 0.0,
-                    average_energy: 0.0,
-                    average_health: 0.0,
-                    max_age: 0,
-                    spike_hits: 0,
-                })
-        })
+        let snapshot = self.read_snapshot()?;
+        Ok(snapshot
+            .completed_summary
+            .clone()
+            .or_else(|| snapshot.summary_history.last().cloned())
+            .unwrap_or_else(|| scriptbots_core::TickSummary {
+                tick: Tick(snapshot.world.tick),
+                agent_count: snapshot.world.agents.len(),
+                births: snapshot.world.summary.births,
+                deaths: snapshot.world.summary.deaths,
+                total_energy: snapshot.world.summary.total_energy,
+                average_energy: snapshot.world.summary.average_energy,
+                average_health: snapshot.world.summary.average_health,
+                max_age: snapshot.world.agents.iter().map(|agent| agent.age).max().unwrap_or(0),
+                spike_hits: 0,
+            }))
     }
 
     /// Retrieve a filtered debug listing of agents.
@@ -528,7 +499,7 @@ impl ControlHandle {
         &self,
         query: AgentDebugQuery,
     ) -> Result<Vec<AgentDebugInfo>, ControlError> {
-        self.with_world(|world| world.agent_debug_view(query))
+        Ok(self.host.debug_agents(query)?)
     }
 
     /// Submit a selection update and return its admission receipt.
@@ -542,11 +513,8 @@ impl ControlHandle {
     /// selection from another, and could not distinguish a command that was
     /// applied from one that was admitted and then dropped (bd-2z0.4.9).
     ///
-    /// The receipt still only reaches `admitted`/`not_required` on the legacy
-    /// bus, exactly as documented on [`CommandStatusDto`]. That is a weaker
-    /// guarantee than application, and it is stated rather than dressed up:
-    /// what changes here is that the client now has an identity to ask about
-    /// at all.
+    /// Poll the returned identity for the host's independent application and
+    /// journal progress; admission itself does not establish application.
     pub fn update_selection(
         &self,
         update: SelectionUpdate,
@@ -571,47 +539,46 @@ impl ControlHandle {
     /// Read current status without waiting for a busy world owner.
     /// During contention, return the last published boundary with its observed tick.
     pub fn status(&self) -> Result<SimulationStatusDto, ControlError> {
-        match self.shared_world.try_lock() {
-            Ok(world) => Ok(SimulationStatusDto::from_world(&world)),
-            Err(TryLockError::WouldBlock) => self
-                .latest_summary
-                .load_full()
-                .map(|observation| observation.status.clone())
-                .ok_or(ControlError::Lock),
-            Err(TryLockError::Poisoned(_)) => Err(ControlError::Lock),
-        }
+        let snapshot = self.read_snapshot()?;
+        Ok(SimulationStatusDto {
+            tick: snapshot.world.tick,
+            agent_count: snapshot.world.agents.len(),
+            is_closed: snapshot.config.closed,
+            config_revision: snapshot.revisions.config.get(),
+        })
     }
 
     /// Retrieve a snapshot of the current hydrology state, if available.
     pub fn hydrology_snapshot(&self) -> Result<Option<HydrologySnapshot>, ControlError> {
-        self.with_world(|world| world.hydrology().map(HydrologySnapshot::from_state))
+        Ok(self
+            .read_snapshot()?
+            .layers
+            .hydrology
+            .as_deref()
+            .map(HydrologySnapshot::from_snapshot))
     }
 
     /// Flatten the configuration into individual knob descriptors for discovery.
     pub fn list_knobs(&self) -> Result<Vec<KnobEntry>, ControlError> {
-        let rev = self.with_world(WorldState::config_revision)?;
+        let snapshot = self.read_snapshot()?;
+        let rev = snapshot.revisions.config.get();
         if let Some((cached_rev, cached)) = lock_cache(&self.knobs_cache).as_ref()
             && *cached_rev == rev
         {
             return Ok(cached.clone());
         }
-        let (rev2, config_value) = self.with_world(|world| {
-            (
-                world.config_revision(),
-                serde_json::to_value(world.config()),
-            )
-        })?;
-        let config_value = config_value.map_err(ControlError::serialization)?;
+        let config_value =
+            serde_json::to_value(snapshot.config.as_ref()).map_err(ControlError::serialization)?;
         let mut entries = Vec::with_capacity(256);
         let mut prefix = String::new();
         flatten_value(&mut prefix, &config_value, &mut entries);
-        *lock_cache(&self.knobs_cache) = Some((rev2, entries.clone()));
+        *lock_cache(&self.knobs_cache) = Some((rev, entries.clone()));
         Ok(entries)
     }
 
     /// Retrieve the configuration audit log accumulated since startup.
     pub fn audit(&self) -> Result<Vec<ConfigAuditEntry>, ControlError> {
-        self.with_world(|world| world.config_audit().to_vec())
+        Ok(self.read_snapshot()?.config_audit.as_ref().clone())
     }
 
     /// Build a tail of recent narrative events from the world's tick history.
@@ -622,102 +589,100 @@ impl ControlHandle {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.with_world(|world| {
-            // The limit arrives unclamped from the query string; cap it so a hostile
-            // request cannot reserve unbounded memory (history yields ≤3 events/tick).
-            let limit = limit.min(world.history().count().saturating_mul(3).max(1));
-            let mut events = Vec::with_capacity(limit);
-            for summary in world.history().rev() {
-                if summary.births > 0 {
-                    events.push(EventEntry::new(
-                        summary.tick.0,
-                        EventKind::Birth,
-                        saturating_u32(summary.births),
-                    ));
-                    if events.len() >= limit {
-                        break;
-                    }
-                }
-                if summary.deaths > 0 {
-                    events.push(EventEntry::new(
-                        summary.tick.0,
-                        EventKind::Death,
-                        saturating_u32(summary.deaths),
-                    ));
-                    if events.len() >= limit {
-                        break;
-                    }
-                }
-                if summary.spike_hits > 0 {
-                    events.push(EventEntry::new(
-                        summary.tick.0,
-                        EventKind::Combat,
-                        summary.spike_hits,
-                    ));
-                    if events.len() >= limit {
-                        break;
-                    }
+        let snapshot = self.read_snapshot()?;
+        // The limit arrives unclamped from the query string; cap it so a hostile
+        // request cannot reserve unbounded memory (history yields ≤3 events/tick).
+        let limit = limit.min(snapshot.summary_history.len().saturating_mul(3).max(1));
+        let mut events = Vec::with_capacity(limit);
+        for summary in snapshot.summary_history.iter().rev() {
+            if summary.births > 0 {
+                events.push(EventEntry::new(
+                    summary.tick.0,
+                    EventKind::Birth,
+                    saturating_u32(summary.births),
+                ));
+                if events.len() >= limit {
+                    break;
                 }
             }
-            events
-        })
+            if summary.deaths > 0 {
+                events.push(EventEntry::new(
+                    summary.tick.0,
+                    EventKind::Death,
+                    saturating_u32(summary.deaths),
+                ));
+                if events.len() >= limit {
+                    break;
+                }
+            }
+            if summary.spike_hits > 0 {
+                events.push(EventEntry::new(
+                    summary.tick.0,
+                    EventKind::Combat,
+                    summary.spike_hits,
+                ));
+                if events.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(events)
     }
 
     /// Render a coarse ASCII map of terrain, food, and agents — the server-side
     /// equivalent of the terminal renderer's saved snapshots.
     pub fn ascii_map(&self) -> Result<String, ControlError> {
-        self.with_world(|world| {
-            let food = world.food();
-            let terrain = world.terrain();
-            let grid_w = food.width().max(1) as usize;
-            let grid_h = food.height().max(1) as usize;
-            let width = grid_w.clamp(16, 96);
-            let height = grid_h.clamp(8, 48);
-            let food_max = world.config().food_max.max(f32::EPSILON);
-            let world_w = (world.config().world_width as f32).max(1.0);
-            let world_h = (world.config().world_height as f32).max(1.0);
-            let tiles = terrain.tiles();
-            let cells = food.cells();
+        let snapshot = self.read_snapshot()?;
+        let food = &snapshot.layers.food;
+        let terrain = &snapshot.layers.terrain;
+        let grid_w = food.width.max(1) as usize;
+        let grid_h = food.height.max(1) as usize;
+        let width = grid_w.clamp(16, 96);
+        let height = grid_h.clamp(8, 48);
+        let food_max = snapshot.config.food_max.max(f32::EPSILON);
+        let world_w = (snapshot.config.world_width as f32).max(1.0);
+        let world_h = (snapshot.config.world_height as f32).max(1.0);
+        let tiles = &terrain.tiles;
+        let cells = &food.cells;
 
-            let mut rows = vec![vec![' '; width]; height];
-            for (y, row) in rows.iter_mut().enumerate() {
-                for (x, slot) in row.iter_mut().enumerate() {
-                    let cell_x = (x * grid_w) / width;
-                    let cell_y = (y * grid_h) / height;
-                    let idx = cell_y * grid_w + cell_x;
-                    let kind = tiles.get(idx).map(|tile| tile.kind);
-                    let food_level = cells.get(idx).copied().unwrap_or(0.0) / food_max;
-                    let base = match kind {
-                        Some(TerrainKind::DeepWater) => '~',
-                        Some(TerrainKind::ShallowWater) => '=',
-                        Some(TerrainKind::Sand) => '.',
-                        Some(TerrainKind::Grass) => ',',
-                        Some(TerrainKind::Bloom) => '*',
-                        Some(TerrainKind::Rock) => '^',
-                        None => ' ',
-                    };
-                    *slot = if food_level > 0.66 {
-                        '#'
-                    } else if food_level > 0.33 {
-                        '+'
-                    } else {
-                        base
-                    };
-                }
+        let mut rows = vec![vec![' '; width]; height];
+        for (y, row) in rows.iter_mut().enumerate() {
+            for (x, slot) in row.iter_mut().enumerate() {
+                let cell_x = (x * grid_w) / width;
+                let cell_y = (y * grid_h) / height;
+                let idx = cell_y * grid_w + cell_x;
+                let kind = tiles.get(idx).map(|tile| tile.kind);
+                let food_level = cells.get(idx).copied().unwrap_or(0.0) / food_max;
+                let base = match kind {
+                    Some(TerrainKind::DeepWater) => '~',
+                    Some(TerrainKind::ShallowWater) => '=',
+                    Some(TerrainKind::Sand) => '.',
+                    Some(TerrainKind::Grass) => ',',
+                    Some(TerrainKind::Bloom) => '*',
+                    Some(TerrainKind::Rock) => '^',
+                    None => ' ',
+                };
+                *slot = if food_level > 0.66 {
+                    '#'
+                } else if food_level > 0.33 {
+                    '+'
+                } else {
+                    base
+                };
             }
-            for pos in world.agents().columns().positions() {
-                let x = (((pos.x / world_w) * width as f32) as usize).min(width - 1);
-                let y = (((pos.y / world_h) * height as f32) as usize).min(height - 1);
-                rows[y][x] = '@';
-            }
+        }
+        for agent in &snapshot.world.agents {
+            let x = (((agent.position[0] / world_w) * width as f32) as usize).min(width - 1);
+            let y = (((agent.position[1] / world_h) * height as f32) as usize).min(height - 1);
+            rows[y][x] = '@';
+        }
 
-            let mut out = format!("ScriptBots tick {}\n", world.tick().0);
-            for row in rows {
-                out.extend(row);
-                out.push('\n');
-            }
-            out
-        })
+        let mut out = format!("ScriptBots tick {}\n", snapshot.world.tick);
+        for row in rows {
+            out.extend(row);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     /// Compute scoreboard snapshots: top predators (carnivores) by energy and oldest living agents.
@@ -726,41 +691,28 @@ impl ControlHandle {
         // the expensive sort provably cannot hold the world lock. That used to
         // rest on a hand-placed `drop(world)` with a comment; now the borrow
         // ends at the closure boundary and the compiler enforces it (bd-88yj).
-        let (mut carnivores, mut oldest) = self.with_world(|world| {
-            let handles: Vec<scriptbots_core::AgentId> = world.agents().iter_handles().collect();
-            let columns = world.agents().columns();
-            let runtimes = world.runtime();
+        let snapshot = self.read_snapshot()?;
+        let mut carnivores = Vec::with_capacity(snapshot.world.agents.len() / 2 + 1);
+        let mut oldest = Vec::with_capacity(snapshot.world.agents.len());
 
-            let mut carnivores = Vec::with_capacity(handles.len() / 2 + 1);
-            let mut oldest = Vec::with_capacity(handles.len());
+        for agent in &snapshot.world.agents {
+            let diet_core = DietClass::from_tendency(agent.herbivore_tendency);
+            let diet = DietClassDto::from(diet_core);
 
-            for (idx, id) in handles.iter().enumerate() {
-                let runtime = runtimes.get(*id);
-                let tendency = runtime.map(|rt| rt.herbivore_tendency).unwrap_or(0.5);
-                let diet_core = DietClass::from_tendency(tendency);
-                let diet = DietClassDto::from(diet_core);
-                let energy = runtime.map(|rt| rt.energy).unwrap_or(0.0);
-                let health = columns.health()[idx];
-                let age = columns.ages()[idx];
-                let generation = columns.generations()[idx].0;
+            let entry = AgentScoreEntry {
+                agent_id: agent.id,
+                energy: agent.energy,
+                health: agent.health,
+                age: agent.age,
+                generation: agent.generation.0,
+                diet,
+            };
 
-                let entry = AgentScoreEntry {
-                    agent_id: id.data().as_ffi(),
-                    energy,
-                    health,
-                    age,
-                    generation,
-                    diet,
-                };
-
-                if matches!(diet_core, DietClass::Carnivore) {
-                    carnivores.push(entry.clone());
-                }
-                oldest.push(entry);
+            if matches!(diet_core, DietClass::Carnivore) {
+                carnivores.push(entry.clone());
             }
-
-            (carnivores, oldest)
-        })?;
+            oldest.push(entry);
+        }
 
         if limit == 0 {
             return Ok(Scoreboard {
@@ -800,18 +752,19 @@ impl ControlHandle {
         // front preserves that consistency exactly while moving the expensive
         // work - a JSON merge and a full config deserialization - off the lock
         // instead of running it under one (bd-88yj).
-        let (config_value, current_dims, current_bounds) = self.with_world(|world| {
-            let config = world.config();
+        let snapshot = self.read_snapshot()?;
+        let (config_value, current_dims, current_bounds) = {
+            let config = &snapshot.config;
             (
-                serde_json::to_value(config),
-                (world.food().width(), world.food().height()),
+                serde_json::to_value(config.as_ref()),
+                (snapshot.layers.food.width, snapshot.layers.food.height),
                 (
                     config.world_width,
                     config.world_height,
                     config.food_cell_size,
                 ),
             )
-        })?;
+        };
         let mut config_value = config_value.map_err(ControlError::serialization)?;
         // Range-check the REQUESTED knobs before merging them. `validate()`
         // proves admissibility (finite, non-negative) but declares no upper
@@ -925,8 +878,13 @@ impl ControlHandle {
         &self,
         command_id: &str,
     ) -> Result<Option<CommandStatusDto>, ControlError> {
-        let cache = lock_cache(&self.status_cache);
-        Ok(cache.get(command_id).cloned())
+        let id: CommandId = serde_json::from_value(Value::String(command_id.to_owned()))
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        self.host
+            .clone()
+            .command_status(id)?
+            .map(|status| self.status_dto(status))
+            .transpose()
     }
 
     /// Submit a command, honouring an idempotency key when one is supplied.
@@ -940,61 +898,78 @@ impl ControlHandle {
     /// retried config patch applies twice — the client cannot tell, because
     /// both attempts return a cheerful receipt with different ids (bd-k7nq).
     ///
-    /// With a key, a repeat returns the ORIGINAL receipt and enqueues nothing.
-    /// Without one, behaviour is exactly as before, so this is opt-in per call
-    /// rather than a change to every existing caller.
-    ///
-    /// LOCK ORDER IS DELIBERATE. The world is read and released BEFORE the
-    /// status cache is taken, preserving the world-then-cache order this
-    /// function already had; taking them the other way round would invert it
-    /// against every other reader here. The cache lock is then held across the
-    /// enqueue so the check and the insert are atomic — otherwise two
-    /// concurrent retries of the same key both miss and both enqueue, which is
-    /// the very duplicate this exists to prevent. `enqueue` touches only the
-    /// command channel, so holding the cache across it cannot deadlock.
+    /// Keyed retries always reach the authoritative host ledger: the same
+    /// envelope reuses its identity, while a changed payload is a typed conflict.
     fn submit_control_command_with_key(
         &self,
         cmd: ControlCommand,
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
-        let (tick, rev) = self.with_world(|world| (world.tick().0, world.config_revision()))?;
-        let mut cache = lock_cache(&self.status_cache);
-        if let Some(key) = idempotency_key
-            && let Some(existing) = cache.get(key)
-        {
-            return Ok(existing.clone());
-        }
-        // Identity is decided BEFORE the send, because the bus now carries it:
-        // the applier can only report against a name that travelled with the
-        // command. A refused enqueue therefore consumes a sequence number,
-        // which leaves harmless gaps in admission order rather than handing two
-        // different commands the same identity.
-        let id_num = self
-            .command_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        let command_id = idempotency_key
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("cmd-{id_num}"));
-        self.enqueue(&command_id, cmd)?;
-        // Report what actually happened: the command took an admission order on the
-        // bounded bus. It has NOT been drained by the simulation driver, has not been
-        // applied to the world, and the legacy app-owned bus writes no journal record
-        // at any point. Claiming applied/durable here collapsed the two axes README
-        // documents as distinct and made /api/control/status/{id} answer "finished"
-        // forever, so a client could never tell an applied command from a dropped one
-        // (bd-f65w). Real applied/durable transitions arrive with the HostCore
-        // migration, which owns the tracking these strings pretended to have.
-        let status = CommandStatusDto {
-            command_id: command_id.clone(),
-            admission_sequence: Some(id_num),
-            application_state: APPLICATION_STATE_ADMITTED.to_string(),
-            journal_state: JOURNAL_STATE_NOT_REQUIRED.to_string(),
-            control_revision: rev,
-            scientific_revision: tick,
+        cmd.validate()
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        let command = HostCommand::try_from(cmd)
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        let id = if let Some(key) = idempotency_key {
+            if key.is_empty() || key.len() > 1024 {
+                return Err(ControlError::InvalidPatch(
+                    "idempotency key must contain 1..=1024 bytes".into(),
+                ));
+            }
+            let mut hasher = blake3::Hasher::new_derive_key("scriptbots.control.idempotency.v1");
+            hasher.update(&self.host.session_id().get().to_le_bytes());
+            hasher.update(key.as_bytes());
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+            u128::from_le_bytes(bytes) | (1_u128 << 127)
+        } else {
+            let sequence = self
+                .command_counter
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |value| value.checked_add(1),
+                )
+                .map_err(|_| {
+                    ControlError::InvalidPatch("command identity sequence exhausted".into())
+                })?;
+            (u128::from(self.command_namespace) << 64) | u128::from(sequence)
         };
-        cache.admit(status.clone());
-        Ok(status)
+        let status = self
+            .host
+            .clone()
+            .submit(CommandEnvelope::new(CommandId::new(id), command))?;
+        self.status_dto(status)
+    }
+
+    fn status_dto(
+        &self,
+        status: scriptbots_runtime::CommandStatus,
+    ) -> Result<CommandStatusDto, ControlError> {
+        let revisions = match status.application() {
+            ApplicationState::Applied(applied) => applied.revisions,
+            _ => self.read_snapshot()?.revisions,
+        };
+        Ok(CommandStatusDto {
+            command_id: status.command_id().to_string(),
+            admission_sequence: status.admission_sequence().map(|sequence| sequence.get()),
+            application_state: match status.application() {
+                ApplicationState::Admitted => "admitted",
+                ApplicationState::Applied(_) => "applied",
+                ApplicationState::Rejected(_) => "rejected",
+                ApplicationState::Failed(_) => "failed",
+            }
+            .to_owned(),
+            journal_state: match status.journal() {
+                JournalState::NotRequired => "not_required",
+                JournalState::Pending => "pending",
+                JournalState::CommittedVolatile => "committed_volatile",
+                JournalState::Durable => "durable",
+                JournalState::Failed(_) => "failed",
+            }
+            .to_owned(),
+            control_revision: revisions.control.get(),
+            scientific_revision: revisions.scientific.get(),
+        })
     }
 
     /// Submit a command without an idempotency key.
@@ -1006,64 +981,6 @@ impl ControlHandle {
         cmd: ControlCommand,
     ) -> Result<CommandStatusDto, ControlError> {
         self.submit_control_command_with_key(cmd, None)
-    }
-
-    /// A reporter the applier can hold without holding the whole handle.
-    ///
-    /// This is the seam. The ledger can record an outcome and the bus now
-    /// carries an identity, but neither matters until the thing that actually
-    /// applies commands says what happened. That thing lives behind a
-    /// `CommandDrain` - in the renderer, in the terminal frontend - and it
-    /// should not need a `ControlHandle`, a world lock, or any knowledge of
-    /// REST to report. It needs exactly this: an id and an outcome (bd-k7nq).
-    ///
-    /// A failed report is logged rather than propagated: the applier has
-    /// already applied the command, and refusing to continue draining because
-    /// the bookkeeping disagreed would turn a reporting problem into a
-    /// simulation stall.
-    #[must_use]
-    pub fn command_reporter(&self) -> CommandReporter {
-        let ledger = std::sync::Arc::clone(&self.status_cache);
-        std::sync::Arc::new(move |command_id: &str, outcome: CommandOutcome| {
-            let state = match outcome {
-                CommandOutcome::Applied => APPLICATION_STATE_APPLIED,
-                CommandOutcome::Rejected => APPLICATION_STATE_REJECTED,
-            };
-            if let Err(error) = lock_cache(&ledger).resolve(command_id, state) {
-                tracing::warn!(%command_id, %error, "could not record the outcome of an applied command");
-            }
-        })
-    }
-
-    /// Report that a submitted command reached the world.
-    ///
-    /// This is the call that makes `admitted` a first step instead of the end
-    /// of the road. Whatever drains the bus and applies a command is the only
-    /// thing that can honestly say so, so the report comes FROM the applier
-    /// rather than being assumed at submission time — which is the whole
-    /// distinction eight fixes across five surfaces were about (bd-k7nq).
-    ///
-    /// Refuses an unknown id and refuses to revise a terminal outcome, because
-    /// a ledger that accepted any write would let a caller record an outcome it
-    /// never observed. Re-reporting the same terminal state is allowed, so an
-    /// applier that replays its report is not punished for it.
-    pub fn mark_applied(&self, command_id: &str) -> Result<CommandStatusDto, ControlError> {
-        self.resolve_command(command_id, APPLICATION_STATE_APPLIED)
-    }
-
-    /// Report that a submitted command reached the world and was refused there.
-    pub fn mark_rejected(&self, command_id: &str) -> Result<CommandStatusDto, ControlError> {
-        self.resolve_command(command_id, APPLICATION_STATE_REJECTED)
-    }
-
-    fn resolve_command(
-        &self,
-        command_id: &str,
-        application_state: &str,
-    ) -> Result<CommandStatusDto, ControlError> {
-        lock_cache(&self.status_cache)
-            .resolve(command_id, application_state)
-            .map_err(|error| ControlError::InvalidPatch(error.to_string()))
     }
 
     /// Submit any control command, optionally keyed for safe retry.
@@ -1080,18 +997,6 @@ impl ControlHandle {
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
         self.submit_control_command_with_key(command, idempotency_key)
-    }
-
-    fn enqueue(&self, id: &str, command: ControlCommand) -> Result<(), ControlError> {
-        if let Err(error) = command.validate() {
-            self.commands.record_validation_rejection();
-            return Err(ControlError::InvalidPatch(error.to_string()));
-        }
-        match self.commands.try_send(id.to_owned(), command) {
-            Ok(()) => Ok(()),
-            Err(CommandSendError::Full(_command)) => Err(ControlError::CommandQueueFull),
-            Err(CommandSendError::Disconnected(_command)) => Err(ControlError::CommandQueueClosed),
-        }
     }
 }
 
@@ -1457,17 +1362,99 @@ fn knob_kind(value: &Value) -> KnobKind {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use slotmap::{Key, KeyData};
     use std::sync::{Arc, Mutex};
 
-    fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
-        let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
-        let (sender, receiver) = crate::command::create_command_bus(4);
-        let handle =
-            ControlHandle::new(Arc::new(Mutex::new(world)), sender, empty_latest_summary());
-        (handle, receiver)
+    pub(crate) struct TestHost {
+        pub(crate) port: ChannelHostPort,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestHost {
+        pub(crate) fn spawn(world: WorldState) -> Self {
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                use scriptbots_runtime::{
+                    FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, ManualInstant,
+                    PlaybackSnapshot,
+                    channel::{ChannelHostDriver, ChannelHostOptions},
+                };
+                let core = HostCore::new(
+                    HostSessionId::new(0xc017),
+                    world,
+                    HostCoreOptions {
+                        initial_playback: PlaybackSnapshot {
+                            paused: true,
+                            speed_multiplier: 1.0,
+                        },
+                        capture_agent_visuals: true,
+                        ..HostCoreOptions::default()
+                    },
+                )
+                .expect("test host");
+                let (mut driver, port) = ChannelHostDriver::new(
+                    FixedDeadlineHost::new(core),
+                    ChannelHostOptions::default(),
+                )
+                .expect("channel owner");
+                send.send(port).expect("publish test port");
+                let epoch = std::time::Instant::now();
+                driver
+                    .run(|| {
+                        ManualInstant::from_nanos(
+                            u64::try_from(epoch.elapsed().as_nanos()).expect("test duration"),
+                        )
+                    })
+                    .expect("test owner run");
+            });
+            Self {
+                port: receive.recv().expect("test host rendezvous"),
+                worker: Some(worker),
+            }
+        }
+
+        pub(crate) fn handle(&self) -> ControlHandle {
+            ControlHandle::new(self.port.clone())
+        }
+
+        pub(crate) fn wait_applied(&self, status: &CommandStatusDto) -> CommandStatusDto {
+            let handle = self.handle();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let observed = handle
+                    .command_status(&status.command_id)
+                    .expect("host status")
+                    .expect("retained command");
+                if observed.application_state != "admitted" && observed.journal_state != "pending" {
+                    assert_eq!(observed.application_state, "applied");
+                    return observed;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "host command did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Drop for TestHost {
+        fn drop(&mut self) {
+            let _ = self.port.submit(CommandEnvelope::new(
+                CommandId::new(u128::MAX - 1),
+                HostCommand::Shutdown,
+            ));
+            if let Some(worker) = self.worker.take() {
+                worker.join().expect("test host joined");
+            }
+        }
+    }
+
+    fn handle() -> (ControlHandle, TestHost) {
+        let host = TestHost::spawn(WorldState::new(ScriptBotsConfig { rng_seed: Some(42), ..ScriptBotsConfig::default() }).expect("world"));
+        (host.handle(), host)
     }
 
     fn drain_and_apply(receiver: &crate::command::CommandReceiver, world: &mut WorldState) {
@@ -2250,10 +2237,7 @@ mod tests {
             .submit_command(ControlCommand::Step, Some("client-abc"))
             .expect("retry of the same logical command");
 
-        assert_eq!(
-            first.command_id, "client-abc",
-            "a supplied key must become the command id, or the client cannot poll what it sent"
-        );
+        assert_eq!(first.command_id.len(), CommandId::new(1).to_string().len());
         assert_eq!(
             first.command_id, retry.command_id,
             "a retry must return the original receipt"
@@ -2263,14 +2247,8 @@ mod tests {
             "a retry must not take a second admission order"
         );
 
-        let mut queued = 0;
-        while receiver.try_recv().is_ok() {
-            queued += 1;
-        }
-        assert_eq!(
-            queued, 1,
-            "the retry reached the command bus; a retried Step would advance the simulation twice"
-        );
+        receiver.wait_applied(&retry);
+        assert_eq!(handle.status().expect("status").tick, 1, "a retried Step must advance once");
     }
 
     /// Positive control: distinct keys are distinct commands.
@@ -2294,11 +2272,8 @@ mod tests {
             "distinct commands must take distinct admission orders"
         );
 
-        let mut queued = 0;
-        while receiver.try_recv().is_ok() {
-            queued += 1;
-        }
-        assert_eq!(queued, 2, "two distinct commands must both reach the bus");
+        receiver.wait_applied(&second);
+        assert_eq!(handle.status().expect("status").tick, 2, "distinct Steps must both apply");
     }
 
     /// An unkeyed submit stays non-idempotent, as every existing caller expects.
@@ -2318,11 +2293,8 @@ mod tests {
             "without a key there is nothing to recognise a retry by, so these are two commands"
         );
 
-        let mut queued = 0;
-        while receiver.try_recv().is_ok() {
-            queued += 1;
-        }
-        assert_eq!(queued, 2);
+        receiver.wait_applied(&second);
+        assert_eq!(handle.status().expect("status").tick, 2);
     }
 
     /// A selection submission must hand back a receipt a client can follow.
@@ -2334,7 +2306,7 @@ mod tests {
     /// afterwards (bd-2z0.4.9).
     #[test]
     fn selection_submission_returns_a_followable_receipt() {
-        let (handle, _receiver) = handle();
+        let (handle, receiver) = handle();
         let update = || SelectionUpdate {
             mode: SelectionMode::Clear,
             agent_ids: Vec::new(),
@@ -2370,18 +2342,15 @@ mod tests {
             .expect("the receipt must be retrievable by its own id");
         assert_eq!(looked_up.command_id, first.command_id);
 
-        // Stated, not dressed up: on the legacy bus this stays at
-        // admitted/not_required for its whole life. The gain here is that the
-        // client has an identity to ask about, NOT that application is proven.
-        assert_eq!(looked_up.application_state, APPLICATION_STATE_ADMITTED);
-        assert_eq!(looked_up.journal_state, JOURNAL_STATE_NOT_REQUIRED);
+        let terminal = receiver.wait_applied(&looked_up);
+        assert_eq!(terminal.application_state, APPLICATION_STATE_APPLIED);
+        assert_eq!(terminal.journal_state, "committed_volatile");
     }
 
     #[test]
     fn debug_agents_lists_selection() {
-        let (handle, receiver) = handle();
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let raw_id = {
-            let mut world = handle.lock_world().expect("world lock");
             let id = world
                 .try_spawn_agent(scriptbots_core::AgentData::default())
                 .expect("default agent is finite");
@@ -2390,9 +2359,10 @@ mod tests {
                 agent_ids: vec![id.data().as_ffi()],
                 state: SelectionState::Selected,
             });
-            drain_and_apply(&receiver, &mut world);
             id.data().as_ffi()
         };
+        let host = TestHost::spawn(world);
+        let handle = host.handle();
 
         let entries = handle
             .debug_agents(AgentDebugQuery {
@@ -2407,15 +2377,16 @@ mod tests {
 
     #[test]
     fn update_selection_enqueues_and_applies() {
-        let (handle, receiver) = handle();
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
         let raw_id = {
-            let mut world = handle.lock_world().expect("world lock");
             let id = world
                 .try_spawn_agent(scriptbots_core::AgentData::default())
                 .expect("default agent is finite");
             id.data().as_ffi()
         };
-        handle
+        let host = TestHost::spawn(world);
+        let handle = host.handle();
+        let receipt = handle
             .update_selection(
                 SelectionUpdate {
                     mode: SelectionMode::Replace,
@@ -2426,11 +2397,10 @@ mod tests {
             )
             .expect("enqueue selection command");
 
-        let mut world = handle.lock_world().expect("world lock");
-        drain_and_apply(&receiver, &mut world);
-        let agent_id = scriptbots_core::AgentId::from(KeyData::from_ffi(raw_id));
-        let runtime = world.agent_runtime(agent_id).expect("runtime");
-        assert!(matches!(runtime.selection, SelectionState::Selected));
+        host.wait_applied(&receipt);
+        let entries = handle.debug_agents(AgentDebugQuery { ids: Some(vec![raw_id]), selection: Some(SelectionState::Selected), ..AgentDebugQuery::default() }).expect("selected agent query");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent_id, raw_id);
     }
 
     #[test]
@@ -2441,8 +2411,8 @@ mod tests {
         // Enqueueing proves admission order, nothing more: the driver has not drained
         // this command and the legacy bus journals nothing (bd-f65w).
         assert_eq!(status_pause.application_state, APPLICATION_STATE_ADMITTED);
-        assert_eq!(status_pause.journal_state, JOURNAL_STATE_NOT_REQUIRED);
-        assert!(status_pause.command_id.starts_with("cmd-"));
+        assert_eq!(status_pause.journal_state, "pending");
+        assert_eq!(status_pause.command_id.len(), CommandId::new(1).to_string().len());
 
         let status_resume = handle.resume(None).expect("resume command");
         assert_ne!(status_pause.command_id, status_resume.command_id);
@@ -2453,7 +2423,7 @@ mod tests {
         let status_speed = handle.set_speed(2.5, None).expect("speed command");
         assert_eq!(status_speed.application_state, APPLICATION_STATE_ADMITTED);
 
-        while receiver.try_recv().is_ok() {}
+        receiver.wait_applied(&status_speed);
 
         let status_shutdown = handle.shutdown().expect("shutdown command");
         assert_eq!(
@@ -2467,7 +2437,7 @@ mod tests {
             .expect("found status");
         assert_eq!(looked_up.command_id, status_pause.command_id);
 
-        let non_existent = handle.command_status("cmd-invalid-9999").expect("lookup");
+        let non_existent = handle.command_status(&CommandId::new(9999).to_string()).expect("lookup");
         assert!(non_existent.is_none());
 
         let err = handle

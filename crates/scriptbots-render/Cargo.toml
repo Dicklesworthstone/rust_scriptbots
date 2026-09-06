@@ -8,6 +8,8 @@ gpui = { workspace = true }
 gpui_platform = { workspace = true }
 tracing = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }
+scriptbots-runtime = { path = "../scriptbots-runtime" }
+slotmap = { workspace = true }
 scriptbots-storage = { path = "../scriptbots-storage" }
 kira = { workspace = true, optional = true }
 rand = { workspace = true }

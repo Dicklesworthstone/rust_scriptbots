@@ -32,17 +32,18 @@ use bevy_post_process::auto_exposure::{AutoExposure, AutoExposurePlugin};
 use bevy_post_process::bloom::Bloom;
 use image::{ImageBuffer, Rgba as ImgRgba};
 use scriptbots_core::{
-    AccessibilityPalette, AgentId, BrainInspectionClientId, BrainInspectionLimits,
-    BrainInspectionRequest, BrainInspectionRevision, ControlCommand, ControlDisposition, GpuClass,
-    GpuInfo, IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderGovernor, RenderQuality,
+    AccessibilityPalette, AgentId, BrainInspectionLimits, ControlCommand, GpuClass, GpuInfo,
+    IndicatorState, NUM_EYES, OutputChannel, OutputsExt, RenderGovernor, RenderQuality,
     RenderSettings, RenderTonemapMode, SelectedBrainTelemetryOutcome, SelectionMode,
     SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, TickSummary, TierFeatures,
-    TraitModifiers, WorldState, WorldStepDriver, apply_control_command, initial_tier_for,
-    tier_features, toroidal_delta,
+    TraitModifiers, WorldState, initial_tier_for, tier_features, toroidal_delta,
     visual::{
         self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
     },
 };
+#[cfg(test)]
+use scriptbots_core::{BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision};
+use scriptbots_runtime::{HostPort, RenderSnapshot, channel::ChannelHostPort};
 use slotmap::Key;
 use std::{
     collections::{HashMap, HashSet},
@@ -54,7 +55,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tracing::{error, info, warn};
 
@@ -65,14 +66,11 @@ use tracing::{error, info, warn};
 /// `bool` could never do — and why every acknowledgement fix in this file could
 /// only ever reach `admitted` (bd-k7nq).
 pub type CommandSubmitFn = Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync>;
-pub type CommandDrainFn = Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync>;
 pub type ControlHealthFn = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
 pub struct BevyRendererContext {
-    pub world: Arc<Mutex<WorldState>>,
-    pub simulation_step: WorldStepDriver,
+    pub host: ChannelHostPort,
     pub command_submit: CommandSubmitFn,
-    pub command_drain: CommandDrainFn,
     pub control_health: Option<ControlHealthFn>,
 }
 
@@ -99,27 +97,31 @@ struct ControlHealthMonitor {
 
 struct BevyWorkerGroup {
     running: Arc<AtomicBool>,
-    snapshot: Option<BevyWorker>,
-    simulation: Option<BevyWorker>,
+    workers: Vec<(&'static str, BevyWorker)>,
 }
 
 impl BevyWorkerGroup {
     fn stop_and_join(mut self) -> Result<()> {
         self.running.store(false, Ordering::Release);
-        let simulation = join_bevy_worker("simulation", self.simulation.take());
-        let snapshot = join_bevy_worker("snapshot", self.snapshot.take());
-        combine_bevy_results(simulation, snapshot, "snapshot worker also failed")
+        let mut result = Ok(());
+        for (role, worker) in self.workers.drain(..) {
+            result = combine_bevy_results(
+                result,
+                join_bevy_worker(role, Some(worker)),
+                "worker also failed",
+            );
+        }
+        result
     }
 }
 
 impl Drop for BevyWorkerGroup {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Err(error) = join_bevy_worker("simulation", self.simulation.take()) {
-            warn!(%error, "Bevy simulation worker failed during emergency cleanup");
-        }
-        if let Err(error) = join_bevy_worker("snapshot", self.snapshot.take()) {
-            warn!(%error, "Bevy snapshot worker failed during emergency cleanup");
+        for (role, worker) in self.workers.drain(..) {
+            if let Err(error) = join_bevy_worker(role, Some(worker)) {
+                warn!(%error, role, "Bevy worker failed during emergency cleanup");
+            }
         }
     }
 }
@@ -552,22 +554,18 @@ fn drive_adaptive_quality(
 }
 
 pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
-    info!("Launching Bevy renderer (Phase 1: static world visuals)");
+    info!("Launching Bevy renderer from host snapshots");
 
     let BevyRendererContext {
-        world,
-        simulation_step,
+        mut host,
         command_submit,
-        command_drain,
         control_health,
     } = ctx;
 
-    let initial_render_settings = {
-        let guard = world.lock().map_err(|error| {
-            anyhow!("world mutex poisoned while reading render settings: {error}")
-        })?;
-        guard.config().render.clone()
-    };
+    let initial = host
+        .snapshot_after(None)?
+        .ok_or_else(|| anyhow!("host has no initial snapshot"))?;
+    let initial_render_settings = initial.config.render.clone();
     let effective_render_settings = resolve_effective_render_settings(&initial_render_settings);
     if effective_render_settings.gpu.is_none() {
         return Err(anyhow!(
@@ -580,15 +578,11 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let first_worker_failure = Arc::new(Mutex::new(None));
     let running = Arc::new(AtomicBool::new(true));
     let worker_flag = Arc::clone(&running);
-    let world_for_worker = Arc::clone(&world);
     let submitter_resource = CommandSubmitter {
         submit: command_submit.clone(),
     };
     let controls_resource = SimulationControl::new();
     let controls_for_thread = controls_resource.clone();
-    let drain_for_thread = Arc::clone(&command_drain);
-    let world_for_sim = Arc::clone(&world);
-    let running_sim = Arc::clone(&running);
     let snapshot_failures = failure_tx.clone();
 
     let snapshot_worker = thread::Builder::new()
@@ -598,33 +592,50 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 let mut last_snapshot: Option<WorldSnapshot> = None;
                 let mut next_revision = 1_u64;
                 // Client identity and revision for brain inspection are owned
-                // here, not in `from_world`, because the revision must be
+                // here, not in the visual projection, because the revision must be
                 // monotonic per client across snapshots (bd-2z0.14.1.15).
-                let brain_client_id = BrainInspectionClientId::new(BRAIN_OVERLAY_CLIENT_ID);
+                let brain_client_id =
+                    scriptbots_runtime::ProjectionClientId::new(BRAIN_OVERLAY_CLIENT_ID);
                 let mut next_brain_revision = 0_u64;
+                let mut host_revision = None;
                 while worker_flag.load(Ordering::Acquire) {
-                    let mut snapshot = {
-                        let guard = world_for_worker.lock().map_err(|error| {
-                            anyhow!("world mutex poisoned in Bevy snapshot worker: {error}")
-                        })?;
-                        let built = WorldSnapshot::from_world(&guard);
-                        // Captured under the same lock, so the activations and
-                        // the rest of the snapshot describe one world state.
-                        built.map(|mut snap| {
-                            snap.brain = BrainOverlay::capture(
-                                &guard,
-                                &snap.agents,
-                                brain_client_id,
-                                &mut next_brain_revision,
-                            );
-                            snap
-                        })
+                    let Some(published) = host.snapshot_after(host_revision)? else {
+                        thread::sleep(Duration::from_millis(30));
+                        continue;
+                    };
+                    host_revision = Some(published.revision);
+                    controls_for_thread.update(|state| {
+                        state.paused = published.playback.paused;
+                        state.speed_multiplier = published.playback.speed_multiplier;
+                        state.pending_steps = 0;
+                        if !state.paused {
+                            state.auto_pause_reason = None;
+                        }
+                    });
+                    if !published.playback.paused
+                        && let Some(reason) = snapshot_auto_pause_reason(&published)
+                    {
+                        if command_submit(ControlCommand::Pause).is_some() {
+                            controls_for_thread.update(|state| {
+                                state.auto_pause_reason = Some(reason.clone());
+                            });
+                            info!(%reason, "Bevy auto-pause admitted by host");
+                        } else {
+                            warn!(%reason, "Bevy host refused auto-pause");
+                        }
                     }
+                    let mut snapshot = WorldSnapshot::from_snapshot(&published)
                     .ok_or_else(|| {
                         anyhow!(
-                            "Bevy snapshot worker rejected non-positive or invalid world dimensions"
+                            "Bevy snapshot worker rejected invalid dimensions or incomplete visual layers"
                         )
                     })?;
+                    snapshot.brain = BrainOverlay::capture_host(
+                        &mut host,
+                        &published,
+                        brain_client_id,
+                        &mut next_brain_revision,
+                    );
 
                     if assign_presentation_revision(
                         &mut snapshot,
@@ -644,30 +655,9 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         })
         .context("failed to spawn Bevy snapshot worker")?;
 
-    let simulation_worker = match spawn_simulation_driver(
-        world_for_sim,
-        simulation_step,
-        drain_for_thread,
-        controls_for_thread.clone(),
-        Arc::clone(&running_sim),
-        failure_tx.clone(),
-    ) {
-        Ok(worker) => worker,
-        Err(error) => {
-            running.store(false, Ordering::Release);
-            let snapshot_cleanup = join_bevy_worker("snapshot", Some(snapshot_worker));
-            return match snapshot_cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error).context(format!("snapshot worker cleanup also failed: {cleanup:#}"))
-                }
-            };
-        }
-    };
     let workers = BevyWorkerGroup {
         running: Arc::clone(&running),
-        snapshot: Some(snapshot_worker),
-        simulation: Some(simulation_worker),
+        workers: vec![("snapshot", snapshot_worker)],
     };
 
     let mut app = App::new();
@@ -792,6 +782,21 @@ fn diagnostics_enabled() -> bool {
         .ok()
         .and_then(|value| parse_env_flag(&value))
         .unwrap_or(false)
+}
+
+fn snapshot_auto_pause_reason(snapshot: &RenderSnapshot) -> Option<String> {
+    let summary = snapshot.completed_summary.as_ref()?;
+    let control = &snapshot.config.control;
+    if control.auto_pause_on_spike_hit && summary.spike_hits > 0 {
+        Some(format!("Spike hits detected ({})", summary.spike_hits))
+    } else if let Some(limit) = control.auto_pause_age_above {
+        (summary.max_age >= limit).then(|| format!("Max age {} ≥ {limit}", summary.max_age))
+    } else if let Some(limit) = control.auto_pause_population_below {
+        (summary.agent_count as u32 <= limit)
+            .then(|| format!("Population {} ≤ {limit}", summary.agent_count))
+    } else {
+        None
+    }
 }
 
 fn parse_env_flag(value: &str) -> Option<bool> {
@@ -1143,8 +1148,6 @@ struct CommandSubmitter {
     submit: CommandSubmitFn,
 }
 
-const SIM_TICK_INTERVAL: f32 = 1.0 / 60.0;
-const MAX_SIM_STEPS_PER_FRAME: usize = 8;
 const SPEED_STEP: f32 = 0.5;
 const MIN_SPEED: f32 = 0.0;
 const MAX_SPEED: f32 = 8.0;
@@ -1226,25 +1229,6 @@ impl SimulationControl {
 impl Default for SimulationControl {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn apply_simulation_command_to_state(state: &mut SimControlData, command: &SimulationCommand) {
-    if let Some(paused) = command.paused {
-        state.paused = paused;
-        if paused {
-            state.auto_pause_reason = None;
-        }
-    }
-    if let Some(speed) = command.speed_multiplier {
-        state.speed_multiplier = speed.clamp(0.0, MAX_SPEED);
-        if state.speed_multiplier <= MIN_SPEED {
-            state.paused = true;
-        }
-    }
-    if command.step_once {
-        enqueue_step_request(state);
-        state.paused = true;
     }
 }
 
@@ -1938,12 +1922,60 @@ impl HudHistory {
 }
 
 impl BrainOverlay {
+    fn capture_host(
+        host: &mut ChannelHostPort,
+        snapshot: &RenderSnapshot,
+        client_id: scriptbots_runtime::ProjectionClientId,
+        next_revision: &mut u64,
+    ) -> Self {
+        let Some((index, _)) = snapshot
+            .agent_selection
+            .iter()
+            .enumerate()
+            .find(|(_, selection)| matches!(selection, SelectionState::Selected))
+        else {
+            return Self::default();
+        };
+        let Some(agent) = snapshot.world.agents.get(index) else {
+            return Self {
+                status: BrainOverlayStatus::NoStableIdentity,
+                ..Self::default()
+            };
+        };
+        *next_revision = next_revision.saturating_add(1);
+        let request = scriptbots_runtime::BrainProjectionRequest {
+            client_id,
+            revision: scriptbots_runtime::ProjectionRequestRevision::new(*next_revision),
+            targets: vec![agent.uid],
+            limits: BrainInspectionLimits::default(),
+        };
+        match host.project_brain(&request) {
+            Ok(response) if response.source.matches_snapshot(snapshot) => {
+                Self::from_response(response.inspection)
+            }
+            Ok(response) => Self {
+                status: BrainOverlayStatus::Unavailable,
+                source_tick: response.source.inspected_tick.0,
+                ..Self::default()
+            },
+            Err(error) => {
+                warn!(%error, "Bevy selected brain inspection failed");
+                Self {
+                    status: BrainOverlayStatus::Unavailable,
+                    source_tick: snapshot.world.tick,
+                    ..Self::default()
+                }
+            }
+        }
+    }
+
     /// Capture the primary selection's activations, or issue no request at all.
     ///
     /// Returns early with `NotRequested` when nothing is selected, BEFORE
     /// touching `inspect_brains`. That ordering is the contract: no request
     /// means no brain is inspected, which is what keeps the projection
     /// digest-neutral.
+    #[cfg(test)]
     fn capture(
         world: &WorldState,
         agents: &[AgentVisual],
@@ -1978,6 +2010,10 @@ impl BrainOverlay {
             };
         };
 
+        Self::from_response(response)
+    }
+
+    fn from_response(response: scriptbots_core::BrainInspectionResponse) -> Self {
         let source_tick = response.source_tick.0;
         match response.telemetry.into_iter().next() {
             Some(SelectedBrainTelemetryOutcome::Ready { telemetry }) => {
@@ -2217,6 +2253,109 @@ struct AgentVisual {
 }
 
 impl WorldSnapshot {
+    fn from_snapshot(snapshot: &RenderSnapshot) -> Option<Self> {
+        let config = &snapshot.config;
+        let width = config.world_width as f32;
+        let height = config.world_height as f32;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let terrain = &snapshot.layers.terrain;
+        let total = terrain.width as usize * terrain.height as usize;
+        let water = snapshot
+            .layers
+            .hydrology
+            .as_ref()
+            .map(|layer| layer.water_depth.as_slice());
+        if terrain.tiles.len() != total || water.is_some_and(|depth| depth.len() != total) {
+            return None;
+        }
+        let (cycle_ticks, start_phase) = config.render.resolved_day_night();
+        let terrain_height = TerrainHeightSnapshot {
+            dims: UVec2::new(terrain.width, terrain.height),
+            cell_size: terrain.cell_size,
+            elevation: terrain.tiles.iter().map(|tile| tile.elevation).collect(),
+            moisture: terrain.tiles.iter().map(|tile| tile.moisture).collect(),
+            accent: terrain.tiles.iter().map(|tile| tile.accent).collect(),
+            fertility: terrain
+                .tiles
+                .iter()
+                .map(|tile| tile.fertility_bias)
+                .collect(),
+            temperature: terrain
+                .tiles
+                .iter()
+                .map(|tile| tile.temperature_bias)
+                .collect(),
+            kinds: terrain.tiles.iter().map(|tile| tile.kind).collect(),
+            water_depth: water.map_or_else(|| vec![0.0; total], <[f32]>::to_vec),
+            daylight: visual::daylight_factor(snapshot.world.tick, cycle_ticks, start_phase),
+        };
+        let mut agents = Vec::with_capacity(snapshot.world.agents.len());
+        for (index, agent) in snapshot.world.agents.iter().enumerate() {
+            // A drawing host must capture visual detail. Absence is a malformed
+            // input, never permission to fabricate a different-looking creature.
+            let visual = snapshot.agent_visuals(index)?;
+            agents.push(AgentVisual {
+                id: AgentId::from(slotmap::KeyData::from_ffi(agent.id)),
+                position: Vec2::from_array(agent.position),
+                heading: agent.heading,
+                color: agent.color,
+                selection: *snapshot.agent_selection.get(index)?,
+                health: agent.health,
+                energy: agent.energy,
+                age: agent.age,
+                generation: agent.generation.0,
+                reference_age_ticks: u64::from(config.aging_health_decay_start.max(1)),
+                spike_length: agent.spike_length,
+                boost: if agent.boost { 1.0 } else { 0.0 },
+                wheel_left: visual.wheel_left,
+                wheel_right: visual.wheel_right,
+                herbivore_tendency: agent.herbivore_tendency,
+                temperature_preference: visual.temperature_preference,
+                food_delta: visual.food_delta,
+                sound_level: visual.sound_level,
+                sound_output: visual.sound_output,
+                sound_multiplier: visual.sound_multiplier,
+                trait_modifiers: TraitModifiers {
+                    smell: visual.trait_smell,
+                    sound: visual.trait_sound,
+                    hearing: visual.trait_hearing,
+                    eye: visual.trait_eye,
+                    blood: visual.trait_blood,
+                },
+                eye_dirs: visual.eye_direction,
+                eye_fov: visual.eye_fov,
+                indicator: visual.indicator,
+                reproduction_intent: visual.reproduction_intent,
+                spiked: visual.spike_victim,
+            });
+        }
+        let mut pixels = Vec::with_capacity(total * 4);
+        for tile in &terrain.tiles {
+            for value in terrain_kind_color(tile.kind) {
+                pixels.push((value * 255.0).round().clamp(0.0, 255.0) as u8);
+            }
+            pixels.push(255);
+        }
+        Some(Self {
+            revision: 1,
+            tick: snapshot.world.tick,
+            world_size: Vec2::new(width, height),
+            agent_radius: config.bot_radius.max(1.0),
+            terrain_color: TerrainColorMap {
+                width: terrain.width,
+                height: terrain.height,
+                pixels,
+            },
+            terrain_height,
+            agents,
+            events: HudEvent::recent_from_history(snapshot.summary_history.iter()),
+            history: HudHistory::from_history(snapshot.summary_history.iter()),
+            brain: BrainOverlay::default(),
+        })
+    }
+
     fn same_render_content(&self, other: &Self) -> bool {
         self.tick == other.tick
             && self.world_size == other.world_size
@@ -5220,17 +5359,7 @@ fn handle_playback_buttons(
         });
 
         if let (Some(submitter), Some(command)) = (submitter.as_ref(), command_to_send) {
-            if command.step_once {
-                // Step keeps its own repair and is deliberately NOT rolled back.
-                // A rejected step cannot simply disappear: it falls back to the
-                // local driver edge, and `paused = true` is part of stepping
-                // rather than an optimistic edit to undo.
-                if !submit_simulation_command(submitter, command) {
-                    controls.update(enqueue_step_request);
-                }
-            } else {
-                submit_playback_command(submitter, command, &controls, &before);
-            }
+            submit_playback_command(submitter, command, &controls, &before);
         }
     }
 }
@@ -5261,6 +5390,7 @@ fn handle_playback_shortcuts(
     }
 
     if keys.just_pressed(KeyCode::KeyN) {
+        let before = controls.snapshot();
         let mut command = SimulationCommand::default();
         controls.update(|state| {
             if !command_is_authoritative {
@@ -5272,10 +5402,8 @@ fn handle_playback_shortcuts(
             command.paused = Some(true);
             command.step_once = true;
         });
-        if let (Some(submitter), Some(command)) = (submitter.as_ref(), Some(command))
-            && !submit_simulation_command(submitter, command)
-        {
-            controls.update(enqueue_step_request);
+        if let Some(submitter) = submitter.as_ref() {
+            submit_playback_command(submitter, command, &controls, &before);
         }
     }
 
@@ -7744,180 +7872,6 @@ pub fn render_png_offscreen(world: &WorldState, width: u32, height: u32) -> Resu
     Ok(bytes)
 }
 
-fn spawn_simulation_driver(
-    world: Arc<Mutex<WorldState>>,
-    simulation_step: WorldStepDriver,
-    command_drain: CommandDrainFn,
-    controls: SimulationControl,
-    running: Arc<AtomicBool>,
-    worker_failures: mpsc::Sender<BevyLifecycleFailure>,
-) -> Result<BevyWorker> {
-    thread::Builder::new()
-        .name("scriptbots-bevy-simulation".into())
-        .spawn(move || {
-            run_reported_worker("simulation worker", &worker_failures, &running, || {
-                let mut last = Instant::now();
-                let mut accumulator = 0.0f32;
-
-                while running.load(Ordering::Acquire) {
-                    let now = Instant::now();
-                    let mut dt = (now - last).as_secs_f32();
-                    last = now;
-                    if !dt.is_finite() || dt > 0.25 {
-                        dt = 0.25;
-                    }
-
-                    let mut latched_step_failure = None;
-                    {
-                        let mut world_guard = world.lock().map_err(|error| {
-                            anyhow!("world mutex poisoned in Bevy simulation worker: {error}")
-                        })?;
-                        if let Some(error) = world_guard.latched_step_error() {
-                            latched_step_failure = Some(format!(
-                                "Simulation stopped after a terminal step failure: {error}"
-                            ));
-                        } else {
-                            for command in (command_drain.as_ref())() {
-                                match apply_control_command(&mut world_guard, command) {
-                                    Ok(ControlDisposition::WorldApplied) => {}
-                                    Ok(ControlDisposition::Playback(command)) => {
-                                        controls.update(|state| {
-                                            apply_simulation_command_to_state(state, &command)
-                                        });
-                                    }
-                                    Err(error) => {
-                                        warn!(%error, "Bevy rejected a drained control command");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(reason) = latched_step_failure {
-                        controls.update(|state| {
-                            apply_auto_pause_to_state(state, &reason);
-                        });
-                        accumulator = 0.0;
-                        thread::sleep(Duration::from_millis(4));
-                        continue;
-                    }
-
-                    let (paused, speed, step_once) = {
-                        let mut paused = false;
-                        let mut speed = 1.0;
-                        let mut step_once = false;
-                        let control_available = controls.update(|state| {
-                            paused = state.paused;
-                            speed = state.speed_multiplier.clamp(MIN_SPEED, MAX_SPEED);
-                            if state.pending_steps > 0 {
-                                step_once = true;
-                                state.pending_steps -= 1;
-                                state.paused = true;
-                                state.auto_pause_reason = None;
-                            }
-                        });
-                        if !control_available {
-                            paused = true;
-                            speed = 0.0;
-                            step_once = false;
-                        }
-                        (paused, speed, step_once)
-                    };
-
-                    if paused && !step_once {
-                        thread::sleep(Duration::from_millis(4));
-                        continue;
-                    }
-
-                    if !step_once {
-                        accumulator += dt * speed.max(0.0);
-                        let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
-                        accumulator = accumulator.min(max_accumulator);
-                    }
-
-                    let mut steps = if step_once {
-                        accumulator = 0.0;
-                        1
-                    } else {
-                        let mut queued = 0usize;
-                        while accumulator >= SIM_TICK_INTERVAL && queued < MAX_SIM_STEPS_PER_FRAME {
-                            accumulator -= SIM_TICK_INTERVAL;
-                            queued += 1;
-                        }
-                        queued
-                    };
-
-                    if steps == 0 && !step_once && speed <= MIN_SPEED {
-                        thread::sleep(Duration::from_millis(4));
-                        continue;
-                    }
-
-                    if steps == 0 && step_once {
-                        steps = 1;
-                    }
-
-                    let mut step_failure = None;
-                    for _ in 0..steps {
-                        if let Err(error) = (simulation_step)() {
-                            step_failure = Some(format!(
-                                "Simulation stopped after a terminal step failure: {error}"
-                            ));
-                            break;
-                        }
-                    }
-
-                    let (control, agent_count, max_age, spike_hits) = {
-                        let world_guard = world.lock().map_err(|error| {
-                            anyhow!("world mutex poisoned in Bevy simulation worker: {error}")
-                        })?;
-                        (
-                            world_guard.config().control.clone(),
-                            world_guard.agent_count(),
-                            world_guard.last_max_age(),
-                            world_guard.last_spike_hits(),
-                        )
-                    };
-
-                    let step_failed = step_failure.is_some();
-                    let mut reason = step_failure;
-                    if reason.is_none() {
-                        if control.auto_pause_on_spike_hit && spike_hits > 0 {
-                            reason = Some(format!("Spike hits detected ({spike_hits})"));
-                        } else if let Some(age_limit) = control.auto_pause_age_above {
-                            if max_age >= age_limit {
-                                reason = Some(format!("Max age {max_age} ≥ {age_limit}"));
-                            }
-                        } else if let Some(limit) = control.auto_pause_population_below
-                            && agent_count as u32 <= limit
-                        {
-                            reason = Some(format!("Population {agent_count} ≤ {limit}"));
-                        }
-                    }
-
-                    if let Some(reason) = reason {
-                        controls.update(|state| {
-                            apply_auto_pause_to_state(state, &reason);
-                        });
-                        if step_failed {
-                            warn!(%reason, "Bevy simulation paused after terminal step failure");
-                        } else {
-                            info!(%reason, "Bevy simulation auto-paused");
-                        }
-                    } else if steps > 0 {
-                        controls.update(|state| {
-                            state.auto_pause_reason = None;
-                        });
-                    }
-
-                    if steps == 0 {
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                }
-                Ok(())
-            })
-        })
-        .context("failed to spawn Bevy simulation worker")
-}
-
 fn color_to_rgba(color: Color) -> [u8; 4] {
     let srgba = color.to_srgba();
     [
@@ -7935,11 +7889,132 @@ mod tests {
     use scriptbots_core::ScriptBotsConfig;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn host_snapshot_matches_owned_world_visuals_without_advancing_science() {
+        use scriptbots_runtime::{
+            HostSessionId, PlaybackSnapshot,
+            host_core::{HostCore, HostCoreOptions},
+        };
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0xBEEF_F00D),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("seeded world");
+        world
+            .try_inject_agent(scriptbots_core::AgentData::default())
+            .expect("finite agent");
+        for _ in 0..3 {
+            world.step().expect("fixture step");
+        }
+        let expected = WorldSnapshot::from_world(&world).expect("owned projection");
+        assert!(
+            !expected.agents.is_empty(),
+            "fixture must exercise visual fields"
+        );
+        let host = HostCore::new(
+            HostSessionId::new(99),
+            world,
+            HostCoreOptions {
+                capture_agent_visuals: true,
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("drawing host");
+        let before = host.scientific_digest_v1().expect("initial digest").overall;
+        let published = host.latest_snapshot();
+        for _ in 0..12 {
+            let rendered = WorldSnapshot::from_snapshot(&published).expect("host projection");
+            assert!(
+                rendered.same_render_content(&expected),
+                "host projection changed visual semantics"
+            );
+        }
+        assert_eq!(host.latest_snapshot().world.tick, expected.tick);
+        assert_eq!(
+            host.scientific_digest_v1()
+                .expect("observed digest")
+                .overall,
+            before
+        );
+        let mut incomplete = (*published).clone();
+        incomplete.agent_visuals = Arc::new(Vec::new());
+        assert!(
+            WorldSnapshot::from_snapshot(&incomplete).is_none(),
+            "missing agent visuals must not fabricate a frame"
+        );
+        incomplete = (*published).clone();
+        incomplete.agent_selection = Arc::new(Vec::new());
+        assert!(
+            WorldSnapshot::from_snapshot(&incomplete).is_none(),
+            "missing selection must not fabricate a frame"
+        );
+        let mut policy = (*published).clone();
+        policy.completed_summary = Some(
+            policy
+                .summary_history
+                .last()
+                .expect("completed history")
+                .clone(),
+        );
+        let control = &mut Arc::make_mut(&mut policy.config).control;
+        control.auto_pause_on_spike_hit = true;
+        control.auto_pause_age_above = None;
+        control.auto_pause_population_below = None;
+        policy
+            .completed_summary
+            .as_mut()
+            .expect("summary")
+            .spike_hits = 0;
+        assert!(snapshot_auto_pause_reason(&policy).is_none());
+        policy
+            .completed_summary
+            .as_mut()
+            .expect("summary")
+            .spike_hits = 1;
+        assert_eq!(
+            snapshot_auto_pause_reason(&policy).as_deref(),
+            Some("Spike hits detected (1)")
+        );
+        policy
+            .completed_summary
+            .as_mut()
+            .expect("summary")
+            .spike_hits = 0;
+        let age = policy.completed_summary.as_ref().expect("summary").max_age;
+        Arc::make_mut(&mut policy.config)
+            .control
+            .auto_pause_age_above = Some(age + 1);
+        assert!(snapshot_auto_pause_reason(&policy).is_none());
+        Arc::make_mut(&mut policy.config)
+            .control
+            .auto_pause_age_above = Some(age);
+        assert!(snapshot_auto_pause_reason(&policy).is_some());
+        Arc::make_mut(&mut policy.config)
+            .control
+            .auto_pause_age_above = None;
+        let count = policy
+            .completed_summary
+            .as_ref()
+            .expect("summary")
+            .agent_count as u32;
+        Arc::make_mut(&mut policy.config)
+            .control
+            .auto_pause_population_below = Some(count);
+        assert!(snapshot_auto_pause_reason(&policy).is_some());
+        Arc::make_mut(&mut policy.config)
+            .control
+            .auto_pause_population_below = Some(count - 1);
+        assert!(snapshot_auto_pause_reason(&policy).is_none());
+    }
+
     fn worker_group(snapshot: BevyWorker, simulation: BevyWorker) -> BevyWorkerGroup {
         BevyWorkerGroup {
             running: Arc::new(AtomicBool::new(true)),
-            snapshot: Some(snapshot),
-            simulation: Some(simulation),
+            workers: vec![("simulation", simulation), ("snapshot", snapshot)],
         }
     }
 
@@ -8385,8 +8460,7 @@ mod tests {
         });
         let workers = BevyWorkerGroup {
             running: Arc::clone(&running),
-            snapshot: Some(snapshot),
-            simulation: Some(simulation),
+            workers: vec![("simulation", simulation), ("snapshot", snapshot)],
         };
 
         workers.stop_and_join().expect("clean worker shutdown");
@@ -8674,39 +8748,53 @@ mod tests {
         );
     }
 
-    fn consume_driver_step_request(state: &mut SimControlData) -> usize {
-        if state.pending_steps > 0 {
-            state.pending_steps -= 1;
-            state.paused = true;
-            state.auto_pause_reason = None;
-            1
-        } else {
-            0
-        }
-    }
-
     fn current_bevy_step_count(queued_command_arrives_before_driver: bool) -> usize {
-        let mut state = SimControlData {
-            paused: true,
-            // Production has a CommandSubmitter, so the UI does not also set
-            // the local edge. The drained command is the single authority.
-            pending_steps: 0,
-            ..SimControlData::default()
+        use scriptbots_runtime::{
+            CommandEnvelope, CommandId, HostCommand, HostSessionId, ManualHostDriver,
+            ManualInstant, PlaybackSnapshot,
+            host_core::{HostCore, HostCoreOptions},
         };
-        let queued = SimulationCommand {
-            paused: Some(true),
-            speed_multiplier: None,
-            step_once: true,
-        };
-
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut host = HostCore::new(
+            HostSessionId::new(42),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("host");
+        let mut port = host.local_port();
+        let queued = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
         if queued_command_arrives_before_driver {
-            apply_simulation_command_to_state(&mut state, &queued);
+            port.submit(queued.clone()).expect("submit step");
         }
-        let mut steps = consume_driver_step_request(&mut state);
+        let mut steps = host
+            .drive(ManualInstant::from_nanos(0))
+            .expect("first boundary")
+            .scientific_steps;
         if !queued_command_arrives_before_driver {
-            apply_simulation_command_to_state(&mut state, &queued);
-            steps += consume_driver_step_request(&mut state);
+            port.submit(queued).expect("submit step");
+            steps += host
+                .drive(ManualInstant::from_nanos(1))
+                .expect("second boundary")
+                .scientific_steps;
         }
+        assert_eq!(
+            port.snapshot_after(None)
+                .expect("read snapshot")
+                .expect("snapshot")
+                .world
+                .tick,
+            1
+        );
         steps
     }
 
@@ -8753,7 +8841,7 @@ mod tests {
     }
 
     #[test]
-    fn step_button_preserves_pending_work_and_falls_back_on_enqueue_rejection() {
+    fn step_button_never_creates_local_work_after_host_refusal() {
         let accepted = run_step_button_with_submitter(true, 0);
         assert_eq!(
             accepted.pending_steps, 0,
@@ -8768,28 +8856,55 @@ mod tests {
 
         let rejected = run_step_button_with_submitter(false, 0);
         assert_eq!(
-            rejected.pending_steps, 1,
-            "a rejected queued step must fall back to the local driver edge"
+            rejected.pending_steps, 0,
+            "a rejected queued step must not invent a second science authority"
         );
     }
 
     #[test]
     fn two_queued_step_edges_produce_two_driver_steps() {
-        let mut state = SimControlData {
-            paused: true,
-            ..SimControlData::default()
+        use scriptbots_runtime::{
+            CommandEnvelope, CommandId, HostCommand, HostSessionId, ManualHostDriver,
+            ManualInstant, PlaybackSnapshot,
+            host_core::{HostCore, HostCoreOptions},
         };
-        let queued = SimulationCommand {
-            paused: Some(true),
-            speed_multiplier: None,
-            step_once: true,
-        };
-        apply_simulation_command_to_state(&mut state, &queued);
-        apply_simulation_command_to_state(&mut state, &queued);
-        assert_eq!(state.pending_steps, 2, "step edges must not coalesce");
-        assert_eq!(consume_driver_step_request(&mut state), 1);
-        assert_eq!(consume_driver_step_request(&mut state), 1);
-        assert_eq!(consume_driver_step_request(&mut state), 0);
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut host = HostCore::new(
+            HostSessionId::new(43),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("host");
+        let mut port = host.local_port();
+        for id in 1..=2 {
+            port.submit(CommandEnvelope::new(CommandId::new(id), HostCommand::Step))
+                .expect("submit step");
+        }
+        let first = host
+            .drive(ManualInstant::from_nanos(0))
+            .expect("first boundary")
+            .scientific_steps;
+        let second = host
+            .drive(ManualInstant::from_nanos(1))
+            .expect("second boundary")
+            .scientific_steps;
+        assert_eq!(first + second, 2, "distinct step edges must not coalesce");
+        assert_eq!(
+            host.drive(ManualInstant::from_nanos(2))
+                .expect("idle boundary")
+                .scientific_steps,
+            0
+        );
     }
 
     #[test]

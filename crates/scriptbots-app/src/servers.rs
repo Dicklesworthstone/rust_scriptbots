@@ -32,17 +32,14 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::ScenarioIdentityV0;
-use crate::SharedWorld;
-use crate::command::{
-    CommandDrain, CommandSubmit, create_command_bus, make_command_drain, make_command_submit,
-};
+use crate::command::CommandSubmit;
 use crate::control::{
-    AgentScoreEntry, CommandReporter, CommandStatusDto, ConfigSnapshot, ControlError,
-    ControlHandle, DietClassDto, EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate,
-    Scoreboard, SelectionModeDto, SelectionStateDto, SharedLatestSummary, SimulationStatusDto,
-    SpeedRequest,
+    AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, DietClassDto,
+    EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
+    SelectionStateDto, SimulationStatusDto, SpeedRequest,
 };
 use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
+use scriptbots_runtime::channel::ChannelHostPort;
 // keep image out of servers unless needed
 use scriptbots_core::ConfigAuditEntry;
 use scriptbots_core::TickSummaryDto;
@@ -88,7 +85,7 @@ pub struct PresentedTerminalFrame {
 
 /// Wait-free publication slot for [`PresentedTerminalFrame`].
 ///
-/// Same shape as [`SharedLatestSummary`]: readers never block, and a request that
+/// A shared latest-value slot: readers never block, and a request that
 /// lands mid-frame gets the previous frame rather than a torn one.
 pub type SharedPresentedFrame = Arc<arc_swap::ArcSwapOption<PresentedTerminalFrame>>;
 
@@ -114,11 +111,8 @@ pub struct ControlServerConfig {
     /// Shared slot the terminal frontend publishes presented frames into and
     /// `GET /api/screenshot/ascii` reads.
     ///
-    /// Carried on the config for the same reason `ControlRuntime::command_reporter`
-    /// is carried on the runtime (bd-tgfz): the writer is the terminal frontend,
-    /// several calls from where the server is built, and widening four signatures to
-    /// reach it would touch files other panes are actively editing. Defaulted, so no
-    /// existing `..ControlServerConfig::default()` construction changes.
+    /// Shared with the terminal frontend so the API serves exactly the frame
+    /// that was presented, including its viewport and revision.
     pub presented_frame: SharedPresentedFrame,
 }
 
@@ -357,17 +351,8 @@ impl ControlServerReservation {
     }
 
     /// Launch the control runtime using the exact listeners reserved earlier.
-    pub fn launch(
-        self,
-        world: SharedWorld,
-        latest_summary: SharedLatestSummary,
-    ) -> Result<(ControlRuntime, CommandDrain, CommandSubmit)> {
-        ControlRuntime::launch_reserved_with_timeout(
-            world,
-            latest_summary,
-            self,
-            CONTROL_STARTUP_TIMEOUT,
-        )
+    pub fn launch(self, host: ChannelHostPort) -> Result<(ControlRuntime, CommandSubmit)> {
+        ControlRuntime::launch_reserved_with_timeout(host, self, CONTROL_STARTUP_TIMEOUT)
     }
 
     /// Actual REST address, including the assigned port when configured with port zero.
@@ -415,13 +400,7 @@ pub enum ControlRuntimeStatus {
 /// issued before the server tasks reach their await would be lost and the
 /// join below would hang forever.
 pub struct ControlRuntime {
-    /// Lets whatever applies drained commands report their outcome.
-    ///
-    /// Carried here rather than threaded through the launch tuple because the
-    /// applier lives in the renderer or the terminal frontend, several calls
-    /// away from where the bus is built, and widening four signatures to reach
-    /// it would touch files other panes are actively editing (bd-tgfz).
-    command_reporter: CommandReporter,
+    control_handle: Option<ControlHandle>,
     /// The slot the terminal frontend publishes presented frames into, shared with
     /// the REST server so `GET /api/screenshot/ascii` serves what was displayed
     /// instead of re-rasterizing the world (bd-2z0.14.2.6).
@@ -441,22 +420,37 @@ enum ControlStartupSignal {
 impl ControlRuntime {
     /// Spawn the control runtime and return only after every enabled listener is bound.
     pub fn launch(
-        world: SharedWorld,
-        latest_summary: SharedLatestSummary,
+        host: ChannelHostPort,
         config: ControlServerConfig,
-    ) -> Result<(Self, CommandDrain, CommandSubmit)> {
-        ControlServerReservation::prepare(config)?.launch(world, latest_summary)
+    ) -> Result<(Self, CommandSubmit)> {
+        ControlServerReservation::prepare(config)?.launch(host)
     }
 
     fn launch_reserved_with_timeout(
-        world: SharedWorld,
-        latest_summary: SharedLatestSummary,
+        host: ChannelHostPort,
         reservation: ControlServerReservation,
         startup_timeout: Duration,
-    ) -> Result<(Self, CommandDrain, CommandSubmit)> {
-        let (command_tx, command_rx) = create_command_bus(32);
-        let command_drain = make_command_drain(command_rx);
-        let command_submit = make_command_submit(command_tx.clone());
+    ) -> Result<(Self, CommandSubmit)> {
+        let handle = ControlHandle::new(host);
+        let submit_handle = handle.clone();
+        let command_submit: CommandSubmit = Arc::new(move |command| {
+            match submit_handle.submit_command(command, None) {
+                Ok(status)
+                    if status.application_state == "admitted"
+                        || status.application_state == "applied" =>
+                {
+                    Some(status.command_id)
+                }
+                Ok(status) => {
+                    warn!(command_id = %status.command_id, application_state = %status.application_state, "host refused control command");
+                    None
+                }
+                Err(error) => {
+                    warn!(%error, "host control submission failed");
+                    None
+                }
+            }
+        });
         let (shutdown, shutdown_rx) = watch::channel(false);
         let shutdown_for_thread = shutdown.clone();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
@@ -465,11 +459,7 @@ impl ControlRuntime {
         // Taken before the reservation moves into the server thread, so the runtime
         // and the REST state hold THE SAME slot rather than two empty ones.
         let presented_frame = reservation.config.presented_frame.clone();
-        let handle = ControlHandle::new(world.clone(), command_tx.clone(), latest_summary);
-        // Derived before the handle moves into the axum state: the reporter
-        // shares the ledger, so an outcome recorded through it is the same
-        // receipt a REST client polls.
-        let command_reporter = handle.command_reporter();
+        let control_handle = Some(handle.clone());
 
         let thread = thread::Builder::new()
             .name("scriptbots-control".into())
@@ -502,7 +492,7 @@ impl ControlRuntime {
         match startup_rx.recv_timeout(startup_timeout) {
             Ok(ControlStartupSignal::Ready) => Ok((
                 Self {
-                    command_reporter,
+                    control_handle,
                     presented_frame,
                     shutdown,
                     thread: Some(thread),
@@ -510,7 +500,6 @@ impl ControlRuntime {
                     #[cfg(test)]
                     _dummy_status_guard: None,
                 },
-                command_drain,
                 command_submit,
             )),
             Ok(ControlStartupSignal::Failed(detail)) => match join_control_thread(thread) {
@@ -544,10 +533,10 @@ impl ControlRuntime {
         self.status.clone()
     }
 
-    /// A reporter the applier uses to record what became of a drained command.
+    /// The same host-backed control client used by the live transports.
     #[must_use]
-    pub fn command_reporter(&self) -> CommandReporter {
-        Arc::clone(&self.command_reporter)
+    pub fn control_handle(&self) -> Option<ControlHandle> {
+        self.control_handle.clone()
     }
 
     /// The slot a frontend publishes its presented frames into.
@@ -668,23 +657,18 @@ fn handoff_control_reaper(handle: JoinHandle<Result<()>>) {
 #[cfg(test)]
 impl ControlRuntime {
     /// Create a no-op runtime for tests without starting background threads.
-    pub fn dummy() -> (Self, CommandDrain, CommandSubmit) {
-        let (command_tx, command_rx) = create_command_bus(4);
-        let command_drain = make_command_drain(command_rx);
-        let command_submit = make_command_submit(command_tx);
+    pub fn dummy() -> (Self, CommandSubmit) {
+        let command_submit: CommandSubmit = Arc::new(|_| None);
         let (status_guard, status) = watch::channel(ControlRuntimeStatus::Running);
         let runtime = Self {
-            // The dummy runtime has no ledger, so its reporter is a sink. It is
-            // explicitly a no-op rather than a panic: tests that never apply a
-            // command should not have to care that they hold one.
-            command_reporter: Arc::new(|_, _| {}),
+            control_handle: None,
             presented_frame: empty_presented_frame(),
             shutdown: watch::channel(false).0,
             thread: None,
             status,
             _dummy_status_guard: Some(status_guard),
         };
-        (runtime, command_drain, command_submit)
+        (runtime, command_submit)
     }
 }
 
@@ -1222,6 +1206,7 @@ impl From<ControlError> for AppError {
             ControlError::InvalidPatch(msg) => Self::bad_request(msg),
             ControlError::Serialization(msg) => Self::internal(msg),
             ControlError::Lock => Self::service_unavailable("world state is currently unavailable"),
+            ControlError::Host(error) => Self::service_unavailable(error.to_string()),
             ControlError::CommandQueueFull => {
                 Self::service_unavailable("command queue is full; retry shortly")
             }
@@ -2683,6 +2668,7 @@ fn map_control_error(err: ControlError) -> McpError {
         ),
         ControlError::InvalidPatch(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::Serialization(msg) => McpError::new(McpErrorCode::InternalError, msg),
+        ControlError::Host(error) => McpError::new(McpErrorCode::InternalError, error.to_string()),
         ControlError::Lock => {
             McpError::new(McpErrorCode::InternalError, "world state is unavailable")
         }
@@ -2699,9 +2685,7 @@ fn map_control_error(err: ControlError) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{
-        APPLICATION_STATE_ADMITTED, JOURNAL_STATE_NOT_REQUIRED, empty_latest_summary,
-    };
+    use crate::control::APPLICATION_STATE_ADMITTED;
     use scriptbots_core::{ScriptBotsConfig, WorldState};
     use serial_test::serial;
     use std::{
@@ -2807,21 +2791,19 @@ mod tests {
         assert_eq!(mcp_idempotency_key(&args), None);
     }
 
-    fn handle() -> (ControlHandle, crate::command::CommandReceiver) {
-        let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
-        let (sender, receiver) = create_command_bus(2);
-        let handle = ControlHandle::new(
-            Arc::new(std::sync::Mutex::new(world)),
-            sender,
-            empty_latest_summary(),
-        );
-        (handle, receiver)
+    fn handle() -> (ControlHandle, crate::control::tests::TestHost) {
+        let host = test_host();
+        (host.handle(), host)
     }
 
-    fn shared_world() -> SharedWorld {
-        Arc::new(std::sync::Mutex::new(
-            WorldState::new(ScriptBotsConfig::default()).expect("world"),
-        ))
+    fn test_host() -> crate::control::tests::TestHost {
+        crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("world"),
+        )
     }
 
     fn unused_loopback_address() -> SocketAddr {
@@ -2954,7 +2936,8 @@ mod tests {
             ..ControlServerConfig::default()
         };
 
-        let error = ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
+        let host = test_host();
+        let error = ControlRuntime::launch(host.port.clone(), config)
             .err()
             .expect("occupied REST address must fail startup");
         let rendered = format!("{error:#}");
@@ -2977,7 +2960,8 @@ mod tests {
             ..ControlServerConfig::default()
         };
 
-        let error = ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
+        let host = test_host();
+        let error = ControlRuntime::launch(host.port.clone(), config)
             .err()
             .expect("occupied MCP address must fail startup");
         let rendered = format!("{error:#}");
@@ -3000,7 +2984,8 @@ mod tests {
             ..ControlServerConfig::default()
         };
 
-        let error = ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
+        let host = test_host();
+        let error = ControlRuntime::launch(host.port.clone(), config)
             .err()
             .expect("MCP must not share the prepared REST listener");
         assert!(
@@ -3023,9 +3008,9 @@ mod tests {
             ..ControlServerConfig::default()
         };
 
-        let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
-                .expect("REST startup");
+        let host = test_host();
+        let (runtime, _submit) =
+            ControlRuntime::launch(host.port.clone(), config).expect("REST startup");
         let stream = TcpStream::connect(rest_address)
             .expect("readiness acknowledgement must follow a listening REST socket");
         drop(stream);
@@ -3057,9 +3042,8 @@ mod tests {
             "reservation must hold the MCP socket before world construction"
         );
 
-        let (runtime, _drain, _submit) = reservation
-            .launch(shared_world(), empty_latest_summary())
-            .expect("MCP startup");
+        let host = test_host();
+        let (runtime, _submit) = reservation.launch(host.port.clone()).expect("MCP startup");
         assert_eq!(runtime.status(), ControlRuntimeStatus::Running);
         let response = http_get(mcp_address, "/health");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -3091,8 +3075,9 @@ mod tests {
         assert!(TcpListener::bind(rest_address).is_err());
         assert!(TcpListener::bind(mcp_address).is_err());
 
-        let (runtime, _drain, _submit) = reservation
-            .launch(shared_world(), empty_latest_summary())
+        let host = test_host();
+        let (runtime, _submit) = reservation
+            .launch(host.port.clone())
             .expect("REST plus MCP startup");
         assert!(http_get(rest_address, "/api/knobs").starts_with("HTTP/1.1 200"));
         assert!(http_get(mcp_address, "/health").starts_with("HTTP/1.1 200"));
@@ -3113,9 +3098,9 @@ mod tests {
             },
             ..ControlServerConfig::default()
         };
-        let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
-                .expect("MCP startup");
+        let host = test_host();
+        let (runtime, _submit) =
+            ControlRuntime::launch(host.port.clone(), config).expect("MCP startup");
 
         let response = http_post_json(
             mcp_address,
@@ -3260,9 +3245,9 @@ mod tests {
             mcp_transport: McpTransportConfig::Disabled,
             ..ControlServerConfig::default()
         };
-        let (runtime, _drain, _submit) =
-            ControlRuntime::launch(shared_world(), empty_latest_summary(), config)
-                .expect("disabled runtime startup");
+        let host = test_host();
+        let (runtime, _submit) =
+            ControlRuntime::launch(host.port.clone(), config).expect("disabled runtime startup");
         runtime.shutdown().expect("disabled runtime shutdown");
     }
 
@@ -3499,10 +3484,14 @@ mod tests {
             "REST error did not identify field: {}",
             error.message
         );
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(crate::command::CommandRecvError::Empty)
-        ));
+        assert!(
+            receiver
+                .handle()
+                .read_snapshot()
+                .expect("snapshot")
+                .last_applied_command
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3525,10 +3514,14 @@ mod tests {
             rendered.contains("food_growth_rate"),
             "MCP error did not identify field: {rendered}"
         );
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(crate::command::CommandRecvError::Empty)
-        ));
+        assert!(
+            receiver
+                .handle()
+                .read_snapshot()
+                .expect("snapshot")
+                .last_applied_command
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3575,8 +3568,8 @@ mod tests {
     /// are also part of the eight that had drifted out of the OpenAPI document
     /// (bd-01dg) and had no coverage at all.
     #[tokio::test]
-    async fn control_routes_report_admitted_and_unjournaled_status_as_json() {
-        let (control, _receiver) = handle();
+    async fn control_routes_report_real_host_application_and_journal_progress_as_json() {
+        let (control, host) = handle();
         let state = ApiState {
             handle: control,
             scenario: None,
@@ -3595,13 +3588,14 @@ mod tests {
             "enqueueing proves admission order, never application: {body}"
         );
         assert_eq!(
-            body["journal_state"], JOURNAL_STATE_NOT_REQUIRED,
-            "the legacy bus writes no lifecycle record, so no journal state may be claimed: {body}"
+            body["journal_state"], "pending",
+            "admission must not claim a completed lifecycle journal: {body}"
         );
         assert_eq!(body["admission_sequence"], 1);
 
-        // The lookup route must return the same record rather than inventing progress:
-        // nothing on this path can advance either axis.
+        let applied = host.wait_applied(&pause);
+        assert_eq!(applied.application_state, "applied");
+        assert_eq!(applied.journal_state, "committed_volatile");
         let looked_up = match get_control_status(
             State(state.clone()),
             axum::extract::Path(pause.command_id.clone()),
@@ -3613,13 +3607,13 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&looked_up).expect("status serializes"),
-            body
+            serde_json::to_value(&applied).expect("actual host status serializes")
         );
 
         // An unknown ID is a typed 404 Not Found, not a fabricated terminal status or 200 null.
         let missing = get_control_status(
             State(state),
-            axum::extract::Path("cmd-does-not-exist".to_owned()),
+            axum::extract::Path(scriptbots_runtime::CommandId::new(9000).to_string()),
         )
         .await
         .expect_err("unknown command id must return 404 not found");

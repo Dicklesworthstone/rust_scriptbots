@@ -2,7 +2,7 @@
 //!
 //! The scene harness in `scriptbots-app` can capture the Bevy world offscreen, and
 //! `--dump-png` can rasterize the world through `render_png_offscreen`. Neither draws
-//! HUD chrome: `render_png_offscreen` takes `&WorldState` and builds its own camera, so
+//! HUD chrome: `render_png_offscreen` takes a host snapshot and builds its own camera, so
 //! it never constructs a [`SimulationView`] and can never contain a panel. That left
 //! every claim about HUD layout (bd-v9cz, and everything bd-f4x0 will do) resting on
 //! code inspection.
@@ -20,7 +20,7 @@
 //! gated behind that crate's `test-support` feature, which is a dev-dependency here and
 //! must not leak into production builds.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use gpui::{AppContext as _, HeadlessAppContext, px, size};
 use image::RgbaImage;
@@ -31,8 +31,7 @@ use scriptbots_core::{
 };
 
 use crate::{
-    AnalyticsSnapshotProvider, CameraSnapshot, ControlCommand, GuiCommandDrain, GuiCommandOutcome,
-    GuiCommandReporter, GuiSession, GuiViewRole, WorldStepDriver,
+    AnalyticsSnapshotProvider, CameraSnapshot, ControlCommand, GuiSession, GuiViewRole, TestHost,
 };
 
 // GPUI's test window reports a fixed 2× device scale. `HeadlessAppContext::open_window`
@@ -91,7 +90,7 @@ fn apply_capture_overrides(view: &mut crate::SimulationView, overrides: CaptureO
 
 /// Render one GPUI view offscreen at exact output dimensions in device pixels.
 pub(crate) fn capture_view(
-    world: Arc<Mutex<WorldState>>,
+    world: Arc<TestHost>,
     role: GuiViewRole,
     width: f32,
     height: f32,
@@ -101,7 +100,7 @@ pub(crate) fn capture_view(
 
 #[cfg(target_os = "macos")]
 fn capture_view_with_world_painter(
-    world: Arc<Mutex<WorldState>>,
+    world: Arc<TestHost>,
     role: GuiViewRole,
     width: f32,
     height: f32,
@@ -120,7 +119,7 @@ fn capture_view_with_world_painter(
 }
 
 fn capture_view_with_overrides(
-    world: Arc<Mutex<WorldState>>,
+    world: Arc<TestHost>,
     role: GuiViewRole,
     width: f32,
     height: f32,
@@ -134,7 +133,7 @@ fn capture_view_with_overrides(
 }
 
 fn capture_view_with_overrides_and_camera(
-    world: Arc<Mutex<WorldState>>,
+    world: Arc<TestHost>,
     role: GuiViewRole,
     width: f32,
     height: f32,
@@ -151,23 +150,17 @@ fn capture_view_with_overrides_and_camera(
         gpui_platform::current_headless_renderer,
     );
 
-    let step_world = Arc::clone(&world);
-    let simulation_step: WorldStepDriver = Arc::new(move || {
-        step_world
-            .lock()
-            .expect("world mutex poisoned during offscreen capture")
-            .step()
-    });
-    let command_drain: GuiCommandDrain = Arc::new(Vec::new);
+    let command_host = Arc::clone(&world);
     let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
-        Arc::new(|_| Some("hud-capture".to_owned()));
+        Arc::new(move |command| {
+            let command = scriptbots_runtime::HostCommand::try_from(command).ok()?;
+            let status = command_host.submit(command);
+            Some(status.command_id().to_string())
+        });
 
     let session = Arc::new(GuiSession::new(
-        world,
-        simulation_step,
+        world.port.clone(),
         AnalyticsSnapshotProvider::empty(),
-        command_drain,
-        Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
         command_submit,
     ));
 
@@ -265,7 +258,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     const LAB_VIEWPORTS: [(f32, f32); 2] = [(460.0, 768.0), (380.0, 600.0)];
 
-    fn capture_world() -> Arc<Mutex<WorldState>> {
+    fn capture_world() -> Arc<TestHost> {
         let config = ScriptBotsConfig {
             world_width: 600,
             world_height: 600,
@@ -281,13 +274,13 @@ mod tests {
             rng_seed: Some(0xBD_C7_09),
             ..ScriptBotsConfig::default()
         };
-        Arc::new(Mutex::new(
+        Arc::new(TestHost::new(
             WorldState::new(config).expect("offscreen capture world"),
         ))
     }
 
     #[cfg(target_os = "macos")]
-    fn capture_visual_world_with_render(render: RenderSettings) -> Arc<Mutex<WorldState>> {
+    fn build_visual_world(render: RenderSettings) -> WorldState {
         const POPULATION: usize = 96;
 
         // Production initial-population framing shows 120 agent diameters across.
@@ -347,11 +340,16 @@ mod tests {
             "visual proof fixture must contain visible food hotspots"
         );
 
-        Arc::new(Mutex::new(world))
+        world
     }
 
     #[cfg(target_os = "macos")]
-    fn capture_visual_world() -> Arc<Mutex<WorldState>> {
+    fn capture_visual_world_with_render(render: RenderSettings) -> Arc<TestHost> {
+        Arc::new(TestHost::new(build_visual_world(render)))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_visual_world() -> Arc<TestHost> {
         capture_visual_world_with_render(RenderSettings::default())
     }
 
@@ -361,11 +359,10 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn capture_agent_expression_world() -> Arc<Mutex<WorldState>> {
+    fn capture_agent_expression_world() -> Arc<TestHost> {
         const COLUMNS: usize = 12;
 
-        let world = capture_visual_world();
-        let mut guard = world.lock().expect("agent expression world lock");
+        let mut guard = build_visual_world(RenderSettings::default());
         let agent_ids: Vec<_> = guard.agents().iter_handles().collect();
         let reference_age = guard.config().aging_health_decay_start.max(1);
 
@@ -429,8 +426,7 @@ mod tests {
                 })
                 .expect("install controlled agent visual state");
         }
-        drop(guard);
-        world
+        Arc::new(TestHost::new(guard))
     }
 
     #[cfg(target_os = "macos")]
@@ -840,11 +836,11 @@ mod tests {
 
         // Case A: two captures sharing ONE world. Any tick advance is caused by capture.
         let shared = capture_world();
-        let t0 = shared.lock().expect("lock").tick().0;
+        let t0 = shared.snapshot().world.tick;
         let a1 = capture_view(Arc::clone(&shared), GuiViewRole::Hud, w, h).expect("a1");
-        let t1 = shared.lock().expect("lock").tick().0;
+        let t1 = shared.snapshot().world.tick;
         let a2 = capture_view(Arc::clone(&shared), GuiViewRole::Hud, w, h).expect("a2");
-        let t2 = shared.lock().expect("lock").tick().0;
+        let t2 = shared.snapshot().world.tick;
         let shared_delta = a1.pixels().zip(a2.pixels()).filter(|(x, y)| x != y).count();
 
         // Case B: two captures from two FRESH worlds, as every existing test does.
@@ -1155,11 +1151,10 @@ mod tests {
         let noon_world = capture_visual_world_with_render(daylight_settings(0.25));
         let midnight_world = capture_visual_world_with_render(daylight_settings(0.75));
 
-        let digest = |world: &Arc<Mutex<WorldState>>| {
+        let digest = |world: &Arc<TestHost>| {
             world
-                .lock()
-                .expect("visual proof world lock")
-                .world_digest_v1()
+                .port
+                .scientific_digest_v1()
                 .expect("visual proof world digest")
         };
         let expected_digest = digest(&default_world);
@@ -1239,9 +1234,8 @@ mod tests {
 
         let world = capture_visual_world();
         let digest_before = world
-            .lock()
-            .expect("capture world lock")
-            .world_digest_v1()
+            .port
+            .scientific_digest_v1()
             .expect("pre-capture world digest");
         let legacy = capture_view_with_world_painter(
             Arc::clone(&world),
@@ -1252,9 +1246,8 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("headless legacy world capture failed: {error:#}"));
         let digest_after_legacy = world
-            .lock()
-            .expect("capture world lock")
-            .world_digest_v1()
+            .port
+            .scientific_digest_v1()
             .expect("post-legacy-capture world digest");
         let continuous = capture_view_with_world_painter(
             Arc::clone(&world),
@@ -1265,9 +1258,8 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("headless continuous world capture failed: {error:#}"));
         let digest_after_continuous = world
-            .lock()
-            .expect("capture world lock")
-            .world_digest_v1()
+            .port
+            .scientific_digest_v1()
             .expect("post-continuous-capture world digest");
 
         assert_eq!(legacy.dimensions(), (1280, 720));
@@ -1330,17 +1322,18 @@ mod tests {
         std::fs::create_dir_all(&probe_dir).expect("bd-ydym probe output directory");
 
         let world = capture_agent_expression_world();
-        let hovered_agent = world
-            .lock()
-            .expect("agent capture world lock")
-            .agents()
-            .iter_handles()
-            .nth(5 * 12 + 4)
-            .expect("controlled hover agent");
+        let hovered_agent = AgentId::from(slotmap::KeyData::from_ffi(
+            world
+                .snapshot()
+                .world
+                .agents
+                .get(5 * 12 + 4)
+                .expect("controlled hover agent")
+                .id,
+        ));
         let digest_before = world
-            .lock()
-            .expect("agent capture world lock")
-            .world_digest_v1()
+            .port
+            .scientific_digest_v1()
             .expect("pre-agent-capture world digest");
         let individual_hidden = capture_view_with_overrides_and_camera(
             Arc::clone(&world),
@@ -1399,9 +1392,8 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("headless compact-agent capture failed: {error:#}"));
         let digest_after = world
-            .lock()
-            .expect("agent capture world lock")
-            .world_digest_v1()
+            .port
+            .scientific_digest_v1()
             .expect("post-agent-capture world digest");
 
         assert_eq!(individual_hidden.image.dimensions(), (1280, 720));

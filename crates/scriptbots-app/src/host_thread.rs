@@ -12,14 +12,11 @@
 //! ownership model `scriptbots_runtime::channel` was built for, rather than one
 //! invented here.
 //!
-//! This module lands before its call site. It is exercised by its own tests
-//! rather than sitting unwired: slice 3 replaces the `Arc` wrap in `main` with a
-//! call to [`HostThread::spawn`].
 
 use anyhow::{Context, Result, anyhow};
 use scriptbots_core::{PersistenceAdmissionSession, WorldState};
 use scriptbots_runtime::channel::{
-    ChannelHostDriver, ChannelHostOptions, ChannelHostPort, ChannelRunReceipt,
+    ChannelHostDriver, ChannelHostOptions, ChannelHostPort, ChannelRunOutcome, ChannelRunReceipt,
 };
 use scriptbots_runtime::{
     FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, JournalPort, ManualInstant,
@@ -31,7 +28,15 @@ use std::time::Instant;
 /// A running host thread and the handle everyone else talks to it through.
 pub struct HostThread {
     port: ChannelHostPort,
-    handle: JoinHandle<Result<ChannelRunReceipt>>,
+    handle: JoinHandle<Result<HostThreadReceipt>>,
+}
+
+/// Owner observations retained after all clients disconnect and finalization finishes.
+pub struct HostThreadReceipt {
+    pub run: ChannelRunReceipt,
+    pub snapshot: std::sync::Arc<scriptbots_runtime::RenderSnapshot>,
+    pub sense_saturations_total: u64,
+    pub required_persistence_tick: Option<u64>,
 }
 
 impl HostThread {
@@ -78,7 +83,13 @@ impl HostThread {
 
         match ready_rx.recv() {
             Ok(Ok(port)) => Ok(Self { port, handle }),
-            Ok(Err(reason)) => Err(anyhow!("host construction failed: {reason}")),
+            Ok(Err(reason)) => match handle.join() {
+                Ok(Err(error)) => Err(error.context(format!("host construction failed: {reason}"))),
+                Ok(Ok(_)) => Err(anyhow!("host construction failed: {reason}")),
+                Err(_) => Err(anyhow!(
+                    "host construction failed: {reason}; owner panicked while exiting"
+                )),
+            },
             // The thread died before reporting either way. Join to recover the
             // real cause rather than reporting the closed channel, which would
             // describe the symptom and hide the panic.
@@ -102,7 +113,7 @@ impl HostThread {
         core_options: HostCoreOptions,
         channel_options: ChannelHostOptions,
         ready_tx: &SyncSender<Result<ChannelHostPort, String>>,
-    ) -> Result<ChannelRunReceipt> {
+    ) -> Result<HostThreadReceipt> {
         let build = (|| -> Result<(ChannelHostDriver, ChannelHostPort)> {
             let core = HostCore::with_journal_and_persistence(
                 session_id,
@@ -135,13 +146,24 @@ impl HostThread {
         // the driver only ever compares and orders these, so an arbitrary epoch
         // is fine as long as it never goes backwards.
         let epoch = Instant::now();
-        driver
+        let run = driver
             .run(|| {
                 ManualInstant::from_nanos(
                     u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 )
             })
-            .map_err(|source| anyhow!("host drive loop stopped: {source}"))
+            .map_err(|source| anyhow!("host drive loop stopped: {source}"))?;
+        let core = driver.host().core();
+        let snapshot = core.latest_snapshot();
+        if run.outcome == ChannelRunOutcome::Faulted {
+            return Err(anyhow!("host drive loop faulted: {:?}", core.health()));
+        }
+        Ok(HostThreadReceipt {
+            run,
+            snapshot,
+            sense_saturations_total: core.world().sense_saturations_total(),
+            required_persistence_tick: core.persistence().last_admitted_tick().map(|tick| tick.0),
+        })
     }
 
     /// A cross-thread handle to the host.
@@ -162,7 +184,7 @@ impl HostThread {
     /// # Errors
     ///
     /// Returns an error if the host thread panicked or its drive loop failed.
-    pub fn join(self) -> Result<ChannelRunReceipt> {
+    pub fn join(self) -> Result<HostThreadReceipt> {
         drop(self.port);
         match self.handle.join() {
             Ok(result) => result,
@@ -221,7 +243,7 @@ mod tests {
         drop(port);
         let receipt = host.join().expect("host thread stops cleanly");
         assert!(
-            receipt.drives >= 1 || receipt.commands_admitted == 0,
+            receipt.run.drives >= 1 || receipt.run.commands_admitted == 0,
             "a host that never drove and never admitted anything did not run"
         );
     }

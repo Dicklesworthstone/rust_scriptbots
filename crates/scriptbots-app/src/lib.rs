@@ -3518,18 +3518,14 @@ pub mod renderer {
     use anyhow::Result;
     use std::sync::Arc;
 
-    use crate::{
-        CommandDrain, CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics,
-        SharedWorld, WorldStepDriver,
-    };
+    use crate::{CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics};
+    use scriptbots_runtime::channel::ChannelHostPort;
 
     /// Shared context passed to renderer implementations.
     pub struct RendererContext<'a> {
-        pub world: SharedWorld,
-        pub simulation_step: WorldStepDriver,
+        pub host: ChannelHostPort,
         pub analytics: SharedAnalytics,
         pub control_runtime: &'a ControlRuntime,
-        pub command_drain: CommandDrain,
         pub command_submit: CommandSubmit,
         /// The run's scenario identity (id, schema version, bootstrap policy).
         pub scenario: Arc<ScenarioIdentityV0>,
