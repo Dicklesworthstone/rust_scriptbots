@@ -9,6 +9,109 @@ when the cutover is verified; retained history is subject to the repository's no
 The integrity-control exception is unnecessary because the explicit request supplies the gate.
 The highest-priority capability is the host cutover; keep checklist maintenance bounded.
 
+Execution checkpoint, 2026-09-06: the cutover is **unfinished and not compiler-verified**.
+All three delegated frontend agents terminated at their usage limits. Root took over their
+reservations. Another actor committed the shared implementation through `a00aaf5`; those
+commit titles do not establish completed behavior. Root's `41d5b1f` formats that checkpoint.
+`cargo fmt --all --check` passed locally; UBS returned 1 with broad findings (including
+test panics, non-secret host/session identities, and current-executable child launches),
+not a clean scanner pass. DSR54 at `41d5b1f` failed the locked dependency graph;
+`68557f5` restores the renderer's missing runtime and slotmap lockfile edges.
+DSR55 at `68557f5` passed all five preflight guards but failed to execute rustc
+with OS error 2; no project compiler verdict came from that attempt. The same-source
+DSR56 retry reached project compilation and failed on two TUI errors: unsupported
+`CommandId` string parsing and an orphaned helper accessing the removed world field.
+The local continuation fixes parsing and removes that uncalled helper; scheduled
+config patches are still NOT wired to the owner. This is an open capability loss,
+not completion inferred from eliminating the compiler error. No cutover tests have passed.
+DSR57 at `89d7769` then failed on seven stale main-test API references. The local
+`0c5a462` checkpoint migrates these and four integration files (terminal, meadow,
+control latency, and shutdown regions), removes the unused app-owned summary slot
+and step driver, and documents inspector fields flagged by the compiler. DSR58
+failed at that exact checkpoint on two meadow fixture session IDs constructed as
+`u128` instead of the declared `u64`; the local continuation corrects those types.
+No cutover suite executed successfully. Formatting and whitespace checks
+passed; UBS returned 1 with 28 critical-pattern hits and 2,828 warnings across the
+eight scanned files, not a clean scanner verdict. Sample hits are test panics,
+non-secret identifiers/watermarks, and current-executable subprocess launches;
+the count is not a count of confirmed defects or a completed security audit.
+`e96adbf` migrates owner-backed GPUI inspection/view fixtures and fixes the meadow
+types. DSR59 then failed on the terminal fixture's obsolete `pipeline.flush()`
+call. `6abf187` uses the declared `flush_and_wait()` receipt API and migrates the
+speed-ratio and pending-selection fixtures. Its checks remain pending. The speed
+test uses an integer manual HostCore clock with zero/one/two speed cases; it is
+scheduling correctness, not measured performance. The selection callbacks capture
+UI intent before explicit real owner application; callback tokens are not admission
+proof. No golden or tolerance changed. The renderer UBS scan returned 1 (12 critical
+patterns, 1,528 warnings); terminal-only scan returned 0 (123 warnings). Neither
+result substitutes for compilation or execution of the affected tests.
+`fd4c7cd` removes Bevy's duplicate auto-pause submission from its snapshot worker;
+the host remains the playback authority. The UI reports a matching pause condition,
+not an inferred cause. An unmet age condition no longer hides a met population
+condition, with a mixed-policy regression assertion. Four more playback fixtures
+now observe real HostCore admission, application and science counts. These are
+unexecuted source changes. DSR60 at `6abf187` failed with seven GPUI test errors
+and 38 app unit-test errors, mainly stale dummy-runtime tuples plus private snapshot
+access and command-ID parsing. `69642f1` fixes the observed call sites, supplies a
+bounded atomic owner query for both characterization V0 and scientific V1 digests,
+and migrates both 240-tick repaint traces without dropping either digest. Its
+real closed-journal fault-display test replaces direct injection of a fault string.
+The old expected-panic shutdown test now checks real ordered owner shutdown and
+final config; control-listener shutdown alone is not claimed to finalize science.
+DSR61 was launched against exact `69642f1`; no passing cutover suite exists.
+
+Remaining concrete integration work discovered during implementation:
+
+- [ ] Move scheduled config patches to the owner before each actual scientific tick;
+      preserve declaration order, exact patch/failure evidence, and TUI notices. The
+      old uncalled TUI helper has been removed; the existing app patch implementation
+      remains available, but production scheduling is not connected.
+- [ ] Convert remaining GPUI session/view and old driver fixtures, retaining every
+      meaningful assertion and existing golden; do not reinstate a mutable world mirror.
+      The local continuation has transferred narrative, passthrough attribution,
+      brain-cache isolation, canvas/double-view, single-step shortcut, rejected clear,
+      hover isolation, closed config and shared playback fixtures to a real owner port.
+      These changes are unexecuted. The shortcut callback waits for real application;
+      its test is not an asynchronous-admission latency measurement. Old driver,
+      pending-selection and repaint-digest fixtures still need migration.
+      Closed-world, select-all and rapid Add/Clear intent fixtures are now migrated
+      in `6abf187`, including each intermediate selection outcome; execution remains
+      open. Both repaint traces now query characterization V0 and world V1 atomically
+      through the owner in `69642f1`; execution remains open. Legacy driver-only
+      failure/retained-step fixtures and removal of the unused driver still remain.
+- [ ] Convert remaining control and server-loop fixtures that lock the former world,
+      inject an app-owned status, or accept the former three-value launch result.
+- [ ] Execute the restored control-boundary queue-capacity test in `89d7769`.
+      It pairs one occupied slot at capacities one and two, requiring rejection
+      without a config change versus actual config application. The separate
+      disconnected-owner test cannot substitute for this unexecuted assertion.
+- [ ] Execute the migrated control tests (real owner application, revision rejection,
+      idempotency, immutable reads while the owner is parked, and poisoned knobs cache).
+- [ ] Execute the strengthened host-thread step/shutdown receipt test and wrong-world
+      persistence-session startup rejection. Neither new test has run yet.
+- [ ] Execute migrated server-loop fixtures: a real closed storage journal must
+      surface in both renderer and owner join; ordered Step then Shutdown must end
+      at exactly tick one. The old mutable-world poison and mid-run foreign-session
+      injection are no longer representable at the frontend boundary; wrong-session
+      rejection is tested at host construction instead. No equivalent coverage claim yet.
+- [ ] Execute all four migrated app integration files. Terminal tail proof now compares
+      a pre-finalization storage flush with the owner's final required tick; meadow
+      ledger proof reads every contiguous owner scientific event. Latency thresholds
+      and the declared cohort remain unchanged. The latency load source changed to
+      the actual owner with a one-nanosecond requested period; compare new measurements
+      only as that workload, not as a replay of the former direct-step loop.
+- [ ] Wire the three-region production teardown; the migrated integration fixture
+      demonstrates the intended registration order only after it actually passes.
+      Existing synchronous finalizers do not enforce their declared wall-clock budgets.
+- [ ] Finish headless/server/interactive visual-capture policy and startup-failure tests.
+- [ ] Restore explicit separate host/control/storage region outcomes and budgets while
+      retaining stop-control → join-owner → acknowledge-storage order.
+- [ ] Exercise new query/source/digest tests and composite playback journal readback;
+      the added test functions have not yet run.
+- [ ] Verify narrative buffer/string allocation accounting and snapshot reuse guards.
+- [ ] Check all changed command matches, journal validators, and source guards against
+      the actual compiled migration, then run the original long server regressions.
+
 - [x] Inspect current startup, host adapter, port, storage ownership and frontend readers.
 - [x] Identify previously missed port needs: brain inspection, sensor attribution, final digest.
 - [ ] Runtime: add bounded owner-thread requests with positive and malformed/stale tests.
@@ -23,6 +126,8 @@ The highest-priority capability is the host cutover; keep checklist maintenance 
 - [ ] GPUI: convert frame/inspector/offscreen capture; preserve Lab and World windows.
 - [ ] GPUI: eliminate frontend scientific stepping and adapt existing fixtures without goldens changes.
 - [ ] Bevy: consume host snapshots; eliminate simulation worker and adapt captures/tests.
+      Duplicate snapshot-worker auto-pause submission removed in `fd4c7cd`; verify
+      owner policy decisions and UI condition display together before completion.
 - [ ] Integrate missing snapshot fields without changing scientific state or wire claims silently.
 - [ ] Review all changed test/gate code for lost assertions, fake defaults and weakened evidence.
 - [ ] Format, UBS exact files, review and freeze the coherent source on main.
