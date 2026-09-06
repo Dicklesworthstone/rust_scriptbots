@@ -11,7 +11,7 @@ use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
     BootstrapEvidenceV0, BrainPreset, CharacterizationTraceV2, ControlServerConfig,
     ControlServerReservation, RunIdentityV1, RunManifestV3, ScenarioDocumentV1, ScenarioIdentityV0,
-    SharedAnalytics, SharedWorld, ThreadPolicyV0, WorldStepDriver, install_brains,
+    SharedAnalytics, ThreadPolicyV0, install_brains,
     precedence::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
@@ -27,15 +27,17 @@ use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_p
 use scriptbots_brain::{AssemblyBrain, DwraonBrain, MlpBrain};
 use scriptbots_core::{
     LEGACY_RENDER_ENV_NAMES, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
-    PersistenceSessionError, RenderQuality, RenderTonemapMode, ReplayEventKind,
-    ReplayInteractionKind, ScriptBotsConfig, TickSummary, WorldDigestV1, WorldPersistence,
-    WorldState, map_legacy_render_env, parse_render_quality,
+    RenderQuality, RenderTonemapMode, ReplayEventKind, ReplayInteractionKind, ScriptBotsConfig,
+    TickSummary, WorldDigestV1, WorldPersistence, WorldState, map_legacy_render_env,
+    parse_render_quality,
 };
 #[cfg(feature = "gui")]
 use scriptbots_render::{render_png_offscreen, run_demo};
+#[cfg(test)]
+use scriptbots_runtime::HostPort;
 use scriptbots_runtime::RunId;
 use scriptbots_runtime::channel::ChannelHostOptions;
-use scriptbots_runtime::{HostCoreOptions, HostPort, HostSessionId, PlaybackSnapshot};
+use scriptbots_runtime::{HostCoreOptions, HostSessionId, PlaybackSnapshot};
 use scriptbots_storage::{
     INTERACTION_REPLAY_SEQ_BASE, NARRATIVE_INPUT_REPLAY_SEQ, PersistedReplayEvent,
     PersistenceGuarantee, ShutdownReceipt, StoragePipeline, StorageReader,
@@ -59,6 +61,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const DEFAULT_BOOTSTRAP_TICKS: u64 = 0;
 const LIVE_RUN_POLICY: &str = "operator-controlled-until-stop-v1";
 
+#[cfg(test)]
 type SharedPersistenceAdmission = Arc<Mutex<PersistenceAdmissionSession>>;
 
 #[derive(Clone, Copy)]
@@ -111,40 +114,6 @@ fn emit_sense_run_end(summary: SenseRunSummary, completed: bool) {
             "sense run ended"
         );
     }
-}
-
-fn capture_shared_sense_run_summary(world: &SharedWorld) -> SenseRunSummary {
-    match world.lock() {
-        Ok(world) => SenseRunSummary::capture(&world),
-        Err(poisoned) => SenseRunSummary::capture(&poisoned.into_inner()),
-    }
-}
-
-fn persistence_step_driver(
-    world: &SharedWorld,
-    session: &SharedPersistenceAdmission,
-    latest_summary: &scriptbots_app::control::SharedLatestSummary,
-) -> WorldStepDriver {
-    let world = Arc::clone(world);
-    let session = Arc::clone(session);
-    let latest_summary = Arc::clone(latest_summary);
-    Arc::new(move || {
-        let mut world = world
-            .lock()
-            .map_err(|error| PersistenceSessionError::Unavailable {
-                detail: format!("world mutex poisoned while stepping: {error}"),
-            })?;
-        let mut session = session
-            .lock()
-            .map_err(|error| PersistenceSessionError::Unavailable {
-                detail: format!("session mutex poisoned while stepping: {error}"),
-            })?;
-        let outcome = session.step(&mut world);
-        // Capture actual status even when the completed step returns a fault.
-        // Readers can serve this boundary while the next admission holds the lock.
-        scriptbots_app::control::publish_world_observation(&latest_summary, &world);
-        outcome
-    })
 }
 
 fn main() -> Result<()> {
@@ -767,6 +736,7 @@ fn finalize_world_persistence(
     })
 }
 
+#[cfg(test)]
 fn finalize_and_shutdown_storage(
     world: &Arc<Mutex<WorldState>>,
     persistence: &SharedPersistenceAdmission,
@@ -4678,7 +4648,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn persistence_step_driver_publishes_actual_status_on_success_and_error() {
+    fn host_binding_guard_precedes_startup_and_successful_steps_publish_actual_status() {
         for wrong_binding in [false, true] {
             let config = ScriptBotsConfig {
                 world_width: 64,
@@ -4697,57 +4667,73 @@ mod tests {
             if wrong_binding {
                 world = WorldState::new(config).expect("distinct world binding");
             }
-            let world = Arc::new(Mutex::new(world));
-            let session = Arc::new(Mutex::new(session));
-            let slot = scriptbots_app::control::empty_latest_summary();
-            let driver = persistence_step_driver(&world, &session, &slot);
-            let result = driver();
+            let result = HostThread::spawn(
+                HostSessionId::new(0x513c),
+                world,
+                session,
+                Box::new(scriptbots_runtime::VolatileJournal::default()),
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    ..HostCoreOptions::default()
+                },
+                ChannelHostOptions::default(),
+            );
             if wrong_binding {
-                assert!(matches!(
-                    result,
-                    Err(scriptbots_core::WorldStepError::PersistenceSession(
-                        PersistenceSessionError::WrongWorld
-                    ))
-                ));
-            } else {
-                assert_eq!(
-                    result.expect("matching binding steps").tick,
-                    scriptbots_core::Tick(1)
-                );
+                let error = result
+                    .err()
+                    .expect("foreign session must fail before publishing a port");
+                assert!(format!("{error:#}").contains("different world"));
+                continue;
             }
-            let (sender, _receiver) = scriptbots_app::command::create_command_bus(4);
-            let handle =
-                scriptbots_app::control::ControlHandle::new(Arc::clone(&world), sender, slot);
-            let owner = world.lock().expect("retain world lock during status read");
-            let (reply, receipt) = std::sync::mpsc::channel();
-            let reader = std::thread::spawn(move || reply.send(handle.status()));
-            let status = receipt.recv_timeout(std::time::Duration::from_secs(2));
-            drop(owner);
-            reader
-                .join()
-                .expect("reader joins")
-                .expect("reply retained");
-            let status = status
-                .expect("status returns before the owner lock is released")
-                .expect("production driver published the boundary");
-            assert_eq!(status.tick, u64::from(!wrong_binding));
+            let host = result.expect("matching binding starts");
+            let handle = scriptbots_app::control::ControlHandle::new(host.port());
+            assert_eq!(handle.status().expect("initial publication").tick, 0);
+            let admitted = handle.step().expect("real step admission");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let receipt = handle
+                    .command_status(&admitted.command_id)
+                    .expect("status access")
+                    .expect("known step");
+                if receipt.application_state != "admitted" {
+                    assert_eq!(receipt.application_state, "applied");
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "step did not resolve");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let status = handle.status().expect("owner publication");
+            assert_eq!(status.tick, 1);
             assert_eq!(status.agent_count, 0);
             assert!(status.is_closed);
             assert_eq!(status.config_revision, 0);
+            drop(handle);
+            assert_eq!(host.join().expect("owner finalized").snapshot.world.tick, 1);
         }
     }
 
     struct ServerLoopFixture {
-        world: SharedWorld,
-        session: SharedPersistenceAdmission,
-        driver: WorldStepDriver,
+        host: HostThread,
+        port: scriptbots_runtime::channel::ChannelHostPort,
         runtime: scriptbots_app::servers::ControlRuntime,
-        drain: scriptbots_app::CommandDrain,
         submit: scriptbots_app::CommandSubmit,
     }
 
     impl ServerLoopFixture {
         fn new() -> Result<Self> {
+            Self::with_journal(
+                Box::new(scriptbots_runtime::VolatileJournal::default()),
+                true,
+            )
+        }
+
+        fn with_journal(
+            journal: Box<dyn scriptbots_runtime::JournalPort + Send>,
+            paused: bool,
+        ) -> Result<Self> {
             let config = ScriptBotsConfig {
                 world_width: 64,
                 world_height: 64,
@@ -4758,13 +4744,23 @@ mod tests {
                 ..ScriptBotsConfig::default()
             };
             let (world, session) = WorldState::with_persistence(config, Box::new(NullPersistence))?;
-            let world = Arc::new(Mutex::new(world));
-            let session = Arc::new(Mutex::new(session));
-            let summary = scriptbots_app::control::empty_latest_summary();
-            let driver = persistence_step_driver(&world, &session, &summary);
-            let (runtime, drain, submit) = scriptbots_app::servers::ControlRuntime::launch(
-                Arc::clone(&world),
-                summary,
+            let host = HostThread::spawn(
+                HostSessionId::new(0x513c),
+                world,
+                session,
+                journal,
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused,
+                        speed_multiplier: 1.0,
+                    },
+                    ..HostCoreOptions::default()
+                },
+                ChannelHostOptions::default(),
+            )?;
+            let port = host.port();
+            let (runtime, submit) = scriptbots_app::servers::ControlRuntime::launch(
+                port.clone(),
                 ControlServerConfig {
                     rest_enabled: false,
                     mcp_transport: scriptbots_app::servers::McpTransportConfig::Disabled,
@@ -4772,104 +4768,97 @@ mod tests {
                 },
             )?;
             Ok(Self {
-                world,
-                session,
-                driver,
+                host,
+                port,
                 runtime,
-                drain,
                 submit,
             })
         }
 
         fn context(&self) -> RendererContext<'_> {
             RendererContext {
-                world: Arc::clone(&self.world),
-                simulation_step: Arc::clone(&self.driver),
+                host: self.port.clone(),
                 analytics: SharedAnalytics::empty(),
                 control_runtime: &self.runtime,
-                command_drain: Arc::clone(&self.drain),
                 command_submit: Arc::clone(&self.submit),
                 scenario: Arc::new(ScenarioIdentityV0::caller_seeded("server-error-test")),
             }
         }
+
+        fn finish(self) -> Result<scriptbots_app::host_thread::HostThreadReceipt> {
+            let Self {
+                host,
+                port,
+                runtime,
+                submit,
+            } = self;
+            runtime.shutdown()?;
+            drop(submit);
+            drop(port);
+            host.join()
+        }
     }
 
     #[test]
-    fn server_loop_preserves_real_step_error_after_successful_control_shutdown() -> Result<()> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let fixture = ServerLoopFixture::new()?;
-        let config = fixture.world.lock().expect("world lock").config().clone();
-        let (_other_world, foreign_session) =
-            WorldState::with_persistence(config, Box::new(NullPersistence))?;
-        let foreign_session = Mutex::new(Some(foreign_session));
-        let session = Arc::clone(&fixture.session);
-        let driver = Arc::clone(&fixture.driver);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed_calls = Arc::clone(&calls);
-        let mut ctx = fixture.context();
-        ctx.simulation_step = Arc::new(move || {
-            observed_calls.fetch_add(1, Ordering::SeqCst);
-            let result = driver();
-            if result.is_ok() {
-                // The first real server iteration succeeds. The second reaches the actual
-                // world/session ownership guard, rather than returning a fabricated error.
-                *session.lock().expect("session lock") = foreign_session
-                    .lock()
-                    .expect("foreign session lock")
-                    .take()
-                    .expect("first step only");
-            }
-            result
-        });
-        let result = ServerRenderer.run(ctx);
-        fixture.runtime.shutdown()?;
-        let error = prefer_storage_failure(result, Ok(()), "runtime")
-            .expect_err("successful cleanup must not erase the simulation failure");
-        assert!(matches!(
-            error.downcast_ref::<scriptbots_core::WorldStepError>(),
-            Some(scriptbots_core::WorldStepError::PersistenceSession(
-                PersistenceSessionError::WrongWorld
-            ))
-        ));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            fixture.world.lock().expect("world lock").tick(),
-            scriptbots_core::Tick(1)
-        );
+    fn server_loop_and_owner_join_report_a_real_closed_storage_journal() -> Result<()> {
+        let mut pipeline = StoragePipeline::unattributed_memory()?;
+        let journal = pipeline.journal_port(HostSessionId::new(0x513c), Default::default())?;
+        pipeline.shutdown()?;
+        // The actual storage gate is closed. Automatic science reaches the real
+        // journal admission path, without a fabricated renderer or step error.
+        let fixture = ServerLoopFixture::with_journal(Box::new(journal), false)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fixture
+            .port
+            .snapshot_hub()
+            .latest()
+            .health
+            .fault()
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "closed journal did not fault the owner"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let snapshot = fixture.port.snapshot_hub().latest();
+        assert_eq!(snapshot.world.tick, 1);
+        let result = ServerRenderer.run(fixture.context());
+        let error = result.expect_err("the server must expose the observed owner fault");
+        assert!(format!("{error:#}").contains("journal_closed"));
+        let join_error = fixture
+            .finish()
+            .err()
+            .expect("owner join must retain the fault");
+        assert!(format!("{join_error:#}").contains("journal_closed"));
         Ok(())
     }
 
     #[test]
-    fn server_loop_returns_poisoned_world_before_stepping() -> Result<()> {
+    fn server_loop_returns_after_ordered_host_shutdown_without_an_extra_tick() -> Result<()> {
         let fixture = ServerLoopFixture::new()?;
-        let poisoned = Arc::clone(&fixture.world);
-        assert!(
-            std::thread::spawn(move || {
-                let _guard = poisoned.lock().expect("unpoisoned world");
-                panic!("plant the poisoned-world boundary");
-            })
-            .join()
-            .is_err()
-        );
-        let error = ServerRenderer
-            .run(fixture.context())
-            .expect_err("poison must fail the run");
-        fixture.runtime.shutdown()?;
-        assert!(
-            error
-                .to_string()
-                .contains("world mutex poisoned in server mode")
-        );
-        assert_eq!(
-            fixture
-                .world
-                .lock()
-                .expect_err("poison retained")
-                .into_inner()
-                .tick(),
-            scriptbots_core::Tick(0)
-        );
+        let mut port = fixture.port.clone();
+        port.submit(scriptbots_runtime::CommandEnvelope::new(
+            scriptbots_runtime::CommandId::new(1),
+            scriptbots_runtime::HostCommand::Step,
+        ))?;
+        port.submit(scriptbots_runtime::CommandEnvelope::new(
+            scriptbots_runtime::CommandId::new(2),
+            scriptbots_runtime::HostCommand::Shutdown,
+        ))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while port.snapshot_hub().latest().lifecycle != scriptbots_runtime::HostLifecycle::Stopped {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ordered shutdown did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        ServerRenderer.run(fixture.context())?;
+        assert_eq!(port.snapshot_hub().latest().world.tick, 1);
+        drop(port);
+        assert_eq!(fixture.finish()?.snapshot.world.tick, 1);
         Ok(())
     }
 
@@ -4882,15 +4871,12 @@ mod tests {
             Err("observed control worker failure".to_owned())
         })
         .expect_err("failed health must fail the run");
-        fixture.runtime.shutdown()?;
         assert_eq!(
             error.root_cause().to_string(),
             "observed control worker failure"
         );
-        assert_eq!(
-            fixture.world.lock().expect("world lock").tick(),
-            scriptbots_core::Tick(0)
-        );
+        assert_eq!(fixture.port.snapshot_hub().latest().world.tick, 0);
+        assert_eq!(fixture.finish()?.snapshot.world.tick, 0);
         Ok(())
     }
 

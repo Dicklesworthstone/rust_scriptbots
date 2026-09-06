@@ -3,12 +3,15 @@
 
 use asupersync::types::{Budget, Outcome};
 use scriptbots_app::{
-    ControlServerConfig, McpTransportConfig, SharedWorld,
-    control::empty_latest_summary,
+    ControlServerConfig, McpTransportConfig,
+    host_thread::HostThread,
     regions::{AppRoot, ServiceRegion},
     servers::ControlRuntime,
 };
 use scriptbots_core::{ScriptBotsConfig, WorldState};
+use scriptbots_runtime::{
+    HostCoreOptions, HostSessionId, PlaybackSnapshot, channel::ChannelHostOptions,
+};
 use scriptbots_storage::StorageReader;
 use std::{fs, sync::Mutex, time::SystemTime};
 
@@ -53,7 +56,25 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
     // Inject load: one science tick admits a real batch through the outbox.
     persistence.step(&mut world).expect("science tick");
 
-    let world_shared: SharedWorld = std::sync::Arc::new(Mutex::new(world));
+    let session_id = HostSessionId::new(7);
+    let journal = pipeline
+        .journal_port(session_id, Default::default())
+        .expect("real storage journal");
+    let host = HostThread::spawn(
+        session_id,
+        world,
+        persistence,
+        Box::new(journal),
+        HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            },
+            ..HostCoreOptions::default()
+        },
+        ChannelHostOptions::default(),
+    )
+    .expect("sole owner host");
     let control_config = ControlServerConfig {
         rest_address: "127.0.0.1:0".parse().expect("ephemeral REST address"),
         mcp_transport: McpTransportConfig::Http {
@@ -61,69 +82,60 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
         },
         ..ControlServerConfig::default()
     };
-    let (control_runtime, _drain, _submit) =
-        ControlRuntime::launch(world_shared.clone(), empty_latest_summary(), control_config)
-            .expect("control runtime launches with every listener bound");
+    let (control_runtime, submit) = ControlRuntime::launch(host.port(), control_config)
+        .expect("control runtime launches with every listener bound");
 
-    let persistence_shared = std::sync::Arc::new(Mutex::new(persistence));
     let mut root = AppRoot::new();
-    let world_for_storage = std::sync::Arc::clone(&world_shared);
-    let persistence_for_storage = std::sync::Arc::clone(&persistence_shared);
+    let required_tick = std::sync::Arc::new(Mutex::new(None));
+    let owner_required_tick = std::sync::Arc::clone(&required_tick);
     root.register(ServiceRegion::new(
         "storage-pipeline",
         Budget::with_deadline_at_secs(30),
-        move |_budget| {
-            let finalize = (|| -> anyhow::Result<()> {
-                let mut world = world_for_storage
-                    .lock()
-                    .map_err(|error| anyhow::anyhow!("world mutex poisoned: {error}"))?;
-                persistence_for_storage
-                    .lock()
-                    .map_err(|error| anyhow::anyhow!("persistence mutex poisoned: {error}"))?
-                    .finalize(&mut world)?;
-                Ok(())
-            })();
-            match finalize.and_then(|()| {
-                pipeline
-                    .shutdown()
-                    .map(|_receipt| ())
-                    .map_err(|error| anyhow::anyhow!("{error:#}"))
-            }) {
-                Ok(()) => Outcome::ok("storage shutdown acknowledged".to_owned()),
-                Err(error) => Outcome::Err(format!("{error:#}")),
+        move |_budget| match pipeline.shutdown() {
+            Ok(receipt) => {
+                assert_eq!(*required_tick.lock().expect("owner receipt"), Some(1));
+                assert_eq!(receipt.watermarks.admitted, receipt.watermarks.durable);
+                Outcome::ok("storage shutdown acknowledged".to_owned())
             }
+            Err(error) => Outcome::Err(format!("{error:#}")),
+        },
+    ));
+    root.register(ServiceRegion::new(
+        "simulation-host",
+        Budget::with_deadline_at_secs(15),
+        move |_budget| match host.join() {
+            Ok(receipt) => {
+                assert_eq!(receipt.snapshot.world.tick, 1);
+                *owner_required_tick.lock().expect("owner receipt") =
+                    receipt.required_persistence_tick;
+                Outcome::ok("host finalized and joined".to_owned())
+            }
+            Err(error) => Outcome::Err(format!("{error:#}")),
         },
     ));
     root.register(ServiceRegion::new(
         "control-server",
         Budget::with_deadline_at_secs(15),
-        move |_budget| match control_runtime.shutdown() {
-            Ok(()) => Outcome::ok("control runtime shut down".to_owned()),
-            Err(error) => Outcome::Err(format!("{error:#}")),
+        move |_budget| {
+            let result = control_runtime.shutdown();
+            drop(submit);
+            match result {
+                Ok(()) => Outcome::ok("control runtime shut down".to_owned()),
+                Err(error) => Outcome::Err(format!("{error:#}")),
+            }
         },
     ));
 
     let outcomes = root.close();
-    assert_eq!(
-        outcomes.len(),
-        2,
-        "every registered region must report an outcome"
-    );
-    assert_eq!(
-        outcomes[0].name, "control-server",
-        "control closes before storage drains"
-    );
-    assert_eq!(outcomes[1].name, "storage-pipeline");
-    assert!(
-        matches!(outcomes[0].outcome, Outcome::Ok(_)),
-        "control region must close cleanly: {:?}",
-        outcomes[0].outcome
-    );
-    assert!(
-        matches!(outcomes[1].outcome, Outcome::Ok(_)),
-        "storage region must drain cleanly: {:?}",
-        outcomes[1].outcome
-    );
+    let expected_order = ["control-server", "simulation-host", "storage-pipeline"];
+    assert_eq!(outcomes.len(), expected_order.len());
+    for (outcome, expected_name) in outcomes.iter().zip(expected_order) {
+        assert_eq!(
+            outcome.name, expected_name,
+            "producer must stop before its downstream owner"
+        );
+        assert!(matches!(outcome.outcome, Outcome::Ok(_)), "{outcome:?}");
+    }
 
     // The durable watermark must equal the last admitted batch after teardown.
     let reader = StorageReader::open(&db).expect("open run database after teardown");

@@ -187,14 +187,23 @@ pub struct AgentInspectorData {
     pub source: BrainProjectionSource,
     /// Stable subject identity, independent of slot reuse.
     pub uid: AgentUid,
+    /// Most recently recorded sensor inputs, in the core's declared input order.
     pub sensors: [f32; INPUT_SIZE],
+    /// Most recently recorded brain outputs, in actuator order.
     pub outputs: [f32; OUTPUT_SIZE],
+    /// Whether the subject currently has a registered brain binding.
     pub brain_bound: bool,
+    /// Descriptor of the bound family, or the unbound subject's descriptor.
     pub brain_descriptor: String,
+    /// Per-subject mutation parameters captured at this boundary.
     pub mutation_rates: MutationRates,
+    /// Per-subject phenotype modifiers captured at this boundary.
     pub trait_modifiers: TraitModifiers,
+    /// Relative viewing direction of each eye.
     pub eye_direction: [f32; NUM_EYES],
+    /// Field of view of each eye.
     pub eye_fov: [f32; NUM_EYES],
+    /// Genome detail when the bound family supports the browser projection.
     pub genome_browser: Option<scriptbots_core::genome_browser::GenomeBrowserViewModel>,
     /// Explanation captured at the same source boundary as the inspector arrays.
     pub sensor_attribution: Option<SensorAttribution>,

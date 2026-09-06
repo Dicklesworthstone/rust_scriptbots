@@ -12,10 +12,12 @@
 //! 5. Negative controls: Divergent seeds break parity; injected ledger breach fails conservation gate.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use scriptbots_app::{
-    BrainPreset, ScenarioDocumentV1, ScenarioEnvelopeV1, ScenarioIdentityV0, install_brains,
+    BrainPreset, ScenarioDocumentV1, ScenarioEnvelopeV1, ScenarioIdentityV0,
+    host_thread::HostThread,
+    install_brains,
     precedence::{ConfigLayerKind, ConfigLayerStatement, resolve_config_layers},
     renderer::RendererContext,
     seed_founding_population,
@@ -29,6 +31,11 @@ use scriptbots_core::{
     WorldDigestV1, WorldState,
 };
 use scriptbots_render::render_png_offscreen;
+use scriptbots_runtime::{
+    CommandEnvelope, CommandId, EventCursor, EventPoll, HostCommand, HostCore, HostCoreOptions,
+    HostPort, HostSessionId, ManualHostDriver, ManualInstant, PlaybackSnapshot, RenderSnapshot,
+    VolatileJournal, channel::ChannelHostOptions,
+};
 use scriptbots_storage::AnalyticsSnapshotProvider;
 
 fn meadow_scenario_path() -> PathBuf {
@@ -89,13 +96,12 @@ fn build_meadow_world(document: &ScenarioDocumentV1, seed: u64) -> WorldState {
     world
 }
 
-fn assert_envelope(id: &str, seed: u64, envelope: &ScenarioEnvelopeV1, world: &WorldState) {
+fn assert_envelope(id: &str, seed: u64, envelope: &ScenarioEnvelopeV1, snapshot: &RenderSnapshot) {
     assert_eq!(
-        world.tick().0,
-        envelope.ticks,
+        snapshot.world.tick, envelope.ticks,
         "{id}/seed {seed}: simulation tick count mismatch"
     );
-    let agent_count = world.agent_count();
+    let agent_count = snapshot.world.agents.len();
     if let Some(min) = envelope.population_min {
         assert!(
             agent_count >= min as usize,
@@ -108,8 +114,16 @@ fn assert_envelope(id: &str, seed: u64, envelope: &ScenarioEnvelopeV1, world: &W
             "{id}/seed {seed}: population {agent_count} exceeded ceiling {max}"
         );
     }
-    let total_births = world.history().map(|h| h.births).sum::<usize>();
-    let total_deaths = world.history().map(|h| h.deaths).sum::<usize>();
+    let total_births = snapshot
+        .summary_history
+        .iter()
+        .map(|h| h.births)
+        .sum::<usize>();
+    let total_deaths = snapshot
+        .summary_history
+        .iter()
+        .map(|h| h.deaths)
+        .sum::<usize>();
     if let Some(min) = envelope.births_min {
         assert!(
             total_births >= min as usize,
@@ -125,7 +139,7 @@ fn assert_envelope(id: &str, seed: u64, envelope: &ScenarioEnvelopeV1, world: &W
 }
 
 struct TuiRunResult {
-    world: WorldState,
+    world: Arc<RenderSnapshot>,
     digest: WorldDigestV1,
     gate: ConservationGate,
     rendered_frames: usize,
@@ -133,30 +147,31 @@ struct TuiRunResult {
 
 fn run_tui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> TuiRunResult {
     let world = build_meadow_world(document, seed);
-    let gate = Arc::new(Mutex::new(ConservationGate::new()));
-    let shared_world = Arc::new(Mutex::new(world));
+    let session_id = HostSessionId::new(u128::from(seed));
+    let persistence = world
+        .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+        .expect("bind owner persistence");
+    let host = HostThread::spawn(
+        session_id,
+        world,
+        persistence,
+        Box::new(VolatileJournal::default()),
+        HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            },
+            capture_agent_visuals: true,
+            scientific_event_capacity: usize::try_from(ticks + 1).expect("cohort capacity"),
+            ..HostCoreOptions::default()
+        },
+        ChannelHostOptions::default(),
+    )
+    .expect("meadow owner");
+    let mut port = host.port();
     let renderer = TerminalRenderer::default();
-    let step_world = Arc::clone(&shared_world);
-    let step_gate = Arc::clone(&gate);
-    let simulation_step = Arc::new(move || {
-        let mut world = step_world.lock().expect("world lock");
-        let summary = world.step()?;
-        let report = world
-            .resource_ledger()
-            .latest
-            .as_ref()
-            .expect("enabled ledger produced tick report");
-        assert!(
-            report.reconciliation.reconciled,
-            "seed {seed} tick {}: resource reconciliation breach: {:?}",
-            world.tick().0,
-            report.reconciliation
-        );
-        step_gate.lock().expect("gate lock").observe(report);
-        Ok(summary)
-    });
 
-    let (control, command_drain, command_submit) = {
+    let (control, command_submit) = {
         let config = scriptbots_app::ControlServerConfig {
             rest_enabled: false,
             mcp_transport: scriptbots_app::McpTransportConfig::Disabled,
@@ -164,20 +179,13 @@ fn run_tui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> TuiRunR
         };
         let reservation =
             scriptbots_app::ControlServerReservation::prepare(config).expect("prepare control");
-        reservation
-            .launch(
-                Arc::clone(&shared_world),
-                scriptbots_app::control::empty_latest_summary(),
-            )
-            .expect("launch control")
+        reservation.launch(port.clone()).expect("launch control")
     };
 
     let context = RendererContext {
-        world: Arc::clone(&shared_world),
-        simulation_step,
+        host: port.clone(),
         analytics: AnalyticsSnapshotProvider::empty(),
         control_runtime: &control,
-        command_drain,
         command_submit,
         scenario: Arc::new(ScenarioIdentityV0::caller_seeded("meadow-tui")),
     };
@@ -191,16 +199,38 @@ fn run_tui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> TuiRunR
     control
         .shutdown()
         .expect("join control runtime before releasing world");
-    let world = Arc::try_unwrap(shared_world)
-        .expect("unwrap shared world")
-        .into_inner()
-        .expect("into inner world");
-
-    let digest = world.world_digest_v1().expect("world digest v1");
-    let gate = Arc::try_unwrap(gate)
-        .expect("step closure released gate")
-        .into_inner()
-        .expect("gate lock");
+    let digest = port.scientific_digest_v1().expect("owner digest");
+    let EventPoll::Contiguous(page) = port
+        .poll_events(
+            EventCursor::beginning(session_id),
+            usize::try_from(ticks).expect("cohort tick count"),
+        )
+        .expect("canonical scientific events")
+    else {
+        panic!("the cohort ring must retain every declared science tick");
+    };
+    assert_eq!(u64::try_from(page.events.len()).unwrap(), ticks);
+    let mut gate = ConservationGate::new();
+    for (index, entry) in page.events.iter().enumerate() {
+        assert_eq!(
+            entry.event.tick.0,
+            u64::try_from(index).unwrap() + 1,
+            "no tick may be skipped or counted twice"
+        );
+        let report = entry
+            .event
+            .boundary
+            .resource_tick()
+            .expect("enabled ledger report for every tick");
+        assert!(
+            report.reconciliation.reconciled,
+            "seed {seed}: {:?}",
+            report.reconciliation
+        );
+        gate.observe(report);
+    }
+    drop(port);
+    let world = host.join().expect("owner finalized").snapshot;
     TuiRunResult {
         world,
         digest,
@@ -210,27 +240,52 @@ fn run_tui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> TuiRunR
 }
 
 struct GuiRunResult {
-    world: WorldState,
+    world: Arc<RenderSnapshot>,
     digest: WorldDigestV1,
     gate: ConservationGate,
     last_png_bytes: Vec<u8>,
 }
 
 fn run_gui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> GuiRunResult {
-    let mut world = build_meadow_world(document, seed);
+    let world = build_meadow_world(document, seed);
+    let mut core = HostCore::new(
+        HostSessionId::new(u128::from(seed)),
+        world,
+        HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            },
+            capture_agent_visuals: true,
+            ..HostCoreOptions::default()
+        },
+    )
+    .expect("CPU render owner");
+    let mut port = core.local_port();
     let mut gate = ConservationGate::new();
     let mut last_png_bytes = Vec::new();
 
     for tick in 1..=ticks {
         if tick == ticks {
-            world.request_replay_world_digest();
+            core.request_replay_world_digest();
         }
 
-        world.step().expect("step world in CPU PNG helper path");
+        port.submit(CommandEnvelope::new(
+            CommandId::new(u128::from(tick)),
+            HostCommand::Step,
+        ))
+        .expect("CPU path step admission");
+        let driven = core
+            .drive(ManualInstant::from_nanos(tick))
+            .expect("CPU path owner drive");
+        assert_eq!(
+            driven.scientific_steps, 1,
+            "one explicit science step per loop"
+        );
 
         // CPU PNG rendering at select cadence and final tick.
         if tick % 50 == 0 || tick == ticks {
-            let png = render_png_offscreen(&world, 800, 450);
+            let png = render_png_offscreen(&core.latest_snapshot(), 800, 450);
             assert!(
                 !png.is_empty() && png.starts_with(b"\x89PNG\r\n\x1a\n"),
                 "seed {seed} tick {tick}: CPU raster must emit valid PNG header"
@@ -238,7 +293,7 @@ fn run_gui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> GuiRunR
             last_png_bytes = png;
         }
 
-        if let Some(ref report) = world.resource_ledger().latest {
+        if let Some(ref report) = core.world().resource_ledger().latest {
             assert!(
                 report.reconciliation.reconciled,
                 "seed {seed} tick {tick}: CPU PNG path resource reconciliation breach! unexplained={:?}, tol={}",
@@ -248,7 +303,8 @@ fn run_gui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> GuiRunR
         }
     }
 
-    let digest = world.world_digest_v1().expect("world digest v1");
+    let digest = core.scientific_digest_v1().expect("world digest v1");
+    let world = core.latest_snapshot();
 
     GuiRunResult {
         world,
@@ -294,9 +350,19 @@ fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
         println!(
             "  [Ratatui TestBackend] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
             ticks,
-            tui_result.world.agent_count(),
-            tui_result.world.history().map(|h| h.births).sum::<usize>(),
-            tui_result.world.history().map(|h| h.deaths).sum::<usize>(),
+            tui_result.world.world.agents.len(),
+            tui_result
+                .world
+                .summary_history
+                .iter()
+                .map(|h| h.births)
+                .sum::<usize>(),
+            tui_result
+                .world
+                .summary_history
+                .iter()
+                .map(|h| h.deaths)
+                .sum::<usize>(),
             tui_result.digest.overall
         );
 
@@ -306,9 +372,19 @@ fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
         println!(
             "  [CPU PNG] Finished {} ticks, pop={}, births={}, deaths={}, digest={}",
             ticks,
-            gui_result.world.agent_count(),
-            gui_result.world.history().map(|h| h.births).sum::<usize>(),
-            gui_result.world.history().map(|h| h.deaths).sum::<usize>(),
+            gui_result.world.world.agents.len(),
+            gui_result
+                .world
+                .summary_history
+                .iter()
+                .map(|h| h.births)
+                .sum::<usize>(),
+            gui_result
+                .world
+                .summary_history
+                .iter()
+                .map(|h| h.deaths)
+                .sum::<usize>(),
             gui_result.digest.overall
         );
 
@@ -353,7 +429,7 @@ fn meadow_testbackend_cpu_png_parity_and_balanced_ledger_cohort() {
             "tui_digest": tui_result.digest.overall,
             "gui_digest": gui_result.digest.overall,
             "parity": true,
-            "final_population": tui_result.world.agent_count(),
+            "final_population": tui_result.world.world.agents.len(),
             "gross_flow_food": seed_verdict.gross_flow[0],
             "gross_flow_energy": seed_verdict.gross_flow[1],
             "gross_flow_health": seed_verdict.gross_flow[2],

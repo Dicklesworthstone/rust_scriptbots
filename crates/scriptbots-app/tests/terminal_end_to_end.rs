@@ -4,14 +4,17 @@ use anyhow::Result;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use scriptbots_app::{
     ControlCommand, ControlRuntime, ControlServerConfig, McpTransportConfig, ScenarioIdentityV0,
-    WorldStepDriver,
-    control::empty_latest_summary,
+    host_thread::HostThread,
     renderer::{Renderer, RendererContext},
     terminal::TerminalRenderer,
 };
 use scriptbots_core::{
     AgentData, Generation, PersistenceAdmissionSession, Position, ScriptBotsConfig, Velocity,
     WorldState,
+};
+use scriptbots_runtime::{
+    HostCoreOptions, HostSessionId, JournalPort, PlaybackSnapshot, VolatileJournal,
+    channel::ChannelHostOptions,
 };
 use scriptbots_storage::{AnalyticsSnapshotProvider, StoragePipeline, StorageReader};
 use serde::Deserialize;
@@ -21,24 +24,32 @@ use tracing::Level;
 
 static ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn disabled_step_driver(world: &Arc<Mutex<WorldState>>) -> WorldStepDriver {
-    let world = Arc::clone(world);
-    Arc::new(move || world.lock().expect("test world mutex").step())
-}
+const HOST_SESSION: HostSessionId = HostSessionId::new(0x7e2e);
 
-fn persistence_step_driver(
-    world: &Arc<Mutex<WorldState>>,
-    persistence: &Arc<Mutex<PersistenceAdmissionSession>>,
-) -> WorldStepDriver {
-    let world = Arc::clone(world);
-    let persistence = Arc::clone(persistence);
-    Arc::new(move || {
-        let mut world = world.lock().expect("test world mutex");
-        persistence
-            .lock()
-            .expect("test persistence session mutex")
-            .step(&mut world)
-    })
+fn terminal_host(
+    world: WorldState,
+    persistence: Option<PersistenceAdmissionSession>,
+    journal: Box<dyn JournalPort + Send>,
+) -> Result<HostThread> {
+    let persistence = match persistence {
+        Some(session) => session,
+        None => world.bind_persistence(Box::new(scriptbots_core::NullPersistence))?,
+    };
+    HostThread::spawn(
+        HOST_SESSION,
+        world,
+        persistence,
+        journal,
+        HostCoreOptions {
+            initial_playback: PlaybackSnapshot {
+                paused: true,
+                speed_multiplier: 1.0,
+            },
+            capture_agent_visuals: true,
+            ..HostCoreOptions::default()
+        },
+        ChannelHostOptions::default(),
+    )
 }
 
 struct EnvCleanup {
@@ -349,7 +360,7 @@ fn tui_evidence_e2e_serves_the_frame_the_renderer_published() -> Result<()> {
         persistence_interval: 0,
         ..ScriptBotsConfig::default()
     })?;
-    let shared_world = Arc::new(Mutex::new(world));
+    let host = terminal_host(world, None, Box::new(VolatileJournal::default()))?;
 
     // Port 0: the OS picks, and the reservation reports what it bound. A fixed port
     // would collide with whatever else is running on a shared machine.
@@ -363,17 +374,14 @@ fn tui_evidence_e2e_serves_the_frame_the_renderer_published() -> Result<()> {
     let rest_addr = reservation
         .rest_address()
         .ok_or_else(|| anyhow::anyhow!("REST listener was not bound"))?;
-    let (control_runtime, command_drain, command_submit) =
-        reservation.launch(Arc::clone(&shared_world), empty_latest_summary())?;
+    let (control_runtime, command_submit) = reservation.launch(host.port())?;
 
     let renderer = TerminalRenderer::default();
     {
         let context = RendererContext {
-            world: Arc::clone(&shared_world),
-            simulation_step: disabled_step_driver(&shared_world),
+            host: host.port(),
             analytics: AnalyticsSnapshotProvider::empty(),
             control_runtime: &control_runtime,
-            command_drain,
             command_submit,
             scenario: Arc::new(ScenarioIdentityV0::caller_seeded("tui-evidence-e2e")),
         };
@@ -419,6 +427,8 @@ fn tui_evidence_e2e_serves_the_frame_the_renderer_published() -> Result<()> {
     );
 
     control_runtime.shutdown()?;
+    let final_owner = host.join()?;
+    assert_eq!(final_owner.snapshot.world.tick, frames as u64);
 
     // The structured evidence line the script gates on. Every field the acceptance
     // criterion names, so a reviewer can audit the run without re-running it.
@@ -557,7 +567,7 @@ fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
             .try_spawn_agent(agent)
             .expect("terminal fixture agent is finite");
     }
-    let shared_world = Arc::new(Mutex::new(world));
+    let host = terminal_host(world, None, Box::new(VolatileJournal::default()))?;
 
     let analytics = AnalyticsSnapshotProvider::empty();
 
@@ -567,20 +577,14 @@ fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
         ..ControlServerConfig::default()
     };
 
-    let (control_runtime, command_drain, command_submit) = ControlRuntime::launch(
-        Arc::clone(&shared_world),
-        empty_latest_summary(),
-        control_config,
-    )?;
+    let (control_runtime, command_submit) = ControlRuntime::launch(host.port(), control_config)?;
 
     let renderer = TerminalRenderer::default();
     {
         let context = RendererContext {
-            world: Arc::clone(&shared_world),
-            simulation_step: disabled_step_driver(&shared_world),
+            host: host.port(),
             analytics: analytics.clone(),
             control_runtime: &control_runtime,
-            command_drain,
             command_submit,
             scenario: Arc::new(ScenarioIdentityV0::caller_seeded("e2e-scenario")),
         };
@@ -588,6 +592,7 @@ fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
     }
 
     control_runtime.shutdown()?;
+    let final_owner = host.join()?;
 
     let report_contents = std::fs::read_to_string(&report_path)?;
     let report: HeadlessReportDto = serde_json::from_str(&report_contents)?;
@@ -671,13 +676,12 @@ fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
     );
 
     {
-        let guard = shared_world.lock().expect("world mutex");
+        let snapshot = &final_owner.snapshot;
         assert_eq!(
-            guard.tick().0,
-            summary.final_tick,
+            snapshot.world.tick, summary.final_tick,
             "world tick should advance to the reported final tick"
         );
-        let history: Vec<_> = guard.history().cloned().collect();
+        let history = &snapshot.summary_history;
         assert!(
             history.len() >= frames,
             "world history should retain per-tick summaries (len={})",
@@ -807,9 +811,8 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
             .try_spawn_agent(agent)
             .expect("terminal fixture agent is finite");
     }
-    let shared_world = Arc::new(Mutex::new(world));
-    let shared_persistence = Arc::new(Mutex::new(persistence));
-    let simulation_step = persistence_step_driver(&shared_world, &shared_persistence);
+    let journal = pipeline.journal_port(HOST_SESSION, Default::default())?;
+    let host = terminal_host(world, Some(persistence), Box::new(journal))?;
 
     let control_config = ControlServerConfig {
         rest_enabled: false,
@@ -817,11 +820,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
         ..ControlServerConfig::default()
     };
 
-    let (control_runtime, command_drain, command_submit) = ControlRuntime::launch(
-        Arc::clone(&shared_world),
-        empty_latest_summary(),
-        control_config,
-    )?;
+    let (control_runtime, command_submit) = ControlRuntime::launch(host.port(), control_config)?;
 
     let mut updated_config = config.clone();
     updated_config.food_growth_rate = 0.36;
@@ -844,28 +843,25 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
     let renderer = TerminalRenderer::default();
     {
         let context = RendererContext {
-            world: Arc::clone(&shared_world),
-            simulation_step,
+            host: host.port(),
             analytics: analytics.clone(),
             control_runtime: &control_runtime,
-            command_drain,
             command_submit,
             scenario: Arc::new(ScenarioIdentityV0::caller_seeded("e2e-scenario")),
         };
         renderer.run(context)?;
     }
     control_runtime.shutdown()?;
-    let finalized_tail = {
-        let mut world = shared_world.lock().expect("world mutex");
-        shared_persistence
-            .lock()
-            .expect("persistence session mutex")
-            .finalize(&mut world)?
-    };
-    assert!(
-        finalized_tail,
-        "a 37-tick run with a five-tick cadence must admit its partial tail"
+    let before_finalization = pipeline.flush()?;
+    let final_owner = host.join()?;
+    let cadence = u64::from(config.persistence_interval);
+    let cadence_boundary = frames as u64 / cadence * cadence;
+    assert_ne!(
+        cadence_boundary, frames as u64,
+        "fixture must have a partial tail"
     );
+    assert_eq!(before_finalization.committed_tick, Some(cadence_boundary));
+    assert_eq!(final_owner.required_persistence_tick, Some(frames as u64));
     let shutdown = pipeline.shutdown()?;
 
     let report_contents = std::fs::read_to_string(&report_path)?;
@@ -949,8 +945,8 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
     );
 
     {
-        let guard = shared_world.lock().expect("world mutex");
-        let world_config = guard.config();
+        let snapshot = &final_owner.snapshot;
+        let world_config = &snapshot.config;
         assert!(
             (world_config.food_growth_rate - updated_config.food_growth_rate).abs() < f32::EPSILON
         );
@@ -970,7 +966,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
             "chart flush interval should reflect control update"
         );
 
-        let history: Vec<_> = guard.history().cloned().collect();
+        let history = &snapshot.summary_history;
         assert!(
             history.len() >= frames,
             "history should capture each simulated tick (len={})",
@@ -988,7 +984,6 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
         );
     }
 
-    drop(shared_world);
     assert!(
         analytics.snapshot().stopped,
         "explicit pipeline shutdown must be visible to frontend readers"

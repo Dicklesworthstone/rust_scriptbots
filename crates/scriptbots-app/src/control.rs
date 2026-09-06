@@ -2,7 +2,6 @@ use std::cmp::Reverse;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 // removed duplicate import
 
-use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -205,41 +204,12 @@ type KnobsCache = std::sync::Arc<Mutex<Option<(u64, Vec<KnobEntry>)>>>;
 
 /// Lock a derived cache, adopting the contents even if a previous holder panicked.
 ///
-/// The world mutex propagates poisoning as [`ControlError::Lock`] because a panic
-/// mid-tick can leave scientific state torn. The knob and command-status caches are
-/// different: both are pure projections whose only invariants are enforced on read
-/// (knobs are revalidated against `config_revision`, statuses are looked up by exact
-/// command ID), so a poisoned guard holds a structurally intact value. Unwrapping
-/// here instead panicked the axum worker on every later `/api/knobs`, `/api/config`,
-/// and `/api/status` request, turning one unrelated panic into a permanently dead
-/// control plane (bd-2t3k).
+/// Knobs are revalidated against the published configuration revision. Recovering
+/// this derived cache cannot repair or alter scientific state; the host owns that
+/// state separately. Unwrapping here would make later knob requests panic after
+/// an unrelated cache holder panicked (bd-2t3k).
 fn lock_cache<T>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
     cache.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Status and completed summary captured together while the owner can read the world.
-/// The status can exist at bootstrap before the first completed tick summary.
-#[derive(Debug, Clone)]
-pub struct PublishedWorldObservation {
-    summary: Option<scriptbots_core::TickSummary>,
-    status: SimulationStatusDto,
-}
-
-/// Latest owner observation; readers load it without acquiring the world mutex.
-pub type SharedLatestSummary = Arc<ArcSwapOption<PublishedWorldObservation>>;
-
-/// Publish the world's actual fields at an owner boundary, including failed steps.
-pub fn publish_world_observation(slot: &SharedLatestSummary, world: &WorldState) {
-    slot.store(Some(Arc::new(PublishedWorldObservation {
-        summary: world.history().next_back().cloned(),
-        status: SimulationStatusDto::from_world(world),
-    })));
-}
-
-/// Fresh, empty published-summary slot.
-#[must_use]
-pub fn empty_latest_summary() -> SharedLatestSummary {
-    Arc::new(ArcSwapOption::empty())
 }
 
 /// Wire tag of `scriptbots_runtime::ApplicationState::Admitted`.

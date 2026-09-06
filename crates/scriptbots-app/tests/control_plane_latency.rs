@@ -3,13 +3,10 @@
 //!
 //! The failure this guards against was measured in the bd-134 audit: every
 //! REST/MCP handler parked a tokio worker on the world mutex, so `num_cpus`
-//! concurrent SSE clients froze the whole control plane. The fixes were
-//! (1) blocking-pool wraps for every world-locking handler, (2) a published
-//! lock-free latest-summary slot, and (3) capture-then-rasterize screenshots.
-//! This harness drives all of that end to end: a real REST server, a real
-//! stepping loop contending on the real world mutex, saturating SSE clients,
-//! and a latency-measured request loop — then prints the histogram table the
-//! bead requires and asserts the acceptance numbers.
+//! concurrent SSE clients froze the whole control plane. The migrated harness
+//! runs a real sole-owner host, a real REST server, saturating SSE clients and
+//! a measured request loop. The parked-owner test below checks immutable status
+//! reads separately; neither fixture is evidence of an in-flight database stall.
 //!
 //! DSR lane only: `#[ignore]` keeps it out of the fast suite; the centralized
 //! DSR profile runs it explicitly on controlled hardware where the acceptance
@@ -19,17 +16,21 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use scriptbots_app::{
-    ControlRuntime, ControlServerConfig, McpTransportConfig, WorldStepDriver,
-    control::{empty_latest_summary, publish_world_observation},
+    ControlRuntime, ControlServerConfig, McpTransportConfig, host_thread::HostThread,
 };
 use scriptbots_core::{AgentData, Position, ScriptBotsConfig, WorldState};
+use scriptbots_runtime::{
+    FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, ManualInstant, PlaybackSnapshot,
+    VolatileJournal,
+    channel::{ChannelHostDriver, ChannelHostOptions},
+};
 
 const AGENT_COUNT: usize = 1_000;
 const MEASURED_REQUESTS: usize = 200;
@@ -72,23 +73,6 @@ fn populated_world() -> WorldState {
     world
 }
 
-/// Production-shaped driver: locks the world per tick and publishes the
-/// completed summary into the lock-free slot, exactly like
-/// `persistence_step_driver` in `main.rs`.
-fn publishing_step_driver(
-    world: &Arc<Mutex<WorldState>>,
-    latest: &scriptbots_app::control::SharedLatestSummary,
-) -> WorldStepDriver {
-    let world = Arc::clone(world);
-    let latest = Arc::clone(latest);
-    Arc::new(move || {
-        let mut world = world.lock().expect("latency world mutex");
-        let events = world.step()?;
-        publish_world_observation(&latest, &world);
-        Ok(events)
-    })
-}
-
 /// Minimal blocking HTTP GET over a fresh connection; returns the whole
 /// response (headers + body). Good enough for latency measurement of small
 /// JSON bodies served with `content-length`.
@@ -113,7 +97,7 @@ fn percentile(sorted: &[Duration], quantile: f64) -> Duration {
 }
 
 #[test]
-fn status_http_returns_the_published_boundary_while_the_owner_mutex_is_held() {
+fn status_http_returns_the_published_boundary_before_the_parked_owner_is_released() {
     let mut world = WorldState::new(ScriptBotsConfig {
         world_width: 64,
         world_height: 64,
@@ -125,13 +109,36 @@ fn status_http_returns_the_published_boundary_while_the_owner_mutex_is_held() {
     })
     .expect("real status world");
     world.step().expect("actual published tick");
-    let latest = empty_latest_summary();
-    publish_world_observation(&latest, &world);
-    let world = Arc::new(Mutex::new(world));
+    let (ready, port_rx) = std::sync::mpsc::sync_channel(1);
+    let (release, wait_for_release) = std::sync::mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        let core = HostCore::new(
+            HostSessionId::new(0x513b),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("status owner");
+        let (mut driver, port) =
+            ChannelHostDriver::new(FixedDeadlineHost::new(core), ChannelHostOptions::default())
+                .expect("channel driver");
+        ready.send(port).expect("publish actual owner snapshot");
+        wait_for_release
+            .recv()
+            .expect("release owner after HTTP read");
+        let epoch = Instant::now();
+        driver
+            .run(|| ManualInstant::from_nanos(u64::try_from(epoch.elapsed().as_nanos()).unwrap()))
+            .expect("owner completes shutdown");
+    });
     let rest_address = unused_loopback_address();
-    let (runtime, _drain, _submit) = ControlRuntime::launch(
-        Arc::clone(&world),
-        latest,
+    let (runtime, submit) = ControlRuntime::launch(
+        port_rx.recv().expect("ready owner"),
         ControlServerConfig {
             rest_address,
             rest_enabled: true,
@@ -140,18 +147,13 @@ fn status_http_returns_the_published_boundary_while_the_owner_mutex_is_held() {
         },
     )
     .expect("real REST startup");
-    let owner = world
-        .lock()
-        .expect("hold the owner mutex through the HTTP read");
-    assert!(matches!(
-        world.try_lock(),
-        Err(std::sync::TryLockError::WouldBlock)
-    ));
     let response = http_get(rest_address, "/api/status");
-    // Release before asserting so a regressed handler can finish and shutdown can join.
-    drop(owner);
+    // Release before asserting so a regressed handler can finish and teardown can join.
+    release.send(()).expect("release owner");
     runtime.shutdown().expect("REST shutdown");
-    let response = response.expect("status returns before the held owner lock is released");
+    drop(submit);
+    owner.join().expect("owner joined");
+    let response = response.expect("status returns before the owner is released");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let (_, body) = response.split_once("\r\n\r\n").expect("HTTP body");
     let status: scriptbots_app::control::SimulationStatusDto =
@@ -165,9 +167,25 @@ fn status_http_returns_the_published_boundary_while_the_owner_mutex_is_held() {
 #[test]
 #[ignore = "DSR latency lane (bd-134): 1k agents, saturating SSE clients, wall-clock acceptance numbers"]
 fn control_plane_latency_holds_under_stepping_and_sse_load() {
-    let world = Arc::new(Mutex::new(populated_world()));
-    let latest = empty_latest_summary();
-    let driver = publishing_step_driver(&world, &latest);
+    let world = populated_world();
+    let persistence = world
+        .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+        .expect("persistence binding");
+    let host = HostThread::spawn(
+        HostSessionId::new(0xb134),
+        world,
+        persistence,
+        Box::new(VolatileJournal::default()),
+        HostCoreOptions {
+            // A one-nanosecond requested period keeps the real owner under load;
+            // its bounded catch-up policy still controls actual science work.
+            tick_period_nanos: 1,
+            ..HostCoreOptions::default()
+        },
+        ChannelHostOptions::default(),
+    )
+    .expect("full-speed owner");
+    let snapshots = host.port().snapshot_hub();
 
     let rest_address = unused_loopback_address();
     let config = ControlServerConfig {
@@ -176,29 +194,15 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
         mcp_transport: McpTransportConfig::Disabled,
         ..ControlServerConfig::default()
     };
-    let (runtime, _drain, _submit) =
-        ControlRuntime::launch(Arc::clone(&world), Arc::clone(&latest), config)
-            .expect("REST startup for latency harness");
+    let (runtime, submit) =
+        ControlRuntime::launch(host.port(), config).expect("REST startup for latency harness");
 
-    // Stepping loop: full speed, production lock pattern, no frame pacing —
-    // the worst realistic contention the control plane can face.
     let stop = Arc::new(AtomicBool::new(false));
-    let ticks = Arc::new(AtomicU64::new(0));
-    let stepper = {
-        let stop = Arc::clone(&stop);
-        let ticks = Arc::clone(&ticks);
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                driver().expect("latency world step");
-                ticks.fetch_add(1, Ordering::Relaxed);
-            }
-        })
-    };
 
     // Phase A: unloaded baseline throughput.
-    let baseline_start = ticks.load(Ordering::Relaxed);
+    let baseline_start = snapshots.latest().world.tick;
     std::thread::sleep(Duration::from_secs(PHASE_SECONDS));
-    let baseline_ticks = ticks.load(Ordering::Relaxed) - baseline_start;
+    let baseline_ticks = snapshots.latest().world.tick - baseline_start;
 
     // Phase B: saturate with SSE clients, then measure request latencies.
     let client_count = 2 * std::thread::available_parallelism().map_or(4, usize::from);
@@ -237,7 +241,7 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
     // Let the SSE herd attach before measuring.
     std::thread::sleep(Duration::from_millis(750));
 
-    let loaded_start_ticks = ticks.load(Ordering::Relaxed);
+    let loaded_start_ticks = snapshots.latest().world.tick;
     let loaded_start = Instant::now();
     let mut latencies = Vec::with_capacity(MEASURED_REQUESTS);
     let mut failures = 0_usize;
@@ -251,14 +255,15 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
         }
     }
     let loaded_elapsed = loaded_start.elapsed().max(Duration::from_millis(1));
-    let loaded_ticks = ticks.load(Ordering::Relaxed) - loaded_start_ticks;
+    let loaded_ticks = snapshots.latest().world.tick - loaded_start_ticks;
 
     stop.store(true, Ordering::Relaxed);
-    stepper.join().expect("stepper joins");
     for client in sse_clients {
         client.join().expect("SSE client joins");
     }
     runtime.shutdown().expect("REST shutdown");
+    drop(submit);
+    host.join().expect("owner shutdown");
 
     latencies.sort_unstable();
     let p50 = percentile(&latencies, 0.50);
@@ -293,6 +298,10 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
     assert_eq!(
         failures, 0,
         "every latest-summary request must succeed under load"
+    );
+    assert!(
+        baseline_ticks > 0 && loaded_ticks > 0,
+        "both phases must observe actual science progress"
     );
     assert!(
         sse_events.load(Ordering::Relaxed) > 0,

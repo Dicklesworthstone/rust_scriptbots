@@ -3549,7 +3549,7 @@ pub use control::{
     CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, HydrologySnapshot, KnobEntry,
     KnobKind, KnobUpdate, SimulationStatusDto, SpeedRequest,
 };
-pub use scriptbots_core::{ControlCommand, WorldStepDriver};
+pub use scriptbots_core::ControlCommand;
 pub use servers::{
     ConfigPatchRequest, ControlRuntime, ControlRuntimeStatus, ControlServerConfig,
     ControlServerReservation, DEFAULT_CONTROL_MCP_HTTP_ADDRESS, DEFAULT_CONTROL_REST_ADDRESS,
