@@ -723,9 +723,9 @@ impl<'a> TerminalApp<'a> {
     fn submit_and_wait(&mut self, command: ControlCommand) -> Result<()> {
         let receipt = (self.command_submit)(command)
             .ok_or_else(|| anyhow!("terminal host rejected command submission"))?;
-        let command_id = receipt
-            .parse::<scriptbots_runtime::CommandId>()
-            .context("terminal command receipt is not a host command identity")?;
+        let command_id: scriptbots_runtime::CommandId =
+            serde_json::from_value(serde_json::Value::String(receipt.clone()))
+                .context("terminal command receipt is not a host command identity")?;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             self.ensure_control_runtime_running()?;
@@ -798,23 +798,9 @@ impl<'a> TerminalApp<'a> {
         if let Some(receipt) =
             (self.command_submit.as_ref())(ControlCommand::UpdateConfig(Box::new(config)))
         {
-            // ENQUEUED, not persisted (bd-0s7x). `command_submit` yields
-            // `Some(receipt)` from `try_send(..) => Ok(())`, which is queue
-            // admission and nothing more: it does not mean the command was
-            // drained, applied, or written anywhere. This line used to say "persisted to run config", which
-            // asserted an outcome this surface never observes — if the command is
-            // dropped after admission the log claims success and the next launch
-            // silently disagrees, which is the very failure the write-back work
-            // existed to remove, reappearing as a false report.
-            //
-            // Reporting real application needs a receipt that advances past
-            // ADMITTED. The CommandLedger now makes that possible, but nothing
-            // publishes application yet, so that belongs with the receipt lane.
-            // When it lands this wording becomes wrong, which is the good kind of
-            // wrong.
-            // The receipt is logged so this claim is checkable: an operator can
-            // follow that id into the command ledger and see what actually became
-            // of it, instead of taking a bare "enqueued" on trust.
+            // Submission proves admission. The logged identity lets a caller
+            // query application and journal commitment from the owner; this
+            // surface has not waited for either outcome (bd-0s7x).
             info!(
                 theme = theme.label(),
                 %receipt,
@@ -850,83 +836,6 @@ impl<'a> TerminalApp<'a> {
 
     fn step_once(&mut self) {
         self.advance_simulation(Instant::now(), true);
-    }
-
-    /// Apply any scheduled scenario interventions at the current completed-tick
-    /// boundary, before the next science step. Application is identical to a
-    /// drained `UpdateConfig` command, so a rerun of the same scenario replays the
-    /// same interventions at the same ticks.
-    fn apply_due_interventions(&mut self) {
-        let due: Vec<crate::ScenarioInterventionV1> = self.scenario.interventions.to_vec();
-        if due.is_empty() {
-            return;
-        }
-
-        // The world lock is scoped so the outcome can be reported AFTER it drops:
-        // pushing an event or toast needs `&mut self`, which cannot coexist with a
-        // guard borrowed from `self.world`.
-        let outcome = {
-            let mut world = self.world.lock().expect("terminal world mutex poisoned");
-            let current_tick = world.tick().0;
-            if !due.iter().any(|item| item.tick == current_tick) {
-                return;
-            }
-            let mut config_value = match serde_json::to_value(world.config()) {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!(%error, "scenario config did not serialize for intervention merge");
-                    return;
-                }
-            };
-            let result = crate::apply_scenario_interventions(
-                &mut world,
-                &mut config_value,
-                &due,
-                current_tick,
-            );
-            (current_tick, result)
-        };
-
-        let (current_tick, result) = outcome;
-        // Name WHAT changed, not just how many. A count alone cannot tell a
-        // drought from a meteor in a log or in the rail, and this bead requires an
-        // ecosystem crash from a mis-parameterised intervention to be obvious
-        // afterwards.
-        let changed = Self::intervention_summary(&due, current_tick);
-
-        match result {
-            Ok(applied) if applied > 0 => {
-                info!(
-                    tick = current_tick,
-                    applied,
-                    changed = %changed,
-                    "applied scenario interventions"
-                );
-                // The user watched the world change; they are entitled to know it
-                // was an intervention rather than emergent behaviour. Previously
-                // this was an info! to a tracing subscriber nobody is reading
-                // while they watch the TUI (bd-16g.10).
-                self.push_event(
-                    current_tick,
-                    EventKind::Population,
-                    format!("Intervention: {changed}"),
-                );
-                self.push_toast(format!("Intervention applied: {changed}"));
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(%error, tick = current_tick, changed = %changed, "scenario intervention failed");
-                // A FAILED intervention was the worse silence: the world simply
-                // did not change and nothing said why, so the run looks like the
-                // intervention had no effect rather than never happening.
-                self.push_event(
-                    current_tick,
-                    EventKind::Death,
-                    format!("Intervention FAILED ({changed}): {error}"),
-                );
-                self.push_toast(format!("Intervention failed: {error}"));
-            }
-        }
     }
 
     /// Report every intervention core has applied or expired since the last check.

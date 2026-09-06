@@ -197,7 +197,10 @@ impl HostThread {
 mod tests {
     use super::*;
     use scriptbots_core::{NullPersistence, ScriptBotsConfig};
-    use scriptbots_runtime::{HostPort, VolatileJournal};
+    use scriptbots_runtime::{
+        ApplicationState, CommandEnvelope, CommandId, HostCommand, HostPort, JournalState,
+        PlaybackSnapshot, VolatileJournal,
+    };
 
     fn world_and_session() -> (WorldState, PersistenceAdmissionSession) {
         WorldState::with_persistence(
@@ -224,28 +227,91 @@ mod tests {
             world,
             persistence,
             Box::new(VolatileJournal::default()),
-            HostCoreOptions::default(),
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
             ChannelHostOptions::default(),
         )
         .expect("host thread starts and publishes its port");
 
-        // The port is the client contract. Asking it for the session identity
-        // proves the round trip works, not merely that a value came back.
-        let port = host.port();
+        let mut port = host.port();
         assert_eq!(
             port.session_id(),
             HostSessionId::new(1),
             "the port must speak for the host that built it"
         );
 
-        // Dropping every port is what stops the driver; join then recovers the
-        // receipt. A hang here would mean the shutdown handshake is wrong.
+        let initial = port
+            .snapshot_after(None)
+            .expect("snapshot access")
+            .expect("initial snapshot");
+        let command_id = CommandId::new(17);
+        port.submit(CommandEnvelope::new(command_id, HostCommand::Step))
+            .expect("real step admission");
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let applied = loop {
+            let status = port
+                .command_status(command_id)
+                .expect("status access")
+                .expect("known step");
+            if matches!(status.journal(), JournalState::CommittedVolatile) {
+                let ApplicationState::Applied(applied) = status.application() else {
+                    panic!("step must actually apply: {status:?}");
+                };
+                break *applied;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "step did not complete: {status:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(applied.tick.0, initial.world.tick + 1);
+
+        // The join receipt must retain the completed science observation after
+        // the final client disconnects and the owner acknowledges shutdown.
         drop(port);
         let receipt = host.join().expect("host thread stops cleanly");
-        assert!(
-            receipt.run.drives >= 1 || receipt.run.commands_admitted == 0,
-            "a host that never drove and never admitted anything did not run"
+        assert_eq!(
+            receipt.run.outcome,
+            ChannelRunOutcome::ControllerDisconnected
         );
+        assert_eq!(receipt.snapshot.world.tick, applied.tick.0);
+        assert_eq!(
+            receipt.snapshot.revisions.scientific,
+            applied.revisions.scientific
+        );
+        assert_eq!(
+            receipt.snapshot.lifecycle,
+            scriptbots_runtime::HostLifecycle::Stopped
+        );
+        assert!(receipt.run.drives > 0);
+    }
+
+    #[test]
+    fn construction_rejects_a_session_bound_to_a_different_world() {
+        let (world, _own_session) = world_and_session();
+        let (_other_world, foreign_session) = world_and_session();
+        let result = HostThread::spawn(
+            HostSessionId::new(3),
+            world,
+            foreign_session,
+            Box::new(VolatileJournal::default()),
+            HostCoreOptions::default(),
+            ChannelHostOptions::default(),
+        );
+        let Err(error) = result else {
+            panic!("a foreign persistence session must not publish a usable host");
+        };
+        assert!(
+            error.to_string().contains("host construction failed"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("different world"), "{error:#}");
     }
 
     /// A host that cannot be built reports an error rather than hanging.

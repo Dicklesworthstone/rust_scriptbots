@@ -5019,6 +5019,37 @@ mod tests {
     }
 
     #[test]
+    fn composite_playback_wire_preserves_options_and_nonfinite_rejection_evidence() {
+        for speed in [None, Some(2.0_f32), Some(f32::from_bits(0x7fc0_1234))] {
+            for step_once in [false, true] {
+                let command = HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
+                    paused: Some(false),
+                    speed_multiplier: speed,
+                    step_once,
+                });
+                let owned = HostCommandPostcardV1::from_runtime(&command);
+                let borrowed = HostCommandPostcardRefV1::from_runtime(&command);
+                let bytes = postcard::to_allocvec(&owned).expect("owned command bytes");
+                assert_eq!(
+                    bytes,
+                    postcard::to_allocvec(&borrowed).expect("borrowed command bytes")
+                );
+                let decoded: HostCommandPostcardV1 =
+                    postcard::from_bytes(&bytes).expect("durable command readback");
+                let HostCommand::UpdateSimulation(update) = decoded.into_runtime() else {
+                    panic!("composite command discriminant changed");
+                };
+                assert_eq!(update.paused, Some(false));
+                assert_eq!(
+                    update.speed_multiplier.map(f32::to_bits),
+                    speed.map(f32::to_bits)
+                );
+                assert_eq!(update.step_once, step_once);
+            }
+        }
+    }
+
+    #[test]
     fn rejected_nonfinite_command_round_trips_losslessly_through_archive_v2() {
         let nan_bits = 0x7fc0_1234_u32;
         let speed = f32::from_bits(nan_bits);

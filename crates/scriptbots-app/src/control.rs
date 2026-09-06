@@ -244,16 +244,12 @@ pub fn empty_latest_summary() -> SharedLatestSummary {
 
 /// Wire tag of `scriptbots_runtime::ApplicationState::Admitted`.
 ///
-/// The legacy app-owned `CommandBus` can honestly report only this value: it hands a
-/// command an admission order and nothing on that path observes application.
+/// Admission establishes identity and ordering; it does not prove application.
 pub const APPLICATION_STATE_ADMITTED: &str = "admitted";
 
 /// Wire tag of `scriptbots_runtime::ApplicationState::Applied`.
 ///
-/// Reachable only when something OBSERVES a command being applied to the world
-/// and reports it back. Nothing on the legacy path does that yet, which is why
-/// this constant exists alongside a ledger that can hold it rather than being
-/// written anywhere on submission (bd-k7nq).
+/// Published by the host after it observes the command's application.
 pub const APPLICATION_STATE_APPLIED: &str = "applied";
 
 /// Wire tag of `scriptbots_runtime::ApplicationState::Rejected`.
@@ -264,18 +260,15 @@ pub const APPLICATION_STATE_REJECTED: &str = "rejected";
 
 /// Wire tag of `scriptbots_runtime::JournalState::NotRequired`.
 ///
-/// That variant exists precisely "for non-runtime and historical producers", which is
-/// what the legacy bus is — it never writes a lifecycle record, so `pending` would be
-/// a promise nothing keeps.
+/// Used for non-runtime and historical producers that require no journal record.
 pub const JOURNAL_STATE_NOT_REQUIRED: &str = "not_required";
 
 /// Two-axis status representation returned by REST, MCP, and CLI interfaces for commands.
 ///
 /// The two axes are independent by design: application tracks
 /// `admitted`/`applied`/`rejected`/`failed`, journal tracks
-/// `not_required`/`pending`/`committed_volatile`/`durable`. Commands issued through the
-/// legacy bus stay at `admitted`/`not_required` for their whole life; only the
-/// `HostCore` path can advance them (bd-f65w).
+/// `not_required`/`pending`/`committed_volatile`/`durable`. Both axes come from the
+/// authoritative host receipt; admission alone does not advance either axis.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandStatusDto {
     pub command_id: String,
@@ -285,130 +278,6 @@ pub struct CommandStatusDto {
     pub journal_state: String,
     pub control_revision: u64,
     pub scientific_revision: u64,
-}
-
-/// What the applier observed when it applied a drained command.
-///
-/// Deliberately only the two outcomes an applier can actually witness. It knows
-/// whether the world took the command; it does not know whether a journal
-/// commit will follow, so it is given no way to claim one (bd-k7nq).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandOutcome {
-    /// The world accepted the command.
-    Applied,
-    /// The world refused it at application time.
-    Rejected,
-}
-
-/// Records an applied command's outcome against the identity it travelled with.
-///
-/// Held by whatever drains and applies, so the report comes FROM the applier
-/// rather than from the submitter guessing.
-pub type CommandReporter = std::sync::Arc<dyn Fn(&str, CommandOutcome) + Send + Sync>;
-
-/// The two-axis record of what has happened to each submitted command.
-///
-/// Eight instances of one defect were fixed across five surfaces by teaching
-/// each of them to say `admitted` instead of asserting an outcome the host
-/// never acknowledged. That was the right correction, but it left `admitted` as
-/// the END of the road rather than the first step: nothing could ever move a
-/// command past it, so a caller still had no way to learn what actually
-/// happened next (bd-k7nq).
-///
-/// This is the mechanism that lets a receipt advance. It replaces a bare
-/// `HashMap<String, CommandStatusDto>` whose only operation was insert, which
-/// is why nothing could advance: there was no notion of a transition at all,
-/// so there was nothing to call when a command was applied.
-///
-/// TRANSITIONS ARE VALIDATED rather than assumed. `admitted` may become
-/// `applied` or `rejected`; a terminal state may not silently change to
-/// another; an unknown id is refused rather than invented. A ledger that
-/// accepted any write would let a caller report an outcome it had not observed
-/// — the same defect one level down, which is exactly the trap this whole line
-/// of work has been about.
-#[derive(Debug, Default)]
-pub struct CommandLedger {
-    entries: std::collections::HashMap<String, CommandStatusDto>,
-}
-
-/// Why a ledger transition was refused.
-#[derive(Debug, PartialEq, Eq)]
-pub enum LedgerError {
-    /// No command was ever admitted under this id.
-    Unknown(String),
-    /// The command already reached a terminal state.
-    AlreadyTerminal {
-        command_id: String,
-        current: String,
-        attempted: String,
-    },
-}
-
-impl std::fmt::Display for LedgerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unknown(id) => write!(
-                f,
-                "no command was admitted under id `{id}`; a receipt cannot be advanced for a \
-                 command that was never submitted"
-            ),
-            Self::AlreadyTerminal {
-                command_id,
-                current,
-                attempted,
-            } => write!(
-                f,
-                "command `{command_id}` is already `{current}` and cannot become `{attempted}`; \
-                 a terminal outcome is not revisable"
-            ),
-        }
-    }
-}
-
-impl CommandLedger {
-    /// Is this application state one that can no longer change?
-    fn is_terminal(state: &str) -> bool {
-        state == APPLICATION_STATE_APPLIED || state == APPLICATION_STATE_REJECTED
-    }
-
-    /// Record a freshly admitted command.
-    fn admit(&mut self, status: CommandStatusDto) {
-        self.entries.insert(status.command_id.clone(), status);
-    }
-
-    /// The receipt for an id, if one was ever admitted.
-    fn get(&self, command_id: &str) -> Option<&CommandStatusDto> {
-        self.entries.get(command_id)
-    }
-
-    /// Advance a command to a terminal application state.
-    ///
-    /// Returns the updated receipt so a caller reports what the ledger now
-    /// holds rather than what it assumed it would hold.
-    fn resolve(
-        &mut self,
-        command_id: &str,
-        application_state: &str,
-    ) -> Result<CommandStatusDto, LedgerError> {
-        let entry = self
-            .entries
-            .get_mut(command_id)
-            .ok_or_else(|| LedgerError::Unknown(command_id.to_owned()))?;
-        if Self::is_terminal(&entry.application_state) {
-            // Re-reporting the SAME terminal state is a retry, not a conflict:
-            // an applier that replays its report must not be punished for it.
-            if entry.application_state == application_state {
-                return Ok(entry.clone());
-            }
-            return Err(LedgerError::AlreadyTerminal {
-                command_id: command_id.to_owned(),
-                current: entry.application_state.clone(),
-                attempted: application_state.to_owned(),
-            });
-        }
-        entry.application_state = application_state.to_owned();
-        Ok(entry.clone())
-    }
 }
 
 /// Request payload for setting simulation speed multiplier.
@@ -930,7 +799,7 @@ impl ControlHandle {
         } else {
             let sequence = self
                 .command_counter
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                     |value| value.checked_add(1),
@@ -1376,11 +1245,16 @@ pub(crate) mod tests {
     pub(crate) struct TestHost {
         pub(crate) port: ChannelHostPort,
         worker: Option<std::thread::JoinHandle<()>>,
+        clock_gate: Arc<Mutex<()>>,
+        clock_blocked: std::sync::mpsc::Receiver<()>,
     }
 
     impl TestHost {
         pub(crate) fn spawn(world: WorldState) -> Self {
             let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let clock_gate = Arc::new(Mutex::new(()));
+            let owner_gate = Arc::clone(&clock_gate);
+            let (blocked, clock_blocked) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
                 use scriptbots_runtime::{
                     FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, ManualInstant,
@@ -1409,6 +1283,13 @@ pub(crate) mod tests {
                 let epoch = std::time::Instant::now();
                 driver
                     .run(|| {
+                        if matches!(
+                            owner_gate.try_lock(),
+                            Err(std::sync::TryLockError::WouldBlock)
+                        ) {
+                            blocked.send(()).expect("clock blockage receiver");
+                            drop(owner_gate.lock().expect("test clock gate"));
+                        }
                         ManualInstant::from_nanos(
                             u64::try_from(epoch.elapsed().as_nanos()).expect("test duration"),
                         )
@@ -1418,6 +1299,8 @@ pub(crate) mod tests {
             Self {
                 port: receive.recv().expect("test host rendezvous"),
                 worker: Some(worker),
+                clock_gate,
+                clock_blocked,
             }
         }
 
@@ -1426,15 +1309,20 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn wait_applied(&self, status: &CommandStatusDto) -> CommandStatusDto {
+            let observed = self.wait_finished(&status.command_id);
+            assert_eq!(observed.application_state, "applied");
+            observed
+        }
+
+        fn wait_finished(&self, command_id: &str) -> CommandStatusDto {
             let handle = self.handle();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 let observed = handle
-                    .command_status(&status.command_id)
+                    .command_status(command_id)
                     .expect("host status")
                     .expect("retained command");
                 if observed.application_state != "admitted" && observed.journal_state != "pending" {
-                    assert_eq!(observed.application_state, "applied");
                     return observed;
                 }
                 assert!(
@@ -1469,16 +1357,9 @@ pub(crate) mod tests {
         (host.handle(), host)
     }
 
-    fn drain_and_apply(receiver: &crate::command::CommandReceiver, world: &mut WorldState) {
-        for bus in crate::command::drain_pending_commands(receiver) {
-            let _ = scriptbots_core::apply_control_command(world, bus.command)
-                .expect("drained test command applies");
-        }
-    }
-
     fn read_status_before_releasing_owner(
         handle: ControlHandle,
-        owner: MutexGuard<'_, WorldState>,
+        owner: MutexGuard<'_, ()>,
     ) -> Result<SimulationStatusDto, ControlError> {
         let (reply, receipt) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || reply.send(handle.status()));
@@ -1516,60 +1397,49 @@ pub(crate) mod tests {
             config_revision: 1,
         };
         assert_eq!(SimulationStatusDto::from_world(&world), expected);
-        let slot = empty_latest_summary();
-        publish_world_observation(&slot, &world);
-        let shared_world = Arc::new(Mutex::new(world));
-        let (sender, _receiver) = crate::command::create_command_bus(4);
-        let handle = ControlHandle::new(Arc::clone(&shared_world), sender, Arc::clone(&slot));
-
-        let mut owner = shared_world.lock().expect("hold the actual owner mutex");
-        let mut config = owner.config().clone();
-        config.closed = true;
-        owner.apply_config_update(config).expect("second revision");
-        assert!(matches!(
-            shared_world.try_lock(),
-            Err(TryLockError::WouldBlock)
-        ));
-        let current = SimulationStatusDto::from_world(&owner);
-        assert_eq!(current.config_revision, 2);
-        assert!(current.is_closed);
-        assert_ne!(
-            current, expected,
-            "the cached observation must actually be stale"
-        );
+        let host = TestHost::spawn(world);
+        let handle = host.handle();
+        let owner = host.clock_gate.lock().expect("hold owner clock");
+        let submitting_handle = handle.clone();
+        let update = std::thread::spawn(move || {
+            submitting_handle.apply_patch(serde_json::json!({"closed": true}))
+        });
+        host.clock_blocked
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("owner must actually be waiting on the gate");
         assert_eq!(
             read_status_before_releasing_owner(handle.clone(), owner)
                 .expect("nonblocking observed status"),
             expected
         );
-        assert_eq!(handle.status().expect("current unlocked status"), current);
-
-        let owner = shared_world
-            .lock()
-            .expect("republish the actual owner boundary");
-        publish_world_observation(&slot, &owner);
-        assert_eq!(
-            read_status_before_releasing_owner(handle, owner).expect("refreshed observed status"),
-            current
+        let receipt = update
+            .join()
+            .expect("submitter joined")
+            .expect("config admitted");
+        host.wait_applied(&receipt);
+        let current = handle.status().expect("owner-applied status");
+        assert_eq!(current.config_revision, 2);
+        assert!(current.is_closed);
+        assert_ne!(
+            current, expected,
+            "the projection must refresh after the queued change applies"
         );
     }
 
     #[test]
-    fn status_without_an_observation_refuses_a_busy_world() {
-        let (handle, _receiver) = handle();
-        let owner = handle.shared_world.lock().expect("hold unobserved world");
-        assert!(handle.latest_summary.load_full().is_none());
-        assert!(matches!(
-            read_status_before_releasing_owner(handle.clone(), owner),
-            Err(ControlError::Lock)
-        ));
+    fn successful_host_construction_always_publishes_an_initial_observation() {
+        let (handle, host) = handle();
+        let snapshot = host.port.snapshot_hub().latest();
+        let status = handle.status().expect("initial owner observation");
+        assert_eq!(status.tick, snapshot.world.tick);
+        assert_eq!(status.agent_count, snapshot.world.agents.len());
+        assert_eq!(status.config_revision, snapshot.revisions.config.get());
     }
 
-    /// bd-134: a published summary is served wait-free — even a POISONED world
-    /// mutex must not take the latest-summary endpoint (and the SSE/NDJSON
-    /// streams built on it) down with it.
+    /// bd-134: latest-summary reads remain available while the real owner is
+    /// parked at an injected clock gate. This is not a live database-stall proof.
     #[test]
-    fn latest_summary_reads_the_published_slot_without_the_world_mutex() {
+    fn latest_summary_reads_publication_while_owner_is_parked() {
         let mut world = WorldState::new(ScriptBotsConfig {
             rng_seed: Some(0xB134_5EED),
             persistence_interval: 0,
@@ -1583,38 +1453,44 @@ pub(crate) mod tests {
             .expect("completed tick summary")
             .clone();
 
-        let slot = empty_latest_summary();
-        publish_world_observation(&slot, &world);
-        let shared_world: SharedWorld = Arc::new(Mutex::new(world));
-        let (sender, _receiver) = crate::command::create_command_bus(4);
-        let handle = ControlHandle::new(Arc::clone(&shared_world), sender, slot);
-
-        // Poison the world mutex on purpose.
-        let poisoner = Arc::clone(&shared_world);
-        let _ = std::thread::spawn(move || {
-            let _guard = poisoner.lock().expect("pre-poison lock");
-            panic!("deliberate poison for bd-134 latest-summary test");
-        })
-        .join();
-        assert!(
-            shared_world.lock().is_err(),
-            "the world mutex must actually be poisoned for this test to prove anything"
-        );
-
-        let served = handle
-            .latest_summary()
-            .expect("published summary served despite the poisoned mutex");
+        let host = TestHost::spawn(world);
+        let handle = host.handle();
+        let owner = host.clock_gate.lock().expect("owner clock gate");
+        let submitter = handle.clone();
+        let command = std::thread::spawn(move || submitter.step());
+        host.clock_blocked
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("actual owner blockage");
+        let reader_handle = handle.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || send.send(reader_handle.latest_summary()));
+        let served = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(owner);
+        reader
+            .join()
+            .expect("summary reader joined")
+            .expect("summary receiver retained");
+        let served = served
+            .expect("summary read must finish while owner is parked")
+            .expect("published summary");
         assert_eq!(served, published);
-
-        // Endpoints that genuinely need the world still fail typed.
-        assert!(matches!(handle.snapshot(), Err(ControlError::Lock)));
-        assert!(matches!(handle.status(), Err(ControlError::Lock)));
+        let receipt = command
+            .join()
+            .expect("step submitter joined")
+            .expect("step admission");
+        host.wait_applied(&receipt);
+        assert_eq!(
+            handle
+                .latest_summary()
+                .expect("next completed summary")
+                .tick
+                .0,
+            published.tick.0 + 1
+        );
     }
 
-    /// bd-2t3k: the derived caches are not scientific state, so one unrelated panic
-    /// while holding either of them must not permanently disable `/api/knobs`,
-    /// `/api/config`, or `/api/status`. Before the fix these call sites unwrapped the
-    /// guard, so every later request panicked its axum worker.
+    /// A poisoned derived knobs cache must not disable config reads or the
+    /// independent host command-status path (bd-2t3k).
     #[test]
     fn poisoned_derived_caches_keep_serving_knobs_and_command_status() {
         let (handle, _receiver) = handle();
@@ -1629,15 +1505,9 @@ pub(crate) mod tests {
             panic!("deliberate poison for the bd-2t3k knobs-cache test");
         })
         .join();
-        let status_poisoner = Arc::clone(&handle.status_cache);
-        let _ = std::thread::spawn(move || {
-            let _guard = status_poisoner.lock().expect("pre-poison status cache");
-            panic!("deliberate poison for the bd-2t3k status-cache test");
-        })
-        .join();
         assert!(
-            handle.knobs_cache.lock().is_err() && handle.status_cache.lock().is_err(),
-            "both cache mutexes must actually be poisoned for this test to prove anything"
+            handle.knobs_cache.lock().is_err(),
+            "the derived cache must actually be poisoned for this test to prove anything"
         );
 
         let after = handle
@@ -1666,6 +1536,7 @@ pub(crate) mod tests {
     #[test]
     fn patch_updates_single_field() {
         let (handle, receiver) = handle();
+        let before = handle.snapshot().expect("config before submission");
         let updates = vec![KnobUpdate {
             path: "food_max".to_string(),
             value: Value::from(0.6),
@@ -1682,22 +1553,17 @@ pub(crate) mod tests {
             "a config update must report the order it took on the bus"
         );
 
-        // The world has NOT changed yet. This is the assertion the old shape
-        // could not make, because it was handed the requested config and had
-        // nothing to compare against.
-        {
-            let world = handle.lock_world().expect("world lock");
-            assert!(
-                (world.config().food_max - 0.5).abs() < f32::EPSILON,
-                "config changed before the command was drained; the update was only admitted"
-            );
-        }
-
-        let mut world = handle.lock_world().expect("world lock");
-        drain_and_apply(&receiver, &mut world);
+        receiver.wait_applied(&receipt);
+        let after = handle.snapshot().expect("owner-applied config");
+        assert_eq!(before.config["food_max"], serde_json::json!(0.5));
         assert!(
-            (world.config().food_max - 0.6).abs() < f32::EPSILON,
-            "draining the admitted command must actually apply it"
+            (after.config["food_max"]
+                .as_f64()
+                .expect("numeric food maximum")
+                - 0.6)
+                .abs()
+                < f64::from(f32::EPSILON),
+            "the owner-applied receipt must agree with a later config read"
         );
     }
 
@@ -1723,14 +1589,8 @@ pub(crate) mod tests {
             "the render patch must report its admission order"
         );
 
-        // Read the round trip back from the world AFTER draining, rather than
-        // from the response. The response no longer echoes the requested config
-        // (bd-k7nq), and reading it back through the authoritative path is what
-        // actually proves the patch survived serialization.
-        {
-            let mut world = handle.lock_world().expect("world lock");
-            drain_and_apply(&receiver, &mut world);
-        }
+        // Read the round trip only after authoritative application is observed.
+        receiver.wait_applied(&snapshot);
         let applied = handle.snapshot().expect("config after drain");
         let render = &applied.config["render"];
         assert_eq!(render["quality"], serde_json::json!("high"));
@@ -1748,16 +1608,15 @@ pub(crate) mod tests {
         assert_eq!(render["post"]["fog"]["mode"], serde_json::json!("low"));
         assert_eq!(render["day_night"]["cycle_ticks"], serde_json::json!(24000));
 
-        // The applied world config carries the same values after the command drains.
-        let mut world = handle.lock_world().expect("world lock");
-        drain_and_apply(&receiver, &mut world);
+        // Decode the authoritative projection back to its typed configuration.
+        let config: ScriptBotsConfig =
+            serde_json::from_value(applied.config).expect("typed applied config");
         assert_eq!(
-            world.config().render.quality,
+            config.render.quality,
             Some(scriptbots_core::RenderQuality::High)
         );
         assert_eq!(
-            world
-                .config()
+            config
                 .render
                 .post
                 .as_ref()
@@ -1806,8 +1665,8 @@ pub(crate) mod tests {
     ///
     /// The response can no longer project, structurally: it is a receipt and
     /// carries no config field at all. What is left to prove is that the
-    /// authoritative read still shows the OLD value while the command is merely
-    /// admitted.
+    /// receipt contains no projected config, and later reads agree with actual
+    /// owner application. Admission may race application on the owner thread.
     #[test]
     fn config_response_reports_only_applied_state() {
         let (handle, receiver) = handle();
@@ -1825,24 +1684,20 @@ pub(crate) mod tests {
             "an accepted config patch must report its admission order"
         );
 
-        let observed = handle.snapshot().expect("current config snapshot");
-        let observed_food_max = observed.config["food_max"].as_f64().expect("food_max");
         assert!(
-            (observed_food_max - baseline).abs() < 1.0e-6,
-            "the authoritative read moved on an admitted-but-undrained command: {baseline} -> \
-             {observed_food_max}"
+            serde_json::to_value(&receipt)
+                .expect("receipt wire")
+                .get("config")
+                .is_none(),
+            "an admission response must not impersonate an applied configuration snapshot"
         );
-        assert!(
-            (observed_food_max - 0.6).abs() > 1.0e-6,
-            "the read reports the REQUESTED value, which is the projection this fix removed"
+        receiver.wait_applied(&receipt);
+        assert_eq!(
+            before.config["food_max"]
+                .as_f64()
+                .expect("retained baseline"),
+            baseline
         );
-
-        // Positive control: the command is real and does apply once drained, so
-        // the assertions above describe timing rather than a dropped command.
-        {
-            let mut world = handle.lock_world().expect("world lock");
-            drain_and_apply(&receiver, &mut world);
-        }
         let applied = handle.snapshot().expect("config after drain");
         let applied_food_max = applied.config["food_max"].as_f64().expect("food_max");
         assert!(
@@ -1899,7 +1754,7 @@ pub(crate) mod tests {
         // The bounds exist to reject the absurd, not to enforce taste: a
         // researcher must still be able to build a brutal world.
         let (handle, receiver) = handle();
-        handle
+        let receipt = handle
             .apply_updates(&[
                 KnobUpdate {
                     path: "metabolism_drain".into(),
@@ -1911,8 +1766,17 @@ pub(crate) mod tests {
                 },
             ])
             .expect("a hostile world is a legitimate experiment");
-        let mut world = handle.lock_world().expect("world lock");
-        drain_and_apply(&receiver, &mut world);
+        receiver.wait_applied(&receipt);
+        let config = handle.snapshot().expect("applied hostile world");
+        assert!(
+            (config.config["metabolism_drain"]
+                .as_f64()
+                .expect("metabolism")
+                - 0.9)
+                .abs()
+                < 1.0e-6
+        );
+        assert_eq!(config.config["spike_damage"], serde_json::json!(9.0));
     }
 
     #[test]
@@ -1972,6 +1836,7 @@ pub(crate) mod tests {
     #[test]
     fn non_finite_knob_update_is_field_specific_and_not_admitted() {
         let (handle, receiver) = handle();
+        let before = receiver.port.snapshot_hub().latest();
         let err = handle
             .apply_updates(&[KnobUpdate {
                 path: "food_growth_rate".into(),
@@ -1989,10 +1854,16 @@ pub(crate) mod tests {
             message.contains("food_growth_rate"),
             "error did not identify field: {message}"
         );
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(crate::command::CommandRecvError::Empty)
-        ));
+        assert_eq!(
+            handle
+                .command_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            receiver.port.snapshot_hub().latest().revisions,
+            before.revisions
+        );
         let value = handle
             .snapshot()
             .expect("snapshot")
@@ -2009,6 +1880,7 @@ pub(crate) mod tests {
     #[test]
     fn unrepresentable_nested_float_reports_exact_path_without_partial_admission() {
         let (handle, receiver) = handle();
+        let before = receiver.port.snapshot_hub().latest();
         let err = handle
             .apply_updates(&[
                 KnobUpdate {
@@ -2036,9 +1908,159 @@ pub(crate) mod tests {
             message.contains("render.auto_exposure.speed_brighten"),
             "error did not identify nested field: {message}"
         );
+        assert_eq!(
+            handle
+                .command_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            receiver.port.snapshot_hub().latest().revisions,
+            before.revisions
+        );
+        assert_eq!(
+            handle.snapshot().expect("snapshot").config.get("food_max"),
+            Some(&Value::from(0.5))
+        );
+    }
+
+    #[test]
+    fn bounded_owner_queue_refuses_config_without_projecting_it_and_accepts_with_room() {
+        use scriptbots_runtime::{
+            FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, ManualInstant,
+            PlaybackSnapshot,
+            channel::{ChannelHostDriver, ChannelHostOptions},
+        };
+
+        for capacity in [1, 2] {
+            let (ready, client) = std::sync::mpsc::sync_channel(1);
+            let (finish, finished) = std::sync::mpsc::channel::<CommandId>();
+            let worker = std::thread::spawn(move || {
+                let core = HostCore::new(
+                    HostSessionId::new(0xca9),
+                    WorldState::new(ScriptBotsConfig {
+                        rng_seed: Some(42),
+                        ..ScriptBotsConfig::default()
+                    })
+                    .expect("world"),
+                    HostCoreOptions {
+                        command_capacity: capacity,
+                        initial_playback: PlaybackSnapshot {
+                            paused: true,
+                            speed_multiplier: 1.0,
+                        },
+                        ..HostCoreOptions::default()
+                    },
+                )
+                .expect("bounded owner");
+                let (mut driver, port) = ChannelHostDriver::new(
+                    FixedDeadlineHost::new(core),
+                    ChannelHostOptions::default(),
+                )
+                .expect("channel driver");
+                ready.send(port).expect("publish port");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                for sequence in 1_u64.. {
+                    match finished.try_recv() {
+                        Ok(id) => {
+                            return (
+                                driver.host().core().latest_snapshot(),
+                                driver
+                                    .host()
+                                    .core()
+                                    .local_port()
+                                    .command_status(id)
+                                    .expect("owner status")
+                                    .expect("known command"),
+                            );
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            panic!("client ended before reporting its receipt")
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "client did not finish"
+                    );
+                    // Occupy one actual owner queue slot immediately before every
+                    // ingress drain. Capacity two admits the config alongside it;
+                    // capacity one must refuse it. No application is simulated.
+                    let filler = driver
+                        .host_mut()
+                        .submit(CommandEnvelope::new(
+                            CommandId::new(u128::from(sequence)),
+                            HostCommand::Pause,
+                        ))
+                        .expect("filler submission");
+                    assert!(matches!(filler.application(), ApplicationState::Admitted));
+                    driver
+                        .step(ManualInstant::from_nanos(sequence))
+                        .expect("real owner boundary");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                unreachable!("unbounded sequence")
+            });
+            let handle = ControlHandle::new(client.recv().expect("owner port"));
+            let receipt = handle
+                .apply_updates(&[KnobUpdate {
+                    path: "food_max".to_owned(),
+                    value: Value::from(0.6),
+                }])
+                .expect("host returns its admission decision");
+            let id = serde_json::from_value(Value::String(receipt.command_id.clone()))
+                .expect("canonical identity");
+            finish.send(id).expect("client finished");
+            let (snapshot, terminal) = worker.join().expect("owner joined");
+            if capacity == 1 {
+                assert_eq!(receipt.application_state, APPLICATION_STATE_REJECTED);
+                assert!(receipt.admission_sequence.is_none());
+                assert!(matches!(
+                    terminal.application(),
+                    ApplicationState::Rejected(scriptbots_runtime::RejectionReason::Overloaded {
+                        capacity: 1
+                    })
+                ));
+                assert_eq!(snapshot.config.food_max, 0.5);
+                assert_eq!(snapshot.revisions.config.get(), 0);
+            } else {
+                assert_eq!(receipt.application_state, APPLICATION_STATE_ADMITTED);
+                assert!(receipt.admission_sequence.is_some());
+                assert!(matches!(
+                    terminal.application(),
+                    ApplicationState::Applied(_)
+                ));
+                assert!((snapshot.config.food_max - 0.6).abs() < f32::EPSILON);
+                assert_eq!(snapshot.revisions.config.get(), 1);
+            }
+            assert_eq!(snapshot.world.tick, 0, "capacity test must not run science");
+        }
+    }
+
+    #[test]
+    fn disconnected_owner_returns_no_optimistic_config_snapshot() {
+        let (handle, mut host) = handle();
+        host.port
+            .submit(CommandEnvelope::new(
+                CommandId::new(u128::MAX - 2),
+                HostCommand::Shutdown,
+            ))
+            .expect("ordered shutdown");
+        host.worker
+            .take()
+            .expect("owner handle")
+            .join()
+            .expect("owner exited");
+
+        let error = handle
+            .apply_updates(&[KnobUpdate {
+                path: "food_max".into(),
+                value: Value::from(0.6),
+            }])
+            .expect_err("closed owner must reject config update");
         assert!(matches!(
-            receiver.try_recv(),
-            Err(crate::command::CommandRecvError::Empty)
+            error,
+            ControlError::Host(scriptbots_runtime::HostAccessError::Disconnected)
         ));
         assert_eq!(
             handle.snapshot().expect("snapshot").config.get("food_max"),
@@ -2046,87 +2068,15 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn full_command_queue_returns_no_optimistic_config_snapshot() {
-        let (handle, receiver) = handle();
-        for _ in 0..4 {
-            handle
-                .update_selection(
-                    SelectionUpdate {
-                        mode: SelectionMode::Clear,
-                        agent_ids: Vec::new(),
-                        state: SelectionState::None,
-                    },
-                    None,
-                )
-                .expect("fill bounded command queue");
-        }
-
-        let error = handle
-            .apply_updates(&[KnobUpdate {
-                path: "food_max".into(),
-                value: Value::from(0.6),
-            }])
-            .expect_err("full queue must reject config update");
-        assert!(matches!(error, ControlError::CommandQueueFull));
-        assert_eq!(
-            handle.snapshot().expect("snapshot").config.get("food_max"),
-            Some(&Value::from(0.5))
-        );
-
-        let mut queued = 0;
-        while receiver.try_recv().is_ok() {
-            queued += 1;
-        }
-        assert_eq!(queued, 4, "invalid optimistic config command reached queue");
-    }
-
-    /// END TO END: a real submission becomes `applied` because the applier said so.
-    ///
-    /// Every earlier test in this file proved a piece. This proves the
-    /// behaviour, which is the only thing that was ever claimed to be missing:
-    ///
-    ///   1. a surface submits through the real ControlHandle path,
-    ///   2. the identity travels on the real bounded bus inside `BusCommand`,
-    ///   3. the real `scriptbots_core::apply_control_command` applies it,
-    ///   4. the APPLIER - not the submitter - reports the outcome through the
-    ///      reporter seam, using the id that arrived with the command,
-    ///   5. polling the receipt shows `applied`.
-    ///
-    /// Nothing here simulates a step. The submitter never touches the ledger
-    /// after admission, which is the distinction this whole line of work rests
-    /// on: an outcome is observed, not assumed (bd-k7nq).
+    /// A real control submission advances science on the owner thread, and its
+    /// polled receipt reports application and volatile journal commitment.
     #[test]
     fn an_applied_command_is_reported_by_the_applier_and_visible_to_the_submitter() {
         let (handle, receiver) = handle();
-        let reporter = handle.command_reporter();
-
-        let admitted = handle.pause(None).expect("pause admitted");
+        let before = handle.status().expect("before step").tick;
+        let admitted = handle.step().expect("step admitted");
         assert_eq!(admitted.application_state, APPLICATION_STATE_ADMITTED);
-
-        // The applier: drains the real bus and applies through core. It holds a
-        // reporter and the id, and nothing else from the control plane.
-        let mut applied_ids = Vec::new();
-        {
-            let mut world = handle.lock_world().expect("world lock");
-            for bus in crate::command::drain_pending_commands(&receiver) {
-                let outcome = match scriptbots_core::apply_control_command(&mut world, bus.command)
-                {
-                    Ok(_) => CommandOutcome::Applied,
-                    Err(_) => CommandOutcome::Rejected,
-                };
-                reporter(&bus.id, outcome);
-                applied_ids.push(bus.id);
-            }
-        }
-
-        assert_eq!(
-            applied_ids,
-            vec![admitted.command_id.clone()],
-            "the id the applier saw must be the id the submitter was given, or the report \
-             cannot be correlated with the submission"
-        );
-
+        receiver.wait_applied(&admitted);
         let polled = handle
             .command_status(&admitted.command_id)
             .expect("lookup")
@@ -2135,29 +2085,26 @@ pub(crate) mod tests {
             polled.application_state, APPLICATION_STATE_APPLIED,
             "the receipt did not advance, so `admitted` is still the end of the road"
         );
+        assert_eq!(polled.journal_state, "committed_volatile");
+        assert_eq!(handle.status().expect("completed step").tick, before + 1);
     }
 
-    /// The same seam records a refusal, and the refusal is the applier's.
-    ///
-    /// Positive control for the test above: without it, a reporter that wrote
-    /// `applied` unconditionally would pass, which would be the submitter
-    /// guessing wearing the applier's clothes.
+    /// A stale revision is rejected by the owner without advancing science.
+    /// This fails an implementation that reports every admitted step as applied.
     #[test]
     fn a_rejected_command_is_reported_as_rejected_not_applied() {
-        let (handle, _receiver) = handle();
-        let reporter = handle.command_reporter();
-        let admitted = handle.resume(None).expect("resume admitted");
-
-        reporter(&admitted.command_id, CommandOutcome::Rejected);
-
-        assert_eq!(
-            handle
-                .command_status(&admitted.command_id)
-                .expect("lookup")
-                .expect("known")
-                .application_state,
-            APPLICATION_STATE_REJECTED
-        );
+        let (handle, mut host) = handle();
+        let command_id = CommandId::new(0xabc);
+        host.port
+            .submit(
+                CommandEnvelope::new(command_id, HostCommand::Step)
+                    .expecting_control_revision(scriptbots_runtime::ControlRevision::new(u64::MAX)),
+            )
+            .expect("admit revision-guarded step");
+        let rejected = host.wait_finished(&command_id.to_string());
+        assert_eq!(rejected.application_state, APPLICATION_STATE_REJECTED);
+        assert_eq!(rejected.journal_state, "committed_volatile");
+        assert_eq!(handle.status().expect("rejected step status").tick, 0);
     }
 
     /// A receipt can advance from admitted to applied.
@@ -2167,13 +2114,11 @@ pub(crate) mod tests {
     /// past it, so a caller had no way to learn what happened next.
     #[test]
     fn a_receipt_advances_from_admitted_to_applied() {
-        let (handle, _receiver) = handle();
+        let (handle, host) = handle();
         let admitted = handle.pause(None).expect("pause admitted");
         assert_eq!(admitted.application_state, APPLICATION_STATE_ADMITTED);
 
-        let applied = handle
-            .mark_applied(&admitted.command_id)
-            .expect("the applier reports application");
+        let applied = host.wait_applied(&admitted);
         assert_eq!(applied.application_state, APPLICATION_STATE_APPLIED);
         assert_eq!(
             applied.command_id, admitted.command_id,
@@ -2189,36 +2134,37 @@ pub(crate) mod tests {
         assert_eq!(polled.application_state, APPLICATION_STATE_APPLIED);
     }
 
-    /// A terminal outcome is not revisable, and an unknown id is refused.
-    ///
-    /// Without both, the ledger would let a caller record an outcome it never
-    /// observed — the same defect one level down from the one this whole line
-    /// of work removed from five surfaces.
+    /// Unknown identities have no receipt; an exact retry preserves the outcome,
+    /// while a conflicting command cannot overwrite it.
     #[test]
     fn the_ledger_refuses_invented_and_revised_outcomes() {
-        let (handle, _receiver) = handle();
-
-        let unknown = handle.mark_applied("never-submitted");
+        let (handle, mut host) = handle();
+        let unknown = handle
+            .command_status(&CommandId::new(99999).to_string())
+            .expect("unknown identity lookup");
         assert!(
-            unknown.is_err(),
+            unknown.is_none(),
             "a receipt was advanced for a command that was never submitted"
         );
 
-        let admitted = handle.resume(None).expect("resume admitted");
-        handle
-            .mark_applied(&admitted.command_id)
-            .expect("first report");
-
-        // Replaying the SAME report is a retry, not a conflict.
-        let replay = handle
-            .mark_applied(&admitted.command_id)
-            .expect("an applier replaying its report must not be punished");
-        assert_eq!(replay.application_state, APPLICATION_STATE_APPLIED);
-
-        // Changing a terminal outcome is refused.
-        let contradiction = handle.mark_rejected(&admitted.command_id);
+        let admitted = handle.pause(None).expect("pause admitted");
+        host.wait_applied(&admitted);
+        let command_id: CommandId =
+            serde_json::from_value(Value::String(admitted.command_id.clone()))
+                .expect("canonical identity");
+        let replay = host
+            .port
+            .submit(CommandEnvelope::new(command_id, HostCommand::Pause))
+            .expect("exact envelope retry");
+        assert!(matches!(replay.application(), ApplicationState::Applied(_)));
+        let contradiction = host
+            .port
+            .submit(CommandEnvelope::new(command_id, HostCommand::Resume));
         assert!(
-            contradiction.is_err(),
+            matches!(
+                contradiction,
+                Err(scriptbots_runtime::HostAccessError::CommandIdCollision { .. })
+            ),
             "an applied command was quietly re-reported as rejected"
         );
         assert_eq!(
@@ -2434,8 +2380,8 @@ pub(crate) mod tests {
         let (handle, receiver) = handle();
 
         let status_pause = handle.pause(None).expect("pause command");
-        // Enqueueing proves admission order, nothing more: the driver has not drained
-        // this command and the legacy bus journals nothing (bd-f65w).
+        // Submission returns the admission receipt. Application and journal
+        // commitment are observed separately through command-status lookup.
         assert_eq!(status_pause.application_state, APPLICATION_STATE_ADMITTED);
         assert_eq!(status_pause.journal_state, "pending");
         assert_eq!(
@@ -2454,12 +2400,6 @@ pub(crate) mod tests {
 
         receiver.wait_applied(&status_speed);
 
-        let status_shutdown = handle.shutdown().expect("shutdown command");
-        assert_eq!(
-            status_shutdown.application_state,
-            APPLICATION_STATE_ADMITTED
-        );
-
         let looked_up = handle
             .command_status(&status_pause.command_id)
             .expect("lookup")
@@ -2475,5 +2415,11 @@ pub(crate) mod tests {
             .set_speed(-1.0, None)
             .expect_err("negative speed must fail");
         assert!(matches!(err, ControlError::InvalidPatch(_)));
+
+        let status_shutdown = handle.shutdown().expect("shutdown command");
+        assert_eq!(
+            status_shutdown.application_state,
+            APPLICATION_STATE_ADMITTED
+        );
     }
 }

@@ -3546,8 +3546,8 @@ pub use command::{
     make_command_submit,
 };
 pub use control::{
-    CommandOutcome, CommandReporter, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle,
-    HydrologySnapshot, KnobEntry, KnobKind, KnobUpdate, SimulationStatusDto, SpeedRequest,
+    CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, HydrologySnapshot, KnobEntry,
+    KnobKind, KnobUpdate, SimulationStatusDto, SpeedRequest,
 };
 pub use scriptbots_core::{ControlCommand, WorldStepDriver};
 pub use servers::{

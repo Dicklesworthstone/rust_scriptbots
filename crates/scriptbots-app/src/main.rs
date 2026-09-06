@@ -527,6 +527,10 @@ fn main() -> Result<()> {
             });
         }
     };
+    let capture_agent_visuals = cli.dump_png.is_some()
+        || resolved_renderer
+            .as_ref()
+            .is_some_and(|(_, renderer)| renderer.name() != "server");
     let host = match HostThread::spawn(
         session_id,
         bootstrapped_world,
@@ -537,7 +541,7 @@ fn main() -> Result<()> {
                 paused: true,
                 speed_multiplier: 1.0,
             },
-            capture_agent_visuals: true,
+            capture_agent_visuals,
             ..Default::default()
         },
         ChannelHostOptions::default(),
