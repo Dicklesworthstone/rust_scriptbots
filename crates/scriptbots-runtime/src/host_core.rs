@@ -4943,9 +4943,8 @@ mod tests {
 
     /// The intervention ring reaches the snapshot, and costs nothing when idle.
     ///
-    /// The TUI reads `world.applied_interventions()` directly today
-    /// (`terminal/mod.rs:1043`) and watermarks on `seq`; after the cutover the
-    /// snapshot is its only source. Both halves matter: a ring that never
+    /// The TUI watermarks the snapshot's intervention records on `seq`.
+    /// Both halves matter: a ring that never
     /// reached the snapshot would silently stop reporting interventions, and one
     /// republished every tick would copy a growing vector forever for events
     /// that happen a handful of times per run.
@@ -4969,18 +4968,16 @@ mod tests {
             "a tick that applied no intervention must reuse the Arc, not rebuild it"
         );
 
-        // Drive a real intervention through the world the same way the scenario
-        // path does, then prove the next publication carries it. Reaching past
+        // Queue a real intervention, then prove the next publication carries its
+        // application record. A config update alone does not populate this ring.
+        // Reaching past
         // the port here is deliberate: this asserts the SNAPSHOT contract, and
         // routing through a command would test the command path instead.
-        let mut config = core.world.config().clone();
-        config.closed = !config.closed;
-        let disposition = apply_control_command(
-            &mut core.world,
-            ControlCommand::UpdateConfig(Box::new(config)),
-        )
-        .expect("config intervention applies");
-        assert_eq!(disposition, ControlDisposition::WorldApplied);
+        let closed = !core.world.is_closed();
+        core.world
+            .enqueue_intervention(scriptbots_core::Intervention::SetClosedWorld { closed })
+            .expect("closed-world intervention queues");
+        assert!(core.world.applied_interventions().is_empty());
 
         submit(&mut port, 2, HostCommand::Step);
         core.drive(ManualInstant::from_nanos(2))
@@ -4991,22 +4988,30 @@ mod tests {
             core.world.applied_interventions().len(),
             "the published ring must match the world's ring exactly"
         );
-        if !third.applied_interventions.is_empty() {
-            assert!(
-                !Arc::ptr_eq(&second.applied_interventions, &third.applied_interventions),
-                "a new intervention must produce a new payload, not a stale pointer"
-            );
-            let published_seq = third
-                .applied_interventions
-                .last()
-                .expect("non-empty ring")
-                .seq;
-            assert_eq!(
-                published_seq,
-                latest_intervention_seq(&core.world),
-                "the published ring must be current, not one intervention behind"
-            );
-        }
+        assert_eq!(third.applied_interventions.len(), 1);
+        assert_eq!(core.world.is_closed(), closed);
+        assert!(
+            !Arc::ptr_eq(&second.applied_interventions, &third.applied_interventions),
+            "a new intervention must produce a new payload, not a stale pointer"
+        );
+        let record = &third.applied_interventions[0];
+        assert_eq!(record.tick, Tick(2));
+        assert_eq!(record.kind, "set_closed_world");
+        assert!(!record.expired);
+        assert_eq!(
+            record.seq,
+            latest_intervention_seq(&core.world),
+            "the published ring must be current, not one intervention behind"
+        );
+
+        submit(&mut port, 3, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(3))
+            .expect("completed step after intervention");
+        let fourth = core.latest_snapshot();
+        assert!(
+            Arc::ptr_eq(&third.applied_interventions, &fourth.applied_interventions),
+            "an unchanged non-empty ring must also reuse its payload"
+        );
     }
 
     #[test]

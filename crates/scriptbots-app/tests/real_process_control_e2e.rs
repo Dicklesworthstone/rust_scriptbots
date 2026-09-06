@@ -432,7 +432,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         "resume must unfreeze world ticks past {tick_step}"
     );
 
-    // (6) Negative paths: malformed step and unknown command status
+    // (6) Negative paths: malformed payload/identifier and a valid unknown ID.
     let (bad_step_code, _) = http_with_body(
         rest_addr,
         "POST",
@@ -442,7 +442,17 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     )?;
     assert_eq!(bad_step_code, 400, "malformed step payload must return 400");
 
-    let (not_found_code, _) = http(rest_addr, "GET", "/api/control/status/no-such-command-xyz")?;
+    let (malformed_id_code, _) = http(rest_addr, "GET", "/api/control/status/no-such-command-xyz")?;
+    assert_eq!(
+        malformed_id_code, 400,
+        "malformed command ID must return 400"
+    );
+    let unknown_id = scriptbots_runtime::CommandId::new(u128::MAX);
+    let (not_found_code, _) = http(
+        rest_addr,
+        "GET",
+        &format!("/api/control/status/{unknown_id}"),
+    )?;
     assert_eq!(
         not_found_code, 404,
         "unknown command status must return 404"

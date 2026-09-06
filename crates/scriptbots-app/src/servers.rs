@@ -1888,9 +1888,10 @@ async fn post_control_shutdown(
     get,
     path = "/api/control/status/{command_id}",
     tag = "control",
-    params(("command_id" = String, Path, description = "Command ID")),
+    params(("command_id" = String, Path, description = "Canonical command ID returned by control admission")),
     responses(
         (status = 200, body = CommandStatusDto),
+        (status = 400, description = "Malformed command ID"),
         (status = 404, description = "Command ID not found")
     )
 )]

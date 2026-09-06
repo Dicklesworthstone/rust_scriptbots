@@ -50,6 +50,7 @@ pub struct SimulationStatusDto {
 }
 
 impl SimulationStatusDto {
+    #[cfg(test)]
     fn from_world(world: &WorldState) -> Self {
         Self {
             tick: world.tick().0,
@@ -1209,7 +1210,7 @@ fn knob_kind(value: &Value) -> KnobKind {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use slotmap::{Key, KeyData};
+    use slotmap::Key;
     use std::sync::{Arc, Mutex};
 
     pub(crate) struct TestHost {

@@ -2119,7 +2119,6 @@ fn start_gui_health_monitor(
 struct SimulationDriveSnapshot {
     paused: bool,
     speed_multiplier: f32,
-    simulation_fault: Option<String>,
 }
 
 /// Real owner-thread fixture with a caller-controlled monotonic clock. Keeping
@@ -2300,14 +2299,6 @@ impl GuiSimulationDriver {
             sim_accumulator: 0.0,
             last_sim_instant: None,
             simulation_fault: None,
-        }
-    }
-
-    fn snapshot(&self) -> SimulationDriveSnapshot {
-        SimulationDriveSnapshot {
-            paused: self.paused,
-            speed_multiplier: self.speed_multiplier,
-            simulation_fault: self.simulation_fault.clone(),
         }
     }
 
@@ -3115,15 +3106,10 @@ impl SimulationView {
             Ok(snapshot) => SimulationDriveSnapshot {
                 paused: snapshot.playback.paused,
                 speed_multiplier: snapshot.playback.speed_multiplier,
-                simulation_fault: match &snapshot.health {
-                    scriptbots_runtime::HostHealth::Healthy => None,
-                    health => Some(format!("{health:?}")),
-                },
             },
-            Err(error) => SimulationDriveSnapshot {
+            Err(_) => SimulationDriveSnapshot {
                 paused: true,
                 speed_multiplier: 0.0,
-                simulation_fault: Some(error.to_string()),
             },
         }
     }
@@ -13867,6 +13853,7 @@ enum PostProcessPass {
     },
 }
 
+#[cfg(test)]
 fn build_post_process_stack(world: &WorldState, palette: ColorPaletteMode) -> PostProcessStack {
     post_process_stack(
         world.tick().0,
@@ -14173,6 +14160,7 @@ impl RenderFrame {
         })
     }
 
+    #[cfg(test)]
     fn from_world(world: &WorldState, palette: ColorPaletteMode) -> Option<Self> {
         let food = world.food();
         let width = food.width();
@@ -18655,14 +18643,6 @@ mod command_characterization_tests {
         })
     }
 
-    fn gui_simulation_driver(
-        world: &Arc<Mutex<WorldState>>,
-        command_drain: TestCommandDrain,
-    ) -> Arc<Mutex<GuiSimulationDriver>> {
-        let simulation_step = disabled_persistence_step_driver(world);
-        gui_simulation_driver_with_step(world, simulation_step, command_drain)
-    }
-
     /// The pre-identity drain shape, kept for tests.
     ///
     /// Production drains carry a command id (bd-tgfz). These tests assert on
@@ -18985,14 +18965,6 @@ mod command_characterization_tests {
             },
         )
         .expect("manual GUI owner")
-    }
-
-    fn prime_exactly_one_driver_step(driver: &Arc<Mutex<GuiSimulationDriver>>, now: Instant) {
-        let mut driver = driver.lock().expect("GUI simulation driver lock");
-        driver.paused = false;
-        driver.speed_multiplier = 1.0;
-        driver.sim_accumulator = 0.0;
-        driver.last_sim_instant = Some(now - Duration::from_secs_f32(SIM_TICK_INTERVAL * 1.25));
     }
 
     /// Mirror of the TUI-side e2e fixture (bd-16g.2.4): forced boom/crash cycles

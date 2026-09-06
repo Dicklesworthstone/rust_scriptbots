@@ -421,7 +421,7 @@ mod tests {
     use scriptbots_core::{
         ControlDisposition, ScriptBotsConfig, SimulationCommand, WorldState, apply_control_command,
     };
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TargetRunState {
