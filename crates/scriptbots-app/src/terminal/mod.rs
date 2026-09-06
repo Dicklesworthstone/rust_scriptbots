@@ -2372,42 +2372,101 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw_mortality(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
+        let mut block = Block::default().borders(Borders::ALL);
+        let mut title = "Mortality".to_owned();
+        let inner = block.inner(area);
         let mut lines: Vec<Line> = Vec::new();
         if let Some(ana) = &self.analytics {
-            lines.push(Line::from(vec![
-                Span::styled("Deaths total ", self.palette.header_style()),
-                Span::raw(format!("{:>4}", ana.deaths_total)),
-            ]));
-            // Simple horizontal bars to visualize proportions
-            let total = ana.deaths_total.max(1) as u64;
-            for cause in MortalityCause::all() {
-                let count = match cause {
-                    MortalityCause::CombatCarnivore => ana.deaths_combat_carnivore,
-                    MortalityCause::CombatHerbivore => ana.deaths_combat_herbivore,
-                    MortalityCause::Starvation => ana.deaths_starvation,
-                    MortalityCause::Aging => ana.deaths_aging,
-                    MortalityCause::Unknown => ana.deaths_unknown,
-                } as u64;
-                let width = ((count * 20) / total).clamp(0, 20) as usize;
-                let bar = "█".repeat(width);
+            if usize::from(inner.height) > MortalityCause::all().len() {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(" {:>2} ", cause.label()),
-                        self.palette.header_style(),
-                    ),
-                    Span::styled(bar, self.palette.mortality_style(cause)),
-                    Span::raw(format!(" {count:>3}")),
+                    Span::styled("Deaths total ", self.palette.header_style()),
+                    Span::raw(format!("{:>4}", ana.deaths_total)),
                 ]));
+                // Simple horizontal bars to visualize proportions.
+                let total = ana.deaths_total.max(1) as u128;
+                for &cause in MortalityCause::all() {
+                    let count = cause.count(ana);
+                    let width = (((count as u128) * 20) / total).min(20) as usize;
+                    let bar = "█".repeat(width);
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!(" {:>2} ", cause.label()),
+                            self.palette.header_style(),
+                        ),
+                        Span::styled(bar, self.palette.mortality_style(cause)),
+                        Span::raw(format!(" {count:>3}")),
+                    ]));
+                }
+            } else {
+                title = format!("Mortality · total {}", ana.deaths_total);
+                if inner.height >= 2 {
+                    let per_row = MortalityCause::all().len().div_ceil(2);
+                    let mut count_overflow = false;
+                    for causes in MortalityCause::all().chunks(per_row) {
+                        let (line, overflow) =
+                            self.compact_mortality_line(causes, ana, usize::from(inner.width));
+                        lines.push(line);
+                        count_overflow |= overflow;
+                    }
+                    if count_overflow {
+                        block = block.title_bottom(Span::styled(
+                            "! count overflow",
+                            self.palette.error_style(),
+                        ));
+                    }
+                } else {
+                    lines.push(Line::styled(
+                        "! panel too small",
+                        self.palette.error_style(),
+                    ));
+                }
             }
         } else {
             lines.push(Line::from(vec![Span::raw("Mortality data warming up…")]));
         }
-        let paragraph = Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .title(self.palette.title("Mortality"))
-                .borders(Borders::ALL),
-        );
+        let paragraph =
+            Paragraph::new(Text::from(lines)).block(block.title(self.palette.title(title)));
         frame.render_widget(paragraph, area);
+    }
+
+    fn compact_mortality_line(
+        &self,
+        causes: &[MortalityCause],
+        analytics: &TerminalAnalytics,
+        width: usize,
+    ) -> (Line<'static>, bool) {
+        let make_line = |overflow: bool| {
+            let mut spans = Vec::new();
+            for &cause in causes {
+                if !spans.is_empty() {
+                    spans.push(Span::raw(" · "));
+                }
+                let count = if overflow {
+                    "!".to_owned()
+                } else {
+                    cause.count(analytics).to_string()
+                };
+                spans.push(Span::styled(
+                    format!("{} {count}", cause.label()),
+                    self.palette.mortality_style(cause),
+                ));
+            }
+            Line::from(spans)
+        };
+        let exact = make_line(false);
+        if exact.width() <= width {
+            (exact, false)
+        } else {
+            // Never present truncated digits as an exact count. The block
+            // supplies the meaning of `!`; preserve names when they fit.
+            let abbreviated = make_line(true);
+            let line = if abbreviated.width() <= width {
+                abbreviated
+            } else {
+                Line::styled("! panel too small", self.palette.error_style())
+            };
+            (line, true)
+        }
     }
 
     /// Sense probe narrowed to one eye cone (bd-2z0.7.15).
@@ -3782,6 +3841,7 @@ struct TerminalAnalytics {
     deaths_combat_herbivore: usize,
     deaths_starvation: usize,
     deaths_aging: usize,
+    deaths_brain_execution_fault: usize,
     deaths_unknown: usize,
     births_total: usize,
     births_hybrid: usize,
@@ -3864,6 +3924,23 @@ fn parse_terminal_analytics(
     let mut brain_shares: Vec<BrainShareEntry> = brain_map.into_values().collect();
     brain_shares.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
 
+    let deaths_combat_carnivore = as_count("mortality.combat_carnivore.count");
+    let deaths_combat_herbivore = as_count("mortality.combat_herbivore.count");
+    let deaths_starvation = as_count("mortality.starvation.count");
+    let deaths_aging = as_count("mortality.aging.count");
+    let deaths_brain_execution_fault = as_count("mortality.brain_execution_fault.count");
+    let deaths_unknown = as_count("mortality.unknown.count");
+    let deaths_total = value("mortality.total.count")
+        .map(|count| count.max(0.0).round() as usize)
+        .unwrap_or(
+            deaths_combat_carnivore
+                + deaths_combat_herbivore
+                + deaths_starvation
+                + deaths_aging
+                + deaths_brain_execution_fault
+                + deaths_unknown,
+        );
+
     Some(TerminalAnalytics {
         age_mean: value("population.age.mean").unwrap_or(0.0),
         age_max: value("population.age.max").unwrap_or(0.0),
@@ -3877,12 +3954,13 @@ fn parse_terminal_analytics(
         mutation_secondary_mean: value("mutation.secondary.mean").unwrap_or(0.0),
         behavior_sensor_entropy: value("behavior.sensors.entropy").unwrap_or(0.0),
         behavior_output_entropy: value("behavior.outputs.entropy").unwrap_or(0.0),
-        deaths_total: as_count("mortality.total.count"),
-        deaths_combat_carnivore: as_count("mortality.combat_carnivore.count"),
-        deaths_combat_herbivore: as_count("mortality.combat_herbivore.count"),
-        deaths_starvation: as_count("mortality.starvation.count"),
-        deaths_aging: as_count("mortality.aging.count"),
-        deaths_unknown: as_count("mortality.unknown.count"),
+        deaths_total,
+        deaths_combat_carnivore,
+        deaths_combat_herbivore,
+        deaths_starvation,
+        deaths_aging,
+        deaths_brain_execution_fault,
+        deaths_unknown,
         births_total: as_count("births.total.count"),
         births_hybrid: as_count("births.hybrid.count"),
         births_hybrid_ratio: value("births.hybrid.ratio").unwrap_or(0.0),
@@ -4495,7 +4573,7 @@ const TREND_LABELS: [&str; 4] = [TREND_POPULATION, TREND_ENERGY, TREND_BIRTHS, T
 ///
 /// Named rather than passed as a bare colour so the panel and its palette
 /// mapping cannot disagree about which bar is which, and so adding a cause is a
-/// compile error in one place instead of a silently unstyled sixth bar
+/// compile error in one place instead of a silently unstyled new bar
 /// (bd-f4x0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MortalityCause {
@@ -4503,10 +4581,22 @@ enum MortalityCause {
     CombatHerbivore,
     Starvation,
     Aging,
+    BrainExecutionFault,
     Unknown,
 }
 
 impl MortalityCause {
+    const fn count(self, analytics: &TerminalAnalytics) -> usize {
+        match self {
+            Self::CombatCarnivore => analytics.deaths_combat_carnivore,
+            Self::CombatHerbivore => analytics.deaths_combat_herbivore,
+            Self::Starvation => analytics.deaths_starvation,
+            Self::Aging => analytics.deaths_aging,
+            Self::BrainExecutionFault => analytics.deaths_brain_execution_fault,
+            Self::Unknown => analytics.deaths_unknown,
+        }
+    }
+
     /// The column label shown beside the bar.
     const fn label(self) -> &'static str {
         match self {
@@ -4514,17 +4604,19 @@ impl MortalityCause {
             Self::CombatHerbivore => "H",
             Self::Starvation => "S",
             Self::Aging => "A",
+            Self::BrainExecutionFault => "Brain fault",
             Self::Unknown => "U",
         }
     }
 
     /// Every cause, in display order.
-    const fn all() -> [Self; 5] {
-        [
+    const fn all() -> &'static [Self] {
+        &[
             Self::CombatCarnivore,
             Self::CombatHerbivore,
             Self::Starvation,
             Self::Aging,
+            Self::BrainExecutionFault,
             Self::Unknown,
         ]
     }
@@ -4925,7 +5017,8 @@ impl FrameLayout {
                     Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
                     Constraint::Length(7),
                     Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
-                    Constraint::Length(6),
+                    // One row per cause, the total, and both borders.
+                    Constraint::Length(MortalityCause::all().len() as u16 + 3),
                     Constraint::Min(3),
                 ]
             } else {
@@ -6390,7 +6483,7 @@ impl Palette {
     /// deaths use the diet colour of the killer, starvation uses the energy
     /// ramp it depletes, and the two residual causes take dimmed chrome rather
     /// than competing with real signal. Switching accessibility palette retunes
-    /// all five at once, and a reader who has learned what carnivore cyan looks
+    /// every cause at once, and a reader who has learned what carnivore cyan looks
     /// like on the map reads the mortality panel without a legend (bd-f4x0).
     fn mortality_style(&self, cause: MortalityCause) -> Style {
         let theme = self.theme();
@@ -6403,6 +6496,7 @@ impl Palette {
             // Aging and unknown are background facts rather than events to react
             // to, so they recede — the bead's "restraint" applied to a readout.
             MortalityCause::Aging => Style::default().fg(theme.accent),
+            MortalityCause::BrainExecutionFault => self.error_style(),
             MortalityCause::Unknown => Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::DIM),
@@ -9921,6 +10015,267 @@ mod tests {
     }
 
     #[test]
+    fn mortality_projection_and_widget_keep_brain_faults_separate_and_in_the_total() {
+        let readings: Vec<_> = [
+            ("mortality.combat_carnivore.count", 1.0),
+            ("mortality.combat_herbivore.count", 2.0),
+            ("mortality.starvation.count", 3.0),
+            ("mortality.aging.count", 4.0),
+            ("mortality.brain_execution_fault.count", 5.0),
+            ("mortality.unknown.count", 6.0),
+        ]
+        .into_iter()
+        .map(|(name, value)| MetricReading {
+            tick: 7,
+            name: name.to_owned(),
+            value,
+        })
+        .collect();
+
+        with_shortcut_app(|app| {
+            for reported_total in [None, Some(42.0)] {
+                let mut metrics = readings.clone();
+                if let Some(value) = reported_total {
+                    metrics.push(MetricReading {
+                        tick: 7,
+                        name: "mortality.total.count".to_owned(),
+                        value,
+                    });
+                }
+                app.analytics = parse_terminal_analytics(7, 0, &metrics);
+                let analytics = app.analytics.as_ref().expect("mortality metrics present");
+                let expected_total = if reported_total.is_some() { 42 } else { 21 };
+                assert_eq!(analytics.deaths_brain_execution_fault, 5);
+                assert_eq!(analytics.deaths_unknown, 6);
+                assert_eq!(analytics.deaths_total, expected_total);
+
+                let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 100))
+                    .expect("mortality TestBackend");
+                terminal
+                    .draw(|frame| {
+                        let layout = FrameLayout::compute(frame.area(), false, true, false);
+                        let area = layout.mortality.expect("expanded mortality panel");
+                        assert_eq!(usize::from(area.height), MortalityCause::all().len() + 3);
+                        app.draw_mortality(frame, area, &app.snapshot);
+                    })
+                    .expect("draw mortality widget");
+                let text = buffer_text(&terminal);
+                assert!(text.contains(&format!("Deaths total {expected_total:>4}")));
+                for (label, count) in [
+                    ("C", 1),
+                    ("H", 2),
+                    ("S", 3),
+                    ("A", 4),
+                    ("Brain fault", 5),
+                    ("U", 6),
+                ] {
+                    let needle = format!(" {label:>2} ");
+                    let row = text
+                        .lines()
+                        .find(|line| line.contains(&needle))
+                        .unwrap_or_else(|| panic!("missing {label} mortality row:\n{text}"));
+                    let content = row.trim().trim_matches('│').trim();
+                    assert!(
+                        content.ends_with(&format!(" {count:>3}")),
+                        "{label} must display its own count {count}, got {content:?}"
+                    );
+                    if label == "Brain fault" {
+                        let bar = if reported_total.is_some() {
+                            "██"
+                        } else {
+                            "████"
+                        };
+                        assert!(content.contains(&format!("Brain fault {bar} ")));
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn mortality_projection_handles_absent_and_zero_brain_fault_metrics() {
+        assert!(parse_terminal_analytics(0, 0, &[]).is_none());
+        for value in [0.0, -1.0] {
+            let analytics = parse_terminal_analytics(
+                0,
+                0,
+                &[MetricReading {
+                    tick: 0,
+                    name: "mortality.brain_execution_fault.count".to_owned(),
+                    value,
+                }],
+            )
+            .expect("brain fault metric present");
+            assert_eq!(analytics.deaths_brain_execution_fault, 0);
+            assert_eq!(analytics.deaths_total, 0);
+            assert_eq!(analytics.deaths_unknown, 0);
+        }
+    }
+
+    #[test]
+    fn compact_mortality_preserves_all_causes_through_viewport_shrinks() {
+        with_shortcut_app(|app| {
+            app.palette = Palette::test_backend_evidence();
+            app.analytics = Some(TerminalAnalytics {
+                deaths_total: 21,
+                deaths_combat_carnivore: 1,
+                deaths_combat_herbivore: 2,
+                deaths_starvation: 3,
+                deaths_aging: 4,
+                deaths_brain_execution_fault: 5,
+                deaths_unknown: 6,
+                ..TerminalAnalytics::default()
+            });
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 100))
+                .expect("resizing mortality TestBackend");
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("draw full mortality rows");
+            assert!(buffer_text(&terminal).contains("Brain fault ████"));
+
+            let mut checked_unused_rows = false;
+            for (width, height) in [(160, 50), (120, 40), (160, 50), (120, 40)] {
+                terminal.backend_mut().resize(width, height);
+                terminal
+                    .draw(|frame| app.draw(frame))
+                    .expect("draw compact mortality");
+                let buffer = terminal.backend().buffer();
+                let area = app
+                    .frame_layout(buffer.area)
+                    .mortality
+                    .expect("expanded panel");
+                let inner = Block::default().borders(Borders::ALL).inner(area);
+                assert!(
+                    inner.height >= 2 && usize::from(inner.height) <= MortalityCause::all().len()
+                );
+                let row_text = |y| {
+                    (area.x..area.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                };
+                assert!(row_text(area.y).contains("Mortality · total 21"));
+                let lines: Vec<_> = (inner.y..inner.bottom()).map(row_text).collect();
+                let text = lines.join("\n");
+                for (cause, entry) in [
+                    (MortalityCause::CombatCarnivore, "C 1"),
+                    (MortalityCause::CombatHerbivore, "H 2"),
+                    (MortalityCause::Starvation, "S 3"),
+                    (MortalityCause::Aging, "A 4"),
+                    (MortalityCause::BrainExecutionFault, "Brain fault 5"),
+                    (MortalityCause::Unknown, "U 6"),
+                ] {
+                    assert_eq!(
+                        text.matches(entry).count(),
+                        1,
+                        "{width}x{height}: {entry}:\n{text}"
+                    );
+                    let (row, line) = lines
+                        .iter()
+                        .enumerate()
+                        .find(|(_, line)| line.contains(entry))
+                        .expect("asserted cause row exists");
+                    let prefix = &line[..line.find(entry).expect("asserted cause label exists")];
+                    let x =
+                        area.x + u16::try_from(Span::raw(prefix).width()).expect("row width fits");
+                    let y = inner.y + u16::try_from(row).expect("row index fits");
+                    let style = app.palette.mortality_style(cause);
+                    for offset in 0..u16::try_from(entry.len()).expect("ASCII entry width fits") {
+                        assert_eq!(
+                            buffer[(x + offset, y)].fg,
+                            style.fg.expect("cause foreground")
+                        );
+                        assert_eq!(buffer[(x + offset, y)].modifier, style.add_modifier);
+                    }
+                }
+                assert!(!text.contains('█'), "compact rows must not retain old bars");
+                for row in lines.iter().skip(2) {
+                    checked_unused_rows = true;
+                    assert!(
+                        row.trim_matches(['│', ' ']).is_empty(),
+                        "stale full row: {row:?}"
+                    );
+                }
+                let mut fresh = Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("fresh comparison backend");
+                fresh
+                    .draw(|frame| app.draw(frame))
+                    .expect("draw fresh compact panel");
+                for y in area.y..area.bottom() {
+                    for x in area.x..area.right() {
+                        assert_eq!(
+                            buffer[(x, y)],
+                            fresh.backend().buffer()[(x, y)],
+                            "resized mortality differs at ({x},{y})"
+                        );
+                    }
+                }
+            }
+            assert!(
+                checked_unused_rows,
+                "the shrink sequence must inspect cleared spare rows"
+            );
+        });
+    }
+
+    #[test]
+    fn compact_mortality_reports_count_overflow_instead_of_truncated_digits() {
+        with_shortcut_app(|app| {
+            let analytics = TerminalAnalytics {
+                deaths_total: usize::MAX,
+                deaths_combat_carnivore: usize::MAX,
+                deaths_combat_herbivore: usize::MAX,
+                deaths_starvation: usize::MAX,
+                deaths_aging: usize::MAX,
+                deaths_brain_execution_fault: usize::MAX,
+                deaths_unknown: usize::MAX,
+                ..TerminalAnalytics::default()
+            };
+            let causes = &MortalityCause::all()[..MortalityCause::all().len().div_ceil(2)];
+            let (exact, overflow) = app.compact_mortality_line(causes, &analytics, usize::MAX);
+            assert!(!overflow);
+            let exact_width = exact.width();
+            assert!(
+                !app.compact_mortality_line(causes, &analytics, exact_width)
+                    .1
+            );
+            let (too_wide, overflow) =
+                app.compact_mortality_line(causes, &analytics, exact_width - 1);
+            assert!(
+                overflow,
+                "one column too narrow must stop claiming exact counts"
+            );
+            assert!(too_wide.width() < exact_width);
+
+            app.analytics = Some(analytics);
+            let panel_width =
+                u16::try_from((exact_width + 1).min(50)).expect("overflow panel width fits");
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(panel_width, 4))
+                .expect("overflow mortality backend");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    app.draw_mortality(frame, area, &app.snapshot);
+                })
+                .expect("draw overflow panel");
+            let text = buffer_text(&terminal);
+            assert!(text.contains(&format!("Mortality · total {}", usize::MAX)));
+            for entry in ["C !", "H !", "S !", "A !", "Brain fault !", "U !"] {
+                assert_eq!(
+                    text.matches(entry).count(),
+                    1,
+                    "missing overflow category {entry}:\n{text}"
+                );
+            }
+            assert_eq!(text.matches("! count overflow").count(), 1);
+            assert_eq!(
+                text.matches(&usize::MAX.to_string()).count(),
+                1,
+                "only the complete title total may contain the extreme number"
+            );
+        });
+    }
+
+    #[test]
     fn mortality_bars_take_the_palette_ramp_that_names_each_cause() {
         for mode in [
             TerminalPaletteMode::Natural,
@@ -9957,10 +10312,15 @@ mod tests {
                 theme.energy_spark,
                 "{mode:?}: starvation must use the energy ramp it depletes"
             );
+            assert_eq!(
+                palette.mortality_style(MortalityCause::BrainExecutionFault),
+                palette.error_style(),
+                "{mode:?}: brain faults must use the palette's existing failure signal"
+            );
 
             // No cause may fall back to a named ANSI constant, which is what
             // bypassed the accessibility palettes before.
-            for cause in MortalityCause::all() {
+            for &cause in MortalityCause::all() {
                 let fg = palette
                     .mortality_style(cause)
                     .fg
@@ -9984,7 +10344,7 @@ mod tests {
     #[test]
     fn every_mortality_cause_carries_a_non_colour_label() {
         let mut seen: Vec<&str> = Vec::new();
-        for cause in MortalityCause::all() {
+        for &cause in MortalityCause::all() {
             let label = cause.label();
             assert!(!label.is_empty(), "{cause:?} must have a label");
             assert!(
@@ -9994,7 +10354,11 @@ mod tests {
             );
             seen.push(label);
         }
-        assert_eq!(seen.len(), 5, "every cause must appear exactly once");
+        assert_eq!(
+            seen.len(),
+            MortalityCause::all().len(),
+            "every cause must appear exactly once"
+        );
     }
 
     #[test]
