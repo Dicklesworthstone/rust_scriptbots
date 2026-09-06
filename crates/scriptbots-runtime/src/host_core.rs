@@ -3030,6 +3030,14 @@ impl HostCore {
     }
 
     fn synchronize_health(&mut self) -> Result<bool, HostAccessError> {
+        // A terminal fault stops playback at the owner boundary, so every
+        // frontend observes the same stopped state. Temporary backpressure must
+        // preserve playback intent and resume after its retained batch clears.
+        let playback_changed = self.latched_fault.is_some() && !self.playback.paused;
+        if self.latched_fault.is_some() {
+            self.playback.paused = true;
+            self.cadence_credit = 0;
+        }
         let next = if let Some(fault) = &self.latched_fault {
             HostHealth::Faulted(fault.clone())
         } else if let Some(blocker) = self.retained_blocker {
@@ -3044,7 +3052,7 @@ impl HostCore {
             }
         };
         if next == self.health {
-            return Ok(false);
+            return Ok(playback_changed);
         }
         self.health = next.clone();
         self.shared
@@ -8945,6 +8953,56 @@ mod tests {
         assert_eq!(boundary.events().tick, Tick(1));
         assert_eq!(boundary.births().len(), boundary.summary().births);
         assert_eq!(boundary.deaths().len(), boundary.summary().deaths);
+    }
+
+    #[test]
+    fn terminal_journal_fault_pauses_playback_but_backpressure_preserves_running_intent() {
+        for closed in [false, true] {
+            let state = Rc::new(RefCell::new(FakeJournalState {
+                full: !closed,
+                closed,
+                ..FakeJournalState::default()
+            }));
+            let mut core = HostCore::with_journal(
+                HostSessionId::new(82),
+                world(0),
+                options(false),
+                Box::new(FakeJournal {
+                    state: Rc::clone(&state),
+                }),
+            )
+            .expect("journal protocol fixture");
+            core.drive(ManualInstant::from_nanos(0)).expect("epoch");
+            assert!(!core.latest_snapshot().playback.paused);
+            let first = core.drive(ManualInstant::from_nanos(10)).expect("tick");
+            assert_eq!(first.scientific_steps, 1);
+            assert_eq!(core.world_tick(), Tick(1));
+            let snapshot = core.latest_snapshot();
+            assert_eq!(snapshot.health.fault().is_some(), closed);
+            assert_eq!(snapshot.playback.paused, closed);
+            let fault = snapshot.health.fault().cloned();
+            let later = core
+                .drive(ManualInstant::from_nanos(100))
+                .expect("later wake");
+            assert_eq!(later.scientific_steps, 0);
+            assert_eq!(core.world_tick(), Tick(1));
+            assert_eq!(state.borrow().attempts.len(), 1);
+            assert_eq!(core.latest_snapshot().health.fault().cloned(), fault);
+
+            if !closed {
+                state.borrow_mut().full = false;
+                assert!(matches!(
+                    core.retry_retained_journal().expect("retry exact batch"),
+                    Some(JournalAdmission::Accepted { .. })
+                ));
+                core.drive(ManualInstant::from_nanos(100))
+                    .expect("receive retry acknowledgement");
+                let resumed = core.drive(ManualInstant::from_nanos(110)).expect("resume");
+                assert_eq!(resumed.scientific_steps, 1);
+                assert_eq!(core.world_tick(), Tick(2));
+                assert!(!core.latest_snapshot().playback.paused);
+            }
+        }
     }
 
     #[test]

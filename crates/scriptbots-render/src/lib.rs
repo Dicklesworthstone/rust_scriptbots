@@ -3589,10 +3589,7 @@ impl SimulationView {
 
         snapshot.analytics = self.analytics_cache.clone();
         snapshot.storage = self.analytics_status.clone();
-        snapshot.simulation_fault = match &published.health {
-            scriptbots_runtime::HostHealth::Healthy => None,
-            health => Some(format!("{health:?}")),
-        };
+        snapshot.simulation_fault = published.health.fault().map(|fault| format!("{fault:?}"));
 
         snapshot.perf = self.last_perf;
         snapshot.controls = self.controls.snapshot(
