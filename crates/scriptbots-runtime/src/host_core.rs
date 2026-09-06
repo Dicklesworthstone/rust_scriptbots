@@ -7212,6 +7212,54 @@ mod tests {
     }
 
     #[test]
+    fn composite_playback_applies_once_and_rejects_invalid_speed_before_mutation() {
+        let (mut core, mut port) = host(true);
+        let command = HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
+            paused: Some(false),
+            speed_multiplier: Some(2.0),
+            step_once: true,
+        });
+        let initial = core.latest_snapshot();
+        let receipt = submit(&mut port, 701, command.clone());
+        let driven = core.drive(ManualInstant::from_nanos(0)).expect("combined playback boundary");
+        assert_eq!(driven.scientific_steps, 1);
+        let applied = core.latest_snapshot();
+        assert_eq!(applied.world.tick, initial.world.tick + 1);
+        assert_eq!(applied.revisions.control.get(), initial.revisions.control.get() + 1);
+        assert!(applied.playback.paused, "explicit step ends paused even when resume was requested");
+        assert_eq!(applied.playback.speed_multiplier.to_bits(), 2.0_f32.to_bits());
+        submit(&mut port, 701, command);
+        core.drive(ManualInstant::from_nanos(10)).expect("same identity retry");
+        assert_eq!(core.world_tick(), Tick(applied.world.tick));
+        assert!(matches!(port.command_status(receipt.command_id()).expect("status lookup").expect("retained status").application(), ApplicationState::Applied(_)));
+
+        let invalid = submit(&mut port, 702, HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
+            paused: Some(false), speed_multiplier: Some(f32::NAN), step_once: true,
+        }));
+        assert!(matches!(invalid.application(), ApplicationState::Rejected(_)));
+        core.drive(ManualInstant::from_nanos(20)).expect("rejection audit");
+        assert_eq!(core.world_tick(), Tick(applied.world.tick));
+        assert_eq!(core.latest_snapshot().playback, applied.playback);
+    }
+
+    #[test]
+    fn owner_auto_pause_observes_each_tick_even_during_catch_up() {
+        for should_pause in [false, true] {
+            let mut config = world(0).config().clone();
+            config.control.auto_pause_population_below = should_pause.then_some(0);
+            let world = WorldState::new(config).expect("auto-pause world");
+            let mut core = HostCore::new(HostSessionId::new(93), world, options(false)).expect("auto-pause host");
+            core.drive(ManualInstant::from_nanos(0)).expect("epoch");
+            let result = core.drive(ManualInstant::from_nanos(100)).expect("catch up");
+            assert_eq!(result.scientific_steps, if should_pause { 1 } else { 4 });
+            assert_eq!(core.latest_snapshot().playback.paused, should_pause);
+            if should_pause {
+                assert_eq!(core.drive(ManualInstant::from_nanos(200)).expect("paused observation").scientific_steps, 0);
+            }
+        }
+    }
+
+    #[test]
     fn playback_commands_and_bounded_cadence_use_injected_time_only() {
         let (mut core, mut port) = host(false);
         core.drive(ManualInstant::from_nanos(0))
