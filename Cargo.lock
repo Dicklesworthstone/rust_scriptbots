@@ -10845,6 +10845,7 @@ dependencies = [
  "image",
  "naga 26.0.0",
  "scriptbots-core",
+ "scriptbots-runtime",
  "serde",
  "serde_json",
  "slotmap",
