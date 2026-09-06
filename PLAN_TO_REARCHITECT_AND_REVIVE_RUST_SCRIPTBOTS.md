@@ -14,6 +14,11 @@ Passing server runs do not close the intermittent storage/journal latency invest
 
 **Primary outcome:** turn the repository into a deterministic, genuinely evolving artificial-life laboratory with one correct simulation runtime, a polished FrankenTUI interface, a real GPU desktop interface, trustworthy replay/experiments, and tests that exercise the actual shipped paths.
 
+[Currently In Progress — `bd-pcfj`, TurquoiseLake, 2026-09-06: transfer production ownership
+into HostThread/HostCore, preserve frontend inspection and exports through bounded owner requests,
+and migrate presentation/controls together. Checklist and proof limits are in the existing
+reality-check report. Preparation and a compiling adapter do not close the production cutover.]
+
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
 
 **Persistence decision (2026-07-11):** FrankenSQLite is the only embedded database backend. The former DuckDB architecture is retired in full; no dual-backend abstraction, compatibility shim, or legacy file migration is retained. The migration is complete only when source, manifests, lockfile, tests, CLI/help, CI, and active documentation all use the exact-revision `fsqlite` public facade and a repository-wide search finds no live DuckDB integration.

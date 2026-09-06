@@ -1,5 +1,37 @@
 # Reality Check — rust_scriptbots — execution refreshed 2026-09-06
 
+## Active implementation TODO — production host cutover, 2026-09-06
+
+`bd-pcfj` remains in progress. No completion credit for this checklist. Creation gate:
+the user explicitly requested a granular TODO; the implementing agents and user consume it
+to avoid losing required frontend behavior during the cutover. Retire this active section
+when the cutover is verified; retained history is subject to the repository's no-deletion rule.
+The integrity-control exception is unnecessary because the explicit request supplies the gate.
+The highest-priority capability is the host cutover; keep checklist maintenance bounded.
+
+- [x] Inspect current startup, host adapter, port, storage ownership and frontend readers.
+- [x] Identify previously missed port needs: brain inspection, sensor attribution, final digest.
+- [ ] Runtime: add bounded owner-thread requests with positive and malformed/stale tests.
+- [ ] Runtime: preserve final digest, step errors and lifecycle receipts through shutdown.
+- [ ] App: move bootstrap world, persistence session and real journal into HostThread.
+- [ ] App: replace ControlHandle world reads with immutable snapshot/host requests.
+- [ ] App: map commands and both status axes to authoritative host receipts; preserve idempotency.
+- [ ] App: remove frontend command-drain/science-driver authority and wire host-backed submit.
+- [ ] App: preserve server-only loop, startup failures, final metrics and shutdown order.
+- [ ] TUI: convert snapshots/config/terrain, inspection, probes and command handling.
+- [ ] TUI: preserve every input/layout feature and adapt existing real-behavior fixtures.
+- [ ] GPUI: convert frame/inspector/offscreen capture; preserve Lab and World windows.
+- [ ] GPUI: eliminate frontend scientific stepping and adapt existing fixtures without goldens changes.
+- [ ] Bevy: consume host snapshots; eliminate simulation worker and adapt captures/tests.
+- [ ] Integrate missing snapshot fields without changing scientific state or wire claims silently.
+- [ ] Review all changed test/gate code for lost assertions, fake defaults and weakened evidence.
+- [ ] Format, UBS exact files, review and freeze the coherent source on main.
+- [ ] Run pinned DSR workspace check, strict Clippy and affected unit/integration suites.
+- [ ] Run real control/600-second server regressions and inspect receipts/digests/errors.
+- [ ] Retain actual GUI/PTY acceptance separately; never relabel CPU/TestBackend as those surfaces.
+- [ ] Recheck original bead acceptance in a fresh verification pass; keep unmet conditions open.
+- [ ] Update evidence and tracker, publish reviewed changes, release file reservations.
+
 ## Comprehensive reassessment — 2026-09-06
 
 **Verdict: a functioning simulation and substantial scientific infrastructure, not yet the
