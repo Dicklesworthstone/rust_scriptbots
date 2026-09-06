@@ -147,7 +147,7 @@ struct TuiRunResult {
 
 fn run_tui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> TuiRunResult {
     let world = build_meadow_world(document, seed);
-    let session_id = HostSessionId::new(u128::from(seed));
+    let session_id = HostSessionId::new(seed);
     let persistence = world
         .bind_persistence(Box::new(scriptbots_core::NullPersistence))
         .expect("bind owner persistence");
@@ -249,7 +249,7 @@ struct GuiRunResult {
 fn run_gui_path(document: &ScenarioDocumentV1, seed: u64, ticks: u64) -> GuiRunResult {
     let world = build_meadow_world(document, seed);
     let mut core = HostCore::new(
-        HostSessionId::new(u128::from(seed)),
+        HostSessionId::new(seed),
         world,
         HostCoreOptions {
             initial_playback: PlaybackSnapshot {

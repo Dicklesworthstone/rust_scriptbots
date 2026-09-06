@@ -2134,6 +2134,15 @@ struct TestHost {
 
 #[cfg(test)]
 impl TestHost {
+    fn take(world: Arc<Mutex<WorldState>>) -> Arc<Self> {
+        Arc::new(Self::new(
+            Arc::try_unwrap(world)
+                .unwrap_or_else(|_| panic!("fixture world is still shared before owner transfer"))
+                .into_inner()
+                .expect("fixture world"),
+        ))
+    }
+
     fn new(world: WorldState) -> Self {
         let clock = Arc::new(AtomicU64::new(0));
         let owner_clock = Arc::clone(&clock);
@@ -2177,6 +2186,17 @@ impl TestHost {
             .snapshot_after(None)
             .expect("GUI fixture snapshot access")
             .expect("GUI fixture initial publication")
+    }
+
+    fn selection(&self, agent_id: AgentId) -> SelectionState {
+        let snapshot = self.snapshot();
+        let row = snapshot
+            .world
+            .agents
+            .iter()
+            .position(|agent| agent.id == agent_id.raw())
+            .expect("GUI fixture agent in owner snapshot");
+        snapshot.agent_selection(row)
     }
 
     fn submit(
@@ -18909,6 +18929,20 @@ mod command_characterization_tests {
         )
     }
 
+    fn host_view(host: Arc<TestHost>) -> SimulationView {
+        SimulationView::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            "command characterization".into(),
+            Arc::new(move |command| {
+                let command = scriptbots_runtime::HostCommand::try_from(command).ok()?;
+                Some(host.apply(command).command_id().to_string())
+            }),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(())),
+        )
+    }
+
     fn prime_exactly_one_driver_step(driver: &Arc<Mutex<GuiSimulationDriver>>, now: Instant) {
         let mut driver = driver.lock().expect("GUI simulation driver lock");
         driver.paused = false;
@@ -19002,8 +19036,7 @@ mod command_characterization_tests {
             )
         };
 
-        let drain: TestCommandDrain = Arc::new(Vec::new);
-        let mut view = simulation_view(Arc::clone(&world), drain);
+        let mut view = host_view(TestHost::take(world));
         let snapshot = view.snapshot();
         let snapshot_sequence: Vec<(u64, NarrativeEventKind)> = snapshot
             .narrative
@@ -19037,8 +19070,21 @@ mod command_characterization_tests {
             guard.step().expect("one tick");
             agent
         };
-        let guard = world.lock().expect("world lock");
-        let detail = AgentInspectorDetails::from_world(&guard, agent, None)
+        let host = TestHost::take(world);
+        let snapshot = host.snapshot();
+        let uid = snapshot
+            .world
+            .agents
+            .iter()
+            .find(|row| row.id == agent.raw())
+            .expect("live fixture agent")
+            .uid;
+        let owned_detail = host
+            .port
+            .inspect_agent(uid, 3)
+            .expect("owner inspector query")
+            .expect("live owner inspector detail");
+        let detail = AgentInspectorDetails::from_snapshot(&snapshot, agent, owned_detail, None)
             .expect("detail for the live agent");
         assert!(!detail.brain_bound, "fixture agent must be unbound");
         let outputs: &[f32; scriptbots_core::OUTPUT_SIZE] = detail.outputs
@@ -19064,23 +19110,25 @@ mod command_characterization_tests {
 
     #[test]
     fn minimal_canvas_is_a_presentation_only_projection() {
-        let world = command_characterization_world();
-        let drain: TestCommandDrain = Arc::new(Vec::new);
-        let driver = gui_simulation_driver(&world, drain);
-        let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().expect("initial digest");
+        let mut canvas = host_view(Arc::clone(&host));
         canvas.set_minimal_canvas_mode();
-        let now = Instant::now();
-        prime_exactly_one_driver_step(&driver, now);
 
         let _snapshot = canvas.snapshot();
 
-        assert_eq!(world.lock().expect("world lock").tick().0, 0);
+        assert_eq!(host.port.snapshot_hub().latest().world.tick, 0);
+        assert_eq!(
+            host.port.scientific_digest_v1().expect("after paint"),
+            before
+        );
         assert!(canvas.minimal_canvas_mode);
-        driver
-            .lock()
-            .expect("GUI simulation driver lock")
-            .drive_at(now);
-        assert_eq!(world.lock().expect("world lock").tick().0, 1);
+        host.apply(scriptbots_runtime::HostCommand::Step);
+        assert_eq!(host.port.snapshot_hub().latest().world.tick, 1);
+        assert_ne!(
+            host.port.scientific_digest_v1().expect("after step"),
+            before
+        );
     }
 
     #[test]
@@ -19158,13 +19206,12 @@ mod command_characterization_tests {
                 .expect("bind GPUI inspection brain");
             agent_id
         };
-        let digest_before = world
-            .lock()
-            .expect("pre-GPUI-inspection world lock")
-            .world_digest_v1()
+        let host = TestHost::take(world);
+        let digest_before = host
+            .port
+            .scientific_digest_v1()
             .expect("pre-GPUI-inspection digest");
-        let drain: TestCommandDrain = Arc::new(Vec::new);
-        let mut hud = simulation_view(Arc::clone(&world), Arc::clone(&drain));
+        let mut hud = host_view(Arc::clone(&host));
         hud.inspector
             .lock()
             .expect("HUD inspector lock")
@@ -19190,7 +19237,7 @@ mod command_characterization_tests {
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 
-        let mut peer = simulation_view(Arc::clone(&world), Arc::clone(&drain));
+        let mut peer = host_view(Arc::clone(&host));
         peer.inspector
             .lock()
             .expect("peer inspector lock")
@@ -19207,7 +19254,7 @@ mod command_characterization_tests {
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 
-        let mut canvas = simulation_view(Arc::clone(&world), drain);
+        let mut canvas = host_view(Arc::clone(&host));
         canvas.set_minimal_canvas_mode();
         canvas
             .inspector
@@ -19217,10 +19264,8 @@ mod command_characterization_tests {
         let _ = canvas.snapshot();
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(
-            world
-                .lock()
-                .expect("post-GPUI-inspection world lock")
-                .world_digest_v1()
+            host.port
+                .scientific_digest_v1()
                 .expect("post-GPUI-inspection digest"),
             digest_before
         );
@@ -19228,31 +19273,24 @@ mod command_characterization_tests {
 
     #[test]
     fn two_gpui_views_share_one_simulation_clock() {
-        let world = command_characterization_world();
-        let drain: TestCommandDrain = Arc::new(Vec::new);
-        let driver = gui_simulation_driver(&world, drain);
-        let mut hud = simulation_view_with_driver(Arc::clone(&driver));
-        let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
+        let host = TestHost::take(command_characterization_world());
+        let mut hud = host_view(Arc::clone(&host));
+        let mut canvas = host_view(Arc::clone(&host));
         canvas.set_minimal_canvas_mode();
-        let now = Instant::now();
-        prime_exactly_one_driver_step(&driver, now);
 
         let _ = hud.snapshot();
         let _ = canvas.snapshot();
         assert_eq!(
-            world.lock().expect("world lock").tick().0,
+            host.port.snapshot_hub().latest().world.tick,
             0,
             "neither GPUI paint callback may advance scientific time"
         );
 
-        driver
-            .lock()
-            .expect("GUI simulation driver lock")
-            .drive_at(now);
+        host.apply(scriptbots_runtime::HostCommand::Step);
         let _ = hud.snapshot();
         let _ = canvas.snapshot();
 
-        let tick = world.lock().expect("world lock").tick().0;
+        let tick = host.port.snapshot_hub().latest().world.tick;
         assert_eq!(
             tick, 1,
             "two GPUI views must not independently advance one shared world"
@@ -20168,32 +20206,24 @@ mod command_characterization_tests {
 
     #[test]
     fn gpui_s_shortcut_submits_one_step_and_leaves_simulation_paused() {
-        let world = command_characterization_world();
-        let pending_commands = Arc::new(Mutex::new(vec![ControlCommand::Pause]));
-        let drain_commands = Arc::clone(&pending_commands);
-        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
-            Arc::new(move || {
-                let mut commands = drain_commands.lock().expect("single-step command queue");
-                std::mem::take(&mut *commands)
-            });
+        let host = TestHost::take(command_characterization_world());
+        host.apply(scriptbots_runtime::HostCommand::Pause);
+        let pending_commands = Arc::new(Mutex::new(Vec::new()));
         let submit_commands = Arc::clone(&pending_commands);
+        let submit_host = Arc::clone(&host);
         let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
             Arc::new(move |command| {
                 submit_commands
                     .lock()
                     .expect("single-step command queue")
-                    .push(command);
-                Some("test-cmd".to_owned())
+                    .push(command.clone());
+                let command = scriptbots_runtime::HostCommand::try_from(command)
+                    .expect("supported GUI command");
+                Some(submit_host.apply(command).command_id().to_string())
             });
-        let step_world = Arc::clone(&world);
-        let simulation_step: WorldStepDriver =
-            Arc::new(move || step_world.lock().expect("single-step world lock").step());
         let session = Arc::new(GuiSession::new(
-            Arc::clone(&world),
-            simulation_step,
+            host.port.clone(),
             AnalyticsSnapshotProvider::empty(),
-            identified(command_drain),
-            Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -20202,16 +20232,11 @@ mod command_characterization_tests {
             .update(|app| session.install(app))
             .expect("install production GPUI single-step session");
         assert!(
-            session
-                .simulation_driver
-                .lock()
-                .expect("single-step driver lock")
-                .snapshot()
-                .paused,
+            host.port.snapshot_hub().latest().playback.paused,
             "the fixture must start scientifically paused"
         );
         assert_eq!(
-            world.lock().expect("single-step world lock").tick().0,
+            host.port.snapshot_hub().latest().world.tick,
             0,
             "installing the windows must not advance science"
         );
@@ -20220,7 +20245,7 @@ mod command_characterization_tests {
                 .lock()
                 .expect("single-step command queue")
                 .is_empty(),
-            "the startup pause command must be drained before keyboard input"
+            "installing windows must not submit a playback command"
         );
 
         force_production_repaint(&mut app, windows.hud);
@@ -20251,7 +20276,7 @@ mod command_characterization_tests {
                 .expect("single-step command queue")
                 .as_slice(),
             &[ControlCommand::Step],
-            "one S keypress must enqueue exactly one canonical step command"
+            "one S keypress must submit exactly one canonical step command"
         );
         app.read_entity(&hud, |view, _| {
             assert!(
@@ -20263,24 +20288,19 @@ mod command_characterization_tests {
         app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
         app.run_until_parked();
         assert_eq!(
-            world.lock().expect("single-step world lock").tick().0,
+            host.port.snapshot_hub().latest().world.tick,
             1,
             "one S keypress must advance science by exactly one tick"
         );
         assert!(
-            session
-                .simulation_driver
-                .lock()
-                .expect("single-step driver lock")
-                .snapshot()
-                .paused,
+            host.port.snapshot_hub().latest().playback.paused,
             "single-step must leave the simulation paused"
         );
 
         app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL * 2.0));
         app.run_until_parked();
         assert_eq!(
-            world.lock().expect("single-step world lock").tick().0,
+            host.port.snapshot_hub().latest().world.tick,
             1,
             "a single-step must not schedule a second scientific tick"
         );
@@ -20491,10 +20511,10 @@ mod command_characterization_tests {
         };
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let captured_attempts = Arc::clone(&attempts);
-        let driver = gui_simulation_driver(&world, Arc::new(Vec::new));
+        let host = TestHost::take(world);
         let projection = Arc::new(Mutex::new(None));
         let mut view = SimulationView::new(
-            driver,
+            host.port.clone(),
             AnalyticsSnapshotProvider::empty(),
             "rejected selection".into(),
             Arc::new(move |_command| {
@@ -20512,15 +20532,7 @@ mod command_characterization_tests {
         assert!(!view.clear_all_selections());
         assert_eq!(attempts.load(AtomicOrdering::Relaxed), 1);
         assert!(
-            matches!(
-                world
-                    .lock()
-                    .expect("rejected-clear world lock")
-                    .agent_runtime(agent_id)
-                    .expect("rejected-clear fixture runtime")
-                    .selection,
-                SelectionState::Selected
-            ),
+            matches!(host.selection(agent_id), SelectionState::Selected),
             "rejected admission must leave canonical selection untouched"
         );
         assert_eq!(
@@ -20676,14 +20688,14 @@ mod command_characterization_tests {
             .expect("hover-isolation world lock")
             .try_spawn_agent(AgentData::default())
             .expect("spawn hover-isolation fixture agent");
-        let driver = gui_simulation_driver(&world, Arc::new(Vec::new));
+        let host = TestHost::take(world);
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let projection = Arc::new(Mutex::new(None));
         let submission = Arc::new(Mutex::new(()));
         let make_view = |title: &'static str| {
             let captured_attempts = Arc::clone(&attempts);
             SimulationView::new(
-                Arc::clone(&driver),
+                host.port.clone(),
                 AnalyticsSnapshotProvider::empty(),
                 title.into(),
                 Arc::new(move |_command| {
@@ -20696,10 +20708,9 @@ mod command_characterization_tests {
         };
         let mut hud_view = make_view("hover HUD");
         let mut canvas_view = make_view("hover canvas");
-        let digest_before = world
-            .lock()
-            .expect("hover-isolation world lock")
-            .world_digest_v1()
+        let digest_before = host
+            .port
+            .scientific_digest_v1()
             .expect("hover-isolation digest");
 
         assert!(hud_view.apply_hover_change(Some(agent_id)));
@@ -20709,22 +20720,12 @@ mod command_characterization_tests {
             "hover must not enter the scientific command bus"
         );
         assert!(
-            matches!(
-                world
-                    .lock()
-                    .expect("hover-isolation world lock")
-                    .agent_runtime(agent_id)
-                    .expect("hover-isolation fixture runtime")
-                    .selection,
-                SelectionState::None
-            ),
+            matches!(host.selection(agent_id), SelectionState::None),
             "hover must not write canonical selection state"
         );
         assert_eq!(
-            world
-                .lock()
-                .expect("hover-isolation world lock")
-                .world_digest_v1()
+            host.port
+                .scientific_digest_v1()
                 .expect("hover-isolation digest"),
             digest_before,
             "presentation-only hover must be science-digest neutral"
@@ -20758,14 +20759,16 @@ mod command_characterization_tests {
             "hover in one GPUI view must not leak into the other view"
         );
 
-        let _ = world
-            .lock()
-            .expect("hover-isolation world lock")
-            .apply_selection_update(SelectionUpdate {
-                mode: SelectionMode::Replace,
-                agent_ids: vec![agent_id.raw()],
-                state: SelectionState::Selected,
-            });
+        host.apply(
+            scriptbots_runtime::HostCommand::try_from(ControlCommand::UpdateSelection(
+                SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![agent_id.raw()],
+                    state: SelectionState::Selected,
+                },
+            ))
+            .expect("owner selection command"),
+        );
         let selected_snapshot = hud_view.snapshot();
         assert!(selected_snapshot.inspector.hovered.is_none());
         assert!(
@@ -21394,46 +21397,38 @@ mod command_characterization_tests {
     }
 
     #[test]
-    fn single_lock_toggle_closed_environment_updates_world_state() {
-        let world = command_characterization_world();
-        let drain: TestCommandDrain = Arc::new(Vec::new);
-        let view = simulation_view(Arc::clone(&world), drain);
-
-        assert!(!world.lock().expect("world lock").is_closed());
-        world
-            .lock()
-            .expect("world lock")
-            .set_closed(true)
-            .expect("set closed");
-        assert!(world.lock().expect("world lock").is_closed());
-        world
-            .lock()
-            .expect("world lock")
-            .set_closed(false)
-            .expect("set open");
-        assert!(!world.lock().expect("world lock").is_closed());
-        assert!(!view.world.lock().expect("world lock").is_closed());
+    fn owner_config_changes_are_visible_to_the_gpui_port() {
+        let host = TestHost::take(command_characterization_world());
+        let view = host_view(Arc::clone(&host));
+        assert!(!host.snapshot().config.closed);
+        for closed in [true, false] {
+            let mut config = host.snapshot().config.as_ref().clone();
+            config.closed = closed;
+            host.apply(
+                scriptbots_runtime::HostCommand::try_from(ControlCommand::UpdateConfig(Box::new(
+                    config,
+                )))
+                .expect("owner config command"),
+            );
+            assert_eq!(host.snapshot().config.closed, closed);
+            assert_eq!(view.host.snapshot_hub().latest().config.closed, closed);
+        }
     }
 
     #[test]
     fn dual_window_snapshots_share_pause_and_speed_state() {
-        let world = command_characterization_world();
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(|| {
-            vec![ControlCommand::UpdateSimulation(SimulationCommand {
+        let host = TestHost::take(command_characterization_world());
+        let mut hud = host_view(Arc::clone(&host));
+        let mut canvas = host_view(Arc::clone(&host));
+        canvas.set_minimal_canvas_mode();
+
+        host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
+            SimulationCommand {
                 paused: Some(true),
                 speed_multiplier: Some(2.5),
                 step_once: false,
-            })]
-        });
-        let driver = gui_simulation_driver(&world, drain);
-        let mut hud = simulation_view_with_driver(Arc::clone(&driver));
-        let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
-        canvas.set_minimal_canvas_mode();
-
-        driver
-            .lock()
-            .expect("GUI simulation driver lock")
-            .drive_at(Instant::now());
+            },
+        ));
 
         let hud_snapshot = hud.snapshot();
         let canvas_snapshot = canvas.snapshot();
@@ -21441,6 +21436,6 @@ mod command_characterization_tests {
         assert!(canvas_snapshot.controls.paused);
         assert_eq!(hud_snapshot.controls.speed_multiplier, 2.5);
         assert_eq!(canvas_snapshot.controls.speed_multiplier, 2.5);
-        assert_eq!(world.lock().expect("world lock").tick().0, 0);
+        assert_eq!(host.port.snapshot_hub().latest().world.tick, 0);
     }
 }
