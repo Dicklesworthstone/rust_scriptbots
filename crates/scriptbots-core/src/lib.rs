@@ -48638,7 +48638,7 @@ mod tests {
         assert_eq!(value("mortality.unknown.ratio"), 1.0 / 6.0);
         let mut empty = Vec::new();
         project_mortality_metrics(Some(&MortalityCounts::default()), &mut empty);
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [MetricSample; 0]);
     }
 
     fn quiet_trace_config(seed: u64, persistence_interval: u32) -> ScriptBotsConfig {
