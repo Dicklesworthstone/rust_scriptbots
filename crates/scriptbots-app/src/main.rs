@@ -606,6 +606,9 @@ fn main() -> Result<()> {
             anyhow::anyhow!("control listeners were not reserved before runtime startup")
         })?;
         let (control_runtime, command_submit) = control_reservation.launch(host_port.clone())?;
+        if renderer.name() != "terminal" && command_submit(scriptbots_core::ControlCommand::Resume).is_none() {
+            return Err(anyhow!("host refused initial resume"));
+        }
         info!(
             requested_mode = cli.mode.as_str(),
             active_mode = active_mode.as_str(),
@@ -644,7 +647,7 @@ fn main() -> Result<()> {
     drop(host_port);
     let host_result = host.join();
     let sense_summary = host_result.as_ref().ok().map(|receipt| SenseRunSummary {
-        tick: receipt.snapshot.tick.0,
+        tick: receipt.snapshot.world.tick,
         saturations_total: receipt.sense_saturations_total,
     });
     let finalization = host_result.map(|receipt| StorageFinalization {

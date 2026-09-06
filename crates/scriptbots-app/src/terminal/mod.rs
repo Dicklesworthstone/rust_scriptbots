@@ -278,6 +278,7 @@ fn run_event_loop(
     ctx: RendererContext<'_>,
 ) -> Result<()> {
     let mut app = TerminalApp::new(renderer, ctx);
+    app.submit_and_wait(ControlCommand::Resume)?;
 
     loop {
         app.ensure_control_runtime_running()?;
