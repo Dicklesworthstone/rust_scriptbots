@@ -5015,6 +5015,84 @@ mod tests {
     }
 
     #[test]
+    fn narrative_publications_follow_real_events_and_reuse_unchanged_nonempty_rings() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            closed: true,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            reproduction_energy_threshold: f32::MAX,
+            persistence_interval: 0,
+            rng_seed: Some(0x16_020_901),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("narrative publication world");
+        for _ in 0..12 {
+            world
+                .try_spawn_agent(AgentData {
+                    health: 2.0,
+                    ..AgentData::default()
+                })
+                .expect("seed narrative population");
+        }
+        let mut core =
+            HostCore::new(HostSessionId::new(81), world, options(true)).expect("narrative owner");
+        let mut port = core.local_port();
+        let mut previous = core.latest_snapshot();
+        assert!(previous.narrative_events.is_empty());
+        let mut observed_event_publication = false;
+        let mut observed_nonempty_reuse = false;
+        for tick in 1_u64..=240 {
+            if tick == 97 {
+                core.world
+                    .enqueue_intervention(scriptbots_core::Intervention::Meteor {
+                        region: scriptbots_core::Region::All,
+                        lethality: 10.0,
+                        scorch: 0.0,
+                    })
+                    .expect("queue actual extinction intervention");
+            }
+            submit(&mut port, u128::from(tick), HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(tick))
+                .expect("narrative owner step");
+            let current = core.latest_snapshot();
+            assert_eq!(current.world.tick, tick);
+            let expected: Vec<_> = core.world.narrative_events().iter().cloned().collect();
+            assert_eq!(*current.narrative_events, expected);
+            assert_eq!(
+                current.narrative_dropped_events,
+                core.world.narrative_dropped_events()
+            );
+            if previous.narrative_events != current.narrative_events {
+                assert!(!Arc::ptr_eq(
+                    &previous.narrative_events,
+                    &current.narrative_events
+                ));
+                observed_event_publication = true;
+            } else if !current.narrative_events.is_empty() {
+                assert!(Arc::ptr_eq(
+                    &previous.narrative_events,
+                    &current.narrative_events
+                ));
+                observed_nonempty_reuse = true;
+            }
+            previous = current;
+        }
+        assert!(observed_event_publication, "the world must emit an event");
+        assert!(
+            observed_nonempty_reuse,
+            "the trace must exercise reuse after at least one event"
+        );
+    }
+
+    #[test]
     fn construction_preserves_an_existing_current_tick_summary_exactly() {
         let mut prestepped = world(0);
         prestepped.step().expect("pre-host scientific tick");
