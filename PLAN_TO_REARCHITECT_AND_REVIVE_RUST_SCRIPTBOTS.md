@@ -262,6 +262,12 @@ beside the completed summary so REST/MCP status reads can return the last observ
 while persistence holds the legacy world mutex. This is a bounded responsiveness repair;
 the full HostClient ownership transition remains with bd-pcfj / bd-88yj.
 
+[Completed — bd-2z0.4.17, TurquoiseLake, 2026-09-06, pinned DSR51 at fb15a70] Preserve
+server simulation, poisoned-world and control-health failures through orderly application
+teardown. Real loop/watch controls, full main tests, normal REST/MCP, compiler/Clippy/format
+and final packaging pass. Null-persistence unit boundaries do not prove file durability;
+storage liveness remains with bd-w1oi. Fresh solo verification, not independent certification.
+
 1. Frontends consume immutable snapshots and send typed intents.
 2. Frontends do not hold a world mutex and do not query FrankenSQLite during paint.
 3. UI state distinguishes `admitted`, `applied`, `durable`, `rejected`, `failed`, `disconnected`, and `stale`.
@@ -2816,6 +2822,12 @@ Verification is a product feature. A simulation laboratory is only as useful as 
 
 ### 13.1 gate hierarchy
 
+**[Currently In Progress — bd-build-farm-reliability-lb19.3, TurquoiseLake, 2026-09-06]**
+Protect DSR's external Cargo home, target and proof roots from SBH before compiling.
+DSR52's actual worker log records deletion of its live Cargo registry; its compiler
+check passed but no server test executed. Keep the original test budgets and rerun
+the pinned lane after installing the existing subtree protection.
+
 Use the cheapest relevant gate first, then widen:
 
 1. format and static structure;
@@ -2840,7 +2852,11 @@ For substantive code changes, the repository-wide handoff gate follows AGENTS ex
 - `cargo test --workspace --all-features`;
 - relevant real frontend/scenario/replay E2E.
 
-Use RCH for compute-intensive gates when healthy; otherwise run sequentially in the external scratch target and record infrastructure limits. Run `ubs <changed-files>` before every commit, not just the first slice. A platform/native-library blocker is attached verbatim to the bead; it is never silently relabeled green.
+Run compute-intensive acceptance gates through the clean, source-pinned DSR profile
+with an external proof directory. Preserve infrastructure failures and rerun through
+DSR after repairing their cause. Run `ubs <changed-files>` before every commit, not
+just the first slice. A platform/native-library blocker is attached verbatim to the
+bead; it is never silently relabeled green.
 
 ### 13.2 core unit/oracle matrix
 

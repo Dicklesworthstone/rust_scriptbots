@@ -2,18 +2,19 @@
 
 ## Execution TODO — started 2026-09-05
 
-Current continuation — **2026-09-06, through source `e84ff10`, TurquoiseLake**. The earlier entries below retain
+Current continuation — **2026-09-06, through source `5bb567a`, TurquoiseLake**. The earlier entries below retain
 the failure history; these are the current next actions and proof limits.
 
 - [ ] **bd-bfkd — Assembly execution-fault containment, resumed 2026-09-06.**
   - [x] Re-read the original C++ interpreter, transactional adapter, world fault latch,
     death cleanup, mortality projection and retained DSR30 failure. No arithmetic change.
   - [x] Implement the distinction between a non-finite execution result and malformed
-    sensors/genomes/state in `8a2a410`. Exact rollback and terminal-error tests await DSR46.
+    sensors/genomes/state in `8a2a410`. Exact rollback and terminal-error tests pass DSR46/48.
   - [x] Implement the failed agent's containment tick with zero outputs, then remove it at the
     ordinary death boundary with an explicit brain-execution cause and deterministic details.
     Wire lifecycle storage/readback, ancestry digest details and mortality totals; forbid dying
-    agents from receiving another corpse reward. Runtime proof remains pending.
+    agents from receiving another corpse reward. The real mixed-world and file-readback
+    controls pass DSR46/48; original file600s acceptance remains unmet below.
   - [x] Bind the changed execution policy to Assembly adapter v4. Preserve the old identity
     encoding pin and explicitly assert the new policy descriptor. Genome/state codecs and
     arithmetic remain unchanged; exact fault bits enter the existing lifecycle stream.
@@ -36,7 +37,12 @@ the failure history; these are the current next actions and proof limits.
       Redistributing only sidebar empty rows to the old panel heights restores both old hashes
       exactly, accounting for the changed geometry without glyph/style substitutions. All
       panels remain present. `e84ff10` manually updates only the two reviewed hashes.
-    - [ ] Verify the committed golden in the final app run.
+    - [x] Verify the committed golden in DSR49 at `e84ff10`: full app library408 passed,
+      zero failed and one preexisting ignore; main65/65 also passes. Workspace compiler,
+      strict Clippy and formatting pass. The final analytics build then failed with missing
+      spawn/dep-info paths, so DSR49 exits6 despite the typed five-check verdict being `pass`.
+      No full DSR packaging qualification. The compiler is present and runnable on a later
+      read; the missing-path cause is unestablished and recorded on build-farm bead `.2`.
     - [x] DSR47 at `a24c682`: exact seed `12659881219344128065` reproduces cell197 positive
       infinity at tick88, then passes the original progress/HTTP deadlines for the full600s
       observation period: 402 status samples, first tick14, last tick1199, 617862ms including
@@ -45,24 +51,96 @@ the failure history; these are the current next actions and proof limits.
       mode failed the unchanged120s progress guard at REST tick599. Child stderr confirms
       an actual storage **Admit** acknowledgement timeout at completed tick600, Indeterminate,
       seed `2227158220202299814`; this is the original `bd-w1oi` failure class in file mode.
-      The unseeded memory test is still running. Keep `bd-bfkd` open with unmet acceptance.
+      The unseeded memory test passed: tick17 to1079,366 status observations,603744ms including
+      termination. Long suite2/3, overall DSR47 failed. Keep `bd-bfkd` open with unmet acceptance.
+      DSR52 `server-final-fb15a70-20260906-52` failed on hz4 at clean `fb15a70` after
+      workspace compilation passed: normal REST/MCP test compilation failed before any
+      test executed, and no long test ran. Worker SBH logs record deletion of the exact
+      active Cargo registry at02:32:25UTC; see build-farm `.3` below.
   - [ ] Run clean pinned DSR focused/full affected tests and required compiler/lint/format
     checks, then both original 600-second server scenarios with their original budgets.
     DSR46 completed with typed failure on clean `876b31cd1127edc11d221ccb6b35c67ca4b242ae`; its nine-command
     scope includes core/brain library tests, one/four-thread real Assembly continuation, actual
     storage fault tests, GUI projection, full app library and workspace compiler/Clippy. No
     whole-lane pass claim: the resize golden failed and Clippy rejected the new empty-vector
-    assertion. Both compiler checks passed. DSR47 runs all three long server tests at clean `a24c682`;
-    its workspace all-target compiler check and normal real-process REST/MCP test passed. Strict Clippy and final-source
-    reruns remain required. The new five-agent carcass test also exercises SIMD lanes and the
+    assertion. Both compiler checks passed. DSR47 ran all three long server tests at clean `a24c682`;
+    its workspace all-target compiler check and normal real-process REST/MCP test passed.
+    The new five-agent carcass test also exercises SIMD lanes and the
     scalar remainder; `a24c682` removes the observed economy-feature unused test import.
-    DSR48 now runs at clean `a665f07`: full core/brain suites (including integrations), scalar
+    DSR48 completed at clean `a665f07`: full core/brain suites (including integrations), scalar
     core library, both thread controls, storage/GUI/app and required check/Clippy/format. Raw
     resize cells are retained for review; the old golden intentionally remains unchanged in
     that pinned source. Its full core/brain command passed860/860 executed tests; scalar core
-    and remaining compiler/lint checks are running. Final app proof will pin `e84ff10`.
+    passed697 with five preexisting ignores, both thread controls/storage3/GUI2 also pass.
+    Workspace all-target compiler, strict Clippy and formatting checks pass. Overall DSR48
+    remains failed solely on the deliberately old resize golden; all eleven copied command-log
+    and profile checksum entries match. DSR49 final app proof pins `e84ff10` on hz4.
   - [ ] Retain exact-source evidence, review original acceptance afresh, update this bead
     honestly, commit and publish verified work. Broader ownership/storage tasks remain open.
+
+- [ ] **bd-w1oi — diagnose the observed file Admit timeout before changing batching.**
+  - [x] Retain DSR47's full proof and all three run directories, including failed SQLite/WAL,
+    manifest, command, stdout/stderr and REST history. All eight command-log SHA256s match.
+  - [x] Inspect admission, outbox apply and one-batch interleaving; the latter already exists.
+  - [x] Repeat exact file seed `2227158220202299814` with existing storage debug logs and
+    thread states in a clean pinned DSR profile. DSR50 `storage-file-e84ff10-20260906-50`
+    completed on hz3 at clean `e84ff10`. The application reached durable admission of batch25
+    at tick1500, then the planned660s supervisor returned124. DSR packaged the diagnostic
+    successfully (exit0); typed status remains `diagnostic`, not an original-test pass.
+    No terminal simulation error was observed. Across17 actual thread snapshots,12 show the
+    storage worker in D-state: eight `jbd2_log_wait_commit`, three `folio_wait_bit_common`,
+    one `do_get_write_access`; five show it running. The longest measured preparation-complete
+    to admission-receipt interval was71.274s. Twelve of17 snapshots are observations of waits,
+    not a wall-time percentage. Extra read-only syscall/stack inspection was denied; raw
+    errors are retained. These observations point to filesystem waits in this run, without
+    establishing the precise cause of DSR47's earlier timeout on a different worker.
+    This is incident diagnosis on a shared worker, not the profiling skill's isolated20-run
+    benchmark. The host's perf policy4 and ptrace policy1 remain unchanged; no CPU-stack sampling,
+    baseline, speedup or kernel-tuning claim. Preserve every process result, including exit0
+    after a terminal simulation failure, as a diagnostic result rather than a liveness pass.
+  - [ ] Attribute the slow operation from those observations, make one justified repair,
+    and rerun the original file/memory and exact-seed server acceptance with unchanged budgets.
+
+- [x] **bd-2z0.4.17 — propagate server failure through orderly shutdown.**
+  - [x] Inspect the actual loop and outer teardown: simulation and poisoned-world errors
+    are logged then discarded; successful finalizers can therefore erase the failed run.
+  - [x] Return the original typed step error, reject poisoned-world access and route existing
+    control-health failures through `Result`. Keep teardown order and error precedence.
+  - [x] Add a real world/session mismatch after one successful server iteration, asserting
+    the typed cause, exact two calls and unchanged tick after failure. Add poisoned-world
+    and controlled health-callback boundaries. The control runtime really starts and joins;
+    the fixture uses explicit null persistence and does not prove database durability or a
+    live REST/MCP crash.
+  - [x] Run clean pinned DSR tests, workspace compiler/Clippy/format and review original
+    acceptance afresh. DSR51 at `fb15a70` on hz3 finishes0 with typedpass, including final
+    analytics build/package. Three new loop controls, real watch-channel health, full app
+    main and normal real REST/MCP pass3/3,1/1,68/68 and1/1 respectively; the three loop
+    controls are also included in main, so their repetition is not extra coverage.
+    Full local proof `/tmp/scriptbots-server-errors-fb15a70-proof-20260906`: eight
+    command/profile hashes and two source-input hashes match; final verdict/result/build-log
+    hashes match the worker. Closed after fresh solo verification, not independent certification.
+    `bd-w1oi` and `bd-bfkd` keep their original long-run criteria.
+
+- [ ] Publish the reviewed server-error and DSR-protection commits, final progress notes
+  and tracker export; verify both remote branch heads after the active acceptance completes.
+
+- [ ] **bd-build-farm-reliability-lb19.3 — prevent cleanup of active DSR inputs.**
+  - [x] Attribute DSR52's missing dependency paths to the exact SBH activity entry:
+    `cargo-home/registry` deleted successfully at02:32:25.660UTC, with a partially failed
+    `cargo-home/git` deletion at02:30:39.464UTC. The compiler remained present.
+    The earlier DSR49 packaging cause remains unestablished; no matching activity entry.
+  - [x] Add existing SBH protection to the correctness runner before Cargo, covering only
+    external Cargo home, target and proof roots. Keep source clean and fleet cleanup enabled.
+  - [x] Protect the still-running DSR51 external paths using the real `sbh protect` command;
+    this adds markers and user protection records, without changing its pinned source/profile.
+  - [ ] Observe actual scanner protection, retain DSR52's complete failure and rerun the
+    clean pinned original server lane. No timeout, test filter, golden or verdict weakened.
+    - [x] Actual hz3 daemon recognizes the new Cargo-home/proof markers. DSR53's hz4 daemon
+      also recognizes the marker installed by the committed runner. DSR52's full
+      proof and DSR state/logs are local; all seven command-log hashes match.
+    - [ ] DSR53 `server-sbh-5bb567a-20260906-53` is running at clean `5bb567a` on hz4.
+      Its first launcher attempt refused before DSR because I omitted the external yq
+      directory from PATH; corrected using the already installed binary. Both logs retained.
 
 - [x] Complete DSR45 and close **bd-2z0.14.2.7**, then **bd-q2w9**, against their original
   acceptance. All 488 selected app tests pass; formatting, workspace all-target compilation
