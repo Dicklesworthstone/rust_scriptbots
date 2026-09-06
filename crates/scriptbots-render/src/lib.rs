@@ -18674,51 +18674,81 @@ mod command_characterization_tests {
     ///
     /// The failure mode this codebase keeps producing is a control wired to something
     /// nothing consumes, and a test asserting `speed_multiplier == 2.0` would pass for
-    /// exactly that defect. So this drives the real consumer — GuiSimulationDriver's
-    /// accumulator path — and counts ticks the world actually executed.
+    /// exactly that defect. This drives HostCore's production clock consumer and
+    /// counts ticks the world actually executed.
     ///
-    /// Asserts the RATIO, not absolute rates. `drive_at` takes `now` as a parameter, so
-    /// the clock is fabricated rather than slept on: the result is identical on an idle
-    /// machine and on one running six agents. An intermittent test gets ignored, and an
-    /// ignored test is the same as no coverage.
+    /// The manual clock tests the scheduling ratio without a wall-clock performance
+    /// claim. No GPUI paint callback participates in scientific scheduling.
     #[test]
     fn simulation_speed_multiplier_changes_the_observed_tick_rate() {
-        fn ticks_after(speed: f32, advance: Duration) -> u64 {
+        use scriptbots_runtime::{
+            CommandEnvelope, CommandId, HostCore, HostCoreOptions, HostSessionId, ManualHostDriver,
+            ManualInstant,
+        };
+
+        const INTERVALS: u64 = 12;
+        const PERIOD_NANOS: u64 = 10_000_000;
+
+        fn ticks_after(speed: f32) -> u64 {
             let world = command_characterization_world();
-            let driver = gui_simulation_driver_with_step(
-                &world,
-                disabled_persistence_step_driver(&world),
-                Arc::new(Vec::new),
-            );
-            let mut driver = driver.lock().expect("driver lock");
-            driver.apply_playback_state(&SimulationCommand {
-                paused: Some(false),
-                speed_multiplier: Some(speed),
-                step_once: false,
-            });
-            let start = Instant::now();
-            // Prime `last` without advancing; the first call establishes the baseline.
-            driver.drive_at(start);
-            let before = world.lock().expect("world lock").tick().0;
-            driver.drive_at(start + advance);
-            world.lock().expect("world lock").tick().0 - before
+            let world = Arc::try_unwrap(world)
+                .unwrap_or_else(|_| panic!("clock fixture world still shared"))
+                .into_inner()
+                .expect("clock fixture world");
+            let mut core = HostCore::new(
+                HostSessionId::new(1),
+                world,
+                HostCoreOptions {
+                    tick_period_nanos: PERIOD_NANOS,
+                    max_automatic_steps_per_drive: usize::try_from(INTERVALS * 2)
+                        .expect("bounded fixture catch-up"),
+                    ..HostCoreOptions::default()
+                },
+            )
+            .expect("clock fixture owner");
+            let mut port = core.local_port();
+            port.submit(CommandEnvelope::new(
+                CommandId::new(1),
+                scriptbots_runtime::HostCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(false),
+                    speed_multiplier: Some(speed),
+                    step_once: false,
+                }),
+            ))
+            .expect("clock control admission");
+            core.drive(ManualInstant::from_nanos(0))
+                .expect("apply clock control");
+            assert!(matches!(
+                port.command_status(CommandId::new(1))
+                    .expect("clock control status")
+                    .expect("clock control receipt")
+                    .application(),
+                scriptbots_runtime::ApplicationState::Applied(_)
+            ));
+            let before = core.latest_snapshot().world.tick;
+            core.drive(ManualInstant::from_nanos(PERIOD_NANOS * INTERVALS))
+                .expect("advance owner clock");
+            core.latest_snapshot().world.tick - before
         }
 
-        // 12 tick-intervals of clock: well under MAX_SIM_STEPS_PER_FRAME (240) and under
-        // the 0.5s accumulator clamp, so neither limiter distorts the ratio.
-        let advance = Duration::from_secs_f32(SIM_TICK_INTERVAL * 12.0);
-        let single = ticks_after(1.0, advance);
-        let double = ticks_after(2.0, advance);
+        let single = ticks_after(1.0);
+        let double = ticks_after(2.0);
+        assert_eq!(
+            ticks_after(0.0),
+            0,
+            "zero speed must disarm automatic science"
+        );
 
         assert!(
             single > 0,
-            "1x produced no ticks over {advance:?}; the speed control has no consumer"
+            "1x produced no ticks over {INTERVALS} intervals; the speed control has no consumer"
         );
+        assert_eq!(single, INTERVALS, "1x must consume each elapsed interval");
         assert_eq!(
             double,
             single * 2,
             "2x must execute exactly twice the ticks of 1x over the same clock advance \
-             (1x={single}, 2x={double}); the multiplier is not reaching the accumulator"
+             (1x={single}, 2x={double}); the multiplier is not reaching the owner clock"
         );
     }
 
@@ -20309,9 +20339,11 @@ mod command_characterization_tests {
 
     #[test]
     fn gpui_closed_world_shortcut_submits_one_intent_without_direct_mutation() {
-        let world = command_characterization_world();
+        let host = TestHost::take(command_characterization_world());
         let submitted_commands = Arc::new(Mutex::new(Vec::new()));
         let captured_commands = Arc::clone(&submitted_commands);
+        // Record frontend intent before deliberately submitting it to the real
+        // owner below. The callback token is a UI fixture, not admission evidence.
         let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
             Arc::new(move |command| {
                 captured_commands
@@ -20320,20 +20352,9 @@ mod command_characterization_tests {
                     .push(command);
                 Some("test-cmd".to_owned())
             });
-        let drain_commands = Arc::clone(&submitted_commands);
-        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
-            Arc::new(move || {
-                let mut commands = drain_commands
-                    .lock()
-                    .expect("closed-world submitted command queue");
-                std::mem::take(&mut *commands)
-            });
         let session = Arc::new(GuiSession::new(
-            Arc::clone(&world),
-            disabled_persistence_step_driver(&world),
+            host.port.clone(),
             AnalyticsSnapshotProvider::empty(),
-            identified(command_drain),
-            Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -20341,7 +20362,7 @@ mod command_characterization_tests {
         let windows = app
             .update(|app| session.install(app))
             .expect("install production GPUI closed-world session");
-        assert!(!world.lock().expect("closed-world world lock").is_closed());
+        assert!(!host.snapshot().config.closed);
 
         app.update(|app| {
             app.update_window(windows.hud.into(), |_, window, app| {
@@ -20353,11 +20374,7 @@ mod command_characterization_tests {
             .expect("dispatch production HUD closed-world shortcut");
         });
 
-        let mut expected_config = world
-            .lock()
-            .expect("closed-world world lock")
-            .config()
-            .clone();
+        let mut expected_config = host.snapshot().config.as_ref().clone();
         expected_config.closed = true;
         assert_eq!(
             submitted_commands
@@ -20368,9 +20385,20 @@ mod command_characterization_tests {
             "one C keypress must enqueue the exact canonical closed-world intent"
         );
         assert!(
-            !world.lock().expect("closed-world world lock").is_closed(),
-            "the GPUI handler must not mutate scientific world state before the intent is drained"
+            !host.snapshot().config.closed,
+            "the GPUI handler must not mutate science before owner submission"
         );
+        let commands = std::mem::take(
+            &mut *submitted_commands
+                .lock()
+                .expect("closed-world submitted command queue"),
+        );
+        for command in commands {
+            host.apply(
+                scriptbots_runtime::HostCommand::try_from(command)
+                    .expect("closed-world owner command"),
+            );
+        }
         app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
         app.run_until_parked();
         assert!(
@@ -20378,11 +20406,11 @@ mod command_characterization_tests {
                 .lock()
                 .expect("closed-world submitted command queue")
                 .is_empty(),
-            "the production driver must drain the admitted closed-world intent"
+            "the fixture must submit every recorded intent to the owner"
         );
         assert!(
-            world.lock().expect("closed-world world lock").is_closed(),
-            "the shared command application path must apply the GPUI closed-world intent"
+            host.snapshot().config.closed,
+            "the owner must apply the GPUI closed-world intent"
         );
         app.update(|app| app.shutdown());
     }
@@ -20395,8 +20423,11 @@ mod command_characterization_tests {
             .expect("select-all world lock")
             .try_spawn_agent(AgentData::default())
             .expect("spawn select-all fixture agent");
+        let host = TestHost::take(world);
         let submitted_commands = Arc::new(Mutex::new(Vec::new()));
         let captured_commands = Arc::clone(&submitted_commands);
+        // This callback captures UI intent only. Real owner admission and
+        // application happen explicitly after the no-direct-mutation assertions.
         let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
             Arc::new(move |command| {
                 captured_commands
@@ -20405,20 +20436,9 @@ mod command_characterization_tests {
                     .push(command);
                 Some("test-cmd".to_owned())
             });
-        let drain_commands = Arc::clone(&submitted_commands);
-        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
-            Arc::new(move || {
-                let mut commands = drain_commands
-                    .lock()
-                    .expect("select-all submitted command queue");
-                std::mem::take(&mut *commands)
-            });
         let session = Arc::new(GuiSession::new(
-            Arc::clone(&world),
-            disabled_persistence_step_driver(&world),
+            host.port.clone(),
             AnalyticsSnapshotProvider::empty(),
-            identified(command_drain),
-            Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
             command_submit,
         ));
 
@@ -20450,16 +20470,8 @@ mod command_characterization_tests {
             "one Ctrl-A keypress must enqueue the exact canonical selection intent"
         );
         assert!(
-            matches!(
-                world
-                    .lock()
-                    .expect("select-all world lock")
-                    .agent_runtime(agent_id)
-                    .expect("select-all fixture runtime")
-                    .selection,
-                SelectionState::None
-            ),
-            "the GPUI handler must not mutate selection before the intent is drained"
+            matches!(host.selection(agent_id), SelectionState::None),
+            "the GPUI handler must not mutate selection before owner submission"
         );
         assert_eq!(
             session
@@ -20468,8 +20480,19 @@ mod command_characterization_tests {
                 .expect("select-all selection projection")
                 .as_deref(),
             Some(&[agent_id][..]),
-            "the HUD and canvas must share the admitted pre-drain selection projection"
+            "the HUD and canvas must share the callback-accepted selection projection"
         );
+        let commands = std::mem::take(
+            &mut *submitted_commands
+                .lock()
+                .expect("select-all submitted command queue"),
+        );
+        for command in commands {
+            host.apply(
+                scriptbots_runtime::HostCommand::try_from(command)
+                    .expect("select-all owner command"),
+            );
+        }
         app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
         app.run_until_parked();
         assert!(
@@ -20477,19 +20500,11 @@ mod command_characterization_tests {
                 .lock()
                 .expect("select-all submitted command queue")
                 .is_empty(),
-            "the production driver must drain the admitted selection intent"
+            "the fixture must submit every recorded selection intent to the owner"
         );
         assert!(
-            matches!(
-                world
-                    .lock()
-                    .expect("select-all world lock")
-                    .agent_runtime(agent_id)
-                    .expect("select-all fixture runtime")
-                    .selection,
-                SelectionState::Selected
-            ),
-            "the shared command application path must apply the GPUI selection intent"
+            matches!(host.selection(agent_id), SelectionState::Selected),
+            "the owner must apply the GPUI selection intent"
         );
         app.update(|app| app.shutdown());
     }
@@ -20567,22 +20582,16 @@ mod command_characterization_tests {
                 ..AgentData::default()
             })
             .expect("spawn rapid-selection fixture agent");
+        let host = TestHost::take(world);
         let pending_commands = Arc::new(Mutex::new(Vec::new()));
-        let drain_commands = Arc::clone(&pending_commands);
-        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
-            Arc::new(move || {
-                let mut commands = drain_commands
-                    .lock()
-                    .expect("rapid-selection command queue");
-                std::mem::take(&mut *commands)
-            });
-        let driver = gui_simulation_driver(&world, command_drain);
         let submit_commands = Arc::clone(&pending_commands);
         let projection = Arc::new(Mutex::new(None));
         let mut view = SimulationView::new(
-            Arc::clone(&driver),
+            host.port.clone(),
             AnalyticsSnapshotProvider::empty(),
             "rapid selection".into(),
+            // Capture both UI intents before owner submission, so the second
+            // click must consume the pending projection, not applied science.
             Arc::new(move |command| {
                 submit_commands
                     .lock()
@@ -20623,16 +20632,8 @@ mod command_characterization_tests {
             "the second pre-drain shift-click must toggle the projected state back off"
         );
         assert!(
-            matches!(
-                world
-                    .lock()
-                    .expect("rapid-selection world lock")
-                    .agent_runtime(agent_id)
-                    .expect("rapid-selection fixture runtime")
-                    .selection,
-                SelectionState::None
-            ),
-            "the GUI must not mutate canonical selection before command drain"
+            matches!(host.selection(agent_id), SelectionState::None),
+            "the GUI must not mutate canonical selection before owner submission"
         );
         assert!(
             projection
@@ -20648,10 +20649,28 @@ mod command_characterization_tests {
         assert_eq!(view.selection_events[1].tick, 0);
         assert_eq!(view.selection_events[1].total_selected, 0);
 
-        driver
-            .lock()
-            .expect("rapid-selection driver")
-            .drive_at(Instant::now());
+        let commands = std::mem::take(
+            &mut *pending_commands
+                .lock()
+                .expect("rapid-selection command queue"),
+        );
+        for (command, expected) in commands
+            .into_iter()
+            .zip([SelectionState::Selected, SelectionState::None])
+        {
+            host.apply(
+                scriptbots_runtime::HostCommand::try_from(command)
+                    .expect("rapid-selection owner command"),
+            );
+            assert!(
+                matches!(
+                    (host.selection(agent_id), expected),
+                    (SelectionState::Selected, SelectionState::Selected)
+                        | (SelectionState::None, SelectionState::None)
+                ),
+                "each owner application must preserve the intermediate FIFO selection"
+            );
+        }
         assert!(
             pending_commands
                 .lock()
@@ -20659,15 +20678,7 @@ mod command_characterization_tests {
                 .is_empty()
         );
         assert!(
-            matches!(
-                world
-                    .lock()
-                    .expect("rapid-selection world lock")
-                    .agent_runtime(agent_id)
-                    .expect("rapid-selection fixture runtime")
-                    .selection,
-                SelectionState::None
-            ),
+            matches!(host.selection(agent_id), SelectionState::None),
             "FIFO application of Add then Clear must reproduce the projected final state"
         );
         let _ = view.snapshot();

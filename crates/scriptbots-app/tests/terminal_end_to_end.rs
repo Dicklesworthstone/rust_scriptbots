@@ -852,7 +852,7 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
         renderer.run(context)?;
     }
     control_runtime.shutdown()?;
-    let before_finalization = pipeline.flush()?;
+    let before_finalization = pipeline.flush_and_wait()?;
     let final_owner = host.join()?;
     let cadence = u64::from(config.persistence_interval);
     let cadence_boundary = frames as u64 / cadence * cadence;
