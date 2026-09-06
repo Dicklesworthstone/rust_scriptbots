@@ -17991,6 +17991,10 @@ fn transform_color(color: Rgba, matrix: [[f32; 3]; 3]) -> Rgba {
 mod command_characterization_tests {
     use super::*;
     use scriptbots_core::{AgentData, CharacterizationDigestV0, WorldDigestV1};
+    use scriptbots_runtime::{
+        ApplicationState, CommandEnvelope, CommandId, HostCore, HostCoreOptions, HostSessionId,
+        ManualHostDriver, ManualInstant, PlaybackSnapshot,
+    };
     use std::time::Duration;
 
     #[test]
@@ -18635,14 +18639,6 @@ mod command_characterization_tests {
         })
     }
 
-    fn simulation_view(
-        world: Arc<Mutex<WorldState>>,
-        command_drain: TestCommandDrain,
-    ) -> SimulationView {
-        let simulation_driver = gui_simulation_driver(&world, command_drain);
-        simulation_view_with_driver(simulation_driver)
-    }
-
     fn gui_simulation_driver(
         world: &Arc<Mutex<WorldState>>,
         command_drain: TestCommandDrain,
@@ -18681,11 +18677,6 @@ mod command_characterization_tests {
     /// claim. No GPUI paint callback participates in scientific scheduling.
     #[test]
     fn simulation_speed_multiplier_changes_the_observed_tick_rate() {
-        use scriptbots_runtime::{
-            CommandEnvelope, CommandId, HostCore, HostCoreOptions, HostSessionId, ManualHostDriver,
-            ManualInstant,
-        };
-
         const INTERVALS: u64 = 12;
         const PERIOD_NANOS: u64 = 10_000_000;
 
@@ -18971,6 +18962,26 @@ mod command_characterization_tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(())),
         )
+    }
+
+    fn manual_owner(paused: bool) -> HostCore {
+        let world = Arc::try_unwrap(command_characterization_world())
+            .unwrap_or_else(|_| panic!("manual owner fixture still shared"))
+            .into_inner()
+            .expect("manual owner world");
+        HostCore::new(
+            HostSessionId::new(1),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused,
+                    speed_multiplier: 1.0,
+                },
+                tick_period_nanos: 10,
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("manual GUI owner")
     }
 
     fn prime_exactly_one_driver_step(driver: &Arc<Mutex<GuiSimulationDriver>>, now: Instant) {
@@ -21094,31 +21105,45 @@ mod command_characterization_tests {
 
     #[test]
     fn gpui_pending_playback_executes_every_admitted_step_in_one_driver_wake() {
-        let world = command_characterization_world();
-        let drain = one_shot_command_drain(vec![ControlCommand::Step, ControlCommand::Step]);
-        let driver = gui_simulation_driver(&world, drain);
-        let now = Instant::now();
-        {
-            let mut driver = driver.lock().expect("GUI simulation driver lock");
-            driver.paused = true;
-            driver.last_sim_instant = Some(now);
-            driver.drive_at(now);
+        let mut owner = manual_owner(true);
+        let mut port = owner.local_port();
+        let ids = [CommandId::new(1), CommandId::new(2)];
+        for id in ids {
+            let admitted = port
+                .submit(CommandEnvelope::new(
+                    id,
+                    scriptbots_runtime::HostCommand::Step,
+                ))
+                .expect("step admission");
+            assert!(matches!(admitted.application(), ApplicationState::Admitted));
         }
-
+        let receipt = owner
+            .drive(ManualInstant::from_nanos(0))
+            .expect("owner step burst");
+        let snapshot = owner.latest_snapshot();
+        assert_eq!(receipt.scientific_steps, ids.len());
         assert_eq!(
-            world.lock().expect("world lock").tick().0,
-            2,
+            snapshot.world.tick,
+            ids.len() as u64,
             "every admitted Step command must advance one distinct scientific tick"
         );
-        let driver = driver.lock().expect("GUI simulation driver lock");
         assert!(
-            driver.snapshot().paused,
+            snapshot.playback.paused,
             "a Step burst must leave the session paused"
         );
-        assert!(
-            driver.pending_playback.is_empty(),
-            "every successfully completed Step obligation must be consumed"
-        );
+        assert_eq!(snapshot.command_queue_depth, 0);
+        for id in ids {
+            assert!(
+                matches!(
+                    port.command_status(id)
+                        .expect("step status")
+                        .expect("retained step receipt")
+                        .application(),
+                    ApplicationState::Applied(_)
+                ),
+                "every step obligation needs its own application receipt"
+            );
+        }
     }
 
     #[test]
@@ -21135,31 +21160,53 @@ mod command_characterization_tests {
                 true,
             ),
         ] {
-            let world = command_characterization_world();
-            let driver = gui_simulation_driver(&world, one_shot_command_drain(commands));
-            let now = Instant::now();
-            prime_exactly_one_driver_step(&driver, now);
-            driver
-                .lock()
-                .expect("GUI simulation driver lock")
-                .drive_at(now);
+            let mut owner = manual_owner(false);
+            owner
+                .drive(ManualInstant::from_nanos(0))
+                .expect("prime owner clock");
+            let mut port = owner.local_port();
+            let ids: Vec<_> = commands
+                .into_iter()
+                .enumerate()
+                .map(|(index, command)| {
+                    let id = CommandId::new(index as u128 + 1);
+                    let command = scriptbots_runtime::HostCommand::try_from(command)
+                        .expect("playback command");
+                    let receipt = port
+                        .submit(CommandEnvelope::new(id, command))
+                        .expect("playback admission");
+                    assert!(matches!(receipt.application(), ApplicationState::Admitted));
+                    id
+                })
+                .collect();
+            let receipt = owner
+                .drive(ManualInstant::from_nanos(10))
+                .expect("owner playback boundary");
+            let snapshot = owner.latest_snapshot();
+            assert_eq!(receipt.scientific_steps, 1);
 
             assert_eq!(
-                world.lock().expect("world lock").tick().0,
-                1,
+                snapshot.world.tick, 1,
                 "{label} must execute the admitted manual Step without also falling through to \
                  an accumulated wall-clock tick"
             );
-            let driver = driver.lock().expect("GUI simulation driver lock");
             assert_eq!(
-                driver.snapshot().paused,
-                expected_paused,
+                snapshot.playback.paused, expected_paused,
                 "{label} must preserve playback command order"
             );
-            assert!(
-                driver.pending_playback.is_empty(),
-                "{label} must consume every successful playback command"
-            );
+            assert_eq!(snapshot.command_queue_depth, 0, "{label}: drained queue");
+            for id in ids {
+                assert!(
+                    matches!(
+                        port.command_status(id)
+                            .expect("playback status")
+                            .expect("retained playback receipt")
+                            .application(),
+                        ApplicationState::Applied(_)
+                    ),
+                    "{label}: every command must apply"
+                );
+            }
         }
     }
 
@@ -21325,61 +21372,53 @@ mod command_characterization_tests {
 
     #[test]
     fn gpui_applies_drained_playback_before_stepping() {
-        let world = command_characterization_world();
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(|| {
-            vec![ControlCommand::UpdateSimulation(SimulationCommand {
+        let mut owner = manual_owner(false);
+        owner
+            .drive(ManualInstant::from_nanos(0))
+            .expect("prime owner clock");
+        let mut port = owner.local_port();
+        port.submit(CommandEnvelope::new(
+            CommandId::new(1),
+            scriptbots_runtime::HostCommand::UpdateSimulation(SimulationCommand {
                 paused: Some(true),
                 speed_multiplier: Some(0.0),
                 step_once: false,
-            })]
-        });
-        let driver = gui_simulation_driver(&world, drain);
-        let now = Instant::now();
-        prime_exactly_one_driver_step(&driver, now);
-        driver
-            .lock()
-            .expect("GUI simulation driver lock")
-            .drive_at(now);
-
-        assert_eq!(world.lock().expect("world lock").tick().0, 0);
-        let state = driver
-            .lock()
-            .expect("GUI simulation driver lock")
-            .snapshot();
+            }),
+        ))
+        .expect("pause admission");
+        let receipt = owner
+            .drive(ManualInstant::from_nanos(10))
+            .expect("pause before due tick");
+        assert_eq!(receipt.scientific_steps, 0);
+        let snapshot = owner.latest_snapshot();
+        assert_eq!(snapshot.world.tick, 0);
+        let state = snapshot.playback;
         assert!(state.paused);
         assert_eq!(state.speed_multiplier, 0.0);
     }
 
     #[test]
     fn gpui_services_world_and_resume_commands_while_paused() {
-        let world = command_characterization_world();
-        let mut updated = world.lock().expect("world lock").config().clone();
+        let host = TestHost::take(command_characterization_world());
+        host.apply(scriptbots_runtime::HostCommand::Pause);
+        let mut updated = host.snapshot().config.as_ref().clone();
         updated.food_max = 0.73;
-        let drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> = Arc::new(move || {
-            vec![
-                ControlCommand::UpdateConfig(Box::new(updated.clone())),
-                ControlCommand::UpdateSimulation(SimulationCommand {
-                    paused: Some(false),
-                    speed_multiplier: Some(1.0),
-                    step_once: false,
-                }),
-            ]
-        });
-        let driver = gui_simulation_driver(&world, drain);
-        let now = Instant::now();
-        {
-            let mut driver = driver.lock().expect("GUI simulation driver lock");
-            driver.paused = true;
-            driver.sim_accumulator = 0.0;
-            driver.last_sim_instant = Some(now);
-            driver.drive_at(now);
+        for command in [
+            ControlCommand::UpdateConfig(Box::new(updated.clone())),
+            ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: Some(1.0),
+                step_once: false,
+            }),
+        ] {
+            host.apply(
+                scriptbots_runtime::HostCommand::try_from(command).expect("paused owner command"),
+            );
         }
-
-        assert!((world.lock().expect("world lock").config().food_max - 0.73).abs() < f32::EPSILON);
-        let state = driver
-            .lock()
-            .expect("GUI simulation driver lock")
-            .snapshot();
+        let snapshot = host.snapshot();
+        assert!((snapshot.config.food_max - 0.73).abs() < f32::EPSILON);
+        assert_eq!(snapshot.world.tick, 0);
+        let state = snapshot.playback;
         assert!(!state.paused);
         assert_eq!(state.speed_multiplier, 1.0);
     }

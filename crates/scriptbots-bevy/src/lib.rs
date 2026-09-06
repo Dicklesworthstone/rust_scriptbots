@@ -608,22 +608,13 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                         state.paused = published.playback.paused;
                         state.speed_multiplier = published.playback.speed_multiplier;
                         state.pending_steps = 0;
-                        if !state.paused {
-                            state.auto_pause_reason = None;
-                        }
-                    });
-                    if !published.playback.paused
-                        && let Some(reason) = snapshot_auto_pause_reason(&published)
-                    {
-                        if command_submit(ControlCommand::Pause).is_some() {
-                            controls_for_thread.update(|state| {
-                                state.auto_pause_reason = Some(reason.clone());
-                            });
-                            info!(%reason, "Bevy auto-pause admitted by host");
+                        state.auto_pause_reason = if state.paused {
+                            snapshot_auto_pause_reason(&published)
+                                .map(|reason| format!("Pause condition met: {reason}"))
                         } else {
-                            warn!(%reason, "Bevy host refused auto-pause");
-                        }
-                    }
+                            None
+                        };
+                    });
                     let mut snapshot = WorldSnapshot::from_snapshot(&published)
                     .ok_or_else(|| {
                         anyhow!(
@@ -789,11 +780,14 @@ fn snapshot_auto_pause_reason(snapshot: &RenderSnapshot) -> Option<String> {
     let control = &snapshot.config.control;
     if control.auto_pause_on_spike_hit && summary.spike_hits > 0 {
         Some(format!("Spike hits detected ({})", summary.spike_hits))
-    } else if let Some(limit) = control.auto_pause_age_above {
-        (summary.max_age >= limit).then(|| format!("Max age {} ≥ {limit}", summary.max_age))
-    } else if let Some(limit) = control.auto_pause_population_below {
-        (summary.agent_count as u32 <= limit)
-            .then(|| format!("Population {} ≤ {limit}", summary.agent_count))
+    } else if let Some(limit) = control.auto_pause_age_above
+        && summary.max_age >= limit
+    {
+        Some(format!("Max age {} ≥ {limit}", summary.max_age))
+    } else if let Some(limit) = control.auto_pause_population_below
+        && summary.agent_count <= limit as usize
+    {
+        Some(format!("Population {} ≤ {limit}", summary.agent_count))
     } else {
         None
     }
@@ -8005,6 +7999,14 @@ mod tests {
             .control
             .auto_pause_population_below = Some(count);
         assert!(snapshot_auto_pause_reason(&policy).is_some());
+        Arc::make_mut(&mut policy.config)
+            .control
+            .auto_pause_age_above = Some(age + 1);
+        assert_eq!(
+            snapshot_auto_pause_reason(&policy),
+            Some(format!("Population {count} ≤ {count}")),
+            "an enabled but unmet age condition must not hide a met population condition"
+        );
         Arc::make_mut(&mut policy.config)
             .control
             .auto_pause_population_below = Some(count - 1);
