@@ -4,6 +4,14 @@
 
 **Evidence date:** 2026-07-11
 
+**Reality-check refresh (2026-09-06):** [Completed — TurquoiseLake; assessment only]
+Current source and retained DSR evidence are reconciled in `REALITY_CHECK_2026-09-03.md`.
+The July motivation and dependency snapshots below are historical; current pins are in
+`Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml`, and acceptance runs through pinned DSR
+profiles. The next product-critical implementation is `bd-pcfj`'s ownership transfer,
+followed by production controls/frontends and `bd-2z0.5.13` checkpoint continuation.
+Passing server runs do not close the intermittent storage/journal latency investigations.
+
 **Primary outcome:** turn the repository into a deterministic, genuinely evolving artificial-life laboratory with one correct simulation runtime, a polished FrankenTUI interface, a real GPU desktop interface, trustworthy replay/experiments, and tests that exercise the actual shipped paths.
 
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
@@ -784,12 +792,14 @@ Before a family can enter a scenario it must prove:
 
 MLP, DWRAON, and Assembly should be the first honest families. Their recurrent/working state receives family-specific checkpoint and offspring tests. NeuroFlow remains optional until its genome/evaluator-state reconstruction and introspection cost are acceptable. Candle/Tract/Tch adapters remain disabled from default scenarios until they load actual models and define reproduction semantics. `ml.placeholder` is removed from production registration.
 
-[Currently In Progress — `bd-bfkd`, TurquoiseLake, 2026-09-06: retain the Assembly arithmetic
+[Completed — `bd-bfkd`, TurquoiseLake, 2026-09-06: retain the Assembly arithmetic
 and atomic evaluator rollback, but distinguish an execution-produced non-finite state from
 invalid protocol input. The faulting agent completes a zero-output containment tick and is
 removed at its normal death boundary with explicit cause/evidence; healthy agents continue.
 Malformed sensors/envelopes and other protocol failures stay terminal. Adapter identity,
-real seeded continuation, persistence and both original long-server proofs are required.]
+real seeded continuation and persistence pass DSR46/48; the retained-seed and both original
+600-second server tests pass DSR53 at `5bb567a`. These tests terminate their child processes;
+they do not prove graceful shutdown or repair the separate intermittent admission timeout.]
 
 MLP and DWRAON now preflight the requested limits before allocating their
 activation layer; Assembly reports introspection as explicitly unsupported;

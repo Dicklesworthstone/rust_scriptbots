@@ -143,7 +143,7 @@ See the active recovery roadmap in `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBO
 ## Getting started
 
 ### Prerequisites
-- Rust toolchain: `nightly-2026-07-09`, pinned in `rust-toolchain.toml`; the
+- Rust toolchain: `nightly-2026-08-31`, pinned in `rust-toolchain.toml`; the
   workspace and locked dependency graph declare a minimum Rust version of 1.89.
   Install through `rustup`.
 - OS: Linux, macOS, or Windows 11 (native or WSL2). GPU drivers should be up to date for best GPUI performance (wgpu backends: Metal/macOS, Vulkan/Linux, D3D12 or Vulkan/Windows).
@@ -426,7 +426,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 ```
 
 ### Command-line options (scriptbots-app)
-- `--mode {auto|gui|bevy|terminal}`: select renderer. Defaults to `auto` and can be set via `SCRIPTBOTS_MODE`.
+- `--mode {auto|gui|bevy|terminal|server}`: select the frontend, or run the control servers without a renderer. Defaults to `auto` and can be set via `SCRIPTBOTS_MODE`.
   - `auto`: choose GPUI, then Bevy, only when that backend is compiled and a real native graphical session is available; otherwise use the terminal.
   - `gui`: require GPUI; an uncompiled feature or native window launch failure is returned to the caller.
   - `bevy`: require the Bevy frontend and fail clearly unless built with the `bevy_render` application feature.
@@ -482,7 +482,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
 - `RAYON_NUM_THREADS` — set simulation thread pool size when `parallel` is enabled.
-- `SCRIPTBOTS_MODE` — `auto|gui|bevy|terminal` (renderer selection).
+- `SCRIPTBOTS_MODE` — `auto|gui|bevy|terminal|server` (frontend or server-only selection).
 - `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — override Auto-mode renderer detection (`1|true|yes`); explicit `--mode` remains authoritative.
 - `SCRIPTBOTS_BOOTSTRAP_TICKS` — explicit pre-frontend science ticks (default `0`, equivalent to `--bootstrap-ticks`; set a nonzero value only when an intentional warmup is part of the run).
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
@@ -607,7 +607,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - **Narration hooks** prepared for future screen-reader integration; the toggle stays beside the World presentation controls.
 
 ### Renderer abstraction
-- The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features). Every frontend consumes the same world and immutable analytics snapshots.
+- The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features); `--mode server` runs without a renderer. Frontends still use the transitional ownership paths described above; production HostClient migration remains open.
 
 ### Keyboard shortcuts (GUI)
 
@@ -967,12 +967,13 @@ MCP quickstart:
   - ✅ Event-log schema (`replay_events` table) and typed event encoding.
   - ✅ Type-safe encoding for replay artifacts shared by storage and analytics crates.
   - ✅ Storage plumbing to persist replay batches alongside standard metrics.
-  - ✅ Headless runner and CLI comparison scaffold that refuses vacuous nonzero runs.
-  - ✅ Persistence-disabled core science checkpoint with strict restore and next-transition proof; application discovery/resume remain planned.
+  - ✅ Headless runner and CLI event comparison that refuses vacuous nonzero runs.
+  - ✅ Production RNG, brain-output, action and world-digest event instrumentation. The remaining cross-tick action-cap defect is tracked by `bd-a9h1`.
+  - ✅ Mock-free positive and perturbed-candidate event-replay test implementation in `crates/scriptbots-app/tests/replay_e2e.rs`; this is separate from checkpoint-start replay.
+  - ✅ Persistence-disabled core science checkpoint with strict restore and next-transition proof; production resume remains planned.
 - **Planned**
-  - ❌ Production instrumentation for nonempty RNG/brain/action event streams.
+  - ❌ Production checkpoint capture, full host/session restore and checkpoint-start replay (`bd-2z0.5.13`). The CLI currently discovers a checkpoint but re-simulates from tick zero.
   - ❌ Branch/diff workflows comparing Rust vs. Rust PR builds vs. the legacy C++ baseline.
-  - ❌ Mock-free positive and perturbed-candidate E2E proofs.
   - ❌ FrankenSQLite-backed analysis views for quick triage of regressions and experiment outcomes.
 - **Use cases**
   - Parity testing between the Rust port and the original C++ implementation.
@@ -1148,7 +1149,7 @@ seeded simulation and report journey remains open under `bd-2z0.11.9`.
 7. DSR packaging and verification: release builds, binaries, and WASM/browser evidence from the pinned repository profile.
 
 ### Mixed brain families (default)
-- The app now registers multiple brain families by default (MLP, DWRAON, Assembly experimental, NeuroFlow) and seeds mixed populations automatically. Random spawns are bound to a sampled brain family.
+- The default mixed founders use the versioned MLP, DWRAON and experimental Assembly families, plus FtBrain when `brain-ft` is enabled. Optional NeuroFlow is registered but withheld from mixed founders because it lacks the versioned heredity contract; `--brain neuro` explicitly selects its legacy runner when the `neuro` feature is enabled.
 - NeuroFlow is enabled in the default config; edit at runtime via REST/CLI or env (e.g., SCRIPTBOTS_NEUROFLOW_*).
 - Brain-material crossover only occurs within the same family (species barrier). On the scheduled population-crossover path, incompatible selected parents cause that arrival to become a fresh spawn sampled from the brain registry.
 - Natural reproduction does not use that fallback: a cross-family partner may contribute body/runtime traits and whole-agent lineage, while the child's brain clones and mutates only the primary parent's genome. The incompatible partner is excluded from brain provenance, so no hybrid brain is fabricated.

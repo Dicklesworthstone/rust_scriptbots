@@ -1,5 +1,198 @@
 # Reality Check — rust_scriptbots — execution refreshed 2026-09-06
 
+## Comprehensive reassessment — 2026-09-06
+
+**Verdict: a functioning simulation and substantial scientific infrastructure, not yet the
+finished Evolution Lab.** The largest remaining return comes from connecting production
+ownership, checkpoint continuation and scientific consumers. More isolated helpers or another
+planning framework will not complete that journey. The host transfer is a substantial coordinated
+change, not a one-line wiring fix.
+
+**Audit boundary:** source `0b8d6e255e27ef216cdd15a207b5de3d530a61e3` on `main`.
+Read all 1,031 lines of AGENTS.md and all 1,155 lines of README.md before assessment,
+recovering truncated read ranges. Read the entire 3,688-line authoritative recovery plan,
+the changed architecture and graph-report documents, and the reality-check skill and its five
+references. Other plan/spec documents retain the earlier audit's full reading: a Markdown diff
+from `fa1fb08b` identifies only the recovery plan, README, this report, architecture and graph
+reports as changed. Historical plans remain subordinate to the recovery plan and current code.
+This refresh combines new source/tracker inspection with explicitly retained executions below;
+it does not claim every test or every line of Rust was freshly executed or inspected.
+
+### The five answers
+
+1. **What works?** Real mixed-family worlds evolve and advance through production server mode;
+   REST/MCP control has real process tests. Assembly nonfinite execution is contained to the
+   faulting agent, preserving healthy-world continuation and recording its exact cause. Genome,
+   RNG, digest and core checkpoint machinery are substantial tested implementations. The real
+   FrankenSQLite worker persists runs; graph readers/exporters, experiment runners, bundles and
+   literal extension recipes are implemented. Their individual evidence does not automatically
+   certify every frontend or the complete laboratory workflow.
+2. **What is missing or faulty?** Production still shares mutable world ownership. Replay reads
+   checkpoint metadata but starts at tick zero. Full FrankenTUI, primary instanced Bevy,
+   browser acceptance, scientific report integration and repeatable release delivery remain
+   incomplete. Intermittent storage admission and journal latency remain unresolved despite
+   later successful server runs. GPU sensing accumulation is still a placeholder.
+3. **What blocks completion?** First, the atomic host cutover and its consumer migration;
+   second, real checkpoint/session persistence and continuation; third, full science and
+   frontend acceptance at their joins. Native visual/performance evidence needs its actual
+   suitable DSR host. DSR is now operational for named Linux correctness lanes: missing local
+   configuration is no longer a blanket explanation for unfinished work.
+4. **Would completing all unfinished beads close the gap?** Their stated scope broadly covers
+   the vision, including the composed journey proof. Yes, if completion means satisfying those
+   actual acceptance conditions, including their negative controls and required surfaces.
+   Merely closing implementation tickets would not: some historical closures overstate proof,
+   and library capabilities still need production consumers. No defensible percentage or
+   delivery date follows from the issue count.
+5. **Which goals lack a bead?** No additional wholly untracked goal was established in this
+   refresh's 25-goal cross-check. Existing owners cover the identified gaps. A concrete tracking
+   weakness was found instead: `bd-pcfj` had extensive design/comments but no description or
+   acceptance field. Both are now populated. Existing release and final-journey beads carry
+   documentation contradictions and the missing distinction between liveness and graceful
+   shutdown. No duplicate feature beads were created.
+
+### Current evidence, including its limits
+
+The complete tracker snapshot contains **664 issues: 477 closed, 178 open, 8 in progress,
+1 blocked**; therefore **187 unfinished**. Initial authoritative BV analysis reports 89
+graph-actionable items versus **64 BR-ready**; only BR readiness authorizes claims. This
+refresh changes acceptance/details, not ownership, priorities, dependency edges or closure.
+
+The previous continuation actually executed DSR53 at `5bb567a`: all three original/retained-seed
+600-second server tests passed, along with workspace all-target checking and final packaging.
+DSR51 at `fb15a70` passed workspace strict Clippy, checking, 68 main tests and the normal real
+REST/MCP process test. This audit rechecked the two retained verdict hashes:
+
+- DSR53: `9d42d653b363aec03200989f07a00704dccd9ef7231537180f656eccfd006d09`.
+- DSR51: `75a923651248932fbbc40b972e1b92374ca44fc148be32721bfb5fde04b4a278`.
+
+There is no change in `crates`, Cargo manifests/lockfile or scripts between `5bb567a` and the
+audit source. These are retained, source-applicable runs, not newly rerun tests. DSR48's 860
+core/brain tests and 697 scalar core tests passed within an overall failed lane; DSR49's 408
+app-library tests passed before its packaging failure. The detailed execution ledger below
+retains these failures and exact source boundaries; neither failed lane becomes an overall pass.
+
+DSR53's children are forcibly terminated by the test. The memory test's last actual successful
+HTTP observation was at 590,512 ms, although total elapsed time exceeded 600 seconds. Neither
+fact proves graceful shutdown. DSR47's file admission timeout used a different seed from DSR53's
+successful file run. DSR50's same-seed diagnostic used a different host and ended by timeout.
+Consequently `bd-w1oi` and `bd-j8o2` remain open investigations, not fixes inferred from a green run.
+
+No fresh full-workspace test suite, GUI pixels, real PTY lifecycle, browser execution or exact-class
+performance comparison is claimed by this reassessment. The latest GitHub release API, checked
+again here, reports [v0.1.1, published July 22](https://github.com/Dicklesworthstone/rust_scriptbots/releases/tag/v0.1.1)
+with zero attached assets. Local DSR packaging does not publish a usable release.
+
+### Refreshed vision checklist and bridge
+
+The IDs preserve the initial checklist below. PARTIAL names a missing product requirement,
+not a claim that all its components fail. UNPROVEN is an execution boundary. Existing detailed
+beads remain the implementation contracts; this table states the missing observable outcome.
+
+| Goal | Reality and missing observation | Existing bridge owners |
+|---|---|---|
+| V01 default living meadow | PARTIAL: scenario/founders exist; production first-run GUI/TUI parity and cohort proof remain. An unspecified seed is materialized and disclosed, not a fixed default seed. | `bd-2z0.10.4`, `bd-2z0.10.5`, `bd-bacf` |
+| V02 one simulation owner | PARTIAL, critical: `main.rs` constructs `SharedWorld`; `ControlHandle::with_world` locks it. `HostThread` construction exists in the adapter, but its spawn callers are tests. | `bd-pcfj`, `bd-88yj`, `bd-2z0.6.1`, `bd-2z0.7.2`, `bd-37m` |
+| V03 acknowledged controls | PARTIAL: actual REST/MCP tests pass; production HostClient, complete journal-axis and stream recovery integration remain. | `bd-5dkk`, `bd-6mus`, `bd-g6wf`, `bd-ydu8`, `bd-2z0.12.2` |
+| V04 heritable brains | Core MLP/DWRAON/Assembly execution and containment have retained proof. Broader family program PARTIAL; NeuroFlow remains legacy/withheld from mixed founders. | `bd-2z0.3.12.3` through `.6` for FtBrain completion |
+| V05 honest ML capability | PARTIAL: Candle tensor code exists, while default `ml.placeholder` copies sensors. A tensor helper is not an installed evolutionary family. | `bd-1bdd`, brain-family program `bd-2z0.3` |
+| V06 deterministic science | Substantial retained kernel proof; PARTIAL for full scientific claims, knob witnesses and the intended sensing baseline. | `bd-dorx`, `bd-3mul`, `bd-6i23`, `bd-m30b` |
+| V07 checkpoint continuation | PARTIAL, critical: `run_replay_cli` loads/logs a checkpoint then calls the ordinary headless runner; full host/session restore is absent there. | `bd-2z0.5.13`, `bd-2z0.11.4` |
+| V08 durable reliable storage | PARTIAL: real outbox/recovery/readback; intermittent admission and journal waits, bounded reaping and preparation remain unresolved. | `bd-w1oi`, `bd-j8o2`, `bd-2z0.5.14`, `bd-2z0.5.17` |
+| V09 experiments and bundles | PARTIAL: implemented persisted sweeps and bundle verification; interrupted continuation and independent-checkout whole-study reproduction remain. | `bd-2z0.5.13`, `bd-2z0.11.4`, `bd-16g.1.7`, `bd-2z0.13.11` |
+| V10 bounded responsive snapshots | PARTIAL: runtime hub/projection exists; app readers still use world locks and retained scaling/latency acceptance remains. | `bd-pcfj`, `bd-2z0.4.8.1`, `bd-2z0.4.16`, `bd-g6wf` |
+| V11 FrankenTUI laboratory | PARTIAL: the production terminal is Ratatui; improved real buffer goldens do not establish ftui integration or PTY behavior. | `bd-2z0.6.1`, `.6.5`, `.6.6`, `.6.8`, `bd-dkd9`, `bd-2z0.14.2.5` |
+| V12 primary Bevy frontend | PARTIAL: real rendering exists; sole-owner integration, instancing and accepted actual-frame semantic parity remain. | `bd-2z0.7.2` through `.4`, `bd-d26y`, `bd-2z0.14.3.9` |
+| V13 cinematic visual program | PARTIAL: terrain, water, creatures, lighting, effects and audio have unfinished production wiring and frame budgets. | `bd-2z0.14.1`, `bd-ogcs`, `bd-rl1h`, `bd-2z0.14.3.5.3` |
+| V14 scientific inspection | PARTIAL: bounded projections exist; live edge attribution, lineage views and eye-selection consumers remain. | `bd-16g.4.4`, `.4.5`, `.3.4`, `.3.5`, `bd-r7cz`, `bd-2z0.7.15` |
+| V15 distinct scenarios | PARTIAL: literal scenario execution now has proof; it does not certify every default product surface or cohort. | `bd-2z0.10.4`, `.10.5`, `.13.3` |
+| V16 scientific reports/graphs | PARTIAL: bounded canonical interactions, multievent count/weight exports and graph proof repaired since initial audit. Whole seeded-run report-suite acceptance remains. | `bd-2z0.11.9`, `.11.6`, `bd-metric-summary-test-memory-8wxv` |
+| V17 narrative timeline | PARTIAL: detector/persistence code exists; complete persisted-input parity, once-only online evidence and scrub/focus UX remain. | `bd-16g.2.9` through `.11`, `bd-ji3a`, `bd-farh` |
+| V18 information theory/QD/communication | PARTIAL: estimator/archive algorithms are insufficient without production callers, persisted archive and scenario evidence. Core still only declares the infotheory module. | `bd-xqd5`, `bd-r4ja`, `bd-16g.6`, `bd-16g.7` |
+| V19 islands/migration | PARTIAL: isolated production island CLI/persistence now exists; migration continuation, parallel topology, scaling and views remain. | `bd-5tyo`, `bd-16g.5.4`, `.5.5`, `bd-t3ge`, `bd-brw4` |
+| V20 autonomous laboratory | PARTIAL: actual matched-seed executor exists; full budgeted state machine, reproducible notebook and adversarial full-stack execution remain. | `bd-16g.1.3`, `.1.7`, `bd-16g.16` |
+| V21 browser product | PARTIAL: Canvas/WASM demo exists; real browser proof, durable browser persistence and packaging remain. | `bd-2z0.12.3`, `.12.4`, `.12.7`, `bd-ywtv`, `bd-azi3` |
+| V22 sharing/theater/tournaments/audio | PARTIAL: supporting code exists; fork/gallery, encoder, ratings and live sound transport acceptance remain. | `bd-16g.8`, `.9`, `.12`, `.14` |
+| V23 GPU scientific sensing | STUB for WGSL accumulation: shader only writes zero to saturations. CPU fixed-point primitives do not prove a GPU sense pass. | `bd-16g.15.2`, `.15.3` |
+| V24 performance budgets | UNPROVEN by this refresh; preserve historical exact-class CPU evidence separately. 1k/5k gates do not prove the 10k publication or GUI frame target. | `bd-h33`, `bd-kuho`, `bd-2z0.7.7`, `.4.15`, `.14.3.5.3` |
+| V25 reproducibility/release | PARTIAL: DSR correctness/profile execution and literal recipes now work; fresh-host acceptance, product matrix and published assets remain. | `bd-build-farm-reliability-lb19.2`, `bd-1bdd`, `bd-2z0.13.9`, `.13.11`, `.9.2`, `.9.3` |
+
+### Execution order and acceptance TODO
+
+- [ ] **P0 / large: production host cutover (`bd-pcfj`).** Transfer the world, journal and
+  persistence session; migrate all affected consumers and fixtures together. Preserve final
+  digest capture and shutdown ordering. Prove one step, two observers, no repaint-driven science,
+  real receipt transitions and responsive snapshot/status reads. Existing consumer tasks then
+  finish their broader interaction/stream/worker contracts. Do not put them back upstream and
+  recreate the historical dependency deadlock.
+- [ ] **P1 / large: checkpoint continuation (`bd-2z0.5.13`).** Persist the complete supported
+  host/session envelope, restore executable brain identities and RNG continuation, and start
+  at the saved tick. Compare subsequent stage digests to tick-zero execution; corrupt or foreign
+  state must fail with the first differing stage. Depends on the production ownership contract.
+- [ ] **P1 / investigation: persistent-run reliability (`bd-w1oi`, `bd-j8o2`).** Retain exact
+  failing seeds/hosts, distinguish preparation/admission/application/durability latency, and
+  prove a causal repair. Keep original budgets and successful controls. Do not infer bounded
+  cleanup from a controller timeout. This investigation can proceed alongside host work.
+- [ ] **P1 / medium-to-large joins: reports, notebook and timeline.** Consume actual persisted
+  artifacts through existing report APIs; prove cohort completeness, capture accounting,
+  null/planted-effect behavior and offline/online identity. Use `bd-2z0.11.9`, `bd-16g.1.7`,
+  `bd-16g.2.9` and `bd-xqd5`, not another generic analytics abstraction.
+- [ ] **Large feature programs: terminal, Bevy and browser.** Execute existing surface-specific
+  tasks against the shared host contract. Keep actual GPU/PTY/browser evidence separate from
+  library, CPU-capture and TestBackend evidence. Preserve the cinematic/scientific feature list.
+- [ ] **Independent evidence work: DSR portability and performance.** Complete fresh-host proof
+  and exact-class benchmark obligations; no cross-host delta, dirty golden or synthetic baseline.
+- [ ] **Final product acceptance (`bd-2z0.13.9` → `.13.11`).** One declared source/cohort flows
+  through launch, inspection, acknowledged intervention, durable history, checkpoint continuation,
+  comparison, report, bundle and independent-checkout verification. Every required surface and
+  stage must pass; retain legitimate experimental/unsupported states without promoting them.
+- [ ] **Release truth (`bd-1bdd`).** Complete the product/platform matrix, media/source evidence,
+  SBOM disposition and supported command execution. Reconcile historical V8/V9 proof: the bead
+  is closed with a DSR assertion, but its visible comments end at pending; this audit has not
+  independently recovered that historical proof. Do not silently promote or reopen it from
+  either prose alone.
+
+### All skill phases and refinement deltas
+
+Phase 1 used documentation, production caller inspection, placeholder searches, exact tracker
+coverage, retained executable evidence and the current release API. The fresh Rust macro search
+finds five `unimplemented!` sites in test code; the behavioral ML/WGSL placeholders above show why
+that count cannot certify implementation. Phase 2 is the checklist and ordered bridge above.
+Phase 3a uses the frozen operator retained below: reuse existing owners, fill `bd-pcfj`'s missing
+self-contained contract, and record release evidence in `bd-1bdd` rather than duplicate tickets.
+
+Three ambition rounds broadened and then grounded the bridge:
+
+1. **From working server to usable laboratory:** require one ownership contract across every
+   surface, including exports and final digest, not merely a new HostCore construction call.
+2. **From replay to repeatable experiments:** require a saved-tick continuation whose output
+   feeds the same matched-seed study and independent bundle verification. The existing checkpoint,
+   notebook and composed-journey owners already cover this; no speculative new framework is needed.
+3. **From green runs to falsifiable reliability:** separate successful polling, scientific
+   progress, durable receipt and graceful shutdown. Preserve exact seed/host controls and genuine
+   scientific nulls. This produced an additional final-journey acceptance item.
+
+Phase 3a was reapplied after those rounds to the same existing tasks. Five refinement passes
+used the unchanged frozen operator below:
+
+1. **Completeness:** found the empty description/acceptance on `bd-pcfj`; populated its concrete
+   production seams, preserved behavior, tests and failure observations without changing owner.
+2. **Dependency/optimality:** rechecked its actual prerequisites and the final journey dependency
+   list. Kept the established host-first direction; no duplicate frontend prerequisite cycle or
+   new dependency edge was needed.
+3. **Test discrimination:** added the final journey criterion that distinguishes the original
+   600-second tests, last actual HTTP time, exact seed/host recurrence and graceful shutdown.
+4. **Claim consistency:** corrected README toolchain, server mode, mixed-founder and replay
+   implementation statements; corrected the completed Assembly plan marker. Historical V8/V9
+   closure-versus-proof ambiguity remains explicitly assigned to `bd-1bdd`.
+5. **Bounded convergence:** reviewed the updated contracts against all 25 goal owners and the
+   unchanged dependency directions. No further task, dependency or acceptance change was needed
+   in this bridge. This is not an assertion that all 664 issues or all code are defect-free.
+
+No implementation bead was closed by this planning refresh. The detailed prior execution TODO
+below remains the evidence ledger; the bridge above is the current product priority order.
+Authoritative BV insight validation computes an empty cycle list. Its readiness distinction
+remains 89 graph-actionable versus 64 BR-ready; no graph edge changed in this refresh.
+
 ## Execution TODO — started 2026-09-05
 
 Current continuation — **2026-09-06, verified executable source `5bb567a`, TurquoiseLake**. The earlier entries below retain
