@@ -771,7 +771,11 @@ mod tests {
             identity, previous,
             "changed fault policy must change science identity"
         );
-        println!("Assembly v4 semantic identity: {identity}");
+        assert_eq!(
+            identity.to_string(),
+            "b1afb60299bc2651c09bdfa2f857cda50de94d47b5441a8edda8428e66200199",
+            "DSR46 observed identity for the reviewed v4 fault policy"
+        );
     }
 
     #[test]

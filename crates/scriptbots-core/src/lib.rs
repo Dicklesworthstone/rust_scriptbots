@@ -44891,8 +44891,14 @@ mod tests {
         });
         let faulty = world.spawn_agent(AgentData::default());
         let survivor = world.spawn_agent(AgentData::default());
+        // Five rows exercise both the four-lane SIMD loop and its scalar remainder.
+        world.spawn_agent(AgentData {
+            position: Position::new(200.0, 0.0),
+            ..AgentData::default()
+        });
+        let faulty_tail = world.spawn_agent(AgentData::default());
         world.agent_runtime_mut(corpse).expect("corpse").spiked = true;
-        for agent in [faulty, survivor] {
+        for agent in [faulty, faulty_tail, survivor] {
             world
                 .agent_runtime_mut(agent)
                 .expect("neighbor")
@@ -44902,14 +44908,15 @@ mod tests {
             .agent_runtime(survivor)
             .expect("survivor")
             .reproduction_counter;
-        let dead =
-            [corpse, faulty].map(|agent| (world.agents.index_of(agent).expect("index"), agent));
-        let faulty_health = world.agents.snapshot(faulty).expect("faulty row").health;
+        let dead = [corpse, faulty, faulty_tail]
+            .map(|agent| (world.agents.index_of(agent).expect("index"), agent));
         let _ = world.distribute_carcass_rewards(&dead);
-        assert_eq!(
-            world.agents.snapshot(faulty).expect("faulty row").health,
-            faulty_health
-        );
+        for agent in [faulty, faulty_tail] {
+            assert_eq!(
+                world.agents.snapshot(agent).expect("faulty row").health,
+                1.0
+            );
+        }
         assert!(
             (world
                 .agents

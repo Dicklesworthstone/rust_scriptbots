@@ -188,7 +188,8 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
     server)
         run_step server-check check cargo check --locked --workspace --all-targets
         run_step server-tests test cargo test --locked -p scriptbots-app --test real_process_control_e2e -- --nocapture
-        run_step server-storage-tests test cargo test --locked -p scriptbots-app --test real_process_control_e2e bd_w1oi -- --ignored --nocapture
+        # Both original storage scenarios and the exact seeded Assembly overflow regression.
+        run_step server-storage-tests test cargo test --locked -p scriptbots-app --test real_process_control_e2e -- --ignored --nocapture
         ;;
     workspace)
         run_step workspace-check check cargo check --locked --workspace --all-targets

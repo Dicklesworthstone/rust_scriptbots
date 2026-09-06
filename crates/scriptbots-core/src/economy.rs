@@ -33,7 +33,7 @@
 )]
 #![allow(clippy::float_cmp, clippy::while_float)]
 
-#[cfg(feature = "economy-faults")]
+#[cfg(all(test, feature = "economy-faults"))]
 use crate::LedgerFault;
 use crate::{RESOURCE_FLOW_KINDS, ResourceAmounts, ResourceFlowKind, ResourceLedgerTick, Tick};
 use serde::{Deserialize, Serialize};
