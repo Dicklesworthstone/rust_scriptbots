@@ -606,7 +606,9 @@ fn main() -> Result<()> {
             anyhow::anyhow!("control listeners were not reserved before runtime startup")
         })?;
         let (control_runtime, command_submit) = control_reservation.launch(host_port.clone())?;
-        if renderer.name() != "terminal" && command_submit(scriptbots_core::ControlCommand::Resume).is_none() {
+        if renderer.name() != "terminal"
+            && command_submit(scriptbots_core::ControlCommand::Resume).is_none()
+        {
             return Err(anyhow!("host refused initial resume"));
         }
         info!(

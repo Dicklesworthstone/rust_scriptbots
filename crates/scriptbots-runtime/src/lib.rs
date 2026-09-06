@@ -1786,12 +1786,16 @@ impl HostCommand {
     pub fn validate(&self) -> Result<(), CommandValidationError> {
         match self {
             Self::UpdateSimulation(update) => {
-                if update.paused.is_none() && update.speed_multiplier.is_none() && !update.step_once {
+                if update.paused.is_none() && update.speed_multiplier.is_none() && !update.step_once
+                {
                     return Err(CommandValidationError::InvalidWorldCommand {
                         message: "simulation update does not request an operation".to_owned(),
                     });
                 }
-                if update.speed_multiplier.is_some_and(|speed| !speed.is_finite() || speed < 0.0) {
+                if update
+                    .speed_multiplier
+                    .is_some_and(|speed| !speed.is_finite() || speed < 0.0)
+                {
                     return Err(CommandValidationError::InvalidSpeed);
                 }
                 Ok(())
@@ -1855,7 +1859,14 @@ impl HostCommand {
     /// Whether successful application advances exactly one scientific tick.
     #[must_use]
     pub const fn requests_step(&self) -> bool {
-        matches!(self, Self::Step | Self::UpdateSimulation(SimulationCommand { step_once: true, .. }))
+        matches!(
+            self,
+            Self::Step
+                | Self::UpdateSimulation(SimulationCommand {
+                    step_once: true,
+                    ..
+                })
+        )
     }
 }
 
@@ -6960,10 +6971,15 @@ mod tests {
                         }
                         if update.step_once {
                             self.playback.paused = true;
-                            self.tick.0 = self.tick.0.checked_add(1)
+                            self.tick.0 = self
+                                .tick
+                                .0
+                                .checked_add(1)
                                 .ok_or_else(|| protocol_violation("tick exhausted"))?;
-                            self.revisions.scientific = self.revisions.scientific.checked_next()
-                                .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+                            self.revisions.scientific =
+                                self.revisions.scientific.checked_next().ok_or_else(|| {
+                                    protocol_violation("scientific revision exhausted")
+                                })?;
                         }
                     }
                     HostCommand::Pause => self.playback.paused = true,

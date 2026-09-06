@@ -489,7 +489,13 @@ impl ControlHandle {
                 total_energy: snapshot.world.summary.total_energy,
                 average_energy: snapshot.world.summary.average_energy,
                 average_health: snapshot.world.summary.average_health,
-                max_age: snapshot.world.agents.iter().map(|agent| agent.age).max().unwrap_or(0),
+                max_age: snapshot
+                    .world
+                    .agents
+                    .iter()
+                    .map(|agent| agent.age)
+                    .max()
+                    .unwrap_or(0),
                 spike_hits: 0,
             }))
     }
@@ -1453,7 +1459,13 @@ pub(crate) mod tests {
     }
 
     fn handle() -> (ControlHandle, TestHost) {
-        let host = TestHost::spawn(WorldState::new(ScriptBotsConfig { rng_seed: Some(42), ..ScriptBotsConfig::default() }).expect("world"));
+        let host = TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("world"),
+        );
         (host.handle(), host)
     }
 
@@ -2248,7 +2260,11 @@ pub(crate) mod tests {
         );
 
         receiver.wait_applied(&retry);
-        assert_eq!(handle.status().expect("status").tick, 1, "a retried Step must advance once");
+        assert_eq!(
+            handle.status().expect("status").tick,
+            1,
+            "a retried Step must advance once"
+        );
     }
 
     /// Positive control: distinct keys are distinct commands.
@@ -2273,7 +2289,11 @@ pub(crate) mod tests {
         );
 
         receiver.wait_applied(&second);
-        assert_eq!(handle.status().expect("status").tick, 2, "distinct Steps must both apply");
+        assert_eq!(
+            handle.status().expect("status").tick,
+            2,
+            "distinct Steps must both apply"
+        );
     }
 
     /// An unkeyed submit stays non-idempotent, as every existing caller expects.
@@ -2398,7 +2418,13 @@ pub(crate) mod tests {
             .expect("enqueue selection command");
 
         host.wait_applied(&receipt);
-        let entries = handle.debug_agents(AgentDebugQuery { ids: Some(vec![raw_id]), selection: Some(SelectionState::Selected), ..AgentDebugQuery::default() }).expect("selected agent query");
+        let entries = handle
+            .debug_agents(AgentDebugQuery {
+                ids: Some(vec![raw_id]),
+                selection: Some(SelectionState::Selected),
+                ..AgentDebugQuery::default()
+            })
+            .expect("selected agent query");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].agent_id, raw_id);
     }
@@ -2412,7 +2438,10 @@ pub(crate) mod tests {
         // this command and the legacy bus journals nothing (bd-f65w).
         assert_eq!(status_pause.application_state, APPLICATION_STATE_ADMITTED);
         assert_eq!(status_pause.journal_state, "pending");
-        assert_eq!(status_pause.command_id.len(), CommandId::new(1).to_string().len());
+        assert_eq!(
+            status_pause.command_id.len(),
+            CommandId::new(1).to_string().len()
+        );
 
         let status_resume = handle.resume(None).expect("resume command");
         assert_ne!(status_pause.command_id, status_resume.command_id);
@@ -2437,7 +2466,9 @@ pub(crate) mod tests {
             .expect("found status");
         assert_eq!(looked_up.command_id, status_pause.command_id);
 
-        let non_existent = handle.command_status(&CommandId::new(9999).to_string()).expect("lookup");
+        let non_existent = handle
+            .command_status(&CommandId::new(9999).to_string())
+            .expect("lookup");
         assert!(non_existent.is_none());
 
         let err = handle

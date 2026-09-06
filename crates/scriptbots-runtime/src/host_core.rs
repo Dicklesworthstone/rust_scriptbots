@@ -1925,16 +1925,22 @@ fn account_narrative_payload(
     events: &Vec<scriptbots_core::narrative::EventRecord>,
     newly_allocated: bool,
 ) {
-    let mut bytes = events.capacity().saturating_mul(size_of::<scriptbots_core::narrative::EventRecord>());
+    let mut bytes = events
+        .capacity()
+        .saturating_mul(size_of::<scriptbots_core::narrative::EventRecord>());
     let mut allocations = usize::from(events.capacity() != 0);
     for event in events {
-        bytes = bytes.saturating_add(event.metric.capacity()).saturating_add(event.human_text.capacity());
-        allocations = allocations.saturating_add(usize::from(event.metric.capacity() != 0))
+        bytes = bytes
+            .saturating_add(event.metric.capacity())
+            .saturating_add(event.human_text.capacity());
+        allocations = allocations
+            .saturating_add(usize::from(event.metric.capacity() != 0))
             .saturating_add(usize::from(event.human_text.capacity() != 0));
     }
     build.total_payload_capacity_bytes = build.total_payload_capacity_bytes.saturating_add(bytes);
     if newly_allocated {
-        build.newly_allocated_capacity_bytes = build.newly_allocated_capacity_bytes.saturating_add(bytes);
+        build.newly_allocated_capacity_bytes =
+            build.newly_allocated_capacity_bytes.saturating_add(bytes);
         build.bulk_allocations = build.bulk_allocations.saturating_add(allocations);
     }
 }
@@ -2137,12 +2143,21 @@ impl HostCore {
                 .collect::<Vec<_>>(),
         );
         let last_published_intervention_seq = latest_intervention_seq(&world);
-        let narrative_events = Arc::new(world.narrative_events().iter().cloned().collect::<Vec<_>>());
+        let narrative_events =
+            Arc::new(world.narrative_events().iter().cloned().collect::<Vec<_>>());
         account_narrative_payload(&mut build, &narrative_events, true);
         let initial_snapshot = Arc::new(RenderSnapshot {
             narrative_events,
             narrative_dropped_events: world.narrative_dropped_events(),
-            hybrid_count: world.agents().iter_handles().filter(|id| world.agent_runtime(*id).is_some_and(|runtime| runtime.hybrid)).count(),
+            hybrid_count: world
+                .agents()
+                .iter_handles()
+                .filter(|id| {
+                    world
+                        .agent_runtime(*id)
+                        .is_some_and(|runtime| runtime.hybrid)
+                })
+                .count(),
             session_id,
             revision: SnapshotRevision::new(1),
             revisions,
@@ -2428,30 +2443,63 @@ impl HostCore {
                 message: "sensor explanation contributor limit exceeded".to_owned(),
             });
         }
-        let Some(id) = self.world.agents().iter_handles()
-            .find(|id| self.world.agent_uid(*id) == Some(uid)) else { return Ok(None); };
-        let Some(runtime) = self.world.agent_runtime(id) else { return Ok(None); };
+        let Some(id) = self
+            .world
+            .agents()
+            .iter_handles()
+            .find(|id| self.world.agent_uid(*id) == Some(uid))
+        else {
+            return Ok(None);
+        };
+        let Some(runtime) = self.world.agent_runtime(id) else {
+            return Ok(None);
+        };
         let latest = self.latest_snapshot();
         let genome_browser = if let Some(envelope) = self.world.agent_brain_genome(id) {
-            let parents: Vec<_> = envelope.provenance().parents.iter().flatten().copied().collect();
+            let parents: Vec<_> = envelope
+                .provenance()
+                .parents
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
             let parent = parents.first().and_then(|parent_uid| {
                 self.world.agents().iter_handles().find_map(|handle| {
                     (self.world.agent_uid(handle) == Some(*parent_uid))
-                        .then(|| self.world.agent_brain_genome(handle)).flatten()
+                        .then(|| self.world.agent_brain_genome(handle))
+                        .flatten()
                 })
             });
-            let index = self.world.agents().index_of(id).ok_or_else(|| HostAccessError::ProtocolViolation {
-                message: "inspected agent missing its dense index".to_owned(),
+            let index = self.world.agents().index_of(id).ok_or_else(|| {
+                HostAccessError::ProtocolViolation {
+                    message: "inspected agent missing its dense index".to_owned(),
+                }
             })?;
-            self.world.brain_registry().family_by_id(envelope.family_id()).map(|codec| {
-                scriptbots_core::genome_browser::GenomeBrowserViewModel::build(
-                    codec, uid, self.world.agents().columns().generations()[index].0,
-                    self.world.tick(), envelope, parent, parents, None, None, 0, 20,
-                )
-            }).transpose().map_err(|error| HostAccessError::ProtocolViolation {
-                message: format!("genome inspection failed: {error}"),
-            })?
-        } else { None };
+            self.world
+                .brain_registry()
+                .family_by_id(envelope.family_id())
+                .map(|codec| {
+                    scriptbots_core::genome_browser::GenomeBrowserViewModel::build(
+                        codec,
+                        uid,
+                        self.world.agents().columns().generations()[index].0,
+                        self.world.tick(),
+                        envelope,
+                        parent,
+                        parents,
+                        None,
+                        None,
+                        0,
+                        20,
+                    )
+                })
+                .transpose()
+                .map_err(|error| HostAccessError::ProtocolViolation {
+                    message: format!("genome inspection failed: {error}"),
+                })?
+        } else {
+            None
+        };
         Ok(Some(crate::channel::AgentInspectorData {
             source: BrainProjectionSource {
                 session_id: self.session_id,
@@ -3109,9 +3157,13 @@ impl HostCore {
             )
         };
         let previous = self.snapshots.latest();
-        let narrative_unchanged = previous.narrative_dropped_events == self.world.narrative_dropped_events()
-                    && previous.narrative_events.len() == self.world.narrative_events().len()
-                    && previous.narrative_events.iter().eq(self.world.narrative_events().iter());
+        let narrative_unchanged = previous.narrative_dropped_events
+            == self.world.narrative_dropped_events()
+            && previous.narrative_events.len() == self.world.narrative_events().len()
+            && previous
+                .narrative_events
+                .iter()
+                .eq(self.world.narrative_events().iter());
         let narrative_events = if narrative_unchanged {
             Arc::clone(&previous.narrative_events)
         } else {
@@ -3121,7 +3173,16 @@ impl HostCore {
         let snapshot = Arc::new(RenderSnapshot {
             narrative_events,
             narrative_dropped_events: self.world.narrative_dropped_events(),
-            hybrid_count: self.world.agents().iter_handles().filter(|id| self.world.agent_runtime(*id).is_some_and(|runtime| runtime.hybrid)).count(),
+            hybrid_count: self
+                .world
+                .agents()
+                .iter_handles()
+                .filter(|id| {
+                    self.world
+                        .agent_runtime(*id)
+                        .is_some_and(|runtime| runtime.hybrid)
+                })
+                .count(),
             session_id: self.session_id,
             revision,
             revisions: self.revisions,
@@ -3221,8 +3282,7 @@ impl HostCore {
 
     fn next_command_requires_scientific_event(&self) -> bool {
         if let Some(active) = &self.active_command {
-            return self.active_command_is_retryable()
-                && active.envelope.command.requests_step();
+            return self.active_command_is_retryable() && active.envelope.command.requests_step();
         }
         self.shared
             .borrow()
@@ -3411,7 +3471,10 @@ impl HostCore {
             || !matches!(
                 &envelope.command,
                 HostCommand::Step
-                    | HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand { step_once: true, .. })
+                    | HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
+                        step_once: true,
+                        ..
+                    })
                     | HostCommand::UpdateConfig(_)
                     | HostCommand::AdjustAgentMutationRates { .. }
                     | HostCommand::SpawnAgent { .. }
@@ -4045,8 +4108,12 @@ impl HostCore {
         self.revisions.config = ConfigRevision::new(config_revision);
         let control = &self.world.config().control;
         if (control.auto_pause_on_spike_hit && summary.spike_hits > 0)
-            || control.auto_pause_age_above.is_some_and(|limit| summary.max_age >= limit)
-            || control.auto_pause_population_below.is_some_and(|limit| summary.agent_count <= limit as usize)
+            || control
+                .auto_pause_age_above
+                .is_some_and(|limit| summary.max_age >= limit)
+            || control
+                .auto_pause_population_below
+                .is_some_and(|limit| summary.agent_count <= limit as usize)
         {
             self.playback.paused = true;
             self.cadence_credit = 0;
@@ -7221,23 +7288,51 @@ mod tests {
         });
         let initial = core.latest_snapshot();
         let receipt = submit(&mut port, 701, command.clone());
-        let driven = core.drive(ManualInstant::from_nanos(0)).expect("combined playback boundary");
+        let driven = core
+            .drive(ManualInstant::from_nanos(0))
+            .expect("combined playback boundary");
         assert_eq!(driven.scientific_steps, 1);
         let applied = core.latest_snapshot();
         assert_eq!(applied.world.tick, initial.world.tick + 1);
-        assert_eq!(applied.revisions.control.get(), initial.revisions.control.get() + 1);
-        assert!(applied.playback.paused, "explicit step ends paused even when resume was requested");
-        assert_eq!(applied.playback.speed_multiplier.to_bits(), 2.0_f32.to_bits());
+        assert_eq!(
+            applied.revisions.control.get(),
+            initial.revisions.control.get() + 1
+        );
+        assert!(
+            applied.playback.paused,
+            "explicit step ends paused even when resume was requested"
+        );
+        assert_eq!(
+            applied.playback.speed_multiplier.to_bits(),
+            2.0_f32.to_bits()
+        );
         submit(&mut port, 701, command);
-        core.drive(ManualInstant::from_nanos(10)).expect("same identity retry");
+        core.drive(ManualInstant::from_nanos(10))
+            .expect("same identity retry");
         assert_eq!(core.world_tick(), Tick(applied.world.tick));
-        assert!(matches!(port.command_status(receipt.command_id()).expect("status lookup").expect("retained status").application(), ApplicationState::Applied(_)));
+        assert!(matches!(
+            port.command_status(receipt.command_id())
+                .expect("status lookup")
+                .expect("retained status")
+                .application(),
+            ApplicationState::Applied(_)
+        ));
 
-        let invalid = submit(&mut port, 702, HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
-            paused: Some(false), speed_multiplier: Some(f32::NAN), step_once: true,
-        }));
-        assert!(matches!(invalid.application(), ApplicationState::Rejected(_)));
-        core.drive(ManualInstant::from_nanos(20)).expect("rejection audit");
+        let invalid = submit(
+            &mut port,
+            702,
+            HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: Some(f32::NAN),
+                step_once: true,
+            }),
+        );
+        assert!(matches!(
+            invalid.application(),
+            ApplicationState::Rejected(_)
+        ));
+        core.drive(ManualInstant::from_nanos(20))
+            .expect("rejection audit");
         assert_eq!(core.world_tick(), Tick(applied.world.tick));
         assert_eq!(core.latest_snapshot().playback, applied.playback);
     }
@@ -7248,13 +7343,21 @@ mod tests {
             let mut config = world(0).config().clone();
             config.control.auto_pause_population_below = should_pause.then_some(0);
             let world = WorldState::new(config).expect("auto-pause world");
-            let mut core = HostCore::new(HostSessionId::new(93), world, options(false)).expect("auto-pause host");
+            let mut core = HostCore::new(HostSessionId::new(93), world, options(false))
+                .expect("auto-pause host");
             core.drive(ManualInstant::from_nanos(0)).expect("epoch");
-            let result = core.drive(ManualInstant::from_nanos(100)).expect("catch up");
+            let result = core
+                .drive(ManualInstant::from_nanos(100))
+                .expect("catch up");
             assert_eq!(result.scientific_steps, if should_pause { 1 } else { 4 });
             assert_eq!(core.latest_snapshot().playback.paused, should_pause);
             if should_pause {
-                assert_eq!(core.drive(ManualInstant::from_nanos(200)).expect("paused observation").scientific_steps, 0);
+                assert_eq!(
+                    core.drive(ManualInstant::from_nanos(200))
+                        .expect("paused observation")
+                        .scientific_steps,
+                    0
+                );
             }
         }
     }

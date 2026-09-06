@@ -18787,7 +18787,11 @@ mod command_characterization_tests {
 
         fixture.press("ctrl-a");
         let selection_receipts = fixture.applied_receipts();
-        assert_eq!(selection_receipts.len(), 1, "Ctrl-A must produce one host receipt");
+        assert_eq!(
+            selection_receipts.len(),
+            1,
+            "Ctrl-A must produce one host receipt"
+        );
         assert!(
             selection_receipts.iter().all(|status| matches!(
                 status.application(),
