@@ -10944,10 +10944,12 @@ dependencies = [
  "rand 0.9.5",
  "scriptbots-brain",
  "scriptbots-core",
+ "scriptbots-runtime",
  "scriptbots-storage",
  "scriptbots-world-gfx",
  "serde",
  "serde_json",
+ "slotmap",
  "tracing",
  "wgpu 27.0.1",
 ]
