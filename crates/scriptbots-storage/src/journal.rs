@@ -727,11 +727,21 @@ enum HostCommandPostcardV1 {
         origin_island: u32,
         origin_uid: u64,
     },
+    UpdateSimulation {
+        paused: Option<bool>,
+        speed_bits: Option<u32>,
+        step_once: bool,
+    },
 }
 
 impl HostCommandPostcardV1 {
     fn from_runtime(command: &HostCommand) -> Self {
         match command {
+            HostCommand::UpdateSimulation(update) => Self::UpdateSimulation {
+                paused: update.paused,
+                speed_bits: update.speed_multiplier.map(f32::to_bits),
+                step_once: update.step_once,
+            },
             HostCommand::Pause => Self::Pause,
             HostCommand::Resume => Self::Resume,
             HostCommand::SetSpeed(speed) => Self::SetSpeedBits(speed.to_bits()),
@@ -770,6 +780,15 @@ impl HostCommandPostcardV1 {
 
     fn into_runtime(self) -> HostCommand {
         match self {
+            Self::UpdateSimulation {
+                paused,
+                speed_bits,
+                step_once,
+            } => HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
+                paused,
+                speed_multiplier: speed_bits.map(f32::from_bits),
+                step_once,
+            }),
             Self::Pause => HostCommand::Pause,
             Self::Resume => HostCommand::Resume,
             Self::SetSpeedBits(bits) => HostCommand::SetSpeed(f32::from_bits(bits)),
@@ -839,11 +858,21 @@ enum HostCommandPostcardRefV1<'a> {
         origin_island: u32,
         origin_uid: u64,
     },
+    UpdateSimulation {
+        paused: Option<bool>,
+        speed_bits: Option<u32>,
+        step_once: bool,
+    },
 }
 
 impl<'a> HostCommandPostcardRefV1<'a> {
     fn from_runtime(command: &'a HostCommand) -> Self {
         match command {
+            HostCommand::UpdateSimulation(update) => Self::UpdateSimulation {
+                paused: update.paused,
+                speed_bits: update.speed_multiplier.map(f32::to_bits),
+                step_once: update.step_once,
+            },
             HostCommand::Pause => Self::Pause,
             HostCommand::Resume => Self::Resume,
             HostCommand::SetSpeed(speed) => Self::SetSpeedBits(speed.to_bits()),
@@ -1736,15 +1765,22 @@ fn validate_scientific_archive_boundary(
             }
             match terminal.application() {
                 ApplicationState::Applied(_) => match &lifecycle.envelope().command {
-                    HostCommand::Pause | HostCommand::Resume | HostCommand::SetSpeed(_)
-                        if scientific.is_some() || event_sequence.is_some() || has_persistence =>
-                    {
+                    HostCommand::Pause
+                    | HostCommand::Resume
+                    | HostCommand::SetSpeed(_)
+                    | HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
+                        step_once: false,
+                        ..
+                    }) if scientific.is_some() || event_sequence.is_some() || has_persistence => {
                         return Err(StorageError::InvalidData {
                             context: "host_journal_archive.command_lifecycle",
                             reason: "an applied control command must be command-only".to_owned(),
                         });
                     }
-                    HostCommand::Step if scientific.is_none() || event_sequence.is_none() => {
+                    command
+                        if command.requests_step()
+                            && (scientific.is_none() || event_sequence.is_none()) =>
+                    {
                         return Err(StorageError::InvalidData {
                             context: "host_journal_archive.scientific",
                             reason: "an applied step command requires its scientific boundary"

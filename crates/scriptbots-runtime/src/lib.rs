@@ -646,6 +646,13 @@ pub struct RenderSnapshot {
     /// carry an owned label first.
     #[serde(serialize_with = "serde_arc::serialize", skip_deserializing)]
     pub applied_interventions: Arc<Vec<AppliedInterventionRecord>>,
+    /// Bounded narrative ring from this completed world boundary.
+    #[serde(with = "serde_arc")]
+    pub narrative_events: Arc<Vec<scriptbots_core::narrative::EventRecord>>,
+    /// Number of narrative records evicted before the retained ring.
+    pub narrative_dropped_events: u64,
+    /// Living agents with two parents, counted from actual runtime rows.
+    pub hybrid_count: usize,
     /// Configuration in effect at this boundary.
     ///
     /// Revision-gated like `summary_history` and `layers`: the `Arc` is only
@@ -1770,12 +1777,25 @@ pub enum HostCommand {
     },
     /// Begin orderly host shutdown.
     Shutdown,
+    /// Apply pause, speed, and an optional single step as one ordered command.
+    UpdateSimulation(SimulationCommand),
 }
 
 impl HostCommand {
     /// Validate input that can be rejected before admission.
     pub fn validate(&self) -> Result<(), CommandValidationError> {
         match self {
+            Self::UpdateSimulation(update) => {
+                if update.paused.is_none() && update.speed_multiplier.is_none() && !update.step_once {
+                    return Err(CommandValidationError::InvalidWorldCommand {
+                        message: "simulation update does not request an operation".to_owned(),
+                    });
+                }
+                if update.speed_multiplier.is_some_and(|speed| !speed.is_finite() || speed < 0.0) {
+                    return Err(CommandValidationError::InvalidSpeed);
+                }
+                Ok(())
+            }
             Self::SetSpeed(speed) if !speed.is_finite() || *speed < 0.0 => {
                 Err(CommandValidationError::InvalidSpeed)
             }
@@ -1827,8 +1847,15 @@ impl HostCommand {
             | Self::SpawnCrossover { .. }
             | Self::Emigrate { .. }
             | Self::Immigrate { .. }
+            | Self::UpdateSimulation(_)
             | Self::Shutdown => true,
         }
+    }
+
+    /// Whether successful application advances exactly one scientific tick.
+    #[must_use]
+    pub const fn requests_step(&self) -> bool {
+        matches!(self, Self::Step | Self::UpdateSimulation(SimulationCommand { step_once: true, .. }))
     }
 }
 
@@ -1838,12 +1865,6 @@ pub enum HostCommandMappingError {
     /// The playback update requested no operation.
     #[error("simulation update does not request an operation")]
     EmptySimulationUpdate,
-    /// One legacy playback update combined operations that need distinct ordered envelopes.
-    #[error("simulation update combines {operation_count} operations")]
-    AmbiguousSimulationUpdate {
-        /// Number of pause, speed, and step operations requested together.
-        operation_count: usize,
-    },
     /// The legacy playback request failed its canonical normalization contract.
     #[error("{message}")]
     InvalidSimulationUpdate {
@@ -1906,7 +1927,7 @@ fn map_simulation_command(
         return Err(HostCommandMappingError::EmptySimulationUpdate);
     }
     if operation_count != 1 {
-        return Err(HostCommandMappingError::AmbiguousSimulationUpdate { operation_count });
+        return Ok(HostCommand::UpdateSimulation(update));
     }
     if let Some(paused) = update.paused {
         return Ok(if paused {
@@ -5341,6 +5362,9 @@ mod tests {
     fn projection_snapshot() -> RenderSnapshot {
         let summary_history = Arc::new((1..=10).map(projection_summary).collect::<Vec<_>>());
         RenderSnapshot {
+            narrative_events: Arc::new(Vec::new()),
+            narrative_dropped_events: 0,
+            hybrid_count: 0,
             config: Arc::new(ScriptBotsConfig::default()),
             config_audit: Arc::new(Vec::new()),
             session_id: HostSessionId::new(44),
@@ -6927,6 +6951,21 @@ mod tests {
                     .checked_next()
                     .ok_or_else(|| protocol_violation("control revision exhausted"))?;
                 match envelope.command {
+                    HostCommand::UpdateSimulation(update) => {
+                        if let Some(paused) = update.paused {
+                            self.playback.paused = paused;
+                        }
+                        if let Some(speed) = update.speed_multiplier {
+                            self.playback.speed_multiplier = speed.clamp(0.0, 32.0);
+                        }
+                        if update.step_once {
+                            self.playback.paused = true;
+                            self.tick.0 = self.tick.0.checked_add(1)
+                                .ok_or_else(|| protocol_violation("tick exhausted"))?;
+                            self.revisions.scientific = self.revisions.scientific.checked_next()
+                                .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+                        }
+                    }
                     HostCommand::Pause => self.playback.paused = true,
                     HostCommand::Resume => self.playback.paused = false,
                     HostCommand::SetSpeed(speed) => self.playback.speed_multiplier = speed,
@@ -7074,6 +7113,9 @@ mod tests {
                 spike_hits: 0,
             });
             self.latest_snapshot = Some(Arc::new(RenderSnapshot {
+                narrative_events: Arc::new(Vec::new()),
+                narrative_dropped_events: 0,
+                hybrid_count: 0,
                 config: Arc::new(ScriptBotsConfig::default()),
                 config_audit: Arc::new(Vec::new()),
                 session_id: self.session_id,
@@ -7534,7 +7576,11 @@ mod tests {
                 speed_multiplier: Some(2.0),
                 step_once: true,
             })),
-            Err(HostCommandMappingError::AmbiguousSimulationUpdate { operation_count: 3 })
+            Ok(HostCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: Some(2.0),
+                step_once: true,
+            }))
         );
     }
 

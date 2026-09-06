@@ -33,10 +33,15 @@
 //!   when the host lifecycle terminates.
 
 use crate::{
-    CommandEnvelope, CommandId, CommandStatus, EventCatchUp, EventCatchUpLocator, EventCursor,
-    EventHub, EventPoll, FixedDeadlineHost, HostAccessError, HostBlocker, HostDriveInterest,
-    HostEvent, HostPort, HostSessionId, LocalHostPort, ManualInstant, NativeDriveTrigger,
-    NativeScheduleError, ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
+    BrainProjection, BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId,
+    CommandStatus, EventCatchUp, EventCatchUpLocator, EventCursor, EventHub, EventPoll,
+    FixedDeadlineHost, HostAccessError, HostBlocker, HostDriveInterest, HostEvent, HostPort,
+    HostSessionId, LocalHostPort, ManualInstant, NativeDriveTrigger, NativeScheduleError,
+    ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
+};
+use scriptbots_core::{
+    AgentDebugInfo, AgentDebugQuery, AgentUid, INPUT_SIZE, MutationRates, NUM_EYES, OUTPUT_SIZE,
+    SensorAttribution, TraitModifiers, WorldDigestV1,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
@@ -54,6 +59,8 @@ pub const DEFAULT_CHANNEL_BOARD_CAPACITY: usize = 4_096;
 pub const DEFAULT_CHANNEL_SUBMIT_DEADLINE: Duration = Duration::from_millis(2_000);
 /// Default polling cadence while journal or shutdown work drains.
 pub const DEFAULT_CHANNEL_MAINTENANCE_PERIOD: Duration = Duration::from_millis(20);
+/// Maximum retained contributors in an on-demand focused-agent explanation.
+pub const MAX_INSPECTOR_CONTRIBUTORS: usize = 64;
 
 /// Bounds and deadlines for one channel host driver and its ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +141,25 @@ pub enum ChannelHostOptionsError {
 
 /// One pre-admission message offered to the owner thread.
 enum IngressMessage {
+    BrainProjection {
+        request: BrainProjectionRequest,
+        reply: Sender<Result<BrainProjection, HostAccessError>>,
+    },
+    AgentInspection {
+        uid: AgentUid,
+        max_contributors: usize,
+        reply: Sender<Result<Option<AgentInspectorData>, HostAccessError>>,
+    },
+    DebugAgents {
+        query: AgentDebugQuery,
+        reply: Sender<Result<Vec<AgentDebugInfo>, HostAccessError>>,
+    },
+    RequestReplayDigest {
+        reply: Sender<Result<(), HostAccessError>>,
+    },
+    ScientificDigest {
+        reply: Sender<Result<WorldDigestV1, HostAccessError>>,
+    },
     /// A command envelope plus the one-shot admission reply lane.
     Command {
         /// Exact client envelope forwarded untouched to host admission.
@@ -151,6 +177,27 @@ enum IngressMessage {
     /// Test-only no-op that occupies ingress without admitting a command.
     #[cfg(test)]
     Wake,
+}
+
+/// On-demand focused-agent detail captured entirely on the scientific owner thread.
+/// Arrays have the core sensor/actuator widths; no evaluator or world handle crosses threads.
+#[derive(Debug, Clone)]
+pub struct AgentInspectorData {
+    /// Source revisions for rejecting a detail paired with an older rendered frame.
+    pub source: BrainProjectionSource,
+    /// Stable subject identity, independent of slot reuse.
+    pub uid: AgentUid,
+    pub sensors: [f32; INPUT_SIZE],
+    pub outputs: [f32; OUTPUT_SIZE],
+    pub brain_bound: bool,
+    pub brain_descriptor: String,
+    pub mutation_rates: MutationRates,
+    pub trait_modifiers: TraitModifiers,
+    pub eye_direction: [f32; NUM_EYES],
+    pub eye_fov: [f32; NUM_EYES],
+    pub genome_browser: Option<scriptbots_core::genome_browser::GenomeBrowserViewModel>,
+    /// Explanation captured at the same source boundary as the inspector arrays.
+    pub sensor_attribution: Option<SensorAttribution>,
 }
 
 /// Bounded mirror of host command statuses for cross-thread lookup.
@@ -252,6 +299,95 @@ impl Clone for ChannelHostPort {
 }
 
 impl ChannelHostPort {
+    /// Clone the lock-free publication reader without retaining command ingress.
+    #[must_use]
+    pub fn snapshot_hub(&self) -> SnapshotHub {
+        self.snapshots.clone()
+    }
+
+    fn read_owner<R>(
+        &self,
+        message: impl FnOnce(Sender<Result<R, HostAccessError>>) -> IngressMessage,
+    ) -> Result<R, HostAccessError> {
+        let started = Instant::now();
+        let (reply, receiver) = std::sync::mpsc::channel();
+        self.enqueue(message(reply), started)?;
+        receiver
+            .recv_timeout(self.submit_deadline.saturating_sub(started.elapsed()))
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => Self::protocol_violation(format!(
+                    "owner inspection reply exceeded {:?}",
+                    self.submit_deadline
+                )),
+                RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
+            })?
+    }
+
+    /// Inspect selected brains with exact inspected and published source identities.
+    pub fn project_brain(
+        &self,
+        request: &BrainProjectionRequest,
+    ) -> Result<BrainProjection, HostAccessError> {
+        if request.targets.len() > scriptbots_core::ACTIVATION_CAPTURE_BUDGET {
+            return Err(Self::protocol_violation(
+                "brain target limit exceeded before enqueue",
+            ));
+        }
+        self.read_owner(|reply| IngressMessage::BrainProjection {
+            request: request.clone(),
+            reply,
+        })
+    }
+
+    /// Read one living agent's inspector detail; a deceased UID returns `None`.
+    pub fn inspect_agent(
+        &self,
+        uid: AgentUid,
+        max_contributors: usize,
+    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        if max_contributors > MAX_INSPECTOR_CONTRIBUTORS {
+            return Err(Self::protocol_violation(
+                "sensor explanation contributor limit exceeded before enqueue",
+            ));
+        }
+        self.read_owner(|reply| IngressMessage::AgentInspection {
+            uid,
+            max_contributors,
+            reply,
+        })
+    }
+
+    /// Query the owner's debug rows, preserving the query's filters and limit.
+    pub fn debug_agents(
+        &self,
+        query: AgentDebugQuery,
+    ) -> Result<Vec<AgentDebugInfo>, HostAccessError> {
+        if query
+            .ids
+            .as_ref()
+            .is_some_and(|ids| ids.len() > DEFAULT_CHANNEL_BOARD_CAPACITY)
+            || query
+                .brain_kind
+                .as_ref()
+                .is_some_and(|kind| kind.len() > 1_024)
+        {
+            return Err(Self::protocol_violation(
+                "debug query input limit exceeded before enqueue",
+            ));
+        }
+        self.read_owner(|reply| IngressMessage::DebugAgents { query, reply })
+    }
+
+    /// Ask the next completed replay tick to include its full scientific digest.
+    pub fn request_replay_world_digest(&self) -> Result<(), HostAccessError> {
+        self.read_owner(|reply| IngressMessage::RequestReplayDigest { reply })
+    }
+
+    /// Compute the full scientific digest at an owner boundary.
+    pub fn scientific_digest_v1(&self) -> Result<WorldDigestV1, HostAccessError> {
+        self.read_owner(|reply| IngressMessage::ScientificDigest { reply })
+    }
+
     fn protocol_violation(message: impl Into<String>) -> HostAccessError {
         HostAccessError::ProtocolViolation {
             message: message.into(),
@@ -602,6 +738,36 @@ impl ChannelHostDriver {
 
     fn process_ingress(&mut self, message: IngressMessage) {
         match message {
+            IngressMessage::BrainProjection { request, reply } => {
+                let result = self
+                    .host
+                    .core()
+                    .inspect_brains(&request)
+                    .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
+                let _ = reply.send(result);
+            }
+            IngressMessage::AgentInspection {
+                uid,
+                max_contributors,
+                reply,
+            } => {
+                let _ = reply.send(self.host.core().inspect_agent(uid, max_contributors));
+            }
+            IngressMessage::DebugAgents { query, reply } => {
+                let _ = reply.send(Ok(self.host.core().world().agent_debug_view(query)));
+            }
+            IngressMessage::RequestReplayDigest { reply } => {
+                self.host.request_replay_world_digest();
+                let _ = reply.send(Ok(()));
+            }
+            IngressMessage::ScientificDigest { reply } => {
+                let result = self
+                    .host
+                    .core()
+                    .scientific_digest_v1()
+                    .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
+                let _ = reply.send(result);
+            }
             IngressMessage::Command { envelope, reply } => {
                 let result = self.host.submit(envelope);
                 if let Ok(status) = &result
@@ -954,6 +1120,129 @@ mod tests {
             maintenance_period: Duration::from_millis(2),
             ..ChannelHostOptions::default()
         }
+    }
+
+    #[test]
+    fn owner_inspections_preserve_source_fields_and_scientific_digest() {
+        let (ready, receive) = std::sync::mpsc::sync_channel(1);
+        let owner = std::thread::spawn(move || {
+            let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(0x5eed_cafe),
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("inspection world");
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("living inspector subject");
+            let uid = world.agent_uid(id).expect("subject UID");
+            let expected = serde_json::to_value(world.agent_debug_view(AgentDebugQuery::default()))
+                .expect("expected owner rows");
+            let core = HostCore::new(
+                HostSessionId::new(19),
+                world,
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    ..HostCoreOptions::default()
+                },
+            )
+            .expect("inspection owner");
+            let (mut driver, port) =
+                ChannelHostDriver::new(FixedDeadlineHost::new(core), ChannelHostOptions::default())
+                    .expect("inspection transport");
+            ready
+                .send((port, uid, expected))
+                .expect("publish transport");
+            driver
+                .run(|| ManualInstant::from_nanos(0))
+                .expect("inspection owner exit")
+        });
+        let (port, uid, expected) = receive.recv().expect("owner ready");
+        let snapshot = port.snapshot_hub().latest();
+        let before = port.scientific_digest_v1().expect("digest before reads");
+        let detail = port
+            .inspect_agent(uid, 0)
+            .expect("owner detail")
+            .expect("living subject");
+        assert_eq!(detail.uid, uid);
+        assert!(detail.source.matches_snapshot(&snapshot));
+        assert_eq!(
+            serde_json::to_value(
+                port.debug_agents(AgentDebugQuery::default())
+                    .expect("owner rows")
+            )
+            .expect("rows JSON"),
+            expected
+        );
+        assert!(
+            port.inspect_agent(AgentUid(u64::MAX), 0)
+                .expect("missing UID query")
+                .is_none()
+        );
+        assert!(
+            port.debug_agents(AgentDebugQuery {
+                limit: Some(0),
+                ..AgentDebugQuery::default()
+            })
+            .expect("empty limit")
+            .is_empty()
+        );
+        let projection = port
+            .project_brain(&BrainProjectionRequest::focused(
+                crate::ProjectionClientId::new(1),
+                crate::ProjectionRequestRevision::new(1),
+                uid,
+            ))
+            .expect("unbound brain remains an explicit inspection result");
+        assert!(projection.source.matches_snapshot(&snapshot));
+        assert_eq!(
+            port.scientific_digest_v1().expect("digest after reads"),
+            before
+        );
+        assert_eq!(port.snapshot_hub().latest().revision, snapshot.revision);
+        drop(port);
+        assert_eq!(
+            owner.join().expect("owner joined").outcome,
+            ChannelRunOutcome::ControllerDisconnected
+        );
+    }
+
+    #[test]
+    fn oversized_owner_queries_are_rejected_before_ingress_and_disconnect_is_typed() {
+        let (driver, port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("query host");
+        assert!(
+            port.inspect_agent(AgentUid(1), MAX_INSPECTOR_CONTRIBUTORS + 1)
+                .is_err()
+        );
+        let mut request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(1),
+            crate::ProjectionRequestRevision::new(1),
+            AgentUid(1),
+        );
+        request
+            .targets
+            .resize(scriptbots_core::ACTIVATION_CAPTURE_BUDGET + 1, AgentUid(1));
+        assert!(port.project_brain(&request).is_err());
+        assert!(
+            port.debug_agents(AgentDebugQuery {
+                ids: Some(vec![1; DEFAULT_CHANNEL_BOARD_CAPACITY + 1]),
+                ..AgentDebugQuery::default()
+            })
+            .is_err()
+        );
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(driver);
+        assert!(matches!(
+            port.scientific_digest_v1(),
+            Err(HostAccessError::Disconnected)
+        ));
     }
 
     fn bounded_journal_driver() -> (ChannelHostDriver, ChannelHostPort) {
@@ -1946,7 +2235,13 @@ mod tests {
                     }))
                     .expect("pending authority reply");
             }
-            IngressMessage::CommandStatus { .. } | IngressMessage::Wake => {
+            IngressMessage::CommandStatus { .. }
+            | IngressMessage::Wake
+            | IngressMessage::BrainProjection { .. }
+            | IngressMessage::AgentInspection { .. }
+            | IngressMessage::DebugAgents { .. }
+            | IngressMessage::RequestReplayDigest { .. }
+            | IngressMessage::ScientificDigest { .. } => {
                 panic!("expected command submission")
             }
         }
@@ -2006,7 +2301,13 @@ mod tests {
                     }))
                     .expect("busy authority reply");
             }
-            IngressMessage::Command { .. } | IngressMessage::Wake => {
+            IngressMessage::Command { .. }
+            | IngressMessage::Wake
+            | IngressMessage::BrainProjection { .. }
+            | IngressMessage::AgentInspection { .. }
+            | IngressMessage::DebugAgents { .. }
+            | IngressMessage::RequestReplayDigest { .. }
+            | IngressMessage::ScientificDigest { .. } => {
                 panic!("expected command-status lookup")
             }
         }

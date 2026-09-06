@@ -152,6 +152,11 @@ impl FixedDeadlineHost {
         &self.core
     }
 
+    /// Request digest instrumentation for the next replay boundary.
+    pub fn request_replay_world_digest(&mut self) {
+        self.core.request_replay_world_digest();
+    }
+
     /// Consume the adapter and return its exact retained host state.
     #[must_use]
     pub fn into_core(self) -> HostCore {

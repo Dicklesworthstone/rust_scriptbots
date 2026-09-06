@@ -1920,6 +1920,25 @@ fn snapshot_build_stats(
     }
 }
 
+fn account_narrative_payload(
+    build: &mut SnapshotBuildStats,
+    events: &Vec<scriptbots_core::narrative::EventRecord>,
+    newly_allocated: bool,
+) {
+    let mut bytes = events.capacity().saturating_mul(size_of::<scriptbots_core::narrative::EventRecord>());
+    let mut allocations = usize::from(events.capacity() != 0);
+    for event in events {
+        bytes = bytes.saturating_add(event.metric.capacity()).saturating_add(event.human_text.capacity());
+        allocations = allocations.saturating_add(usize::from(event.metric.capacity() != 0))
+            .saturating_add(usize::from(event.human_text.capacity() != 0));
+    }
+    build.total_payload_capacity_bytes = build.total_payload_capacity_bytes.saturating_add(bytes);
+    if newly_allocated {
+        build.newly_allocated_capacity_bytes = build.newly_allocated_capacity_bytes.saturating_add(bytes);
+        build.bulk_allocations = build.bulk_allocations.saturating_add(allocations);
+    }
+}
+
 /// Pure synchronous authority for command order and scientific time.
 ///
 /// `HostCore` owns its world and persistence-admission session by value. It
@@ -2091,7 +2110,7 @@ impl HostCore {
         )?);
         let agent_selection = Arc::new(capture_agent_selection(&world)?);
         let summary_history = Arc::new(world.history().cloned().collect::<Vec<_>>());
-        let build = snapshot_build_stats(
+        let mut build = snapshot_build_stats(
             &dynamic_world,
             AgentPayloadCapacities {
                 visuals: agent_visuals.capacity(),
@@ -2118,7 +2137,12 @@ impl HostCore {
                 .collect::<Vec<_>>(),
         );
         let last_published_intervention_seq = latest_intervention_seq(&world);
+        let narrative_events = Arc::new(world.narrative_events().iter().cloned().collect::<Vec<_>>());
+        account_narrative_payload(&mut build, &narrative_events, true);
         let initial_snapshot = Arc::new(RenderSnapshot {
+            narrative_events,
+            narrative_dropped_events: world.narrative_dropped_events(),
+            hybrid_count: world.agents().iter_handles().filter(|id| world.agent_runtime(*id).is_some_and(|runtime| runtime.hybrid)).count(),
             session_id,
             revision: SnapshotRevision::new(1),
             revisions,
@@ -2371,6 +2395,11 @@ impl HostCore {
         &self.world
     }
 
+    /// Include a full digest in the next replay event without advancing science.
+    pub fn request_replay_world_digest(&mut self) {
+        self.world.request_replay_world_digest();
+    }
+
     /// Read-only access to the persistence session.
     #[must_use]
     pub const fn persistence(&self) -> &PersistenceAdmissionSession {
@@ -2386,6 +2415,63 @@ impl HostCore {
     /// Canonical full scientific digest without exposing the mutable world.
     pub fn scientific_digest_v1(&self) -> Result<WorldDigestV1, CharacterizationError> {
         self.world.world_digest_v1()
+    }
+
+    /// Capture focused inspector data without sharing the world or its evaluator.
+    pub fn inspect_agent(
+        &self,
+        uid: AgentUid,
+        max_contributors: usize,
+    ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
+        if max_contributors > crate::channel::MAX_INSPECTOR_CONTRIBUTORS {
+            return Err(HostAccessError::ProtocolViolation {
+                message: "sensor explanation contributor limit exceeded".to_owned(),
+            });
+        }
+        let Some(id) = self.world.agents().iter_handles()
+            .find(|id| self.world.agent_uid(*id) == Some(uid)) else { return Ok(None); };
+        let Some(runtime) = self.world.agent_runtime(id) else { return Ok(None); };
+        let latest = self.latest_snapshot();
+        let genome_browser = if let Some(envelope) = self.world.agent_brain_genome(id) {
+            let parents: Vec<_> = envelope.provenance().parents.iter().flatten().copied().collect();
+            let parent = parents.first().and_then(|parent_uid| {
+                self.world.agents().iter_handles().find_map(|handle| {
+                    (self.world.agent_uid(handle) == Some(*parent_uid))
+                        .then(|| self.world.agent_brain_genome(handle)).flatten()
+                })
+            });
+            let index = self.world.agents().index_of(id).ok_or_else(|| HostAccessError::ProtocolViolation {
+                message: "inspected agent missing its dense index".to_owned(),
+            })?;
+            self.world.brain_registry().family_by_id(envelope.family_id()).map(|codec| {
+                scriptbots_core::genome_browser::GenomeBrowserViewModel::build(
+                    codec, uid, self.world.agents().columns().generations()[index].0,
+                    self.world.tick(), envelope, parent, parents, None, None, 0, 20,
+                )
+            }).transpose().map_err(|error| HostAccessError::ProtocolViolation {
+                message: format!("genome inspection failed: {error}"),
+            })?
+        } else { None };
+        Ok(Some(crate::channel::AgentInspectorData {
+            source: BrainProjectionSource {
+                session_id: self.session_id,
+                published_snapshot: latest.revision,
+                published_host: latest.revisions,
+                inspected_host: self.revisions,
+                inspected_tick: self.world.tick(),
+            },
+            uid,
+            sensors: runtime.sensors,
+            outputs: runtime.outputs,
+            brain_bound: runtime.brain.is_bound(),
+            brain_descriptor: runtime.brain.describe().into_owned(),
+            mutation_rates: runtime.mutation_rates,
+            trait_modifiers: runtime.trait_modifiers,
+            eye_direction: runtime.eye_direction,
+            eye_fov: runtime.eye_fov,
+            genome_browser,
+            sensor_attribution: self.world.explain_sensors(id, max_contributors),
+        }))
     }
 
     /// Collect the organism a completed [`HostCommand::Emigrate`] removed from
@@ -2977,7 +3063,7 @@ impl HostCore {
         } else {
             Arc::clone(&self.summary_history)
         };
-        let build = snapshot_build_stats(
+        let mut build = snapshot_build_stats(
             &dynamic_world,
             AgentPayloadCapacities {
                 visuals: agent_visuals.capacity(),
@@ -3022,7 +3108,20 @@ impl HostCore {
                 shared.last_applied.map(|(_, command_id)| command_id),
             )
         };
+        let previous = self.snapshots.latest();
+        let narrative_unchanged = previous.narrative_dropped_events == self.world.narrative_dropped_events()
+                    && previous.narrative_events.len() == self.world.narrative_events().len()
+                    && previous.narrative_events.iter().eq(self.world.narrative_events().iter());
+        let narrative_events = if narrative_unchanged {
+            Arc::clone(&previous.narrative_events)
+        } else {
+            Arc::new(self.world.narrative_events().iter().cloned().collect())
+        };
+        account_narrative_payload(&mut build, &narrative_events, !narrative_unchanged);
         let snapshot = Arc::new(RenderSnapshot {
+            narrative_events,
+            narrative_dropped_events: self.world.narrative_dropped_events(),
+            hybrid_count: self.world.agents().iter_handles().filter(|id| self.world.agent_runtime(*id).is_some_and(|runtime| runtime.hybrid)).count(),
             session_id: self.session_id,
             revision,
             revisions: self.revisions,
@@ -3123,13 +3222,13 @@ impl HostCore {
     fn next_command_requires_scientific_event(&self) -> bool {
         if let Some(active) = &self.active_command {
             return self.active_command_is_retryable()
-                && matches!(&active.envelope.command, HostCommand::Step);
+                && active.envelope.command.requests_step();
         }
         self.shared
             .borrow()
             .queue
             .front()
-            .is_some_and(|admitted| matches!(&admitted.envelope.command, HostCommand::Step))
+            .is_some_and(|admitted| admitted.envelope.command.requests_step())
     }
 
     fn ensure_journal_sequence_available(&self) -> Result<(), HostAccessError> {
@@ -3184,6 +3283,19 @@ impl HostCore {
             HostCommand::SetSpeed(speed) => {
                 self.playback.speed_multiplier = speed;
                 self.complete_playback_command(admission, &retry_envelope, next_control)
+            }
+            HostCommand::UpdateSimulation(update) => {
+                if let Some(paused) = update.paused {
+                    self.playback.paused = paused;
+                }
+                if let Some(speed) = update.speed_multiplier {
+                    self.playback.speed_multiplier = speed.clamp(0.0, 32.0);
+                }
+                if update.step_once {
+                    self.apply_step_command(admission, &retry_envelope, next_control)
+                } else {
+                    self.complete_playback_command(admission, &retry_envelope, next_control)
+                }
             }
             HostCommand::UpdateConfig(config) => {
                 self.apply_config_command(admission, &retry_envelope, config, next_control)
@@ -3299,6 +3411,7 @@ impl HostCore {
             || !matches!(
                 &envelope.command,
                 HostCommand::Step
+                    | HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand { step_once: true, .. })
                     | HostCommand::UpdateConfig(_)
                     | HostCommand::AdjustAgentMutationRates { .. }
                     | HostCommand::SpawnAgent { .. }
@@ -3930,6 +4043,14 @@ impl HostCore {
         } = outcome;
         self.revisions.scientific = next_scientific;
         self.revisions.config = ConfigRevision::new(config_revision);
+        let control = &self.world.config().control;
+        if (control.auto_pause_on_spike_hit && summary.spike_hits > 0)
+            || control.auto_pause_age_above.is_some_and(|limit| summary.max_age >= limit)
+            || control.auto_pause_population_below.is_some_and(|limit| summary.agent_count <= limit as usize)
+        {
+            self.playback.paused = true;
+            self.cadence_credit = 0;
+        }
         self.latest_completed_summary = Some(summary.clone());
         let tick = summary.tick;
         self.shared.borrow_mut().visible_boundary = AppliedCommand {
@@ -4105,7 +4226,7 @@ impl ManualHostDriver for HostCore {
                     self.consume_automatic_credit();
                     scientific_steps += 1;
                 }
-                if result.blocked {
+                if result.blocked || self.playback.paused {
                     break;
                 }
             }
