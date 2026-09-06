@@ -9,7 +9,9 @@ when the cutover is verified; retained history is subject to the repository's no
 The integrity-control exception is unnecessary because the explicit request supplies the gate.
 The highest-priority capability is the host cutover; keep checklist maintenance bounded.
 
-Execution checkpoint, 2026-09-06: the cutover is **unfinished and not compiler-verified**.
+Execution checkpoint, 2026-09-06: the cutover is **unfinished**. DSR62 verified the
+workspace compiler check and real-process REST/MCP test at `4490d1e`; its three
+long regressions remain in progress. Later edits still require their own evidence.
 All three delegated frontend agents terminated at their usage limits. Root took over their
 reservations. Another actor committed the shared implementation through `a00aaf5`; those
 commit titles do not establish completed behavior. Root's `41d5b1f` formats that checkpoint.
@@ -58,10 +60,48 @@ and migrates both 240-tick repaint traces without dropping either digest. Its
 real closed-journal fault-display test replaces direct injection of a fault string.
 The old expected-panic shutdown test now checks real ordered owner shutdown and
 final config; control-listener shutdown alone is not claimed to finalize science.
-DSR61 was launched against exact `69642f1`; no passing cutover suite exists.
+DSR61 at exact `69642f1` passed the workspace/all-targets compiler check, then failed
+the real-process test: a malformed command ID returned 400 where the fixture expected
+404. `4490d1e` preserves the malformed case as a required 400 and adds a canonical
+never-submitted ID requiring 404; the OpenAPI response list now names both cases.
+The same commit strengthens a vacuous intervention-publication test: a real queued
+SetClosedWorld intervention must yield one exact-tick record and a new Arc, followed
+by non-empty Arc reuse on the next idle tick. The former conditional assertion could
+pass with an empty ring. Unused projection fields/helpers were removed; direct-world
+reference projectors remain in test builds. No fault-display assertion was removed.
+Formatting/whitespace checks passed; UBS exited 1 (111 critical-pattern matches,
+4,422 warnings across six whole files), not a clean scanner verdict. DSR61 supplied
+no passing test suite; its three 600-second regressions did not run.
+DSR62 (server) and DSR63 (app/runtime/render plus compiler/Clippy diagnostics) are
+pinned to `4490d1e`. DSR62 has passed the compiler check and ordinary real-process
+test (one passed, three ignored there); its separate serial 600-second cases have
+started. DSR63 is queued, not executed. The later `a9f7d04` adds a 240-tick actual-world
+narrative publication trace with mandatory event and non-empty reuse observations; it requires
+a subsequent pinned run and must not inherit either earlier run's result.
+`6154237` makes terminal owner faults publish paused playback, preserving running
+intent for temporary backpressure. Its two-case journal protocol fixture requires
+actual resumption after Full clears. This uses the existing fake protocol adapter,
+not a live-storage claim. GPUI now labels only typed terminal faults as simulation
+faults; its real closed-storage fault-refresh test remains unchanged and unexecuted.
 
 Remaining concrete integration work discovered during implementation:
 
+- [x] Execute both real-process status-ID negative cases at `4490d1e` or later;
+      require malformed 400 and canonical unknown 404 independently, then the
+      original unpresented-screenshot refusal and shutdown assertions. DSR62's
+      ordinary real-process test passed at exact `4490d1e`; later source changes
+      do not inherit this pass.
+- [ ] Execute the strengthened non-empty intervention-ring publication/reuse guard;
+      compilation alone cannot establish its exact tick, kind, or pointer assertions.
+- [ ] Execute the narrative publication trace added in `a9f7d04`; require complete
+      record/drop-count parity, a changed payload and non-empty payload reuse. It
+      does not yet verify narrative allocation byte accounting or ring-overflow reuse.
+- [ ] Verify terminal owner faults publish paused playback, while temporary journal
+      backpressure preserves running intent and actually resumes after admission.
+      The new owner fix and two-case protocol fixture require a subsequent pinned run.
+- [ ] Distinguish temporary `HostHealth::Blocked` from terminal faults in the GPUI
+      `simulation_fault` projection. Source corrected in `6154237`; verification
+      remains open. Preserve the actual closed-journal fault-refresh assertion.
 - [ ] Move scheduled config patches to the owner before each actual scientific tick;
       preserve declaration order, exact patch/failure evidence, and TUI notices. The
       old uncalled TUI helper has been removed; the existing app patch implementation
