@@ -4209,9 +4209,7 @@ impl SimulationView {
             );
 
         let mortality_panel = {
-            let total = analytics.deaths_total.max(1);
-            let make_row = |label: &str, count: usize| {
-                let ratio = (count as f64 / total as f64) * 100.0;
+            let make_row = |(label, count): (&str, String)| {
                 let label_text: SharedString = label.to_string().into();
                 div()
                     .flex()
@@ -4219,7 +4217,7 @@ impl SimulationView {
                     .text_xs()
                     .text_color(rgb(theme.text_primary))
                     .child(div().child(label_text))
-                    .child(div().child(format!("{count} ({ratio:.1}%)")))
+                    .child(div().child(count))
             };
 
             div()
@@ -4232,11 +4230,7 @@ impl SimulationView {
                 .border_1()
                 .border_color(rgb(theme.card_border))
                 .child(div().text_sm().text_color(rgb(0xf472b6)).child("Mortality"))
-                .child(make_row("Carnivore", analytics.deaths_combat_carnivore))
-                .child(make_row("Herbivore", analytics.deaths_combat_herbivore))
-                .child(make_row("Starvation", analytics.deaths_starvation))
-                .child(make_row("Aging", analytics.deaths_aging))
-                .child(make_row("Other", analytics.deaths_unknown))
+                .children(analytics.mortality_rows().map(make_row))
                 .child(
                     div()
                         .flex()
@@ -11007,12 +11001,32 @@ struct HudAnalytics {
     deaths_combat_herbivore: usize,
     deaths_starvation: usize,
     deaths_aging: usize,
+    deaths_brain_execution_fault: usize,
     deaths_unknown: usize,
     deaths_total: usize,
     births_total: usize,
     births_hybrid: usize,
     births_hybrid_ratio: f64,
     brain_shares: Vec<BrainShareEntry>,
+}
+
+impl HudAnalytics {
+    fn mortality_rows(&self) -> impl Iterator<Item = (&'static str, String)> {
+        let total = self.deaths_total.max(1);
+        [
+            ("Carnivore", self.deaths_combat_carnivore),
+            ("Herbivore", self.deaths_combat_herbivore),
+            ("Starvation", self.deaths_starvation),
+            ("Aging", self.deaths_aging),
+            ("Brain fault", self.deaths_brain_execution_fault),
+            ("Other", self.deaths_unknown),
+        ]
+        .into_iter()
+        .map(move |(label, count)| {
+            let ratio = (count as f64 / total as f64) * 100.0;
+            (label, format!("{count} ({ratio:.1}%)"))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -11112,6 +11126,7 @@ fn parse_analytics(
     let deaths_combat_herbivore = as_count("mortality.combat_herbivore.count");
     let deaths_starvation = as_count("mortality.starvation.count");
     let deaths_aging = as_count("mortality.aging.count");
+    let deaths_brain_execution_fault = as_count("mortality.brain_execution_fault.count");
     let deaths_unknown = as_count("mortality.unknown.count");
     let deaths_total = value("mortality.total.count")
         .map(|v| v.max(0.0).round() as usize)
@@ -11120,6 +11135,7 @@ fn parse_analytics(
                 + deaths_combat_herbivore
                 + deaths_starvation
                 + deaths_aging
+                + deaths_brain_execution_fault
                 + deaths_unknown,
         );
     let births_total = as_count("births.total.count");
@@ -11168,6 +11184,7 @@ fn parse_analytics(
         deaths_combat_herbivore,
         deaths_starvation,
         deaths_aging,
+        deaths_brain_execution_fault,
         deaths_unknown,
         deaths_total,
         births_total,
@@ -11940,6 +11957,80 @@ struct HudDisclosures {
 #[cfg(test)]
 mod hud_disclosure_layout_tests {
     use super::*;
+
+    #[test]
+    fn mortality_projection_formats_brain_fault_rows_and_includes_them_in_fallback_total() {
+        let mut readings: Vec<_> = [
+            ("mortality.combat_carnivore.count", 1.0),
+            ("mortality.combat_herbivore.count", 2.0),
+            ("mortality.starvation.count", 3.0),
+            ("mortality.aging.count", 4.0),
+            ("mortality.brain_execution_fault.count", 5.0),
+            ("mortality.unknown.count", 6.0),
+        ]
+        .into_iter()
+        .map(|(name, value)| MetricReading {
+            tick: 7,
+            name: name.to_owned(),
+            value,
+        })
+        .collect();
+        let analytics = parse_analytics(7, 0, &readings).expect("mortality metrics present");
+        assert_eq!(analytics.deaths_total, 21);
+        assert_eq!(analytics.deaths_brain_execution_fault, 5);
+        assert_eq!(analytics.deaths_unknown, 6);
+        // These are the exact label/value strings consumed by the GPUI rows;
+        // this assertion covers the projection, not native pixel visibility.
+        assert_eq!(
+            analytics.mortality_rows().collect::<Vec<_>>(),
+            [
+                ("Carnivore", "1 (4.8%)"),
+                ("Herbivore", "2 (9.5%)"),
+                ("Starvation", "3 (14.3%)"),
+                ("Aging", "4 (19.0%)"),
+                ("Brain fault", "5 (23.8%)"),
+                ("Other", "6 (28.6%)"),
+            ]
+            .map(|(label, count)| (label, count.to_owned()))
+        );
+
+        readings.push(MetricReading {
+            tick: 7,
+            name: "mortality.total.count".to_owned(),
+            value: 42.0,
+        });
+        let reported = parse_analytics(7, 0, &readings).expect("reported total present");
+        assert_eq!(reported.deaths_total, 42);
+        assert!(
+            reported
+                .mortality_rows()
+                .any(|(label, count)| { label == "Brain fault" && count == "5 (11.9%)" })
+        );
+    }
+
+    #[test]
+    fn mortality_projection_keeps_empty_and_zero_fault_data_distinct() {
+        assert!(parse_analytics(0, 0, &[]).is_none());
+        for value in [0.0, -1.0] {
+            let analytics = parse_analytics(
+                0,
+                0,
+                &[MetricReading {
+                    tick: 0,
+                    name: "mortality.brain_execution_fault.count".to_owned(),
+                    value,
+                }],
+            )
+            .expect("brain fault metric present");
+            assert_eq!(analytics.deaths_brain_execution_fault, 0);
+            assert_eq!(analytics.deaths_total, 0);
+            assert!(
+                analytics
+                    .mortality_rows()
+                    .all(|(_, count)| count == "0 (0.0%)")
+            );
+        }
+    }
 
     /// bd-rzy3: the perf readout must be MOUNTED on every frame it is open.
     ///

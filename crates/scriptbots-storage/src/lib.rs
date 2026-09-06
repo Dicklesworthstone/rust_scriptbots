@@ -53,12 +53,13 @@ use journal::{
     encode_host_command_postcard_hex, encode_journal_u64, prepare_host_journal_archive,
 };
 use scriptbots_core::{
-    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainFamilyCodec,
-    BrainGenomeEnvelope, DeathCause, DeathRecord, Generation, INTERACTION_EVENTS_OBSERVED_KIND,
-    INTERACTION_EVENTS_PERSISTED_KIND, INTERACTION_EVENTS_SAMPLED_OUT_KIND,
-    INTERACTION_EVENTS_TRUNCATED_KIND, PersistedGenome, PersistenceAdmissionError,
-    PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind, Position, ReplayAgentPhase,
-    ReplayEvent, ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick, WorldPersistence,
+    AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainExecutionFault,
+    BrainFamilyCodec, BrainGenomeEnvelope, DeathCause, DeathRecord, Generation,
+    INTERACTION_EVENTS_OBSERVED_KIND, INTERACTION_EVENTS_PERSISTED_KIND,
+    INTERACTION_EVENTS_SAMPLED_OUT_KIND, INTERACTION_EVENTS_TRUNCATED_KIND, PersistedGenome,
+    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
+    Position, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayInteractionKind,
+    ReplayRngScope, Tick, WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
     narrative::{
         EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord,
@@ -6168,6 +6169,13 @@ where
         if index.is_multiple_of(64) {
             observer.checkpoint(PreparationStage::Measure, *progress)?;
         }
+        if matches!(death.cause, DeathCause::BrainExecutionFault(_)) {
+            bytes = bytes.saturating_add(
+                BRAIN_EXECUTION_FAULT_CAUSE_MAX_LEN
+                    .saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER),
+            );
+            progress.scientific_bytes = bytes;
+        }
         if let Some(kind) = &death.brain_kind {
             bytes = bytes.saturating_add(
                 kind.len()
@@ -7256,6 +7264,7 @@ impl StorageBuffer {
             checked_u64("deaths.agent_uid", row.agent_uid)?;
             checked_u32("deaths.age", row.age)?;
             checked_u32("deaths.generation", row.generation)?;
+            decode_death_cause(&row.cause)?;
             if !death_uids.insert((row.island_id, row.agent_uid)) {
                 return Err(StorageError::InvalidData {
                     context: "deaths.agent_uid",
@@ -23684,14 +23693,63 @@ where
     })
 }
 
-fn death_cause_to_string(cause: DeathCause) -> &'static str {
-    match cause {
-        DeathCause::CombatCarnivore => "combat_carnivore",
-        DeathCause::CombatHerbivore => "combat_herbivore",
-        DeathCause::Starvation => "starvation",
-        DeathCause::Aging => "aging",
-        DeathCause::Unknown => "unknown",
+const BRAIN_EXECUTION_FAULT_CAUSE_PREFIX: &str = "brain_execution_fault:non_finite_state:";
+const BRAIN_EXECUTION_FAULT_BITS_HEX_WIDTH: usize = size_of::<u32>() * 2;
+const BRAIN_EXECUTION_FAULT_CAUSE_MAX_LEN: usize = BRAIN_EXECUTION_FAULT_CAUSE_PREFIX.len()
+    + u32::MAX.ilog10() as usize
+    + 1
+    + ":".len()
+    + BRAIN_EXECUTION_FAULT_BITS_HEX_WIDTH;
+
+fn death_cause_to_string(cause: DeathCause) -> Result<String, StorageError> {
+    Ok(match cause {
+        DeathCause::CombatCarnivore => "combat_carnivore".to_owned(),
+        DeathCause::CombatHerbivore => "combat_herbivore".to_owned(),
+        DeathCause::Starvation => "starvation".to_owned(),
+        DeathCause::Aging => "aging".to_owned(),
+        DeathCause::Unknown => "unknown".to_owned(),
+        DeathCause::BrainExecutionFault(fault) => {
+            if !fault.is_valid() {
+                return Err(StorageError::InvalidData {
+                    context: "deaths.cause",
+                    reason: "non-finite brain execution fault contains finite state bits"
+                        .to_owned(),
+                });
+            }
+            match fault {
+                BrainExecutionFault::NonFiniteState { index, bits } => format!(
+                    "{BRAIN_EXECUTION_FAULT_CAUSE_PREFIX}{index}:{bits:0width$x}",
+                    width = BRAIN_EXECUTION_FAULT_BITS_HEX_WIDTH,
+                ),
+            }
+        }
+    })
+}
+
+fn decode_brain_execution_fault_cause(value: &str) -> Option<BrainExecutionFault> {
+    // Bound parsing before scanning fields. Neither unbounded decimal strings nor extra
+    // fields can turn one persisted cause into unbounded parsing work.
+    if value.len() > BRAIN_EXECUTION_FAULT_CAUSE_MAX_LEN {
+        return None;
     }
+    let (index, bits) = value
+        .strip_prefix(BRAIN_EXECUTION_FAULT_CAUSE_PREFIX)?
+        .split_once(':')?;
+    if index.is_empty()
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+        || (index.len() > 1 && index.starts_with('0'))
+        || bits.len() != BRAIN_EXECUTION_FAULT_BITS_HEX_WIDTH
+        || !bits
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let fault = BrainExecutionFault::NonFiniteState {
+        index: index.parse().ok()?,
+        bits: u32::from_str_radix(bits, 16).ok()?,
+    };
+    fault.is_valid().then_some(fault)
 }
 
 fn decode_death_cause(value: &str) -> Result<DeathCause, StorageError> {
@@ -23701,10 +23759,12 @@ fn decode_death_cause(value: &str) -> Result<DeathCause, StorageError> {
         "starvation" => Ok(DeathCause::Starvation),
         "aging" => Ok(DeathCause::Aging),
         "unknown" => Ok(DeathCause::Unknown),
-        other => Err(StorageError::InvalidData {
-            context: "deaths.cause",
-            reason: format!("unknown death cause {other:?}"),
-        }),
+        other => decode_brain_execution_fault_cause(other)
+            .map(DeathCause::BrainExecutionFault)
+            .ok_or_else(|| StorageError::InvalidData {
+                context: "deaths.cause",
+                reason: "unknown or noncanonical death cause".to_owned(),
+            }),
     }
 }
 
@@ -23744,7 +23804,7 @@ where
             .transpose()?,
         energy: f64::from(record.energy),
         food_balance_total: f64::from(record.food_balance_total),
-        cause: death_cause_to_string(record.cause).to_string(),
+        cause: death_cause_to_string(record.cause)?,
         was_hybrid: record.was_hybrid,
         spike_attacker: record.combat_flags.spike_attacker,
         spike_victim: record.combat_flags.spike_victim,
@@ -34862,6 +34922,10 @@ mod tests {
             ("unknown", DeathCause::Unknown),
         ] {
             assert!(matches!(decode_death_cause(encoded), Ok(actual) if actual == expected));
+            assert_eq!(
+                death_cause_to_string(expected).expect("valid cause"),
+                encoded
+            );
         }
         assert!(matches!(
             decode_death_cause("not-a-cause"),
@@ -34904,6 +34968,210 @@ mod tests {
             starvation.canonical_digest(),
             "substituting Starvation for the persisted cause must change the ancestry oracle"
         );
+    }
+
+    #[test]
+    fn brain_execution_fault_deaths_persist_and_rebuild_exact_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                197,
+                0x7f80_0000,
+                "brain_execution_fault:non_finite_state:197:7f800000",
+            ),
+            (
+                0,
+                0xff80_0000,
+                "brain_execution_fault:non_finite_state:0:ff800000",
+            ),
+            (
+                u32::MAX,
+                0x7fc0_1234,
+                "brain_execution_fault:non_finite_state:4294967295:7fc01234",
+            ),
+            (
+                197,
+                0xff80_1234,
+                "brain_execution_fault:non_finite_state:197:ff801234",
+            ),
+        ];
+        let path = temp_db_path("storage-brain-execution-fault");
+        let path_string = path.to_string_lossy().into_owned();
+        let mut storage = create_file_storage(&path_string)?;
+        let mut batch = sample_batch(11, 1.0);
+        for (ordinal, &(index, bits, _)) in cases.iter().enumerate() {
+            let uid = u64::try_from(ordinal)? + 1;
+            batch.births.push(sample_birth(10, uid, BirthOrigin::Born));
+            batch.deaths.push(sample_death(
+                11,
+                uid,
+                DeathCause::BrainExecutionFault(BrainExecutionFault::NonFiniteState {
+                    index,
+                    bits,
+                }),
+            ));
+        }
+        synchronize_lifecycle_counts(&mut batch);
+        storage.persist(&batch)?;
+        storage.flush()?;
+        let rows = storage.connection()?.query_with_params(
+            "SELECT cause FROM deaths WHERE run_id = ?1 ORDER BY agent_uid",
+            &[sqlite_run_id(storage.run_id)],
+        )?;
+        assert_eq!(rows.len(), cases.len());
+        for (row, &(_, _, expected_text)) in rows.iter().zip(&cases) {
+            assert_eq!(decode::<String>(row, 0, "deaths.cause")?, expected_text);
+        }
+        storage.close()?;
+
+        let reader = StorageReader::open(&path_string)?;
+        let births = reader.load_ancestry_births()?;
+        let deaths = reader.load_ancestry_deaths()?;
+        assert_eq!(births.len(), cases.len());
+        assert_eq!(deaths.len(), cases.len());
+        let graph = rebuild_ancestry(&births, &deaths)?;
+        for (ordinal, (actual, &(index, bits, _))) in deaths.iter().zip(&cases).enumerate() {
+            let uid = AgentUid(u64::try_from(ordinal)? + 1);
+            let cause = DeathCause::BrainExecutionFault(BrainExecutionFault::NonFiniteState {
+                index,
+                bits,
+            });
+            assert_eq!(actual.agent_uid, uid);
+            assert_eq!(actual.tick, Tick(11));
+            assert_eq!(actual.cause, cause);
+            assert_eq!(
+                graph.node(uid).and_then(|node| node.death_cause),
+                Some(cause)
+            );
+        }
+        let mut substituted = deaths.clone();
+        substituted[0].cause = DeathCause::Unknown;
+        assert_ne!(
+            graph.canonical_digest(),
+            rebuild_ancestry(&births, &substituted)?.canonical_digest(),
+            "dropping a fault cause must change the reconstructed ancestry"
+        );
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn brain_execution_fault_with_finite_bits_is_refused_before_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut storage = Storage::unattributed_memory()?;
+        let mut batch = sample_batch(11, 1.0);
+        batch.births.push(sample_birth(10, 1, BirthOrigin::Born));
+        batch.deaths.push(sample_death(11, 1, DeathCause::Aging));
+        synchronize_lifecycle_counts(&mut batch);
+        let ordinary_estimate = estimate_batch_size(&batch);
+        let initial_watermarks = storage.persistence_watermarks()?;
+        for bits in [0.0_f32.to_bits(), (-0.0_f32).to_bits(), f32::MAX.to_bits()] {
+            batch.deaths[0].cause =
+                DeathCause::BrainExecutionFault(BrainExecutionFault::NonFiniteState {
+                    index: 197,
+                    bits,
+                });
+            assert_invalid_data_context(storage.persist(&batch), "deaths.cause");
+            assert!(storage.buffer.is_empty());
+            assert_eq!(storage.persistence_watermarks()?, initial_watermarks);
+        }
+        batch.deaths[0].cause =
+            DeathCause::BrainExecutionFault(BrainExecutionFault::NonFiniteState {
+                index: u32::MAX,
+                bits: 0x7f80_0000,
+            });
+        let fault_estimate = estimate_batch_size(&batch);
+        let cause_text = death_cause_to_string(batch.deaths[0].cause)?;
+        assert_eq!(cause_text.len(), BRAIN_EXECUTION_FAULT_CAUSE_MAX_LEN);
+        assert_eq!(fault_estimate.1, ordinary_estimate.1);
+        assert!(
+            fault_estimate.0 - ordinary_estimate.0 >= cause_text.len() * 2,
+            "admission must charge both the owned fault text and its outbox copy"
+        );
+        storage.persist(&batch)?;
+        storage.flush()?;
+        let stored: String = storage
+            .connection()?
+            .query_row("SELECT cause FROM deaths")?
+            .get_typed(0)?;
+        assert_eq!(
+            stored, cause_text,
+            "a refused false fault must leave the writer usable"
+        );
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn brain_execution_fault_cause_corruption_is_rejected_by_reader_and_outbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-brain-fault-corrupt-cause");
+        let path_string = path.to_string_lossy().into_owned();
+        let mut storage = create_file_storage(&path_string)?;
+        let mut batch = sample_batch(11, 1.0);
+        batch.births.push(sample_birth(10, 1, BirthOrigin::Born));
+        batch.deaths.push(sample_death(11, 1, DeathCause::Aging));
+        synchronize_lifecycle_counts(&mut batch);
+        storage.persist(&batch)?;
+        storage.flush()?;
+        let mut prepared = Storage::prepare_batch(&batch)?;
+        for invalid in [
+            "not-a-cause",
+            "brain_execution_fault",
+            "brain_execution_fault:other:197:7f800000",
+            "brain_execution_fault:non_finite_state:197:00000000",
+            "brain_execution_fault:non_finite_state:197:80000000",
+            "brain_execution_fault:non_finite_state:197:7f7fffff",
+            "brain_execution_fault:non_finite_state::7f800000",
+            "brain_execution_fault:non_finite_state:+197:7f800000",
+            "brain_execution_fault:non_finite_state:-1:7f800000",
+            "brain_execution_fault:non_finite_state:0197:7f800000",
+            "brain_execution_fault:non_finite_state:4294967296:7f800000",
+            "brain_execution_fault:non_finite_state:42949672950:7f800000",
+            "brain_execution_fault:non_finite_state:197:",
+            "brain_execution_fault:non_finite_state:197:7F800000",
+            "brain_execution_fault:non_finite_state:197:0x7f800000",
+            "brain_execution_fault:non_finite_state:197:7f80000",
+            "brain_execution_fault:non_finite_state:197:07f800000",
+            "brain_execution_fault:non_finite_state:197:7f80000g",
+            "brain_execution_fault:non_finite_state:197:7f800000:extra",
+            "brain_execution_fault:non_finite_state:197:7f800000\n",
+            "brain_execution_fault:non_finite_state: 197:7f800000",
+        ] {
+            assert_invalid_data_context(decode_death_cause(invalid), "deaths.cause");
+            prepared.deaths[0].cause = invalid.to_owned();
+            assert_invalid_data_context(prepared.encode_outbox(storage.run_id, 11), "deaths.cause");
+            let payload = serde_json::to_string(&OutboxPayloadRef {
+                version: OUTBOX_PAYLOAD_VERSION,
+                run_id: storage.run_id,
+                tick: 11,
+                storage: &prepared,
+            })?;
+            let digest = format!("blake3:{}", blake3::hash(payload.as_bytes()).to_hex());
+            assert_invalid_data_context(
+                StorageBuffer::decode_outbox(&payload, storage.run_id, 11, &digest),
+                "deaths.cause",
+            );
+            assert_eq!(
+                storage.connection()?.execute_with_params(
+                    "UPDATE deaths SET cause = ?1 WHERE run_id = ?2 AND agent_uid = 1",
+                    &[invalid.into(), sqlite_run_id(storage.run_id)],
+                )?,
+                1
+            );
+            let reader = StorageReader::open(&path_string)?;
+            assert_invalid_data_context(reader.load_ancestry_deaths(), "deaths.cause");
+            reader.close()?;
+        }
+        storage.connection()?.execute_with_params(
+            "UPDATE deaths SET cause = 'aging' WHERE run_id = ?1 AND agent_uid = 1",
+            &[sqlite_run_id(storage.run_id)],
+        )?;
+        storage.close()?;
+        let reader = StorageReader::open(&path_string)?;
+        assert_eq!(reader.load_ancestry_deaths()?[0].cause, DeathCause::Aging);
+        reader.close()?;
+        Ok(())
     }
 
     #[test]

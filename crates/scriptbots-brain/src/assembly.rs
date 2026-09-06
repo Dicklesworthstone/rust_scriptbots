@@ -3,7 +3,7 @@
 use rand::Rng;
 use scriptbots_core::{
     BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
-    BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial,
+    BrainExecutionFault, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial,
     BrainHeredityCapabilityV1, BrainInspection, BrainInspectionError, BrainInspectionSnapshot,
     BrainLocusSchemaIdentityV1, BrainMutationTrialGroupV1, BrainProtocolError, MutationRates,
     OffspringStatePolicy, RandomStream,
@@ -19,8 +19,8 @@ use crate::{Brain, BrainKind, into_runner};
 
 const BRAIN_SIZE: usize = 200;
 const ASSEMBLY_FAMILY_ID: &str = "assembly";
-const ADAPTER_SEMANTIC_VERSION: u32 = 3;
-const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.assembly.adapter-semantics.v3";
+const ADAPTER_SEMANTIC_VERSION: u32 = 4;
+const ADAPTER_SEMANTIC_DESCRIPTOR: &[u8] = b"scriptbots.assembly.adapter-semantics.v4:atomic-nonfinite-execution-fault;zero-output-containment-tick;brain-fault-death-at-cleanup";
 const ASSEMBLY_GENOME_SCHEMA_VERSION: u32 = 1;
 const LOCUS_SCHEMA_SEMANTIC_DESCRIPTOR: &[u8] =
     b"scriptbots.assembly.locus-schema.cell-index-ascending:[Cell]";
@@ -310,11 +310,21 @@ impl BrainEvaluator for AssemblyProtocolEvaluator {
                 ),
             ));
         }
-        validate_cells_for_family(
-            &candidate.cells,
-            BrainEnvelopeKind::EvaluatorState,
-            &self.family_id,
-        )?;
+        if let Some((index, value)) = candidate
+            .cells
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(BrainProtocolError::ExecutionFault {
+                family_id: self.family_id.clone(),
+                fault: BrainExecutionFault::NonFiniteState {
+                    index: u32::try_from(index).expect("Assembly cell index fits u32"),
+                    bits: value.to_bits(),
+                },
+            });
+        }
         self.brain = candidate;
         Ok(outputs)
     }
@@ -732,21 +742,36 @@ mod tests {
     use super::*;
     use rand::RngCore;
     use scriptbots_core::{
-        AgentUid, BrainFamilyAdapter, BrainGenomeDerivation, BrainInspectionLimits, SmallRngStream,
-        Tick,
+        AgentData, AgentUid, BrainBinding, BrainFamilyAdapter, BrainGenomeDerivation,
+        BrainInspectionLimits, DeathCause, Position, ScriptBotsConfig, SmallRngStream, Tick,
+        WorldState,
     };
 
     #[test]
-    fn adapter_semantic_identity_v3_is_pinned() {
-        let identity = AssemblyFamilyAdapter::new()
-            .expect("canonical Assembly adapter")
-            .adapter_identity();
+    fn adapter_semantic_identity_v4_is_pinned() {
+        let family = AssemblyFamilyAdapter::new().expect("canonical Assembly adapter");
+        let identity = family.adapter_identity();
         assert_eq!(identity.semantic_version(), ADAPTER_SEMANTIC_VERSION);
-        assert_eq!(
-            identity.to_string(),
-            "583ebc134825074238b390853d06bfaef68e9da54491247a452fb134d9497be7",
-            "update only after reviewing an intentional Assembly executable-semantics change"
+        let previous = BrainAdapterIdentityV1::from_semantic_descriptor(
+            family.family_id(),
+            3,
+            b"scriptbots.assembly.adapter-semantics.v3",
         );
+        assert_eq!(
+            previous.to_string(),
+            "583ebc134825074238b390853d06bfaef68e9da54491247a452fb134d9497be7",
+            "the existing semantic-identity encoding must remain stable"
+        );
+        assert_eq!(identity, BrainAdapterIdentityV1::from_semantic_descriptor(
+            family.family_id(),
+            4,
+            b"scriptbots.assembly.adapter-semantics.v4:atomic-nonfinite-execution-fault;zero-output-containment-tick;brain-fault-death-at-cleanup",
+        ));
+        assert_ne!(
+            identity, previous,
+            "changed fault policy must change science identity"
+        );
+        println!("Assembly v4 semantic identity: {identity}");
     }
 
     #[test]
@@ -1371,10 +1396,12 @@ mod tests {
             .expect("checkpoint before interpreter overflow");
         assert!(matches!(
             overflowing_evaluator.evaluate(&[0.0; INPUT_SIZE]),
-            Err(BrainProtocolError::InvalidPayload {
-                kind: BrainEnvelopeKind::EvaluatorState,
-                ..
-            })
+            Err(BrainProtocolError::ExecutionFault {
+                family_id,
+                fault: BrainExecutionFault::NonFiniteState { index, bits },
+            }) if &family_id == family.family_id()
+                && index == u32::try_from(BRAIN_SIZE - 1).expect("cell index")
+                && bits == f32::INFINITY.to_bits()
         ));
         assert_eq!(
             family
@@ -1382,6 +1409,150 @@ mod tests {
                 .expect("checkpoint after interpreter overflow"),
             before_overflow,
             "an instruction-produced non-finite result must roll back byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn bound_assembly_execution_fault_removes_only_failed_agents_and_continues() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            persistence_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            reproduction_energy_threshold: 0.0,
+            rng_seed: Some(0xBFCD),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("mixed real Assembly world");
+        let family = AssemblyFamilyAdapter::new().expect("Assembly family");
+        let key = world
+            .register_brain_family("assembly", Box::new(family.clone()))
+            .expect("register real Assembly family");
+        let mut overflow = [0.0; BRAIN_SIZE];
+        overflow[INPUT_SIZE] = 2.25;
+        overflow[INPUT_SIZE + 1] = 0.25;
+        overflow[INPUT_SIZE + 2] = 0.50;
+        overflow[INPUT_SIZE + 3] = 0.995;
+        overflow[50] = f32::MAX;
+        overflow[100] = f32::MAX;
+        let mut finite = [0.0; BRAIN_SIZE];
+        finite[BRAIN_SIZE - 1] = 0.25;
+        finite[BRAIN_SIZE - 2] = 0.5;
+        let mut rng = SmallRngStream::seed_from_u64(1);
+        let mut agents = Vec::new();
+        for (ordinal, cells) in [overflow, finite, overflow].into_iter().enumerate() {
+            let agent = world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(
+                        40.0 + 40.0 * f32::from(u16::try_from(ordinal).expect("fixture ordinal")),
+                        100.0,
+                    ),
+                    ..AgentData::default()
+                })
+                .expect("spawn real agent");
+            let genome = family
+                .genome(&cells, BrainProvenance::default())
+                .expect("admit finite genome");
+            let state = family
+                .initial_state(&genome, &mut rng)
+                .expect("initial state");
+            let evaluator = family.evaluator(&genome, &state).expect("real evaluator");
+            assert!(
+                world
+                    .try_update_agent_runtime(agent, |runtime| {
+                        runtime.brain = BrainBinding::Protocol {
+                            registry_key: key,
+                            kind: "assembly".to_owned(),
+                            genome,
+                            evaluator: Some(evaluator),
+                        };
+                        runtime.outputs = [0.75; OUTPUT_SIZE];
+                    })
+                    .expect("attach admitted real evaluator")
+            );
+            agents.push(agent);
+        }
+        let failed_uids = [agents[0], agents[2]].map(|agent| world.agent_uid(agent).expect("uid"));
+        let healthy = agents[1];
+        let healthy_position = world
+            .agents()
+            .snapshot(healthy)
+            .expect("healthy agent")
+            .position;
+        world.set_resource_ledger_enabled(true);
+        let completion = world.step_outcome().expect("containment transition");
+        assert!(
+            completion.fault.is_none(),
+            "agent-local fault must not latch the world"
+        );
+        assert_eq!(completion.outcome.events.tick, Tick(1));
+        assert_eq!(completion.outcome.deaths.len(), failed_uids.len());
+        assert!(
+            completion
+                .outcome
+                .resource_tick
+                .as_ref()
+                .expect("resource accounting")
+                .reconciliation
+                .reconciled
+        );
+        for (death, uid) in completion.outcome.deaths.iter().zip(failed_uids) {
+            assert_eq!(
+                death.agent_uid, uid,
+                "deaths must remain in stable UID order"
+            );
+            assert_eq!(death.brain_kind.as_deref(), Some("assembly"));
+            assert_eq!(death.brain_key, Some(key));
+            assert_eq!(
+                death.cause,
+                DeathCause::BrainExecutionFault(BrainExecutionFault::NonFiniteState {
+                    index: u32::try_from(BRAIN_SIZE - 1).expect("cell index"),
+                    bits: f32::INFINITY.to_bits(),
+                })
+            );
+        }
+        assert!(!world.agents().contains(agents[0]));
+        assert!(!world.agents().contains(agents[2]));
+        assert_eq!(world.agents().len(), 1);
+        assert!(world.brain_fault().is_none());
+        let outputs = world
+            .agent_runtime(healthy)
+            .expect("healthy runtime")
+            .outputs;
+        assert_eq!(&outputs[..2], &[0.25, 0.5]);
+        assert_ne!(
+            world
+                .agents()
+                .snapshot(healthy)
+                .expect("moved healthy agent")
+                .position,
+            healthy_position
+        );
+        for tick in 2..=8 {
+            let completion = world.step_outcome().expect("continued healthy transition");
+            assert!(completion.fault.is_none());
+            assert!(completion.outcome.deaths.is_empty());
+            assert_eq!(completion.outcome.events.tick, Tick(tick));
+            assert!(world.agents().contains(healthy));
+            assert!(
+                world
+                    .agent_brain_evaluator_state(healthy)
+                    .expect("finite checkpoint")
+                    .is_some()
+            );
+        }
+        println!(
+            "assembly_fault_continuation_digest={}",
+            world
+                .world_digest_v1()
+                .expect("continued world digest")
+                .overall
         );
     }
 
@@ -1432,14 +1603,15 @@ mod tests {
             .evaluate(&[0.0; INPUT_SIZE])
             .expect_err("interpreter-generated NaN must reject the tick");
         match error {
-            BrainProtocolError::InvalidPayload {
-                kind,
-                family_id,
-                detail,
-            } => {
-                assert_eq!(kind, BrainEnvelopeKind::EvaluatorState);
+            BrainProtocolError::ExecutionFault { family_id, fault } => {
                 assert_eq!(&family_id, family.family_id());
-                assert_eq!(detail, "Assembly cell 199 is non-finite (NaN)");
+                assert_eq!(
+                    fault,
+                    BrainExecutionFault::NonFiniteState {
+                        index: u32::try_from(BRAIN_SIZE - 1).expect("cell index"),
+                        bits: arithmetic_probe.cells[BRAIN_SIZE - 1].to_bits(),
+                    }
+                );
             }
             other => panic!("unexpected Assembly evaluation error: {other}"),
         }

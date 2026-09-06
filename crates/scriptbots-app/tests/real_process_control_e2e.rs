@@ -655,7 +655,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
 #[ignore = "bd-w1oi live server regression: 600 seconds per storage backend. Run explicitly: cargo test -p scriptbots-app \
             --test real_process_control_e2e -- --ignored bd_w1oi --nocapture"]
 fn bd_w1oi_server_mode_keeps_advancing_with_memory_storage() -> Result<()> {
-    verify_server_progress("memory")
+    verify_server_progress("memory", None)
 }
 
 /// Exercise the same progress requirement against the production file backend.
@@ -664,11 +664,20 @@ fn bd_w1oi_server_mode_keeps_advancing_with_memory_storage() -> Result<()> {
 #[ignore = "bd-w1oi live server regression: 600 seconds per storage backend. Run explicitly: cargo test -p scriptbots-app \
             --test real_process_control_e2e -- --ignored bd_w1oi --nocapture"]
 fn bd_w1oi_server_mode_keeps_advancing_with_file_storage() -> Result<()> {
-    verify_server_progress("file")
+    verify_server_progress("file", None)
+}
+
+/// DSR30's exact world seed produced Assembly cell 197 = infinity within two seconds.
+/// The same arithmetic must now produce an explicit agent death while the real server advances.
+#[test]
+#[serial]
+#[ignore = "bd-bfkd exact seeded server regression: 600 seconds; run explicitly through DSR"]
+fn bd_bfkd_seeded_assembly_fault_keeps_server_advancing() -> Result<()> {
+    verify_server_progress("memory", Some(12_659_881_219_344_128_065))
 }
 
 /// Observe actual tick progress, not merely a live process or HTTP 200 responses.
-fn verify_server_progress(storage: &str) -> Result<()> {
+fn verify_server_progress(storage: &str, seed: Option<u64>) -> Result<()> {
     let run_dir = tempfile::Builder::new()
         .prefix(&format!("server-progress-{storage}-"))
         .tempdir()?
@@ -693,6 +702,9 @@ fn verify_server_progress(storage: &str) -> Result<()> {
         .current_dir(&run_dir)
         .stdout(std::fs::File::create(run_dir.join("server.stdout"))?)
         .stderr(std::fs::File::create(&stderr_path)?);
+    if let Some(seed) = seed {
+        command.args(["--rng-seed", &seed.to_string()]);
+    }
     std::fs::write(run_dir.join("command.txt"), format!("{command:?}\n"))?;
     let child = command
         .spawn()
@@ -775,8 +787,18 @@ fn verify_server_progress(storage: &str) -> Result<()> {
         !stderr.contains("Simulation step failed in server mode"),
         "server stopped simulating before termination: {stderr}"
     );
+    if seed.is_some() {
+        assert!(
+            stderr.lines().any(|line| {
+                line.contains("brain execution fault; agent scheduled for death cleanup")
+                    && line.contains("working-state cell 197 became non-finite")
+                    && line.contains("0x7f800000")
+            }),
+            "the seeded regression must exercise its original Assembly overflow, not just survive: {stderr}"
+        );
+    }
     let result = serde_json::json!({
-        "storage": storage, "elapsed_ms": started.elapsed().as_millis(),
+        "storage": storage, "seed": seed, "elapsed_ms": started.elapsed().as_millis(),
         "first_tick": first_tick, "last_tick": last_tick, "samples": samples,
         "termination": "killed and reaped by test", "child_exit": exit.to_string(),
     });

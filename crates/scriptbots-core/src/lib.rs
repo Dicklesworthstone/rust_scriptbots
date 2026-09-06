@@ -7951,6 +7951,8 @@ pub enum DeathCause {
     Aging,
     /// Undetermined.
     Unknown,
+    /// A valid brain program produced an invalid execution state and was removed.
+    BrainExecutionFault(BrainExecutionFault),
 }
 
 impl DeathCause {
@@ -7966,6 +7968,7 @@ impl DeathCause {
             Self::Starvation => 0x03,
             Self::Aging => 0x04,
             Self::Unknown => 0x05,
+            Self::BrainExecutionFault(_) => 0x06,
         }
     }
 }
@@ -9891,6 +9894,34 @@ impl fmt::Display for BrainEnvelopeKind {
     }
 }
 
+/// A deterministic failure produced while executing an otherwise valid brain.
+///
+/// Keep the exact floating-point bits: serializing infinity or NaN as a JSON number would
+/// discard the evidence. This category never describes corrupt input or a missing evaluator.
+#[derive(
+    Debug, Clone, Copy, Error, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum BrainExecutionFault {
+    /// A working-state cell became non-finite during evaluation.
+    #[error("working-state cell {index} became non-finite (f32 bits 0x{bits:08x})")]
+    NonFiniteState {
+        /// Zero-based index in the family-owned working state.
+        index: u32,
+        /// Exact IEEE-754 bits of the rejected value.
+        bits: u32,
+    },
+}
+
+impl BrainExecutionFault {
+    /// Reject a false non-finite claim before it can become an agent death.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        match self {
+            Self::NonFiniteState { bits, .. } => !f32::from_bits(bits).is_finite(),
+        }
+    }
+}
+
 /// Explicit protocol and adapter failures. Version mismatches never fall back or coerce bytes.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum BrainProtocolError {
@@ -9989,6 +10020,14 @@ pub enum BrainProtocolError {
         family_id: BrainFamilyId,
         /// Validation failure detail.
         detail: String,
+    },
+    /// Valid input produced a deterministic execution fault; candidate state was rolled back.
+    #[error("brain family `{family_id}` execution fault: {fault}")]
+    ExecutionFault {
+        /// Family whose evaluator produced the fault.
+        family_id: BrainFamilyId,
+        /// Exact rejected execution result.
+        fault: BrainExecutionFault,
     },
     /// The family is already registered.
     #[error("brain family `{family_id}` is already registered")]
@@ -10152,9 +10191,10 @@ pub trait BrainEvaluator: Send + Sync {
 
     /// Evaluate one fixed `ScriptBots` sensor vector.
     ///
-    /// Returning `Err` must leave every future-affecting evaluator value unchanged. Core uses a
-    /// deterministic zero-output containment action for that completed terminal tick and then
-    /// latches the typed fault, so a rejected candidate must never leak partial recurrent state.
+    /// Returning `Err` must leave every future-affecting evaluator value unchanged. Core uses
+    /// zero outputs for the containment tick. A matching, valid [`BrainProtocolError::ExecutionFault`]
+    /// removes only this agent at death cleanup; every other error latches a terminal world fault.
+    /// A rejected candidate must never leak partial recurrent state in either case.
     fn evaluate(
         &mut self,
         sensors: &[f32; INPUT_SIZE],
@@ -18442,6 +18482,7 @@ struct MortalityCounts {
     starvation: usize,
     aging: usize,
     unknown: usize,
+    brain_execution_fault: usize,
 }
 
 /// Birth composition tallied at the boundary, so the projection never sees a `BirthRecord`
@@ -18557,7 +18598,9 @@ fn project_mortality_metrics(counts: Option<&MortalityCounts>, metrics: &mut Vec
     let starvation = counts.starvation;
     let aging = counts.aging;
     let unknown = counts.unknown;
-    let total = combat_carnivore + combat_herbivore + starvation + aging + unknown;
+    let brain_execution_fault = counts.brain_execution_fault;
+    let total =
+        combat_carnivore + combat_herbivore + starvation + aging + unknown + brain_execution_fault;
     if total == 0 {
         return;
     }
@@ -18582,6 +18625,10 @@ fn project_mortality_metrics(counts: Option<&MortalityCounts>, metrics: &mut Vec
         telemetry_count_f64(unknown),
     ));
     metrics.push(MetricSample::new(
+        "mortality.brain_execution_fault.count",
+        telemetry_count_f64(brain_execution_fault),
+    ));
+    metrics.push(MetricSample::new(
         "mortality.total.count",
         telemetry_count_f64(total),
     ));
@@ -18604,6 +18651,10 @@ fn project_mortality_metrics(counts: Option<&MortalityCounts>, metrics: &mut Vec
     metrics.push(MetricSample::new(
         "mortality.unknown.ratio",
         telemetry_count_f64(unknown) / telemetry_count_f64(total),
+    ));
+    metrics.push(MetricSample::new(
+        "mortality.brain_execution_fault.ratio",
+        telemetry_count_f64(brain_execution_fault) / telemetry_count_f64(total),
     ));
 }
 
@@ -20269,7 +20320,10 @@ impl WorldState {
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
-    fn stage_brains(&mut self) -> Result<(), BrainSpawnError> {
+    fn stage_brains(
+        &mut self,
+        execution_faults: &mut BTreeMap<AgentId, BrainExecutionFault>,
+    ) -> Result<(), BrainSpawnError> {
         #[cfg(feature = "batch-brains")]
         #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
         struct BrainCohortKey {
@@ -20285,6 +20339,7 @@ impl WorldState {
             sensors: [f32; INPUT_SIZE],
             outputs: [f32; OUTPUT_SIZE],
             error: Option<BrainSpawnError>,
+            execution_fault: Option<BrainExecutionFault>,
             #[cfg(feature = "batch-brains")]
             protocol_registry_key: Option<u64>,
             #[cfg(feature = "batch-brains")]
@@ -20309,6 +20364,7 @@ impl WorldState {
                     sensors: runtime.sensors,
                     outputs: [0.0; OUTPUT_SIZE],
                     error: None,
+                    execution_fault: None,
                     #[cfg(feature = "batch-brains")]
                     protocol_registry_key,
                     #[cfg(feature = "batch-brains")]
@@ -20568,6 +20624,14 @@ impl WorldState {
                 }
                 BrainExecution::Protocol(evaluator) => match evaluator.evaluate(&job.sensors) {
                     Ok(outputs) => job.outputs = outputs,
+                    Err(BrainProtocolError::ExecutionFault { family_id, fault })
+                        if &family_id == evaluator.family_id() && fault.is_valid() =>
+                    {
+                        // Only an explicit, self-consistent execution fault is agent-local.
+                        // The evaluator has retained its pre-tick state; leave zero outputs
+                        // for this containment tick and remove the agent at death cleanup.
+                        job.execution_fault = Some(fault);
+                    }
                     Err(error) => {
                         // Family evaluators are required to reject atomically. Zero output keeps
                         // the one containment transition deterministic and inert before the fault
@@ -20587,6 +20651,17 @@ impl WorldState {
             if let Some(runtime) = self.runtime.get_mut(job.agent_id) {
                 runtime.brain.restore_execution(job.execution);
                 runtime.outputs = job.outputs;
+            }
+            if let Some(fault) = job.execution_fault {
+                execution_faults.insert(job.agent_id, fault);
+                self.pending_deaths.push(job.agent_id);
+                diag_warn!(
+                    tick = self.tick.next().0,
+                    agent_uid = ?self.identities.get(job.agent_id).map(|identity| identity.uid),
+                    brain_kind = %job.kind,
+                    fault = %fault,
+                    "brain execution fault; agent scheduled for death cleanup"
+                );
             }
             if first_error.is_none() {
                 first_error = job.error;
@@ -23691,6 +23766,12 @@ impl WorldState {
         let healths: Vec<f32> = self.agents.columns().health().to_vec();
 
         let agent_count = handles.len();
+        // A brain-fault death may still have positive health at this boundary. No agent
+        // already scheduled for removal may receive a reward from another carcass.
+        let mut dying = vec![false; agent_count];
+        for (index, _) in dead {
+            dying[*index] = true;
+        }
         let mut health_add = vec![0.0f32; agent_count];
         let mut energy_add = vec![0.0f32; agent_count];
         let mut reproduction_bonus = vec![0.0f32; agent_count];
@@ -23745,7 +23826,7 @@ impl WorldState {
                     let dist2 = dist2_v.to_array();
                     for lane in 0..4 {
                         let idx = base + lane;
-                        if ids[lane] == *agent_id {
+                        if ids[lane] == *agent_id || dying[idx] {
                             continue;
                         }
                         if healths.get(idx).copied().unwrap_or(0.0) <= 0.0 {
@@ -23759,7 +23840,7 @@ impl WorldState {
                 let base = handles.len() - remainder.len();
                 for (o, neighbor_id) in remainder.iter().enumerate() {
                     let idx = base + o;
-                    if *neighbor_id == *agent_id {
+                    if *neighbor_id == *agent_id || dying[idx] {
                         continue;
                     }
                     if healths.get(idx).copied().unwrap_or(0.0) <= 0.0 {
@@ -23774,7 +23855,7 @@ impl WorldState {
             }
             #[cfg(not(feature = "simd_wide"))]
             for (idx, neighbor_id) in handles.iter().enumerate() {
-                if *neighbor_id == *agent_id {
+                if *neighbor_id == *agent_id || dying[idx] {
                     continue;
                 }
                 if healths.get(idx).copied().unwrap_or(0.0) <= 0.0 {
@@ -23868,7 +23949,11 @@ impl WorldState {
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
-    fn stage_death_cleanup(&mut self, tick: Tick) -> DeathResourceActivity {
+    fn stage_death_cleanup(
+        &mut self,
+        tick: Tick,
+        execution_faults: &BTreeMap<AgentId, BrainExecutionFault>,
+    ) -> DeathResourceActivity {
         // Health exhaustion is fatal no matter which stage drained it; the
         // legacy sim erases every health<=0 agent each tick. Without this
         // sweep, agents drained by actuation/metabolism linger as zombies.
@@ -23933,7 +24018,9 @@ impl WorldState {
                     let herbivore = clamp01(runtime.herbivore_tendency);
                     let brain_kind = runtime.brain.kind().map(str::to_string);
                     let brain_key = runtime.brain.registry_key();
-                    let cause = if runtime.combat.was_spiked_by_carnivore {
+                    let cause = if let Some(fault) = execution_faults.get(agent_id) {
+                        DeathCause::BrainExecutionFault(*fault)
+                    } else if runtime.combat.was_spiked_by_carnivore {
                         DeathCause::CombatCarnivore
                     } else if runtime.combat.was_spiked_by_herbivore {
                         DeathCause::CombatHerbivore
@@ -25347,6 +25434,7 @@ impl WorldState {
                         DeathCause::Starvation => counts.starvation += 1,
                         DeathCause::Aging => counts.aging += 1,
                         DeathCause::Unknown => counts.unknown += 1,
+                        DeathCause::BrainExecutionFault(_) => counts.brain_execution_fault += 1,
                     }
                 }
                 counts
@@ -25449,8 +25537,10 @@ impl WorldState {
     /// Execute one simulation transition without performing downstream persistence I/O.
     ///
     /// `Err` means no new transition started. Once a transition begins, this always advances to a
-    /// completed boundary and returns its [`StepCompletion`]. A brain evaluation failure uses a
-    /// deterministic zero-output containment action, suppresses births, and is carried alongside
+    /// completed boundary and returns its [`StepCompletion`]. A validated agent-local execution
+    /// fault uses zero outputs and removes that agent at death cleanup with its exact typed cause.
+    /// Other brain evaluation failures use a deterministic zero-output containment action,
+    /// suppress births, and are carried alongside
     /// population-construction faults in [`StepCompletion::fault`]; the latch rejects every later
     /// transition. This direct API is limited to persistence-disabled worlds; persistence-enabled
     /// callers use [`PersistenceAdmissionSession::step_outcome`].
@@ -25617,7 +25707,10 @@ impl WorldState {
         observed_stage!(WorldStepStage::Sense, {
             self.stage_sense();
         });
-        let brain_evaluation = observed_stage!(WorldStepStage::Brains, { self.stage_brains() });
+        let mut execution_faults = BTreeMap::new();
+        let brain_evaluation = observed_stage!(WorldStepStage::Brains, {
+            self.stage_brains(&mut execution_faults)
+        });
         observed_stage!(WorldStepStage::Actuation, {
             self.stage_actuation();
             self.record_replay_action_events(next_tick);
@@ -25669,7 +25762,7 @@ impl WorldState {
             self.record_resource_change(ResourceFlowKind::Combat, before);
         });
         observed_stage!(WorldStepStage::DeathCleanup, {
-            let death_activity = self.stage_death_cleanup(next_tick);
+            let death_activity = self.stage_death_cleanup(next_tick, &execution_faults);
             self.resource_ledger.record(
                 ResourceFlowKind::CarcassReward,
                 death_activity.carcass_delta,
@@ -31832,7 +31925,7 @@ mod tests {
             }
 
             let error = world
-                .stage_brains()
+                .stage_brains(&mut BTreeMap::new())
                 .expect_err("a missing legacy runner must fail closed");
             assert_eq!(error.kind(), "stub");
             let source = std::error::Error::source(&error)
@@ -31861,7 +31954,7 @@ mod tests {
             runtime.sensors[..OUTPUT_SIZE].copy_from_slice(&sensor_copy);
         }
         unbound_world
-            .stage_brains()
+            .stage_brains(&mut BTreeMap::new())
             .expect("literal unbound brain uses intentional sensor-copy behavior");
         assert_eq!(
             unbound_world
@@ -36298,7 +36391,9 @@ mod tests {
                 runtime.selection = SelectionState::Selected;
             }
         }
-        world.stage_brains().expect("brain stage");
+        world
+            .stage_brains(&mut BTreeMap::new())
+            .expect("brain stage");
         assert_eq!(inspections.load(AtomicUsizeOrdering::Relaxed), 0);
 
         let before = world.world_digest_v1().expect("pre-inspection digest");
@@ -39528,6 +39623,75 @@ mod tests {
     }
 
     #[test]
+    fn brain_execution_fault_classification_requires_the_family_and_nonfinite_bits() {
+        struct FaultProbe {
+            inner: Box<dyn BrainEvaluator>,
+            reported_family: BrainFamilyId,
+            fault: BrainExecutionFault,
+        }
+        impl BrainEvaluator for FaultProbe {
+            fn family_id(&self) -> &BrainFamilyId {
+                self.inner.family_id()
+            }
+            fn evaluate(
+                &mut self,
+                _sensors: &[f32; INPUT_SIZE],
+            ) -> Result<[f32; OUTPUT_SIZE], BrainProtocolError> {
+                Err(BrainProtocolError::ExecutionFault {
+                    family_id: self.reported_family.clone(),
+                    fault: self.fault,
+                })
+            }
+            fn inspect(
+                &self,
+                request: BrainInspection,
+            ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+                self.inner.inspect(request)
+            }
+            fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+                self.inner.checkpoint_state()
+            }
+        }
+        for (reported_family, bits, contained) in [
+            ("fault-probe", f32::INFINITY.to_bits(), true),
+            ("wrong-family", f32::INFINITY.to_bits(), false),
+            ("fault-probe", f32::MAX.to_bits(), false),
+        ] {
+            let mut world = WorldState::new(protocol_reproduction_config(0.0)).expect("world");
+            let key = world
+                .register_brain_family(
+                    "fault-probe",
+                    Box::new(FixtureBrainFamily::new("fault-probe")),
+                )
+                .expect("fixture family");
+            let agent = protocol_fixture_parent(&mut world, key, 41);
+            let runtime = world.agent_runtime_mut(agent).expect("runtime");
+            let BrainBinding::Protocol { evaluator, .. } = &mut runtime.brain else {
+                panic!("fixture must be protocol bound");
+            };
+            let fault = BrainExecutionFault::NonFiniteState { index: 17, bits };
+            *evaluator = Some(Box::new(FaultProbe {
+                inner: evaluator.take().expect("live fixture evaluator"),
+                reported_family: BrainFamilyId::new(reported_family).expect("family id"),
+                fault,
+            }));
+            runtime.outputs = [0.75; OUTPUT_SIZE];
+            let mut faults = BTreeMap::new();
+            let result = world.stage_brains(&mut faults);
+            assert_eq!(result.is_ok(), contained);
+            assert_eq!(faults.get(&agent).copied(), contained.then_some(fault));
+            assert_eq!(world.pending_deaths.contains(&agent), contained);
+            assert_eq!(
+                world
+                    .agent_runtime(agent)
+                    .expect("restored runtime")
+                    .outputs,
+                [0.0; OUTPUT_SIZE]
+            );
+        }
+    }
+
+    #[test]
     fn protocol_evaluation_failure_completes_one_fail_closed_tick_then_latches() {
         let mut config = protocol_reproduction_config(0.0);
         config.reproduction_energy_threshold = 10.0;
@@ -40052,7 +40216,9 @@ mod tests {
             fixture_protocol_lane(5, 2, 0, -1, 5.0),
         );
 
-        world.stage_brains().expect("mixed batch stage");
+        world
+            .stage_brains(&mut BTreeMap::new())
+            .expect("mixed batch stage");
 
         assert_eq!(
             *alpha_probe.lock().expect("alpha probe"),
@@ -40177,7 +40343,7 @@ mod tests {
             .brain = BrainBinding::with_runner(Box::new(StubBrain)).clone();
 
         let error = world
-            .stage_brains()
+            .stage_brains(&mut BTreeMap::new())
             .expect_err("missing execution must remain a typed terminal fault");
         assert_eq!(error.kind(), "batch-missing-execution");
         assert!(
@@ -40267,7 +40433,7 @@ mod tests {
                 .num_threads(threads)
                 .build()
                 .expect("dedicated test pool");
-            pool.install(|| world.stage_brains())
+            pool.install(|| world.stage_brains(&mut BTreeMap::new()))
                 .expect("thread-count brain stage");
             let outputs = world
                 .agents()
@@ -40355,7 +40521,9 @@ mod tests {
             ),
         ];
 
-        world.stage_brains().expect("scalar fallback stage");
+        world
+            .stage_brains(&mut BTreeMap::new())
+            .expect("scalar fallback stage");
         assert!(scalar_probe.lock().expect("scalar probe").is_empty());
         assert_eq!(
             *declining_probe.lock().expect("declining probe"),
@@ -40419,8 +40587,12 @@ mod tests {
             agents: batch_agents,
             probe: batch_probe,
         } = build_world(true);
-        scalar.stage_brains().expect("matched scalar stage");
-        batch.stage_brains().expect("matched batch stage");
+        scalar
+            .stage_brains(&mut BTreeMap::new())
+            .expect("matched scalar stage");
+        batch
+            .stage_brains(&mut BTreeMap::new())
+            .expect("matched batch stage");
         assert!(
             scalar_probe
                 .lock()
@@ -40506,7 +40678,7 @@ mod tests {
         }
 
         let error = world
-            .stage_brains()
+            .stage_brains(&mut BTreeMap::new())
             .expect_err("partial batch mutation must fail the whole cohort");
         assert_eq!(error.kind(), "batch-rollback");
         assert!(error.to_string().contains("fixture batch failed at lane 1"));
@@ -40567,7 +40739,7 @@ mod tests {
         });
 
         let error = world
-            .stage_brains()
+            .stage_brains(&mut BTreeMap::new())
             .expect_err("one invalid replacement must roll back every cohort lane");
         assert!(
             error
@@ -40634,7 +40806,7 @@ mod tests {
         });
 
         let error = world
-            .stage_brains()
+            .stage_brains(&mut BTreeMap::new())
             .expect_err("wrong batch checkpoint count must fail closed");
         assert!(error.to_string().contains("batch cardinality mismatch"));
         assert_eq!(*probe.lock().expect("cardinality probe"), vec![vec![2, 3]]);
@@ -40689,7 +40861,9 @@ mod tests {
             ),
         ];
 
-        world.stage_brains().expect("feature-disabled scalar stage");
+        world
+            .stage_brains(&mut BTreeMap::new())
+            .expect("feature-disabled scalar stage");
         assert!(probe.lock().expect("disabled probe").is_empty());
         for (agent, expected) in agents.into_iter().zip([12.0_f32, 5.0]) {
             assert_eq!(
@@ -42487,7 +42661,7 @@ mod tests {
             })
             .expect("ordinary pre-death state update");
         world.pending_deaths.push(agent);
-        world.stage_death_cleanup(Tick(1));
+        world.stage_death_cleanup(Tick(1), &BTreeMap::new());
         let death = world.pending_death_records.last().expect("death record");
         assert_eq!(death.agent_uid, insertion_record.agent_uid);
         assert_eq!(death.generation, insertion_record.generation);
@@ -44698,6 +44872,67 @@ mod tests {
         );
     }
     #[test]
+    fn brain_fault_deaths_cannot_receive_another_carcass_reward() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            carcass_distribution_radius: 50.0,
+            carcass_health_reward: 0.4,
+            carcass_reproduction_reward: 0.2,
+            carcass_neighbor_exponent: 1.0,
+            carcass_maturity_age: 5,
+            rng_seed: Some(314),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("carcass world");
+        let corpse = world.spawn_agent(AgentData {
+            health: 0.0,
+            age: 10,
+            ..AgentData::default()
+        });
+        let faulty = world.spawn_agent(AgentData::default());
+        let survivor = world.spawn_agent(AgentData::default());
+        world.agent_runtime_mut(corpse).expect("corpse").spiked = true;
+        for agent in [faulty, survivor] {
+            world
+                .agent_runtime_mut(agent)
+                .expect("neighbor")
+                .herbivore_tendency = 0.0;
+        }
+        let before = world
+            .agent_runtime(survivor)
+            .expect("survivor")
+            .reproduction_counter;
+        let dead =
+            [corpse, faulty].map(|agent| (world.agents.index_of(agent).expect("index"), agent));
+        let faulty_health = world.agents.snapshot(faulty).expect("faulty row").health;
+        let _ = world.distribute_carcass_rewards(&dead);
+        assert_eq!(
+            world.agents.snapshot(faulty).expect("faulty row").health,
+            faulty_health
+        );
+        assert!(
+            (world
+                .agents
+                .snapshot(survivor)
+                .expect("survivor row")
+                .health
+                - 1.4)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (world
+                .agent_runtime(survivor)
+                .expect("survivor")
+                .reproduction_counter
+                - before
+                - 0.2)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
     fn carcass_distribution_rewards_neighbors() {
         let config = ScriptBotsConfig {
             world_width: 200,
@@ -44745,7 +44980,7 @@ mod tests {
         }
 
         world.pending_deaths.push(victim);
-        world.stage_death_cleanup(Tick::zero());
+        world.stage_death_cleanup(Tick::zero(), &BTreeMap::new());
 
         assert!(
             !world.agents().contains(victim),
@@ -44832,7 +45067,7 @@ mod tests {
         }
 
         world.pending_deaths.push(victim);
-        world.stage_death_cleanup(Tick::zero());
+        world.stage_death_cleanup(Tick::zero(), &BTreeMap::new());
         world.stage_accumulate_tick_events();
         let projection = world.prepare_persistence(Tick(1), false);
         let projected = ready_batch_arc(&projection);
@@ -46001,7 +46236,7 @@ mod tests {
         world.pending_deaths.push(ids[3]);
         world.pending_deaths.push(ids[1]);
 
-        world.stage_death_cleanup(Tick::zero());
+        world.stage_death_cleanup(Tick::zero(), &BTreeMap::new());
 
         let survivors: Vec<_> = world.agents().iter_handles().collect();
         assert_eq!(survivors, vec![ids[0], ids[2]]);
@@ -46031,7 +46266,7 @@ mod tests {
         world.identities.remove(agent);
         world.pending_deaths.push(agent);
 
-        let activity = world.stage_death_cleanup(Tick::zero());
+        let activity = world.stage_death_cleanup(Tick::zero(), &BTreeMap::new());
 
         // The record is not processed, and nothing is invented for it.
         assert_eq!(activity.carcass_delta, ResourceAmounts::default());
@@ -48337,6 +48572,13 @@ mod tests {
             death(3, DeathCause::Starvation),
             death(4, DeathCause::Aging),
             death(5, DeathCause::Unknown),
+            death(
+                6,
+                DeathCause::BrainExecutionFault(BrainExecutionFault::NonFiniteState {
+                    index: 197,
+                    bits: f32::INFINITY.to_bits(),
+                }),
+            ),
         ];
 
         let birth = |uid: u64, is_hybrid: bool| BirthRecord {
@@ -48362,13 +48604,34 @@ mod tests {
         world.pending_spike_attempt_events = 3;
         world.pending_spike_hit_events = 2;
         world.pending_birth_events = 3;
-        world.pending_death_events = 5;
+        world.pending_death_events = world.pending_lifecycle_death_metrics.len();
 
         let projection = world.prepare_persistence(Tick(1), false);
         projection
             .batch()
             .expect("synthetic projection must be ready")
             .clone()
+    }
+
+    #[test]
+    fn mortality_projection_counts_brain_faults_in_totals_and_ratios() {
+        let batch = synthetic_full_coverage_batch();
+        let value = |name| {
+            batch
+                .metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .expect("projected metric")
+                .value
+        };
+        assert_eq!(value("mortality.brain_execution_fault.count"), 1.0);
+        assert_eq!(value("mortality.total.count"), 6.0);
+        assert_eq!(value("mortality.brain_execution_fault.ratio"), 1.0 / 6.0);
+        assert_eq!(value("mortality.unknown.count"), 1.0);
+        assert_eq!(value("mortality.unknown.ratio"), 1.0 / 6.0);
+        let mut empty = Vec::new();
+        project_mortality_metrics(Some(&MortalityCounts::default()), &mut empty);
+        assert!(empty.is_empty());
     }
 
     fn quiet_trace_config(seed: u64, persistence_interval: u32) -> ScriptBotsConfig {

@@ -605,6 +605,13 @@ impl AncestryGraph {
             mix(node.origin.digest_tag());
             mix(node.death_tick.map_or(u64::MAX, |tick| tick.0));
             mix(node.death_cause.map_or(u64::MAX, DeathCause::digest_tag));
+            if let Some(DeathCause::BrainExecutionFault(
+                crate::BrainExecutionFault::NonFiniteState { index, bits },
+            )) = node.death_cause
+            {
+                mix(u64::from(index));
+                mix(u64::from(bits));
+            }
             mix(u64::from(node.generation.0));
             mix(node.brain_key.unwrap_or(u64::MAX));
             mix(u64::from(node.is_hybrid));
@@ -1083,6 +1090,17 @@ mod tests {
         assert_ne!(combat, starvation);
         assert_ne!(combat, aging);
         assert_ne!(starvation, aging);
+        let fault_digest = |index, bits| {
+            build(DeathCause::BrainExecutionFault(
+                crate::BrainExecutionFault::NonFiniteState { index, bits },
+            ))
+            .canonical_digest()
+        };
+        let infinity = fault_digest(197, f32::INFINITY.to_bits());
+        assert_ne!(infinity, aging);
+        assert_ne!(infinity, fault_digest(198, f32::INFINITY.to_bits()));
+        assert_ne!(infinity, fault_digest(197, f32::NEG_INFINITY.to_bits()));
+        assert_ne!(infinity, fault_digest(197, f32::NAN.to_bits()));
     }
 
     #[test]
