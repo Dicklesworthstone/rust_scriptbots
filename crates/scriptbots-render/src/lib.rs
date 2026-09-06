@@ -2144,11 +2144,21 @@ impl TestHost {
     }
 
     fn new(world: WorldState) -> Self {
+        Self::with_journal(
+            world,
+            Box::new(scriptbots_runtime::VolatileJournal::default()),
+        )
+    }
+
+    fn with_journal(
+        world: WorldState,
+        journal: Box<dyn scriptbots_runtime::JournalPort + Send>,
+    ) -> Self {
         let clock = Arc::new(AtomicU64::new(0));
         let owner_clock = Arc::clone(&clock);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
-            let core = scriptbots_runtime::HostCore::new(
+            let core = scriptbots_runtime::HostCore::with_journal(
                 scriptbots_runtime::HostSessionId::new(1),
                 world,
                 scriptbots_runtime::HostCoreOptions {
@@ -2156,6 +2166,7 @@ impl TestHost {
                     snapshot_interval_ticks: 1,
                     ..scriptbots_runtime::HostCoreOptions::default()
                 },
+                journal,
             )
             .expect("GUI fixture owner");
             let (mut driver, port) = scriptbots_runtime::channel::ChannelHostDriver::new(
@@ -2246,7 +2257,12 @@ impl TestHost {
 #[cfg(test)]
 impl Drop for TestHost {
     fn drop(&mut self) {
-        self.submit(scriptbots_runtime::HostCommand::Shutdown);
+        let snapshot = self.snapshot();
+        if snapshot.lifecycle != scriptbots_runtime::HostLifecycle::Stopped
+            && snapshot.health.fault().is_none()
+        {
+            self.submit(scriptbots_runtime::HostCommand::Shutdown);
+        }
         if let Some(worker) = self.worker.take() {
             worker.join().expect("GUI fixture owner join");
         }
@@ -18937,19 +18953,6 @@ mod command_characterization_tests {
         .into()
     }
 
-    fn simulation_view_with_driver(
-        simulation_driver: Arc<Mutex<GuiSimulationDriver>>,
-    ) -> SimulationView {
-        SimulationView::new(
-            simulation_driver,
-            AnalyticsSnapshotProvider::empty(),
-            "command characterization".into(),
-            Arc::new(|_command: ControlCommand| Some("test-cmd".to_owned())),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(())),
-        )
-    }
-
     fn host_view(host: Arc<TestHost>) -> SimulationView {
         SimulationView::new(
             host.port.clone(),
@@ -19375,22 +19378,11 @@ mod command_characterization_tests {
             focused_agent.get_or_insert(agent_id);
         }
         let focused_agent = focused_agent.expect("seeded repaint-schedule agent");
-        let world = Arc::new(Mutex::new(world));
-
-        let pending_commands = Arc::new(Mutex::new(Vec::new()));
-        let drain_commands = Arc::clone(&pending_commands);
-        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
-            Arc::new(move || {
-                let mut commands = drain_commands
-                    .lock()
-                    .expect("repaint-schedule command queue");
-                std::mem::take(&mut *commands)
-            });
-        let driver = gui_simulation_driver(&world, command_drain);
+        let host = Arc::new(TestHost::new(world));
 
         let mut views = Vec::with_capacity(snapshot_count);
         if snapshot_count > 0 {
-            let hud = simulation_view_with_driver(Arc::clone(&driver));
+            let hud = host_view(Arc::clone(&host));
             hud.inspector
                 .lock()
                 .expect("HUD inspector lock")
@@ -19398,41 +19390,30 @@ mod command_characterization_tests {
             views.push(hud);
         }
         if snapshot_count > 1 {
-            let mut canvas = simulation_view_with_driver(Arc::clone(&driver));
+            let mut canvas = host_view(Arc::clone(&host));
             canvas.set_minimal_canvas_mode();
             views.push(canvas);
         }
 
-        let now = Instant::now();
         let mut digest_trace = Vec::with_capacity(240);
         for expected_tick in 1..=240 {
-            pending_commands
-                .lock()
-                .expect("repaint-schedule command queue")
-                .push(ControlCommand::UpdateSimulation(SimulationCommand {
+            host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
+                SimulationCommand {
                     paused: None,
                     speed_multiplier: None,
                     step_once: true,
-                }));
-            driver
-                .lock()
-                .expect("GUI simulation driver lock")
-                .drive_at(now);
+                },
+            ));
             for view in &mut views {
                 let _ = view.snapshot();
             }
-            let world = world.lock().expect("repaint-schedule world");
+            let digests = host.port.world_digests().expect("owner repaint digests");
             assert_eq!(
-                world.tick().0,
-                expected_tick,
+                digests.0.tick.0, expected_tick,
                 "every driver command must advance exactly one science tick"
             );
-            digest_trace.push((
-                world
-                    .characterization_digest_v0()
-                    .expect("characterization digest"),
-                world.world_digest_v1().expect("canonical world digest"),
-            ));
+            assert_eq!(digests.0.tick, digests.1.tick);
+            digest_trace.push(digests);
         }
 
         digest_trace
@@ -20060,10 +20041,11 @@ mod command_characterization_tests {
         // or fabricated handle.
         let live: Vec<AgentId> = fixture
             .world
-            .lock()
-            .expect("shortcut world lock")
-            .agents()
-            .iter_handles()
+            .snapshot()
+            .world
+            .agents
+            .iter()
+            .map(|agent| AgentId::from(slotmap::KeyData::from_ffi(agent.id)))
             .collect();
         assert!(
             after.is_some_and(|id| live.contains(&id)),
@@ -20841,59 +20823,27 @@ mod command_characterization_tests {
             focused_agent.get_or_insert(agent_id);
         }
         let focused_agent = focused_agent.expect("seeded production-repaint agent");
-        let world = Arc::new(Mutex::new(world));
-
-        let drain_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pending_commands = Arc::new(Mutex::new(Vec::new()));
-        let drain_commands = Arc::clone(&pending_commands);
-        let counted_drains = Arc::clone(&drain_calls);
-        let command_drain: Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync> =
-            Arc::new(move || {
-                counted_drains.fetch_add(1, AtomicOrdering::Relaxed);
-                let mut commands = drain_commands
-                    .lock()
-                    .expect("production-repaint command queue");
-                std::mem::take(&mut *commands)
-            });
-        let submit_commands = Arc::clone(&pending_commands);
+        let host = Arc::new(TestHost::new(world));
+        let applied_commands = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_commands = Arc::clone(&applied_commands);
+        let submit_host = Arc::clone(&host);
         let command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync> =
             Arc::new(move |command| {
-                submit_commands
-                    .lock()
-                    .expect("production-repaint command queue")
-                    .push(command);
-                Some("test-cmd".to_owned())
+                let command = scriptbots_runtime::HostCommand::try_from(command).ok()?;
+                let receipt = submit_host.apply(command);
+                counted_commands.fetch_add(1, AtomicOrdering::Relaxed);
+                Some(receipt.command_id().to_string())
             });
-        let step_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted_steps = Arc::clone(&step_calls);
-        let step_world = Arc::clone(&world);
-        let simulation_step: WorldStepDriver = Arc::new(move || {
-            counted_steps.fetch_add(1, AtomicOrdering::Relaxed);
-            step_world
-                .lock()
-                .expect("production-repaint world lock")
-                .step()
-        });
         let session = Arc::new(GuiSession::new(
-            Arc::clone(&world),
-            simulation_step,
+            host.port.clone(),
             AnalyticsSnapshotProvider::empty(),
-            identified(command_drain),
-            Arc::new(|_: &str, _: GuiCommandOutcome| {}) as GuiCommandReporter,
             command_submit,
         ));
 
-        let digest_before_install = {
-            let world = world.lock().expect("pre-install production world");
-            (
-                world
-                    .characterization_digest_v0()
-                    .expect("pre-install characterization digest"),
-                world
-                    .world_digest_v1()
-                    .expect("pre-install canonical world digest"),
-            )
-        };
+        let digest_before_install = host
+            .port
+            .world_digests()
+            .expect("pre-install owner digests");
         let mut app = gpui::TestApp::new();
         let windows = app
             .update(|app| session.install(app))
@@ -20904,26 +20854,19 @@ mod command_characterization_tests {
             "the production GPUI session must install exactly two windows"
         );
         assert_eq!(
-            drain_calls.load(AtomicOrdering::Relaxed),
-            1,
-            "one production driver task must perform one startup drain"
+            applied_commands.load(AtomicOrdering::Relaxed),
+            0,
+            "window installation must not submit scientific commands"
         );
         assert_eq!(
-            step_calls.load(AtomicOrdering::Relaxed),
+            host.snapshot().world.tick,
             0,
             "session installation must not advance scientific time"
         );
-        let digest_after_install = {
-            let world = world.lock().expect("post-install production world");
-            (
-                world
-                    .characterization_digest_v0()
-                    .expect("post-install characterization digest"),
-                world
-                    .world_digest_v1()
-                    .expect("post-install canonical world digest"),
-            )
-        };
+        let digest_after_install = host
+            .port
+            .world_digests()
+            .expect("post-install owner digests");
         assert_eq!(
             digest_after_install, digest_before_install,
             "production window installation and initial renders must be science-neutral"
@@ -20937,8 +20880,11 @@ mod command_characterization_tests {
             .expect("production canvas root");
         app.update_entity(&hud, |view, _| {
             assert!(
-                Arc::ptr_eq(&view.simulation_driver, &session.simulation_driver),
-                "the production HUD must use the session-level simulation driver"
+                Arc::ptr_eq(
+                    &view.host.snapshot_hub().latest(),
+                    &session.host.snapshot_hub().latest()
+                ),
+                "the production HUD must share the session's owner publication"
             );
             assert!(
                 !view.minimal_canvas_mode,
@@ -20951,8 +20897,11 @@ mod command_characterization_tests {
         });
         app.read_entity(&canvas, |view, _| {
             assert!(
-                Arc::ptr_eq(&view.simulation_driver, &session.simulation_driver),
-                "the production canvas must use the session-level simulation driver"
+                Arc::ptr_eq(
+                    &view.host.snapshot_hub().latest(),
+                    &session.host.snapshot_hub().latest()
+                ),
+                "the production canvas must share the session's owner publication"
             );
             assert!(
                 view.minimal_canvas_mode,
@@ -20971,35 +20920,30 @@ mod command_characterization_tests {
                     }
                 ))
                 .is_some(),
-                "production GPUI step command must be admitted"
+                "production GPUI step command must apply through the owner"
             );
             app.advance_clock(Duration::from_secs_f32(SIM_TICK_INTERVAL));
             app.run_until_parked();
             assert_eq!(
-                drain_calls.load(AtomicOrdering::Relaxed),
-                expected_tick as usize + 1,
-                "exactly one production driver task must drain once per timer wake"
+                applied_commands.load(AtomicOrdering::Relaxed),
+                expected_tick as usize,
+                "each requested step must have exactly one owner application receipt"
             );
             assert_eq!(
-                step_calls.load(AtomicOrdering::Relaxed),
-                expected_tick as usize,
+                host.snapshot().world.tick,
+                expected_tick,
                 "each admitted step-once command must execute exactly one science step"
             );
 
-            let digest_before_repaint = {
-                let world = world.lock().expect("production-repaint world");
-                assert_eq!(
-                    world.tick().0,
-                    expected_tick,
-                    "one session driver wake must advance exactly one science tick"
-                );
-                (
-                    world
-                        .characterization_digest_v0()
-                        .expect("characterization digest"),
-                    world.world_digest_v1().expect("canonical world digest"),
-                )
-            };
+            let digest_before_repaint = host
+                .port
+                .world_digests()
+                .expect("owner digests before repaint");
+            assert_eq!(
+                digest_before_repaint.0.tick.0, expected_tick,
+                "one requested step must advance exactly one science tick"
+            );
+            assert_eq!(digest_before_repaint.0.tick, digest_before_repaint.1.tick);
             if repaint_count > 0 {
                 force_production_repaint(&mut app, windows.hud);
                 let rendered_tick = app.read_entity(&hud, |view, _| {
@@ -21010,17 +20954,7 @@ mod command_characterization_tests {
                     Some(expected_tick),
                     "HUD draw must execute the real production Render::render path"
                 );
-                let digest_after_hud = {
-                    let world = world.lock().expect("post-HUD production world");
-                    (
-                        world
-                            .characterization_digest_v0()
-                            .expect("post-HUD characterization digest"),
-                        world
-                            .world_digest_v1()
-                            .expect("post-HUD canonical world digest"),
-                    )
-                };
+                let digest_after_hud = host.port.world_digests().expect("post-HUD owner digests");
                 assert_eq!(
                     digest_after_hud, digest_before_repaint,
                     "the full production HUD render path must be science-neutral"
@@ -21036,17 +20970,10 @@ mod command_characterization_tests {
                     Some(expected_tick),
                     "canvas draw must execute the real production Render::render path"
                 );
-                let digest_after_canvas = {
-                    let world = world.lock().expect("post-canvas production world");
-                    (
-                        world
-                            .characterization_digest_v0()
-                            .expect("post-canvas characterization digest"),
-                        world
-                            .world_digest_v1()
-                            .expect("post-canvas canonical world digest"),
-                    )
-                };
+                let digest_after_canvas = host
+                    .port
+                    .world_digests()
+                    .expect("post-canvas owner digests");
                 assert_eq!(
                     digest_after_canvas, digest_before_repaint,
                     "the full production canvas render path must be science-neutral"
@@ -21073,13 +21000,13 @@ mod command_characterization_tests {
             "canvas playback history must expose the requested repaint schedule"
         );
         assert_eq!(
-            drain_calls.load(AtomicOrdering::Relaxed),
-            241,
-            "one startup drain plus 240 timer wakes proves one session-level driver task"
+            applied_commands.load(AtomicOrdering::Relaxed),
+            digest_trace.len(),
+            "each trace entry must have exactly one owner-applied command"
         );
         assert_eq!(
-            step_calls.load(AtomicOrdering::Relaxed),
-            240,
+            host.snapshot().world.tick,
+            digest_trace.len() as u64,
             "the production session must execute exactly 240 science ticks"
         );
         app.update(|app| app.shutdown());
@@ -21425,22 +21352,37 @@ mod command_characterization_tests {
 
     #[test]
     fn simulation_fault_survives_storage_health_refresh() {
-        let world = command_characterization_world();
-        let drain: TestCommandDrain = Arc::new(Vec::new);
-        let driver = gui_simulation_driver(&world, drain);
-        let mut view = simulation_view_with_driver(Arc::clone(&driver));
-        driver
-            .lock()
-            .expect("GUI simulation driver lock")
-            .pause_for_simulation_failure("deliberate brain construction failure".to_owned());
+        let mut pipeline = scriptbots_storage::StoragePipeline::unattributed_memory()
+            .expect("real storage worker");
+        let journal = pipeline
+            .journal_port(HostSessionId::new(1), Default::default())
+            .expect("real journal port");
+        pipeline.shutdown().expect("close actual journal gate");
+        let world = Arc::try_unwrap(command_characterization_world())
+            .unwrap_or_else(|_| panic!("fault fixture world still shared"))
+            .into_inner()
+            .expect("fault fixture world");
+        let host = Arc::new(TestHost::with_journal(world, Box::new(journal)));
+        let mut view = host_view(Arc::clone(&host));
+        host.clock.store(1_000_000_000, AtomicOrdering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.snapshot().health.fault().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "closed journal must fault the owner"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let before = view
+            .snapshot()
+            .simulation_fault
+            .expect("published owner fault");
+        assert!(before.contains("journal_closed"), "{before}");
 
         view.maybe_refresh_analytics(0, 0);
         let snapshot = view.snapshot();
 
-        assert_eq!(
-            snapshot.simulation_fault.as_deref(),
-            Some("deliberate brain construction failure")
-        );
+        assert_eq!(snapshot.simulation_fault.as_deref(), Some(before.as_str()));
         assert!(snapshot.storage.last_error.is_none());
         assert!(!snapshot.storage.stopped);
         assert!(snapshot.controls.paused);

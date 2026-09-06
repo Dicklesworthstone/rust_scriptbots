@@ -40,8 +40,8 @@ use crate::{
     ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
 };
 use scriptbots_core::{
-    AgentDebugInfo, AgentDebugQuery, AgentUid, INPUT_SIZE, MutationRates, NUM_EYES, OUTPUT_SIZE,
-    SensorAttribution, TraitModifiers, WorldDigestV1,
+    AgentDebugInfo, AgentDebugQuery, AgentUid, CharacterizationDigestV0, INPUT_SIZE, MutationRates,
+    NUM_EYES, OUTPUT_SIZE, SensorAttribution, TraitModifiers, WorldDigestV1,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
@@ -159,6 +159,9 @@ enum IngressMessage {
     },
     ScientificDigest {
         reply: Sender<Result<WorldDigestV1, HostAccessError>>,
+    },
+    WorldDigests {
+        reply: Sender<Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError>>,
     },
     /// A command envelope plus the one-shot admission reply lane.
     Command {
@@ -395,6 +398,17 @@ impl ChannelHostPort {
     /// Compute the full scientific digest at an owner boundary.
     pub fn scientific_digest_v1(&self) -> Result<WorldDigestV1, HostAccessError> {
         self.read_owner(|reply| IngressMessage::ScientificDigest { reply })
+    }
+
+    /// Compute physical-layout and logical-science digests at the same owner boundary.
+    ///
+    /// Characterization V0 retains slot identities that scientific V1 deliberately
+    /// replaces with stable agent identities. Repaint diagnostics need both to
+    /// detect an unintended allocator change as well as a scientific state change.
+    pub fn world_digests(
+        &self,
+    ) -> Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError> {
+        self.read_owner(|reply| IngressMessage::WorldDigests { reply })
     }
 
     fn protocol_violation(message: impl Into<String>) -> HostAccessError {
@@ -777,6 +791,18 @@ impl ChannelHostDriver {
                     .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
                 let _ = reply.send(result);
             }
+            IngressMessage::WorldDigests { reply } => {
+                let world = self.host.core().world();
+                let result = world
+                    .characterization_digest_v0()
+                    .and_then(|physical| {
+                        world
+                            .world_digest_v1()
+                            .map(|scientific| (physical, scientific))
+                    })
+                    .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
+                let _ = reply.send(result);
+            }
             IngressMessage::Command { envelope, reply } => {
                 let result = self.host.submit(envelope);
                 if let Ok(status) = &result
@@ -1147,6 +1173,14 @@ mod tests {
             let uid = world.agent_uid(id).expect("subject UID");
             let expected = serde_json::to_value(world.agent_debug_view(AgentDebugQuery::default()))
                 .expect("expected owner rows");
+            let expected_digests = (
+                world
+                    .characterization_digest_v0()
+                    .expect("physical digest before transfer"),
+                world
+                    .world_digest_v1()
+                    .expect("scientific digest before transfer"),
+            );
             let core = HostCore::new(
                 HostSessionId::new(19),
                 world,
@@ -1163,13 +1197,13 @@ mod tests {
                 ChannelHostDriver::new(FixedDeadlineHost::new(core), ChannelHostOptions::default())
                     .expect("inspection transport");
             ready
-                .send((port, uid, expected))
+                .send((port, uid, expected, expected_digests))
                 .expect("publish transport");
             driver
                 .run(|| ManualInstant::from_nanos(0))
                 .expect("inspection owner exit")
         });
-        let (port, uid, expected) = receive.recv().expect("owner ready");
+        let (mut port, uid, expected, expected_digests) = receive.recv().expect("owner ready");
         let snapshot = port.snapshot_hub().latest();
         let before = port.scientific_digest_v1().expect("digest before reads");
         let detail = port
@@ -1212,6 +1246,19 @@ mod tests {
             before
         );
         assert_eq!(port.snapshot_hub().latest().revision, snapshot.revision);
+        assert_eq!(
+            port.world_digests().expect("atomic owner digests"),
+            expected_digests
+        );
+        let step_id = CommandId::new(1);
+        port.submit(CommandEnvelope::new(step_id, HostCommand::Step))
+            .expect("step admission");
+        let step = wait_resolved(&mut port, step_id);
+        assert!(matches!(step.application(), ApplicationState::Applied(_)));
+        let advanced = port.world_digests().expect("digests after science");
+        assert_ne!(advanced.0, expected_digests.0);
+        assert_ne!(advanced.1, expected_digests.1);
+        assert_eq!(advanced.0.tick, advanced.1.tick);
         drop(port);
         assert_eq!(
             owner.join().expect("owner joined").outcome,
@@ -2250,6 +2297,7 @@ mod tests {
             | IngressMessage::AgentInspection { .. }
             | IngressMessage::DebugAgents { .. }
             | IngressMessage::RequestReplayDigest { .. }
+            | IngressMessage::WorldDigests { .. }
             | IngressMessage::ScientificDigest { .. } => {
                 panic!("expected command submission")
             }
@@ -2316,6 +2364,7 @@ mod tests {
             | IngressMessage::AgentInspection { .. }
             | IngressMessage::DebugAgents { .. }
             | IngressMessage::RequestReplayDigest { .. }
+            | IngressMessage::WorldDigests { .. }
             | IngressMessage::ScientificDigest { .. } => {
                 panic!("expected command-status lookup")
             }

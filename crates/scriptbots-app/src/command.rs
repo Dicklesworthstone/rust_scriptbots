@@ -1248,32 +1248,60 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "KNOWN DEFECT bd-2z0.4.1: shutdown returns while admitted command work is pending"
-    )]
-    fn target_shutdown_terminally_resolves_pending_commands() {
-        let world = Arc::new(Mutex::new(
-            WorldState::new(ScriptBotsConfig::default()).expect("world"),
-        ));
-        let (runtime, drain, submit) = crate::servers::ControlRuntime::dummy();
-        let mut updated = world.lock().expect("world lock").config().clone();
+    fn ordered_host_shutdown_applies_prior_control_commands() {
+        use scriptbots_runtime::{CommandEnvelope, CommandId, HostCommand, HostPort};
+
+        let world = WorldState::new(ScriptBotsConfig {
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        let mut updated = world.config().clone();
         updated.food_max = 0.73;
+        let persistence = world
+            .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+            .expect("owner persistence");
+        let host = crate::host_thread::HostThread::spawn(
+            scriptbots_runtime::HostSessionId::new(1),
+            world,
+            persistence,
+            Box::new(scriptbots_runtime::VolatileJournal::default()),
+            scriptbots_runtime::HostCoreOptions {
+                initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..scriptbots_runtime::HostCoreOptions::default()
+            },
+            scriptbots_runtime::channel::ChannelHostOptions::default(),
+        )
+        .expect("owner startup");
+        let mut port = host.port();
+        let (runtime, submit) = crate::servers::ControlRuntime::launch(
+            port.clone(),
+            crate::servers::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::servers::ControlServerConfig::default()
+            },
+        )
+        .expect("control runtime");
         assert!(submit(ControlCommand::UpdateConfig(Box::new(updated))).is_some());
-
+        let shutdown_id = CommandId::from_client_sequence(u64::MAX, 1);
+        port.submit(CommandEnvelope::new(shutdown_id, HostCommand::Shutdown))
+            .expect("ordered shutdown admission");
+        // ControlRuntime owns listeners; only the owner can finalize science.
         runtime.shutdown().expect("control runtime shutdown");
-        let observed_at_shutdown = world.lock().expect("world lock").config().food_max;
-        assert!((observed_at_shutdown - 0.73).abs() > f32::EPSILON);
-
-        let mut world_guard = world.lock().expect("world lock");
-        for bus in (drain.as_ref())() {
-            let _ = apply_control_command(&mut world_guard, bus.command)
-                .expect("apply command after shutdown");
-        }
-        drop(world_guard);
-        assert!((world.lock().expect("world lock").config().food_max - 0.73).abs() < f32::EPSILON);
-        assert!(
-            (observed_at_shutdown - 0.73).abs() < f32::EPSILON,
-            "KNOWN DEFECT bd-2z0.4.1: shutdown returns while admitted command work is pending"
+        drop(submit);
+        drop(port);
+        let final_owner = host.join().expect("owner shutdown receipt");
+        assert!((final_owner.snapshot.config.food_max - 0.73).abs() < f32::EPSILON);
+        assert_eq!(final_owner.snapshot.world.tick, 0);
+        assert_eq!(final_owner.snapshot.command_queue_depth, 0);
+        assert_eq!(final_owner.snapshot.last_applied_command, Some(shutdown_id));
+        assert_eq!(
+            final_owner.snapshot.lifecycle,
+            scriptbots_runtime::HostLifecycle::Stopped
         );
     }
 }

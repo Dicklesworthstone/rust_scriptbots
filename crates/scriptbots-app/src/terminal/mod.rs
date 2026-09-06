@@ -8683,7 +8683,7 @@ mod tests {
             }
         }
 
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -8857,7 +8857,7 @@ mod tests {
     #[test]
     fn cone_selection_cycles_through_every_eye_and_wraps_both_ways() {
         let world = command_characterization_world();
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -8899,7 +8899,7 @@ mod tests {
     #[test]
     fn the_cone_shortcuts_are_reachable_from_the_keyboard() {
         let world = command_characterization_world();
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -8921,7 +8921,7 @@ mod tests {
     /// app needs it.
     fn with_shortcut_app(probe: impl FnOnce(&mut TerminalApp)) {
         let world = command_characterization_world();
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -10388,7 +10388,10 @@ mod tests {
             assert!(after.revisions.config > before.revisions.config);
             let status = app
                 .host
-                .command_status(receipt.parse().expect("host identity"))
+                .command_status(
+                    serde_json::from_value(serde_json::Value::String(receipt.clone()))
+                        .expect("host identity"),
+                )
                 .expect("authoritative command lookup")
                 .expect("retained receipt");
             assert!(matches!(
@@ -10822,7 +10825,7 @@ mod tests {
                 .expect("default agent is finite");
         }
         let before = world.lock().expect("tick").tick().0;
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -11320,7 +11323,7 @@ mod tests {
     fn narrow_insights_panel_keeps_brain_provenance_and_clipping_visible() {
         let world = command_characterization_world();
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -11608,7 +11611,7 @@ mod tests {
             }
         }
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -11767,7 +11770,7 @@ mod tests {
             .world_digest_v1()
             .expect("pre-inspection digest");
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -11811,7 +11814,7 @@ mod tests {
     #[test]
     fn terminal_app_key_handler_single_step_advances_exactly_once_and_stays_paused() {
         let world = command_characterization_world();
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -11862,7 +11865,7 @@ mod tests {
         height: u16,
     ) -> HeadlessBufferEvidence {
         let world = command_characterization_world();
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -11888,7 +11891,7 @@ mod tests {
     /// one the widgets painted into, not a second guess at it.
     fn matrix_frame_buffer(width: u16, height: u16) -> (Buffer, FrameLayout, u64) {
         let world = command_characterization_world();
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -11985,7 +11988,7 @@ mod tests {
         height: u16,
     ) -> Buffer {
         let world = command_characterization_world();
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
@@ -12093,7 +12096,7 @@ mod tests {
     fn headless_test_backend_frame_proves_buffer_semantics_and_current_tick() {
         let world = command_characterization_world();
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
 
@@ -12202,7 +12205,7 @@ mod tests {
 
         let repeat_world = command_characterization_world();
         let repeat_host = TerminalTestHost::take(repeat_world);
-        let (repeat_runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (repeat_runtime, _) = crate::servers::ControlRuntime::dummy();
         let repeat_ctx = repeat_host.context(&repeat_runtime);
         let repeat = renderer
             .run_headless_frames(repeat_ctx, 1)
@@ -12856,7 +12859,7 @@ mod tests {
             }
         }
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         // Freeze the running chrome exercised by this pure capability matrix;
@@ -13406,7 +13409,7 @@ mod tests {
     fn target_queue_full_rejection_does_not_change_tui_playback_state() {
         let world = command_characterization_world();
         let host = TerminalTestHost::take(world);
-        let (runtime, _unused_drain, _unused_submit) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _unused_submit) = crate::servers::ControlRuntime::dummy();
         let (sender, _receiver) = crate::command::create_command_bus(1);
         sender
             // The bus now admits under an explicit identity so an applier can
@@ -13446,10 +13449,7 @@ mod tests {
             scriptbots_runtime::HostCoreOptions::default(),
         )
         .expect("real snapshot owner");
-        let published = host
-            .snapshot_hub()
-            .snapshot_after(None)
-            .expect("initial publication");
+        let published = host.snapshot_hub().latest();
         let snapshot = Snapshot::from_render(&published);
         host.with_world(|world| {
             assert_eq!(snapshot.agent_count, world.agent_count());
@@ -13978,10 +13978,7 @@ mod tests {
             scriptbots_runtime::HostCoreOptions::default(),
         )
         .expect("real identity snapshot owner");
-        let published = host
-            .snapshot_hub()
-            .snapshot_after(None)
-            .expect("initial publication");
+        let published = host.snapshot_hub().latest();
         let snapshot = Snapshot::from_render(&published);
         host.with_world(|world| {
             let handles: Vec<AgentId> = world.agents().iter_handles().collect();
@@ -14033,7 +14030,7 @@ mod tests {
             WorldState::new(ScriptBotsConfig::default()).expect("world"),
         ));
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -14059,7 +14056,7 @@ mod tests {
     fn simulation_fault_survives_storage_health_refresh() {
         let world = command_characterization_world();
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -14081,7 +14078,7 @@ mod tests {
 
         let world = Arc::new(std::sync::Mutex::new(world));
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
 
@@ -14100,7 +14097,7 @@ mod tests {
 
         let world = Arc::new(std::sync::Mutex::new(world));
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -14133,7 +14130,7 @@ mod tests {
     macro_rules! rail_test_app {
         ($world:expr, $app:ident, $backend:ident) => {
             let host = TerminalTestHost::take($world);
-            let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+            let (runtime, _) = crate::servers::ControlRuntime::dummy();
             let renderer = TerminalRenderer::default();
             let ctx = host.context(&runtime);
             let mut $app = TerminalApp::new(&renderer, ctx);
@@ -14642,7 +14639,7 @@ mod tests {
 
         let world = Arc::new(std::sync::Mutex::new(world));
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -14663,7 +14660,7 @@ mod tests {
 
         let world = Arc::new(std::sync::Mutex::new(world));
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -14689,7 +14686,7 @@ mod tests {
         let world = WorldState::new(config).expect("world");
         let world = Arc::new(std::sync::Mutex::new(world));
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
@@ -15018,7 +15015,7 @@ mod tests {
         let world = WorldState::new(config).expect("world");
         let world = Arc::new(std::sync::Mutex::new(world));
         let host = TerminalTestHost::take(world);
-        let (runtime, _, _) = crate::servers::ControlRuntime::dummy();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
