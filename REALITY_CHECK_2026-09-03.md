@@ -2,10 +2,10 @@
 
 ## Execution TODO — started 2026-09-05
 
-Current continuation — **2026-09-06, through source `5bb567a`, TurquoiseLake**. The earlier entries below retain
+Current continuation — **2026-09-06, verified executable source `5bb567a`, TurquoiseLake**. The earlier entries below retain
 the failure history; these are the current next actions and proof limits.
 
-- [ ] **bd-bfkd — Assembly execution-fault containment, resumed 2026-09-06.**
+- [x] **bd-bfkd — Assembly execution-fault containment, completed 2026-09-06.**
   - [x] Re-read the original C++ interpreter, transactional adapter, world fault latch,
     death cleanup, mortality projection and retained DSR30 failure. No arithmetic change.
   - [x] Implement the distinction between a non-finite execution result and malformed
@@ -14,7 +14,7 @@ the failure history; these are the current next actions and proof limits.
     ordinary death boundary with an explicit brain-execution cause and deterministic details.
     Wire lifecycle storage/readback, ancestry digest details and mortality totals; forbid dying
     agents from receiving another corpse reward. The real mixed-world and file-readback
-    controls pass DSR46/48; original file600s acceptance remains unmet below.
+    controls pass DSR46/48; original file600s acceptance subsequently passes DSR53 below.
   - [x] Bind the changed execution policy to Assembly adapter v4. Preserve the old identity
     encoding pin and explicitly assert the new policy descriptor. Genome/state codecs and
     arithmetic remain unchanged; exact fault bits enter the existing lifecycle stream.
@@ -52,12 +52,12 @@ the failure history; these are the current next actions and proof limits.
       an actual storage **Admit** acknowledgement timeout at completed tick600, Indeterminate,
       seed `2227158220202299814`; this is the original `bd-w1oi` failure class in file mode.
       The unseeded memory test passed: tick17 to1079,366 status observations,603744ms including
-      termination. Long suite2/3, overall DSR47 failed. Keep `bd-bfkd` open with unmet acceptance.
+      termination. Long suite2/3, overall DSR47 failed; acceptance remained unmet at that point.
       DSR52 `server-final-fb15a70-20260906-52` failed on hz4 at clean `fb15a70` after
       workspace compilation passed: normal REST/MCP test compilation failed before any
       test executed, and no long test ran. Worker SBH logs record deletion of the exact
       active Cargo registry at02:32:25UTC; see build-farm `.3` below.
-  - [ ] Run clean pinned DSR focused/full affected tests and required compiler/lint/format
+  - [x] Run clean pinned DSR focused/full affected tests and required compiler/lint/format
     checks, then both original 600-second server scenarios with their original budgets.
     DSR46 completed with typed failure on clean `876b31cd1127edc11d221ccb6b35c67ca4b242ae`; its nine-command
     scope includes core/brain library tests, one/four-thread real Assembly continuation, actual
@@ -75,8 +75,28 @@ the failure history; these are the current next actions and proof limits.
     Workspace all-target compiler, strict Clippy and formatting checks pass. Overall DSR48
     remains failed solely on the deliberately old resize golden; all eleven copied command-log
     and profile checksum entries match. DSR49 final app proof pins `e84ff10` on hz4.
-  - [ ] Retain exact-source evidence, review original acceptance afresh, update this bead
+  - [x] Retain exact-source evidence, review original acceptance afresh, update this bead
     honestly, commit and publish verified work. Broader ownership/storage tasks remain open.
+  - [x] Final DSR53 `server-sbh-5bb567a-20260906-53` at clean `5bb567a` on hz4 passes
+    all nine commands, typed `pass`, final analytics build and DSR packaging exit0. Normal
+    real REST/MCP passes1/1, and all three original-budget long tests pass3/3:
+
+    | Scenario | Raw status rows | First / last tick | Last observed status / result elapsed, ms |
+    | --- | ---: | ---: | ---: |
+    | Exact Assembly seed `12659881219344128065` | 452 | 17 / 1199 | 600685 / 600819 |
+    | Original file storage | 518 | 20 / 3419 | 600900 / 600934 |
+    | Original memory storage | 529 | 17 / 1139 | 590512 / 603541 |
+
+    Raw rows independently reproduce every count and endpoint. Seeded stderr records
+    cell197/+Inf at tick88/UID9; the world then continues. Result elapsed includes test
+    termination: children are killed/reaped, so this is not graceful-shutdown proof.
+    The file run generated seed `8905175406244118193`, distinct from failed DSR47.
+    Full local evidence: `/tmp/scriptbots-server-sbh-5bb567a-proof-20260906`.
+    All22 run-file hashes (including SQLite/WAL), nine command-log hashes, profile and two
+    source-input hashes match; final verdict/result/build-log/manifest hashes match the worker.
+    DSR51 compiler/strict Clippy cover identical current Rust/Cargo inputs. Closed after fresh
+    solo original-acceptance/source review; no independent certification, general storage
+    stability, native-pixel, full-workspace-test or performance claim.
 
 - [ ] **bd-w1oi — diagnose the observed file Admit timeout before changing batching.**
   - [x] Retain DSR47's full proof and all three run directories, including failed SQLite/WAL,
@@ -100,6 +120,9 @@ the failure history; these are the current next actions and proof limits.
     after a terminal simulation failure, as a diagnostic result rather than a liveness pass.
   - [ ] Attribute the slow operation from those observations, make one justified repair,
     and rerun the original file/memory and exact-seed server acceptance with unchanged budgets.
+    DSR53 now passes the original scenarios, but its different file seed and a successful
+    observation window do not explain or repair the intermittent DSR47 timeout. No storage
+    latency code changed in this continuation; this bead and `bd-j8o2` remain in progress.
 
 - [x] **bd-2z0.4.17 — propagate server failure through orderly shutdown.**
   - [x] Inspect the actual loop and outer teardown: simulation and poisoned-world errors
@@ -119,12 +142,14 @@ the failure history; these are the current next actions and proof limits.
     Full local proof `/tmp/scriptbots-server-errors-fb15a70-proof-20260906`: eight
     command/profile hashes and two source-input hashes match; final verdict/result/build-log
     hashes match the worker. Closed after fresh solo verification, not independent certification.
-    `bd-w1oi` and `bd-bfkd` keep their original long-run criteria.
+    `bd-bfkd` subsequently satisfies its original long-run criteria in DSR53; `bd-w1oi`
+    remains open for causal storage-latency repair.
 
-- [ ] Publish the reviewed server-error and DSR-protection commits, final progress notes
-  and tracker export; verify both remote branch heads after the active acceptance completes.
+- [x] Publish the verified server-error and DSR-protection code. Both remote branch heads
+  were confirmed at `379f6ef` before the final acceptance closeout. That concurrent commit
+  preserved the pending progress notes and tracker without changing executable source.
 
-- [ ] **bd-build-farm-reliability-lb19.3 — prevent cleanup of active DSR inputs.**
+- [x] **bd-build-farm-reliability-lb19.3 — prevent cleanup of active DSR inputs.**
   - [x] Attribute DSR52's missing dependency paths to the exact SBH activity entry:
     `cargo-home/registry` deleted successfully at02:32:25.660UTC, with a partially failed
     `cargo-home/git` deletion at02:30:39.464UTC. The compiler remained present.
@@ -133,14 +158,16 @@ the failure history; these are the current next actions and proof limits.
     external Cargo home, target and proof roots. Keep source clean and fleet cleanup enabled.
   - [x] Protect the still-running DSR51 external paths using the real `sbh protect` command;
     this adds markers and user protection records, without changing its pinned source/profile.
-  - [ ] Observe actual scanner protection, retain DSR52's complete failure and rerun the
+  - [x] Observe actual scanner protection, retain DSR52's complete failure and rerun the
     clean pinned original server lane. No timeout, test filter, golden or verdict weakened.
     - [x] Actual hz3 daemon recognizes the new Cargo-home/proof markers. DSR53's hz4 daemon
       also recognizes the marker installed by the committed runner. DSR52's full
       proof and DSR state/logs are local; all seven command-log hashes match.
-    - [ ] DSR53 `server-sbh-5bb567a-20260906-53` is running at clean `5bb567a` on hz4.
+    - [x] DSR53 `server-sbh-5bb567a-20260906-53` finishes successfully at clean `5bb567a` on hz4.
       Its first launcher attempt refused before DSR because I omitted the external yq
       directory from PATH; corrected using the already installed binary. Both logs retained.
+      All nine commands and final packaging pass; closed after fresh solo acceptance review.
+      Earlier DSR49's missing-path cause remains unestablished and its separate bead stays open.
 
 - [x] Complete DSR45 and close **bd-2z0.14.2.7**, then **bd-q2w9**, against their original
   acceptance. All 488 selected app tests pass; formatting, workspace all-target compilation
@@ -181,20 +208,26 @@ the failure history; these are the current next actions and proof limits.
   primary mutation threshold above one at about 412 seconds (last REST tick 2941). Memory
   mode's HTTP read failed after last observed tick 541 at 92.9 seconds; retained stderr has no
   terminal simulation error. Do not identify either as a proved storage-admission timeout.
-- [ ] Complete **bd-1bzg**, the evolved-threshold reproduction fix. `5f44fca` admits finite
+- [x] Complete **bd-1bzg**, the evolved-threshold reproduction fix. `5f44fca` admits finite
   nonnegative thresholds without clamping inherited values or changing mutation kernels/RNG.
   DSR28 real heredity 12/12 passed, including actual Gaussian crossing and inherited saturation
   in all three production families; 70/73 brain tests passed, with only deliberately old adapter
   identity pins failing. `89d907a` pins the captured, reviewed MLP-v4/DWRAON-v3/Assembly-v3 hashes.
-  Full core/brain now pass DSR29; both 600-second server proofs remain required before closure.
-- [ ] Complete **bd-w1oi** and **bd-s5ou** acceptance. DSR30 at `89d907a` passed normal
+  Full core/brain pass DSR29 and DSR48. Both original600s scenarios now pass DSR53.
+  Fresh review rechecked all three families' above-one/MAX-finite legacy byte/RNG parity,
+  invalid-no-RNG controls, production registry/discovery and real reproduction witnesses.
+  Closed after original acceptance was satisfied; no clamping or RNG-order change.
+- [x] Complete **bd-s5ou** acceptance. DSR30 at `89d907a` passed normal
   real-process REST/MCP 1/1, but long file/memory scenarios failed 0/2 after 144.46 seconds total.
   File HTTP reads failed after last observed tick 1200 at 112.8 seconds, seed
   `5280383142373791406`; memory stopped after an Assembly cell became infinite, seed
-  `12659881219344128065`. Keep the original time budgets and both storage modes.
-- [ ] Resolve **bd-bfkd**: an evolved Assembly arithmetic overflow must not be papered over
-  with changed scientific arithmetic or weakened finite-state guards. Determine the explicit
-  per-agent fault policy, reproduce the retained seed, then prove healthy world continuation.
+  `12659881219344128065`. DSR53 subsequently passes normal REST/MCP and both original storage
+  scenarios with unchanged budgets. Supported alternative-version success and malformed-type
+  invalid-parameters refusal remain distinct, executed assertions. Closed after fresh solo
+  review; production negotiation unchanged. **bd-w1oi** stays open as described above.
+- [x] Resolve **bd-bfkd** without changing scientific arithmetic or weakening finite-state
+  guards. Explicit per-agent policy, exact seeded reproduction and healthy world continuation
+  are verified by the final acceptance evidence above.
 - [ ] Resolve **bd-j8o2** journal latency causally; DSR29 again passed 6/8 with two command
   durability deadlines missed. Command application is observed; commitment remains pending.
   DSR34 additionally missed the unchanged owner-client handoff timeout, producing 7/10 total
@@ -1016,17 +1049,17 @@ before committing. The full scratch audit, including all twenty honesty prompts,
 `/tmp/scriptbots-work-block-audit-20260905.md`. Strict Clippy remains red; no clean
 scanner, full-workspace, performance, GUI, PTY or browser result is claimed.
 
-## Current verdict and evidence boundary
+## Initial audit verdict and evidence boundary
 
 **ScriptBots contains a substantial simulation and research substrate, but it does not yet deliver the complete Evolution Lab journey.** The limiting work is connecting the production host, frontends, checkpoint continuation, scientific reports, and release evidence. Completing components or closing their issues does not prove those connections.
 
-This refresh supersedes the September 3 assessment preserved below. Source audited: `fa1fb08b1bc1a341f2ea4f0638ae2ecaa7eb7dbf` on `main`. The initial checkout already had a modified `.beads/last-touched` and an untracked compiler ICE report; neither was treated as audit-authored code. No application code is changed by this assessment.
+This initial refresh superseded the September 3 assessment preserved below. Source audited: `fa1fb08b1bc1a341f2ea4f0638ae2ecaa7eb7dbf` on `main`. The initial checkout already had a modified `.beads/last-touched` and an untracked compiler ICE report; neither was treated as audit-authored code. The assessment itself changed no application code. Subsequent implementation and pinned DSR acceptance through `5bb567a` are recorded in the execution TODO above; the initial infrastructure refusal below is not the current state.
 
 Method: read all 1,031 lines of AGENTS.md and 1,053 lines of README.md; read the recovery plan, four historical root plans, architecture guide, rendering plans/specification, browser ADRs/plans, analytics contracts, and integration decisions. The recovery plan is the active measuring stick; historical proposals do not override it. Inspect implementation, production callers, feature declarations and tests by capability. Search the full tracker snapshot, including closed issues, before adding completion debt. Keyword scan found 73 matching Rust lines; AST scan found five `unimplemented!()` calls, all in tests/test-only modules. These counts are scan results, not defect counts. Behavioral inspection found more consequential gaps without those macros.
 
 Initial tracker: **636 issues: 456 closed, 173 open, 6 in progress, 1 blocked; 180 not closed.** `br ready` returned 63 entries, including aggregates. The authoritative BV wrapper reported 87 graph-actionable entries and explicitly warned that only BR authorizes claims. Active dependency cycle count was zero. No percentage of product completion is inferred from these counts.
 
-Fresh execution evidence is limited:
+Fresh execution evidence at that initial audit was limited:
 
 | Observation on this host | Result | What it proves |
 |---|---|---|
@@ -1037,9 +1070,9 @@ Fresh execution evidence is limited:
 | `br dep cycles --json` and authoritative BV triage | zero active cycles; snapshot accepted | Tracker structure/freshness, not product correctness. |
 | GitHub Releases API | v0.1.1, published 2026-07-22, zero attached assets | A release record exists; it does not provide downloaded native/WASM binaries to verify. |
 
-Raw local observations are retained in `/tmp/scriptbots-reality-20260904-G9j3WJ` (tracker snapshot, triage, scans, DSR refusal, guard logs, release JSON). These are diagnostic files, not a portable acceptance bundle. A discovered `/data/tmp/.../pkg/scriptbots-app` was an 18-byte shell fixture that only prints `ok`; it was excluded as runtime evidence. No current-source application test suite, GUI/PTY/browser journey, or benchmark was executed successfully in this audit. Historical green tests remain historical evidence at their recorded commits.
+Raw local observations are retained in `/tmp/scriptbots-reality-20260904-G9j3WJ` (tracker snapshot, triage, scans, DSR refusal, guard logs, release JSON). These are diagnostic files, not a portable acceptance bundle. A discovered `/data/tmp/.../pkg/scriptbots-app` was an 18-byte shell fixture that only prints `ok`; it was excluded as runtime evidence. No current-source application test suite, GUI/PTY/browser journey, or benchmark was executed successfully in that initial audit. Later actual executions and their precise scopes are recorded above; each result remains bound to its recorded commit.
 
-## Vision checklist: component evidence versus product delivery
+## Initial vision checklist: component evidence versus product delivery
 
 `PARTIAL` means substantial code exists but the stated journey has missing implementation or integration. `UNPROVEN` means the claim exceeds available execution evidence. `STUB` is reserved for an observed placeholder. No row is marked `WORKING`: the skill requires tests and E2E verified, and this host could not provide fresh acceptance. This does not assert that every component is broken.
 

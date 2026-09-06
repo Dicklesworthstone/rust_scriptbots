@@ -2822,11 +2822,12 @@ Verification is a product feature. A simulation laboratory is only as useful as 
 
 ### 13.1 gate hierarchy
 
-**[Currently In Progress — bd-build-farm-reliability-lb19.3, TurquoiseLake, 2026-09-06]**
-Protect DSR's external Cargo home, target and proof roots from SBH before compiling.
-DSR52's actual worker log records deletion of its live Cargo registry; its compiler
-check passed but no server test executed. Keep the original test budgets and rerun
-the pinned lane after installing the existing subtree protection.
+**[Completed — bd-build-farm-reliability-lb19.3, TurquoiseLake, 2026-09-06, DSR53 at 5bb567a]**
+DSR protects its external Cargo home, target and proof roots through existing SBH
+subtree protection before compiling. The actual daemon recognizes the marker;
+all nine server-lane commands and final packaging pass with original test budgets.
+DSR52's live-registry deletion evidence remains retained. This repairs that build
+interference; it does not establish a fix for intermittent simulation-storage latency.
 
 Use the cheapest relevant gate first, then widen:
 
