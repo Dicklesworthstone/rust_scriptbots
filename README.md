@@ -1080,6 +1080,12 @@ The host needs DSR's native-build prerequisites, including Mike Farah's `yq` v4,
 selected Cargo lane. `dsr config validate` checks the materialized configuration;
 it does not compile the workspace or prove those system libraries are installed.
 
+On workers with SBH installed, the runner protects the external Cargo home,
+target directory and proof root before running Cargo. This prevents the cleanup
+daemon from reclaiming active dependencies: a source checkout's Git protection
+does not cover DSR's sibling Cargo cache. Protection failures stop verification;
+the markers stay outside the clean source checkout, and fleet cleanup stays enabled.
+
 The external `config.yaml` needs `schema_version: "1.0.0"`. For native execution
 on the Linux host where DSR runs, use this external `hosts.yaml`:
 

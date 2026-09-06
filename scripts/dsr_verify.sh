@@ -120,6 +120,19 @@ actual_target=$(printf '%s\n' "$compiler_identity" | sed -n 's/^host: //p')
 [[ ${CARGO_TARGET_DIR:-} = /* ]] || refuse "missing external Cargo target directory"
 case "$CARGO_TARGET_DIR/" in "$source_root/"*) refuse "Cargo target must be outside source" ;; esac
 
+# The source checkout's Git protection does not cover DSR's sibling Cargo home.
+# bd-build-farm-reliability-lb19.3: SBH deleted an active registry during DSR52.
+# Protect only our external build inputs/outputs; leave fleet cleanup running.
+if command -v sbh >/dev/null; then
+    [[ ${CARGO_HOME:-} = /* && -d "$CARGO_HOME" ]] || refuse "missing DSR Cargo home for SBH protection"
+    case "$CARGO_HOME/" in "$source_root/"*) refuse "Cargo home must be outside source" ;; esac
+    mkdir -p "$CARGO_TARGET_DIR"
+    for protected_path in "$CARGO_HOME" "$CARGO_TARGET_DIR" "$proof_root"; do
+        sbh protect "$protected_path" || refuse "failed SBH protection: $protected_path"
+        [[ -f "$protected_path/.sbh-protect" ]] || refuse "missing SBH marker: $protected_path"
+    done
+fi
+
 proof_dir="$proof_root/$proof_version"
 mkdir "$proof_dir" || refuse "proof directory already exists or cannot be created"
 cp "$SCRIPTBOTS_VERIFY_PROFILE" "$proof_dir/profile.yaml"
