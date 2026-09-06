@@ -122,7 +122,7 @@ the failure history; these are the current next actions and proof limits.
     and rerun the original file/memory and exact-seed server acceptance with unchanged budgets.
     DSR53 now passes the original scenarios, but its different file seed and a successful
     observation window do not explain or repair the intermittent DSR47 timeout. No storage
-    latency code changed in this continuation; this bead and `bd-j8o2` remain in progress.
+    latency code changed in this continuation; this bead is `in_progress` and `bd-j8o2` is `open`.
 
 - [x] **bd-2z0.4.17 — propagate server failure through orderly shutdown.**
   - [x] Inspect the actual loop and outer teardown: simulation and poisoned-world errors
