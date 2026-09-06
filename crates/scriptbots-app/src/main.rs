@@ -3314,15 +3314,25 @@ impl Renderer for ServerRenderer {
     }
 
     fn run(&self, ctx: RendererContext<'_>) -> Result<()> {
+        let control_health = ctx.control_runtime.health_probe();
+        Self::run_with_health(ctx, control_health)
+    }
+}
+
+impl ServerRenderer {
+    fn run_with_health(
+        ctx: RendererContext<'_>,
+        control_health: impl Fn() -> std::result::Result<(), String>,
+    ) -> Result<()> {
         info!("ScriptBots server mode starting (headless background simulation with REST/MCP API)");
         let target_interval = std::time::Duration::from_millis(16);
         let reporter = ctx.control_runtime.command_reporter();
         let mut server_paused = false;
         let mut force_step = false;
-        while !matches!(
-            ctx.control_runtime.status(),
-            scriptbots_app::servers::ControlRuntimeStatus::Failed(_)
-        ) {
+        loop {
+            control_health()
+                .map_err(anyhow::Error::msg)
+                .context("server control runtime failed")?;
             let start = std::time::Instant::now();
             // Server mode APPLIES the commands it admits. This loop previously
             // stepped the world and never drained the bus, so every command a
@@ -3361,22 +3371,22 @@ impl Renderer for ServerRenderer {
                 }
                 Err(error) => {
                     warn!(%error, "world mutex poisoned in server mode; stopping loop");
-                    break;
+                    return Err(anyhow!("world mutex poisoned in server mode: {error}"));
                 }
             }
             let should_step = !server_paused || force_step;
             force_step = false;
             if should_step && let Err(error) = (ctx.simulation_step)() {
                 warn!(%error, "Simulation step failed in server mode; stopping loop");
-                break;
+                // The entrypoint still owns orderly control/storage teardown. Preserve this
+                // cause even when both finalizers succeed after a late admission resolves.
+                return Err(error).context("server simulation step failed");
             }
             let elapsed = start.elapsed();
             if elapsed < target_interval {
                 std::thread::sleep(target_interval - elapsed);
             }
         }
-        info!("Server mode exiting");
-        Ok(())
     }
 }
 
@@ -4789,6 +4799,163 @@ mod tests {
             assert!(status.is_closed);
             assert_eq!(status.config_revision, 0);
         }
+    }
+
+    struct ServerLoopFixture {
+        world: SharedWorld,
+        session: SharedPersistenceAdmission,
+        driver: WorldStepDriver,
+        runtime: scriptbots_app::servers::ControlRuntime,
+        drain: scriptbots_app::CommandDrain,
+        submit: scriptbots_app::CommandSubmit,
+    }
+
+    impl ServerLoopFixture {
+        fn new() -> Result<Self> {
+            let config = ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                rng_seed: Some(0x513C),
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            };
+            let (world, session) = WorldState::with_persistence(config, Box::new(NullPersistence))?;
+            let world = Arc::new(Mutex::new(world));
+            let session = Arc::new(Mutex::new(session));
+            let summary = scriptbots_app::control::empty_latest_summary();
+            let driver = persistence_step_driver(&world, &session, &summary);
+            let (runtime, drain, submit) = scriptbots_app::servers::ControlRuntime::launch(
+                Arc::clone(&world),
+                summary,
+                ControlServerConfig {
+                    rest_enabled: false,
+                    mcp_transport: scriptbots_app::servers::McpTransportConfig::Disabled,
+                    ..ControlServerConfig::default()
+                },
+            )?;
+            Ok(Self {
+                world,
+                session,
+                driver,
+                runtime,
+                drain,
+                submit,
+            })
+        }
+
+        fn context(&self) -> RendererContext<'_> {
+            RendererContext {
+                world: Arc::clone(&self.world),
+                simulation_step: Arc::clone(&self.driver),
+                analytics: SharedAnalytics::empty(),
+                control_runtime: &self.runtime,
+                command_drain: Arc::clone(&self.drain),
+                command_submit: Arc::clone(&self.submit),
+                scenario: Arc::new(ScenarioIdentityV0::caller_seeded("server-error-test")),
+            }
+        }
+    }
+
+    #[test]
+    fn server_loop_preserves_real_step_error_after_successful_control_shutdown() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = ServerLoopFixture::new()?;
+        let config = fixture.world.lock().expect("world lock").config().clone();
+        let (_other_world, foreign_session) =
+            WorldState::with_persistence(config, Box::new(NullPersistence))?;
+        let foreign_session = Mutex::new(Some(foreign_session));
+        let session = Arc::clone(&fixture.session);
+        let driver = Arc::clone(&fixture.driver);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let mut ctx = fixture.context();
+        ctx.simulation_step = Arc::new(move || {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            let result = driver();
+            if result.is_ok() {
+                // The first real server iteration succeeds. The second reaches the actual
+                // world/session ownership guard, rather than returning a fabricated error.
+                *session.lock().expect("session lock") = foreign_session
+                    .lock()
+                    .expect("foreign session lock")
+                    .take()
+                    .expect("first step only");
+            }
+            result
+        });
+        let result = ServerRenderer.run(ctx);
+        fixture.runtime.shutdown()?;
+        let error = prefer_storage_failure(result, Ok(()), "runtime")
+            .expect_err("successful cleanup must not erase the simulation failure");
+        assert!(matches!(
+            error.downcast_ref::<scriptbots_core::WorldStepError>(),
+            Some(scriptbots_core::WorldStepError::PersistenceSession(
+                PersistenceSessionError::WrongWorld
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            fixture.world.lock().expect("world lock").tick(),
+            scriptbots_core::Tick(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_loop_returns_poisoned_world_before_stepping() -> Result<()> {
+        let fixture = ServerLoopFixture::new()?;
+        let poisoned = Arc::clone(&fixture.world);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.lock().expect("unpoisoned world");
+                panic!("plant the poisoned-world boundary");
+            })
+            .join()
+            .is_err()
+        );
+        let error = ServerRenderer
+            .run(fixture.context())
+            .expect_err("poison must fail the run");
+        fixture.runtime.shutdown()?;
+        assert!(
+            error
+                .to_string()
+                .contains("world mutex poisoned in server mode")
+        );
+        assert_eq!(
+            fixture
+                .world
+                .lock()
+                .expect_err("poison retained")
+                .into_inner()
+                .tick(),
+            scriptbots_core::Tick(0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_loop_returns_control_health_failure_before_stepping() -> Result<()> {
+        let fixture = ServerLoopFixture::new()?;
+        // This controls the health callback boundary. It does not claim to crash a live
+        // REST/MCP service; servers.rs separately tests the actual runtime watch channel.
+        let error = ServerRenderer::run_with_health(fixture.context(), || {
+            Err("observed control worker failure".to_owned())
+        })
+        .expect_err("failed health must fail the run");
+        fixture.runtime.shutdown()?;
+        assert_eq!(
+            error.root_cause().to_string(),
+            "observed control worker failure"
+        );
+        assert_eq!(
+            fixture.world.lock().expect("world lock").tick(),
+            scriptbots_core::Tick(0)
+        );
+        Ok(())
     }
 
     /// bd-2z0.14.3.4: the semantic projection path must not touch the GPU.
