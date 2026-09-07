@@ -804,8 +804,8 @@ impl<'a> TerminalApp<'a> {
         phase: &str,
     ) -> String {
         let context = format!("terminal command {command_id} {phase}");
-        match self.host.snapshot_hub().snapshot_after(None) {
-            Some(snapshot) => format!(
+        match self.host.clone().snapshot_after(None) {
+            Ok(Some(snapshot)) => format!(
                 "{context}; latest publication: published_tick={}, lifecycle={:?}, health={:?}, queued_commands={}, last_applied={:?}",
                 snapshot.world.tick,
                 snapshot.lifecycle,
@@ -813,7 +813,8 @@ impl<'a> TerminalApp<'a> {
                 snapshot.command_queue_depth,
                 snapshot.last_applied_command,
             ),
-            None => format!("{context}; no host publication available"),
+            Ok(None) => format!("{context}; no host publication available"),
+            Err(error) => format!("{context}; host publication read failed: {error}"),
         }
     }
 
