@@ -131,6 +131,37 @@ with a renderer test result. Compiler/Clippy follow-up continues. The two app-fi
 UBS scans returned 1 (terminal 23 critical patterns/1,328 warnings; main 15/868),
 with inspected samples of test panics, public IDs/watermarks and current-executable
 subprocesses. The corrected app suites still require a pinned DSR run.
+DSR63 finished with typed fail; all seven retained command-log hashes and source
+bindings were checked in `/tmp/scriptbots-dsr63-proof-20260907`. Its runtime suite
+passed 195 tests (5 ignored) and workspace compiler passed. DSR66 is queued at
+`efc0c9b` for the corrected app suites and all earlier diagnostics. DSR65 at
+`0f10844` has passed runtime 197/0/5 and is building the renderer suite.
+Later `bd31d1d` corrects a production TUI event-time bug: delayed intervention
+records now use their actual application/expiry ticks instead of the current
+displayed snapshot tick. A real drought/expiry regression requires event ticks
+1 and 3 when first observed at tick 4, distinct kinds and no duplicate reporting.
+That latest fix is outside DSR65/66 and still needs a pinned run. Formatting and
+whitespace passed; whole-terminal UBS remains exit1 (23 critical patterns/1,352
+warnings), not a clean scan or execution evidence.
+DSR65 completed with typed fail: runtime 197/0/5 and workspace compiler passed,
+renderer executed zero tests after OS-error-2 failures, and strict Clippy reported
+two follow-on diagnostics (borrow the playback update; propagate const to the
+native wrapper). `731741c` fixes those diagnostics. All five DSR65 command-log
+hashes and source bindings were checked in `/tmp/scriptbots-dsr65-proof-20260907`.
+Worker SBH logs show cleanup attempted inside DSR65's active Cargo home. Root added
+protection markers to this task's artifact/source roots and active DSR65/66 staging
+directories; a read-only scan with the daemon's config then found no reclaim
+candidates under the active Cargo home. No cleanup or process-stop command was run.
+DSR67 is queued at `731741c`, includes the latest event-time regression and all app,
+runtime and renderer suites, and protects its fresh staging directory before Cargo.
+The infrastructure mitigation and latest source still require successful execution.
+DSR66's app library finished 399 passed/11 failed/1 ignored: my static-frame
+`u64::MAX` period overflowed the native scheduler's first `clock + period` deadline.
+These failures occurred at owner join, so they do not establish a golden mismatch.
+`08ebb6e` corrects that fixture to a one-hour period with clock headroom, preserving
+all running/tick-zero assertions and golden files. The app binary suite passed all
+68 tests, including the repaired semantic source guard. DSR67 is already pinned to
+`731741c` and still contains the fixture error; a later pin must verify `08ebb6e`.
 
 Remaining concrete integration work discovered during implementation:
 
@@ -155,6 +186,11 @@ Remaining concrete integration work discovered during implementation:
       later crates may expose more diagnostics once runtime compilation succeeds.
 - [ ] Re-execute app library/binary suites at `5644a00` or later, including both
       untouched resize goldens and the semantic-capture source guard's negative case.
+- [ ] Execute delayed intervention application/expiry reporting at `bd31d1d` or
+      later; require distinct actual record ticks despite a later displayed tick,
+      preserved application/expiry kinds and no duplicates on the next read.
+- [ ] Complete the protected DSR rerun after observed SBH interference; retain the
+      earlier zero-test renderer failures as infrastructure evidence, not test results.
 - [ ] Distinguish temporary `HostHealth::Blocked` from terminal faults in the GPUI
       `simulation_fault` projection. Source corrected in `6154237`; verification
       remains open. Preserve the actual closed-journal fault-refresh assertion.
