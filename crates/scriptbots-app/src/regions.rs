@@ -1,13 +1,12 @@
 //! Region-owned background services and structured shutdown (bd-2z0.4.13).
 //!
-//! The app entrypoints (GPUI, terminal, Bevy, headless) own an [`AppRoot`] whose child
-//! regions wrap each background service: the control-server bridge and the storage
-//! pipeline bridge today. Closing the root runs each region's finalizer in reverse
+//! [`AppRoot`] closes registered service finalizers in reverse
 //! dependency order with an explicit [`Budget`], records a per-region
 //! [`Outcome`](asupersync::types::Outcome) (`Ok`/`Err`/`Cancelled`/`Panicked`), and
-//! logs every outcome at the exit boundary. A wedged finalizer exhausts its budget as
-//! a typed `Cancelled` outcome instead of hanging the process forever, and every
-//! finalizer runs on the orderly path so `Drop` remains a last-resort guard.
+//! logs every outcome at the exit boundary. Finalizers run synchronously and must
+//! enforce their own budgets: this root cannot interrupt a wedged finalizer.
+//! Production currently registers the control-server region; complete host/storage
+//! region ownership remains part of bd-pcfj.
 //!
 //! Semantic contract types come from the asupersync ecosystem
 //! (`asupersync::types::{Budget, Outcome, CancelReason}`); the runtime's own scopes
@@ -51,12 +50,14 @@ impl ServiceRegion {
 }
 
 /// The recorded result of one region's teardown: its outcome, wall time, and whether
-/// the teardown budget was exhausted.
+/// the finalizer reported budget exhaustion.
 #[derive(Debug)]
 pub struct RegionOutcome {
     pub name: &'static str,
     pub outcome: Outcome<String, String>,
     pub elapsed: std::time::Duration,
+    /// The cancellation reason names deadline, poll-quota, or cost-budget
+    /// exhaustion. This is reported by the finalizer, not measured by the root.
     pub budget_exhausted: bool,
 }
 
@@ -75,7 +76,8 @@ impl AppRoot {
     }
 
     /// Register a child region. Regions close in REVERSE registration order, so
-    /// register producers before the services that drain them (storage goes last).
+    /// register downstream services first (storage), then their producers (host,
+    /// control). Producers therefore stop before the services that drain them.
     pub fn register(&mut self, region: ServiceRegion) {
         self.regions.push(region);
     }
@@ -105,7 +107,10 @@ impl AppRoot {
                 }
             };
             let elapsed = started.elapsed();
-            let budget_exhausted = matches!(outcome, Outcome::Cancelled(_));
+            let budget_exhausted = matches!(
+                &outcome,
+                Outcome::Cancelled(reason) if reason.is_budget_exceeded()
+            );
             match &outcome {
                 Outcome::Ok(detail) => info!(
                     region = name,
@@ -123,7 +128,8 @@ impl AppRoot {
                     region = name,
                     elapsed_ms = elapsed.as_millis() as u64,
                     ?reason,
-                    "region teardown exhausted its budget"
+                    budget_exhausted,
+                    "region finalizer reported cancellation"
                 ),
                 Outcome::Panicked(payload) => error!(
                     region = name,
@@ -146,5 +152,60 @@ impl AppRoot {
 impl Default for AppRoot {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asupersync::types::{CancelKind, CancelReason};
+
+    #[test]
+    fn cancellation_reports_distinguish_budget_exhaustion_from_other_reasons() {
+        for (kind, expected_exhaustion) in [
+            (CancelKind::User, false),
+            (CancelKind::Timeout, false),
+            (CancelKind::Shutdown, false),
+            (CancelKind::Deadline, true),
+            (CancelKind::PollQuota, true),
+            (CancelKind::CostBudget, true),
+        ] {
+            let mut root = AppRoot::new();
+            root.register(ServiceRegion::new("service", Budget::new(), move |_| {
+                Outcome::Cancelled(CancelReason::new(kind))
+            }));
+            let outcomes = root.close();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(
+                outcomes[0].budget_exhausted, expected_exhaustion,
+                "{kind:?}"
+            );
+            let Outcome::Cancelled(reason) = &outcomes[0].outcome else {
+                panic!("the actual cancellation must remain in the outcome");
+            };
+            assert_eq!(reason.kind, kind);
+        }
+    }
+
+    #[test]
+    fn panicking_producer_does_not_skip_its_downstream_finalizer() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut root = AppRoot::new();
+        let storage_observed = std::sync::Arc::clone(&observed);
+        root.register(ServiceRegion::new("storage", Budget::new(), move |_| {
+            storage_observed.lock().expect("trace").push("storage");
+            Outcome::ok("drained".to_owned())
+        }));
+        let control_observed = std::sync::Arc::clone(&observed);
+        root.register(ServiceRegion::new("control", Budget::new(), move |_| {
+            control_observed.lock().expect("trace").push("control");
+            panic!("finalizer failure");
+        }));
+        let outcomes = root.close();
+        assert_eq!(*observed.lock().expect("trace"), ["control", "storage"]);
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(outcomes[0].outcome, Outcome::Panicked(_)));
+        assert!(matches!(outcomes[1].outcome, Outcome::Ok(_)));
+        assert!(outcomes.iter().all(|outcome| !outcome.budget_exhausted));
     }
 }

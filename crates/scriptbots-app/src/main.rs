@@ -698,7 +698,7 @@ fn prefer_storage_failure<T>(
 }
 
 /// Map one region's recorded outcome back into the `Result` contract the caller
-/// already had, preserving the typed error in the message.
+/// already had. Region errors currently carry diagnostic strings, not typed causes.
 fn region_result(outcomes: &[RegionOutcome], name: &str) -> Result<()> {
     let Some(region) = outcomes.iter().find(|outcome| outcome.name == name) else {
         return Err(anyhow!("region {name} reported no teardown outcome"));
@@ -707,7 +707,7 @@ fn region_result(outcomes: &[RegionOutcome], name: &str) -> Result<()> {
         Outcome::Ok(_) => Ok(()),
         Outcome::Err(error) => Err(anyhow!(error.clone())),
         Outcome::Cancelled(reason) => Err(anyhow!(
-            "region {name} exhausted its teardown budget: {reason:?}"
+            "region {name} finalizer reported cancellation: {reason:?}"
         )),
         Outcome::Panicked(payload) => Err(anyhow!("region {name} finalizer panicked: {payload}")),
     }
@@ -4691,6 +4691,25 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    #[test]
+    fn region_cancellation_error_reports_the_actual_reason_without_inventing_exhaustion() {
+        for kind in [
+            asupersync::types::CancelKind::User,
+            asupersync::types::CancelKind::PollQuota,
+        ] {
+            let mut root = AppRoot::new();
+            root.register(ServiceRegion::new("control", Budget::new(), move |_| {
+                Outcome::Cancelled(asupersync::types::CancelReason::new(kind))
+            }));
+            let error = region_result(&root.close(), "control")
+                .expect_err("cancellation must remain an error");
+            let message = error.to_string();
+            assert!(message.contains("control"));
+            assert!(message.contains(&format!("{kind:?}")));
+            assert!(!message.contains("exhausted"));
+        }
+    }
 
     #[test]
     fn host_binding_guard_precedes_startup_and_successful_steps_publish_actual_status() {

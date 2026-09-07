@@ -155,12 +155,10 @@ fn structured_shutdown_reports_every_region_outcome_and_drains_storage() {
     cleanup(&db);
 }
 
-/// Cancellation storm (bd-2z0.4.13 TESTS #2): abandon the shutdown wait at seeded,
-/// varying points and prove the durability invariants survive every abandonment — the
-/// outbox protocol and recovery converge admitted/applied/durable watermarks with no
-/// torn batches, regardless of when the wait was given up.
+/// Exercise zero-poll-quota cancellation after seeded run lengths. This tests one
+/// cancellation boundary; it does not cover varied in-flight abandonment points.
 #[test]
-fn cancellation_storm_preserves_durability_invariants_at_every_point() {
+fn zero_poll_quota_cancellation_preserves_durable_ticks_after_recovery() {
     // Deterministic xorshift so every run replays the same storm.
     let mut rng_state = 0x9e37_79b9_7f4a_7c15_u64;
     let mut next_u64 = move || {
@@ -205,7 +203,7 @@ fn cancellation_storm_preserves_durability_invariants_at_every_point() {
                     // A zero poll quota can never wait: cancellation is the honest report.
                     if budget.poll_quota == 0 {
                         return Outcome::Cancelled(asupersync::types::CancelReason::new(
-                            asupersync::types::CancelKind::Deadline,
+                            asupersync::types::CancelKind::PollQuota,
                         ));
                     }
                     drop(world_for_storage);
