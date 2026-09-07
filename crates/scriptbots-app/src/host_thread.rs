@@ -122,9 +122,9 @@ impl HostThread {
                 journal,
                 persistence,
             )
-            .map_err(|source| anyhow!("HostCore construction failed: {source}"))?;
+            .context("HostCore construction failed")?;
             ChannelHostDriver::new(FixedDeadlineHost::new(core), channel_options)
-                .map_err(|source| anyhow!("channel host driver rejected its options: {source}"))
+                .context("channel host driver rejected its options")
         })();
 
         let (mut driver, port) = match build {
@@ -132,7 +132,7 @@ impl HostThread {
             Err(error) => {
                 // Report before returning, or the caller blocks on a rendezvous
                 // that will never be answered.
-                let _ = ready_tx.send(Err(error.to_string()));
+                let _ = ready_tx.send(Err(format!("{error:#}")));
                 return Err(error);
             }
         };
@@ -152,7 +152,7 @@ impl HostThread {
                     u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 )
             })
-            .map_err(|source| anyhow!("host drive loop stopped: {source}"))?;
+            .context("host drive loop stopped")?;
         let core = driver.host().core();
         let snapshot = core.latest_snapshot();
         if run.outcome == ChannelRunOutcome::Faulted {
@@ -312,6 +312,12 @@ mod tests {
             "{error:#}"
         );
         assert!(error.to_string().contains("different world"), "{error:#}");
+        assert!(matches!(
+            error.downcast_ref::<scriptbots_runtime::HostCoreBuildError>(),
+            Some(scriptbots_runtime::HostCoreBuildError::Persistence(
+                scriptbots_core::PersistenceSessionError::WrongWorld
+            ))
+        ));
     }
 
     /// A host that cannot be built reports an error rather than hanging.
@@ -344,5 +350,9 @@ mod tests {
             error.to_string().contains("host construction failed"),
             "the failure must name construction, got: {error}"
         );
+        assert!(matches!(
+            error.downcast_ref::<scriptbots_runtime::channel::ChannelHostOptionsError>(),
+            Some(scriptbots_runtime::channel::ChannelHostOptionsError::EmptyIngress)
+        ));
     }
 }
