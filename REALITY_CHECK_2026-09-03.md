@@ -226,10 +226,25 @@ not independent verification; no original cutover acceptance item is closed.
 
 Remaining concrete integration work discovered during implementation:
 
-- [ ] [Currently In Progress] Capture the final WorldDigestV1 on the owner after
+- [x] Capture the final WorldDigestV1 on the owner after
       its loop exits, return it through the shutdown/fault receipt, and report its
       coverage explicitly. Compare the complete digest against a live stepped
       owner and reject a pending persistence boundary without losing the host fault.
+      Implemented in `b57afab`, verified in DSR73 at that exact clean source:
+      app library 411/0/1, app binary 68/0/0, runtime 197/0/5, renderer 126/0/3,
+      formatting and workspace all-target compiler pass. The complete stepped
+      digest differs from initialization and equals the shutdown receipt; the real
+      cadence-one closed-journal case retains both HostFault and typed
+      RetainedPersistenceBatch digest refusal. Production main reports the hash
+      with evaluator/factory coverage and treats a failed required final capture
+      as an error while still shutting storage down. Original bd-pcfj AC4 is now
+      verified; the other seven criteria remain open. This is solo re-execution
+      and source review, not independent verification or live process-log proof.
+      Strict Clippy remains red only on the prior unused legacy GUI driver and
+      scenario-summary helper, so DSR73's final typed verdict is `fail`. All seven
+      command-log hashes/source bindings and the profile hash were verified in
+      `/tmp/scriptbots-dsr73-proof-20260907`. No recovery, GUI/PTY, full-workspace
+      test or performance claim follows from this result.
 - [x] Preserve terminal HostFault and owner receipt through
       join, and consume faulted-owner sense observations in production run-end
       reporting. The real closed-journal and orderly-shutdown regressions passed
@@ -336,6 +351,8 @@ Remaining concrete integration work discovered during implementation:
 - [x] Identify previously missed port needs: brain inspection, sensor attribution, final digest.
 - [ ] Runtime: add bounded owner-thread requests with positive and malformed/stale tests.
 - [ ] Runtime: preserve final digest, step errors and lifecycle receipts through shutdown.
+      Final digest and typed terminal-fault observations are verified through the
+      owner result in DSR73; retained work and complete failure teardown remain open.
 - [ ] App: move bootstrap world, persistence session and real journal into HostThread.
 - [ ] App: replace ControlHandle world reads with immutable snapshot/host requests.
 - [ ] App: map commands and both status axes to authoritative host receipts; preserve idempotency.
