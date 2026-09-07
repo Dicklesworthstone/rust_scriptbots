@@ -405,10 +405,39 @@ Remaining concrete integration work discovered during implementation:
       claim full-cohort parity or relax the envelope without scientific evidence.
       This reproduces the earlier DSR40 failure already recorded on `bd-2z0.10.5`,
       whose existing owner and full production acceptance remain unchanged.
-- [ ] Wire the three-region production teardown; the migrated integration fixture
+- [x] Wire the three-region production teardown; the migrated integration fixture
       passed in DSR74 and demonstrates control → host → storage registration/close
-      behavior with a real file-storage tail. Production still registers only control.
-      Existing synchronous finalizers do not enforce their declared wall-clock budgets.
+      behavior with a real file-storage tail. `bdbe7bd` now registers all three in
+      production and retains typed results through bounded one-shot handoffs.
+      Control ownership is retained immediately after launch, including an error
+      before renderer entry. Storage always runs after the host finalizer and names
+      its own acknowledgement separately from an upstream host failure.
+      DSR79 must execute the actual production helper: real file-storage partial
+      tail, control launched/absent, operation error retention, and typed closed-journal
+      host fault, plus app suites, region integration and compiler/lint checks.
+      Existing synchronous finalizers still do not enforce declared wall-clock budgets;
+      earlier startup failures and lost-receipt/retry acceptance remain open.
+      DSR79 main 70/1 exposed an incorrect new fixture expectation: a second
+      completed StoragePipeline shutdown is an error, not receipt replay. The
+      real-file partial-tail case passed; library 415 passed/one ignored and
+      regions 2 passed. Formatting/compiler passed; known strict Clippy failures
+      remain. All six command hashes, source bindings and profile hash verified
+      in `/tmp/scriptbots-dsr79-proof-20260907`. `43497a7` corrects the new fixture
+      to require opposite outcomes for live versus already-closed storage while
+      preserving the original host fault in both. Its live-worker fault case
+      isolates failure domains; it does not prove coupled scientific recovery.
+      DSR80 verifies that correction. No production shutdown
+      behavior, deadline or existing test assertion was changed by the correction.
+      DSR80 main completed 71/0, including both new production-helper tests. The
+      live and already-closed storage cases now differ as required, and both retain
+      HostThreadFaultError. Library 415/0/one ignored and regions 2/0 also passed:
+      488 total passed, zero failed. Formatting and workspace compilation passed;
+      strict Clippy retains the six known legacy dead-code findings, so the typed
+      overall verdict remains fail. No independent review or CLI-process proof
+      claimed. The checkmark covers the production wiring and tested helper paths,
+      not the parent's full shutdown/recovery acceptance or deadline enforcement.
+      All six command hashes, source bindings, the profile hash and both named new
+      test results verified in `/tmp/scriptbots-dsr80-proof-20260907`.
 - [ ] Finish headless/server/interactive visual-capture policy and startup-failure tests.
 - [ ] Restore explicit separate host/control/storage region outcomes and budgets while
       retaining stop-control → join-owner → acknowledge-storage order.
