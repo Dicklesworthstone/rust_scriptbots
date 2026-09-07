@@ -230,13 +230,14 @@ Remaining concrete integration work discovered during implementation:
       The local continuation has transferred narrative, passthrough attribution,
       brain-cache isolation, canvas/double-view, single-step shortcut, rejected clear,
       hover isolation, closed config and shared playback fixtures to a real owner port.
-      These changes are unexecuted. The shortcut callback waits for real application;
+      These migrated fixtures passed in DSR68's renderer suite at `6fb6764`
+      (126 passed, 3 ignored). The shortcut callback waits for real application;
       its test is not an asynchronous-admission latency measurement. Old driver,
       pending-selection and repaint-digest fixtures still need migration.
       Closed-world, select-all and rapid Add/Clear intent fixtures are now migrated
-      in `6abf187`, including each intermediate selection outcome; execution remains
-      open. Both repaint traces now query characterization V0 and world V1 atomically
-      through the owner in `69642f1`; execution remains open. Legacy driver-only
+      in `6abf187`, including each intermediate selection outcome; execution passed
+      in DSR68. Both repaint traces now query characterization V0 and world V1 atomically
+      through the owner in `69642f1`; execution passed in DSR68. Legacy driver-only
       failure/retained-step fixtures and removal of the unused driver still remain.
 - [ ] During that failure-fixture migration, verify the fate of commands admitted
       behind a terminal fault: the channel mirrors statuses, then returns Faulted;
@@ -245,19 +246,22 @@ Remaining concrete integration work discovered during implementation:
       old dormant-step guarantees survived the ownership transfer.
 - [ ] Convert remaining control and server-loop fixtures that lock the former world,
       inject an app-owned status, or accept the former three-value launch result.
-- [ ] Execute the restored control-boundary queue-capacity test in `89d7769`.
+- [x] Execute the restored control-boundary queue-capacity test in `89d7769`.
       It pairs one occupied slot at capacities one and two, requiring rejection
       without a config change versus actual config application. The separate
-      disconnected-owner test cannot substitute for this unexecuted assertion.
+      disconnected-owner test cannot substitute for this assertion. The named
+      bounded-owner-queue test passed in DSR68 at `6fb6764`.
 - [ ] Execute the migrated control tests (real owner application, revision rejection,
       idempotency, immutable reads while the owner is parked, and poisoned knobs cache).
-- [ ] Execute the strengthened host-thread step/shutdown receipt test and wrong-world
-      persistence-session startup rejection. Neither new test has run yet.
-- [ ] Execute migrated server-loop fixtures: a real closed storage journal must
+- [x] Execute the strengthened host-thread step/shutdown receipt test and wrong-world
+      persistence-session startup rejection. Both named tests passed in DSR68 at `6fb6764`.
+- [x] Execute migrated server-loop fixtures: a real closed storage journal must
       surface in both renderer and owner join; ordered Step then Shutdown must end
       at exactly tick one. The old mutable-world poison and mid-run foreign-session
       injection are no longer representable at the frontend boundary; wrong-session
-      rejection is tested at host construction instead. No equivalent coverage claim yet.
+      rejection is tested at host construction instead. Both named server-loop tests
+      passed in DSR68 at `6fb6764`; this does not establish equivalence to the removed
+      mutable-world injection mechanism.
 - [ ] Execute all four migrated app integration files. Terminal tail proof now compares
       a pre-finalization storage flush with the owner's final required tick; meadow
       ledger proof reads every contiguous owner scientific event. Latency thresholds
