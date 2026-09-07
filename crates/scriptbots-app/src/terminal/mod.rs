@@ -11557,7 +11557,9 @@ mod tests {
             Self::with_options(
                 world,
                 scriptbots_runtime::HostCoreOptions {
-                    tick_period_nanos: u64::MAX,
+                    // One hour leaves room for the owner's nonzero clock epoch;
+                    // u64::MAX would overflow its first fixed deadline.
+                    tick_period_nanos: 3_600_000_000_000,
                     capture_agent_visuals: true,
                     ..scriptbots_runtime::HostCoreOptions::default()
                 },
