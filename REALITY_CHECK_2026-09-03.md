@@ -226,6 +226,10 @@ not independent verification; no original cutover acceptance item is closed.
 
 Remaining concrete integration work discovered during implementation:
 
+- [ ] [Currently In Progress] Capture the final WorldDigestV1 on the owner after
+      its loop exits, return it through the shutdown/fault receipt, and report its
+      coverage explicitly. Compare the complete digest against a live stepped
+      owner and reject a pending persistence boundary without losing the host fault.
 - [x] Preserve terminal HostFault and owner receipt through
       join, and consume faulted-owner sense observations in production run-end
       reporting. The real closed-journal and orderly-shutdown regressions passed
