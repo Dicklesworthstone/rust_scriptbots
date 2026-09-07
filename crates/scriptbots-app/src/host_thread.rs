@@ -19,7 +19,8 @@ use scriptbots_runtime::channel::{
     ChannelHostDriver, ChannelHostOptions, ChannelHostPort, ChannelRunOutcome, ChannelRunReceipt,
 };
 use scriptbots_runtime::{
-    FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, JournalPort, ManualInstant,
+    FixedDeadlineHost, HostCore, HostCoreOptions, HostFault, HostSessionId, JournalPort,
+    ManualInstant,
 };
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::{Builder, JoinHandle};
@@ -31,12 +32,23 @@ pub struct HostThread {
     handle: JoinHandle<Result<HostThreadReceipt>>,
 }
 
-/// Owner observations retained after all clients disconnect and finalization finishes.
+/// Owner observations when the drive loop exits; a fault does not prove finalization.
+#[derive(Debug)]
 pub struct HostThreadReceipt {
     pub run: ChannelRunReceipt,
     pub snapshot: std::sync::Arc<scriptbots_runtime::RenderSnapshot>,
     pub sense_saturations_total: u64,
     pub required_persistence_tick: Option<u64>,
+}
+
+/// A terminal host fault together with its last owner observations.
+///
+/// This receipt describes the failed run, not a successfully persisted tail.
+#[derive(Debug, thiserror::Error)]
+#[error("host drive loop faulted: {fault:?}")]
+pub struct HostThreadFaultError {
+    pub fault: HostFault,
+    pub receipt: HostThreadReceipt,
 }
 
 impl HostThread {
@@ -155,15 +167,21 @@ impl HostThread {
             .context("host drive loop stopped")?;
         let core = driver.host().core();
         let snapshot = core.latest_snapshot();
-        if run.outcome == ChannelRunOutcome::Faulted {
-            return Err(anyhow!("host drive loop faulted: {:?}", core.health()));
-        }
-        Ok(HostThreadReceipt {
+        let receipt = HostThreadReceipt {
             run,
             snapshot,
             sense_saturations_total: core.world().sense_saturations_total(),
             required_persistence_tick: core.persistence().last_admitted_tick().map(|tick| tick.0),
-        })
+        };
+        if run.outcome == ChannelRunOutcome::Faulted {
+            let fault = core
+                .health()
+                .fault()
+                .cloned()
+                .context("host drive loop reported a fault without a recorded cause")?;
+            return Err(HostThreadFaultError { fault, receipt }.into());
+        }
+        Ok(receipt)
     }
 
     /// A cross-thread handle to the host.

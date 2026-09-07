@@ -5,7 +5,7 @@ use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::archipelago_report::{self, ReportArchipelagoArgs};
 use scriptbots_app::economy_audit::{self, EconomyAuditArgs};
-use scriptbots_app::host_thread::HostThread;
+use scriptbots_app::host_thread::{HostThread, HostThreadFaultError, HostThreadReceipt};
 #[cfg(feature = "neuro")]
 use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
@@ -71,6 +71,17 @@ struct SenseRunSummary {
 }
 
 impl SenseRunSummary {
+    fn from_host_result(result: &Result<HostThreadReceipt>) -> Option<Self> {
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(error) => &error.downcast_ref::<HostThreadFaultError>()?.receipt,
+        };
+        Some(Self {
+            tick: receipt.snapshot.world.tick,
+            saturations_total: receipt.sense_saturations_total,
+        })
+    }
+
     fn capture(world: &WorldState) -> Self {
         Self {
             tick: world.tick().0,
@@ -621,10 +632,7 @@ fn main() -> Result<()> {
     })();
     drop(host_port);
     let host_result = host.join();
-    let sense_summary = host_result.as_ref().ok().map(|receipt| SenseRunSummary {
-        tick: receipt.snapshot.world.tick,
-        saturations_total: receipt.sense_saturations_total,
-    });
+    let sense_summary = SenseRunSummary::from_host_result(&host_result);
     let finalization = host_result.map(|receipt| StorageFinalization {
         admitted_tail: false,
         required_tick: receipt.required_persistence_tick,
@@ -4827,11 +4835,26 @@ mod tests {
         let result = ServerRenderer.run(fixture.context());
         let error = result.expect_err("the server must expose the observed owner fault");
         assert!(format!("{error:#}").contains("journal_closed"));
-        let join_error = fixture
-            .finish()
-            .err()
-            .expect("owner join must retain the fault");
+        let join_result = fixture.finish();
+        let summary = SenseRunSummary::from_host_result(&join_result)
+            .expect("a faulted owner must retain its final numeric observations");
+        let join_error = join_result.expect_err("owner join must retain the fault");
         assert!(format!("{join_error:#}").contains("journal_closed"));
+        let failure = join_error
+            .downcast_ref::<HostThreadFaultError>()
+            .expect("owner fault and receipt must survive the join boundary");
+        assert_eq!(Some(&failure.fault), snapshot.health.fault());
+        assert_eq!(*failure.receipt.snapshot, *snapshot);
+        assert_eq!(
+            failure.receipt.run.outcome,
+            scriptbots_runtime::channel::ChannelRunOutcome::Faulted
+        );
+        assert!(failure.receipt.run.drives > 0);
+        assert_eq!(summary.tick, snapshot.world.tick);
+        assert_eq!(
+            summary.saturations_total,
+            failure.receipt.sense_saturations_total
+        );
         Ok(())
     }
 
@@ -4858,7 +4881,13 @@ mod tests {
         ServerRenderer.run(fixture.context())?;
         assert_eq!(port.snapshot_hub().latest().world.tick, 1);
         drop(port);
-        assert_eq!(fixture.finish()?.snapshot.world.tick, 1);
+        let join_result = fixture.finish();
+        let summary = SenseRunSummary::from_host_result(&join_result)
+            .expect("an orderly owner must retain its numeric observations");
+        let receipt = join_result?;
+        assert_eq!(receipt.snapshot.world.tick, 1);
+        assert_eq!(summary.tick, 1);
+        assert_eq!(summary.saturations_total, receipt.sense_saturations_total);
         Ok(())
     }
 
