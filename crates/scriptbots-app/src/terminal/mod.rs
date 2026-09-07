@@ -9153,7 +9153,10 @@ mod tests {
             assert_eq!(records.len(), 2);
             assert_eq!(records[0].tick.0, 1);
             assert!(!records[0].expired);
-            assert_eq!(records[1].tick.0, 3);
+            // Two active transitions end at tick 2; t3 is the first tick
+            // without the effect, not the tick that records its expiry.
+            assert_eq!(records[0].expires_at, Some(scriptbots_core::Tick(3)));
+            assert_eq!(records[1].tick.0, 2);
             assert!(records[1].expired);
         }
         let host = TerminalTestHost::take(world);
@@ -9170,7 +9173,7 @@ mod tests {
         let events: Vec<_> = app.event_log.iter().filter(is_intervention).collect();
         assert_eq!(
             events.iter().map(|event| event.tick).collect::<Vec<_>>(),
-            [1, 3]
+            [1, 2]
         );
         assert!(events[0].message.contains("until t3"));
         assert!(matches!(events[0].kind, EventKind::Population));
