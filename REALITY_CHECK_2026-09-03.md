@@ -198,10 +198,22 @@ and tail-retention work; this does not close that gap. DSR69 is launched at clea
 Cargo home failed the directory check before any Cargo command or test executed:
 the prior temporary directory no longer existed. That cache assumption was mine.
 The override was removed; DSR70 reruns the same source through normal DSR isolation.
-The new assertions have not executed yet. DSR69 is not a red or green test result.
+DSR69 is not a red or green test result. DSR70 has now passed all four focused suites
+at `33d191f`: runtime 197/0/5, renderer 126/0/3, app library 411/0/1 and app binary
+68/0/0. Both strengthened typed-startup-error assertions and the successful owner
+transfer test passed. Workspace compiler passed; strict Clippy still fails on the
+unused legacy GUI driver and disconnected scenario-summary helper. The final typed
+verdict remains `fail`. No original cutover acceptance item is closed by these results.
+All seven command-log hashes/source bindings and the profile hash were checked in
+`/tmp/scriptbots-dsr70-proof-20260907`. This was root's re-execution and self-review,
+not independent review. The current crate sources are unchanged from the tested pin.
 
 Remaining concrete integration work discovered during implementation:
 
+- [x] Preserve concrete host/channel construction error causes through the owner
+      rendezvous and join; require WrongWorld and EmptyIngress variants as well as
+      readable diagnostics. Passed in DSR70 at `33d191f`. This does not establish
+      preservation of the separate terminal-fault receipt or pending persistence tail.
 - [x] Execute both real-process status-ID negative cases at `4490d1e` or later;
       require malformed 400 and canonical unknown 404 independently, then the
       original unpresented-screenshot refusal and shutdown assertions. DSR62's
