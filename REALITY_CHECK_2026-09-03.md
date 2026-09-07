@@ -183,7 +183,22 @@ driver/scheduling warnings; no suppression or acceptance exemption was added.
 DSR68 app library has now passed 411 tests (0 failed, 1 ignored) at `6fb6764`.
 Named passes include delayed intervention application/expiry reporting and all three
 unchanged resize-ladder, resize-storm and theme-matrix goldens. This executes the
-clock-headroom and distinct fixture-state corrections. Remaining run steps are pending.
+clock-headroom and distinct fixture-state corrections. DSR68 finished with all four
+focused suites passing (802 passed, 9 ignored), workspace compiler passing, and
+strict Clippy failing on the unused legacy GUI driver and disconnected scenario
+summary helper. All seven command-log hashes/source bindings and the profile hash
+were verified in `/tmp/scriptbots-dsr68-proof-20260907`. The typed verdict is `fail`.
+
+`8d83315` now preserves typed host construction and drive-loop errors with anyhow
+context instead of flattening their causes into strings. Existing wrong-world and
+empty-ingress startup tests require exact downcastable variants as well as readable
+diagnostics. The owner terminal-fault outcome still has separate unresolved receipt
+and tail-retention work; this does not close that gap. DSR69 is launched at clean
+`33d191f`, which includes the change. Its attempted reuse of DSR68's temporary
+Cargo home failed the directory check before any Cargo command or test executed:
+the prior temporary directory no longer existed. That cache assumption was mine.
+The override was removed; DSR70 reruns the same source through normal DSR isolation.
+The new assertions have not executed yet. DSR69 is not a red or green test result.
 
 Remaining concrete integration work discovered during implementation:
 
