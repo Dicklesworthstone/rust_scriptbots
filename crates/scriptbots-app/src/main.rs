@@ -72,10 +72,7 @@ struct SenseRunSummary {
 
 impl SenseRunSummary {
     fn from_host_result(result: &Result<HostThreadReceipt>) -> Option<Self> {
-        let receipt = match result {
-            Ok(receipt) => receipt,
-            Err(error) => &error.downcast_ref::<HostThreadFaultError>()?.receipt,
-        };
+        let receipt = host_observations(result)?;
         Some(Self {
             tick: receipt.snapshot.world.tick,
             saturations_total: receipt.sense_saturations_total,
@@ -87,6 +84,40 @@ impl SenseRunSummary {
             tick: world.tick().0,
             saturations_total: world.sense_saturations_total(),
         }
+    }
+}
+
+fn host_observations(result: &Result<HostThreadReceipt>) -> Option<&HostThreadReceipt> {
+    match result {
+        Ok(receipt) => Some(receipt),
+        Err(error) => error
+            .downcast_ref::<HostThreadFaultError>()
+            .map(|failure| &failure.receipt),
+    }
+}
+
+fn report_final_host_digest(result: &Result<HostThreadReceipt>) {
+    let Some(receipt) = host_observations(result) else {
+        return;
+    };
+    match &receipt.final_digest {
+        Ok(digest) => info!(
+            target: "scriptbots::science",
+            tick = digest.tick.0,
+            schema = %digest.schema,
+            scientific_digest = %digest.overall,
+            evaluator_state_covered = digest.evaluator_state_covered,
+            factory_state_covered = digest.factory_state_covered,
+            uncovered_families = ?digest.uncovered_families,
+            uncovered_factory_families = ?digest.uncovered_factory_families,
+            "Final owner scientific boundary observed"
+        ),
+        Err(error) => warn!(
+            target: "scriptbots::science",
+            tick = receipt.snapshot.world.tick,
+            error = %error,
+            "Final owner scientific digest unavailable"
+        ),
     }
 }
 
@@ -632,10 +663,16 @@ fn main() -> Result<()> {
     })();
     drop(host_port);
     let host_result = host.join();
+    report_final_host_digest(&host_result);
     let sense_summary = SenseRunSummary::from_host_result(&host_result);
-    let finalization = host_result.map(|receipt| StorageFinalization {
-        admitted_tail: false,
-        required_tick: receipt.required_persistence_tick,
+    let finalization = host_result.and_then(|receipt| {
+        receipt
+            .final_digest
+            .context("final owner scientific digest unavailable")?;
+        Ok(StorageFinalization {
+            admitted_tail: false,
+            required_tick: receipt.required_persistence_tick,
+        })
     });
     let storage_result = finalize_then_shutdown_storage(finalization, &mut storage_pipeline);
     let result = prefer_storage_failure(runtime_result, storage_result, "runtime");
@@ -4747,7 +4784,9 @@ mod tests {
                 world_height: 64,
                 food_cell_size: 16,
                 rng_seed: Some(0x513C),
-                persistence_interval: 0,
+                // Every completed step stages a real persistence batch, so a
+                // closed journal also exercises the digest's pending-batch guard.
+                persistence_interval: 1,
                 closed: true,
                 ..ScriptBotsConfig::default()
             };
@@ -4850,6 +4889,12 @@ mod tests {
             scriptbots_runtime::channel::ChannelRunOutcome::Faulted
         );
         assert!(failure.receipt.run.drives > 0);
+        assert!(matches!(
+            &failure.receipt.final_digest,
+            Err(scriptbots_core::CharacterizationError::NonContinuable {
+                blocker: scriptbots_core::WorldContinuationBlocker::RetainedPersistenceBatch,
+            })
+        ));
         assert_eq!(summary.tick, snapshot.world.tick);
         assert_eq!(
             summary.saturations_total,
@@ -4886,6 +4931,7 @@ mod tests {
             .expect("an orderly owner must retain its numeric observations");
         let receipt = join_result?;
         assert_eq!(receipt.snapshot.world.tick, 1);
+        assert_eq!(receipt.final_digest?.tick.0, receipt.snapshot.world.tick);
         assert_eq!(summary.tick, 1);
         assert_eq!(summary.saturations_total, receipt.sense_saturations_total);
         Ok(())

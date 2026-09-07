@@ -14,7 +14,9 @@
 //!
 
 use anyhow::{Context, Result, anyhow};
-use scriptbots_core::{PersistenceAdmissionSession, WorldState};
+use scriptbots_core::{
+    CharacterizationError, PersistenceAdmissionSession, WorldDigestV1, WorldState,
+};
 use scriptbots_runtime::channel::{
     ChannelHostDriver, ChannelHostOptions, ChannelHostPort, ChannelRunOutcome, ChannelRunReceipt,
 };
@@ -39,6 +41,9 @@ pub struct HostThreadReceipt {
     pub snapshot: std::sync::Arc<scriptbots_runtime::RenderSnapshot>,
     pub sense_saturations_total: u64,
     pub required_persistence_tick: Option<u64>,
+    /// Canonical digest captured on the owner after the loop exits. A blocked
+    /// scientific boundary retains its typed refusal instead of a stale digest.
+    pub final_digest: Result<WorldDigestV1, CharacterizationError>,
 }
 
 /// A terminal host fault together with its last owner observations.
@@ -172,6 +177,7 @@ impl HostThread {
             snapshot,
             sense_saturations_total: core.world().sense_saturations_total(),
             required_persistence_tick: core.persistence().last_admitted_tick().map(|tick| tick.0),
+            final_digest: core.scientific_digest_v1(),
         };
         if run.outcome == ChannelRunOutcome::Faulted {
             let fault = core
@@ -267,6 +273,7 @@ mod tests {
             .snapshot_after(None)
             .expect("snapshot access")
             .expect("initial snapshot");
+        let initial_digest = port.scientific_digest_v1().expect("initial digest");
         let command_id = CommandId::new(17);
         port.submit(CommandEnvelope::new(command_id, HostCommand::Step))
             .expect("real step admission");
@@ -289,6 +296,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         };
         assert_eq!(applied.tick.0, initial.world.tick + 1);
+        let applied_digest = port
+            .scientific_digest_v1()
+            .expect("applied boundary digest");
+        assert_ne!(applied_digest.overall, initial_digest.overall);
 
         // The join receipt must retain the completed science observation after
         // the final client disconnects and the owner acknowledges shutdown.
@@ -299,6 +310,11 @@ mod tests {
             ChannelRunOutcome::ControllerDisconnected
         );
         assert_eq!(receipt.snapshot.world.tick, applied.tick.0);
+        assert_eq!(
+            receipt.final_digest.expect("final owner digest"),
+            applied_digest,
+            "shutdown must return the exact last scientific boundary, not startup state"
+        );
         assert_eq!(
             receipt.snapshot.revisions.scientific,
             applied.revisions.scientific
