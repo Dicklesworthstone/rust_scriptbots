@@ -180,6 +180,10 @@ DSR68 is launched at clean `6fb6764`, including both corrected fixtures, the exp
 expectation correction and the import/default cleanup. Its staging directory is
 protected before Cargo starts. Strict Clippy is expected to retain the unfinished
 driver/scheduling warnings; no suppression or acceptance exemption was added.
+DSR68 app library has now passed 411 tests (0 failed, 1 ignored) at `6fb6764`.
+Named passes include delayed intervention application/expiry reporting and all three
+unchanged resize-ladder, resize-storm and theme-matrix goldens. This executes the
+clock-headroom and distinct fixture-state corrections. Remaining run steps are pending.
 
 Remaining concrete integration work discovered during implementation:
 
@@ -203,11 +207,15 @@ Remaining concrete integration work discovered during implementation:
       The named test passed in DSR66 at `efc0c9b`; renderer 126/0/3 also passed in DSR67.
 - [ ] Finish strict workspace Clippy after the four runtime diagnostics are resolved;
       later crates may expose more diagnostics once runtime compilation succeeds.
-- [ ] Re-execute app library/binary suites at `5644a00` or later, including both
+- [x] Re-execute app library/binary suites at `5644a00` or later, including both
       untouched resize goldens and the semantic-capture source guard's negative case.
-- [ ] Execute delayed intervention application/expiry reporting at `bd31d1d` or
+      DSR68 at `6fb6764`: library 411/0/1 and binary 68/0/0 passed. Golden files
+      are byte-identical to `4490d1e`; their executable comparisons passed.
+- [x] Execute delayed intervention application/expiry reporting at `bd31d1d` or
       later; require distinct actual record ticks despite a later displayed tick,
       preserved application/expiry kinds and no duplicates on the next read.
+      Passed in DSR68 at `6fb6764`: event ticks 1 and 2, displayed tick 4, first
+      unaffected tick 3. This is real owner/TestBackend evidence, not interactive PTY proof.
 - [ ] Complete the protected DSR rerun after observed SBH interference; retain the
       earlier zero-test renderer failures as infrastructure evidence, not test results.
 - [ ] Distinguish temporary `HostHealth::Blocked` from terminal faults in the GPUI
