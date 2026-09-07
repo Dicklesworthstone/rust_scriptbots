@@ -851,7 +851,7 @@ impl<'a> TerminalApp<'a> {
     /// exactly like food recovering on its own, which is the wrong conclusion to
     /// draw from a resilience experiment.
     fn report_applied_interventions(&mut self) {
-        let fresh: Vec<(u64, String, EventKind)> = {
+        let fresh: Vec<(u64, u64, String, EventKind)> = {
             let world = match self.host.clone().snapshot_after(None) {
                 Ok(Some(world)) => world,
                 _ => return,
@@ -883,15 +883,14 @@ impl<'a> TerminalApp<'a> {
                     } else {
                         EventKind::Population
                     };
-                    (record.seq, message, kind)
+                    (record.seq, record.tick.0, message, kind)
                 })
                 .collect()
         };
 
-        for (seq, message, kind) in fresh {
+        for (seq, tick, message, kind) in fresh {
             self.intervention_watermark = self.intervention_watermark.max(seq);
-            info!(seq, %message, "intervention recorded");
-            let tick = self.snapshot.tick;
+            info!(seq, tick, %message, "intervention recorded");
             self.push_event(tick, kind, message);
         }
     }
@@ -9133,6 +9132,53 @@ mod tests {
              can be reasoned about; got {rect:?}"
         );
         assert_ne!(disc, rect, "the shapes must not render identically");
+    }
+
+    #[test]
+    fn delayed_intervention_reporting_preserves_application_and_expiry_ticks() {
+        let world = command_characterization_world();
+        {
+            let mut world = world.lock().expect("prepare intervention world");
+            world
+                .enqueue_intervention(scriptbots_core::Intervention::Drought {
+                    region: scriptbots_core::Region::All,
+                    ticks: 2,
+                    growth_scale: 0.0,
+                })
+                .expect("queue real timed intervention");
+            for _ in 0..4 {
+                world.step().expect("advance past application and expiry");
+            }
+            let records = world.applied_interventions();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].tick.0, 1);
+            assert!(!records[0].expired);
+            assert_eq!(records[1].tick.0, 3);
+            assert!(records[1].expired);
+        }
+        let host = TerminalTestHost::take(world);
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        assert_eq!(app.snapshot.tick, 4);
+        let is_intervention = |event: &&EventEntry| {
+            event.message.starts_with("drought [")
+                || event.message.starts_with("expiry:drought lapsed [")
+        };
+        assert_eq!(app.event_log.iter().filter(is_intervention).count(), 0);
+        app.report_applied_interventions();
+        let events: Vec<_> = app.event_log.iter().filter(is_intervention).collect();
+        assert_eq!(
+            events.iter().map(|event| event.tick).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(events[0].message.contains("until t3"));
+        assert!(matches!(events[0].kind, EventKind::Population));
+        assert!(matches!(events[1].kind, EventKind::Info));
+        let watermark = app.intervention_watermark;
+        app.report_applied_interventions();
+        assert_eq!(app.event_log.iter().filter(is_intervention).count(), 2);
+        assert_eq!(app.intervention_watermark, watermark);
     }
 
     /// An applied intervention must name WHAT it changed, not just how many.
