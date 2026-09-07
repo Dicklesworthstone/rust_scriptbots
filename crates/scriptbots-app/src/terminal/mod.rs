@@ -11924,6 +11924,12 @@ mod tests {
         let mut host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.host
+            .submit(scriptbots_runtime::CommandEnvelope::new(
+                scriptbots_runtime::CommandId::new(u128::MAX),
+                scriptbots_runtime::HostCommand::Shutdown,
+            ))
+            .expect("request owner shutdown before joining with a live client");
         host.owner.take().expect("owner").join().expect("shutdown");
         let error = app
             .submit_and_wait(ControlCommand::Step)

@@ -20,7 +20,6 @@ use scriptbots_storage::{AnalyticsSnapshotProvider, StoragePipeline, StorageRead
 use serde::Deserialize;
 use serial_test::serial;
 use tempfile::tempdir;
-use tracing::Level;
 
 static ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -488,7 +487,6 @@ fn terminal_test_backend_generates_semantic_buffer_report() -> Result<()> {
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,scriptbots_app=info")
-        .with_max_level(Level::INFO)
         .with_test_writer()
         .try_init();
 
@@ -710,7 +708,6 @@ fn terminal_test_backend_applies_control_updates_and_renders_receipts() -> Resul
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,scriptbots_app=info")
-        .with_max_level(Level::INFO)
         .with_test_writer()
         .try_init();
 
