@@ -226,6 +226,17 @@ not independent verification; no original cutover acceptance item is closed.
 
 Remaining concrete integration work discovered during implementation:
 
+- [x] Correct region cancellation reporting: user/shutdown
+      cancellation must not claim budget exhaustion. Verify budget and non-budget
+      causes plus continued downstream teardown after a producer panic. Correct
+      reverse registration guidance and qualify the zero-quota recovery fixture;
+      synchronous root deadline enforcement and varied cancellation remain open.
+      Implemented in `c309631`, re-executed in DSR75 at that exact clean source:
+      app library 413 passed/one ignored, binary 69 passed, region integration two
+      passed; zero failures across those 484 tests. Formatting and workspace check
+      passed. Strict Clippy retains the six known legacy GUI/scenario dead-code
+      diagnostic categories, so the overall typed verdict remains fail. No lint
+      suppression, deadline widening, or acceptance weakening was used.
 - [x] Capture the final WorldDigestV1 on the owner after
       its loop exits, return it through the shutdown/fault receipt, and report its
       coverage explicitly. Compare the complete digest against a live stepped
@@ -329,14 +340,39 @@ Remaining concrete integration work discovered during implementation:
       rejection is tested at host construction instead. Both named server-loop tests
       passed in DSR68 at `6fb6764`; this does not establish equivalence to the removed
       mutable-world injection mechanism.
-- [ ] Execute all four migrated app integration files. Terminal tail proof now compares
+- [x] Execute all four migrated app integration files; failures remain open below. Terminal tail proof now compares
       a pre-finalization storage flush with the owner's final required tick; meadow
       ledger proof reads every contiguous owner scientific event. Latency thresholds
       and the declared cohort remain unchanged. The latency load source changed to
       the actual owner with a one-nanosecond requested period; compare new measurements
       only as that workload, not as a replay of the former direct-step loop.
+      DSR74 at `b57afab` executed all eight tests: six passed, two failed.
+      Terminal was 2/1; meadow 0/1; regions 2/0; parked-owner HTTP 1/0;
+      explicitly enabled HTTP/SSE load 1/0. All six command-log hashes and the
+      profile hash were verified in `/tmp/scriptbots-dsr74-proof-20260907`.
+      The region fixture still covers only zero poll quota, not varied cancellation
+      points or root-enforced deadlines. This is self-review and re-execution.
+- [ ] [Currently In Progress] Resolve the DSR74 terminal file-storage failure:
+      durable command identity `00000000000000010000000000000005` lookup timed
+      out after two seconds, and CommandSubmit erased the typed failure to None.
+      Trace queue wait versus SQL execution and preserve the original command
+      identity across any retry. Do not increase deadlines or bypass durable claims
+      to green the fixture; its 37-tick cadence/tail assertions remain unexecuted.
+      The channel already retries Pending/Busy/Capacity with the same envelope
+      inside its two-second deadline. Storage lookup can commit a durable claim:
+      a timeout therefore cannot be treated as proof that the command was absent.
+      The next diagnostic must distinguish authority queue time from owner-thread
+      SQL/commit time; ordinary terminal repaint need not wait for either.
+- [ ] Diagnose the DSR74 meadow seed `20260717` mortality failure: zero deaths
+      against the unchanged minimum of one at 300 ticks. Seeds 42 and 137 matched
+      complete TestBackend/CPU-PNG digests with zero ledger breaches. The third
+      seed stopped before its CPU comparison and later negative guards; do not
+      claim full-cohort parity or relax the envelope without scientific evidence.
+      This reproduces the earlier DSR40 failure already recorded on `bd-2z0.10.5`,
+      whose existing owner and full production acceptance remain unchanged.
 - [ ] Wire the three-region production teardown; the migrated integration fixture
-      demonstrates the intended registration order only after it actually passes.
+      passed in DSR74 and demonstrates control → host → storage registration/close
+      behavior with a real file-storage tail. Production still registers only control.
       Existing synchronous finalizers do not enforce their declared wall-clock budgets.
 - [ ] Finish headless/server/interactive visual-capture policy and startup-failure tests.
 - [ ] Restore explicit separate host/control/storage region outcomes and budgets while
