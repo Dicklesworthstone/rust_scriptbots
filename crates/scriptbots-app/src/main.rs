@@ -565,6 +565,7 @@ fn main() -> Result<()> {
         }
     };
     let host_port = host.port();
+    let mut control_to_close = None;
 
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
     // finalized and the worker is acknowledged before this function returns.
@@ -621,6 +622,8 @@ fn main() -> Result<()> {
             anyhow::anyhow!("control listeners were not reserved before runtime startup")
         })?;
         let (control_runtime, command_submit) = control_reservation.launch(host_port.clone())?;
+        // Retain teardown ownership even if initial resume or renderer startup fails.
+        let control_runtime = control_to_close.insert(control_runtime);
         if renderer.name() != "terminal"
             && command_submit(scriptbots_core::ControlCommand::Resume).is_none()
         {
@@ -635,51 +638,146 @@ fn main() -> Result<()> {
         let context = RendererContext {
             host: host_port.clone(),
             analytics: analytics.clone(),
-            control_runtime: &control_runtime,
+            control_runtime,
             command_submit,
             scenario: Arc::clone(&launch_scenario_shared),
         };
-        let render_result = renderer.run(context);
-        // Stop network producers before disconnecting the owner's final port.
-        let mut root = AppRoot::new();
-        root.register(ServiceRegion::new(
-            "control-server",
-            Budget::with_deadline_at_secs(15),
-            move |_budget| match control_runtime.shutdown() {
-                Ok(()) => Outcome::ok("control runtime shut down".to_owned()),
-                Err(error) => Outcome::Err(format!("{error:#}")),
-            },
-        ));
-        let outcomes = root.close();
-        let control_result = region_result(&outcomes, "control-server");
-        match (render_result, control_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(render_error), Ok(())) => Err(render_error),
-            (Ok(()), Err(control_error)) => Err(control_error),
-            (Err(render_error), Err(control_error)) => Err(render_error).context(format!(
-                "control runtime shutdown also failed: {control_error:#}"
-            )),
-        }
+        renderer.run(context)
     })();
     drop(host_port);
-    let host_result = host.join();
-    report_final_host_digest(&host_result);
-    let sense_summary = SenseRunSummary::from_host_result(&host_result);
-    let finalization = host_result.and_then(|receipt| {
-        receipt
-            .final_digest
-            .context("final owner scientific digest unavailable")?;
-        Ok(StorageFinalization {
-            admitted_tail: false,
-            required_tick: receipt.required_persistence_tick,
-        })
-    });
-    let storage_result = finalize_then_shutdown_storage(finalization, &mut storage_pipeline);
-    let result = prefer_storage_failure(runtime_result, storage_result, "runtime");
-    if let Some(summary) = sense_summary {
-        emit_sense_run_end(summary, result.is_ok());
+    let teardown = close_runtime_regions(control_to_close, host, storage_pipeline);
+    teardown.finish(runtime_result)
+}
+
+struct RuntimeTeardown {
+    outcomes: Vec<RegionOutcome>,
+    control_result: Result<()>,
+    storage_result: Result<()>,
+    sense_summary: Option<SenseRunSummary>,
+}
+
+impl RuntimeTeardown {
+    fn finish(self, runtime_result: Result<()>) -> Result<()> {
+        let runtime_result = match (runtime_result, self.control_result) {
+            (Ok(()), control_result) => control_result,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(control_error)) => Err(error).context(format!(
+                "control runtime shutdown also failed: {control_error:#}"
+            )),
+        };
+        // Each region also has a recorded outcome, including panic isolation. The
+        // one-shot results below retain typed causes instead of parsing those logs.
+        debug!(regions = self.outcomes.len(), "runtime regions finalized");
+        let result = prefer_storage_failure(runtime_result, self.storage_result, "runtime");
+        if let Some(summary) = self.sense_summary {
+            emit_sense_run_end(summary, result.is_ok());
+        }
+        result
     }
-    result
+}
+
+/// Finalizers execute synchronously in dependency order. Their internal service
+/// waits retain their existing limits; AppRoot cannot interrupt an in-flight join.
+fn close_runtime_regions(
+    control: Option<scriptbots_app::ControlRuntime>,
+    host: HostThread,
+    mut storage: StoragePipeline,
+) -> RuntimeTeardown {
+    let (host_tx, host_rx) = std::sync::mpsc::sync_channel::<Result<HostThreadReceipt>>(1);
+    let (control_tx, control_rx) = std::sync::mpsc::sync_channel(1);
+    let (storage_tx, storage_rx) = std::sync::mpsc::sync_channel(1);
+    let mut root = AppRoot::new();
+    root.register(ServiceRegion::new(
+        "storage-pipeline",
+        Budget::with_deadline_at_secs(30),
+        move |_| {
+            // No blocking receive: the preceding host finalizer must already
+            // have returned. Even a panicked host finalizer cannot skip storage.
+            let host_result = host_rx.try_recv().unwrap_or_else(|error| {
+                Err(anyhow!("host finalizer returned no owner receipt: {error}"))
+            });
+            let sense_summary = SenseRunSummary::from_host_result(&host_result);
+            let finalization = host_result.and_then(|receipt| {
+                receipt
+                    .final_digest
+                    .context("final owner scientific digest unavailable")?;
+                Ok(StorageFinalization {
+                    admitted_tail: false,
+                    required_tick: receipt.required_persistence_tick,
+                })
+            });
+            let has_finalization = finalization.is_ok();
+            let shutdown = shutdown_storage(&mut storage);
+            let shutdown_outcome = teardown_outcome(&shutdown, "storage shutdown acknowledged");
+            let result = finish_storage_shutdown(finalization, shutdown);
+            // A host failure must remain the returned primary cause, but it is
+            // not evidence that the storage worker failed its own shutdown.
+            let outcome = if has_finalization {
+                teardown_outcome(&result, "storage shutdown acknowledged and tail validated")
+            } else {
+                shutdown_outcome
+            };
+            if storage_tx.send((result, sense_summary)).is_err() {
+                return Outcome::Err("storage teardown result receiver disconnected".to_owned());
+            }
+            outcome
+        },
+    ));
+    root.register(ServiceRegion::new(
+        "simulation-host",
+        Budget::with_deadline_at_secs(15),
+        move |_| {
+            let result = host.join();
+            report_final_host_digest(&result);
+            let outcome = teardown_outcome(&result, "host finalized and joined");
+            if host_tx.send(result).is_err() {
+                return Outcome::Err("host teardown result receiver disconnected".to_owned());
+            }
+            outcome
+        },
+    ));
+    root.register(ServiceRegion::new(
+        "control-server",
+        Budget::with_deadline_at_secs(15),
+        move |_| {
+            let detail = if control.is_some() {
+                "control runtime shut down"
+            } else {
+                "control runtime was not launched"
+            };
+            let result = control.map_or(Ok(()), |runtime| runtime.shutdown());
+            let outcome = teardown_outcome(&result, detail);
+            if control_tx.send(result).is_err() {
+                return Outcome::Err("control teardown result receiver disconnected".to_owned());
+            }
+            outcome
+        },
+    ));
+    let outcomes = root.close();
+    let control_result = control_rx.try_recv().unwrap_or_else(|error| {
+        region_result(&outcomes, "control-server")
+            .and_then(|()| Err(anyhow!("control finalizer returned no result: {error}")))
+    });
+    let (storage_result, sense_summary) = storage_rx.try_recv().unwrap_or_else(|error| {
+        (
+            region_result(&outcomes, "storage-pipeline")
+                .and_then(|()| Err(anyhow!("storage finalizer returned no result: {error}"))),
+            None,
+        )
+    });
+    RuntimeTeardown {
+        outcomes,
+        control_result,
+        storage_result,
+        sense_summary,
+    }
+}
+
+fn teardown_outcome<T>(result: &Result<T>, success: &str) -> Outcome<String, String> {
+    match result {
+        Ok(_) => Outcome::ok(success.to_owned()),
+        Err(error) => Outcome::Err(format!("{error:#}")),
+    }
 }
 
 fn prefer_storage_failure<T>(
@@ -804,7 +902,13 @@ fn finalize_then_shutdown_storage(
     pipeline: &mut StoragePipeline,
 ) -> Result<()> {
     let shutdown = shutdown_storage(pipeline);
+    finish_storage_shutdown(finalization, shutdown)
+}
 
+fn finish_storage_shutdown(
+    finalization: Result<StorageFinalization>,
+    shutdown: Result<ShutdownReceipt>,
+) -> Result<()> {
     match (finalization, shutdown) {
         (Ok(finalization), Ok(receipt)) => {
             let receipt = validate_shutdown_receipt(finalization, receipt)?;
@@ -4691,6 +4795,174 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    #[test]
+    fn production_regions_close_real_services_and_persist_a_partial_tail() -> Result<()> {
+        for launch_control in [false, true] {
+            let directory = tempdir()?;
+            let database = directory.path().join("regions.sqlite");
+            let path = database.to_str().expect("temporary UTF-8 path");
+            let mut pipeline = StoragePipeline::create_unattributed_file(path)?;
+            let (mut world, mut persistence) = WorldState::with_persistence(
+                ScriptBotsConfig {
+                    world_width: 64,
+                    world_height: 64,
+                    food_cell_size: 16,
+                    rng_seed: Some(0x513c),
+                    persistence_interval: 5,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                },
+                Box::new(pipeline.sink()),
+            )?;
+            for _ in 0..3 {
+                persistence.step(&mut world)?;
+            }
+            assert_eq!(world.tick().0, 3);
+            assert_eq!(pipeline.flush_and_wait()?.committed_tick, None);
+            let session = HostSessionId::new(0x513c);
+            let journal = pipeline.journal_port(session, Default::default())?;
+            let host = HostThread::spawn(
+                session,
+                world,
+                persistence,
+                Box::new(journal),
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    ..HostCoreOptions::default()
+                },
+                ChannelHostOptions::default(),
+            )?;
+            let control = if launch_control {
+                let (runtime, submit) = scriptbots_app::ControlRuntime::launch(
+                    host.port(),
+                    ControlServerConfig {
+                        rest_address: "127.0.0.1:0".parse()?,
+                        mcp_transport: scriptbots_app::McpTransportConfig::Disabled,
+                        ..ControlServerConfig::default()
+                    },
+                )?;
+                drop(submit);
+                Some(runtime)
+            } else {
+                None
+            };
+            let operation_result = if launch_control {
+                // Fail after launch, before cleanup starts.
+                Err(fs::read(directory.path().join("missing-input"))
+                    .expect_err("missing input is a real operation error")
+                    .into())
+            } else {
+                Ok(())
+            };
+            let teardown = close_runtime_regions(control, host, pipeline);
+            assert_eq!(
+                teardown
+                    .outcomes
+                    .iter()
+                    .map(|item| item.name)
+                    .collect::<Vec<_>>(),
+                ["control-server", "simulation-host", "storage-pipeline"]
+            );
+            assert!(
+                teardown
+                    .outcomes
+                    .iter()
+                    .all(|item| matches!(item.outcome, Outcome::Ok(_)))
+            );
+            assert_eq!(
+                teardown
+                    .sense_summary
+                    .as_ref()
+                    .expect("owner observations")
+                    .tick,
+                3
+            );
+            if launch_control {
+                // An ordinary operation failure after launch still drains all
+                // services, and its actual io::Error survives successful cleanup.
+                let error = teardown
+                    .finish(operation_result)
+                    .expect_err("cleanup cannot erase the operation failure");
+                assert_eq!(
+                    error
+                        .downcast_ref::<io::Error>()
+                        .expect("typed operation error")
+                        .kind(),
+                    io::ErrorKind::NotFound
+                );
+            } else {
+                teardown.finish(operation_result)?;
+            }
+            let reader = StorageReader::open(path)?;
+            assert_eq!(reader.max_tick()?, Some(3));
+            let watermarks = reader.persistence_watermarks()?;
+            assert!(watermarks.admitted.is_some());
+            assert_eq!(watermarks.admitted, watermarks.applied);
+            assert_eq!(watermarks.applied, watermarks.durable);
+            reader.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_regions_retain_typed_host_fault_and_still_acknowledge_storage() -> Result<()> {
+        let mut pipeline = StoragePipeline::unattributed_memory()?;
+        let journal = pipeline.journal_port(HostSessionId::new(0x513c), Default::default())?;
+        pipeline.shutdown()?;
+        let fixture = ServerLoopFixture::with_journal(Box::new(journal), false)?;
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while fixture
+            .port
+            .snapshot_hub()
+            .latest()
+            .health
+            .fault()
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "closed journal did not fault the owner"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let ServerLoopFixture {
+            host,
+            port,
+            runtime,
+            submit,
+        } = fixture;
+        drop(port);
+        drop(submit);
+        let teardown = close_runtime_regions(Some(runtime), host, pipeline);
+        assert!(matches!(teardown.outcomes[0].outcome, Outcome::Ok(_)));
+        assert!(matches!(teardown.outcomes[1].outcome, Outcome::Err(_)));
+        assert!(matches!(teardown.outcomes[2].outcome, Outcome::Ok(_)));
+        assert_eq!(
+            teardown
+                .sense_summary
+                .as_ref()
+                .expect("fault observations")
+                .tick,
+            1
+        );
+        let error = teardown
+            .finish(Ok(()))
+            .expect_err("host fault must survive region reporting");
+        let fault = error
+            .downcast_ref::<HostThreadFaultError>()
+            .expect("original typed host fault");
+        assert!(format!("{:?}", fault.fault).contains("journal_closed"));
+        assert_eq!(fault.receipt.snapshot.world.tick, 1);
+        assert!(matches!(
+            fault.receipt.final_digest,
+            Err(scriptbots_core::CharacterizationError::NonContinuable { .. })
+        ));
+        Ok(())
+    }
 
     #[test]
     fn region_cancellation_error_reports_the_actual_reason_without_inventing_exhaustion() {

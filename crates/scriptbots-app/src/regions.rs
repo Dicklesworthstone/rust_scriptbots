@@ -5,8 +5,9 @@
 //! [`Outcome`](asupersync::types::Outcome) (`Ok`/`Err`/`Cancelled`/`Panicked`), and
 //! logs every outcome at the exit boundary. Finalizers run synchronously and must
 //! enforce their own budgets: this root cannot interrupt a wedged finalizer.
-//! Production currently registers the control-server region; complete host/storage
-//! region ownership remains part of bd-pcfj.
+//! Production registers storage, host, then control, so control closes first and
+//! storage drains last. Its typed result handoffs remain separate from these
+//! diagnostic summaries. Hard deadline enforcement remains part of bd-pcfj.
 //!
 //! Semantic contract types come from the asupersync ecosystem
 //! (`asupersync::types::{Budget, Outcome, CancelReason}`); the runtime's own scopes
