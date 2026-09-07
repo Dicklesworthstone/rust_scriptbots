@@ -357,12 +357,47 @@ Remaining concrete integration work discovered during implementation:
       out after two seconds, and CommandSubmit erased the typed failure to None.
       Trace queue wait versus SQL execution and preserve the original command
       identity across any retry. Do not increase deadlines or bypass durable claims
-      to green the fixture; its 37-tick cadence/tail assertions remain unexecuted.
+      to green the fixture; DSR78 now executes its unchanged 37-tick cadence/tail assertions.
       The channel already retries Pending/Busy/Capacity with the same envelope
       inside its two-second deadline. Storage lookup can commit a durable claim:
       a timeout therefore cannot be treated as proof that the command was absent.
       The next diagnostic must distinguish authority queue time from owner-thread
       SQL/commit time; ordinary terminal repaint need not wait for either.
+      In `bb0fe2f`, the batch barrier prepares one validated envelope and retries
+      only typed authority timeouts with that identity. The channel default remains
+      two seconds per call; admission and application now share the existing
+      30-second batch budget, with status reads capped by the remaining time.
+      Nonretryable failures retain their typed cause. DSR76 must execute the
+      unchanged file-storage fixture plus duplicate/distinct-command, expired-budget,
+      and disconnected-owner guards before this receives verification credit.
+      DSR76 did not clear the failure: terminal 2/1; its command at namespace21
+      exceeded the total barrier while still awaiting status. No admission-retry
+      warning was observed. Runtime198 passed. The new disconnection unit fixture
+      hung because it joined with a live client before requesting shutdown; root
+      stopped that exact verified test process with SIGTERM, so app-library has no
+      suite verdict. `556a855` corrects that fixture with explicit Shutdown and
+      restores its declared warn/app-info filter (with_max_level had replaced it).
+      Every cadence/tail assertion remains unchanged. `19af63f` adds latest
+      published host state to typed failure context. DSR77 exposed a private-API
+      compile error in that diagnostic; `f3beb52` corrects it to the public HostPort
+      snapshot reader. DSR77 executed only the runtime suite (198 passed, five
+      ignored); failed app compilation is not runtime verification.
+      DSR78 at `f3beb52` passed terminal 3/0, runtime 198/0, app-library 415/0,
+      and app-main 69/0: 685 passed, six existing ignored. The file fixture
+      encountered real authority timeouts, retried original identities, and reached
+      exactly 37 ticks with the unchanged pre-finalization cadence and final durable
+      tail assertions. Duplicate/distinct-command, expired-budget/no-enqueue, and
+      typed-disconnection guards passed. This verifies bounded batch retry under
+      the observed workload; it does not diagnose or repair storage commit latency.
+      Formatting and workspace compilation passed. Strict Clippy failed on the
+      existing unused GuiSimulationDriver, its methods/start function/timing
+      constants, and intervention_summary; the overall typed verdict remains fail.
+      All seven command-log hashes, source bindings, and the profile hash were
+      verified in `/tmp/scriptbots-dsr78-proof-20260907`. Six admission retry warnings
+      were observed. No deadlines, persistence assertions, or mortality thresholds
+      were relaxed; this is self-review and re-execution, not independent verification.
+      The remaining investigation is authority queue time versus owner SQL/commit
+      latency; the successful batch retry is complete without closing that larger gap.
 - [ ] Diagnose the DSR74 meadow seed `20260717` mortality failure: zero deaths
       against the unchanged minimum of one at 300 ticks. Seeds 42 and 137 matched
       complete TestBackend/CPU-PNG digests with zero ledger breaches. The third
