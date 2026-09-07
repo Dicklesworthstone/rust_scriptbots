@@ -2411,7 +2411,7 @@ impl HostCore {
     }
 
     /// Include a full digest in the next replay event without advancing science.
-    pub fn request_replay_world_digest(&mut self) {
+    pub const fn request_replay_world_digest(&mut self) {
         self.world.request_replay_world_digest();
     }
 
@@ -3100,6 +3100,38 @@ impl HostCore {
         Ok(ready)
     }
 
+    fn snapshot_narrative(
+        &self,
+        build: &mut SnapshotBuildStats,
+    ) -> Arc<Vec<scriptbots_core::narrative::EventRecord>> {
+        let previous = self.snapshots.latest();
+        let unchanged = previous.narrative_dropped_events == self.world.narrative_dropped_events()
+            && previous.narrative_events.len() == self.world.narrative_events().len()
+            && previous
+                .narrative_events
+                .iter()
+                .eq(self.world.narrative_events().iter());
+        let events = if unchanged {
+            Arc::clone(&previous.narrative_events)
+        } else {
+            Arc::new(self.world.narrative_events().iter().cloned().collect())
+        };
+        account_narrative_payload(build, &events, !unchanged);
+        events
+    }
+
+    fn hybrid_count(&self) -> usize {
+        self.world
+            .agents()
+            .iter_handles()
+            .filter(|id| {
+                self.world
+                    .agent_runtime(*id)
+                    .is_some_and(|runtime| runtime.hybrid)
+            })
+            .count()
+    }
+
     fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
         let revision = self.next_snapshot;
         let following_revision = revision
@@ -3164,33 +3196,11 @@ impl HostCore {
                 shared.last_applied.map(|(_, command_id)| command_id),
             )
         };
-        let previous = self.snapshots.latest();
-        let narrative_unchanged = previous.narrative_dropped_events
-            == self.world.narrative_dropped_events()
-            && previous.narrative_events.len() == self.world.narrative_events().len()
-            && previous
-                .narrative_events
-                .iter()
-                .eq(self.world.narrative_events().iter());
-        let narrative_events = if narrative_unchanged {
-            Arc::clone(&previous.narrative_events)
-        } else {
-            Arc::new(self.world.narrative_events().iter().cloned().collect())
-        };
-        account_narrative_payload(&mut build, &narrative_events, !narrative_unchanged);
+        let narrative_events = self.snapshot_narrative(&mut build);
         let snapshot = Arc::new(RenderSnapshot {
             narrative_events,
             narrative_dropped_events: self.world.narrative_dropped_events(),
-            hybrid_count: self
-                .world
-                .agents()
-                .iter_handles()
-                .filter(|id| {
-                    self.world
-                        .agent_runtime(*id)
-                        .is_some_and(|runtime| runtime.hybrid)
-                })
-                .count(),
+            hybrid_count: self.hybrid_count(),
             session_id: self.session_id,
             revision,
             revisions: self.revisions,
@@ -3353,17 +3363,7 @@ impl HostCore {
                 self.complete_playback_command(admission, &retry_envelope, next_control)
             }
             HostCommand::UpdateSimulation(update) => {
-                if let Some(paused) = update.paused {
-                    self.playback.paused = paused;
-                }
-                if let Some(speed) = update.speed_multiplier {
-                    self.playback.speed_multiplier = speed.clamp(0.0, 32.0);
-                }
-                if update.step_once {
-                    self.apply_step_command(admission, &retry_envelope, next_control)
-                } else {
-                    self.complete_playback_command(admission, &retry_envelope, next_control)
-                }
+                self.apply_simulation_command(admission, &retry_envelope, update, next_control)
             }
             HostCommand::UpdateConfig(config) => {
                 self.apply_config_command(admission, &retry_envelope, config, next_control)
@@ -3421,6 +3421,26 @@ impl HostCore {
             HostCommand::Shutdown => {
                 self.apply_shutdown_command(admission, &retry_envelope, next_control)
             }
+        }
+    }
+
+    fn apply_simulation_command(
+        &mut self,
+        admission: AdmissionSequence,
+        envelope: &CommandEnvelope,
+        update: scriptbots_core::SimulationCommand,
+        next_control: ControlRevision,
+    ) -> Result<ApplyResult, HostAccessError> {
+        if let Some(paused) = update.paused {
+            self.playback.paused = paused;
+        }
+        if let Some(speed) = update.speed_multiplier {
+            self.playback.speed_multiplier = speed.clamp(0.0, 32.0);
+        }
+        if update.step_once {
+            self.apply_step_command(admission, envelope, next_control)
+        } else {
+            self.complete_playback_command(admission, envelope, next_control)
         }
     }
 

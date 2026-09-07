@@ -1233,13 +1233,7 @@ mod tests {
             .expect("empty limit")
             .is_empty()
         );
-        let projection = port
-            .project_brain(&BrainProjectionRequest::focused(
-                crate::ProjectionClientId::new(1),
-                crate::ProjectionRequestRevision::new(1),
-                uid,
-            ))
-            .expect("unbound brain remains an explicit inspection result");
+        let projection = inspect_unbound_brain(&port, uid);
         assert!(projection.source.matches_snapshot(&snapshot));
         assert_eq!(
             port.scientific_digest_v1().expect("digest after reads"),
@@ -1264,6 +1258,15 @@ mod tests {
             owner.join().expect("owner joined").outcome,
             ChannelRunOutcome::ControllerDisconnected
         );
+    }
+
+    fn inspect_unbound_brain(port: &ChannelHostPort, uid: AgentUid) -> BrainProjection {
+        port.project_brain(&BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(1),
+            crate::ProjectionRequestRevision::new(1),
+            uid,
+        ))
+        .expect("unbound brain remains an explicit inspection result")
     }
 
     #[test]

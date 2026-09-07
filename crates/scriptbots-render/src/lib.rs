@@ -20036,6 +20036,26 @@ mod command_characterization_tests {
     /// all still submit *something* and pass a weaker assertion.
     #[test]
     fn speed_shortcuts_submit_the_exact_canonical_speed_intent() {
+        for (key, expected) in [("shift-=", 1.25), ("-", 0.75)] {
+            let mut fixture = ShortcutFixture::install();
+            let initial = fixture.world.snapshot().playback;
+            assert_eq!(initial.speed_multiplier, 1.0);
+            fixture.press(key);
+            let submitted = fixture.submitted();
+            assert!(
+                matches!(submitted.as_slice(), [ControlCommand::UpdateSimulation(update)]
+                    if update.speed_multiplier == Some(expected)
+                        && update.paused == Some(initial.paused)
+                        && !update.step_once),
+                "{key} must submit exactly one speed intent for {expected}, got {submitted:?}"
+            );
+            assert_eq!(fixture.applied_receipts().len(), 1);
+            let applied = fixture.world.snapshot().playback;
+            assert_eq!(applied.speed_multiplier, expected);
+            assert_eq!(applied.paused, initial.paused);
+        }
+
+        // A subsequent shortcut must use the owner's newly applied speed.
         let mut fixture = ShortcutFixture::install();
         let base = fixture.read(|view| view.simulation_drive_snapshot().speed_multiplier);
 
@@ -20058,9 +20078,7 @@ mod command_characterization_tests {
             after_decrease.len() > after_increase.len(),
             "DecreaseSimulationSpeed: '-' must submit an intent of its own"
         );
-        // The view recomputes from the DRIVER's speed, which the fixture never
-        // advances, so the decrease is one step below the same base.
-        let expected_down = ((base - 0.25).clamp(0.25, 4.0) * 100.0).round() / 100.0;
+        let expected_down = ((expected_up - 0.25).clamp(0.25, 4.0) * 100.0).round() / 100.0;
         assert!(
             after_decrease
                 .iter()
@@ -20084,6 +20102,8 @@ mod command_characterization_tests {
             )),
             "a speed change must preserve pause state and never request a step"
         );
+        assert_eq!(fixture.applied_receipts().len(), 2);
+        assert_eq!(fixture.world.snapshot().playback.speed_multiplier, base);
     }
 
     /// CyclePalette was "driven but not state-proven". The accessibility palette
