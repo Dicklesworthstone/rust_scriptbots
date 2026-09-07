@@ -9,9 +9,12 @@ when the cutover is verified; retained history is subject to the repository's no
 The integrity-control exception is unnecessary because the explicit request supplies the gate.
 The highest-priority capability is the host cutover; keep checklist maintenance bounded.
 
-Execution checkpoint, 2026-09-06: the cutover is **unfinished**. DSR62 verified the
-workspace compiler check and real-process REST/MCP test at `4490d1e`; its three
-long regressions remain in progress. Later edits still require their own evidence.
+Execution checkpoint, 2026-09-07: the cutover is **unfinished**. DSR62 verified the
+complete server lane at `4490d1e`, including the three original long regressions.
+DSR64 at `6454ef5` passed 197 runtime tests (5 ignored) and the workspace compiler
+check. Renderer tests finished 125 passed, 1 failed, 3 ignored; strict Clippy failed
+on four runtime diagnostics. Corrections are committed in `0f10844`; DSR65 is
+launched against that exact commit. DSR63 has started the older app follow-up lane.
 All three delegated frontend agents terminated at their usage limits. Root took over their
 reservations. Another actor committed the shared implementation through `a00aaf5`; those
 commit titles do not establish completed behavior. Root's `41d5b1f` formats that checkpoint.
@@ -83,6 +86,51 @@ intent for temporary backpressure. Its two-case journal protocol fixture require
 actual resumption after Full clears. This uses the existing fake protocol adapter,
 not a live-storage claim. GPUI now labels only typed terminal faults as simulation
 faults; its real closed-storage fault-refresh test remains unchanged and unexecuted.
+DSR64 is queued against clean `6454ef5` (code through `6154237`) in a separate
+checkout, covering runtime/render library tests and workspace compiler/Clippy.
+It must not change the clean `4490d1e` checkout reserved for DSR62/63. DSR62 has
+now passed the seeded Assembly case (600,397 ms, ticks 8→480, 599 samples) and
+file-storage case (600,525 ms, ticks 2→900, 588 samples). The original memory case
+is still running. These tests enforce the existing 120-second admission-derived
+no-progress bound; they do not prove continuous or production-budget throughput.
+DSR62 subsequently completed with process exit 0 and typed `pass` (9 steps). Its
+ordinary real-process test passed once, and all three long cases passed (1801.40 s).
+The final memory case ran 600,463 ms, ticks 8→480, 599 samples. Raw status traces
+show maximum flat intervals of 42,082 ms (seeded memory), 23,441 ms (file), and
+41,074 ms (ordinary memory), within the existing 120-second guard. The repeated
+memory endpoint at tick 480 is an observation to investigate, not a demonstrated
+cause or a reason to claim the intermittent liveness investigations are resolved.
+Retained proof metadata/logs are in `/tmp/scriptbots-dsr62-proof-20260906`; all nine
+command-log hashes and the profile hash match, and the typed verdict binds exact
+`4490d1e`. DSR64 has now passed its runtime suite at `6454ef5` (197 passed, 5 ignored),
+including the new narrative, intervention-ring and terminal-fault/backpressure tests.
+DSR64's real closed-storage fault-refresh assertion and production GPUI repaint
+trace also passed. Its sole renderer failure expected a decrease from the original
+speed after the same fixture had actually applied an increase. `0f10844` preserves
+independent exact 1.25/0.75 shortcut checks, checks actual owner application, and
+also requires increase then decrease to return to the original speed. It extracts
+unchanged narrative/hybrid/playback logic and a query-test helper for strict Clippy,
+plus the reported const annotation; no lint suppression or assertion was removed.
+The full DSR64 verdict remains fail; metadata/logs are retained at
+`/tmp/scriptbots-dsr64-proof-20260907`. Formatting/whitespace passed locally; UBS
+returned 1 across three files (97 critical-pattern matches, 4,213 warnings), including
+test panics, temporary-path timestamps and public identity comparisons. This is
+not a clean scan or an independent review. DSR65 results remain pending.
+DSR63 at `4490d1e` subsequently ran app library tests (408 passed, 2 failed, 1
+ignored) and app binary tests (67 passed, 1 failed). The two resize golden
+mismatches affect only the header: the migrated owner fixture is paused while the
+committed frame depicts RUNNING at tick zero. `5644a00` uses the real owner's
+running playback and an explicit `u64::MAX` tick period for static-frame fixtures,
+asserting running state and tick zero; all golden bytes and layout checks remain
+unchanged. Other fixtures retain paused startup. The binary source guard's obsolete
+anchor matched its own string rather than production code; the same commit bounds
+the actual semantic-capture arm and requires rejection of an injected GPU probe.
+These are fixture/source-guard corrections, not live terminal or GPU evidence.
+DSR63's renderer command then failed before rustc could execute (OS error 2), not
+with a renderer test result. Compiler/Clippy follow-up continues. The two app-file
+UBS scans returned 1 (terminal 23 critical patterns/1,328 warnings; main 15/868),
+with inspected samples of test panics, public IDs/watermarks and current-executable
+subprocesses. The corrected app suites still require a pinned DSR run.
 
 Remaining concrete integration work discovered during implementation:
 
@@ -91,14 +139,22 @@ Remaining concrete integration work discovered during implementation:
       original unpresented-screenshot refusal and shutdown assertions. DSR62's
       ordinary real-process test passed at exact `4490d1e`; later source changes
       do not inherit this pass.
-- [ ] Execute the strengthened non-empty intervention-ring publication/reuse guard;
-      compilation alone cannot establish its exact tick, kind, or pointer assertions.
-- [ ] Execute the narrative publication trace added in `a9f7d04`; require complete
+- [x] Execute the strengthened non-empty intervention-ring publication/reuse guard;
+      DSR64 runtime tests passed at `6454ef5`, including its exact tick/kind/pointer assertions.
+- [x] Execute the narrative publication trace added in `a9f7d04`; require complete
       record/drop-count parity, a changed payload and non-empty payload reuse. It
-      does not yet verify narrative allocation byte accounting or ring-overflow reuse.
-- [ ] Verify terminal owner faults publish paused playback, while temporary journal
+      passed in DSR64 at `6454ef5`. This does not verify narrative allocation byte
+      accounting or ring-overflow reuse; those remain open.
+- [x] Verify terminal owner faults publish paused playback, while temporary journal
       backpressure preserves running intent and actually resumes after admission.
-      The new owner fix and two-case protocol fixture require a subsequent pinned run.
+      The two-case runtime protocol fixture and the separate GUI real-storage
+      fault-refresh test both passed in DSR64 at `6454ef5`.
+- [ ] Execute the corrected speed-shortcut fixture at `0f10844` or later, preserving
+      independent directions, sequential owner state, and exact application receipts.
+- [ ] Finish strict workspace Clippy after the four runtime diagnostics are resolved;
+      later crates may expose more diagnostics once runtime compilation succeeds.
+- [ ] Re-execute app library/binary suites at `5644a00` or later, including both
+      untouched resize goldens and the semantic-capture source guard's negative case.
 - [ ] Distinguish temporary `HostHealth::Blocked` from terminal faults in the GPUI
       `simulation_fault` projection. Source corrected in `6154237`; verification
       remains open. Preserve the actual closed-journal fault-refresh assertion.
@@ -119,6 +175,11 @@ Remaining concrete integration work discovered during implementation:
       open. Both repaint traces now query characterization V0 and world V1 atomically
       through the owner in `69642f1`; execution remains open. Legacy driver-only
       failure/retained-step fixtures and removal of the unused driver still remain.
+- [ ] During that failure-fixture migration, verify the fate of commands admitted
+      behind a terminal fault: the channel mirrors statuses, then returns Faulted;
+      HostThread turns that into an error and drops its driver. Check retained
+      payloads, final status authority and tail finalization before claiming the
+      old dormant-step guarantees survived the ownership transfer.
 - [ ] Convert remaining control and server-loop fixtures that lock the former world,
       inject an app-owned status, or accept the former three-value launch result.
 - [ ] Execute the restored control-boundary queue-capacity test in `89d7769`.
