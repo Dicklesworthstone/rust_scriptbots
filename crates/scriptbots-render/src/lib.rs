@@ -37,11 +37,11 @@ use scriptbots_core::{
     AccessibilityPalette, ActivationEdge, ActivationLayer, AgentId, AgentUid, BrainActivations,
     BrainInspectionClientId, BrainInspectionRevision, BrainInspectionUnavailable, ControlCommand,
     ControlDisposition, Generation, IndicatorState, MutationRates, NUM_EYES, OutputChannel,
-    OutputsExt, Position, RenderFogMode, RenderQuality, RenderTonemapMode, SENSOR_LAYOUT,
-    ScriptBotsConfig, SelectedBrainTelemetryOutcome, SelectionMode, SelectionState,
-    SelectionUpdate, SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer,
-    TerrainTile, TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver,
-    apply_control_command, tier_features, toroidal_delta,
+    Position, RenderFogMode, RenderQuality, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
+    SelectedBrainTelemetryOutcome, SelectionMode, SelectionState, SelectionUpdate,
+    SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile,
+    TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver, apply_control_command,
+    tier_features, toroidal_delta,
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, channel::ChannelHostPort};
@@ -14159,6 +14159,8 @@ impl RenderFrame {
 
     #[cfg(test)]
     fn from_world(world: &WorldState, palette: ColorPaletteMode) -> Option<Self> {
+        use scriptbots_core::OutputsExt;
+
         let food = world.food();
         let width = food.width();
         let height = food.height();

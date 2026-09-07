@@ -4531,20 +4531,17 @@ impl Snapshot {
         let world_width = config.world_width.max(1) as f32;
         let world_height = config.world_height.max(1) as f32;
 
-        let summary = snapshot
-            .completed_summary
-            .clone()
-            .unwrap_or_else(|| TickSummary {
-                tick: scriptbots_core::Tick(snapshot.world.tick),
-                agent_count,
-                births: 0,
-                deaths: 0,
-                total_energy: 0.0,
-                average_energy: 0.0,
-                average_health: 0.0,
-                max_age: 0,
-                spike_hits: 0,
-            });
+        let summary = snapshot.completed_summary.clone().unwrap_or(TickSummary {
+            tick: scriptbots_core::Tick(snapshot.world.tick),
+            agent_count,
+            births: 0,
+            deaths: 0,
+            total_energy: 0.0,
+            average_energy: 0.0,
+            average_health: 0.0,
+            max_age: 0,
+            spike_hits: 0,
+        });
         let history: Vec<HistoryEntry> = snapshot
             .summary_history
             .iter()
@@ -11938,7 +11935,9 @@ mod tests {
     ) -> HeadlessBufferEvidence {
         let world = command_characterization_world();
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
-        let host = TerminalTestHost::running_frame(world);
+        // The theme matrix characterizes paused chrome; the resize fixtures
+        // below characterize running chrome. Preserve both reviewed states.
+        let host = TerminalTestHost::take(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
@@ -11948,7 +11947,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|frame| app.draw(frame)).expect("draw frame");
-        assert!(!app.paused);
+        assert!(app.paused);
         assert_eq!(app.snapshot().tick, 0);
         let backend_buffer = terminal.backend().buffer();
         let layout = app.frame_layout(backend_buffer.area);
