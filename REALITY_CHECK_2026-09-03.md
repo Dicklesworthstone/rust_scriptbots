@@ -138,8 +138,11 @@ passed 195 tests (5 ignored) and workspace compiler passed. DSR66 is queued at
 `0f10844` has passed runtime 197/0/5 and is building the renderer suite.
 Later `bd31d1d` corrects a production TUI event-time bug: delayed intervention
 records now use their actual application/expiry ticks instead of the current
-displayed snapshot tick. A real drought/expiry regression requires event ticks
-1 and 3 when first observed at tick 4, distinct kinds and no duplicate reporting.
+displayed snapshot tick. The initial drought/expiry regression incorrectly expected
+expiry at tick 3; DSR67 observed tick 2. Core records expiry at the end of the second
+active transition, while `expires_at = 3` names the first unaffected tick. The
+corrected regression requires event ticks 1 and 2 when first observed at tick 4,
+distinct kinds, the separate `until t3` label and no duplicate reporting.
 That latest fix is outside DSR65/66 and still needs a pinned run. Formatting and
 whitespace passed; whole-terminal UBS remains exit1 (23 critical patterns/1,352
 warnings), not a clean scan or execution evidence.
@@ -162,6 +165,21 @@ These failures occurred at owner join, so they do not establish a golden mismatc
 all running/tick-zero assertions and golden files. The app binary suite passed all
 68 tests, including the repaired semantic source guard. DSR67 is already pinned to
 `731741c` and still contains the fixture error; a later pin must verify `08ebb6e`.
+DSR67 has now executed runtime 197/0/5, renderer 126/0/3 and app binary 68/0/0
+successfully. App library is 399/12/1: the eleven known clock-overflow failures plus
+the incorrect expiry expectation above.
+DSR67 completed with typed fail. Workspace compiler passed; strict Clippy now
+reports the unused old GUI driver, disconnected intervention-summary helper,
+test-only OutputsExt import and an unnecessary lazy summary default. All seven
+command-log hashes, source bindings and the profile hash were checked in
+`/tmp/scriptbots-dsr67-proof-20260907`. The last two cleanup issues are corrected;
+the migration gaps remain open. Pre-pin review also found that the theme matrix
+passed with paused playback in DSR63, unlike the running resize goldens. Its fixture
+now retains paused playback with an explicit assertion. No golden file changed.
+DSR68 is launched at clean `6fb6764`, including both corrected fixtures, the expiry
+expectation correction and the import/default cleanup. Its staging directory is
+protected before Cargo starts. Strict Clippy is expected to retain the unfinished
+driver/scheduling warnings; no suppression or acceptance exemption was added.
 
 Remaining concrete integration work discovered during implementation:
 
@@ -180,8 +198,9 @@ Remaining concrete integration work discovered during implementation:
       backpressure preserves running intent and actually resumes after admission.
       The two-case runtime protocol fixture and the separate GUI real-storage
       fault-refresh test both passed in DSR64 at `6454ef5`.
-- [ ] Execute the corrected speed-shortcut fixture at `0f10844` or later, preserving
+- [x] Execute the corrected speed-shortcut fixture at `0f10844` or later, preserving
       independent directions, sequential owner state, and exact application receipts.
+      The named test passed in DSR66 at `efc0c9b`; renderer 126/0/3 also passed in DSR67.
 - [ ] Finish strict workspace Clippy after the four runtime diagnostics are resolved;
       later crates may expose more diagnostics once runtime compilation succeeds.
 - [ ] Re-execute app library/binary suites at `5644a00` or later, including both
