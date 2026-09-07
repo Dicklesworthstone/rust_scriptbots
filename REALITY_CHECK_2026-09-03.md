@@ -206,10 +206,31 @@ unused legacy GUI driver and disconnected scenario-summary helper. The final typ
 verdict remains `fail`. No original cutover acceptance item is closed by these results.
 All seven command-log hashes/source bindings and the profile hash were checked in
 `/tmp/scriptbots-dsr70-proof-20260907`. This was root's re-execution and self-review,
-not independent review. The current crate sources are unchanged from the tested pin.
+not independent review. Crate sources at that checkpoint were unchanged from the tested pin.
+
+Terminal-fault continuation: `9bc0a35` retains the typed `HostFault` and owner
+receipt through join. Production run-end reporting now uses those observed sense
+values while propagating the original failure. DSR72 at that exact clean source
+passed app library 411/0/1, app binary 68/0/0, runtime 197/0/5 and renderer 126/0/3
+(passed/failed/ignored), plus formatting and the workspace all-target compiler.
+Both strengthened real closed-journal and orderly-shutdown tests passed. Strict
+Clippy still fails only on the previously observed legacy GUI driver and unused
+scenario-summary helper; the final typed verdict is `fail`. This does not establish
+pending-payload recovery, successful fault-tail finalization, GUI/PTY behavior or
+full-workspace test coverage. DSR71 was my failed source-bundle setup: the clean-pin
+check refused the stale checkout before Cargo. I corrected the import with fetch
+and a verified fast-forward before launching DSR72; zero tests ran in DSR71.
+All seven command-log hashes/source bindings and the profile hash were verified
+in `/tmp/scriptbots-dsr72-proof-20260907`. This is self-review and re-execution,
+not independent verification; no original cutover acceptance item is closed.
 
 Remaining concrete integration work discovered during implementation:
 
+- [x] Preserve terminal HostFault and owner receipt through
+      join, and consume faulted-owner sense observations in production run-end
+      reporting. The real closed-journal and orderly-shutdown regressions passed
+      in DSR72 at `9bc0a35`; the fault remains an error. Pending persistence-tail
+      work and all original bd-pcfj acceptance items remain open. Solo verification.
 - [x] Preserve concrete host/channel construction error causes through the owner
       rendezvous and join; require WrongWorld and EmptyIngress variants as well as
       readable diagnostics. Passed in DSR70 at `33d191f`. This does not establish
