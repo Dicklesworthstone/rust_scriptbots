@@ -721,18 +721,55 @@ impl<'a> TerminalApp<'a> {
     /// Explicit batch-mode command barrier. Repainting never invokes this;
     /// only a requested headless science step waits for its own receipt.
     fn submit_and_wait(&mut self, command: ControlCommand) -> Result<()> {
-        let receipt = (self.command_submit)(command)
-            .ok_or_else(|| anyhow!("terminal host rejected command submission"))?;
-        let command_id: scriptbots_runtime::CommandId =
-            serde_json::from_value(serde_json::Value::String(receipt.clone()))
-                .context("terminal command receipt is not a host command identity")?;
         let deadline = Instant::now() + Duration::from_secs(30);
+        let envelope = crate::control::ControlHandle::new(self.host.clone())
+            .prepare_control_command(command, None)?;
+        let command_id = envelope.command_id;
+        // A durable claim may finish after its acknowledgement times out. Keep
+        // the exact identity/payload so retry cannot apply a second Step.
+        loop {
+            self.ensure_control_runtime_running()?;
+            match self.host.submit_before(envelope.clone(), deadline) {
+                Ok(status)
+                    if matches!(
+                        status.application(),
+                        scriptbots_runtime::ApplicationState::Admitted
+                            | scriptbots_runtime::ApplicationState::Applied(_)
+                    ) =>
+                {
+                    break;
+                }
+                Ok(status) => {
+                    return Err(anyhow!(
+                        "terminal command {command_id} was not admitted: {:?}",
+                        status.application()
+                    ));
+                }
+                Err(
+                    error @ scriptbots_runtime::HostAccessError::CommandAuthorityLookup {
+                        failure: scriptbots_runtime::CommandAuthorityLookupFailure::Timeout { .. },
+                        ..
+                    },
+                ) if Instant::now() < deadline => {
+                    warn!(%command_id, %error, "retrying terminal batch command with its original identity");
+                    std::thread::park_timeout(Duration::from_millis(1));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("terminal command {command_id} admission did not complete")
+                    });
+                }
+            }
+        }
         loop {
             self.ensure_control_runtime_running()?;
             let status = self
                 .host
-                .command_status(command_id)?
-                .ok_or_else(|| anyhow!("terminal command {receipt} lost its admitted identity"))?;
+                .command_status_before(command_id, deadline)
+                .with_context(|| format!("terminal command {command_id} status lookup failed"))?
+                .ok_or_else(|| {
+                    anyhow!("terminal command {command_id} lost its admitted identity")
+                })?;
             match status.application() {
                 scriptbots_runtime::ApplicationState::Applied(applied) => {
                     if self.host.snapshot_after(None)?.is_some_and(|snapshot| {
@@ -747,13 +784,13 @@ impl<'a> TerminalApp<'a> {
                 scriptbots_runtime::ApplicationState::Admitted => {}
                 failure => {
                     return Err(anyhow!(
-                        "terminal command {receipt} did not apply: {failure:?}"
+                        "terminal command {command_id} did not apply: {failure:?}"
                     ));
                 }
             }
             ensure!(
                 Instant::now() < deadline,
-                "terminal command {receipt} remained admitted beyond the 30-second wait"
+                "terminal command {command_id} did not complete within the 30-second barrier"
             );
             std::thread::park_timeout(Duration::from_millis(1));
         }
@@ -11878,6 +11915,24 @@ mod tests {
                 .expect("post-inspection digest"),
             digest_before
         );
+    }
+
+    #[test]
+    fn terminal_batch_command_preserves_typed_disconnection() {
+        let world = command_characterization_world();
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let mut host = TerminalTestHost::take(world);
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        host.owner.take().expect("owner").join().expect("shutdown");
+        let error = app
+            .submit_and_wait(ControlCommand::Step)
+            .expect_err("stopped owner cannot admit a step");
+        assert!(matches!(
+            error.downcast_ref::<scriptbots_runtime::HostAccessError>(),
+            Some(scriptbots_runtime::HostAccessError::Disconnected)
+        ));
+        assert!(error.to_string().contains("admission did not complete"));
     }
 
     #[test]

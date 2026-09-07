@@ -311,6 +311,38 @@ impl Clone for ChannelHostPort {
 }
 
 impl ChannelHostPort {
+    /// Submit within both this port's per-call limit and a caller's total budget.
+    /// An expired budget refuses before enqueueing; this never changes the port's
+    /// configured limit or assigns a new command identity.
+    pub fn submit_before(
+        &self,
+        envelope: CommandEnvelope,
+        deadline: Instant,
+    ) -> Result<CommandStatus, HostAccessError> {
+        self.bounded_before(deadline)?.submit(envelope)
+    }
+
+    /// Read command authority without exceeding the caller's remaining budget.
+    pub fn command_status_before(
+        &self,
+        command_id: CommandId,
+        deadline: Instant,
+    ) -> Result<Option<CommandStatus>, HostAccessError> {
+        self.bounded_before(deadline)?.command_status(command_id)
+    }
+
+    fn bounded_before(&self, deadline: Instant) -> Result<Self, HostAccessError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Self::protocol_violation(
+                "channel caller budget elapsed before ingress",
+            ));
+        }
+        let mut bounded = self.clone();
+        bounded.submit_deadline = bounded.submit_deadline.min(remaining);
+        Ok(bounded)
+    }
+
     /// Clone the lock-free publication reader without retaining command ingress.
     #[must_use]
     pub fn snapshot_hub(&self) -> SnapshotHub {
@@ -2328,6 +2360,44 @@ mod tests {
             }
         );
         drop(stalled_retry);
+    }
+
+    #[test]
+    fn caller_budget_caps_port_deadline_and_expiry_never_enqueues() {
+        let (driver, port) = ChannelHostDriver::new(
+            test_host(true),
+            ChannelHostOptions {
+                submit_deadline: Duration::from_secs(60),
+                ..fast_options()
+            },
+        )
+        .expect("driver");
+        let original = port.submit_deadline;
+        let short = Duration::from_secs(30);
+        let capped = port
+            .bounded_before(Instant::now() + short)
+            .expect("unexpired caller budget");
+        assert!(capped.submit_deadline <= short);
+        assert_eq!(port.submit_deadline, original);
+        let long = port
+            .bounded_before(Instant::now() + original + Duration::from_secs(1))
+            .expect("long caller budget");
+        assert_eq!(long.submit_deadline, original);
+
+        let expired = Instant::now();
+        let command_id = CommandId::new(613);
+        assert!(matches!(
+            port.submit_before(CommandEnvelope::new(command_id, HostCommand::Step), expired),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            port.command_status_before(command_id, expired),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]

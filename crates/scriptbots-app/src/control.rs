@@ -751,6 +751,18 @@ impl ControlHandle {
         cmd: ControlCommand,
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
+        let envelope = self.prepare_control_command(cmd, idempotency_key)?;
+        let status = self.host.clone().submit(envelope)?;
+        self.status_dto(status)
+    }
+
+    /// Validate and assign one identity before a caller starts a bounded retry.
+    /// Retrying must reuse this complete envelope, not prepare the command again.
+    pub(crate) fn prepare_control_command(
+        &self,
+        cmd: ControlCommand,
+        idempotency_key: Option<&str>,
+    ) -> Result<CommandEnvelope, ControlError> {
         cmd.validate()
             .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
         let command = HostCommand::try_from(cmd)
@@ -780,11 +792,7 @@ impl ControlHandle {
                 })?;
             (u128::from(self.command_namespace) << 64) | u128::from(sequence)
         };
-        let status = self
-            .host
-            .clone()
-            .submit(CommandEnvelope::new(CommandId::new(id), command))?;
-        self.status_dto(status)
+        Ok(CommandEnvelope::new(CommandId::new(id), command))
     }
 
     fn status_dto(
@@ -2182,6 +2190,30 @@ pub(crate) mod tests {
             1,
             "a retried Step must advance once"
         );
+    }
+
+    #[test]
+    fn prepared_command_retry_applies_once_and_new_preparation_advances_again() {
+        let (handle, owner) = handle();
+        let envelope = handle
+            .prepare_control_command(ControlCommand::Step, None)
+            .expect("prepare step");
+        assert_eq!(handle.status().expect("preparation status").tick, 0);
+        let mut port = handle.host.clone();
+        let first = port.submit(envelope.clone()).expect("first submission");
+        let retry = port.submit(envelope.clone()).expect("same envelope retry");
+        assert_eq!(first.command_id(), retry.command_id());
+        assert_eq!(first.admission_sequence(), retry.admission_sequence());
+        owner.wait_applied(&handle.status_dto(retry).expect("retry DTO"));
+        assert_eq!(handle.status().expect("after retry").tick, 1);
+
+        let next = handle
+            .prepare_control_command(ControlCommand::Step, None)
+            .expect("next step");
+        assert_ne!(next.command_id, envelope.command_id);
+        let applied = port.submit(next).expect("new submission");
+        owner.wait_applied(&handle.status_dto(applied).expect("new DTO"));
+        assert_eq!(handle.status().expect("after distinct step").tick, 2);
     }
 
     /// Positive control: distinct keys are distinct commands.
