@@ -756,7 +756,7 @@ impl<'a> TerminalApp<'a> {
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("terminal command {command_id} admission did not complete")
+                        self.batch_command_failure_context(command_id, "admission did not complete")
                     });
                 }
             }
@@ -766,7 +766,9 @@ impl<'a> TerminalApp<'a> {
             let status = self
                 .host
                 .command_status_before(command_id, deadline)
-                .with_context(|| format!("terminal command {command_id} status lookup failed"))?
+                .with_context(|| {
+                    self.batch_command_failure_context(command_id, "status lookup failed")
+                })?
                 .ok_or_else(|| {
                     anyhow!("terminal command {command_id} lost its admitted identity")
                 })?;
@@ -793,6 +795,25 @@ impl<'a> TerminalApp<'a> {
                 "terminal command {command_id} did not complete within the 30-second barrier"
             );
             std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    fn batch_command_failure_context(
+        &self,
+        command_id: scriptbots_runtime::CommandId,
+        phase: &str,
+    ) -> String {
+        let context = format!("terminal command {command_id} {phase}");
+        match self.host.snapshot_hub().snapshot_after(None) {
+            Some(snapshot) => format!(
+                "{context}; latest publication: published_tick={}, lifecycle={:?}, health={:?}, queued_commands={}, last_applied={:?}",
+                snapshot.world.tick,
+                snapshot.lifecycle,
+                snapshot.health,
+                snapshot.command_queue_depth,
+                snapshot.last_applied_command,
+            ),
+            None => format!("{context}; no host publication available"),
         }
     }
 
@@ -11939,6 +11960,8 @@ mod tests {
             Some(scriptbots_runtime::HostAccessError::Disconnected)
         ));
         assert!(error.to_string().contains("admission did not complete"));
+        assert!(error.to_string().contains("published_tick=0"));
+        assert!(error.to_string().contains("lifecycle=Stopped"));
     }
 
     #[test]
