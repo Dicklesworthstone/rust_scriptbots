@@ -153,7 +153,7 @@ impl FixedDeadlineHost {
     }
 
     /// Request digest instrumentation for the next replay boundary.
-    pub fn request_replay_world_digest(&mut self) {
+    pub const fn request_replay_world_digest(&mut self) {
         self.core.request_replay_world_digest();
     }
 

@@ -3363,7 +3363,7 @@ impl HostCore {
                 self.complete_playback_command(admission, &retry_envelope, next_control)
             }
             HostCommand::UpdateSimulation(update) => {
-                self.apply_simulation_command(admission, &retry_envelope, update, next_control)
+                self.apply_simulation_command(admission, &retry_envelope, &update, next_control)
             }
             HostCommand::UpdateConfig(config) => {
                 self.apply_config_command(admission, &retry_envelope, config, next_control)
@@ -3428,7 +3428,7 @@ impl HostCore {
         &mut self,
         admission: AdmissionSequence,
         envelope: &CommandEnvelope,
-        update: scriptbots_core::SimulationCommand,
+        update: &scriptbots_core::SimulationCommand,
         next_control: ControlRevision,
     ) -> Result<ApplyResult, HostAccessError> {
         if let Some(paused) = update.paused {
