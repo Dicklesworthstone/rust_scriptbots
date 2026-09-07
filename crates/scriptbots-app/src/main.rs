@@ -4910,57 +4910,78 @@ mod tests {
 
     #[test]
     fn production_regions_retain_typed_host_fault_and_still_acknowledge_storage() -> Result<()> {
-        let mut pipeline = StoragePipeline::unattributed_memory()?;
-        let journal = pipeline.journal_port(HostSessionId::new(0x513c), Default::default())?;
-        pipeline.shutdown()?;
-        let fixture = ServerLoopFixture::with_journal(Box::new(journal), false)?;
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while fixture
-            .port
-            .snapshot_hub()
-            .latest()
-            .health
-            .fault()
-            .is_none()
-        {
-            assert!(
-                Instant::now() < deadline,
-                "closed journal did not fault the owner"
+        for storage_already_closed in [false, true] {
+            let mut pipeline = StoragePipeline::unattributed_memory()?;
+            let journal = pipeline.journal_port(HostSessionId::new(0x513c), Default::default())?;
+            pipeline.shutdown()?;
+            let fixture = ServerLoopFixture::with_journal(Box::new(journal), false)?;
+            // Isolate the teardown failure domains with real workers. The coupled
+            // world/file partial tail is exercised by the preceding test. This case
+            // checks both a fresh worker acknowledgement and a second-shutdown error.
+            let pipeline = if storage_already_closed {
+                pipeline
+            } else {
+                StoragePipeline::unattributed_memory()?
+            };
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while fixture
+                .port
+                .snapshot_hub()
+                .latest()
+                .health
+                .fault()
+                .is_none()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "closed journal did not fault the owner"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let ServerLoopFixture {
+                host,
+                port,
+                runtime,
+                submit,
+            } = fixture;
+            drop(port);
+            drop(submit);
+            let teardown = close_runtime_regions(Some(runtime), host, pipeline);
+            assert!(matches!(teardown.outcomes[0].outcome, Outcome::Ok(_)));
+            assert!(matches!(teardown.outcomes[1].outcome, Outcome::Err(_)));
+            assert_eq!(
+                matches!(teardown.outcomes[2].outcome, Outcome::Err(_)),
+                storage_already_closed,
+                "storage must report its own result: {:?}",
+                teardown.outcomes[2]
             );
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if !storage_already_closed {
+                assert!(matches!(teardown.outcomes[2].outcome, Outcome::Ok(_)));
+            }
+            assert_eq!(
+                teardown
+                    .sense_summary
+                    .as_ref()
+                    .expect("fault observations")
+                    .tick,
+                1
+            );
+            let error = teardown
+                .finish(Ok(()))
+                .expect_err("host fault must survive region reporting");
+            if storage_already_closed {
+                assert!(format!("{error:#}").contains("already been shut down"));
+            }
+            let fault = error
+                .downcast_ref::<HostThreadFaultError>()
+                .expect("original typed host fault");
+            assert!(format!("{:?}", fault.fault).contains("journal_closed"));
+            assert_eq!(fault.receipt.snapshot.world.tick, 1);
+            assert!(matches!(
+                fault.receipt.final_digest,
+                Err(scriptbots_core::CharacterizationError::NonContinuable { .. })
+            ));
         }
-        let ServerLoopFixture {
-            host,
-            port,
-            runtime,
-            submit,
-        } = fixture;
-        drop(port);
-        drop(submit);
-        let teardown = close_runtime_regions(Some(runtime), host, pipeline);
-        assert!(matches!(teardown.outcomes[0].outcome, Outcome::Ok(_)));
-        assert!(matches!(teardown.outcomes[1].outcome, Outcome::Err(_)));
-        assert!(matches!(teardown.outcomes[2].outcome, Outcome::Ok(_)));
-        assert_eq!(
-            teardown
-                .sense_summary
-                .as_ref()
-                .expect("fault observations")
-                .tick,
-            1
-        );
-        let error = teardown
-            .finish(Ok(()))
-            .expect_err("host fault must survive region reporting");
-        let fault = error
-            .downcast_ref::<HostThreadFaultError>()
-            .expect("original typed host fault");
-        assert!(format!("{:?}", fault.fault).contains("journal_closed"));
-        assert_eq!(fault.receipt.snapshot.world.tick, 1);
-        assert!(matches!(
-            fault.receipt.final_digest,
-            Err(scriptbots_core::CharacterizationError::NonContinuable { .. })
-        ));
         Ok(())
     }
 
