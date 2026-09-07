@@ -4897,13 +4897,16 @@ mod tests {
     fn semantic_projection_path_never_probes_the_gpu() {
         let source = include_str!("main.rs");
         let after = source
-            .split_once("if let Some(path) = cli.dump_semantic_png.as_ref() {")
+            .split_once("if let Some(path) = &cli.dump_semantic_png {")
             .expect("semantic png branch")
             .1;
-        // Stop at the next top-level CLI branch so only this arm is inspected.
+        // The adjacent else arm performs GPU scene capture. Fail if that
+        // boundary disappears instead of scanning the rest of this file,
+        // including this test's own source strings.
         let block = after
-            .split_once("\n        #[cfg(feature")
-            .map_or(after, |(before, _)| before);
+            .split_once("\n            } else {")
+            .expect("semantic capture ends before the GPU scene-capture arm")
+            .0;
         // Comments are stripped before scanning. The block deliberately explains
         // in prose why it does NOT probe, and naming the function there must not
         // read as calling it — a guard that cannot tell a call from a comment
@@ -4913,15 +4916,16 @@ mod tests {
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
+        let is_cpu_only =
+            |body: &str| body.contains("render_bevy_png") && !body.contains("probe_gpu_capability");
         assert!(
-            !code.contains("probe_gpu_capability"),
+            is_cpu_only(&code),
             "the CPU-only semantic projection path must not probe the GPU; \
              --dump-scene-png owns real GPU captures"
         );
         assert!(
-            code.contains("render_bevy_png"),
-            "scan anchored to the wrong block: the semantic arm must still \
-             render through the CPU rasterizer"
+            !is_cpu_only(&format!("{code}\nprobe_gpu_capability();")),
+            "the source guard must reject a GPU probe added to the semantic arm"
         );
     }
 

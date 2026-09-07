@@ -11491,6 +11491,34 @@ mod tests {
 
     impl TerminalTestHost {
         fn take(world: SharedWorld) -> Self {
+            Self::with_options(
+                world,
+                scriptbots_runtime::HostCoreOptions {
+                    initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    capture_agent_visuals: true,
+                    ..scriptbots_runtime::HostCoreOptions::default()
+                },
+            )
+        }
+
+        fn running_frame(world: SharedWorld) -> Self {
+            // These goldens depict a running world before its first tick. Keep
+            // that state on the real owner, with a tick period longer than the
+            // test, rather than overwriting the renderer's playback projection.
+            Self::with_options(
+                world,
+                scriptbots_runtime::HostCoreOptions {
+                    tick_period_nanos: u64::MAX,
+                    capture_agent_visuals: true,
+                    ..scriptbots_runtime::HostCoreOptions::default()
+                },
+            )
+        }
+
+        fn with_options(world: SharedWorld, options: scriptbots_runtime::HostCoreOptions) -> Self {
             let world = Arc::try_unwrap(world)
                 .unwrap_or_else(|_| panic!("terminal fixture must transfer sole world ownership"))
                 .into_inner()
@@ -11503,14 +11531,7 @@ mod tests {
                 world,
                 persistence,
                 Box::new(scriptbots_runtime::VolatileJournal::default()),
-                scriptbots_runtime::HostCoreOptions {
-                    initial_playback: scriptbots_runtime::PlaybackSnapshot {
-                        paused: true,
-                        speed_multiplier: 1.0,
-                    },
-                    capture_agent_visuals: true,
-                    ..scriptbots_runtime::HostCoreOptions::default()
-                },
+                options,
                 scriptbots_runtime::channel::ChannelHostOptions::default(),
             )
             .expect("start real terminal host");
@@ -11866,7 +11887,7 @@ mod tests {
     ) -> HeadlessBufferEvidence {
         let world = command_characterization_world();
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
-        let host = TerminalTestHost::take(world);
+        let host = TerminalTestHost::running_frame(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
@@ -11876,6 +11897,8 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|frame| app.draw(frame)).expect("draw frame");
+        assert!(!app.paused);
+        assert_eq!(app.snapshot().tick, 0);
         let backend_buffer = terminal.backend().buffer();
         let layout = app.frame_layout(backend_buffer.area);
         HeadlessBufferEvidence::inspect(backend_buffer, app.snapshot().tick, &layout)
@@ -11892,7 +11915,7 @@ mod tests {
     fn matrix_frame_buffer(width: u16, height: u16) -> (Buffer, FrameLayout, u64) {
         let world = command_characterization_world();
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
-        let host = TerminalTestHost::take(world);
+        let host = TerminalTestHost::running_frame(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
@@ -11900,6 +11923,8 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|frame| app.draw(frame)).expect("draw frame");
+        assert!(!app.paused);
+        assert_eq!(app.snapshot().tick, 0);
         let buffer = terminal.backend().buffer().clone();
         let layout = app.frame_layout(buffer.area);
         (buffer, layout, app.snapshot().tick)
@@ -11989,7 +12014,7 @@ mod tests {
     ) -> Buffer {
         let world = command_characterization_world();
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
-        let host = TerminalTestHost::take(world);
+        let host = TerminalTestHost::running_frame(world);
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
@@ -11999,6 +12024,8 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|frame| app.draw(frame)).expect("draw frame");
+        assert!(!app.paused);
+        assert_eq!(app.snapshot().tick, 0);
         terminal.backend().buffer().clone()
     }
 
