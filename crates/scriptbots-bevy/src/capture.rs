@@ -1558,7 +1558,11 @@ fn configure_session<'a>(
         if config.corrupt { 0.0 } else { 800.0 };
     app.insert_resource(CaptureCorrupt(config.corrupt));
     app.insert_resource(effective.clone());
-    configure_capture_tonemapping(app.world_mut(), &config.render_settings);
+    configure_capture_camera_effects(
+        app.world_mut(),
+        &config.render_settings,
+        effective.features.bloom,
+    );
 
     // Fresh render target; repoint the app-lifetime capture camera and
     // retune the sun for tier/corrupt without respawning either.
@@ -1618,14 +1622,29 @@ fn configure_session<'a>(
 
 /// Use the native renderer's settings conversion, resetting the persistent
 /// camera for every session so a previous look cannot leak into the next one.
-fn configure_capture_tonemapping(world: &mut World, settings: &RenderSettings) {
+fn configure_capture_camera_effects(world: &mut World, settings: &RenderSettings, bloom: bool) {
     let state = crate::TonemappingState::from_render_settings(settings);
     let mut cameras = world
-        .query_filtered::<(&mut crate::Tonemapping, &mut crate::ColorGrading), With<CaptureCamera>>(
-        );
-    for (mut tonemap, mut grading) in cameras.iter_mut(world) {
-        *tonemap = state.mode.to_component();
-        grading.global.exposure = state.exposure_bias;
+        .query_filtered::<
+            (Entity, &mut crate::Tonemapping, &mut crate::ColorGrading),
+            With<CaptureCamera>,
+        >();
+    let entities: Vec<Entity> = cameras
+        .iter_mut(world)
+        .map(|(entity, mut tonemap, mut grading)| {
+            *tonemap = state.mode.to_component();
+            grading.global.exposure = state.exposure_bias;
+            entity
+        })
+        .collect();
+    for entity in entities {
+        // As in the native camera, component presence enables the effect.
+        // Reset both directions because this camera outlives each session.
+        if bloom {
+            world.entity_mut(entity).insert(crate::Bloom::NATURAL);
+        } else {
+            world.entity_mut(entity).remove::<crate::Bloom>();
+        }
     }
 }
 
@@ -1737,7 +1756,7 @@ mod tests {
             tonemap_exposure_bias: Some(-0.75),
             ..Default::default()
         };
-        configure_capture_tonemapping(&mut world, &settings);
+        configure_capture_camera_effects(&mut world, &settings, false);
         assert_eq!(
             world.get::<crate::Tonemapping>(camera),
             Some(&crate::Tonemapping::AgX)
@@ -1750,7 +1769,7 @@ mod tests {
                 .exposure,
             -0.75
         );
-        configure_capture_tonemapping(&mut world, &RenderSettings::default());
+        configure_capture_camera_effects(&mut world, &RenderSettings::default(), false);
         assert_eq!(
             world.get::<crate::Tonemapping>(camera),
             Some(&crate::Tonemapping::AcesFitted)
@@ -1763,6 +1782,30 @@ mod tests {
                 .exposure,
             0.0
         );
+    }
+
+    #[test]
+    fn capture_bloom_tracks_resolved_feature_across_sessions() {
+        let mut world = World::new();
+        let camera = world
+            .spawn((
+                CaptureCamera,
+                crate::Tonemapping::AcesFitted,
+                crate::ColorGrading::default(),
+                bevy::render::view::Hdr,
+            ))
+            .id();
+        let unrelated = world.spawn(crate::Bloom::NATURAL).id();
+        for enabled in [true, false, true, false] {
+            configure_capture_camera_effects(&mut world, &RenderSettings::default(), enabled);
+            let bloom = world.get::<crate::Bloom>(camera);
+            assert_eq!(bloom.is_some(), enabled, "stale capture bloom state");
+            if let Some(bloom) = bloom {
+                assert_eq!(bloom.intensity, crate::Bloom::NATURAL.intensity);
+            }
+            assert!(world.get::<crate::Bloom>(unrelated).is_some());
+            assert!(world.get::<bevy::render::view::Hdr>(camera).is_some());
+        }
     }
 
     #[test]
