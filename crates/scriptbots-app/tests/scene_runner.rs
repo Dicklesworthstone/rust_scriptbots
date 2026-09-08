@@ -27,9 +27,22 @@ fn load_all() -> Vec<SceneManifest> {
         })
         .collect();
     manifests.sort_by(|a, b| a.name.cmp(&b.name));
-    // Five bd-2z0.14.3.5.1 reference scenes plus the bd-2z0.14.3.4 offscreen
-    // smoke scene; the count is explicit so a dropped scene fails loudly.
-    assert_eq!(manifests.len(), 6, "all six reference scenes load");
+    assert_eq!(
+        manifests
+            .iter()
+            .map(|scene| scene.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "bevy_offscreen_smoke",
+            "combat_burst",
+            "day_night_sweep",
+            "ecosystem_look",
+            "empty_world",
+            "hydrology_flood",
+            "mixed_population_1k",
+        ],
+        "the complete named reference scene set must load"
+    );
     manifests
 }
 
@@ -45,6 +58,7 @@ fn every_reference_scene_validates_and_runs_null_driver() {
         assert_eq!(log.ticks_executed, manifest.ticks);
         let json = serde_json::to_value(&log).expect("scene log serializes");
         for field in [
+            "manifest",
             "name",
             "frontend",
             "seed",
@@ -79,6 +93,23 @@ fn every_reference_scene_validates_and_runs_null_driver() {
             )
         });
     }
+}
+
+#[test]
+fn ecosystem_look_bookmarks_share_a_tick_and_retain_distinct_cameras() {
+    let manifest = SceneManifest::load(&scenes_dir().join("ecosystem_look.toml")).unwrap();
+    let log = run_scene(&manifest, &mut NullDriver).unwrap();
+    let mut positions = Vec::new();
+    for capture in &log.manifest.captures {
+        assert_eq!(capture.tick, 0);
+        let key = &log.manifest.camera[capture.camera_key.expect("explicit bookmark")];
+        assert!(!positions.contains(&key.pos), "collapsed camera matrix");
+        positions.push(key.pos);
+    }
+    assert_eq!(positions.len(), manifest.camera.len());
+    assert_eq!(positions.len(), 3, "near, mid and overview views");
+    let config = manifest.compose_config().unwrap();
+    assert_eq!(config.render.tonemap_exposure_bias, Some(-0.35));
 }
 
 #[test]

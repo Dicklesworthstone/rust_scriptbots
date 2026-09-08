@@ -96,6 +96,10 @@ pub struct CapturePoint {
     pub tick: u64,
     /// Artifact name (without extension).
     pub name: String,
+    /// Optional index into `camera`, allowing several views of one science tick.
+    /// Omitted captures use the latest camera keyframe at their tick.
+    #[serde(default)]
+    pub camera_key: Option<usize>,
 }
 
 /// An expected visual fact.
@@ -190,6 +194,11 @@ impl SceneManifest {
                     problems.push(format!("camera[{index}].pos.{axis} is not finite"));
                 }
             }
+            for (angle, value) in [("yaw", key.yaw), ("pitch", key.pitch)] {
+                if !value.is_finite() {
+                    problems.push(format!("camera[{index}].{angle} is not finite"));
+                }
+            }
             if !(1.0..=179.0).contains(&key.fov) {
                 problems.push(format!("camera[{index}].fov {} outside [1, 179]", key.fov));
             }
@@ -208,6 +217,13 @@ impl SceneManifest {
             }
             if capture.name.trim().is_empty() {
                 problems.push(format!("captures[{index}].name must be non-empty"));
+            }
+            if let Some(key) = capture.camera_key
+                && self.camera.get(key).is_none()
+            {
+                problems.push(format!(
+                    "captures[{index}].camera_key {key} is out of range"
+                ));
             }
         }
         for window in self.captures.windows(2) {
@@ -356,6 +372,9 @@ pub struct ExpectationResult {
 /// The structured per-scene JSON log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneLog {
+    /// Exact requested scene, including per-capture bookmarks and render inputs.
+    /// Adapter-resolved settings and world identity remain in frame provenance.
+    pub manifest: SceneManifest,
     /// Scene name.
     pub name: String,
     /// Frontend that executed it.
@@ -710,8 +729,12 @@ fn camera_pose_at(
     manifest: &SceneManifest,
     tick: u64,
     world: &WorldState,
+    camera_key: Option<usize>,
 ) -> ([f32; 3], [f32; 3], f32) {
-    let Some(key) = manifest.camera.iter().rev().find(|key| key.tick <= tick) else {
+    let Some(key) = camera_key
+        .and_then(|index| manifest.camera.get(index))
+        .or_else(|| manifest.camera.iter().rev().find(|key| key.tick <= tick))
+    else {
         return ([0.0, 1800.0, 1400.0], [0.0, 0.0, 0.0], 55.0);
     };
     if let Some(uid) = key.follow_uid
@@ -883,15 +906,19 @@ impl SceneDriver for BevyOffscreenDriver {
                     if due.is_empty() {
                         return Ok(());
                     }
-                    let (pos, look_at, fov) = camera_pose_at(manifest, tick, world);
-                    capture.set_camera_pose(pos, look_at, fov);
-                    let frame = capture
-                        .render(world, &manifest.name, manifest.seed, tick)
-                        .map_err(|error| SceneError {
-                            problems: vec![format!("offscreen render at tick {tick}: {error:#}")],
-                        })?;
-                    let hash = fnv1a64_hex(&frame.rgba8);
                     for point in due {
+                        let (pos, look_at, fov) =
+                            camera_pose_at(manifest, tick, world, point.camera_key);
+                        capture.set_camera_pose(pos, look_at, fov);
+                        let frame = capture
+                            .render(world, &manifest.name, manifest.seed, tick)
+                            .map_err(|error| SceneError {
+                                problems: vec![format!(
+                                    "offscreen render {} at tick {tick}: {error:#}",
+                                    point.name
+                                )],
+                            })?;
+                        let hash = fnv1a64_hex(&frame.rgba8);
                         facts.captures.push((
                             point.name.clone(),
                             tick,
@@ -1183,6 +1210,7 @@ pub fn run_scene(
         ("total".to_owned(), elapsed_ms(total_started)),
     ]);
     Ok(SceneLog {
+        manifest: manifest.clone(),
         name: manifest.name.clone(),
         frontend: driver.name().to_string(),
         seed: manifest.seed,
@@ -1224,6 +1252,7 @@ mod tests {
             captures: vec![CapturePoint {
                 tick: 10,
                 name: "mid".to_string(),
+                camera_key: None,
             }],
             expect: vec![Expectation::AgentCount {
                 min: 1,
@@ -1235,6 +1264,37 @@ mod tests {
     #[test]
     fn valid_manifest_passes_validation() {
         base_manifest().validate().expect("base manifest is valid");
+    }
+
+    #[test]
+    fn capture_camera_bookmarks_validate_indices_and_finite_angles() {
+        let mut manifest = base_manifest();
+        manifest.camera.push(CameraKey {
+            tick: 0,
+            pos: [0.0, 450.0, 450.0],
+            yaw: std::f32::consts::PI,
+            pitch: -std::f32::consts::FRAC_PI_4,
+            fov: 55.0,
+            follow_uid: None,
+        });
+        manifest.captures[0].camera_key = Some(0);
+        manifest.validate().expect("existing bookmark");
+        manifest.captures[0].camera_key = Some(manifest.camera.len());
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("camera_key 1")
+        );
+        manifest.captures[0].camera_key = Some(0);
+        for angle in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            manifest.camera[0].yaw = angle;
+            manifest.camera[0].pitch = angle;
+            let error = manifest.validate().unwrap_err().to_string();
+            assert!(error.contains("yaw is not finite"));
+            assert!(error.contains("pitch is not finite"));
+        }
     }
 
     #[test]
@@ -1493,6 +1553,7 @@ stars = true
             captures: vec![CapturePoint {
                 tick: 12,
                 name: "final".to_string(),
+                camera_key: None,
             }],
             expect: vec![
                 Expectation::AgentCount {
@@ -1526,6 +1587,7 @@ stars = true
         manifest.captures = vec![CapturePoint {
             tick: 4,
             name: "final".to_string(),
+            camera_key: None,
         }];
         // Learn the hash first, then require it (self-consistency, not a
         // golden): proves the evaluator's hash comparison actually runs.

@@ -1,0 +1,58 @@
+# Initial look-development candidate, not an approved art golden.
+# Three real GPU views of the SAME seeded world at tick zero; no science
+# progression is used to change camera composition. Review shoreline and
+# character readability before treating this as the finished meadow target.
+name = "ecosystem_look"
+seed = 3
+ticks = 1
+quality = "medium"
+frontend = "bevy_offscreen"
+
+[config_overrides]
+world_width = 600
+world_height = 600
+
+[config_overrides.render]
+tonemap_mode = "aces"
+tonemap_exposure_bias = -0.35
+
+[[camera]]
+tick = 0
+pos = [0.0, 250.0, 250.0]
+yaw = 3.1415927
+pitch = -0.7853982
+fov = 55.0
+
+[[camera]]
+tick = 0
+pos = [0.0, 450.0, 450.0]
+yaw = 3.1415927
+pitch = -0.7853982
+fov = 55.0
+
+[[camera]]
+tick = 0
+pos = [0.0, 900.0, 900.0]
+yaw = 3.1415927
+pitch = -0.7853982
+fov = 55.0
+
+[[captures]]
+tick = 0
+name = "near"
+camera_key = 0
+
+[[captures]]
+tick = 0
+name = "mid"
+camera_key = 1
+
+[[captures]]
+tick = 0
+name = "overview"
+camera_key = 2
+
+[[expect]]
+kind = "agent_count"
+min = 1
+max = 10000

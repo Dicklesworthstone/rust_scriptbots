@@ -861,6 +861,17 @@ impl<'a> OffscreenCapture<'a> {
         config: &OffscreenCaptureConfig,
         f: impl FnOnce(&mut OffscreenCapture) -> Result<R>,
     ) -> Result<R> {
+        config.render_settings.validate()?;
+        if config
+            .render_settings
+            .auto_exposure
+            .as_ref()
+            .is_some_and(|settings| settings.enabled)
+        {
+            return Err(anyhow!(
+                "offscreen capture requires fixed exposure; disable render.auto_exposure"
+            ));
+        }
         let (width, height) = config.viewport;
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return Err(anyhow!(
@@ -1542,6 +1553,7 @@ fn configure_session<'a>(
         if config.corrupt { 0.0 } else { 800.0 };
     app.insert_resource(CaptureCorrupt(config.corrupt));
     app.insert_resource(effective.clone());
+    configure_capture_tonemapping(app.world_mut(), &config.render_settings);
 
     // Fresh render target; repoint the app-lifetime capture camera and
     // retune the sun for tier/corrupt without respawning either.
@@ -1597,6 +1609,19 @@ fn configure_session<'a>(
         corrupt: config.corrupt,
         next_snapshot_revision: 1,
     })
+}
+
+/// Use the native renderer's settings conversion, resetting the persistent
+/// camera for every session so a previous look cannot leak into the next one.
+fn configure_capture_tonemapping(world: &mut World, settings: &RenderSettings) {
+    let state = crate::TonemappingState::from_render_settings(settings);
+    let mut cameras = world
+        .query_filtered::<(&mut crate::Tonemapping, &mut crate::ColorGrading), With<CaptureCamera>>(
+        );
+    for (mut tonemap, mut grading) in cameras.iter_mut(world) {
+        *tonemap = state.mode.to_component();
+        grading.global.exposure = state.exposure_bias;
+    }
 }
 
 /// The app-lifetime rig: HDR capture camera + sun. Spawned once in Startup
@@ -1691,6 +1716,86 @@ fn setup_capture_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_tonemapping_consumes_settings_and_resets_between_sessions() {
+        let mut world = World::new();
+        let camera = world
+            .spawn((
+                CaptureCamera,
+                crate::Tonemapping::AcesFitted,
+                crate::ColorGrading::default(),
+            ))
+            .id();
+        let settings = RenderSettings {
+            tonemap_mode: Some(scriptbots_core::RenderTonemapMode::Agx),
+            tonemap_exposure_bias: Some(-0.75),
+            ..Default::default()
+        };
+        configure_capture_tonemapping(&mut world, &settings);
+        assert_eq!(
+            world.get::<crate::Tonemapping>(camera),
+            Some(&crate::Tonemapping::AgX)
+        );
+        assert_eq!(
+            world
+                .get::<crate::ColorGrading>(camera)
+                .unwrap()
+                .global
+                .exposure,
+            -0.75
+        );
+        configure_capture_tonemapping(&mut world, &RenderSettings::default());
+        assert_eq!(
+            world.get::<crate::Tonemapping>(camera),
+            Some(&crate::Tonemapping::AcesFitted)
+        );
+        assert_eq!(
+            world
+                .get::<crate::ColorGrading>(camera)
+                .unwrap()
+                .global
+                .exposure,
+            0.0
+        );
+    }
+
+    #[test]
+    fn invalid_capture_exposure_is_rejected_before_gpu_initialization() {
+        for bias in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let config = OffscreenCaptureConfig {
+                viewport: (32, 32),
+                render_settings: RenderSettings {
+                    tonemap_exposure_bias: Some(bias),
+                    ..Default::default()
+                },
+                corrupt: false,
+            };
+            let error =
+                OffscreenCapture::run::<()>(&config, |_| panic!("invalid settings admitted"))
+                    .expect_err("nonfinite exposure must fail");
+            assert!(error.to_string().contains("tonemap_exposure_bias"));
+        }
+    }
+
+    #[test]
+    fn adaptive_capture_exposure_is_explicitly_refused() {
+        let config = OffscreenCaptureConfig {
+            viewport: (32, 32),
+            render_settings: RenderSettings {
+                auto_exposure: Some(scriptbots_core::RenderAutoExposureSettings {
+                    enabled: true,
+                    speed_brighten: None,
+                    speed_darken: None,
+                }),
+                ..Default::default()
+            },
+            corrupt: false,
+        };
+        let error = OffscreenCapture::run::<()>(&config, |_| panic!("adaptive exposure admitted"))
+            .expect_err("adaptive capture exposure must fail");
+        assert!(error.to_string().contains("requires fixed exposure"));
+    }
 
     fn frame(width: u32, height: u32, value: u8) -> Vec<u8> {
         vec![value; (width * height * 4) as usize]

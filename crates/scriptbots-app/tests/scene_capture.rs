@@ -9,8 +9,8 @@
 #![cfg(feature = "bevy_render")]
 
 use scriptbots_app::scene::{
-    BevyOffscreenDriver, CapturePoint, Expectation, FrontendKind, GoldenOutcome, SceneDriver,
-    SceneError, SceneManifest, process_golden,
+    BevyOffscreenDriver, CameraKey, CapturePoint, Expectation, FrontendKind, GoldenOutcome,
+    SceneDriver, SceneError, SceneManifest, process_golden,
 };
 use scriptbots_bevy::capture::{
     CapturedFrame, CompareThresholds, compare_frames, encode_png, rgba8_is_visually_blank,
@@ -74,6 +74,7 @@ world_height = 600
         captures: vec![CapturePoint {
             tick: 2,
             name: "mid".to_string(),
+            camera_key: None,
         }],
         expect: vec![Expectation::AgentCount {
             min: 1,
@@ -84,6 +85,64 @@ world_height = 600
 
 const ADAPTER_UNAVAILABLE_PROBLEM: &str = "offscreen capture: no GPU adapter available for offscreen capture \
      (software lane requires llvmpipe/lavapipe via WGPU_BACKEND, or a real GPU)";
+
+#[test]
+#[serial]
+fn same_tick_camera_bookmarks_render_distinct_views_of_identical_science() {
+    let _guard = GPU_GUARD.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("capture directory");
+    let mut manifest = tiny_manifest("camera-bookmarks");
+    manifest.camera = [450.0, 900.0]
+        .into_iter()
+        .map(|distance| CameraKey {
+            tick: 0,
+            pos: [0.0, distance, distance],
+            yaw: std::f32::consts::PI,
+            pitch: -std::f32::consts::FRAC_PI_4,
+            fov: 55.0,
+            follow_uid: None,
+        })
+        .collect();
+    manifest.captures = ["near", "overview"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| CapturePoint {
+            tick: 0,
+            name: name.to_string(),
+            camera_key: Some(index),
+        })
+        .collect();
+    let mut driver = BevyOffscreenDriver {
+        seed_agents: 8,
+        viewport: (256, 256),
+        artifacts_dir: Some(dir.path().to_path_buf()),
+    };
+    let facts = driver.run(&manifest).expect("real GPU bookmark captures");
+    assert_eq!(facts.captures.len(), manifest.captures.len());
+    assert_ne!(
+        facts.captures[0].2, facts.captures[1].2,
+        "camera consumer disconnected"
+    );
+    let provenance: Vec<scriptbots_bevy::capture::CaptureProvenance> = ["near", "overview"]
+        .into_iter()
+        .map(|name| {
+            serde_json::from_slice(
+                &std::fs::read(dir.path().join(format!("{name}.provenance.json"))).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert!(provenance[0].world_digest.is_some());
+    assert_eq!(provenance[0].world_digest, provenance[1].world_digest);
+    for frame in &provenance {
+        assert_eq!(frame.tick, 0);
+        assert_eq!(frame.seed, manifest.seed);
+        eprintln!(
+            "bookmark evidence: {}",
+            serde_json::to_string(frame).unwrap()
+        );
+    }
+}
 
 fn is_adapter_unavailable(error: &SceneError) -> bool {
     matches!(

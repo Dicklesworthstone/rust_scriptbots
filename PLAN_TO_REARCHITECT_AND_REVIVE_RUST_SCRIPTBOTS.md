@@ -2684,6 +2684,10 @@ idempotent cancel/shutdown landed and were pushed at exact revision
 
 #### 3.9 Bevy terrain, camera, HUD, and capture
 
+**[Currently In Progress — bd-2z0.14.1.20, TurquoiseLake, 2026-09-08]**
+Connect same-tick look-development camera bookmarks and configured exposure to
+the existing GPU capture path. Art review and hardware evidence remain open.
+
 - revisioned terrain;
 - camera/picking;
 - UI actions/receipts;
