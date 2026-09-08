@@ -91,6 +91,13 @@ const ADAPTER_UNAVAILABLE_PROBLEM: &str = "offscreen capture: no GPU adapter ava
 fn same_tick_camera_bookmarks_render_distinct_views_of_identical_science() {
     let _guard = GPU_GUARD.lock().unwrap_or_else(|error| error.into_inner());
     let dir = tempfile::tempdir().expect("capture directory");
+    let retained = std::env::var_os("SCRIPTBOTS_LOOK_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .map(|root| root.join("bookmarks"));
+    if let Some(path) = &retained {
+        std::fs::create_dir(path).expect("fresh retained bookmark directory");
+    }
+    let artifacts = retained.as_deref().unwrap_or(dir.path());
     let mut manifest = tiny_manifest("camera-bookmarks");
     manifest.camera = [450.0, 900.0]
         .into_iter()
@@ -115,7 +122,7 @@ fn same_tick_camera_bookmarks_render_distinct_views_of_identical_science() {
     let mut driver = BevyOffscreenDriver {
         seed_agents: 8,
         viewport: (256, 256),
-        artifacts_dir: Some(dir.path().to_path_buf()),
+        artifacts_dir: Some(artifacts.to_path_buf()),
     };
     let facts = driver.run(&manifest).expect("real GPU bookmark captures");
     assert_eq!(facts.captures.len(), manifest.captures.len());
@@ -127,13 +134,14 @@ fn same_tick_camera_bookmarks_render_distinct_views_of_identical_science() {
         .into_iter()
         .map(|name| {
             serde_json::from_slice(
-                &std::fs::read(dir.path().join(format!("{name}.provenance.json"))).unwrap(),
+                &std::fs::read(artifacts.join(format!("{name}.provenance.json"))).unwrap(),
             )
             .unwrap()
         })
         .collect();
     assert!(provenance[0].world_digest.is_some());
     assert_eq!(provenance[0].world_digest, provenance[1].world_digest);
+    eprintln!("bookmark capture hashes: {:?}", facts.captures);
     for frame in &provenance {
         assert_eq!(frame.tick, 0);
         assert_eq!(frame.seed, manifest.seed);
@@ -142,6 +150,51 @@ fn same_tick_camera_bookmarks_render_distinct_views_of_identical_science() {
             serde_json::to_string(frame).unwrap()
         );
     }
+}
+
+#[test]
+#[serial]
+fn look_development_exposure_changes_pixels_without_changing_science() {
+    let _guard = GPU_GUARD.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("exposure capture directory");
+    let retained = std::env::var_os("SCRIPTBOTS_LOOK_CAPTURE_DIR").map(std::path::PathBuf::from);
+    let root = retained.as_deref().unwrap_or(dir.path());
+    let mut hashes = Vec::new();
+    let mut digests = Vec::new();
+    for (name, exposure) in [("baseline", 0.0), ("proposed", -0.75), ("reset", 0.0)] {
+        let artifacts = root.join(name);
+        std::fs::create_dir(&artifacts).expect("fresh exposure directory");
+        let mut manifest = tiny_manifest(name);
+        manifest.config_overrides = Some(
+            toml::from_str(&format!(
+                "world_width = 600\nworld_height = 600\n[render]\ntonemap_exposure_bias = {exposure:.2}\n"
+            ))
+            .unwrap(),
+        );
+        let mut driver = BevyOffscreenDriver {
+            seed_agents: 8,
+            viewport: (256, 256),
+            artifacts_dir: Some(artifacts.clone()),
+        };
+        let facts = driver.run(&manifest).expect("real GPU exposure capture");
+        let provenance: scriptbots_bevy::capture::CaptureProvenance =
+            serde_json::from_slice(&std::fs::read(artifacts.join("mid.provenance.json")).unwrap())
+                .unwrap();
+        eprintln!(
+            "exposure={exposure} captures={:?} provenance={}",
+            facts.captures,
+            serde_json::to_string(&provenance).unwrap()
+        );
+        assert!(provenance.world_digest.is_some());
+        hashes.push(facts.captures[0].2.clone());
+        digests.push(provenance.world_digest);
+    }
+    assert_ne!(hashes[0], hashes[1], "exposure consumer disconnected");
+    assert_eq!(
+        hashes[0], hashes[2],
+        "exposure leaked into the next session"
+    );
+    assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 fn is_adapter_unavailable(error: &SceneError) -> bool {
