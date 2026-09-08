@@ -839,10 +839,42 @@ pub(crate) struct AgentRegistry {
     records: HashMap<AgentId, AgentRecord>,
 }
 
-#[derive(Resource, Clone, Default)]
+#[derive(Resource, Clone)]
 pub(crate) struct ReflectionProbeAssets {
     diffuse: Handle<Image>,
     specular: Handle<Image>,
+}
+
+impl ReflectionProbeAssets {
+    /// A neutral, fully populated cubemap until authored environment lighting
+    /// is available. Default handles select Bevy's D2 fallback, which cannot
+    /// satisfy the PBR environment-map Cube binding. This is not an HDR sky or
+    /// a prefiltered environment; native and capture use identical pixels.
+    fn fallback(images: &mut Assets<Image>) -> Self {
+        use bevy::render::render_resource::{
+            Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
+        };
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 6,
+            },
+            TextureDimension::D2,
+            &[32, 32, 40, 255],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_view_descriptor = Some(TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::Cube),
+            ..default()
+        });
+        let cube = images.add(image);
+        Self {
+            diffuse: cube.clone(),
+            specular: cube,
+        }
+    }
 }
 
 struct PartRef {
@@ -2552,6 +2584,7 @@ fn assign_presentation_revision(
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     effective: Res<EffectiveRenderSettings>,
 ) {
     let camera_transform = Transform::from_xyz(0.0, 1800.0, 1400.0).looking_at(Vec3::ZERO, Vec3::Y);
@@ -2625,10 +2658,7 @@ fn setup_scene(
     });
     commands.insert_resource(CameraRig::default());
 
-    commands.insert_resource(ReflectionProbeAssets {
-        diffuse: Handle::default(),
-        specular: Handle::default(),
-    });
+    commands.insert_resource(ReflectionProbeAssets::fallback(&mut images));
 
     commands.spawn((
         Camera2d,
@@ -9676,7 +9706,9 @@ mod tests {
         app.insert_resource(AgentMeshes::default());
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
-        app.insert_resource(ReflectionProbeAssets::default());
+        let mut images = Assets::<Image>::default();
+        app.insert_resource(ReflectionProbeAssets::fallback(&mut images));
+        app.insert_resource(images);
         app.insert_resource(AccessibilityState::default());
 
         app.add_systems(Update, sync_world);

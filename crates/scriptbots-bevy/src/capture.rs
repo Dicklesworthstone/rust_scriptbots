@@ -1744,36 +1744,81 @@ fn setup_capture_resources(
         height_scale: crate::TERRAIN_HEIGHT_SCALE,
         ..default()
     });
-    // Valid 1x1 CUBE textures for the reflection probes: the PBR
-    // environment-map bind group expects Cube-dimension views, and the
-    // default (empty) handle resolves to a 2D texture — which panics wgpu
-    // validation the moment a lit 3D scene renders.
-    let mut cube_image = Image::new_fill(
-        Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 6,
-        },
-        TextureDimension::D2,
-        &[32, 32, 40, 255],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    );
-    cube_image.texture_view_descriptor =
-        Some(bevy::render::render_resource::TextureViewDescriptor {
-            dimension: Some(bevy::render::render_resource::TextureViewDimension::Cube),
-            ..Default::default()
-        });
-    let cube = images.add(cube_image);
-    commands.insert_resource(ReflectionProbeAssets {
-        diffuse: cube.clone(),
-        specular: cube,
-    });
+    commands.insert_resource(ReflectionProbeAssets::fallback(&mut images));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_and_capture_setup_populate_reflection_cubemaps() {
+        use bevy::render::render_resource::TextureViewDimension;
+        for native in [true, false] {
+            let mut app = App::new();
+            app.insert_resource(Assets::<Mesh>::default());
+            let mut images = Assets::<Image>::default();
+            // ImagePlugin installs this real D2 sentinel at the default handle.
+            // A handle can therefore resolve successfully and STILL be invalid
+            // for the environment-map Cube binding; exercise that old failure.
+            images.insert(&Handle::default(), Image::default()).unwrap();
+            app.insert_resource(images);
+            if native {
+                app.insert_resource(crate::resolve_effective_render_settings_for_gpu(
+                    &RenderSettings::default(),
+                    None,
+                ));
+                // Run the production setup system, not just the constructor:
+                // leaving native startup on empty handles must fail this test.
+                app.add_systems(Startup, crate::setup_scene);
+            } else {
+                app.add_systems(Startup, setup_capture_resources);
+            }
+            app.update();
+            let mut cameras = app
+                .world_mut()
+                .query_filtered::<Entity, With<crate::PrimaryCamera>>();
+            assert_eq!(
+                cameras.iter(app.world()).next().is_some(),
+                native,
+                "the two cases must execute distinct native/capture setup paths"
+            );
+            let probes = app.world().resource::<ReflectionProbeAssets>();
+            let images = app.world().resource::<Assets<Image>>();
+            for handle in [&probes.diffuse, &probes.specular] {
+                let image = images
+                    .get(handle)
+                    .expect("probe handle must resolve to an image");
+                assert_eq!(image.texture_descriptor.dimension, TextureDimension::D2);
+                assert_eq!(image.texture_descriptor.size.width, 1);
+                assert_eq!(image.texture_descriptor.size.height, 1);
+                assert_eq!(image.texture_descriptor.size.depth_or_array_layers, 6);
+                assert_eq!(
+                    image.texture_descriptor.format,
+                    TextureFormat::Rgba8UnormSrgb
+                );
+                assert_eq!(image.texture_descriptor.mip_level_count, 1);
+                assert!(
+                    image
+                        .texture_descriptor
+                        .usage
+                        .contains(TextureUsages::TEXTURE_BINDING)
+                );
+                assert_eq!(
+                    image.texture_view_descriptor.as_ref().unwrap().dimension,
+                    Some(TextureViewDimension::Cube)
+                );
+                // Preserve the existing capture fallback on all six faces.
+                let expected = [32, 32, 40, 255]
+                    .repeat(image.texture_descriptor.size.depth_or_array_layers as usize);
+                assert_eq!(
+                    image.data.as_deref(),
+                    Some(expected.as_slice()),
+                    "native={native}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn capture_tonemapping_consumes_settings_and_resets_between_sessions() {
