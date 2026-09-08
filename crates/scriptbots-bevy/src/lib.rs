@@ -5464,10 +5464,13 @@ fn handle_selection_input(
     windows: Query<&Window>,
     primary_window: Query<Entity, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<PrimaryCamera>>,
-    state: Res<SnapshotState>,
+    (state, registry, display_poses): (
+        Res<SnapshotState>,
+        Option<Res<AgentRegistry>>,
+        Query<&AgentDisplayPose>,
+    ),
     submitter: Option<Res<CommandSubmitter>>,
     mut rig: ResMut<CameraRig>,
-    (registry, display_poses): (Option<Res<AgentRegistry>>, Query<&AgentDisplayPose>),
 ) {
     let Some(submitter) = submitter else {
         return;
@@ -10145,8 +10148,11 @@ mod tests {
         app.add_plugins(MinimalPlugins);
 
         let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("seed visible agent");
         for _ in 0..42 {
-            let _ = world.step();
+            world.step().expect("simulation step");
         }
         let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
         let snapshot_state = SnapshotState {
@@ -10210,6 +10216,30 @@ mod tests {
         assert_eq!(
             state.last_applied_tick, 42,
             "presentation-only palette changes must not advance science"
+        );
+
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[0].position += Vec2::splat(10.0);
+        }
+        app.update();
+        let snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap();
+        let agent = &snapshot.agents[0];
+        let root = app.world().resource::<AgentRegistry>().records[&agent.id].root;
+        let entity = app.world().entity(root);
+        let expected = agent_translation(snapshot, agent);
+        assert_eq!(entity.get::<Transform>().unwrap().translation, expected);
+        assert_ne!(
+            entity.get::<AgentDisplayPose>().unwrap().translation,
+            expected,
+            "shared sync must publish the exact new pose even without advancing the native display state"
         );
 
         Ok(())
