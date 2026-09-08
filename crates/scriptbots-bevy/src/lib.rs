@@ -7032,7 +7032,7 @@ mod terrain_tests {
             let expected_triangles = (bounds.size.x * bounds.size.y * 2) as usize;
             assert!(expected_triangles > 0);
             assert_eq!(indices.len(), expected_triangles * 3);
-            for triangle in indices.chunks_exact(3) {
+            for triangle in indices.as_chunks::<3>().0 {
                 let [a, b, c] = [triangle[0], triangle[1], triangle[2]]
                     .map(|index| Vec3::from_array(positions[index as usize]));
                 let normal = (b - a).cross(c - a);
