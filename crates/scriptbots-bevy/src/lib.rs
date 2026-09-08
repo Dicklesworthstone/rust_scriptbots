@@ -16,7 +16,7 @@ use bevy::core_pipeline::prepass::{DepthPrepass, NormalPrepass};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
-use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::light::{
     CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap,
     EnvironmentMapLight, LightProbe,
@@ -1342,6 +1342,10 @@ const DIAGNOSTIC_REPORT_INTERVAL: u32 = 300;
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
 const CAMERA_MAX_DISTANCE: f32 = 6000.0;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
+// Interaction tuning, not a platform guarantee: forty trackpad pixels feel like
+// one wheel notch. Normalize before scaling so pixel devices do not jump fivefold.
+const CAMERA_SCROLL_PIXELS_PER_LINE: f64 = 40.0;
+const CAMERA_ZOOM_LOG_STEP: f64 = 0.1;
 const FIT_WORLD_FACTOR: f32 = 0.38;
 const FIT_SELECTION_FACTOR: f32 = 0.55;
 
@@ -6265,10 +6269,26 @@ fn control_camera(
     let shift_held = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let alt_held = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
 
-    for wheel in mouse_wheel.read() {
-        rig.distance *= (1.0 - wheel.y * 0.1).clamp(0.2, 5.0);
-    }
     rig.distance = rig.distance.clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
+    let scroll_lines: f64 = mouse_wheel
+        .read()
+        .filter(|wheel| wheel.y.is_finite())
+        .map(|wheel| match wheel.unit {
+            MouseScrollUnit::Line => f64::from(wheel.y),
+            MouseScrollUnit::Pixel => f64::from(wheel.y) / CAMERA_SCROLL_PIXELS_PER_LINE,
+        })
+        .sum();
+    if scroll_lines != 0.0 {
+        // Away from the distance limits, opposite gestures cancel and event
+        // coalescing does not change zoom. Clamp in log space before exp to keep
+        // extreme finite device deltas from overflowing. Existing easing follows.
+        rig.distance = (f64::from(rig.distance).ln() - scroll_lines * CAMERA_ZOOM_LOG_STEP)
+            .clamp(
+                f64::from(CAMERA_MIN_DISTANCE).ln(),
+                f64::from(CAMERA_MAX_DISTANCE).ln(),
+            )
+            .exp() as f32;
+    }
 
     if keys.just_pressed(KeyCode::KeyF) {
         if ctrl_held {
@@ -6397,7 +6417,7 @@ fn control_camera(
         target_focus.y = target_focus.y.clamp(0.0, world_size.y);
     }
 
-    if rig.recenter_now || rig.focus_smoothed.length_squared() == 0.0 {
+    if rig.recenter_now {
         rig.focus_smoothed = target_focus;
         rig.distance_smoothed = rig.distance;
         rig.recenter_now = false;
@@ -9583,6 +9603,106 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn camera_zoom_after_scroll(
+        events: &[(MouseScrollUnit, f32)],
+        split_frames: bool,
+    ) -> (f32, f32) {
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time);
+        app.insert_resource(CameraRig {
+            recenter_now: false,
+            ..Default::default()
+        });
+        app.insert_resource(SnapshotState::default());
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Messages::<MouseMotion>::default());
+        app.insert_resource(Messages::<MouseWheel>::default());
+        app.add_systems(Update, control_camera);
+        let camera = app
+            .world_mut()
+            .spawn((PrimaryCamera, Transform::default()))
+            .id();
+        for &(unit, y) in events {
+            app.world_mut()
+                .resource_mut::<Messages<MouseWheel>>()
+                .write(MouseWheel {
+                    unit,
+                    x: 0.0,
+                    y,
+                    window: Entity::PLACEHOLDER,
+                });
+            if split_frames {
+                app.update();
+            }
+        }
+        if !split_frames {
+            app.update();
+        }
+        let rig = app.world().resource::<CameraRig>();
+        let transform = app
+            .world()
+            .entity(camera)
+            .get::<Transform>()
+            .expect("camera transform");
+        (rig.distance, transform.translation.length())
+    }
+
+    #[test]
+    fn camera_zoom_normalizes_device_units_and_preserves_easing_at_world_origin() {
+        let line = camera_zoom_after_scroll(&[(MouseScrollUnit::Line, 1.0)], false);
+        let pixel = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 40.0)], false);
+        assert!((line.0 - pixel.0).abs() < 0.001);
+        assert!((line.1 - pixel.1).abs() < 0.001);
+        assert!(line.0 > CAMERA_MIN_DISTANCE && line.0 < 2200.0);
+        assert!(
+            line.1 > line.0 && line.1 < 2200.0,
+            "rendered camera must ease toward the requested distance"
+        );
+        let fine = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 1.0)], false);
+        assert!(fine.0 > line.0 && fine.0 < 2200.0);
+    }
+
+    #[test]
+    fn camera_zoom_is_reversible_and_independent_of_event_segmentation_inside_limits() {
+        for split_frames in [false, true] {
+            let roundtrip = camera_zoom_after_scroll(
+                &[(MouseScrollUnit::Line, 1.0), (MouseScrollUnit::Line, -1.0)],
+                split_frames,
+            );
+            assert!((roundtrip.0 - 2200.0).abs() < 0.001);
+            let split =
+                camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 10.0); 4], split_frames);
+            let whole = camera_zoom_after_scroll(&[(MouseScrollUnit::Pixel, 40.0)], false);
+            assert!((split.0 - whole.0).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn camera_zoom_bounds_extreme_input_and_ignores_nonfinite_events() {
+        for (y, expected) in [
+            (f32::MAX, CAMERA_MIN_DISTANCE),
+            (-f32::MAX, CAMERA_MAX_DISTANCE),
+        ] {
+            let result = camera_zoom_after_scroll(&[(MouseScrollUnit::Line, y)], false);
+            assert!((result.0 - expected).abs() < 0.001);
+            assert!(result.1.is_finite());
+        }
+        let ignored = camera_zoom_after_scroll(
+            &[
+                (MouseScrollUnit::Line, f32::NAN),
+                (MouseScrollUnit::Pixel, f32::INFINITY),
+                (MouseScrollUnit::Line, f32::NEG_INFINITY),
+                (MouseScrollUnit::Pixel, 0.0),
+            ],
+            false,
+        );
+        assert!((ignored.0 - 2200.0).abs() < 0.001);
+        assert!(ignored.1.is_finite());
     }
 
     #[test]
