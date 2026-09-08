@@ -197,6 +197,115 @@ fn look_development_exposure_changes_pixels_without_changing_science() {
     assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
+#[test]
+#[serial]
+fn follow_camera_matches_explicit_view_without_changing_science() {
+    let _guard = GPU_GUARD.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().expect("follow capture directory");
+    let retained = std::env::var_os("SCRIPTBOTS_LOOK_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .map(|root| root.join("follow"));
+    if let Some(path) = &retained {
+        std::fs::create_dir(path).expect("fresh retained follow directory");
+    }
+    let artifacts = retained.as_deref().unwrap_or(dir.path());
+    let mut manifest = tiny_manifest("off-center-follow");
+    manifest.config_overrides =
+        Some(toml::from_str("world_width = 900\nworld_height = 600\n").unwrap());
+    let mut world = scriptbots_core::WorldState::new(manifest.compose_config().unwrap()).unwrap();
+    let first = world
+        .try_spawn_agent(scriptbots_core::AgentData::default())
+        .unwrap();
+    let uid = world.agent_uid(first).unwrap().get();
+    // The scene lattice starts at science (60, 60). In a 900 x 600 world,
+    // its ground projection is (-390, 0, 240). Aim at it from above/south;
+    // the mirrored negative instead looks toward Z=-240.
+    let explicit = CameraKey {
+        tick: 0,
+        pos: [-390.0, 500.0, 740.0],
+        yaw: std::f32::consts::PI,
+        pitch: -std::f32::consts::FRAC_PI_4,
+        fov: 55.0,
+        follow_uid: None,
+    };
+    let mut follow = explicit.clone();
+    follow.follow_uid = Some(uid);
+    // A disconnected follow consumer must not pass by using the same ray.
+    follow.yaw = 0.0;
+    follow.pitch = 0.0;
+    let mut mirrored = explicit.clone();
+    mirrored.yaw = std::f32::consts::PI;
+    mirrored.pitch = (-500.0_f32).atan2(980.0);
+    manifest.camera = vec![follow, explicit, mirrored];
+    manifest.captures = ["follow", "explicit", "mirrored"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| CapturePoint {
+            tick: 0,
+            name: name.to_string(),
+            camera_key: Some(index),
+        })
+        .collect();
+    let mut driver = BevyOffscreenDriver {
+        seed_agents: 8,
+        viewport: (256, 256),
+        artifacts_dir: Some(artifacts.to_path_buf()),
+    };
+    let facts = driver.run(&manifest).expect("real follow capture");
+    assert_eq!(facts.captures.len(), manifest.captures.len());
+    let mut pixels = Vec::new();
+    let mut digests = Vec::new();
+    for capture in &manifest.captures {
+        let (width, height, rgba) = scriptbots_bevy::capture::decode_png(
+            &std::fs::read(artifacts.join(format!("{}.png", capture.name))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((width, height), driver.viewport);
+        assert!(!rgba8_is_visually_blank(&rgba));
+        pixels.push(rgba);
+        let provenance: scriptbots_bevy::capture::CaptureProvenance = serde_json::from_slice(
+            &std::fs::read(artifacts.join(format!("{}.provenance.json", capture.name))).unwrap(),
+        )
+        .unwrap();
+        assert!(provenance.world_digest.is_some());
+        eprintln!(
+            "follow-view={} provenance={}",
+            capture.name,
+            serde_json::to_string(&provenance).unwrap()
+        );
+        digests.push(provenance.world_digest);
+    }
+    assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
+    let correct = compare_frames(
+        &pixels[0],
+        &pixels[1],
+        driver.viewport.0,
+        driver.viewport.1,
+        &CompareThresholds::default(),
+    )
+    .unwrap();
+    let incorrect = compare_frames(
+        &pixels[0],
+        &pixels[2],
+        driver.viewport.0,
+        driver.viewport.1,
+        &CompareThresholds::default(),
+    )
+    .unwrap();
+    eprintln!(
+        "follow hashes={:?} explicit={correct:?} mirrored={incorrect:?}",
+        facts.captures
+    );
+    assert!(
+        correct.pass,
+        "follow must frame the actual agent ground position"
+    );
+    assert!(
+        !incorrect.pass,
+        "mirrored coordinates must fail image comparison"
+    );
+}
+
 fn is_adapter_unavailable(error: &SceneError) -> bool {
     matches!(
         error.problems.as_slice(),

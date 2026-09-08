@@ -744,7 +744,7 @@ fn camera_pose_at(
         let look_at = [
             x - config.world_width as f32 * 0.5,
             0.0,
-            y - config.world_height as f32 * 0.5,
+            config.world_height as f32 * 0.5 - y,
         ];
         return (key.pos, look_at, key.fov);
     }
@@ -1264,6 +1264,67 @@ mod tests {
     #[test]
     fn valid_manifest_passes_validation() {
         base_manifest().validate().expect("base manifest is valid");
+    }
+
+    #[cfg(feature = "bevy_render")]
+    #[test]
+    fn camera_follow_targets_both_sides_of_a_nonsquare_world() {
+        let config = ScriptBotsConfig {
+            world_width: 900,
+            world_height: 600,
+            rng_seed: Some(42),
+            ..Default::default()
+        };
+        let mut world = WorldState::new(config).unwrap();
+        let mut manifest = base_manifest();
+        for (y, expected_z) in [(60.0, 240.0), (540.0, -240.0)] {
+            let mut agent = AgentData::default();
+            agent.position.x = 120.0;
+            agent.position.y = y;
+            let id = world.try_spawn_agent(agent).unwrap();
+            let uid = world.agent_uid(id).unwrap().get();
+            let key = CameraKey {
+                tick: 0,
+                pos: [20.0, 500.0, 400.0],
+                yaw: 0.0,
+                pitch: -0.5,
+                fov: 60.0,
+                follow_uid: Some(uid),
+            };
+            manifest.camera = vec![key.clone()];
+            let (position, target, fov) = camera_pose_at(&manifest, 0, &world, Some(0));
+            assert_eq!(position, key.pos);
+            assert_eq!(fov, key.fov);
+            assert_eq!(target, [-330.0, 0.0, expected_z]);
+            assert_ne!(target[2], -expected_z, "mirrored follow target");
+        }
+    }
+
+    #[cfg(feature = "bevy_render")]
+    #[test]
+    fn missing_follow_target_uses_the_keyframe_direction() {
+        let world = WorldState::new(ScriptBotsConfig::default()).unwrap();
+        let mut manifest = base_manifest();
+        manifest.camera.push(CameraKey {
+            tick: 0,
+            pos: [20.0, 500.0, 400.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            fov: 60.0,
+            follow_uid: Some(u64::MAX),
+        });
+        let followed = camera_pose_at(&manifest, 0, &world, None);
+        assert_eq!(
+            followed,
+            ([20.0, 500.0, 400.0], [20.0, 500.0, 1400.0], 60.0)
+        );
+        manifest.camera[0].follow_uid = None;
+        assert_eq!(followed, camera_pose_at(&manifest, 0, &world, None));
+        manifest.camera.clear();
+        assert_eq!(
+            camera_pose_at(&manifest, 0, &world, None),
+            ([0.0, 1800.0, 1400.0], [0.0, 0.0, 0.0], 55.0)
+        );
     }
 
     #[test]
