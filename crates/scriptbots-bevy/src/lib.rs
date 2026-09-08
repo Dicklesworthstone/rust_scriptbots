@@ -705,7 +705,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         Update,
         (
             poll_snapshots,
-            sync_world,
+            (sync_world, smooth_agent_poses).chain(),
             handle_playback_shortcuts,
             handle_playback_buttons,
             handle_tonemap_mode_buttons,
@@ -904,6 +904,59 @@ struct AgentRecord {
     sound_inner: PartRef,
     sound_outer: PartRef,
     eyes: Vec<EyePart>,
+}
+
+#[derive(Component, Clone, Copy)]
+struct AgentPoseTarget {
+    translation: Vec3,
+    rotation: Quat,
+    tick: u64,
+}
+
+#[derive(Component)]
+struct AgentDisplayPose {
+    translation: Vec3,
+    rotation: Quat,
+    previous_target: AgentPoseTarget,
+}
+
+// Approximately 95% convergence in 100 ms, independent of render frame rate.
+const AGENT_POSE_RESPONSE: f32 = 30.0;
+
+fn smooth_agent_poses(
+    time: Res<Time>,
+    state: Res<SnapshotState>,
+    mut agents: Query<(&AgentPoseTarget, &mut AgentDisplayPose, &mut Transform)>,
+) {
+    let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
+    for (target, mut display, mut transform) in &mut agents {
+        let delta = target.translation - display.previous_target.translation;
+        let wrapped = (state.world_size.x > 0.0 && delta.x.abs() > state.world_size.x * 0.5)
+            || (state.world_size.y > 0.0 && delta.z.abs() > state.world_size.y * 0.5);
+        if target.tick < display.previous_target.tick || wrapped {
+            display.translation = target.translation;
+            display.rotation = target.rotation;
+        } else {
+            display.translation = display.translation.lerp(target.translation, blend);
+            display.rotation = display.rotation.slerp(target.rotation, blend);
+        }
+        display.previous_target = *target;
+        transform.translation = display.translation;
+        transform.rotation = display.rotation;
+    }
+}
+
+fn displayed_agent_position(
+    authoritative: Vec2,
+    display: Option<&AgentDisplayPose>,
+    world_size: Vec2,
+) -> Vec2 {
+    display.map_or(authoritative, |pose| {
+        Vec2::new(
+            pose.translation.x + world_size.x * 0.5,
+            world_size.y * 0.5 - pose.translation.z,
+        )
+    })
 }
 
 #[derive(Resource, Default)]
@@ -5402,6 +5455,7 @@ fn handle_selection_input(
     state: Res<SnapshotState>,
     submitter: Option<Res<CommandSubmitter>>,
     mut rig: ResMut<CameraRig>,
+    (registry, display_poses): (Option<Res<AgentRegistry>>, Query<&AgentDisplayPose>),
 ) {
     let Some(submitter) = submitter else {
         return;
@@ -5478,12 +5532,17 @@ fn handle_selection_input(
     let mut best_dist = f32::MAX;
 
     for agent in &snapshot.agents {
+        let display = registry
+            .as_ref()
+            .and_then(|registry| registry.records.get(&agent.id))
+            .and_then(|record| display_poses.get(record.root).ok());
+        let position = displayed_agent_position(agent.position, display, world_size);
         // Argument order swapped versus the removed private copy: that computed
         // target - origin, core computes a - b. Both feed dist_sq below, so the
         // sign is unused, but the swap keeps the value identical rather than
         // relying on that (bd-ikts.4).
-        let dx = toroidal_delta(agent.position.x, world_point.x, world_size.x);
-        let dy = toroidal_delta(agent.position.y, world_point.y, world_size.y);
+        let dx = toroidal_delta(position.x, world_point.x, world_size.x);
+        let dy = toroidal_delta(position.y, world_point.y, world_size.y);
         let dist_sq = dx.mul_add(dx, dy * dy);
         if dist_sq <= radius_sq && dist_sq < best_dist {
             best_dist = dist_sq;
@@ -7561,9 +7620,20 @@ fn spawn_agent_entity(
 ) -> AgentRecord {
     let root_transform = Transform::from_translation(agent_translation(snapshot, agent))
         .with_rotation(Quat::from_rotation_y(agent.heading));
+    let target = AgentPoseTarget {
+        translation: root_transform.translation,
+        rotation: root_transform.rotation,
+        tick: snapshot.tick,
+    };
     let root = commands
         .spawn((
             root_transform,
+            target,
+            AgentDisplayPose {
+                translation: target.translation,
+                rotation: target.rotation,
+                previous_target: target,
+            },
             GlobalTransform::default(),
             Visibility::default(),
             InheritedVisibility::default(),
@@ -7835,9 +7905,14 @@ fn apply_agent_visuals(
     let visuals = canonical_agent_visual_params(agent);
     let translation = agent_translation(snapshot, agent);
     let rotation = Quat::from_rotation_y(agent.heading);
-    commands
-        .entity(record.root)
-        .insert(Transform::from_translation(translation).with_rotation(rotation));
+    commands.entity(record.root).insert((
+        Transform::from_translation(translation).with_rotation(rotation),
+        AgentPoseTarget {
+            translation,
+            rotation,
+            tick: snapshot.tick,
+        },
+    ));
 
     let scale_factor = (snapshot.agent_radius / meshes.base_radius).clamp(0.2, 1024.0);
     let body_length = scale_factor * 2.35;
@@ -9626,6 +9701,126 @@ mod tests {
     }
 
     #[test]
+    fn agent_pose_easing_uses_render_time_and_shortest_heading_arc() {
+        fn run(dt: f32, frames: usize) -> (Vec3, Quat) {
+            let mut app = App::new();
+            let mut time = Time::<()>::default();
+            time.advance_by(Duration::from_secs_f32(dt));
+            app.insert_resource(time);
+            app.insert_resource(SnapshotState {
+                world_size: Vec2::splat(1000.0),
+                ..Default::default()
+            });
+            app.add_systems(Update, smooth_agent_poses);
+            let start = AgentPoseTarget {
+                translation: Vec3::ZERO,
+                rotation: Quat::from_rotation_y(350.0_f32.to_radians()),
+                tick: 1,
+            };
+            let target = AgentPoseTarget {
+                translation: Vec3::X * 100.0,
+                rotation: Quat::from_rotation_y(10.0_f32.to_radians()),
+                tick: 2,
+            };
+            let entity = app
+                .world_mut()
+                .spawn((
+                    target,
+                    AgentDisplayPose {
+                        translation: start.translation,
+                        rotation: start.rotation,
+                        previous_target: start,
+                    },
+                    Transform::from_translation(target.translation).with_rotation(target.rotation),
+                ))
+                .id();
+            for _ in 0..frames {
+                app.update();
+            }
+            assert_eq!(
+                app.world()
+                    .entity(entity)
+                    .get::<AgentPoseTarget>()
+                    .unwrap()
+                    .translation,
+                target.translation
+            );
+            let transform = app.world().entity(entity).get::<Transform>().unwrap();
+            (transform.translation, transform.rotation)
+        }
+        let (position, rotation) = run(1.0 / 60.0, 1);
+        assert!(position.x > 0.0 && position.x < 100.0);
+        assert!(rotation.angle_between(Quat::IDENTITY) < 10.0_f32.to_radians());
+        let whole = run(1.0 / 30.0, 1);
+        let split = run(1.0 / 60.0, 2);
+        assert!(whole.0.distance(split.0) < 0.001);
+        assert!(whole.1.angle_between(split.1) < 0.001);
+    }
+
+    #[test]
+    fn agent_pose_discontinuities_snap_and_picking_uses_displayed_pose() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default());
+        app.insert_resource(SnapshotState {
+            world_size: Vec2::splat(1000.0),
+            ..Default::default()
+        });
+        app.add_systems(Update, smooth_agent_poses);
+        let previous = AgentPoseTarget {
+            translation: Vec3::X * 490.0,
+            rotation: Quat::IDENTITY,
+            tick: 10,
+        };
+        let target = AgentPoseTarget {
+            translation: Vec3::X * -490.0,
+            tick: 11,
+            ..previous
+        };
+        let entity = app
+            .world_mut()
+            .spawn((
+                target,
+                AgentDisplayPose {
+                    translation: previous.translation,
+                    rotation: previous.rotation,
+                    previous_target: previous,
+                },
+                Transform::default(),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            target.translation
+        );
+        let rewind = AgentPoseTarget {
+            translation: Vec3::ZERO,
+            tick: 2,
+            ..target
+        };
+        app.world_mut().entity_mut(entity).insert(rewind);
+        app.update();
+        let display = app
+            .world()
+            .entity(entity)
+            .get::<AgentDisplayPose>()
+            .unwrap();
+        assert_eq!(display.translation, Vec3::ZERO);
+        assert_eq!(
+            displayed_agent_position(Vec2::ZERO, Some(display), Vec2::splat(1000.0)),
+            Vec2::splat(500.0)
+        );
+        assert_eq!(
+            displayed_agent_position(Vec2::ONE, None, Vec2::splat(1000.0)),
+            Vec2::ONE
+        );
+    }
+
+    #[test]
     fn free_camera_holds_position_across_snapshot_motion_and_follow_transitions() {
         let mut app = App::new();
         let mut time = Time::<()>::default();
@@ -9948,6 +10143,22 @@ mod tests {
         let state = app.world().resource::<SnapshotState>();
         assert_eq!(state.last_applied_revision, 1);
         assert_eq!(state.last_applied_tick, 42);
+
+        // The shared sync path must still place capture entities exactly on
+        // snapshot poses when the native smoothing system is not installed.
+        let snapshot = state.latest.as_ref().unwrap();
+        assert!(!snapshot.agents.is_empty());
+        for agent in &snapshot.agents {
+            let root = app.world().resource::<AgentRegistry>().records[&agent.id].root;
+            let transform = app.world().entity(root).get::<Transform>().unwrap();
+            assert_eq!(transform.translation, agent_translation(snapshot, agent));
+            assert!(
+                transform
+                    .rotation
+                    .angle_between(Quat::from_rotation_y(agent.heading))
+                    < 0.001
+            );
+        }
 
         // Multiple presentation repaints on unchanged snapshot tick do not advance tick
         app.update();
