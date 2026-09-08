@@ -1460,6 +1460,8 @@ struct CameraRig {
     distance: f32,
     distance_smoothed: f32,
     pan: Vec2,
+    // World-space anchor for manual panning; never refreshed by agent motion.
+    free_focus: Option<Vec2>,
     focus_smoothed: Vec2,
     follow_mode: FollowMode,
     pending_fit: Option<FitCommand>,
@@ -1474,6 +1476,7 @@ impl Default for CameraRig {
             distance: 2200.0,
             distance_smoothed: 2200.0,
             pan: Vec2::ZERO,
+            free_focus: None,
             focus_smoothed: Vec2::ZERO,
             follow_mode: FollowMode::Selected,
             pending_fit: None,
@@ -6404,17 +6407,34 @@ fn control_camera(
             .or(state.first_agent_position),
     };
 
-    let mut target_focus = focus_override
-        .or(follow_target)
-        .unwrap_or(state.focus_point);
-    if rig.follow_mode == FollowMode::Off && focus_override.is_none() {
-        target_focus += rig.pan;
-    }
+    let mut target_focus = if rig.follow_mode == FollowMode::Off {
+        if let Some(focus) = focus_override {
+            rig.free_focus = Some(focus);
+            rig.pan = Vec2::ZERO;
+        } else if rig.recenter_now {
+            rig.free_focus = Some(state.focus_point);
+        }
+        let current_focus = rig.focus_smoothed;
+        let anchor = *rig.free_focus.get_or_insert(current_focus);
+        anchor + rig.pan
+    } else {
+        rig.free_focus = None;
+        focus_override
+            .or(follow_target)
+            .unwrap_or(state.focus_point)
+    };
 
     let world_size = state.world_size;
     if world_size.x > 0.0 && world_size.y > 0.0 {
         target_focus.x = target_focus.x.clamp(0.0, world_size.x);
         target_focus.y = target_focus.y.clamp(0.0, world_size.y);
+    }
+    if rig.follow_mode == FollowMode::Off
+        && let Some(anchor) = rig.free_focus
+    {
+        // Do not bank invisible movement beyond the edge: the first reverse
+        // input must move back into the world rather than repay an overshoot.
+        rig.pan = target_focus - anchor;
     }
 
     if rig.recenter_now {
@@ -9603,6 +9623,96 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn free_camera_holds_position_across_snapshot_motion_and_follow_transitions() {
+        let mut app = App::new();
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time);
+        app.insert_resource(CameraRig {
+            follow_mode: FollowMode::Off,
+            focus_smoothed: Vec2::splat(400.0),
+            recenter_now: false,
+            ..Default::default()
+        });
+        app.insert_resource(SnapshotState {
+            world_size: Vec2::splat(1000.0),
+            focus_point: Vec2::splat(600.0),
+            selection_center: Some(Vec2::splat(600.0)),
+            ..Default::default()
+        });
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Messages::<MouseMotion>::default());
+        app.insert_resource(Messages::<MouseWheel>::default());
+        app.add_systems(Update, control_camera);
+        app.world_mut().spawn((PrimaryCamera, Transform::default()));
+
+        for focus in [600.0, 800.0, 200.0] {
+            app.world_mut().resource_mut::<SnapshotState>().focus_point = Vec2::splat(focus);
+            app.update();
+            let rig = app.world().resource::<CameraRig>();
+            assert_eq!(rig.free_focus, Some(Vec2::splat(400.0)));
+            assert_eq!(rig.focus_smoothed, Vec2::splat(400.0));
+        }
+
+        app.world_mut()
+            .resource_mut::<CameraRig>()
+            .toggle_follow_mode(FollowMode::Selected);
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().focus_smoothed,
+            Vec2::splat(600.0)
+        );
+        assert!(app.world().resource::<CameraRig>().free_focus.is_none());
+        app.world_mut()
+            .resource_mut::<CameraRig>()
+            .toggle_follow_mode(FollowMode::Selected);
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().free_focus,
+            Some(Vec2::splat(600.0))
+        );
+
+        // Explicit recenter remains distinct from ordinary snapshot updates.
+        app.world_mut().resource_mut::<CameraRig>().recenter_now = true;
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().focus_smoothed,
+            Vec2::splat(200.0)
+        );
+
+        // Saturated manual pan must not accumulate invisible overshoot.
+        app.world_mut().resource_mut::<CameraRig>().pan = Vec2::splat(5000.0);
+        app.update();
+        assert_eq!(app.world().resource::<CameraRig>().pan, Vec2::splat(800.0));
+        app.world_mut().resource_mut::<CameraRig>().pan -= Vec2::splat(10.0);
+        app.update();
+        let rig = app.world().resource::<CameraRig>();
+        assert_eq!(rig.free_focus.unwrap() + rig.pan, Vec2::splat(990.0));
+
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            state.latest = Some(WorldSnapshot::from_world(&world).expect("snapshot"));
+            state.world_center = Vec2::splat(500.0);
+        }
+        app.world_mut()
+            .resource_mut::<CameraRig>()
+            .queue_fit(FitCommand::World);
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().focus_smoothed,
+            Vec2::splat(500.0)
+        );
+        app.world_mut().resource_mut::<SnapshotState>().focus_point = Vec2::splat(900.0);
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().focus_smoothed,
+            Vec2::splat(500.0)
+        );
     }
 
     fn camera_zoom_after_scroll(
