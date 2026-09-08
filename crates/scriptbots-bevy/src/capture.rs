@@ -11,8 +11,8 @@
 //! DSR-blessed goldens for real GPUs).
 //!
 //! Determinism contract: fixed exposure (no AutoExposure), fixed camera
-//! poses, fixed viewport, one warmup frame so pipeline compilation never
-//! leaks into captures. Two captures of the same world state on the same
+//! poses, fixed viewport, synchronous pipeline compilation and attachment
+//! warmup frames. Two captures of the same world state on the same
 //! adapter are byte-identical (asserted in tests). Cross-adapter byte
 //! identity is NOT claimed — that is what the provenance labels are for.
 //!
@@ -1024,8 +1024,9 @@ impl<'a> OffscreenCapture<'a> {
         self.set_camera_active(true);
         // Frame 1: sync_world applies the snapshot; pipelines compile.
         self.app.update();
-        // Frame 2: full draw of the settled scene (async pipeline
-        // compilation can never leak a half-drawn frame into evidence).
+        // Frame 2: draw after scene synchronization. Pipeline compilation is
+        // synchronous in this offscreen app; a fixed frame count alone cannot
+        // establish that asynchronous compiler tasks finished.
         self.app.update();
         // Frames 3-4: attachment/ViewTarget preparation has frame latency
         // (prepare_assets runs after ManageViews on the first frame).
@@ -1290,6 +1291,10 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
             .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
             .set(RenderPlugin {
                 render_creation,
+                // Captures need completed pipelines, not interactive startup
+                // responsiveness. Async compilation can outlive all warmup
+                // updates and leave the first readback blank on a cold run.
+                synchronous_pipeline_compilation: true,
                 ..default()
             })
             .set(WindowPlugin {
