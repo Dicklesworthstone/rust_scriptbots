@@ -1563,6 +1563,11 @@ fn configure_session<'a>(
         &config.render_settings,
         effective.features.bloom,
     );
+    configure_capture_fog(
+        app.world_mut(),
+        effective.features.fog,
+        effective.fog_settings.as_ref(),
+    );
 
     // Fresh render target; repoint the app-lifetime capture camera and
     // retune the sun for tier/corrupt without respawning either.
@@ -1620,8 +1625,24 @@ fn configure_session<'a>(
     })
 }
 
-/// Use the native renderer's settings conversion, resetting the persistent
-/// camera for every session so a previous look cannot leak into the next one.
+/// Reset the persistent capture camera's tier fog between sessions.
+fn configure_capture_fog(
+    world: &mut World,
+    enabled: bool,
+    settings: Option<&scriptbots_core::RenderFogSettings>,
+) {
+    let mut cameras = world.query_filtered::<Entity, With<CaptureCamera>>();
+    let entities: Vec<Entity> = cameras.iter(world).collect();
+    for entity in entities {
+        if let Some(fog) = crate::tier_distance_fog(enabled, settings) {
+            world.entity_mut(entity).insert(fog);
+        } else {
+            world.entity_mut(entity).remove::<crate::DistanceFog>();
+        }
+    }
+}
+
+/// Reset native tonemapping, exposure and bloom on the persistent session camera.
 fn configure_capture_camera_effects(world: &mut World, settings: &RenderSettings, bloom: bool) {
     let state = crate::TonemappingState::from_render_settings(settings);
     let mut cameras = world
@@ -1781,6 +1802,48 @@ mod tests {
                 .global
                 .exposure,
             0.0
+        );
+    }
+
+    #[test]
+    fn capture_fog_tracks_resolved_tiers_across_sessions() {
+        let mut world = World::new();
+        let camera = world.spawn(CaptureCamera).id();
+        let unrelated = world.spawn(crate::DistanceFog::default()).id();
+        for tier in [
+            RenderQuality::Medium,
+            RenderQuality::Potato,
+            RenderQuality::Ultra,
+            RenderQuality::Low,
+        ] {
+            let enabled = scriptbots_core::tier_features(tier).fog;
+            configure_capture_fog(&mut world, enabled, None);
+            let actual = world.get::<crate::DistanceFog>(camera);
+            assert_eq!(actual.is_some(), enabled);
+            if let Some(actual) = actual {
+                let native = crate::tier_distance_fog(enabled, None).unwrap();
+                assert_eq!(actual.color, native.color);
+                assert!(
+                    matches!(actual.falloff, crate::FogFalloff::Exponential { density } if density > 0.0)
+                );
+            }
+            assert!(world.get::<crate::DistanceFog>(unrelated).is_some());
+        }
+        let override_settings = scriptbots_core::RenderFogSettings {
+            mode: Some(scriptbots_core::RenderFogMode::High),
+            color: Some([0.2, 0.4, 0.6]),
+        };
+        configure_capture_fog(&mut world, true, Some(&override_settings));
+        let fog = world.get::<crate::DistanceFog>(camera).unwrap();
+        assert_eq!(fog.color, Color::linear_rgb(0.2, 0.4, 0.6));
+        assert!(
+            matches!(fog.falloff, crate::FogFalloff::Exponential { density } if density == 0.0006)
+        );
+        configure_capture_fog(&mut world, true, None);
+        let fog = world.get::<crate::DistanceFog>(camera).unwrap();
+        assert_ne!(fog.color, Color::linear_rgb(0.2, 0.4, 0.6));
+        assert!(
+            matches!(fog.falloff, crate::FogFalloff::Exponential { density } if density == 0.00015)
         );
     }
 

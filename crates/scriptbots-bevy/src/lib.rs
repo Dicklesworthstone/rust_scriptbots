@@ -268,6 +268,8 @@ pub struct EffectiveRenderSettings {
     pub tier: RenderQuality,
     /// Canonical per-tier feature matrix row.
     pub features: TierFeatures,
+    /// Launch fog overrides, retained when the governor changes tiers.
+    pub fog_settings: Option<scriptbots_core::RenderFogSettings>,
     /// Adapter probe (None when probing found no adapter).
     pub gpu: Option<GpuInfo>,
     /// The tier the operator actually asked for, retained after Auto-resolution.
@@ -424,6 +426,7 @@ pub(crate) fn resolve_effective_render_settings_for_gpu(
     EffectiveRenderSettings {
         tier,
         features,
+        fog_settings: settings.post.as_ref().and_then(|post| post.fog.clone()),
         gpu,
         requested,
     }
@@ -716,6 +719,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 drive_adaptive_quality,
                 apply_tier_to_sun_light,
                 apply_tier_to_bloom,
+                apply_tier_to_fog,
             )
                 .chain(),
             handle_auto_exposure_toggle,
@@ -2571,6 +2575,9 @@ fn setup_scene(
     if effective.features.bloom {
         commands.entity(camera).insert(Bloom::NATURAL);
     }
+    if let Some(fog) = tier_distance_fog(effective.features.fog, effective.fog_settings.as_ref()) {
+        commands.entity(camera).insert(fog);
+    }
 
     let light_transform =
         Transform::from_xyz(-1200.0, 1800.0, 900.0).looking_at(Vec3::ZERO, Vec3::Y);
@@ -3852,6 +3859,7 @@ mod adaptive_governor_tests {
         EffectiveRenderSettings {
             tier,
             features: tier_features(tier),
+            fog_settings: None,
             gpu: None,
             requested: RenderQuality::Auto,
         }
@@ -3942,6 +3950,7 @@ mod adaptive_governor_tests {
         let pinned = EffectiveRenderSettings {
             tier: RenderQuality::High,
             features: tier_features(RenderQuality::High),
+            fog_settings: None,
             gpu: None,
             requested: RenderQuality::High,
         };
@@ -4309,6 +4318,7 @@ mod quality_tier_consumer_tests {
         let effective = EffectiveRenderSettings {
             tier: RenderQuality::Ultra,
             features: tier_features(RenderQuality::Ultra),
+            fog_settings: None,
             gpu: None,
             requested: RenderQuality::Ultra,
         };
@@ -4595,6 +4605,118 @@ mod quality_tier_consumer_tests {
             "shadow resolution must vary across tiers, or a live consumer still \
              renders Potato and Ultra identically"
         );
+    }
+
+    #[test]
+    fn fog_tier_transitions_update_only_scene_cameras_without_churn() {
+        let mut app = App::new();
+        app.add_systems(Update, apply_tier_to_fog);
+        let camera = app.world_mut().spawn(PrimaryCamera).id();
+        let unrelated = app.world_mut().spawn(DistanceFog::default()).id();
+        for (tier, enabled) in [
+            (RenderQuality::Potato, false),
+            (RenderQuality::Low, false),
+            (RenderQuality::Medium, true),
+            (RenderQuality::Ultra, true),
+            (RenderQuality::Potato, false),
+            (RenderQuality::High, true),
+        ] {
+            app.insert_resource(resolve_effective_render_settings_for_gpu(
+                &RenderSettings {
+                    quality: Some(tier),
+                    ..default()
+                },
+                Some(gpu_info("fog-test", GpuClass::Discrete)),
+            ));
+            app.update();
+            assert_eq!(app.world().get::<DistanceFog>(camera).is_some(), enabled);
+            assert!(app.world().get::<DistanceFog>(unrelated).is_some());
+            if enabled {
+                let fog = app.world().get::<DistanceFog>(camera).unwrap();
+                let [r, g, b] = visual::visual_style().atmosphere.fog_srgb;
+                assert_eq!(fog.color, Color::srgb(r, g, b));
+                assert!(
+                    matches!(fog.falloff, FogFalloff::Exponential { density } if density > 0.0)
+                );
+                let before = app
+                    .world()
+                    .entity(camera)
+                    .get_ref::<DistanceFog>()
+                    .unwrap()
+                    .last_changed();
+                app.update();
+                let after = app
+                    .world()
+                    .entity(camera)
+                    .get_ref::<DistanceFog>()
+                    .unwrap()
+                    .last_changed();
+                assert_eq!(
+                    before, after,
+                    "unchanged fog must not dirty the render world"
+                );
+            }
+        }
+        let reopened = app.world_mut().spawn(PrimaryCamera).id();
+        app.update();
+        assert!(app.world().get::<DistanceFog>(reopened).is_some());
+    }
+
+    #[test]
+    fn fog_overrides_reach_the_camera_and_preserve_the_software_tier_clamp() {
+        use scriptbots_core::{RenderFogMode, RenderFogSettings};
+        let mut app = App::new();
+        app.add_systems(Update, apply_tier_to_fog);
+        let camera = app.world_mut().spawn(PrimaryCamera).id();
+        for (mode, expected_density) in [
+            (RenderFogMode::Low, Some(0.00015)),
+            (RenderFogMode::High, Some(0.0006)),
+            (RenderFogMode::Medium, Some(0.0003)),
+            (RenderFogMode::Off, None),
+        ] {
+            let effective = resolve_effective_render_settings_for_gpu(
+                &RenderSettings {
+                    quality: Some(RenderQuality::High),
+                    post: Some(scriptbots_core::RenderPostSettings {
+                        fog: Some(RenderFogSettings {
+                            mode: Some(mode),
+                            color: Some([0.2, 0.4, 0.6]),
+                        }),
+                        ..default()
+                    }),
+                    ..default()
+                },
+                Some(gpu_info("fog-test", GpuClass::Discrete)),
+            );
+            app.insert_resource(effective);
+            app.update();
+            let fog = app.world().get::<DistanceFog>(camera);
+            assert_eq!(fog.is_some(), expected_density.is_some());
+            if let Some(fog) = fog {
+                assert_eq!(fog.color, Color::linear_rgb(0.2, 0.4, 0.6));
+                assert!(
+                    matches!(fog.falloff, FogFalloff::Exponential { density } if Some(density) == expected_density)
+                );
+            }
+        }
+        let software = resolve_effective_render_settings_for_gpu(
+            &RenderSettings {
+                quality: Some(RenderQuality::Ultra),
+                post: Some(scriptbots_core::RenderPostSettings {
+                    fog: Some(RenderFogSettings {
+                        mode: Some(RenderFogMode::High),
+                        color: None,
+                    }),
+                    ..default()
+                }),
+                ..default()
+            },
+            Some(gpu_info("software-fog-test", GpuClass::Software)),
+        );
+        assert_eq!(software.tier, RenderQuality::Potato);
+        app.insert_resource(software);
+        app.update();
+        assert!(app.world().get::<DistanceFog>(camera).is_none());
     }
 
     /// `features.bloom` must have a real consumer, not just a log line.
@@ -5673,6 +5795,68 @@ fn apply_tier_to_bloom(
             }
             // Already in the requested state; touching it would churn the
             // render world for no reason.
+            _ => {}
+        }
+    }
+}
+
+/// Shared native/capture default for the tier's distance haze. This is classic
+/// PBR distance fog, not volumetric or height fog. Density is in inverse world
+/// units: at 2,000 units the default mixes roughly 26% atmospheric color.
+fn tier_distance_fog(
+    enabled: bool,
+    settings: Option<&scriptbots_core::RenderFogSettings>,
+) -> Option<DistanceFog> {
+    use scriptbots_core::RenderFogMode;
+    if !enabled {
+        return None;
+    }
+    let density = match settings.and_then(|settings| settings.mode) {
+        Some(RenderFogMode::Off) => return None,
+        Some(RenderFogMode::Low) | None => 0.00015,
+        Some(RenderFogMode::Medium) => 0.0003,
+        Some(RenderFogMode::High) => 0.0006,
+    };
+    let color = settings.and_then(|settings| settings.color).map_or_else(
+        || {
+            let [r, g, b] = visual::visual_style().atmosphere.fog_srgb;
+            Color::srgb(r, g, b)
+        },
+        |[r, g, b]| Color::linear_rgb(r, g, b),
+    );
+    Some(DistanceFog {
+        color,
+        falloff: FogFalloff::Exponential { density },
+        ..default()
+    })
+}
+
+fn apply_tier_to_fog(
+    mut commands: Commands,
+    effective: Res<EffectiveRenderSettings>,
+    cameras: Query<(Entity, Option<&DistanceFog>), With<PrimaryCamera>>,
+) {
+    // Also inspect newly added cameras when the tier has not changed. Repeated
+    // frames leave existing components untouched, preserving change detection.
+    let desired = tier_distance_fog(effective.features.fog, effective.fog_settings.as_ref());
+    for (entity, current) in &cameras {
+        match (&desired, current) {
+            (Some(fog), None) => {
+                commands.entity(entity).insert(fog.clone());
+            }
+            (None, Some(_)) => {
+                commands.entity(entity).remove::<DistanceFog>();
+            }
+            (Some(fog), Some(current)) => {
+                let same_density = matches!(
+                    (&fog.falloff, &current.falloff),
+                    (FogFalloff::Exponential { density: desired }, FogFalloff::Exponential { density: actual })
+                        if desired == actual
+                );
+                if fog.color != current.color || !same_density {
+                    commands.entity(entity).insert(fog.clone());
+                }
+            }
             _ => {}
         }
     }
