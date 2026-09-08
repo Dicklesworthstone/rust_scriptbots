@@ -686,6 +686,9 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     })
     .insert_resource(SnapshotState::default())
     .insert_resource(AgentRegistry::default())
+    .insert_resource(AgentMotionSettings {
+        enabled: !initial_render_settings.reduced_motion.unwrap_or(false),
+    })
     .insert_resource(AccessibilityState::new())
     .insert_resource(TonemappingState::from_render_settings(
         &initial_render_settings,
@@ -923,9 +926,15 @@ struct AgentDisplayPose {
 // Approximately 95% convergence in 100 ms, independent of render frame rate.
 const AGENT_POSE_RESPONSE: f32 = 30.0;
 
+#[derive(Resource)]
+struct AgentMotionSettings {
+    enabled: bool,
+}
+
 fn smooth_agent_poses(
     time: Res<Time>,
     state: Res<SnapshotState>,
+    settings: Option<Res<AgentMotionSettings>>,
     mut agents: Query<(&AgentPoseTarget, &mut AgentDisplayPose, &mut Transform)>,
 ) {
     let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
@@ -933,7 +942,10 @@ fn smooth_agent_poses(
         let delta = target.translation - display.previous_target.translation;
         let wrapped = (state.world_size.x > 0.0 && delta.x.abs() > state.world_size.x * 0.5)
             || (state.world_size.y > 0.0 && delta.z.abs() > state.world_size.y * 0.5);
-        if target.tick < display.previous_target.tick || wrapped {
+        if settings.as_ref().is_some_and(|settings| !settings.enabled)
+            || target.tick < display.previous_target.tick
+            || wrapped
+        {
             display.translation = target.translation;
             display.rotation = target.rotation;
         } else {
@@ -9817,6 +9829,22 @@ mod tests {
         assert_eq!(
             displayed_agent_position(Vec2::ONE, None, Vec2::splat(1000.0)),
             Vec2::ONE
+        );
+        app.insert_resource(AgentMotionSettings { enabled: false });
+        let unsmoothed = AgentPoseTarget {
+            translation: Vec3::X * 100.0,
+            tick: 3,
+            ..rewind
+        };
+        app.world_mut().entity_mut(entity).insert(unsmoothed);
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(entity)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            unsmoothed.translation
         );
     }
 
