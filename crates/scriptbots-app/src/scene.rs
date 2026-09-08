@@ -909,6 +909,14 @@ impl SceneDriver for BevyOffscreenDriver {
                     for point in due {
                         let (pos, look_at, fov) =
                             camera_pose_at(manifest, tick, world, point.camera_key);
+                        tracing::debug!(
+                            capture = %point.name,
+                            tick,
+                            ?pos,
+                            ?look_at,
+                            fov,
+                            "resolved scene capture camera"
+                        );
                         capture.set_camera_pose(pos, look_at, fov);
                         let frame = capture
                             .render(world, &manifest.name, manifest.seed, tick)
