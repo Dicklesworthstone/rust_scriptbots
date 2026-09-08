@@ -6322,7 +6322,9 @@ fn build_chunk_mesh(
             let i1 = i0 + 1;
             let i2 = i0 + stride;
             let i3 = i2 + 1;
-            indices.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
+            // Rows advance toward -Z, so this order faces +Y. Reversing it
+            // culls the ground from above and also points its normals down.
+            indices.extend_from_slice(&[i0, i1, i2, i1, i3, i2]);
         }
     }
 
@@ -6981,6 +6983,79 @@ mod terrain_tests {
 
         assert!(built.stats.mean_moisture > 0.0);
         assert!(built.stats.max_height > 0.0);
+    }
+
+    #[test]
+    fn flat_terrain_normals_point_toward_the_sky() {
+        let mut snapshot = sample_world_snapshot();
+        snapshot.terrain_height.elevation.fill(0.25);
+        let built = build_chunk_mesh(
+            &snapshot,
+            TerrainChunkBounds {
+                origin: UVec2::ZERO,
+                size: snapshot.terrain_height.dims,
+            },
+            100.0,
+            ColorPaletteMode::Natural,
+        );
+        let Some(VertexAttributeValues::Float32x3(normals)) =
+            built.mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        else {
+            panic!("terrain normals missing");
+        };
+        assert!(!normals.is_empty());
+        assert!(normals.iter().all(|normal| *normal == Vec3::Y.to_array()));
+    }
+
+    #[test]
+    fn terrain_triangles_and_normals_face_up_on_slopes_and_edge_chunks() {
+        let snapshot = sample_world_snapshot();
+        for bounds in [
+            TerrainChunkBounds {
+                origin: UVec2::ZERO,
+                size: snapshot.terrain_height.dims,
+            },
+            TerrainChunkBounds {
+                origin: UVec2::ONE,
+                size: UVec2::ONE,
+            },
+        ] {
+            let built = build_chunk_mesh(&snapshot, bounds, 100.0, ColorPaletteMode::Natural);
+            let Some(VertexAttributeValues::Float32x3(positions)) =
+                built.mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!("terrain positions missing");
+            };
+            let Some(Indices::U32(indices)) = built.mesh.indices() else {
+                panic!("terrain triangle indices missing");
+            };
+            let expected_triangles = (bounds.size.x * bounds.size.y * 2) as usize;
+            assert!(expected_triangles > 0);
+            assert_eq!(indices.len(), expected_triangles * 3);
+            for triangle in indices.chunks_exact(3) {
+                let [a, b, c] = [triangle[0], triangle[1], triangle[2]]
+                    .map(|index| Vec3::from_array(positions[index as usize]));
+                let normal = (b - a).cross(c - a);
+                assert!(
+                    normal.is_finite() && normal.y > 0.0,
+                    "downward terrain face"
+                );
+                // The original winding is a discriminating negative, even on
+                // nonplanar terrain: reversing the face must point below ground.
+                assert!((c - a).cross(b - a).y < 0.0);
+            }
+            let Some(VertexAttributeValues::Float32x3(normals)) =
+                built.mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+            else {
+                panic!("terrain normals missing");
+            };
+            assert_eq!(normals.len(), positions.len());
+            for normal in normals {
+                let normal = Vec3::from_array(*normal);
+                assert!(normal.is_finite() && normal.y > 0.0);
+                assert!((normal.length() - 1.0).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]
