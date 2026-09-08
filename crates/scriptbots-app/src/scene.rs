@@ -341,9 +341,21 @@ fn merge_json(target: &mut serde_json::Value, incoming: &serde_json::Value) {
     }
 }
 
+/// Renderer settings observed from the initialized session, rather than launch requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneRenderFacts {
+    /// Actual adapter capability report; absent when the session could not report it.
+    pub gpu: Option<scriptbots_core::GpuInfo>,
+    /// Tier after adapter classification and software-fallback clamping.
+    pub effective_quality: scriptbots_core::RenderQuality,
+}
+
 /// Raw facts captured during a run (expectations evaluate against this).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SceneRunFacts {
+    /// Present only when the driver initialized a GPU rendering session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render: Option<SceneRenderFacts>,
     /// Per-tick agent counts (index = tick offset from start).
     pub agent_counts: Vec<usize>,
     /// Events observed as `(event_kind, first_tick)`.
@@ -373,8 +385,12 @@ pub struct ExpectationResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneLog {
     /// Exact requested scene, including per-capture bookmarks and render inputs.
-    /// Adapter-resolved settings and world identity remain in frame provenance.
+    /// Adapter-resolved settings are recorded separately in `render`.
     pub manifest: SceneManifest,
+    /// Actual session capabilities, including runs without capture points.
+    /// Non-GPU drivers leave this absent; absence never implies hardware acceleration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render: Option<SceneRenderFacts>,
     /// Scene name.
     pub name: String,
     /// Frontend that executed it.
@@ -894,6 +910,10 @@ impl SceneDriver for BevyOffscreenDriver {
                 corrupt,
             },
             |capture| {
+                facts.render = Some(SceneRenderFacts {
+                    gpu: capture.gpu_info().cloned(),
+                    effective_quality: capture.tier(),
+                });
                 let mut do_captures = |world: &WorldState,
                                        tick: u64,
                                        facts: &mut SceneRunFacts|
@@ -1219,6 +1239,7 @@ pub fn run_scene(
     ]);
     Ok(SceneLog {
         manifest: manifest.clone(),
+        render: facts.render.clone(),
         name: manifest.name.clone(),
         frontend: driver.name().to_string(),
         seed: manifest.seed,
@@ -1510,6 +1531,71 @@ stars = true
         }
         assert_eq!(log.timings_ms.len(), SceneLog::TIMING_PHASES.len());
         log.validate().expect("a completed run yields a valid log");
+    }
+
+    #[test]
+    fn scene_log_preserves_observed_adapter_without_captures() {
+        // A unit fixture for the driver/log boundary, not a rendered-frame proof.
+        struct ReportDriver(SceneRenderFacts);
+        impl SceneDriver for ReportDriver {
+            fn run(&mut self, _: &SceneManifest) -> Result<SceneRunFacts, SceneError> {
+                Ok(SceneRunFacts {
+                    render: Some(self.0.clone()),
+                    agent_counts: vec![0],
+                    ..Default::default()
+                })
+            }
+
+            fn name(&self) -> &'static str {
+                "report_fixture"
+            }
+        }
+
+        let mut manifest = base_manifest();
+        manifest.captures.clear();
+        manifest.quality = Some("ultra".to_owned());
+        for (class, tier, driver) in [
+            (
+                scriptbots_core::GpuClass::Software,
+                scriptbots_core::RenderQuality::Potato,
+                None,
+            ),
+            (
+                scriptbots_core::GpuClass::Discrete,
+                scriptbots_core::RenderQuality::Ultra,
+                Some("reported-driver".to_owned()),
+            ),
+        ] {
+            let report = SceneRenderFacts {
+                gpu: Some(scriptbots_core::GpuInfo {
+                    name: format!("{class:?}"),
+                    backend: "vulkan".to_owned(),
+                    class,
+                    vram_bytes: None,
+                    max_texture_2d: Some(8192),
+                    timestamp_queries: true,
+                    vendor_id: Some(123),
+                    device_id: Some(456),
+                    driver,
+                    driver_info: None,
+                }),
+                effective_quality: tier,
+            };
+            let log = run_scene(&manifest, &mut ReportDriver(report.clone())).expect("scene");
+            assert!(log.captures.is_empty());
+            assert_eq!(log.manifest.quality.as_deref(), Some("ultra"));
+            assert_eq!(log.render.as_ref(), Some(&report));
+            let json = serde_json::to_string(&log).expect("serialize");
+            let decoded: SceneLog = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded.render, Some(report));
+        }
+
+        let log = run_scene(&manifest, &mut NullDriver).expect("non-GPU scene");
+        assert!(log.render.is_none());
+        let json = serde_json::to_value(&log).expect("serialize");
+        assert!(json.get("render").is_none());
+        let decoded: SceneLog = serde_json::from_value(json).expect("absent report parses");
+        assert!(decoded.render.is_none());
     }
 
     /// README advertises a JSON scene log beside the PNGs; it was never written.
