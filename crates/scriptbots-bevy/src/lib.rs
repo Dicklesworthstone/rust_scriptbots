@@ -12,6 +12,7 @@ use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::prelude::*;
+use bevy::core_pipeline::prepass::{DepthPrepass, NormalPrepass};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
@@ -21,6 +22,7 @@ use bevy::light::{
     EnvironmentMapLight, LightProbe,
 };
 use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
+use bevy::pbr::ScreenSpaceAmbientOcclusion;
 use bevy::pbr::prelude::*;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
@@ -698,7 +700,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         ..Default::default()
     }))
     .add_plugins(AutoExposurePlugin)
-    .add_systems(Startup, setup_scene)
+    .add_systems(Startup, (initialize_ssao_support, setup_scene).chain())
     .add_systems(
         Update,
         (
@@ -720,6 +722,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 apply_tier_to_sun_light,
                 apply_tier_to_bloom,
                 apply_tier_to_fog,
+                apply_tier_to_ssao,
             )
                 .chain(),
             handle_auto_exposure_toggle,
@@ -4000,6 +4003,117 @@ mod adaptive_governor_tests {
 mod quality_tier_consumer_tests {
     use super::*;
 
+    #[test]
+    fn ssao_rejects_each_missing_device_requirement() {
+        for r16_storage in [false, true] {
+            for textures in [0, 4, 5, 8] {
+                assert_eq!(
+                    ssao_capabilities_supported(r16_storage, textures),
+                    r16_storage && matches!(textures, 5 | 8),
+                    "R16 storage={r16_storage}, storage textures={textures}"
+                );
+            }
+        }
+        let mut world = World::new();
+        initialize_ssao_support(&mut world);
+        assert!(
+            !world.resource::<SsaoSupport>().0,
+            "no device is not support"
+        );
+    }
+
+    #[test]
+    fn ssao_tiers_restore_msaa_and_prepasses_without_component_churn() {
+        let mut app = App::new();
+        // Synthetic capability input: this proves ECS lifecycle, not GPU pixels.
+        app.insert_resource(SsaoSupport(true))
+            .add_systems(Update, apply_tier_to_ssao);
+        let camera = app.world_mut().spawn((PrimaryCamera, Msaa::Sample4)).id();
+        let independent = app
+            .world_mut()
+            .spawn((PrimaryCamera, Msaa::Sample2, DepthPrepass))
+            .id();
+        let unrelated = app.world_mut().spawn(Msaa::Sample8).id();
+        for (tier, expected) in [
+            (RenderQuality::Low, false),
+            (RenderQuality::High, true),
+            (RenderQuality::Ultra, true),
+            (RenderQuality::Medium, false),
+            (RenderQuality::High, true),
+            (RenderQuality::Potato, false),
+        ] {
+            let settings = RenderSettings {
+                quality: Some(tier),
+                ..default()
+            };
+            app.insert_resource(resolve_effective_render_settings_for_gpu(
+                &settings,
+                Some(gpu_info("synthetic hardware", GpuClass::Discrete)),
+            ));
+            app.update();
+            let entity = app.world().entity(camera);
+            assert_eq!(
+                entity.contains::<ScreenSpaceAmbientOcclusion>(),
+                expected,
+                "{tier:?}"
+            );
+            assert_eq!(entity.contains::<DepthPrepass>(), expected, "{tier:?}");
+            assert_eq!(entity.contains::<NormalPrepass>(), expected, "{tier:?}");
+            assert_eq!(
+                entity.get::<Msaa>(),
+                Some(if expected { &Msaa::Off } else { &Msaa::Sample4 })
+            );
+            let change_ticks = |world: &World| {
+                let entity = world.entity(camera);
+                (
+                    entity.get_ref::<Msaa>().unwrap().last_changed(),
+                    entity
+                        .get_ref::<ScreenSpaceAmbientOcclusion>()
+                        .map(|value| value.last_changed()),
+                    entity
+                        .get_ref::<DepthPrepass>()
+                        .map(|value| value.last_changed()),
+                    entity
+                        .get_ref::<NormalPrepass>()
+                        .map(|value| value.last_changed()),
+                )
+            };
+            let before = change_ticks(app.world());
+            app.update();
+            assert_eq!(change_ticks(app.world()), before);
+            assert!(app.world().entity(independent).contains::<DepthPrepass>());
+            assert_eq!(
+                app.world().get::<Msaa>(independent),
+                Some(if expected { &Msaa::Off } else { &Msaa::Sample2 })
+            );
+            assert_eq!(app.world().get::<Msaa>(unrelated), Some(&Msaa::Sample8));
+            assert!(
+                !app.world()
+                    .entity(unrelated)
+                    .contains::<ScreenSpaceAmbientOcclusion>()
+            );
+        }
+        // Losing support must also undo a previously enabled effect.
+        app.world_mut()
+            .resource_mut::<EffectiveRenderSettings>()
+            .features
+            .ssao = true;
+        app.update();
+        assert!(
+            app.world()
+                .entity(camera)
+                .contains::<ScreenSpaceAmbientOcclusion>()
+        );
+        app.insert_resource(SsaoSupport(false));
+        app.update();
+        assert!(
+            !app.world()
+                .entity(camera)
+                .contains::<ScreenSpaceAmbientOcclusion>()
+        );
+        assert_eq!(app.world().get::<Msaa>(camera), Some(&Msaa::Sample4));
+    }
+
     /// A fixed adapter so tier-consumer tests never depend on the host's GPU.
     fn gpu_info(name: &str, class: GpuClass) -> GpuInfo {
         GpuInfo {
@@ -5829,6 +5943,92 @@ fn tier_distance_fog(
         falloff: FogFalloff::Exponential { density },
         ..default()
     })
+}
+
+/// Bevy 0.17's SSAO plugin requires both capabilities. Read the renderer's
+/// actual device, not the separate launch adapter probe, before enabling it.
+#[derive(Resource)]
+struct SsaoSupport(bool);
+
+impl FromWorld for SsaoSupport {
+    fn from_world(world: &mut World) -> Self {
+        use bevy::render::renderer::{RenderAdapter, RenderDevice};
+        let supported = world
+            .get_resource::<RenderAdapter>()
+            .zip(world.get_resource::<RenderDevice>())
+            .is_some_and(|(adapter, device)| {
+                ssao_capabilities_supported(
+                    adapter
+                        .get_texture_format_features(wgpu::TextureFormat::R16Float)
+                        .allowed_usages
+                        .contains(wgpu::TextureUsages::STORAGE_BINDING),
+                    device.limits().max_storage_textures_per_shader_stage,
+                )
+            });
+        info!(
+            ssao_supported = supported,
+            "actual renderer SSAO capability resolved"
+        );
+        Self(supported)
+    }
+}
+
+fn ssao_capabilities_supported(r16_storage: bool, storage_textures: u32) -> bool {
+    // Matches ScreenSpaceAmbientOcclusionPlugin::finish in pinned Bevy 0.17.
+    r16_storage && storage_textures >= 5
+}
+
+fn initialize_ssao_support(world: &mut World) {
+    world.init_resource::<SsaoSupport>();
+}
+
+/// Remember only state this consumer changed. Disabling SSAO must not remove
+/// a prepass supplied by another effect or leave a low tier paying its cost.
+#[derive(Component)]
+struct SsaoCameraRestore {
+    msaa: Option<Msaa>,
+    had_depth_prepass: bool,
+    had_normal_prepass: bool,
+}
+
+fn configure_camera_ssao(world: &mut World, camera: Entity, enabled: bool) {
+    let mut camera = world.entity_mut(camera);
+    if enabled {
+        if !camera.contains::<SsaoCameraRestore>() {
+            let restore = SsaoCameraRestore {
+                msaa: camera.get::<Msaa>().copied(),
+                had_depth_prepass: camera.contains::<DepthPrepass>(),
+                had_normal_prepass: camera.contains::<NormalPrepass>(),
+            };
+            // SSAO's required components install depth and normal prepasses.
+            // MSAA is a separate axis from the tier's FXAA/TAA setting. Bevy
+            // rejects multisampled SSAO, so restore the original MSAA on exit.
+            camera.insert((restore, Msaa::Off, ScreenSpaceAmbientOcclusion::default()));
+        }
+    } else if let Some(restore) = camera.take::<SsaoCameraRestore>() {
+        camera.remove::<ScreenSpaceAmbientOcclusion>();
+        if !restore.had_depth_prepass {
+            camera.remove::<DepthPrepass>();
+        }
+        if !restore.had_normal_prepass {
+            camera.remove::<NormalPrepass>();
+        }
+        if let Some(msaa) = restore.msaa {
+            camera.insert(msaa);
+        } else {
+            camera.remove::<Msaa>();
+        }
+    }
+}
+
+fn apply_tier_to_ssao(world: &mut World) {
+    let enabled = world.resource::<EffectiveRenderSettings>().features.ssao
+        && world.resource::<SsaoSupport>().0;
+    let mut query = world.query_filtered::<Entity, With<PrimaryCamera>>();
+    let cameras: Vec<_> = query.iter(world).collect();
+    for camera in cameras {
+        configure_camera_ssao(world, camera, enabled);
+    }
 }
 
 fn apply_tier_to_fog(
@@ -9686,7 +9886,7 @@ mod acknowledgement_guard {
 
     /// Calls that unambiguously reach the command bus.
     ///
-    /// These three are the ONLY hand-written entries left, and they are seeds
+    /// These are the only hand-written entries left, and they are seeds
     /// rather than a registry: everything else is derived from them by
     /// following the call graph. bd-hhsl was raised to P1 because a
     /// hand-maintained registry missed two live defects in one session -
@@ -9697,6 +9897,9 @@ mod acknowledgement_guard {
         "(submitter.submit)(",
         "(self.command_submit.as_ref())(",
         "self.commands.try_send(",
+        // ControlHandle's production HostPort boundary after world ownership
+        // moved to the host. Keep the legacy seeds for the remaining surfaces.
+        "self.host.clone().submit(",
     ];
 
     /// The file whose methods a `handle.` / `state.handle.` receiver names.
@@ -9709,7 +9912,12 @@ mod acknowledgement_guard {
     const CONTROL_HANDLE_FILE: &str = "crates/scriptbots-app/src/control.rs";
 
     /// Calls that submit a command from inside a control method.
-    const SUBMITTING_CALLS: &[&str] = &["self.enqueue(", "self.submit_control_command("];
+    const SUBMITTING_CALLS: &[&str] = &[
+        "self.enqueue(",
+        "self.submit_control_command(",
+        "self.submit_control_command_with_key(",
+        "self.host.clone().submit(",
+    ];
 
     /// The receipt type a submitting method must hand back.
     const RECEIPT_TYPE: &str = "CommandStatusDto";
@@ -9959,7 +10167,7 @@ mod acknowledgement_guard {
 
     /// DERIVE the submitter set instead of listing it.
     ///
-    /// Seeded from the three calls that unambiguously reach the bus, then
+    /// Seeded from calls that unambiguously reach the bus, then
     /// closed over the call graph. Returns the functions that both reach the
     /// bus AND hand back an answer, mapped to the files that define them so a
     /// caller can be matched by receiver rather than by bare name.
@@ -9994,10 +10202,16 @@ mod acknowledgement_guard {
 
         reaches_bus
             .into_iter()
-            .filter(|(name, files)| {
-                all.iter().any(|f| {
-                    &f.name == name && files.contains(&f.file) && yields_a_receipt(&f.signature)
-                })
+            .filter_map(|(name, mut files)| {
+                // A same-named function in another crate may return unit.
+                // Keep only the defining files whose own signature yields a
+                // receipt, rather than lending one file another file's type.
+                files.retain(|file| {
+                    all.iter().any(|f| {
+                        f.name == name && &f.file == file && yields_a_receipt(&f.signature)
+                    })
+                });
+                (!files.is_empty()).then_some((name, files))
             })
             .collect()
     }
@@ -10267,7 +10481,7 @@ mod acknowledgement_guard {
     /// No call to a derived submitter may drop its answer.
     ///
     /// This is the rule the hand-written registry could not be: it finds
-    /// submitters by following the call graph from three bus seeds, so a
+    /// submitters by following the call graph from the bus seeds, so a
     /// helper added tomorrow is covered the moment it reaches the bus.
     #[test]
     fn no_derived_submitter_call_discards_its_answer() {
@@ -10431,6 +10645,82 @@ mod acknowledgement_guard {
             discarded_submissions(&corrected).is_empty(),
             "the guard fires on the corrected form, so it would forbid its own fix"
         );
+    }
+
+    /// The HostPort boundary must seed derivation for both the failing and
+    /// corrected surface. Removing its definition must not make a fix pass.
+    #[test]
+    fn derivation_follows_hostport_and_distinguishes_bound_receipts() {
+        let definitions = [
+            "fn submit_control_command_with_key(&self, cmd: ControlCommand) -> Result<CommandStatusDto, ControlError> {",
+            "    let status = self.host.clone().submit(envelope)?;",
+            "    self.status_dto(status)",
+            "}",
+            "pub fn pause(&self) -> Result<CommandStatusDto, ControlError> {",
+            "    self.submit_control_command_with_key(ControlCommand::Pause)",
+            "}",
+        ].join("\n");
+        for (statement, expected_offences) in [
+            ("let _ = handle.pause();", 1),
+            ("let status = handle.pause()?;", 0),
+        ] {
+            let sources = vec![
+                (CONTROL_HANDLE_FILE.to_owned(), definitions.clone()),
+                (
+                    "crates/scriptbots-app/src/servers.rs".to_owned(),
+                    format!("async fn ws() {{\n    {statement}\n}}"),
+                ),
+            ];
+            let submitters = derived_submitters(&sources);
+            assert!(
+                submitters
+                    .get("pause")
+                    .is_some_and(|files| files.contains(CONTROL_HANDLE_FILE))
+            );
+            let offences = discarded_calls_to_derived_submitters(&sources);
+            assert_eq!(
+                offences.len(),
+                expected_offences,
+                "{statement}: {offences:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_types_are_bound_to_their_defining_file() {
+        let terminal = "crates/scriptbots-app/src/terminal/mod.rs";
+        for (return_type, expected_files) in [("", 1), (" -> Option<String>", 2)] {
+            let sources = vec![
+                (CONTROL_HANDLE_FILE.to_owned(), "fn submit_command(&self) -> CommandStatusDto {\n    self.host.clone().submit(envelope)\n}".to_owned()),
+                (terminal.to_owned(), format!("fn submit_command(&self){return_type} {{\n    let status = self.host.clone().submit(envelope);\n}}\nfn action(&self) {{\n    self.submit_command();\n}}")),
+            ];
+            let submitters = derived_submitters(&sources);
+            assert_eq!(submitters["submit_command"].len(), expected_files);
+            assert_eq!(
+                discarded_calls_to_derived_submitters(&sources).len(),
+                expected_files - 1
+            );
+        }
+    }
+
+    #[test]
+    fn hostport_submission_cannot_be_projected_into_a_boolean() {
+        for submission in [
+            "self.host.clone().submit(envelope)",
+            "self.submit_control_command_with_key(command, None)",
+        ] {
+            let sources = vec![(
+                CONTROL_HANDLE_FILE.to_owned(),
+                format!(
+                    "use crate::CommandStatusDto;\npub fn pause(&self) -> bool {{\n    {submission}.is_ok()\n}}"
+                ),
+            )];
+            assert_eq!(
+                submitters_returning_a_projection(&sources).len(),
+                1,
+                "{submission}"
+            );
+        }
     }
 
     /// The derived rule must catch both defects the hand registry missed.

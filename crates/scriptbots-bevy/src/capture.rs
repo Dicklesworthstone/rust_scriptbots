@@ -1322,6 +1322,7 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     // wedges at "readback did not complete in budget" on Metal.
     app.finish();
     app.cleanup();
+    crate::initialize_ssao_support(app.world_mut());
     // Warmup: startup + two frames so base pipelines compile outside the
     // evidence path.
     app.update();
@@ -1568,6 +1569,7 @@ fn configure_session<'a>(
         effective.features.fog,
         effective.fog_settings.as_ref(),
     );
+    configure_capture_ssao(app.world_mut(), effective.features.ssao);
 
     // Fresh render target; repoint the app-lifetime capture camera and
     // retune the sun for tier/corrupt without respawning either.
@@ -1666,6 +1668,17 @@ fn configure_capture_camera_effects(world: &mut World, settings: &RenderSettings
         } else {
             world.entity_mut(entity).remove::<crate::Bloom>();
         }
+    }
+}
+
+/// Reused capture cameras obey the same actual-device gate and reversible
+/// prepass/MSAA setup as the native camera.
+fn configure_capture_ssao(world: &mut World, requested: bool) {
+    let enabled = requested && world.resource::<crate::SsaoSupport>().0;
+    let mut query = world.query_filtered::<Entity, With<CaptureCamera>>();
+    let cameras: Vec<_> = query.iter(world).collect();
+    for camera in cameras {
+        crate::configure_camera_ssao(world, camera, enabled);
     }
 }
 
@@ -1803,6 +1816,46 @@ mod tests {
                 .exposure,
             0.0
         );
+    }
+
+    #[test]
+    fn capture_ssao_reuse_restores_camera_state_and_refuses_unsupported_devices() {
+        let mut world = World::new();
+        world.insert_resource(crate::SsaoSupport(true));
+        let camera = world.spawn((CaptureCamera, Msaa::Sample4)).id();
+        let unrelated = world.spawn(Msaa::Sample2).id();
+        for (tier, expected) in [
+            (RenderQuality::High, true),
+            (RenderQuality::Low, false),
+            (RenderQuality::Ultra, true),
+            (RenderQuality::Potato, false),
+        ] {
+            configure_capture_ssao(&mut world, scriptbots_core::tier_features(tier).ssao);
+            assert_eq!(
+                world
+                    .entity(camera)
+                    .contains::<crate::ScreenSpaceAmbientOcclusion>(),
+                expected,
+                "{tier:?}"
+            );
+            assert_eq!(
+                world.entity(camera).contains::<crate::NormalPrepass>(),
+                expected
+            );
+            assert_eq!(
+                world.get::<Msaa>(camera),
+                Some(if expected { &Msaa::Off } else { &Msaa::Sample4 })
+            );
+            assert_eq!(world.get::<Msaa>(unrelated), Some(&Msaa::Sample2));
+        }
+        world.insert_resource(crate::SsaoSupport(false));
+        configure_capture_ssao(&mut world, true);
+        assert!(
+            !world
+                .entity(camera)
+                .contains::<crate::ScreenSpaceAmbientOcclusion>()
+        );
+        assert_eq!(world.get::<Msaa>(camera), Some(&Msaa::Sample4));
     }
 
     #[test]

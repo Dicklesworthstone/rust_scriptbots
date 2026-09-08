@@ -2906,8 +2906,12 @@ impl<'a> TerminalApp<'a> {
                 // to the same control, and a theme that survives a restart only
                 // when chosen by keyboard would be a subtler bug than not
                 // persisting at all (bd-2z0.14.2.2).
-                self.persist_theme_choice(self.palette.theme_id);
-                self.push_toast(format!("Theme: {lbl}"));
+                let admission = self.persist_theme_choice(self.palette.theme_id);
+                self.push_toast(if admission.is_some() {
+                    format!("Theme: {lbl} (run update submitted)")
+                } else {
+                    format!("Theme: {lbl} (no run update submitted)")
+                });
             }
             CommandPaletteAction::CyclePalette => {
                 let lbl = self.palette.cycle_mode();
@@ -3077,8 +3081,12 @@ impl<'a> TerminalApp<'a> {
             (KeyCode::Char('t') | KeyCode::Char('T'), KeyModifiers::CONTROL) => {
                 let theme_label = self.palette.cycle_theme();
                 info!(theme = %theme_label, "terminal chrome theme cycled");
-                self.persist_theme_choice(self.palette.theme_id);
-                self.push_toast(format!("Theme: {theme_label}"));
+                let admission = self.persist_theme_choice(self.palette.theme_id);
+                self.push_toast(if admission.is_some() {
+                    format!("Theme: {theme_label} (run update submitted)")
+                } else {
+                    format!("Theme: {theme_label} (no run update submitted)")
+                });
                 return Ok(false);
             }
             // Plain `p` cycles the accessibility palette, which is an ORTHOGONAL
@@ -10411,6 +10419,10 @@ mod tests {
                 .expect("ctrl-t is handled");
             let after = app.palette.theme_id;
             assert_ne!(after, before, "Ctrl+T must advance the theme");
+            assert_eq!(
+                app.toasts.back().expect("theme feedback").message,
+                format!("Theme: {} (run update submitted)", after.label())
+            );
 
             let persisted = wait_for_theme(app, after).config.render.theme;
 
@@ -10418,6 +10430,24 @@ mod tests {
                 persisted,
                 Some(after.to_config()),
                 "the persisted theme must be the one now displayed, not the previous one"
+            );
+        });
+    }
+
+    #[test]
+    fn theme_shortcut_reports_when_submission_is_refused() {
+        with_shortcut_app(|app| {
+            // Inject only the admission refusal; exercise the real key handler
+            // and config-reading path against the fixture's running host.
+            app.command_submit = Arc::new(|_| None);
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                .expect("ctrl-t is handled");
+            assert_eq!(
+                app.toasts.back().expect("theme feedback").message,
+                format!(
+                    "Theme: {} (no run update submitted)",
+                    app.palette.theme_id.label()
+                )
             );
         });
     }
