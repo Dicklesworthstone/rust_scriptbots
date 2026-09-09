@@ -1951,6 +1951,7 @@ impl TerrainChunkSignature {
 pub(crate) struct WorldSnapshot {
     revision: u64,
     tick: u64,
+    reduced_motion: bool,
     world_size: Vec2,
     agent_radius: f32,
     terrain_color: TerrainColorMap,
@@ -2497,6 +2498,7 @@ impl WorldSnapshot {
         Some(Self {
             revision: 1,
             tick: snapshot.world.tick,
+            reduced_motion: config.render.reduced_motion.unwrap_or(false),
             world_size: Vec2::new(width, height),
             agent_radius: config.bot_radius.max(1.0),
             terrain_color: TerrainColorMap {
@@ -2514,6 +2516,7 @@ impl WorldSnapshot {
 
     fn same_render_content(&self, other: &Self) -> bool {
         self.tick == other.tick
+            && self.reduced_motion == other.reduced_motion
             && self.world_size == other.world_size
             && self.agent_radius == other.agent_radius
             && self.terrain_color == other.terrain_color
@@ -2671,6 +2674,7 @@ impl WorldSnapshot {
         Some(Self {
             revision: 1,
             tick: world.tick().0,
+            reduced_motion: config.render.reduced_motion.unwrap_or(false),
             world_size: Vec2::new(width, height),
             agent_radius: config.bot_radius.max(1.0),
             terrain_color: TerrainColorMap {
@@ -3168,9 +3172,14 @@ fn setup_scene(
     });
 }
 
-fn poll_snapshots(inbox: NonSendMut<SnapshotInbox>, mut state: ResMut<SnapshotState>) {
+fn poll_snapshots(
+    inbox: NonSendMut<SnapshotInbox>,
+    mut state: ResMut<SnapshotState>,
+    mut motion: ResMut<AgentMotionSettings>,
+) {
     let receiver = &inbox.receiver;
     while let Ok(snapshot) = receiver.try_recv() {
+        motion.enabled = !snapshot.reduced_motion;
         state.latest = Some(snapshot);
     }
 }
@@ -7164,6 +7173,7 @@ mod terrain_tests {
         WorldSnapshot {
             revision: 1,
             tick: 42,
+            reduced_motion: false,
             world_size,
             agent_radius: 12.0,
             terrain_color: color,
@@ -7206,6 +7216,7 @@ mod terrain_tests {
         WorldSnapshot {
             revision: 1,
             tick: 42,
+            reduced_motion: false,
             world_size: Vec2::splat(150.0),
             agent_radius: 12.0,
             terrain_color: TerrainColorMap {
@@ -7459,6 +7470,113 @@ mod terrain_tests {
                 (actual - expected).abs() < 1.0e-6,
                 "Bevy {channel} channel {actual} disagrees with core authority {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn same_tick_motion_preferences_reach_both_native_easing_systems() {
+        let mut app = App::new();
+        let (sender, receiver) = mpsc::channel();
+        app.insert_non_send_resource(SnapshotInbox { receiver });
+        app.insert_resource(SnapshotState::default());
+        app.insert_resource(AgentMotionSettings { enabled: true });
+        let mut time = Time::<()>::default();
+        time.advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.insert_resource(time);
+        app.add_systems(
+            Update,
+            (poll_snapshots, smooth_agent_poses, smooth_spike_poses).chain(),
+        );
+        let target = AgentPoseTarget {
+            translation: Vec3::X * 10.0,
+            rotation: Quat::IDENTITY,
+            tick: 42,
+        };
+        let agent = app
+            .world_mut()
+            .spawn((
+                Transform::IDENTITY,
+                target,
+                AgentDisplayPose {
+                    translation: Vec3::ZERO,
+                    rotation: Quat::IDENTITY,
+                    previous_target: target,
+                },
+            ))
+            .id();
+        let spike_target = Transform::from_scale(Vec3::splat(3.0));
+        let spike = app
+            .world_mut()
+            .spawn((
+                Transform::IDENTITY,
+                SpikePoseTarget {
+                    transform: spike_target,
+                    tick: 42,
+                },
+                SpikeDisplayPose {
+                    transform: Transform::IDENTITY,
+                    tick: 42,
+                },
+            ))
+            .id();
+        let mut previous = sample_world_snapshot();
+        let mut next_revision = 2;
+        for reduced_motion in [true, false, true] {
+            let mut snapshot = previous.clone();
+            snapshot.reduced_motion = reduced_motion;
+            assert!(
+                assign_presentation_revision(&mut snapshot, Some(&previous), &mut next_revision)
+                    .unwrap()
+            );
+            assert_eq!(
+                snapshot.tick, previous.tick,
+                "preference changes do not advance science"
+            );
+            let mut unchanged = snapshot.clone();
+            assert!(
+                !assign_presentation_revision(&mut unchanged, Some(&snapshot), &mut next_revision)
+                    .unwrap()
+            );
+            // Start both displayed poses away from their unchanged targets so
+            // a stale preference produces an observable wrong transform.
+            app.world_mut()
+                .entity_mut(agent)
+                .get_mut::<AgentDisplayPose>()
+                .unwrap()
+                .translation = Vec3::ZERO;
+            app.world_mut()
+                .entity_mut(spike)
+                .get_mut::<SpikeDisplayPose>()
+                .unwrap()
+                .transform = Transform::IDENTITY;
+            sender.send(snapshot.clone()).unwrap();
+            app.update();
+            assert_eq!(
+                app.world().resource::<AgentMotionSettings>().enabled,
+                !reduced_motion
+            );
+            let position = app
+                .world()
+                .entity(agent)
+                .get::<Transform>()
+                .unwrap()
+                .translation
+                .x;
+            let scale = app
+                .world()
+                .entity(spike)
+                .get::<Transform>()
+                .unwrap()
+                .scale
+                .x;
+            if reduced_motion {
+                assert_eq!(position, 10.0);
+                assert_eq!(scale, 3.0);
+            } else {
+                assert!(position > 0.0 && position < 10.0);
+                assert!(scale > 1.0 && scale < 3.0);
+            }
+            previous = snapshot;
         }
     }
 
@@ -8567,6 +8685,10 @@ mod tests {
         };
         let mut world = WorldState::new(ScriptBotsConfig {
             rng_seed: Some(0xBEEF_F00D),
+            render: RenderSettings {
+                reduced_motion: Some(true),
+                ..RenderSettings::default()
+            },
             ..ScriptBotsConfig::default()
         })
         .expect("seeded world");
@@ -8577,6 +8699,7 @@ mod tests {
             world.step().expect("fixture step");
         }
         let expected = WorldSnapshot::from_world(&world).expect("owned projection");
+        assert!(expected.reduced_motion);
         assert!(
             !expected.agents.is_empty(),
             "fixture must exercise visual fields"
@@ -8596,6 +8719,21 @@ mod tests {
         .expect("drawing host");
         let before = host.scientific_digest_v1().expect("initial digest").overall;
         let published = host.latest_snapshot();
+        let mut motion_changed = (*published).clone();
+        Arc::make_mut(&mut motion_changed.config)
+            .render
+            .reduced_motion = Some(false);
+        let changed = WorldSnapshot::from_snapshot(&motion_changed).expect("changed preference");
+        assert!(!changed.reduced_motion);
+        assert!(!changed.same_render_content(&expected));
+        Arc::make_mut(&mut motion_changed.config)
+            .render
+            .reduced_motion = None;
+        assert!(
+            !WorldSnapshot::from_snapshot(&motion_changed)
+                .unwrap()
+                .reduced_motion
+        );
         for _ in 0..12 {
             let rendered = WorldSnapshot::from_snapshot(&published).expect("host projection");
             assert!(
