@@ -6390,6 +6390,7 @@ fn control_camera(
     time: Res<Time>,
     mut rig: ResMut<CameraRig>,
     state: Res<SnapshotState>,
+    motion: Option<Res<AgentMotionSettings>>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut mouse_motion: MessageReader<MouseMotion>,
@@ -6571,7 +6572,7 @@ fn control_camera(
         rig.pan = target_focus - anchor;
     }
 
-    if rig.recenter_now {
+    if rig.recenter_now || motion.as_ref().is_some_and(|settings| !settings.enabled) {
         rig.focus_smoothed = target_focus;
         rig.distance_smoothed = rig.distance;
         rig.recenter_now = false;
@@ -10126,6 +10127,72 @@ mod tests {
                 .translation,
             unsmoothed.translation
         );
+    }
+
+    #[test]
+    fn reduced_motion_camera_applies_targets_immediately_and_can_resume_easing() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default());
+        app.insert_resource(AgentMotionSettings { enabled: false });
+        app.insert_resource(CameraRig {
+            follow_mode: FollowMode::Selected,
+            focus_smoothed: Vec2::splat(100.0),
+            distance: 700.0,
+            distance_smoothed: 400.0,
+            recenter_now: false,
+            ..Default::default()
+        });
+        app.insert_resource(SnapshotState {
+            world_size: Vec2::splat(1000.0),
+            selection_center: Some(Vec2::splat(600.0)),
+            ..Default::default()
+        });
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Messages::<MouseMotion>::default());
+        app.insert_resource(Messages::<MouseWheel>::default());
+        app.add_systems(Update, control_camera);
+        let camera = app
+            .world_mut()
+            .spawn((PrimaryCamera, Transform::default()))
+            .id();
+        // No elapsed time: ordinary easing would leave the old focus/distance.
+        app.update();
+        let rig = app.world().resource::<CameraRig>();
+        assert_eq!(rig.focus_smoothed, Vec2::splat(600.0));
+        assert_eq!(rig.distance_smoothed, 700.0);
+        let transform = app.world().entity(camera).get::<Transform>().unwrap();
+        let center = Vec3::new(100.0, 0.0, -100.0);
+        assert!((transform.translation.distance(center) - 700.0).abs() < 0.001);
+        assert!(
+            transform
+                .forward()
+                .dot((center - transform.translation).normalize())
+                > 0.999
+        );
+
+        app.world_mut()
+            .resource_mut::<AgentMotionSettings>()
+            .enabled = true;
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .selection_center = Some(Vec2::splat(800.0));
+        app.world_mut().resource_mut::<CameraRig>().distance = 900.0;
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+        app.update();
+        let rig = app.world().resource::<CameraRig>();
+        assert!(rig.focus_smoothed.x > 600.0 && rig.focus_smoothed.x < 800.0);
+        assert!(rig.distance_smoothed > 700.0 && rig.distance_smoothed < 900.0);
+
+        app.world_mut()
+            .resource_mut::<AgentMotionSettings>()
+            .enabled = false;
+        app.update();
+        let rig = app.world().resource::<CameraRig>();
+        assert_eq!(rig.focus_smoothed, Vec2::splat(800.0));
+        assert_eq!(rig.distance_smoothed, 900.0);
     }
 
     #[test]
