@@ -4802,7 +4802,7 @@ mod tests {
             let directory = tempdir()?;
             let database = directory.path().join("regions.sqlite");
             let path = database.to_str().expect("temporary UTF-8 path");
-            let mut pipeline = StoragePipeline::create_unattributed_file(path)?;
+            let pipeline = StoragePipeline::create_unattributed_file(path)?;
             let (mut world, mut persistence) = WorldState::with_persistence(
                 ScriptBotsConfig {
                     world_width: 64,

@@ -36,12 +36,11 @@ use scriptbots_core::visual::{
 use scriptbots_core::{
     AccessibilityPalette, ActivationEdge, ActivationLayer, AgentId, AgentUid, BrainActivations,
     BrainInspectionClientId, BrainInspectionRevision, BrainInspectionUnavailable, ControlCommand,
-    ControlDisposition, Generation, IndicatorState, MutationRates, NUM_EYES, OutputChannel,
-    Position, RenderFogMode, RenderQuality, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
+    Generation, IndicatorState, MutationRates, NUM_EYES, OutputChannel, Position, RenderFogMode,
+    RenderQuality, RenderTonemapMode, SENSOR_LAYOUT, ScriptBotsConfig,
     SelectedBrainTelemetryOutcome, SelectionMode, SelectionState, SelectionUpdate,
     SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TerrainLayer, TerrainTile,
-    TickSummary, TraitModifiers, Velocity, WorldState, WorldStepDriver, apply_control_command,
-    tier_features, toroidal_delta,
+    TickSummary, TraitModifiers, Velocity, WorldState, tier_features, toroidal_delta,
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, channel::ChannelHostPort};
@@ -2301,262 +2300,6 @@ impl Drop for TestHost {
     }
 }
 
-struct GuiSimulationDriver {
-    world: Arc<Mutex<WorldState>>,
-    simulation_step: WorldStepDriver,
-    command_drain: GuiCommandDrain,
-    command_reporter: GuiCommandReporter,
-    pending_playback: VecDeque<SimulationCommand>,
-    paused: bool,
-    speed_multiplier: f32,
-    sim_accumulator: f32,
-    last_sim_instant: Option<Instant>,
-    simulation_fault: Option<String>,
-}
-
-impl GuiSimulationDriver {
-    fn new(
-        world: Arc<Mutex<WorldState>>,
-        simulation_step: WorldStepDriver,
-        command_drain: GuiCommandDrain,
-        command_reporter: GuiCommandReporter,
-    ) -> Self {
-        Self {
-            world,
-            simulation_step,
-            command_drain,
-            command_reporter,
-            pending_playback: VecDeque::new(),
-            paused: false,
-            speed_multiplier: 1.0,
-            sim_accumulator: 0.0,
-            last_sim_instant: None,
-            simulation_fault: None,
-        }
-    }
-
-    fn pause_for_simulation_failure(&mut self, detail: String) {
-        self.paused = true;
-        self.sim_accumulator = 0.0;
-        self.simulation_fault = Some(detail.clone());
-        warn!(error = %detail, "Simulation paused after a terminal step failure");
-    }
-
-    fn apply_playback_state(&mut self, command: &SimulationCommand) {
-        if let Some(paused) = command.paused {
-            self.paused = paused;
-            if paused {
-                self.sim_accumulator = 0.0;
-            }
-        }
-        if let Some(speed) = command.speed_multiplier {
-            self.speed_multiplier = speed;
-        }
-        if command.step_once {
-            self.paused = true;
-            self.sim_accumulator = 0.0;
-        }
-    }
-
-    fn world_tick_for_step_accounting(&self) -> Result<u64, String> {
-        self.world.lock().map(|world| world.tick().0).map_err(|_| {
-            "simulation world mutex poisoned while accounting for an admitted Step".to_owned()
-        })
-    }
-
-    fn service_pending_playback(&mut self) -> bool {
-        let mut attempted_steps = 0;
-        while attempted_steps < MAX_SIM_STEPS_PER_FRAME {
-            let Some(command) = self.pending_playback.front().cloned() else {
-                break;
-            };
-            self.apply_playback_state(&command);
-            if !command.step_once {
-                self.pending_playback.pop_front();
-                continue;
-            }
-            attempted_steps += 1;
-
-            let before_tick = match self.world_tick_for_step_accounting() {
-                Ok(tick) => tick,
-                Err(error) => {
-                    self.pause_for_simulation_failure(error);
-                    break;
-                }
-            };
-            let step_result = (self.simulation_step)();
-            let after_tick = match self.world_tick_for_step_accounting() {
-                Ok(tick) => tick,
-                Err(error) => {
-                    self.pause_for_simulation_failure(error);
-                    break;
-                }
-            };
-
-            let expected_after_tick = before_tick.checked_add(1);
-            let advanced_exactly_once = expected_after_tick == Some(after_tick);
-            if advanced_exactly_once {
-                self.pending_playback.pop_front();
-            }
-
-            match step_result {
-                Ok(_) if advanced_exactly_once => {}
-                Ok(_) => {
-                    self.pause_for_simulation_failure(format!(
-                        "simulation step driver violated its one-tick contract: tick changed from \
-                         {before_tick} to {after_tick}"
-                    ));
-                    break;
-                }
-                Err(error) if advanced_exactly_once => {
-                    self.pause_for_simulation_failure(error.to_string());
-                    break;
-                }
-                Err(error) => {
-                    self.pause_for_simulation_failure(format!(
-                        "{error}; admitted Step did not complete exactly one tick \
-                         (before={before_tick}, after={after_tick})"
-                    ));
-                    break;
-                }
-            }
-        }
-        attempted_steps > 0
-    }
-
-    #[allow(clippy::collapsible_if)]
-    fn drive_at(&mut self, now: Instant) {
-        let last = self.last_sim_instant.replace(now);
-        if self.simulation_fault.is_some() {
-            return;
-        }
-
-        let mut playback = Vec::new();
-        let mut step_error = None;
-        if let Ok(mut world) = self.world.lock() {
-            if let Some(error) = world.latched_step_error() {
-                step_error = Some(error.to_string());
-            } else {
-                for (receipt, command) in (self.command_drain.as_ref())() {
-                    // Reported from HERE, the only place that knows whether the
-                    // world took the command. Playback counts as applied: the
-                    // command was accepted and routed, it just lands on the
-                    // driver rather than on world state (bd-tgfz).
-                    match apply_control_command(&mut world, command) {
-                        Ok(ControlDisposition::WorldApplied) => {
-                            (self.command_reporter)(&receipt, GuiCommandOutcome::Applied);
-                        }
-                        Ok(ControlDisposition::Playback(command)) => {
-                            (self.command_reporter)(&receipt, GuiCommandOutcome::Applied);
-                            playback.push(command);
-                        }
-                        Err(error) => {
-                            (self.command_reporter)(&receipt, GuiCommandOutcome::Rejected);
-                            warn!(%error, %receipt, "GPUI rejected a drained control command");
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(error) = step_error {
-            self.pause_for_simulation_failure(error);
-            return;
-        }
-
-        self.pending_playback.extend(playback);
-        let attempted_manual_step = self.service_pending_playback();
-        if self.simulation_fault.is_some() || attempted_manual_step {
-            return;
-        }
-
-        if !self.paused {
-            if let Ok(world) = self.world.lock() {
-                let control = world.config().control.clone();
-                let agent_count = world.agent_count();
-                let max_age = world.last_max_age();
-                let spike_hits = world.last_spike_hits();
-                drop(world);
-
-                let mut reason: Option<String> = None;
-                if control.auto_pause_on_spike_hit && spike_hits > 0 {
-                    reason = Some(format!("spike hits detected ({spike_hits})"));
-                } else if let Some(age_limit) = control.auto_pause_age_above {
-                    if max_age >= age_limit {
-                        reason = Some(format!("max age {max_age} ≥ {age_limit}"));
-                    }
-                } else if let Some(limit) = control.auto_pause_population_below {
-                    if agent_count as u32 <= limit {
-                        reason = Some(format!("population {agent_count} ≤ {limit}"));
-                    }
-                }
-
-                if let Some(reason) = reason {
-                    self.paused = true;
-                    info!(reason = %reason, "Auto-paused due to control settings");
-                }
-            }
-        }
-
-        if self.paused || self.speed_multiplier <= 0.0 {
-            self.sim_accumulator = 0.0;
-            return;
-        }
-
-        let Some(last) = last else {
-            return;
-        };
-        let delta = now.saturating_duration_since(last).as_secs_f32();
-        self.sim_accumulator += delta * self.speed_multiplier;
-        if self.sim_accumulator < SIM_TICK_INTERVAL {
-            return;
-        }
-
-        let max_accumulator = SIM_TICK_INTERVAL * MAX_SIM_STEPS_PER_FRAME as f32;
-        self.sim_accumulator = self.sim_accumulator.min(max_accumulator).min(0.5);
-        let steps = (self.sim_accumulator / SIM_TICK_INTERVAL).floor() as usize;
-        if steps == 0 {
-            return;
-        }
-        let steps = steps.min(MAX_SIM_STEPS_PER_FRAME);
-        self.sim_accumulator -= SIM_TICK_INTERVAL * steps as f32;
-
-        let mut step_error = self
-            .world
-            .lock()
-            .ok()
-            .and_then(|world| world.latched_step_error().map(|error| error.to_string()));
-        for _ in 0..steps {
-            if step_error.is_some() {
-                break;
-            }
-            if let Err(error) = (self.simulation_step)() {
-                step_error = Some(error.to_string());
-            }
-        }
-        if let Some(error) = step_error {
-            self.pause_for_simulation_failure(error);
-        }
-    }
-}
-
-fn start_gui_simulation_driver(app: &App, driver: Arc<Mutex<GuiSimulationDriver>>) {
-    app.spawn(async move |cx| {
-        loop {
-            {
-                let mut driver = match driver.lock() {
-                    Ok(driver) => driver,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                driver.drive_at(Instant::now());
-            }
-            cx.background_executor()
-                .timer(Duration::from_secs_f32(SIM_TICK_INTERVAL))
-                .await;
-        }
-    })
-    .detach();
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuiViewRole {
     Hud,
@@ -2822,26 +2565,6 @@ fn open_gui_session_windows(
 }
 
 /// Launch the ScriptBots GPUI shell with an interactive HUD.
-/// Drained commands, each paired with the identity it was admitted under.
-///
-/// The renderer does not depend on scriptbots-app, so it names the identity as
-/// a plain `String` rather than importing the bus type. What matters is that an
-/// id arrives WITH the command: without it the GPUI applier cannot report what
-/// became of anything it applies (bd-tgfz).
-pub type GuiCommandDrain = Arc<dyn Fn() -> Vec<(String, ControlCommand)> + Send + Sync + 'static>;
-
-/// What the GPUI applier observed when it applied a drained command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuiCommandOutcome {
-    /// The world accepted the command.
-    Applied,
-    /// The world refused it at application time.
-    Rejected,
-}
-
-/// Records an applied command's outcome against the id it travelled with.
-pub type GuiCommandReporter = Arc<dyn Fn(&str, GuiCommandOutcome) + Send + Sync + 'static>;
-
 pub fn run_demo(
     host: ChannelHostPort,
     analytics: AnalyticsSnapshotProvider,
@@ -2914,8 +2637,6 @@ pub fn run_demo(
 }
 
 const MAX_SELECTION_EVENTS: usize = 64;
-const SIM_TICK_INTERVAL: f32 = 1.0 / 60.0;
-const MAX_SIM_STEPS_PER_FRAME: usize = 240;
 const WORLD_PRESENTATION_SETTINGS_ESTIMATED_HEIGHT: f32 = 440.0;
 static NEXT_BRAIN_INSPECTION_CLIENT: AtomicU64 = AtomicU64::new(1);
 
@@ -18033,12 +17754,17 @@ fn transform_color(color: Rgba, matrix: [[f32; 3]; 3]) -> Rgba {
 #[cfg(test)]
 mod command_characterization_tests {
     use super::*;
-    use scriptbots_core::{AgentData, CharacterizationDigestV0, WorldDigestV1};
+    use scriptbots_core::{
+        AgentData, CharacterizationDigestV0, ControlDisposition, WorldDigestV1,
+        apply_control_command,
+    };
     use scriptbots_runtime::{
         ApplicationState, CommandEnvelope, CommandId, HostCore, HostCoreOptions, HostSessionId,
         ManualHostDriver, ManualInstant, PlaybackSnapshot,
     };
     use std::time::Duration;
+
+    const SIM_TICK_INTERVAL: f32 = 1.0 / 60.0;
 
     #[test]
     fn production_renderer_has_no_direct_world_selection_writes() {
@@ -18062,8 +17788,7 @@ mod command_characterization_tests {
         );
     }
 
-    /// bd-37m acceptance guard: the driver command drain is the sole renderer-owned path that may
-    /// borrow scientific world state mutably.
+    /// The HostCore cutover leaves no renderer-owned mutable science path.
     #[test]
     fn production_renderer_has_no_direct_agent_science_writes_or_rng() {
         let (production, _) = include_str!("lib.rs")
@@ -18120,8 +17845,8 @@ mod command_characterization_tests {
             production
                 .matches("if let Ok(mut world) = self.world.lock()")
                 .count(),
-            1,
-            "the simulation driver command drain must be the sole mutable WorldState lock in production rendering"
+            0,
+            "scientific world locking belongs to the host, never the renderer"
         );
     }
 
@@ -18755,68 +18480,58 @@ mod command_characterization_tests {
             .step(&mut world)
             .expect("seal the first persistence boundary");
         assert_eq!(world.tick().0, 1);
-        let world = Arc::new(Mutex::new(world));
-        let drain = one_shot_command_drain(vec![ControlCommand::SpawnAgent {
-            herbivore_tendency: 0.5,
-        }]);
-        let driver = gui_simulation_driver_with_step(
-            &world,
-            disabled_persistence_step_driver(&world),
-            drain,
-        );
-
-        let (agent_count_before, rng_before, identity_before) = {
-            let world = world.lock().expect("world lock");
-            (
-                world.agent_count(),
-                world.random_streams_checkpoint(),
-                world.identity_sequence_state(),
-            )
-        };
-        driver
-            .lock()
-            .expect("GUI simulation driver lock")
-            .drive_at(Instant::now());
-        assert_eq!(
-            world.lock().expect("world lock").agent_count(),
-            agent_count_before,
-            "a rejected manual ingress must not add an agent"
-        );
-        let world = world.lock().expect("world lock");
-        assert_eq!(
+        let before = (
+            world.agent_count(),
             world.random_streams_checkpoint(),
-            rng_before,
-            "sealed GUI ingress must be rejected before Population-domain position/color sampling"
+            world.identity_sequence_state(),
+            world.tick(),
         );
-        assert_eq!(world.identity_sequence_state(), identity_before);
-    }
-
-    fn disabled_persistence_step_driver(world: &Arc<Mutex<WorldState>>) -> WorldStepDriver {
-        let world = Arc::clone(world);
-        Arc::new(move || {
-            world
-                .lock()
-                .expect("world mutex poisoned while executing test simulation step")
-                .step()
-        })
-    }
-
-    /// The pre-identity drain shape, kept for tests.
-    ///
-    /// Production drains carry a command id (bd-tgfz). These tests assert on
-    /// world state rather than on reporting, so they keep feeding bare commands
-    /// and `identified` attaches synthetic ids at the boundary - one adapter
-    /// instead of an id threaded through every fixture.
-    type TestCommandDrain = Arc<dyn Fn() -> Vec<ControlCommand> + Send + Sync>;
-
-    fn identified(drain: TestCommandDrain) -> GuiCommandDrain {
-        Arc::new(move || {
-            (drain)()
-                .into_iter()
-                .enumerate()
-                .map(|(index, command)| (format!("test-{index}"), command))
-                .collect()
-        })
+        let mut owner = HostCore::with_journal_and_persistence(
+            HostSessionId::new(1),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            Box::new(scriptbots_runtime::host_core::VolatileJournal::default()),
+            persistence,
+        )
+        .expect("transfer sealed world and its persistence session");
+        let mut port = owner.local_port();
+        let id = CommandId::new(1);
+        port.submit(CommandEnvelope::new(
+            id,
+            scriptbots_runtime::HostCommand::SpawnAgent {
+                herbivore_tendency: 0.5,
+            },
+        ))
+        .expect("spawn admission");
+        assert_eq!(
+            owner
+                .drive(ManualInstant::from_nanos(0))
+                .unwrap()
+                .scientific_steps,
+            0
+        );
+        assert!(matches!(
+            port.command_status(id).unwrap().unwrap().application(),
+            ApplicationState::Failed(failure) if failure.code == "world_control_application"
+        ));
+        owner.with_world(|world| {
+            assert_eq!(
+                (
+                    world.agent_count(),
+                    world.random_streams_checkpoint(),
+                    world.identity_sequence_state(),
+                    world.tick(),
+                ),
+                before,
+                "sealed ingress must fail before population sampling or identity allocation"
+            );
+        });
     }
 
     /// bd-jw6f: the speed control must change the OBSERVED TICK RATE, not merely assign
@@ -19056,39 +18771,6 @@ mod command_characterization_tests {
             before_agents + 1,
             "crossover must add exactly one child (before={before_agents}, after={after_agents})"
         );
-    }
-
-    fn gui_simulation_driver_with_step(
-        world: &Arc<Mutex<WorldState>>,
-        simulation_step: WorldStepDriver,
-        command_drain: TestCommandDrain,
-    ) -> Arc<Mutex<GuiSimulationDriver>> {
-        // Tests assert on world state, not on reporting, so the reporter is an
-        // explicit sink here rather than a parameter every helper must thread.
-        Arc::new(Mutex::new(GuiSimulationDriver::new(
-            Arc::clone(world),
-            simulation_step,
-            identified(command_drain),
-            Arc::new(|_, _| {}),
-        )))
-    }
-
-    fn one_shot_command_drain(commands: Vec<ControlCommand>) -> TestCommandDrain {
-        let commands = Mutex::new(Some(commands));
-        Arc::new(move || {
-            commands
-                .lock()
-                .expect("one-shot command drain lock")
-                .take()
-                .unwrap_or_default()
-        })
-    }
-
-    fn injected_step_error(detail: &str) -> scriptbots_core::WorldStepError {
-        scriptbots_core::PersistenceSessionError::Unavailable {
-            detail: detail.to_owned(),
-        }
-        .into()
     }
 
     fn host_view(host: Arc<TestHost>) -> SimulationView {
@@ -20186,7 +19868,7 @@ mod command_characterization_tests {
     /// bd-jw6f tier 1, the group the map called costliest to get wrong: "if these
     /// are inert the app feels broken on first contact".
     ///
-    /// Speed already had a state proof — the GuiSimulationDriver ratio test —
+    /// Speed already had a state proof — the HostCore ratio test —
     /// but that drives the DRIVER directly and never presses a key, so the
     /// binding half was still unproven. This closes it from the other end:
     /// keystroke in, canonical intent out.
@@ -21287,164 +20969,366 @@ mod command_characterization_tests {
         }
     }
 
-    #[test]
-    fn gpui_pending_playback_retains_first_failed_step_and_blocks_implicit_retry() {
-        let world = command_characterization_world();
-        let step_calls = Arc::new(AtomicU64::new(0));
-        let observed_step_calls = Arc::clone(&step_calls);
-        let simulation_step: WorldStepDriver = Arc::new(move || {
-            observed_step_calls.fetch_add(1, AtomicOrdering::Relaxed);
-            Err(injected_step_error("injected failure before science"))
-        });
-        let driver = gui_simulation_driver_with_step(
-            &world,
-            simulation_step,
-            one_shot_command_drain(vec![ControlCommand::Step, ControlCommand::Step]),
-        );
-        let now = Instant::now();
-        {
-            let mut driver = driver.lock().expect("GUI simulation driver lock");
-            driver.paused = true;
-            driver.last_sim_instant = Some(now);
-            driver.drive_at(now);
-            assert_eq!(
-                driver.pending_playback.len(),
-                2,
-                "a pre-transition failure must retain its own Step and every later obligation"
-            );
-            assert!(driver.simulation_fault.is_some());
-
-            driver.drive_at(now + Duration::from_secs_f32(SIM_TICK_INTERVAL));
-            assert_eq!(
-                driver.pending_playback.len(),
-                2,
-                "a terminal driver fault must leave retained playback dormant"
-            );
-        }
-
-        assert_eq!(world.lock().expect("world lock").tick().0, 0);
-        assert_eq!(
-            step_calls.load(AtomicOrdering::Relaxed),
-            1,
-            "a retained failed Step must not retry on the next timer wake"
-        );
+    // V1 intentionally refuses non-continuable worlds. Observe coherent fault
+    // boundaries with V0's biological lanes plus its explicit RNG, identity,
+    // and configuration omissions; this is not a resumable checkpoint proof.
+    fn fault_boundary_observation(owner: &HostCore) -> impl std::fmt::Debug + PartialEq + use<> {
+        owner.with_world(|world| {
+            (
+                world.characterization_digest_v0().unwrap(),
+                world.random_streams_checkpoint(),
+                world.identity_sequence_state(),
+                serde_json::to_value(world.config()).unwrap(),
+                world.tick(),
+            )
+        })
     }
 
     #[test]
-    fn gpui_pending_playback_retains_failed_second_step_and_later_commands() {
-        let world = command_characterization_world();
-        let step_world = Arc::clone(&world);
-        let step_calls = Arc::new(AtomicU64::new(0));
-        let observed_step_calls = Arc::clone(&step_calls);
-        let simulation_step: WorldStepDriver = Arc::new(move || {
-            if observed_step_calls.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
-                step_world
-                    .lock()
-                    .expect("world lock for successful first step")
-                    .step()
-            } else {
-                Err(injected_step_error(
-                    "injected failure before second science tick",
+    fn gpui_host_pretransition_failure_preserves_failed_receipts_and_science() {
+        let (mut world, mut persistence) = WorldState::with_persistence(
+            ScriptBotsConfig {
+                world_width: 100,
+                world_height: 100,
+                food_cell_size: 50,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 1,
+                rng_seed: Some(42),
+                ..ScriptBotsConfig::default()
+            },
+            Box::new(scriptbots_core::NullPersistence),
+        )
+        .unwrap();
+        // Stage a real unresolved fixture boundary. The next transition must
+        // fail in persistence preflight, before it can mutate science.
+        let completion = persistence.step_outcome(&mut world).unwrap();
+        assert_eq!(completion.outcome.summary.tick.0, 1);
+        assert!(persistence.has_pending_batch());
+        let mut owner = HostCore::with_journal_and_persistence(
+            HostSessionId::new(94),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            Box::new(scriptbots_runtime::host_core::VolatileJournal::default()),
+            persistence,
+        )
+        .unwrap();
+        assert!(matches!(
+            owner.scientific_digest_v1(),
+            Err(scriptbots_core::CharacterizationError::NonContinuable {
+                blocker: scriptbots_core::WorldContinuationBlocker::RetainedPersistenceBatch
+            })
+        ));
+        let before = fault_boundary_observation(&owner);
+        let mut port = owner.local_port();
+        for id in [1, 2] {
+            let status = port
+                .submit(CommandEnvelope::new(
+                    CommandId::new(id),
+                    scriptbots_runtime::HostCommand::Step,
                 ))
-            }
-        });
-        let driver = gui_simulation_driver_with_step(
-            &world,
-            simulation_step,
-            one_shot_command_drain(vec![
-                ControlCommand::Step,
-                ControlCommand::Step,
-                ControlCommand::Resume,
-            ]),
-        );
-        let now = Instant::now();
-        {
-            let mut driver = driver.lock().expect("GUI simulation driver lock");
-            driver.paused = true;
-            driver.last_sim_instant = Some(now);
-            driver.drive_at(now);
-            assert_eq!(
-                driver.pending_playback.len(),
-                2,
-                "the failed second Step and trailing Resume must remain ordered and pending"
-            );
-            assert!(
-                driver
-                    .pending_playback
-                    .front()
-                    .is_some_and(|command| command.step_once)
-            );
-            assert_eq!(
-                driver
-                    .pending_playback
-                    .back()
-                    .and_then(|command| command.paused),
-                Some(false),
-                "the trailing Resume must not overtake the failed Step"
-            );
-
-            driver.drive_at(now + Duration::from_secs_f32(SIM_TICK_INTERVAL));
-            assert_eq!(driver.pending_playback.len(), 2);
+                .unwrap();
+            assert!(matches!(status.application(), ApplicationState::Admitted));
         }
-
-        assert_eq!(world.lock().expect("world lock").tick().0, 1);
         assert_eq!(
-            step_calls.load(AtomicOrdering::Relaxed),
-            2,
-            "the driver must stop at the second failure and must not retry implicitly"
+            owner
+                .drive(ManualInstant::from_nanos(0))
+                .unwrap()
+                .scientific_steps,
+            0
         );
+        assert_eq!(fault_boundary_observation(&owner), before);
+        let first = port.command_status(CommandId::new(1)).unwrap().unwrap();
+        let second = port.command_status(CommandId::new(2)).unwrap().unwrap();
+        assert!(
+            matches!(first.application(), ApplicationState::Failed(failure) if failure.code == "world_step")
+        );
+        assert!(
+            matches!(second.application(), ApplicationState::Failed(failure) if failure.code == "science_blocked")
+        );
+        let fault = owner.health().fault().cloned().unwrap();
+        for now in [1, 1_000, 1_000_000] {
+            assert_eq!(
+                owner
+                    .drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            assert_eq!(fault_boundary_observation(&owner), before);
+            assert_eq!(owner.health().fault(), Some(&fault));
+            assert_eq!(
+                port.command_status(CommandId::new(1))
+                    .unwrap()
+                    .unwrap()
+                    .application(),
+                first.application()
+            );
+            assert_eq!(
+                port.command_status(CommandId::new(2))
+                    .unwrap()
+                    .unwrap()
+                    .application(),
+                second.application()
+            );
+        }
     }
 
     #[test]
-    fn gpui_pending_playback_consumes_step_after_completed_boundary_fault() {
-        let world = command_characterization_world();
-        let step_world = Arc::clone(&world);
-        let step_calls = Arc::new(AtomicU64::new(0));
-        let observed_step_calls = Arc::clone(&step_calls);
-        let simulation_step: WorldStepDriver = Arc::new(move || {
-            observed_step_calls.fetch_add(1, AtomicOrdering::Relaxed);
-            step_world
-                .lock()
-                .expect("world lock for completed-boundary step")
-                .step()?;
-            Err(injected_step_error(
-                "injected admission failure after completed science",
-            ))
-        });
-        let driver = gui_simulation_driver_with_step(
-            &world,
-            simulation_step,
-            one_shot_command_drain(vec![ControlCommand::Step, ControlCommand::Resume]),
-        );
-        let now = Instant::now();
-        {
-            let mut driver = driver.lock().expect("GUI simulation driver lock");
-            driver.paused = true;
-            driver.last_sim_instant = Some(now);
-            driver.drive_at(now);
-
-            assert_eq!(
-                driver.pending_playback.len(),
-                1,
-                "a Step that advanced science is consumed even when its callback returns an error"
-            );
-            let pending = driver
-                .pending_playback
-                .front()
-                .expect("trailing Resume remains pending");
-            assert!(!pending.step_once);
-            assert_eq!(pending.paused, Some(false));
-
-            driver.drive_at(now + Duration::from_secs_f32(SIM_TICK_INTERVAL));
-            assert_eq!(
-                driver.pending_playback.len(),
-                1,
-                "the later Resume must remain dormant behind the terminal fault"
-            );
+    fn gpui_host_retains_second_completed_boundary_when_storage_closes() {
+        fn admit(port: &mut impl HostPort, id: u128, command: scriptbots_runtime::HostCommand) {
+            let envelope = CommandEnvelope::new(CommandId::new(id), command);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match port.submit(envelope.clone()) {
+                    Ok(status) => {
+                        assert!(matches!(status.application(), ApplicationState::Admitted));
+                        return;
+                    }
+                    Err(
+                        error @ scriptbots_runtime::HostAccessError::CommandAuthorityLookup {
+                            failure: scriptbots_runtime::CommandAuthorityLookupFailure::Pending,
+                            ..
+                        },
+                    ) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "command {id} claim remains pending: {error}"
+                        );
+                        std::thread::park_timeout(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("command {id} admission failed: {error}"),
+                }
+            }
         }
 
-        assert_eq!(world.lock().expect("world lock").tick().0, 1);
-        assert_eq!(step_calls.load(AtomicOrdering::Relaxed), 1);
+        let mut pipeline = scriptbots_storage::StoragePipeline::unattributed_memory().unwrap();
+        let session = HostSessionId::new(95);
+        let journal = pipeline.journal_port(session, Default::default()).unwrap();
+        let world = Arc::try_unwrap(command_characterization_world())
+            .unwrap_or_else(|_| panic!("storage closure fixture still shared"))
+            .into_inner()
+            .unwrap();
+        let mut owner = HostCore::with_journal(
+            session,
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            Box::new(journal),
+        )
+        .unwrap();
+        let mut port = owner.local_port();
+        admit(&mut port, 1, scriptbots_runtime::HostCommand::Step);
+        assert_eq!(
+            owner
+                .drive(ManualInstant::from_nanos(0))
+                .unwrap()
+                .scientific_steps,
+            1
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut now = 1;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "first Step must reach volatile commitment"
+            );
+            assert_eq!(
+                owner
+                    .drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            now += 1;
+            let status = port.command_status(CommandId::new(1)).unwrap().unwrap();
+            assert!(
+                matches!(status.application(), ApplicationState::Applied(applied) if applied.tick.0 == 1)
+            );
+            if matches!(
+                status.journal(),
+                scriptbots_runtime::JournalState::CommittedVolatile
+            ) {
+                break;
+            }
+            assert!(
+                !matches!(
+                    status.journal(),
+                    scriptbots_runtime::JournalState::Failed(_)
+                ),
+                "first journal failed: {status:?}"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        for (id, command) in [
+            (2, scriptbots_runtime::HostCommand::Step),
+            (3, scriptbots_runtime::HostCommand::Resume),
+        ] {
+            admit(&mut port, id, command);
+        }
+        // Close the real worker admission gate. Step 2 still completes science;
+        // its independent journal failure must retain that exact boundary and
+        // prevent Resume from overtaking it. This is not a pre-Step-2 failure.
+        pipeline.shutdown().unwrap();
+        assert_eq!(
+            owner
+                .drive(ManualInstant::from_nanos(now))
+                .unwrap()
+                .scientific_steps,
+            1
+        );
+        let second = port.command_status(CommandId::new(2)).unwrap().unwrap();
+        assert!(
+            matches!(second.application(), ApplicationState::Applied(applied) if applied.tick.0 == 2)
+        );
+        assert!(
+            matches!(second.journal(), scriptbots_runtime::JournalState::Failed(failure) if failure.code == "journal_closed")
+        );
+        let retained = owner.pending_journal_batch().unwrap();
+        assert_eq!(retained.command_id(), Some(CommandId::new(2)));
+        let observed = fault_boundary_observation(&owner);
+        let fault = owner.health().fault().cloned().unwrap();
+        for offset in [1, 1_000, 1_000_000] {
+            assert_eq!(
+                owner
+                    .drive(ManualInstant::from_nanos(now + offset))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            assert_eq!(fault_boundary_observation(&owner), observed);
+            assert!(Arc::ptr_eq(
+                &retained,
+                &owner.pending_journal_batch().unwrap()
+            ));
+            assert_eq!(owner.health().fault(), Some(&fault));
+            assert_eq!(
+                port.command_status(CommandId::new(2)).unwrap().unwrap(),
+                second
+            );
+            assert!(matches!(
+                port.command_status(CommandId::new(3))
+                    .unwrap()
+                    .unwrap()
+                    .application(),
+                ApplicationState::Admitted
+            ));
+        }
+    }
+
+    #[test]
+    fn gpui_host_step_stays_applied_after_completed_population_fault() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 50,
+            population_minimum: 1,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(0xFA17),
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        // Fail the actual population factory inside a scientific transition,
+        // rather than returning a fabricated error after a successful step.
+        world
+            .brain_registry_mut()
+            .unwrap()
+            .register("test.population-fault", move |_| {
+                observed_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                Err(scriptbots_core::BrainSpawnError::new(
+                    "test.population-fault",
+                    std::io::Error::other("deliberate population factory failure"),
+                ))
+            });
+        let mut owner = HostCore::new(
+            HostSessionId::new(1),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .unwrap();
+        let mut port = owner.local_port();
+        for (id, command) in [
+            (1, scriptbots_runtime::HostCommand::Step),
+            (2, scriptbots_runtime::HostCommand::Resume),
+            (3, scriptbots_runtime::HostCommand::Step),
+        ] {
+            port.submit(CommandEnvelope::new(CommandId::new(id), command))
+                .unwrap();
+        }
+        assert_eq!(
+            owner
+                .drive(ManualInstant::from_nanos(0))
+                .unwrap()
+                .scientific_steps,
+            1
+        );
+        let status = port.command_status(CommandId::new(1)).unwrap().unwrap();
+        assert!(
+            matches!(status.application(), ApplicationState::Applied(applied) if applied.tick.0 == 1)
+        );
+        assert!(matches!(
+            port.command_status(CommandId::new(3)).unwrap().unwrap().application(),
+            ApplicationState::Failed(failure) if failure.code == "science_blocked"
+        ));
+        let snapshot = owner.latest_snapshot();
+        assert!(
+            matches!(snapshot.health.fault(), Some(scriptbots_runtime::HostFault::Scientific { tick, code, message })
+            if tick.0 == 1 && code == "brain_spawn" && message.contains("deliberate population factory failure"))
+        );
+        assert!(
+            snapshot.playback.paused,
+            "Resume cannot restart faulted science"
+        );
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 1);
+        assert!(matches!(
+            owner.scientific_digest_v1(),
+            Err(scriptbots_core::CharacterizationError::NonContinuable {
+                blocker: scriptbots_core::WorldContinuationBlocker::BrainFault
+            })
+        ));
+        let observed = fault_boundary_observation(&owner);
+        for now in [1, 1_000_000_000] {
+            assert_eq!(
+                owner
+                    .drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            assert_eq!(fault_boundary_observation(&owner), observed);
+            assert_eq!(
+                owner.latest_snapshot().health.fault(),
+                snapshot.health.fault()
+            );
+            assert_eq!(
+                port.command_status(CommandId::new(1))
+                    .unwrap()
+                    .unwrap()
+                    .application(),
+                status.application()
+            );
+        }
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]
