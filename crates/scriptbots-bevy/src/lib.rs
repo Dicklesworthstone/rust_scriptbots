@@ -6572,6 +6572,15 @@ fn control_camera(
         rig.pan = target_focus - anchor;
     }
 
+    // A followed target crossing the toroidal seam must not drag the camera
+    // through the whole map. Free-camera movement is deliberately unaffected.
+    let focus_delta = target_focus - rig.focus_smoothed;
+    let follow_discontinuity = rig.follow_mode != FollowMode::Off
+        && ((world_size.x > 0.0 && focus_delta.x.abs() > world_size.x * 0.5)
+            || (world_size.y > 0.0 && focus_delta.y.abs() > world_size.y * 0.5));
+    if follow_discontinuity {
+        rig.focus_smoothed = target_focus;
+    }
     if rig.recenter_now || motion.as_ref().is_some_and(|settings| !settings.enabled) {
         rig.focus_smoothed = target_focus;
         rig.distance_smoothed = rig.distance;
@@ -10127,6 +10136,108 @@ mod tests {
                 .translation,
             unsmoothed.translation
         );
+    }
+
+    #[test]
+    fn follow_camera_snaps_large_seam_jumps_without_snapping_zoom_or_free_pan() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default());
+        app.insert_resource(CameraRig::default());
+        app.insert_resource(SnapshotState::default());
+        app.insert_resource(ButtonInput::<MouseButton>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(Messages::<MouseMotion>::default());
+        app.insert_resource(Messages::<MouseWheel>::default());
+        app.add_systems(Update, control_camera);
+        let camera = app
+            .world_mut()
+            .spawn((PrimaryCamera, Transform::default()))
+            .id();
+        for (from, target, mode, snap) in [
+            (
+                Vec2::new(990.0, 500.0),
+                Vec2::new(10.0, 500.0),
+                FollowMode::Selected,
+                true,
+            ),
+            (
+                Vec2::new(10.0, 500.0),
+                Vec2::new(990.0, 500.0),
+                FollowMode::Selected,
+                true,
+            ),
+            (
+                Vec2::new(500.0, 990.0),
+                Vec2::new(500.0, 10.0),
+                FollowMode::Oldest,
+                true,
+            ),
+            (
+                Vec2::new(500.0, 10.0),
+                Vec2::new(500.0, 990.0),
+                FollowMode::Oldest,
+                true,
+            ),
+            (
+                Vec2::splat(200.0),
+                Vec2::splat(700.0),
+                FollowMode::Selected,
+                false,
+            ),
+            (
+                Vec2::splat(200.0),
+                Vec2::splat(210.0),
+                FollowMode::Selected,
+                false,
+            ),
+            (
+                Vec2::splat(10.0),
+                Vec2::splat(990.0),
+                FollowMode::Off,
+                false,
+            ),
+        ] {
+            app.insert_resource(CameraRig {
+                follow_mode: mode,
+                focus_smoothed: from,
+                free_focus: Some(from),
+                pan: if mode == FollowMode::Off {
+                    target - from
+                } else {
+                    Vec2::ZERO
+                },
+                distance: 700.0,
+                distance_smoothed: 400.0,
+                recenter_now: false,
+                ..Default::default()
+            });
+            app.insert_resource(SnapshotState {
+                world_size: Vec2::splat(1000.0),
+                selection_center: Some(target),
+                oldest_position: Some(target),
+                ..Default::default()
+            });
+            app.update();
+            let expected = if snap { target } else { from };
+            let rig = app.world().resource::<CameraRig>();
+            assert_eq!(
+                rig.focus_smoothed, expected,
+                "{mode:?}: {from:?} -> {target:?}"
+            );
+            assert_eq!(
+                rig.distance_smoothed, 400.0,
+                "focus discontinuity must not snap zoom"
+            );
+            let center = Vec3::new(expected.x - 500.0, 0.0, 500.0 - expected.y);
+            let transform = app.world().entity(camera).get::<Transform>().unwrap();
+            assert!((transform.translation.distance(center) - 400.0).abs() < 0.001);
+            assert!(
+                transform
+                    .forward()
+                    .dot((center - transform.translation).normalize())
+                    > 0.999
+            );
+        }
     }
 
     #[test]
