@@ -97,6 +97,79 @@ struct ControlHealthMonitor {
     failure_reported: bool,
 }
 
+#[derive(Resource)]
+struct HostLifecycleMonitor {
+    snapshots: scriptbots_runtime::SnapshotHub,
+    failures: mpsc::Sender<BevyLifecycleFailure>,
+    running: Arc<AtomicBool>,
+    terminal_reported: bool,
+}
+
+fn host_terminal_result(snapshot: &RenderSnapshot) -> Option<Result<(), String>> {
+    // A fault remains a failure even if finalization also reached Stopped.
+    if let Some(fault) = snapshot.health.fault() {
+        return Some(Err(format!("{fault:?}")));
+    }
+    (snapshot.lifecycle == scriptbots_runtime::HostLifecycle::Stopped).then_some(Ok(()))
+}
+
+fn install_host_lifecycle_monitor(
+    app: &mut App,
+    snapshots: scriptbots_runtime::SnapshotHub,
+    failures: mpsc::Sender<BevyLifecycleFailure>,
+    running: Arc<AtomicBool>,
+) {
+    app.insert_resource(HostLifecycleMonitor {
+        snapshots,
+        failures,
+        running,
+        terminal_reported: false,
+    })
+    .add_systems(
+        Update,
+        poll_host_lifecycle.before(poll_bevy_lifecycle_failures),
+    );
+}
+
+fn poll_host_lifecycle(
+    mut monitor: ResMut<HostLifecycleMonitor>,
+    mut exit_events: MessageWriter<AppExit>,
+) {
+    // This detached, latest-value read cannot wait on projection work, command
+    // admission, or storage. It also does not keep command ingress alive.
+    let snapshot = monitor.snapshots.latest();
+    if let Some(exit) = monitor.observe(&snapshot) {
+        exit_events.write(exit);
+    }
+}
+
+impl HostLifecycleMonitor {
+    fn observe(&mut self, snapshot: &RenderSnapshot) -> Option<AppExit> {
+        if self.terminal_reported {
+            return None;
+        }
+        let result = host_terminal_result(snapshot)?;
+        self.terminal_reported = true;
+        self.running.store(false, Ordering::Release);
+        match result {
+            Ok(()) => {
+                info!(
+                    tick = snapshot.world.tick,
+                    "simulation host stopped; closing Bevy renderer"
+                );
+                Some(AppExit::Success)
+            }
+            Err(detail) => {
+                let _ = self.failures.send(BevyLifecycleFailure {
+                    component: "simulation host",
+                    detail,
+                });
+                None
+            }
+        }
+    }
+}
+
 struct BevyWorkerGroup {
     running: Arc<AtomicBool>,
     workers: Vec<(&'static str, BevyWorker)>,
@@ -589,6 +662,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     let controls_resource = SimulationControl::new();
     let controls_for_thread = controls_resource.clone();
     let snapshot_failures = failure_tx.clone();
+    let host_snapshots = host.snapshot_hub();
 
     let snapshot_worker = thread::Builder::new()
         .name("scriptbots-bevy-snapshot".into())
@@ -657,6 +731,12 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     };
 
     let mut app = App::new();
+    install_host_lifecycle_monitor(
+        &mut app,
+        host_snapshots,
+        failure_tx.clone(),
+        Arc::clone(&running),
+    );
     let diagnostics_enabled = diagnostics_enabled();
     // bd-2z0.14.3.3: probe the adapter and resolve the effective quality tier
     // BEFORE the render app exists so the capability report is honest even
@@ -9967,6 +10047,133 @@ mod tests {
         let error = app_exit_result(AppExit::error()).expect_err("error exit must propagate");
         assert!(error.to_string().contains("error code 1"));
         app_exit_result(AppExit::Success).expect("success exit");
+    }
+
+    #[test]
+    fn real_host_shutdown_exits_bevy_without_projection_worker_or_science_steps() {
+        use scriptbots_runtime::{
+            HostCore, HostCoreOptions, HostSessionId, ManualHostDriver, ManualInstant,
+        };
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let mut host =
+            HostCore::new(HostSessionId::new(91), world, HostCoreOptions::default()).unwrap();
+        let before = host.scientific_digest_v1().unwrap();
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        install_host_lifecycle_monitor(
+            &mut app,
+            host.snapshot_hub(),
+            failure_tx,
+            Arc::clone(&running),
+        );
+        app.update();
+        assert!(app.should_exit().is_none());
+        assert!(running.load(Ordering::Acquire));
+        host.request_shutdown().unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(
+            host.latest_snapshot().lifecycle,
+            scriptbots_runtime::HostLifecycle::Stopping
+        );
+        app.update();
+        assert!(app.should_exit().is_none());
+        assert!(running.load(Ordering::Acquire));
+        // The next owner boundary observes the volatile journal barrier;
+        // shutdown admission/application alone must not close the renderer.
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(
+            host.latest_snapshot().lifecycle,
+            scriptbots_runtime::HostLifecycle::Stopped
+        );
+        app.update();
+        assert!(matches!(app.should_exit(), Some(AppExit::Success)));
+        assert!(!running.load(Ordering::Acquire));
+        assert!(failure_rx.try_recv().is_err());
+        assert_eq!(host.scientific_digest_v1().unwrap(), before);
+        // Consume the first event so another frame cannot hide duplicate exits.
+        app.world_mut().resource_mut::<Messages<AppExit>>().clear();
+        app.update();
+        assert!(app.should_exit().is_none());
+    }
+
+    #[test]
+    fn host_health_matrix_preserves_faults_and_keeps_recoverable_states_open() {
+        use scriptbots_runtime::{
+            HostBlocker, HostCore, HostCoreOptions, HostFault, HostHealth, HostLifecycle,
+            HostSessionId,
+        };
+        let world = WorldState::new(ScriptBotsConfig::default()).unwrap();
+        let host =
+            HostCore::new(HostSessionId::new(92), world, HostCoreOptions::default()).unwrap();
+        let fault = HostFault::Protocol {
+            code: "lifecycle_matrix".into(),
+            message: "exact diagnostic must survive".into(),
+        };
+        // Explicit projection-state unit matrix, not a claim to induce a live
+        // scientific fault. Every cell uses the production observation method
+        // and actual Bevy lifecycle error consumer.
+        for lifecycle in [
+            HostLifecycle::Running,
+            HostLifecycle::Stopping,
+            HostLifecycle::Stopped,
+        ] {
+            for health in [
+                HostHealth::Healthy,
+                HostHealth::Blocked(HostBlocker::PlaybackPaused),
+                HostHealth::Faulted(fault.clone()),
+            ] {
+                let (failure_tx, failure_rx) = mpsc::channel();
+                let first_failure = Arc::new(Mutex::new(None));
+                let running = Arc::new(AtomicBool::new(true));
+                let mut monitor = HostLifecycleMonitor {
+                    snapshots: host.snapshot_hub(),
+                    failures: failure_tx,
+                    running: Arc::clone(&running),
+                    terminal_reported: false,
+                };
+                let mut snapshot = (*host.latest_snapshot()).clone();
+                snapshot.lifecycle = lifecycle;
+                snapshot.health = health.clone();
+                let mut app = App::new();
+                app.add_plugins(MinimalPlugins)
+                    .insert_non_send_resource(BevyLifecycleFailureInbox {
+                        receiver: failure_rx,
+                        first_failure: Arc::clone(&first_failure),
+                    })
+                    .add_systems(Update, poll_bevy_lifecycle_failures);
+                let exit = monitor.observe(&snapshot);
+                if let Some(exit) = exit {
+                    app.world_mut().write_message(exit);
+                }
+                app.update();
+                let faulted = health.fault().is_some();
+                let terminal = faulted || lifecycle == HostLifecycle::Stopped;
+                assert_eq!(running.load(Ordering::Acquire), !terminal);
+                if faulted {
+                    assert!(matches!(app.should_exit(), Some(AppExit::Error(_))));
+                    assert_eq!(
+                        first_failure.lock().unwrap().as_deref(),
+                        Some(format!("Bevy simulation host failed: {fault:?}").as_str())
+                    );
+                } else if terminal {
+                    assert!(matches!(app.should_exit(), Some(AppExit::Success)));
+                    assert!(first_failure.lock().unwrap().is_none());
+                } else {
+                    assert!(app.should_exit().is_none());
+                    assert!(first_failure.lock().unwrap().is_none());
+                }
+                app.world_mut().resource_mut::<Messages<AppExit>>().clear();
+                assert!(monitor.observe(&snapshot).is_none());
+                app.update();
+                assert!(app.should_exit().is_none());
+            }
+        }
     }
 
     #[test]
