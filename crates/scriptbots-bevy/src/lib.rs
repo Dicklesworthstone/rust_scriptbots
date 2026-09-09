@@ -4108,6 +4108,93 @@ mod adaptive_governor_tests {
     use super::*;
 
     #[test]
+    fn terrain_detail_mips_are_complete_filtered_and_include_odd_edges() {
+        use bevy::image::{ImageFilterMode, ImageSampler};
+        for divisor in [1, 2, 4, 86, 255] {
+            let image = terrain_detail_image(divisor);
+            let width = image.texture_descriptor.size.width;
+            assert_eq!(image.texture_descriptor.mip_level_count, width.ilog2() + 1);
+            let ImageSampler::Descriptor(sampler) = &image.sampler else {
+                panic!("terrain filtering must not depend on ImagePlugin defaults");
+            };
+            assert_eq!(sampler.min_filter, ImageFilterMode::Linear);
+            assert_eq!(sampler.mag_filter, ImageFilterMode::Linear);
+            assert_eq!(sampler.mipmap_filter, ImageFilterMode::Linear);
+            let data = image.data.as_ref().unwrap();
+            let mut offset = 0;
+            let mut previous: Option<(&[u8], usize)> = None;
+            for level in 0..image.texture_descriptor.mip_level_count {
+                let side = (width >> level).max(1) as usize;
+                let bytes = side * side * 4;
+                let pixels = &data[offset..offset + bytes];
+                for pixel in pixels.as_chunks::<4>().0 {
+                    assert_eq!([pixel[0], pixel[2], pixel[3]], [255; 3]);
+                    assert!(pixel[1] >= 193);
+                }
+                if let Some((parent, parent_side)) = previous {
+                    if parent_side == 3 {
+                        assert_eq!(side, 1);
+                        let sum: u32 = parent
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|p| u32::from(p[1]))
+                            .sum();
+                        assert_eq!(
+                            u32::from(pixels[1]),
+                            (sum + 4) / 9,
+                            "all nine odd-level texels contribute"
+                        );
+                    } else {
+                        for (x, y) in [(0, 0), (side - 1, side - 1)] {
+                            let source = (y * 2 * parent_side + x * 2) * 4 + 1;
+                            let sum: u32 = [
+                                parent[source],
+                                parent[source + 4],
+                                parent[source + parent_side * 4],
+                                parent[source + parent_side * 4 + 4],
+                            ]
+                            .map(u32::from)
+                            .iter()
+                            .sum();
+                            assert_eq!(u32::from(pixels[(y * side + x) * 4 + 1]), (sum + 2) / 4);
+                        }
+                    }
+                }
+                previous = Some((pixels, side));
+                offset += bytes;
+            }
+            assert_eq!(
+                offset,
+                data.len(),
+                "payload exactly matches declared mip chain"
+            );
+            assert_eq!(previous.unwrap().1, 1);
+        }
+        // Generated coarse noise can round to the same value with or without
+        // the odd edges. Put all energy in the final corner to expose that bug.
+        let side = 3_u32;
+        let count = (side * side) as usize;
+        let mut pixels = [255, 0, 255, 255].repeat(count);
+        pixels[(count - 1) * 4 + 1] = 255;
+        let truncated_average = [pixels[1], pixels[5], pixels[13], pixels[17]]
+            .map(u32::from)
+            .iter()
+            .sum::<u32>()
+            / 4;
+        assert_eq!(
+            append_terrain_detail_mips(&mut pixels, side),
+            side.ilog2() + 1
+        );
+        let last = u32::from(pixels[count * 4 + 1]);
+        assert_eq!(last, (255 + count as u32 / 2) / count as u32);
+        assert_ne!(
+            last, truncated_average,
+            "fixture distinguishes omission of the odd edges"
+        );
+    }
+
+    #[test]
     fn terrain_detail_tiers_average_one_nonuniform_linear_roughness_pattern() {
         use bevy::render::render_resource::TextureFormat;
         let full = terrain_detail_image(1);
@@ -7128,7 +7215,7 @@ fn terrain_detail_image(divisor: u8) -> Image {
             pixels.extend_from_slice(&[255, ((sum + count / 2) / count) as u8, 255, 255]);
         }
     }
-    Image::new(
+    let mut image = Image::new(
         Extent3d {
             width: side,
             height: side,
@@ -7138,7 +7225,41 @@ fn terrain_detail_image(divisor: u8) -> Image {
         pixels,
         TextureFormat::Rgba8Unorm,
         RenderAssetUsages::default(),
-    )
+    );
+    let pixels = image.data.as_mut().expect("terrain detail has CPU pixels");
+    image.texture_descriptor.mip_level_count = append_terrain_detail_mips(pixels, side);
+    image.sampler = bevy::image::ImageSampler::linear();
+    image
+}
+
+fn append_terrain_detail_mips(pixels: &mut Vec<u8>, side: u32) -> u32 {
+    let mut levels = 1;
+    let mut previous_side = side;
+    let mut previous_offset = 0;
+    while previous_side > 1 {
+        let next_side = previous_side / 2;
+        let next_offset = pixels.len();
+        for y in 0..next_side {
+            for x in 0..next_side {
+                let mut sum = 0_u32;
+                let mut count = 0_u32;
+                // Partition the whole previous level, including the final row
+                // and column of odd dimensions. Every source texel contributes.
+                for sy in y * previous_side / next_side..(y + 1) * previous_side / next_side {
+                    for sx in x * previous_side / next_side..(x + 1) * previous_side / next_side {
+                        let offset = previous_offset + ((sy * previous_side + sx) * 4) as usize;
+                        sum += u32::from(pixels[offset + 1]);
+                        count += 1;
+                    }
+                }
+                pixels.extend_from_slice(&[255, ((sum + count / 2) / count) as u8, 255, 255]);
+            }
+        }
+        previous_side = next_side;
+        previous_offset = next_offset;
+        levels += 1;
+    }
+    levels
 }
 
 pub(crate) fn apply_tier_to_terrain_detail(
