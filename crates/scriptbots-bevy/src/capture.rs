@@ -31,7 +31,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::prelude::*;
 use bevy::ecs::system::RunSystemOnce;
-use bevy::math::primitives::{Capsule3d, Cone, Rectangle, Sphere, Torus};
+use bevy::math::primitives::{Cone, Rectangle, Sphere, Torus};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::renderer::{
@@ -1750,7 +1750,7 @@ fn setup_capture_resources(
 ) {
     commands.insert_resource(AgentMeshes {
         base_radius: 1.0,
-        body: meshes.add(Mesh::from(Capsule3d::new(0.5, 1.6))),
+        body: meshes.add(Mesh::from(crate::AGENT_BODY_CAPSULE)),
         wheel: meshes.add(Mesh::from(Torus::new(0.3, 0.6))),
         spike: meshes.add(Mesh::from(Cone {
             radius: 0.45,

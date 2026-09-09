@@ -1080,6 +1080,8 @@ pub(crate) struct AgentMeshes {
     ring: Handle<Mesh>,
 }
 
+pub(crate) const AGENT_BODY_CAPSULE: Capsule3d = Capsule3d::new(0.5, 1.6);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ColorPaletteMode {
     #[default]
@@ -2819,7 +2821,7 @@ fn setup_scene(
         TierDrivenSunLight,
     ));
 
-    let body_mesh = meshes.add(Mesh::from(Capsule3d::new(0.5, 1.6)));
+    let body_mesh = meshes.add(Mesh::from(AGENT_BODY_CAPSULE));
     let wheel_mesh = meshes.add(Mesh::from(Torus::new(0.3, 0.6)));
     let spike_mesh = meshes.add(Mesh::from(Cone {
         radius: 0.45,
@@ -8792,10 +8794,13 @@ fn apply_agent_visuals(
     let body_transform = Transform {
         translation: Vec3::ZERO,
         rotation: Quat::from_rotation_z(FRAC_PI_2),
+        // Capsule length is local Y; the rotation maps it onto agent X.
+        // Normalize the source primitive so these are world dimensions,
+        // rather than scale factors whose meaning depends on the mesh.
         scale: Vec3::new(
-            body_length.max(0.1),
-            body_radius.max(0.1),
-            body_radius.max(0.1),
+            body_radius / AGENT_BODY_CAPSULE.radius,
+            body_length / (2.0 * (AGENT_BODY_CAPSULE.radius + AGENT_BODY_CAPSULE.half_length)),
+            body_radius / AGENT_BODY_CAPSULE.radius,
         ),
     };
     let (body_color, body_emissive) = agent_colors_from_params(&visuals, palette);
@@ -11466,7 +11471,7 @@ mod tests {
     }
 
     #[test]
-    fn boost_quad_extends_rearward_from_fixed_attachment_and_obeys_visibility() -> Result<()> {
+    fn agent_body_bounds_and_boost_attachment_follow_snapshot_dimensions() -> Result<()> {
         let mut world = WorldState::new(ScriptBotsConfig::default())?;
         world.try_spawn_agent(scriptbots_core::AgentData::default())?;
         let snapshot = WorldSnapshot::from_world(&world).expect("visible diagnostic agent");
@@ -11480,7 +11485,10 @@ mod tests {
         app.insert_resource(TerrainChunkRegistry::default());
         let mut meshes = Assets::<Mesh>::default();
         let quad = meshes.add(Mesh::from(Rectangle::new(1.0, 1.0)));
+        let body = meshes.add(Mesh::from(AGENT_BODY_CAPSULE));
         app.insert_resource(AgentMeshes {
+            base_radius: 1.0,
+            body: body.clone(),
             quad: quad.clone(),
             ..default()
         });
@@ -11491,6 +11499,49 @@ mod tests {
         app.insert_resource(images);
         app.insert_resource(AccessibilityState::default());
         app.add_systems(Update, sync_world);
+
+        for (radius, bounded_radius) in [
+            (0.05, 0.2),
+            (0.2, 0.2),
+            (1.0, 1.0),
+            (10.0, 10.0),
+            (2048.0, 1024.0),
+        ] {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agent_radius = radius;
+            app.update();
+            let record = &app.world().resource::<AgentRegistry>().records[&id];
+            let entity = app.world().entity(record.body.entity);
+            assert_eq!(entity.get::<Mesh3d>().unwrap().0, body);
+            let transform = entity.get::<Transform>().unwrap();
+            let assets = app.world().resource::<Assets<Mesh>>();
+            let mesh = assets.get(&body).unwrap();
+            let bevy::mesh::VertexAttributeValues::Float32x3(vertices) =
+                mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+            else {
+                panic!("body mesh must provide 3D positions");
+            };
+            assert!(!vertices.is_empty());
+            let (min, max) = vertices.iter().fold(
+                (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+                |(min, max), vertex| {
+                    let point = transform.transform_point(Vec3::from_array(*vertex));
+                    (min.min(point), max.max(point))
+                },
+            );
+            let dimensions = (max - min) / bounded_radius;
+            assert!(
+                (dimensions - Vec3::new(2.35, 1.76, 1.76)).length() < 0.001,
+                "actual body vertex bounds at radius {radius}: {dimensions:?}"
+            );
+            assert!(
+                (min + max).length() < bounded_radius * 0.001,
+                "body remains centered"
+            );
+            assert_eq!(app.world().resource::<SnapshotState>().last_applied_tick, 0);
+        }
 
         let mut attachment: Option<Vec3> = None;
         let mut previous_rear: Option<Vec3> = None;
