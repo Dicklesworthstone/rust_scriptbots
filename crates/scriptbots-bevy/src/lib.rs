@@ -1209,11 +1209,17 @@ fn update_part_colors(
     base: Color,
     emissive: Color,
 ) {
+    let emissive = emissive.into();
     if let Some(handle) = part.material.as_ref()
+        // Mutable asset access emits Modified even when no value changes.
+        // Keep unchanged parts out of render-world material preparation.
+        && materials
+            .get(handle)
+            .is_some_and(|mat| mat.base_color != base || mat.emissive != emissive)
         && let Some(mat) = materials.get_mut(handle)
     {
         mat.base_color = base;
-        mat.emissive = emissive.into();
+        mat.emissive = emissive;
     }
 }
 
@@ -11468,6 +11474,125 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn unchanged_part_colors_emit_no_material_events_but_real_changes_do() {
+        use bevy::asset::{AssetApp, AssetEvent, AssetPlugin};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<StandardMaterial>();
+        let base = Color::srgb(0.2, 0.4, 0.6);
+        let glow = Color::linear_rgb(0.1, 0.2, 0.3);
+        let parts: Vec<_> = (0..32)
+            .map(|_| {
+                let material = app
+                    .world_mut()
+                    .resource_mut::<Assets<StandardMaterial>>()
+                    .add(StandardMaterial {
+                        base_color: base,
+                        emissive: glow.into(),
+                        alpha_mode: AlphaMode::Add,
+                        metallic: 0.42,
+                        perceptual_roughness: 0.31,
+                        unlit: true,
+                        ..default()
+                    });
+                PartRef {
+                    entity: Entity::PLACEHOLDER,
+                    material: Some(material),
+                }
+            })
+            .collect();
+        app.update();
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+            .clear();
+
+        for _ in 0..8 {
+            for part in &parts {
+                update_part_colors(
+                    &mut app.world_mut().resource_mut::<Assets<StandardMaterial>>(),
+                    part,
+                    base,
+                    glow,
+                );
+            }
+            app.update();
+            assert_eq!(
+                app.world_mut()
+                    .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+                    .drain()
+                    .count(),
+                0,
+                "unchanged colors must not request GPU material preparation"
+            );
+        }
+
+        let new_base = Color::srgb(0.8, 0.3, 0.1);
+        let new_glow = Color::linear_rgb(4.0, 2.0, 1.0);
+        {
+            let mut materials = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+            update_part_colors(&mut materials, &parts[0], new_base, glow);
+            update_part_colors(&mut materials, &parts[1], base, new_glow);
+        }
+        app.update();
+        let events: Vec<_> = app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+            .drain()
+            .collect();
+        assert_eq!(events.len(), 2);
+        for part in &parts[..2] {
+            assert!(events.contains(&AssetEvent::Modified {
+                id: part.material.as_ref().unwrap().id()
+            }));
+        }
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        for (index, part) in parts.iter().enumerate() {
+            let material = materials.get(part.material.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                material.base_color,
+                if index == 0 { new_base } else { base }
+            );
+            assert_eq!(
+                material.emissive,
+                if index == 1 {
+                    new_glow.into()
+                } else {
+                    glow.into()
+                }
+            );
+            assert_eq!(material.alpha_mode, AlphaMode::Add);
+            assert_eq!(material.metallic, 0.42);
+            assert_eq!(material.perceptual_roughness, 0.31);
+            assert!(material.unlit);
+        }
+        {
+            let mut materials = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+            update_part_colors(&mut materials, &parts[0], new_base, glow);
+            update_part_colors(&mut materials, &parts[1], base, new_glow);
+            for material in [None, Some(Handle::default())] {
+                update_part_colors(
+                    &mut materials,
+                    &PartRef {
+                        entity: Entity::PLACEHOLDER,
+                        material,
+                    },
+                    base,
+                    glow,
+                );
+            }
+        }
+        app.update();
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+                .drain()
+                .count(),
+            0
+        );
     }
 
     #[test]
