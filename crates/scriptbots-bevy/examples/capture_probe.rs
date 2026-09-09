@@ -13,15 +13,28 @@ fn main() {
         ..ScriptBotsConfig::default()
     })
     .expect("world");
+    let mut boosted = Vec::new();
     for i in 0..4u32 {
         let mut a = AgentData::default();
         a.position.x = 200.0 + (i % 2) as f32 * 200.0;
         a.position.y = 200.0 + (i / 2) as f32 * 200.0;
         a.spike_length = 1.0;
-        world.try_spawn_agent(a).expect("spawn");
+        let id = world.try_spawn_agent(a).expect("spawn");
+        if i % 2 == 1 {
+            boosted.push(id);
+        }
     }
     // Step once so the probe exercises a completed science boundary.
     world.step().expect("step once");
+    // Explicit diagnostic state: display active and inactive boost cues in
+    // the same frame, without relying on a random brain choosing to boost.
+    for id in boosted {
+        assert!(
+            world
+                .try_update_agent(id, |agent, _| agent.boost = true)
+                .expect("set diagnostic boost")
+        );
+    }
     let config = OffscreenCaptureConfig {
         viewport: (800, 600),
         render_settings: RenderSettings::default(),

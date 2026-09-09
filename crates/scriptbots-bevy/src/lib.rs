@@ -8929,11 +8929,18 @@ fn apply_agent_visuals(
     update_part_colors(materials, &record.spike, spike_color, spike_emissive);
 
     let boost_strength = clamp01(agent.boost);
+    let boost_length = (scale_factor * (0.6 + boost_strength * 0.9)).max(0.05);
     let boost_transform = Transform {
-        translation: Vec3::new(-body_length * 0.62, -scale_factor * 0.05, 0.0),
-        rotation: Quat::from_rotation_z(FRAC_PI_2),
+        // The unit XY quad extends along X. Anchor its forward edge behind
+        // the body so stronger boosts lengthen the trail rearward.
+        translation: Vec3::new(
+            -body_length * 0.62 - boost_length * 0.5,
+            -scale_factor * 0.05,
+            0.0,
+        ),
+        rotation: Quat::IDENTITY,
         scale: Vec3::new(
-            (scale_factor * (0.6 + boost_strength * 0.9)).max(0.05),
+            boost_length,
             (scale_factor * 0.18).max(0.03),
             (scale_factor * 0.18).max(0.03),
         ),
@@ -11455,6 +11462,87 @@ mod tests {
             forward.dot(toward_center)
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn boost_quad_extends_rearward_from_fixed_attachment_and_obeys_visibility() -> Result<()> {
+        let mut world = WorldState::new(ScriptBotsConfig::default())?;
+        world.try_spawn_agent(scriptbots_core::AgentData::default())?;
+        let snapshot = WorldSnapshot::from_world(&world).expect("visible diagnostic agent");
+        let id = snapshot.agents[0].id;
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot),
+            ..default()
+        });
+        app.insert_resource(AgentRegistry::default());
+        app.insert_resource(TerrainChunkRegistry::default());
+        let mut meshes = Assets::<Mesh>::default();
+        let quad = meshes.add(Mesh::from(Rectangle::new(1.0, 1.0)));
+        app.insert_resource(AgentMeshes {
+            quad: quad.clone(),
+            ..default()
+        });
+        app.insert_resource(meshes);
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        let mut images = Assets::<Image>::default();
+        app.insert_resource(ReflectionProbeAssets::fallback(&mut images));
+        app.insert_resource(images);
+        app.insert_resource(AccessibilityState::default());
+        app.add_systems(Update, sync_world);
+
+        let mut attachment: Option<Vec3> = None;
+        let mut previous_rear: Option<Vec3> = None;
+        for strength in [0.0, 0.02, 0.03, 0.5, 1.0] {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[0].boost = strength;
+            app.update();
+
+            let record = &app.world().resource::<AgentRegistry>().records[&id];
+            let entity = app.world().entity(record.boost.entity);
+            assert_eq!(entity.get::<Mesh3d>().unwrap().0, quad);
+            assert_eq!(
+                *entity.get::<Visibility>().unwrap(),
+                if strength > 0.02 {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                }
+            );
+            let transform = entity.get::<Transform>().unwrap();
+            let front = transform.transform_point(Vec3::X * 0.5);
+            let rear = transform.transform_point(-Vec3::X * 0.5);
+            assert!(front.x < 0.0, "attachment is behind the agent origin");
+            assert!((rear - front).normalize().distance(-Vec3::X) < 0.001);
+            if let Some(expected) = attachment {
+                assert!(
+                    front.distance(expected) < 0.001,
+                    "front edge stays anchored"
+                );
+            }
+            if let Some(previous) = previous_rear {
+                assert!(rear.x < previous.x, "stronger boost extends rearward");
+                assert!((rear.y - previous.y).abs() < 0.001);
+            }
+            attachment = Some(front);
+            previous_rear = Some(rear);
+            assert_eq!(app.world().resource::<SnapshotState>().last_applied_tick, 0);
+        }
+        let mut state = app.world_mut().resource_mut::<SnapshotState>();
+        let snapshot = state.latest.as_mut().unwrap();
+        snapshot.revision += 1;
+        snapshot.agents[0].boost = 0.0;
+        app.update();
+        let boost = app.world().resource::<AgentRegistry>().records[&id]
+            .boost
+            .entity;
+        assert_eq!(
+            app.world().get::<Visibility>(boost),
+            Some(&Visibility::Hidden)
+        );
         Ok(())
     }
 
