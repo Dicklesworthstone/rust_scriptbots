@@ -518,8 +518,12 @@ sketch. `scriptbots-runtime` owns the production bounded Asupersync ingress and
 ordered cancellation/shutdown path, while its canonical `SnapshotHub` retains
 one immutable latest value with independent consumer cursors. `bd-2z0.4.12`
 removes Crossfire from the still-legacy app callback bus without introducing a
-second snapshot transport. The remaining Bevy worker and unbounded snapshot
-queue migrate directly to `SnapshotHub` under `bd-2z0.7.2`; the Tokio watches
+second snapshot transport. [Implemented — TurquoiseLake, 2026-09-09, `bd-pcfj`
+contribution: the Bevy presentation mailbox retains one replaceable pending frame;
+RCH Bevy tests cover stalled delivery, revision gaps, and disconnect. Broader
+host-cutover acceptance remains open.]
+The remaining Bevy projection worker migrates directly to `SnapshotHub` under
+`bd-2z0.7.2`; the Tokio watches
 in `servers.rs` remain private to the Axum adapter. The first-party pin remains
 exactly `=0.3.6`; any advancement is serialized through the dependency lane
 and must preserve one resolved Asupersync type universe.

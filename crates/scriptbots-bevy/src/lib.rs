@@ -52,7 +52,7 @@ use std::{
     env,
     io::Cursor,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -578,7 +578,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         ));
     }
 
-    let (tx, rx) = mpsc::channel::<WorldSnapshot>();
+    let (snapshot_publisher, snapshot_inbox) = SnapshotInbox::pair();
     let (failure_tx, failure_rx) = mpsc::channel::<BevyLifecycleFailure>();
     let first_worker_failure = Arc::new(Mutex::new(None));
     let running = Arc::new(AtomicBool::new(true));
@@ -639,7 +639,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                         &mut next_revision,
                     )? {
                         last_snapshot = Some(snapshot.clone());
-                        if tx.send(snapshot).is_err() {
+                        if !snapshot_publisher.publish(snapshot) {
                             break;
                         }
                     }
@@ -673,7 +673,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
     .insert_resource(AdaptiveQualityGovernor::for_launch(
         &effective_render_settings,
     ))
-    .insert_non_send_resource(SnapshotInbox { receiver: rx })
+    .insert_non_send_resource(snapshot_inbox)
     .insert_non_send_resource(BevyLifecycleFailureInbox {
         receiver: failure_rx,
         first_failure: Arc::clone(&first_worker_failure),
@@ -823,7 +823,49 @@ fn parse_env_flag(value: &str) -> Option<bool> {
 struct PrimaryCamera;
 
 struct SnapshotInbox {
-    receiver: mpsc::Receiver<WorldSnapshot>,
+    pending: Arc<Mutex<Option<WorldSnapshot>>>,
+}
+
+/// A stalled renderer must not retain a history of full world projections.
+/// The weak publisher also lets the worker notice when its consumer disappears.
+struct SnapshotPublisher {
+    pending: Weak<Mutex<Option<WorldSnapshot>>>,
+}
+
+impl SnapshotInbox {
+    fn pair() -> (SnapshotPublisher, Self) {
+        let pending = Arc::new(Mutex::new(None));
+        (
+            SnapshotPublisher {
+                pending: Arc::downgrade(&pending),
+            },
+            Self { pending },
+        )
+    }
+
+    fn take_latest(&self) -> Option<WorldSnapshot> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl SnapshotPublisher {
+    fn publish(&self, snapshot: WorldSnapshot) -> bool {
+        let Some(pending) = self.pending.upgrade() else {
+            return false;
+        };
+        // Only exchange ownership under the lock. Allocation, projection, and
+        // destruction of the displaced world's vectors happen outside it.
+        // No producer waits for the renderer to free queue capacity.
+        let displaced = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(snapshot);
+        drop(displaced);
+        true
+    }
 }
 
 #[derive(Default, Resource)]
@@ -3244,8 +3286,7 @@ fn poll_snapshots(
     mut state: ResMut<SnapshotState>,
     mut motion: ResMut<AgentMotionSettings>,
 ) {
-    let receiver = &inbox.receiver;
-    while let Ok(snapshot) = receiver.try_recv() {
+    if let Some(snapshot) = inbox.take_latest() {
         motion.enabled = !snapshot.reduced_motion;
         state.latest = Some(snapshot);
     }
@@ -7768,6 +7809,109 @@ mod terrain_tests {
     }
 
     #[test]
+    fn stalled_snapshot_consumer_resumes_at_latest_complete_projection() {
+        let (publisher, inbox) = SnapshotInbox::pair();
+        let mut app = App::new();
+        app.insert_non_send_resource(inbox)
+            .init_resource::<SnapshotState>()
+            .insert_resource(AgentMotionSettings { enabled: true })
+            .add_systems(Update, poll_snapshots);
+        app.update();
+        assert!(app.world().resource::<SnapshotState>().latest.is_none());
+
+        let mut snapshot = sample_world_snapshot();
+        snapshot.agents.push(sample_agent_visual());
+        // Same science tick, distinct presentation revisions: coalescing must
+        // preserve paused-world edits as well as advancing science frames.
+        for revision in 1..=1_000 {
+            snapshot.revision = revision;
+            snapshot.agents[0].position.x = revision as f32;
+            snapshot.terrain_color.pixels[0] = (revision % 251) as u8;
+            snapshot.reduced_motion = revision == 1_000;
+            assert!(publisher.publish(snapshot.clone()));
+        }
+        app.update();
+        let latest = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .as_ref()
+            .unwrap();
+        assert_eq!(latest.revision, 1_000);
+        assert_eq!(latest.tick, snapshot.tick);
+        assert_eq!(latest.agents[0].position.x, 1_000.0);
+        assert_eq!(latest.terrain_color.pixels, snapshot.terrain_color.pixels);
+        assert!(!app.world().resource::<AgentMotionSettings>().enabled);
+        assert!(
+            app.world()
+                .non_send_resource::<SnapshotInbox>()
+                .take_latest()
+                .is_none()
+        );
+
+        // An empty poll retains the displayed frame; a later publication still
+        // updates the real consumer, so dropping every frame cannot pass.
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .revision,
+            1_000
+        );
+        snapshot.revision = 1_007;
+        snapshot.tick += 1;
+        snapshot.reduced_motion = false;
+        assert!(publisher.publish(snapshot));
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .revision,
+            1_007
+        );
+        assert!(app.world().resource::<AgentMotionSettings>().enabled);
+    }
+
+    #[test]
+    fn snapshot_publication_does_not_wait_for_rendering_and_detects_disconnect() {
+        let (publisher, inbox) = SnapshotInbox::pair();
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut snapshot = sample_world_snapshot();
+            for revision in 1..=1_000 {
+                snapshot.revision = revision;
+                assert!(publisher.publish(snapshot.clone()));
+            }
+            finished_tx
+                .send(publisher)
+                .expect("test observer remains live");
+        });
+        // Deliberately never consume a frame while the producer runs. A bounded
+        // FIFO with blocking send cannot satisfy this handshake.
+        let publisher = finished_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("publication must finish without renderer polling");
+        worker.join().expect("publisher completed");
+        assert_eq!(inbox.take_latest().expect("latest frame").revision, 1_000);
+        assert!(inbox.take_latest().is_none());
+
+        let (other_publisher, other_inbox) = SnapshotInbox::pair();
+        assert!(publisher.publish(sample_world_snapshot()));
+        assert!(other_inbox.take_latest().is_none());
+        drop(inbox);
+        assert!(!publisher.publish(sample_world_snapshot()));
+        assert!(other_publisher.publish(sample_world_snapshot()));
+        drop(other_publisher);
+        assert!(other_inbox.take_latest().is_some());
+    }
+
+    #[test]
     fn predictive_follow_bounds_velocity_and_rejects_invalid_inputs() {
         let world = Vec2::splat(1000.0);
         assert_eq!(
@@ -8171,8 +8315,8 @@ mod terrain_tests {
     #[test]
     fn same_tick_motion_preferences_reach_both_native_easing_systems() {
         let mut app = App::new();
-        let (sender, receiver) = mpsc::channel();
-        app.insert_non_send_resource(SnapshotInbox { receiver });
+        let (publisher, inbox) = SnapshotInbox::pair();
+        app.insert_non_send_resource(inbox);
         app.insert_resource(SnapshotState::default());
         app.insert_resource(AgentMotionSettings { enabled: true });
         let mut time = Time::<()>::default();
@@ -8244,7 +8388,7 @@ mod terrain_tests {
                 .get_mut::<SpikeDisplayPose>()
                 .unwrap()
                 .transform = Transform::IDENTITY;
-            sender.send(snapshot.clone()).unwrap();
+            assert!(publisher.publish(snapshot.clone()));
             app.update();
             assert_eq!(
                 app.world().resource::<AgentMotionSettings>().enabled,
