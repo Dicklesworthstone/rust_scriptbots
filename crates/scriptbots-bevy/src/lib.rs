@@ -1458,6 +1458,8 @@ const DIAGNOSTIC_REPORT_INTERVAL: u32 = 300;
 const CAMERA_MIN_DISTANCE: f32 = 300.0;
 const CAMERA_MAX_DISTANCE: f32 = 6000.0;
 const CAMERA_SMOOTHING_LERP: f32 = 8.0;
+const CAMERA_PAN_SPEED: f32 = 600.0;
+const CAMERA_PAN_RESPONSE: f32 = 18.0;
 // Interaction tuning, not a platform guarantee: forty trackpad pixels feel like
 // one wheel notch. Normalize before scaling so pixel devices do not jump fivefold.
 const CAMERA_SCROLL_PIXELS_PER_LINE: f64 = 40.0;
@@ -1576,6 +1578,7 @@ struct CameraRig {
     distance: f32,
     distance_smoothed: f32,
     pan: Vec2,
+    pan_velocity: Vec2,
     // World-space anchor for manual panning; never refreshed by agent motion.
     free_focus: Option<Vec2>,
     focus_smoothed: Vec2,
@@ -1592,6 +1595,7 @@ impl Default for CameraRig {
             distance: 2200.0,
             distance_smoothed: 2200.0,
             pan: Vec2::ZERO,
+            pan_velocity: Vec2::ZERO,
             free_focus: None,
             focus_smoothed: Vec2::ZERO,
             follow_mode: FollowMode::Selected,
@@ -6485,14 +6489,34 @@ fn control_camera(
         pan_input.x += 1.0;
     }
 
+    if rig.recenter_now || rig.follow_mode != FollowMode::Off || !allow_pan {
+        rig.pan_velocity = Vec2::ZERO;
+    }
+    let mut target_velocity = Vec2::ZERO;
     if pan_input.length_squared() > 0.0 {
+        pan_input = pan_input.normalize();
         let forward = Vec2::new(rig.yaw.cos(), rig.yaw.sin());
         let right = Vec2::new(-forward.y, forward.x);
-        let delta = (right * pan_input.x + forward * pan_input.y) * 600.0 * time.delta_secs();
+        target_velocity = (right * pan_input.x + forward * pan_input.y) * CAMERA_PAN_SPEED;
         if rig.follow_mode != FollowMode::Off {
             rig.follow_mode = FollowMode::Off;
         }
-        rig.pan += delta;
+    }
+    if rig.follow_mode == FollowMode::Off {
+        let dt = time.delta_secs();
+        let displacement = if motion.as_ref().is_some_and(|settings| !settings.enabled) {
+            rig.pan_velocity = target_velocity;
+            target_velocity * dt
+        } else {
+            // Integrate the exponential velocity response exactly for this
+            // constant-input frame, including the deceleration after release.
+            let blend = -(-CAMERA_PAN_RESPONSE * dt).exp_m1();
+            let difference = rig.pan_velocity - target_velocity;
+            let displacement = target_velocity * dt + difference * (blend / CAMERA_PAN_RESPONSE);
+            rig.pan_velocity -= difference * blend;
+            displacement
+        };
+        rig.pan += displacement;
     }
 
     let mut focus_override = None;
@@ -6561,15 +6585,22 @@ fn control_camera(
 
     let world_size = state.world_size;
     if world_size.x > 0.0 && world_size.y > 0.0 {
-        target_focus.x = target_focus.x.clamp(0.0, world_size.x);
-        target_focus.y = target_focus.y.clamp(0.0, world_size.y);
-    }
-    if rig.follow_mode == FollowMode::Off
-        && let Some(anchor) = rig.free_focus
-    {
-        // Do not bank invisible movement beyond the edge: the first reverse
-        // input must move back into the world rather than repay an overshoot.
-        rig.pan = target_focus - anchor;
+        let bounded = target_focus.clamp(Vec2::ZERO, world_size);
+        if bounded.x != target_focus.x {
+            rig.pan_velocity.x = 0.0;
+        }
+        if bounded.y != target_focus.y {
+            rig.pan_velocity.y = 0.0;
+        }
+        if bounded != target_focus
+            && rig.follow_mode == FollowMode::Off
+            && let Some(anchor) = rig.free_focus
+        {
+            // Only rewrite the offset after actual clipping. Subtracting a
+            // large anchor every frame discards small subpixel pan increments.
+            rig.pan = bounded - anchor;
+        }
+        target_focus = bounded;
     }
 
     // A followed target crossing the toroidal seam must not drag the camera
@@ -10136,6 +10167,99 @@ mod tests {
                 .translation,
             unsmoothed.translation
         );
+    }
+
+    #[test]
+    fn keyboard_pan_is_inertial_frame_independent_and_respects_reduced_motion() {
+        fn run(dt: f32, frames: usize, diagonal: bool, reduced: bool) -> Vec2 {
+            let mut app = App::new();
+            let mut time = Time::<()>::default();
+            time.advance_by(Duration::from_secs_f32(dt));
+            app.insert_resource(time);
+            app.insert_resource(AgentMotionSettings { enabled: !reduced });
+            app.insert_resource(CameraRig {
+                yaw: 0.0,
+                follow_mode: FollowMode::Off,
+                free_focus: Some(Vec2::splat(5000.0)),
+                focus_smoothed: Vec2::splat(5000.0),
+                recenter_now: false,
+                ..Default::default()
+            });
+            app.insert_resource(SnapshotState {
+                world_size: Vec2::splat(10000.0),
+                ..Default::default()
+            });
+            app.insert_resource(ButtonInput::<MouseButton>::default());
+            let mut keys = ButtonInput::<KeyCode>::default();
+            keys.press(KeyCode::KeyW);
+            if diagonal {
+                keys.press(KeyCode::KeyD);
+            }
+            app.insert_resource(keys);
+            app.insert_resource(Messages::<MouseMotion>::default());
+            app.insert_resource(Messages::<MouseWheel>::default());
+            app.add_systems(Update, control_camera);
+            app.world_mut().spawn((PrimaryCamera, Transform::default()));
+            for _ in 0..frames {
+                app.update();
+            }
+            let rig = app.world().resource::<CameraRig>();
+            let held = rig.pan;
+            let speed = rig.pan_velocity.length();
+            if reduced {
+                assert!((speed - CAMERA_PAN_SPEED).abs() < 0.001);
+            } else {
+                assert!(speed > 0.0 && speed < CAMERA_PAN_SPEED);
+            }
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .reset_all();
+            app.update();
+            let rig = app.world().resource::<CameraRig>();
+            if reduced {
+                assert_eq!(rig.pan, held);
+                assert_eq!(rig.pan_velocity, Vec2::ZERO);
+            } else {
+                assert!(
+                    rig.pan.length() > held.length(),
+                    "release must decelerate rather than stop abruptly"
+                );
+                assert!(rig.pan_velocity.length() < speed);
+            }
+            let before_shortcut = rig.pan;
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(KeyCode::ControlLeft);
+            app.update();
+            assert_eq!(app.world().resource::<CameraRig>().pan, before_shortcut);
+            assert_eq!(app.world().resource::<CameraRig>().pan_velocity, Vec2::ZERO);
+            if !reduced {
+                let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+                keys.reset_all();
+                keys.press(KeyCode::KeyS);
+                {
+                    let mut rig = app.world_mut().resource_mut::<CameraRig>();
+                    rig.pan = Vec2::new(5000.0, 0.0);
+                    rig.pan_velocity = Vec2::X * CAMERA_PAN_SPEED;
+                }
+                app.update();
+                assert_eq!(app.world().resource::<CameraRig>().pan.x, 5000.0);
+                assert_eq!(app.world().resource::<CameraRig>().pan_velocity.x, 0.0);
+                app.update();
+                assert!(
+                    app.world().resource::<CameraRig>().pan.x < 5000.0,
+                    "after edge collision, reversal must not repay outward velocity"
+                );
+            }
+            held
+        }
+        let full = run(1.0 / 30.0, 1, false, false);
+        let split = run(1.0 / 60.0, 2, false, false);
+        assert!((full - split).length() < 0.0001);
+        assert!((full.length() - run(1.0 / 30.0, 1, true, false).length()).abs() < 0.0001);
+        let immediate = run(1.0 / 30.0, 1, false, true);
+        assert!((immediate.x - CAMERA_PAN_SPEED / 30.0).abs() < 0.001);
+        assert!(full.length() < immediate.length());
     }
 
     #[test]
