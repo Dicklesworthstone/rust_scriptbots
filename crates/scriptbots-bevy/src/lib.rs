@@ -732,6 +732,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 apply_tier_to_bloom,
                 apply_tier_to_fog,
                 apply_tier_to_ssao,
+                apply_tier_to_reflection_probes,
             )
                 .chain(),
             handle_auto_exposure_toggle,
@@ -854,7 +855,11 @@ pub(crate) struct AgentRegistry {
 pub(crate) struct ReflectionProbeAssets {
     diffuse: Handle<Image>,
     specular: Handle<Image>,
+    disabled_specular: Handle<Image>,
 }
+
+#[derive(Component)]
+pub(crate) struct TierDrivenReflectionProbe;
 
 impl ReflectionProbeAssets {
     /// A neutral, fully populated cubemap until authored environment lighting
@@ -880,10 +885,16 @@ impl ReflectionProbeAssets {
             dimension: Some(TextureViewDimension::Cube),
             ..default()
         });
+        let mut black = image.clone();
+        black.data = Some(
+            [0, 0, 0, 255].repeat(black.texture_descriptor.size.depth_or_array_layers as usize),
+        );
+        let disabled_specular = images.add(black);
         let cube = images.add(image);
         Self {
             diffuse: cube.clone(),
             specular: cube,
+            disabled_specular,
         }
     }
 }
@@ -4095,6 +4106,75 @@ mod visual_authority_consumer_guard {
 mod adaptive_governor_tests {
     use super::*;
 
+    #[test]
+    fn reflection_tiers_switch_real_probe_maps_and_preserve_diffuse_lighting() {
+        let mut app = App::new();
+        let mut images = Assets::<Image>::default();
+        let assets = ReflectionProbeAssets::fallback(&mut images);
+        let original = EnvironmentMapLight {
+            diffuse_map: assets.diffuse.clone(),
+            specular_map: assets.specular.clone(),
+            intensity: 3500.0,
+            ..default()
+        };
+        app.insert_resource(images);
+        app.insert_resource(assets.clone());
+        app.insert_resource(auto_launch(RenderQuality::High));
+        app.add_systems(Update, apply_tier_to_reflection_probes);
+        let probe = app
+            .world_mut()
+            .spawn((TierDrivenReflectionProbe, original.clone()))
+            .id();
+        let unrelated = app.world_mut().spawn(original.clone()).id();
+        for tier in [
+            RenderQuality::High,
+            RenderQuality::Potato,
+            RenderQuality::Medium,
+            RenderQuality::Low,
+            RenderQuality::Ultra,
+        ] {
+            app.insert_resource(auto_launch(tier));
+            app.update();
+            let actual = app
+                .world()
+                .entity(probe)
+                .get::<EnvironmentMapLight>()
+                .unwrap();
+            let expected = if tier_features(tier).water_reflections == 0 {
+                &assets.disabled_specular
+            } else {
+                &assets.specular
+            };
+            assert_eq!(&actual.specular_map, expected, "tier {tier:?}");
+            assert_eq!(actual.diffuse_map, original.diffuse_map);
+            assert_eq!(actual.intensity, original.intensity);
+            assert_eq!(
+                app.world()
+                    .entity(unrelated)
+                    .get::<EnvironmentMapLight>()
+                    .unwrap()
+                    .specular_map,
+                original.specular_map
+            );
+        }
+        app.insert_resource(auto_launch(RenderQuality::Potato));
+        app.update();
+        let late = app
+            .world_mut()
+            .spawn((TierDrivenReflectionProbe, original))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(late)
+                .get::<EnvironmentMapLight>()
+                .unwrap()
+                .specular_map,
+            assets.disabled_specular,
+            "new probe obeys unchanged tier"
+        );
+    }
+
     /// A launch that is permitted to adapt, with a known tier, built by hand so
     /// these tests never depend on the host having a particular GPU.
     fn auto_launch(tier: RenderQuality) -> EffectiveRenderSettings {
@@ -6930,6 +7010,7 @@ fn spawn_reflection_probe(
     commands
         .spawn((
             LightProbe::new(),
+            TierDrivenReflectionProbe,
             EnvironmentMapLight {
                 diffuse_map: assets.diffuse.clone(),
                 specular_map: assets.specular.clone(),
@@ -6943,6 +7024,28 @@ fn spawn_reflection_probe(
             InheritedVisibility::default(),
         ))
         .id()
+}
+
+/// Switch only specular environment sampling: diffuse illumination must survive
+/// the no-reflections tier. Mode 2 still uses the existing static fallback;
+/// planar reflections require a separate render pass and are not implemented.
+pub(crate) fn apply_tier_to_reflection_probes(
+    effective: Res<EffectiveRenderSettings>,
+    assets: Res<ReflectionProbeAssets>,
+    mut probes: Query<&mut EnvironmentMapLight, With<TierDrivenReflectionProbe>>,
+) {
+    let desired = if effective.features.water_reflections == 0 {
+        &assets.disabled_specular
+    } else {
+        &assets.specular
+    };
+    // Also covers probes added on a new snapshot while the tier is unchanged.
+    // Compare first so unchanged frames do not trigger render extraction writes.
+    for mut probe in &mut probes {
+        if probe.specular_map != *desired {
+            probe.specular_map = desired.clone();
+        }
+    }
 }
 
 fn chunk_probe_transform(
@@ -11060,6 +11163,18 @@ mod tests {
             "unselected follow uses the first agent velocity"
         );
         assert_eq!(state.oldest_lead, expected_lead);
+
+        let terrain = app.world().resource::<TerrainChunkRegistry>();
+        assert!(!terrain.chunks.is_empty());
+        for chunk in terrain.chunks.values() {
+            let probe = chunk.probe.expect("terrain chunk has an environment probe");
+            assert!(
+                app.world()
+                    .entity(probe)
+                    .contains::<TierDrivenReflectionProbe>(),
+                "production-spawned probes must participate in tier switching"
+            );
+        }
 
         // The shared sync path must still place capture entities exactly on
         // snapshot poses when the native smoothing system is not installed.

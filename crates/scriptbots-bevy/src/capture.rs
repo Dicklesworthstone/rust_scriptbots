@@ -1304,7 +1304,10 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
                 ..Default::default()
             }),
     )
-    .add_systems(Update, sync_world)
+    .add_systems(
+        Update,
+        (sync_world, crate::apply_tier_to_reflection_probes).chain(),
+    )
     .add_systems(
         Startup,
         (setup_capture_rig, setup_capture_resources).chain(),
@@ -1785,7 +1788,7 @@ mod tests {
             );
             let probes = app.world().resource::<ReflectionProbeAssets>();
             let images = app.world().resource::<Assets<Image>>();
-            for handle in [&probes.diffuse, &probes.specular] {
+            for handle in [&probes.diffuse, &probes.specular, &probes.disabled_specular] {
                 let image = images
                     .get(handle)
                     .expect("probe handle must resolve to an image");
@@ -1809,8 +1812,13 @@ mod tests {
                     Some(TextureViewDimension::Cube)
                 );
                 // Preserve the existing capture fallback on all six faces.
-                let expected = [32, 32, 40, 255]
-                    .repeat(image.texture_descriptor.size.depth_or_array_layers as usize);
+                let pixel = if handle == &probes.disabled_specular {
+                    [0, 0, 0, 255]
+                } else {
+                    [32, 32, 40, 255]
+                };
+                let expected =
+                    pixel.repeat(image.texture_descriptor.size.depth_or_array_layers as usize);
                 assert_eq!(
                     image.data.as_deref(),
                     Some(expected.as_slice()),
