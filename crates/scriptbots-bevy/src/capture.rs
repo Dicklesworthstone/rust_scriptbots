@@ -1331,10 +1331,10 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     app.finish();
     app.cleanup();
     crate::initialize_ssao_support(app.world_mut());
+    let (effective, _) = resolve_capture_quality(&mut app, config)?;
     // Warmup: startup + two frames so base pipelines compile outside the
-    // evidence path.
-    app.update();
-    app.update();
+    // evidence path. Tier consumers run during these first frames too.
+    warmup_capture_app(&mut app, effective);
     info!(
         viewport = ?config.viewport,
         "process-wide offscreen capture app built"
@@ -1497,15 +1497,12 @@ fn add_target_image(app: &mut App, viewport: (u32, u32)) -> Handle<Image> {
     app.world_mut().resource_mut::<Assets<Image>>().add(image)
 }
 
-/// Reset the process app for a new scene: wipe scene CONTENT (meshes,
-/// readbacks, probes — never the capture camera or sun, which were spawned
-/// pre-finish and keep their plugin initialization), reset the registries,
-/// re-resolve the effective tier, create a fresh render target, repoint
-/// the camera, and retune the lighting for tier/corrupt mode.
-fn configure_session<'a>(
-    app: &'a mut App,
+/// Resolve quality against the actual initialized render device, including
+/// before the first warmup frame, not only when configuring later sessions.
+fn resolve_capture_quality(
+    app: &mut App,
     config: &OffscreenCaptureConfig,
-) -> Result<OffscreenCapture<'a>> {
+) -> Result<(crate::EffectiveRenderSettings, String)> {
     let (actual_gpu, actual_device_type) = {
         let render_app = app
             .get_sub_app_mut(RenderApp)
@@ -1539,6 +1536,22 @@ fn configure_session<'a>(
     };
     let effective =
         crate::resolve_effective_render_settings_for_gpu(&config.render_settings, Some(actual_gpu));
+    Ok((effective, actual_device_type))
+}
+
+fn warmup_capture_app(app: &mut App, effective: crate::EffectiveRenderSettings) {
+    app.insert_resource(effective);
+    app.update();
+    app.update();
+}
+
+/// Reset scene content and configure a fresh target and effective tier while
+/// retaining the app-lifetime camera, sun and plugin-owned entities.
+fn configure_session<'a>(
+    app: &'a mut App,
+    config: &OffscreenCaptureConfig,
+) -> Result<OffscreenCapture<'a>> {
+    let (effective, actual_device_type) = resolve_capture_quality(app, config)?;
     // Wipe scene content only. A blanket wipe of every entity kills
     // plugin-owned startup entities the render path depends on (the wiped
     // app then produces no ViewTargets and every capture reads back as the
@@ -1758,6 +1771,48 @@ fn setup_capture_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_capture_warmup_initializes_tier_before_real_consumers_run() {
+        let mut app = App::new();
+        app.insert_resource(SnapshotState::default());
+        app.insert_resource(AgentRegistry::default());
+        app.insert_resource(AccessibilityState::new());
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<Image>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.add_systems(Startup, setup_capture_resources);
+        app.add_systems(
+            Update,
+            (
+                sync_world,
+                crate::apply_tier_to_reflection_probes,
+                crate::apply_tier_to_terrain_detail,
+            )
+                .chain(),
+        );
+        assert!(
+            !app.world()
+                .contains_resource::<crate::EffectiveRenderSettings>()
+        );
+        let effective =
+            crate::resolve_effective_render_settings_for_gpu(&RenderSettings::default(), None);
+        let expected_tier = effective.tier;
+        warmup_capture_app(&mut app, effective);
+        assert_eq!(
+            app.world()
+                .resource::<crate::EffectiveRenderSettings>()
+                .tier,
+            expected_tier
+        );
+        let images = app.world().resource::<Assets<Image>>();
+        assert!(
+            images
+                .iter()
+                .any(|(_, image)| image.texture_descriptor.mip_level_count > 1),
+            "terrain consumer executed during warmup"
+        );
+    }
 
     #[test]
     fn native_and_capture_setup_populate_reflection_cubemaps() {

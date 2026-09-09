@@ -8907,8 +8907,8 @@ fn apply_agent_visuals(
         ),
         rotation: Quat::from_rotation_z(-FRAC_PI_2),
         scale: Vec3::new(
-            spike_length.max(0.06),
             (scale_factor * 0.48).max(0.04),
+            spike_length.max(0.06),
             (scale_factor * 0.48).max(0.04),
         ),
     };
@@ -11596,7 +11596,19 @@ mod tests {
             .get::<SpikePoseTarget>()
             .expect("shared sync publishes spike target");
         assert_eq!(*entity.get::<Transform>().unwrap(), target.transform);
-        assert!(target.transform.scale.x > previous_spike.scale.x);
+        assert!(target.transform.scale.y > previous_spike.scale.y);
+        assert_eq!(target.transform.scale.x, previous_spike.scale.x);
+        assert_eq!(target.transform.scale.z, previous_spike.scale.z);
+        // The stock cone is one unit tall along Y before its -90-degree
+        // rotation. Extension must move its tip along +X without moving its
+        // base or widening the cone, not merely increase a scale component.
+        let base = target.transform.transform_point(-Vec3::Y * 0.5);
+        let tip = target.transform.transform_point(Vec3::Y * 0.5);
+        let previous_base = previous_spike.transform_point(-Vec3::Y * 0.5);
+        let previous_tip = previous_spike.transform_point(Vec3::Y * 0.5);
+        assert!(base.distance(previous_base) < 0.001);
+        assert!((tip - base).normalize().distance(Vec3::X) < 0.001);
+        assert!(tip.x > previous_tip.x);
         assert!(target.transform.translation.x > previous_spike.translation.x);
         assert_eq!(target.tick, snapshot.tick);
         assert!(
