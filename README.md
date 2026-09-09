@@ -66,9 +66,9 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
                 │ AgentSnapshots            │ StepOutcome                │ ControlCommand ↑ / disposition ↓
                 │                           │ + Arc<PersistenceBatch>     │
         ┌───────▼────────┐          ┌────────▼───────────────┐     ┌─────▼──────────┐
-        │ Renderer (GUI) │          │ Application runtime    │     │ Application   │
+        │ Renderer (GUI) │          │ HostCore owner         │     │ HostCore      │
         │ GPUI window    │          │ PersistenceAdmission   │     │ command driver│
-        │ or Terminal TUI│          │ Session / step driver  │     └─────┬───────────┘
+        │ or Terminal TUI│          │ Session / tick boundary│     └─────┬───────────┘
         │ (console text) │          └────────┬───────────────┘           │
         └───────┬────────┘                   │ admitted batch             │
                 │ World snapshots   ┌────────▼───────────┐               │
@@ -84,7 +84,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
                                  ┌─────────────────────────────────────────▼────────────────────┐
                                  │ scriptbots-app (orchestrator)                                │
                                  │ - launches ControlRuntime (Tokio thread)                     │
-                                 │ - owns CommandBus and drains one ordered vector per boundary │
+                                 │ - starts HostThread; shares ChannelHostPort with clients     │
                                  │ - selects Renderer (CLI flag/env)                            │
                                  │ - seeds world, installs brains, primes history               │
                                  └───────────────┬───────────────────────────────┬──────────────┘
@@ -106,11 +106,11 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Background workers: `StoragePipeline` is a bounded-admission writer whose dedicated thread creates and exclusively owns its FrankenSQLite connection; `ControlRuntime` (Tokio) is separately isolated. A successful enqueue is not a durability receipt: flush or shutdown must acknowledge the earlier transactions. Application drivers drain one ordered command vector at a boundary; core applies world-owned mutations and returns normalized playback explicitly instead of owning a second queue.
+- Background workers: `HostThread` owns the simulation's `HostCore` and fixed-deadline driver. `StoragePipeline` is a bounded-admission writer whose separate thread creates and exclusively owns its FrankenSQLite connection; `ControlRuntime` (Tokio) is separately isolated. A successful enqueue is not a durability receipt: flush or shutdown must acknowledge the earlier transactions. Frontends and control servers submit commands through `ChannelHostPort`; the host applies them at owner boundaries.
 - Startup is fail-closed and transactional. Renderer selection and control-environment validation happen first, then every enabled REST/MCP socket is prebound and held before configuration output, auto-tuning, process-priority changes, world construction, or storage reservation. Launch consumes those exact listeners, so a bind failure cannot leave config, tuning, or run-database artifacts behind and cannot race a later rebind.
 - REST and MCP run as supervised sibling tasks. An unexpected error or clean task exit stops the sibling, preserves the original failure as the root cause, and publishes failed runtime health; the TUI, GPUI, and Bevy frontends observe that health and terminate with the same root failure. Graceful shutdown joins both tasks and releases both listeners.
 - That supervision guarantee covers ordinary returned errors and task exits. Debug/test builds use unwinding boundaries to exercise panic reporting, while the shipped `panic = "abort"` release profile intentionally cannot recover from a panic or promise destructor-based cleanup after one.
-- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. GPUI has exactly one session-level simulation driver, independent of either window's repaint cadence, that owns scientific stepping, command draining, and shared pause/speed state; both the Lab and World windows are presentation-only projections. This closes the characterized GPUI double-drive defect. `HostCore` and its native lifecycle are implemented, but TUI/GPUI/Bevy and the live server transports remain on their interim adapters until the dedicated migration beads move that ownership into the renderer-neutral host.
+- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The app transfers the scientific world to `HostThread`; TUI, GPUI, Bevy, and live server transports use ports to that same owner. Both GPUI windows are presentation-only projections, and repaint cadence does not drive scientific ticks. Host lifecycle publications distinguish recoverable blockers, terminal faults, and completed shutdown. The broader `bd-pcfj` cutover remains in progress: obsolete GPUI driver tests, remaining client interaction work, and native acceptance evidence are not yet complete.
 - `scriptbots-runtime` owns the renderer-neutral command, two-axis status, snapshot, event-cursor, and manual-drive contracts plus the exact sole-owner `HostCore`. Command lifecycle schema v1 retains the exact envelope, client namespace/sequence, optional admission order, typed control/scientific/config guards, and contiguous application transitions; every terminal runtime outcome has a journal obligation. Its optional `native-asupersync` feature drives that same `!Send` host as one current-thread root future at absolute deadlines. Commands and journal-ready signals wake the owner, catch-up is bounded and reported, quiescent paused worlds have no periodic timer, and ordered shutdown retains its exact host and journal obligations without spawning or detaching a simulation task. The lifecycle persistence source is committed under `bd-2z0.5.2`; centralized DSR proof is pending.
 - Brain introspection is an explicit read-only projection, never a per-tick side effect. A client issues a revisioned request for up to eight stable `AgentUid` values; core and each brain family enforce independent bounds for layers, names, values, edges, source scalars, and retained payload. Responses carry the exact source tick and typed unavailable/clipped status, while TUI and GPUI cache by client, stable identity, and source tick. With no request, no brain is inspected and NeuroFlow performs no inspection JSON serialization; digest-neutrality and next-output purity are tested across the supported families.
 - Assembly arithmetic can overflow during valid execution. Its protocol adapter discards that candidate state; the world supplies zero actions for the containment tick and schedules the agent for normal death cleanup. The death records the failing cell and exact float bits; analytics shows a separate **Brain fault** cause. Healthy agents continue, while malformed inputs, corrupt envelopes, missing evaluators, and other protocol errors still stop the world. This policy is part of Assembly adapter semantic identity v4; the interpreter arithmetic and genome/state codecs are unchanged.
@@ -125,13 +125,13 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - **`scriptbots-index`**: Production uniform-grid neighborhood index. Alternate backends are not advertised until they have real implementations and conformance coverage.
 - **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
 - **`scriptbots-render`**: GPUI UI layer with a tiled World + Lab shell, canvas renderer for agents/food, selection highlights, tabbed inspection/analytics, and scrollable diagnostics.
-- **`scriptbots-app`**: Binary shell. Wires tracing/logging, config/env, storage pipeline, installs brains, seeds agents, and launches the GPUI shell.
+- **`scriptbots-app`**: Binary shell. Wires tracing/logging, config/env and storage, installs brains, seeds agents, starts the sole-owner `HostThread`, and connects the selected renderer and REST/MCP servers to its ports.
 - **`scriptbots-web`**: WebAssembly harness exposing bindings to init/tick/reset and snapshot the simulation; consumes `scriptbots-core` with `default-features = false` (sequential fallback; Rayon disabled on wasm).
 
 ## Current status
 - Workspace scaffolding, shared lints, and profiles are in place.
 - `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
-- `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, schema-v1 lifecycle evidence, opaque client ports, cursors, manual-drive contract, sole-owner `HostCore`, pure fixed-deadline driver, and optional current-thread Asupersync lifecycle are implemented. The `bd-2z0.5.2` lifecycle source is centralized-DSR-pending; legacy frontend and transport migration remains pending.
+- `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, schema-v1 lifecycle evidence, opaque client ports, cursors, manual-drive contract, sole-owner `HostCore`, pure fixed-deadline driver, and optional current-thread Asupersync lifecycle are implemented. The app uses `HostCore` through its owner thread and channel ports. The `bd-2z0.5.2` lifecycle source is centralized-DSR-pending; the broader frontend cutover acceptance remains open under `bd-pcfj`.
 - `scriptbots-render`: GPUI World + tabbed Lab windows with camera controls, selection highlights, scrollable diagnostics, and optional `kira` audio.
 - `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The full cross-feature/platform startup matrix remains a Phase 0.4 acceptance gate.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
@@ -607,7 +607,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - **Narration hooks** prepared for future screen-reader integration; the toggle stays beside the World presentation controls.
 
 ### Renderer abstraction
-- The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features); `--mode server` runs without a renderer. Frontends still use the transitional ownership paths described above; production HostClient migration remains open.
+- The app selects GPUI, Bevy, or terminal renderers via `--mode {auto|gui|bevy|terminal}` (subject to build features); `--mode server` runs without a renderer. Each mode connects to the same sole-owner host through `ChannelHostPort`. Full client interaction and native cutover acceptance remain open; selecting a renderer does not create another scientific owner.
 
 ### Keyboard shortcuts (GUI)
 
