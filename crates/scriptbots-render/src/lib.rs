@@ -2016,6 +2016,8 @@ pub enum GuiRunError {
     WindowLaunch(String),
     /// A supervised host dependency failed after the windows were published.
     ControlRuntime(String),
+    /// The sole-owner simulation host published a terminal fault.
+    SimulationHost(scriptbots_runtime::HostFault),
 }
 
 impl std::fmt::Display for GuiRunError {
@@ -2023,6 +2025,7 @@ impl std::fmt::Display for GuiRunError {
         match self {
             Self::WindowLaunch(detail) => write!(f, "GPUI launch failed: {detail}"),
             Self::ControlRuntime(detail) => write!(f, "GPUI control runtime failed: {detail}"),
+            Self::SimulationHost(fault) => write!(f, "GPUI simulation host failed: {fault:?}"),
         }
     }
 }
@@ -2044,11 +2047,21 @@ fn record_gui_run_error(slot: &Mutex<Option<GuiRunError>>, error: GuiRunError) {
 
 trait GuiQuitRequest {
     fn request_gui_quit(&mut self);
+
+    fn request_gui_failure(&mut self);
 }
 
 impl GuiQuitRequest for App {
     fn request_gui_quit(&mut self) {
         self.quit();
+    }
+
+    fn request_gui_failure(&mut self) {
+        self.quit();
+        // Windows GPUI calls ExitProcess(0), preempting run_demo's error
+        // return. Preserve failure status for launch and runtime failures.
+        #[cfg(target_os = "windows")]
+        std::process::exit(1);
     }
 }
 
@@ -2059,14 +2072,7 @@ fn abort_gui_launch(
 ) {
     tracing::error!(error = %detail, "aborting GPUI shell launch due to window creation failure");
     record_gui_run_error(slot, GuiRunError::WindowLaunch(detail));
-    app.request_gui_quit();
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows, GPUI platform run calls ExitProcess(0) during quit, which preempts
-        // run_demo from returning its recorded WindowLaunch error to main().
-        // Force an immediate exit(1) on Windows when window launch fails.
-        std::process::exit(1);
-    }
+    app.request_gui_failure();
 }
 
 fn gui_health_failure(probe: &GuiHealthProbe) -> Option<String> {
@@ -2097,14 +2103,16 @@ fn gui_health_failure(probe: &GuiHealthProbe) -> Option<String> {
 
 fn start_gui_health_monitor(
     app: &App,
+    snapshots: scriptbots_runtime::SnapshotHub,
     probe: GuiHealthProbe,
     error_slot: Arc<Mutex<Option<GuiRunError>>>,
-) {
+) -> gpui::Task<()> {
     app.spawn(async move |cx| {
         loop {
-            if let Some(detail) = gui_health_failure(&probe) {
-                record_gui_run_error(&error_slot, GuiRunError::ControlRuntime(detail));
-                cx.update(|app| app.quit());
+            // Read the detached latest publication, not a view's cached frame
+            // or command ingress. A stopped host still has a readable snapshot.
+            let snapshot = snapshots.latest();
+            if cx.update(|app| poll_gui_health(app, &snapshot, &probe, &error_slot)) {
                 return;
             }
             cx.background_executor()
@@ -2112,7 +2120,32 @@ fn start_gui_health_monitor(
                 .await;
         }
     })
-    .detach();
+}
+
+fn poll_gui_health(
+    app: &mut impl GuiQuitRequest,
+    snapshot: &RenderSnapshot,
+    probe: &GuiHealthProbe,
+    error_slot: &Mutex<Option<GuiRunError>>,
+) -> bool {
+    // Neither orderly host finalization nor a simultaneous control failure
+    // may turn a published scientific/journal fault into a successful exit.
+    let error = snapshot
+        .health
+        .fault()
+        .cloned()
+        .map(GuiRunError::SimulationHost)
+        .or_else(|| gui_health_failure(probe).map(GuiRunError::ControlRuntime));
+    if let Some(error) = error {
+        tracing::error!(%error, "terminating GPUI session after runtime failure");
+        record_gui_run_error(error_slot, error);
+        app.request_gui_failure();
+    } else if snapshot.lifecycle != scriptbots_runtime::HostLifecycle::Stopped {
+        return false;
+    } else {
+        app.request_gui_quit();
+    }
+    true
 }
 
 #[derive(Clone)]
@@ -2828,6 +2861,7 @@ pub fn run_demo(
         );
     }
 
+    let host_snapshots = host.snapshot_hub();
     let session = Arc::new(GuiSession::new(host, analytics, command_submit));
     let session_for_app = Arc::clone(&session);
     let run_error = Arc::new(Mutex::new(None));
@@ -2859,7 +2893,13 @@ pub fn run_demo(
             };
             let _ = (hud, canvas);
 
-            start_gui_health_monitor(app, health_probe, Arc::clone(&run_error_for_app));
+            start_gui_health_monitor(
+                app,
+                host_snapshots,
+                health_probe,
+                Arc::clone(&run_error_for_app),
+            )
+            .detach();
             app.activate(true);
         });
 
@@ -18472,11 +18512,17 @@ mod command_characterization_tests {
     #[derive(Default)]
     struct FakeGuiLifecycle {
         quit_requested: bool,
+        failure_requested: bool,
     }
 
     impl GuiQuitRequest for FakeGuiLifecycle {
         fn request_gui_quit(&mut self) {
             self.quit_requested = true;
+        }
+
+        fn request_gui_failure(&mut self) {
+            self.failure_requested = true;
+            self.request_gui_quit();
         }
     }
 
@@ -18520,6 +18566,119 @@ mod command_characterization_tests {
             gui_health_failure(&failed).as_deref(),
             Some("injected REST serve failure")
         );
+    }
+
+    #[test]
+    fn gui_health_monitor_stops_polling_after_real_host_shutdown() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        use scriptbots_runtime::{
+            HostCore, HostCoreOptions, HostLifecycle, HostSessionId, ManualHostDriver,
+            ManualInstant,
+        };
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            population_minimum: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let mut host =
+            HostCore::new(HostSessionId::new(93), world, HostCoreOptions::default()).unwrap();
+        let before = host.scientific_digest_v1().unwrap();
+        let polls = Arc::new(AtomicU64::new(0));
+        let probe_polls = Arc::clone(&polls);
+        let probe: GuiHealthProbe = Arc::new(move || {
+            probe_polls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        });
+        let slot = Arc::new(Mutex::new(None));
+        let mut app = gpui::TestApp::new();
+        let _monitor = app.update(|app| {
+            start_gui_health_monitor(app, host.snapshot_hub(), probe, Arc::clone(&slot))
+        });
+        app.run_until_parked();
+        let initial_polls = polls.load(AtomicOrdering::SeqCst);
+        assert!(initial_polls > 0);
+        host.request_shutdown().unwrap();
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(host.latest_snapshot().lifecycle, HostLifecycle::Stopping);
+        app.advance_clock(Duration::from_millis(50));
+        app.run_until_parked();
+        let stopping_polls = polls.load(AtomicOrdering::SeqCst);
+        assert!(stopping_polls > initial_polls);
+        host.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(host.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        app.advance_clock(Duration::from_millis(50));
+        app.run_until_parked();
+        let terminal_polls = polls.load(AtomicOrdering::SeqCst);
+        assert!(terminal_polls > stopping_polls);
+        app.advance_clock(Duration::from_millis(150));
+        app.run_until_parked();
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), terminal_polls);
+        assert_eq!(*slot.lock().unwrap(), None);
+        assert_eq!(host.scientific_digest_v1().unwrap(), before);
+        // TestPlatform::quit is a no-op. This proves the installed task exits,
+        // while the separate unit matrix observes the production quit request.
+        app.update(|app| app.shutdown());
+    }
+
+    #[test]
+    fn gui_health_matrix_requests_quit_and_preserves_typed_fault_precedence() {
+        use scriptbots_runtime::{HostBlocker, HostFault, HostHealth, HostLifecycle};
+        let host = TestHost::take(command_characterization_world());
+        let fault = HostFault::Protocol {
+            code: "gui_lifecycle_matrix".into(),
+            message: "exact host diagnostic".into(),
+        };
+        // Synthetic publication matrix: this is not a live induced host fault
+        // or evidence that a native platform has closed its windows.
+        for state in [
+            HostLifecycle::Running,
+            HostLifecycle::Stopping,
+            HostLifecycle::Stopped,
+        ] {
+            for health in [
+                HostHealth::Healthy,
+                HostHealth::Blocked(HostBlocker::PlaybackPaused),
+                HostHealth::Faulted(fault.clone()),
+            ] {
+                for control_failed in [false, true] {
+                    let mut snapshot = (*host.port.snapshot_hub().latest()).clone();
+                    snapshot.lifecycle = state;
+                    snapshot.health = health.clone();
+                    let probe: GuiHealthProbe = Arc::new(move || {
+                        if control_failed {
+                            Err("control failure".into())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    let expected = if health.fault().is_some() {
+                        Some(GuiRunError::SimulationHost(fault.clone()))
+                    } else if control_failed {
+                        Some(GuiRunError::ControlRuntime("control failure".into()))
+                    } else {
+                        None
+                    };
+                    let terminal = expected.is_some() || state == HostLifecycle::Stopped;
+                    let slot = Mutex::new(None);
+                    let mut app = FakeGuiLifecycle::default();
+                    assert_eq!(
+                        poll_gui_health(&mut app, &snapshot, &probe, &slot),
+                        terminal
+                    );
+                    assert_eq!(app.quit_requested, terminal);
+                    assert_eq!(app.failure_requested, expected.is_some());
+                    assert_eq!(*slot.lock().unwrap(), expected);
+                    // A later observation must retain an already recorded cause.
+                    let first = GuiRunError::WindowLaunch("earlier launch error".into());
+                    let prior_slot = Mutex::new(Some(first.clone()));
+                    poll_gui_health(&mut app, &snapshot, &probe, &prior_slot);
+                    assert_eq!(*prior_slot.lock().unwrap(), Some(first));
+                }
+            }
+        }
     }
 
     #[test]
