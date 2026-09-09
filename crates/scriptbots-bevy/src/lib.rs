@@ -733,6 +733,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 apply_tier_to_fog,
                 apply_tier_to_ssao,
                 apply_tier_to_reflection_probes,
+                apply_tier_to_terrain_detail,
             )
                 .chain(),
             handle_auto_exposure_toggle,
@@ -4107,6 +4108,144 @@ mod adaptive_governor_tests {
     use super::*;
 
     #[test]
+    fn terrain_detail_tiers_average_one_nonuniform_linear_roughness_pattern() {
+        use bevy::render::render_resource::TextureFormat;
+        let full = terrain_detail_image(1);
+        let pixels = full.data.as_ref().unwrap();
+        let roughness: HashSet<_> = pixels.as_chunks::<4>().0.iter().map(|p| p[1]).collect();
+        assert!(roughness.len() > 16, "texture must carry surface variation");
+        assert_eq!(full.texture_descriptor.format, TextureFormat::Rgba8Unorm);
+        for pixel in pixels.as_chunks::<4>().0 {
+            assert_eq!([pixel[0], pixel[2], pixel[3]], [255; 3]);
+            assert!(pixel[1] >= 193);
+        }
+        for divisor in [2_u8, 4] {
+            let image = terrain_detail_image(divisor);
+            let side = image.texture_descriptor.size.width as usize;
+            let d = usize::from(divisor);
+            assert_eq!(side * d, TERRAIN_DETAIL_RESOLUTION as usize);
+            let low = image.data.as_ref().unwrap();
+            for y in 0..side {
+                for x in 0..side {
+                    let mut sum = 0_u32;
+                    for dy in 0..d {
+                        for dx in 0..d {
+                            sum += u32::from(
+                                pixels[((y * d + dy) * TERRAIN_DETAIL_RESOLUTION as usize
+                                    + x * d
+                                    + dx)
+                                    * 4
+                                    + 1],
+                            );
+                        }
+                    }
+                    let count = (d * d) as u32;
+                    assert_eq!(
+                        u32::from(low[(y * side + x) * 4 + 1]),
+                        (sum + count / 2) / count
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            terrain_detail_image(0).data,
+            full.data,
+            "zero divisor is normalized"
+        );
+    }
+
+    #[test]
+    fn live_terrain_materials_follow_detail_tiers_without_asset_growth() {
+        let mut app = App::new();
+        let world = WorldState::new(scriptbots_core::ScriptBotsConfig::default()).unwrap();
+        app.insert_resource(SnapshotState {
+            latest: WorldSnapshot::from_world(&world),
+            ..default()
+        });
+        app.insert_resource(AgentRegistry::default());
+        app.insert_resource(TerrainChunkRegistry::default());
+        app.insert_resource(AgentMeshes::default());
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        let mut images = Assets::<Image>::default();
+        app.insert_resource(ReflectionProbeAssets::fallback(&mut images));
+        app.insert_resource(images);
+        app.insert_resource(AccessibilityState::default());
+        app.insert_resource(auto_launch(RenderQuality::High));
+        app.add_systems(Update, (sync_world, apply_tier_to_terrain_detail).chain());
+        app.update();
+        let registry = app.world().resource::<TerrainChunkRegistry>();
+        let chunk = registry.chunks.values().next().expect("real terrain chunk");
+        let material_handle = chunk.material.clone();
+        let material = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .get(&material_handle)
+            .unwrap();
+        let original = (
+            material.base_color,
+            material.metallic,
+            material.perceptual_roughness,
+        );
+        let texture = material
+            .metallic_roughness_texture
+            .clone()
+            .expect("production material must bind texture");
+        let image_count = app.world().resource::<Assets<Image>>().len();
+        for tier in [
+            RenderQuality::Potato,
+            RenderQuality::Low,
+            RenderQuality::Ultra,
+        ] {
+            app.insert_resource(auto_launch(tier));
+            app.update();
+            let images = app.world().resource::<Assets<Image>>();
+            assert_eq!(images.len(), image_count);
+            let image = images.get(&texture).unwrap();
+            assert_eq!(
+                image.texture_descriptor.size.width,
+                TERRAIN_DETAIL_RESOLUTION / u32::from(tier_features(tier).terrain_detail_divisor)
+            );
+            let material = app
+                .world()
+                .resource::<Assets<StandardMaterial>>()
+                .get(&material_handle)
+                .unwrap();
+            assert_eq!(material.metallic_roughness_texture.as_ref(), Some(&texture));
+            assert_eq!(
+                (
+                    material.base_color,
+                    material.metallic,
+                    material.perceptual_roughness
+                ),
+                original
+            );
+        }
+        let before = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&texture)
+            .unwrap()
+            .data
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&texture)
+                .unwrap()
+                .data
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            before,
+            "unchanged frame keeps texture allocation"
+        );
+    }
+
+    #[test]
     fn reflection_tiers_switch_real_probe_maps_and_preserve_diffuse_lighting() {
         let mut app = App::new();
         let mut images = Assets::<Image>::default();
@@ -6957,6 +7096,87 @@ fn create_chunk_material(stats: &TerrainChunkStats) -> StandardMaterial {
         reflectance: (0.04 + stats.height_factor * 0.02).clamp(0.02, 0.08),
         emissive: emissive.into(),
         ..Default::default()
+    }
+}
+
+const TERRAIN_DETAIL_RESOLUTION: u32 = 256;
+
+fn terrain_detail_image(divisor: u8) -> Image {
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    let divisor = u32::from(divisor).max(1);
+    let side = TERRAIN_DETAIL_RESOLUTION.div_ceil(divisor);
+    let mut pixels = Vec::with_capacity((side * side * 4) as usize);
+    for y in 0..side {
+        for x in 0..side {
+            let mut sum = 0_u32;
+            let mut count = 0_u32;
+            // Average the same full-resolution pattern at every tier, rather
+            // than resampling noise at a different frequency and aliasing it.
+            for sy in y * divisor..((y + 1) * divisor).min(TERRAIN_DETAIL_RESOLUTION) {
+                for sx in x * divisor..((x + 1) * divisor).min(TERRAIN_DETAIL_RESOLUTION) {
+                    let noise = visual::value_noise_2d(
+                        0x0074_6572_7261_696e,
+                        sx as f32 * 0.25,
+                        sy as f32 * 0.25,
+                    );
+                    sum += (224.0 + 31.0 * noise).round().clamp(193.0, 255.0) as u32;
+                    count += 1;
+                }
+            }
+            // StandardMaterial reads roughness from G and metallic from B.
+            // White B preserves the existing metallic factor; no albedo tint.
+            pixels.extend_from_slice(&[255, ((sum + count / 2) / count) as u8, 255, 255]);
+        }
+    }
+    Image::new(
+        Extent3d {
+            width: side,
+            height: side,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::default(),
+    )
+}
+
+pub(crate) fn apply_tier_to_terrain_detail(
+    effective: Res<EffectiveRenderSettings>,
+    registry: Res<TerrainChunkRegistry>,
+    mut active: Local<Option<(u8, Handle<Image>)>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let divisor = effective.features.terrain_detail_divisor.max(1);
+    let handle = match active.as_mut() {
+        Some((previous, handle)) => {
+            if *previous != divisor || images.get(&*handle).is_none() {
+                if let Some(image) = images.get_mut(&*handle) {
+                    *image = terrain_detail_image(divisor);
+                } else {
+                    *handle = images.add(terrain_detail_image(divisor));
+                }
+                *previous = divisor;
+            }
+            handle.clone()
+        }
+        None => {
+            let handle = images.add(terrain_detail_image(divisor));
+            *active = Some((divisor, handle.clone()));
+            handle
+        }
+    };
+    // New chunks also need binding when the tier has not changed. Existing
+    // material parameters and vertex palette colors remain authoritative.
+    for chunk in registry.chunks.values() {
+        if materials
+            .get(&chunk.material)
+            .is_some_and(|material| material.metallic_roughness_texture.as_ref() != Some(&handle))
+            && let Some(material) = materials.get_mut(&chunk.material)
+        {
+            material.metallic_roughness_texture = Some(handle.clone());
+        }
     }
 }
 

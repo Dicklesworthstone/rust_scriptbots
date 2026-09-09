@@ -1306,7 +1306,12 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
     )
     .add_systems(
         Update,
-        (sync_world, crate::apply_tier_to_reflection_probes).chain(),
+        (
+            sync_world,
+            crate::apply_tier_to_reflection_probes,
+            crate::apply_tier_to_terrain_detail,
+        )
+            .chain(),
     )
     .add_systems(
         Startup,
