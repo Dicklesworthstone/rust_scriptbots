@@ -278,10 +278,22 @@ fn run_event_loop(
     ctx: RendererContext<'_>,
 ) -> Result<()> {
     let mut app = TerminalApp::new(renderer, ctx);
-    app.submit_and_wait(ControlCommand::Resume)?;
+    if app.interactive_runtime_finished()? {
+        return Ok(());
+    }
+    if let Err(error) = app.submit_and_wait(ControlCommand::Resume) {
+        // Shutdown can finish between the precheck and Resume admission.
+        // Reconcile only interactive startup; batch callers retain the error.
+        if app.interactive_runtime_finished()? {
+            return Ok(());
+        }
+        return Err(error);
+    }
 
     loop {
-        app.ensure_control_runtime_running()?;
+        if app.interactive_runtime_finished()? {
+            break;
+        }
         let now = Instant::now();
         app.maybe_step_simulation(now);
 
@@ -354,6 +366,23 @@ fn run_event_loop(
     }
 
     Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("simulation host failed while the TUI was active: {0:?}")]
+struct TerminalHostFailure(scriptbots_runtime::HostFault);
+
+fn terminal_runtime_finished(
+    snapshot: &RenderSnapshot,
+    control_health: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    // A fault remains a failure even if shutdown finalization has completed
+    // or a control server fails at the same time.
+    if let Some(fault) = snapshot.health.fault() {
+        return Err(TerminalHostFailure(fault.clone()).into());
+    }
+    control_health()?;
+    Ok(snapshot.lifecycle == scriptbots_runtime::HostLifecycle::Stopped)
 }
 
 impl TerminalRenderer {
@@ -698,6 +727,13 @@ impl<'a> TerminalApp<'a> {
         self.control
             .health()
             .map_err(|detail| anyhow!("control runtime failed while the TUI was active: {detail}"))
+    }
+
+    fn interactive_runtime_finished(&self) -> Result<bool> {
+        // The retained publication is readable after command ingress closes.
+        // Do not infer host liveness from a cached frame or a command receipt.
+        let snapshot = self.host.snapshot_hub().latest();
+        terminal_runtime_finished(&snapshot, || self.ensure_control_runtime_running())
     }
 
     fn submit_simulation_command(&mut self, command: ControlCommand) {
@@ -11967,6 +12003,93 @@ mod tests {
                 .expect("post-inspection digest"),
             digest_before
         );
+    }
+
+    #[test]
+    fn terminal_interactive_lifecycle_observes_real_owner_shutdown() {
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let mut host = TerminalTestHost::take(command_characterization_world());
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        let before = app.host.snapshot_hub().latest();
+        let digest = app.host.scientific_digest_v1().unwrap();
+        assert!(!app.interactive_runtime_finished().unwrap());
+        assert!(!app.interactive_runtime_finished().unwrap());
+        assert_eq!(app.host.scientific_digest_v1().unwrap(), digest);
+        app.host
+            .submit(scriptbots_runtime::CommandEnvelope::new(
+                scriptbots_runtime::CommandId::new(u128::MAX),
+                scriptbots_runtime::HostCommand::Shutdown,
+            ))
+            .unwrap();
+        host.owner.take().unwrap().join().unwrap();
+        let stopped = app.host.snapshot_hub().latest();
+        assert_eq!(
+            stopped.lifecycle,
+            scriptbots_runtime::HostLifecycle::Stopped
+        );
+        assert_eq!(stopped.world, before.world);
+        // Exercise the interactive loop's actual observer after ingress is gone.
+        // The existing dummy control runtime is healthy; this does not exercise
+        // native terminal setup, event delivery, or control-server processes.
+        assert!(app.interactive_runtime_finished().unwrap());
+        assert!(app.interactive_runtime_finished().unwrap());
+        let resume_error = app.submit_and_wait(ControlCommand::Resume).unwrap_err();
+        assert!(matches!(
+            resume_error.downcast_ref::<scriptbots_runtime::HostAccessError>(),
+            Some(scriptbots_runtime::HostAccessError::Disconnected)
+        ));
+        assert!(app.interactive_runtime_finished().unwrap());
+        assert!(matches!(
+            app.host.scientific_digest_v1(),
+            Err(scriptbots_runtime::HostAccessError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn terminal_interactive_lifecycle_matrix_preserves_faults_and_recoverable_states() {
+        use scriptbots_runtime::{HostBlocker, HostFault, HostHealth, HostLifecycle};
+        let host = TerminalTestHost::take(command_characterization_world());
+        let fault = HostFault::Protocol {
+            code: "terminal_lifecycle_matrix".into(),
+            message: "exact host fault diagnostic".into(),
+        };
+        // Explicit synthetic publication matrix, not an induced live host fault.
+        for lifecycle in [
+            HostLifecycle::Running,
+            HostLifecycle::Stopping,
+            HostLifecycle::Stopped,
+        ] {
+            for health in [
+                HostHealth::Healthy,
+                HostHealth::Blocked(HostBlocker::PlaybackPaused),
+                HostHealth::Faulted(fault.clone()),
+            ] {
+                for control_failed in [false, true] {
+                    let mut snapshot = (*host.port().snapshot_hub().latest()).clone();
+                    snapshot.lifecycle = lifecycle;
+                    snapshot.health = health.clone();
+                    let result = terminal_runtime_finished(&snapshot, || {
+                        if control_failed {
+                            Err(anyhow!("control failure"))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if health.fault().is_some() {
+                        let error = result.expect_err("host fault must fail every lifecycle");
+                        assert_eq!(
+                            error.downcast_ref::<TerminalHostFailure>().unwrap().0,
+                            fault
+                        );
+                    } else if control_failed {
+                        assert_eq!(result.unwrap_err().to_string(), "control failure");
+                    } else {
+                        assert_eq!(result.unwrap(), lifecycle == HostLifecycle::Stopped);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
