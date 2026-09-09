@@ -838,6 +838,8 @@ pub(crate) struct SnapshotState {
     selection_bounds: Option<(Vec2, Vec2)>,
     oldest_position: Option<Vec2>,
     first_agent_position: Option<Vec2>,
+    selected_lead: Vec2,
+    oldest_lead: Vec2,
     hud_prev_tick: u64,
     hud_prev_time: f64,
     sim_rate: f32,
@@ -1989,6 +1991,7 @@ pub(crate) struct WorldSnapshot {
     revision: u64,
     tick: u64,
     reduced_motion: bool,
+    paused: bool,
     world_size: Vec2,
     agent_radius: f32,
     terrain_color: TerrainColorMap,
@@ -2415,6 +2418,7 @@ impl HudEvent {
 struct AgentVisual {
     id: AgentId,
     position: Vec2,
+    velocity: Vec2,
     heading: f32,
     color: [f32; 3],
     selection: SelectionState,
@@ -2493,6 +2497,7 @@ impl WorldSnapshot {
             agents.push(AgentVisual {
                 id: AgentId::from(slotmap::KeyData::from_ffi(agent.id)),
                 position: Vec2::from_array(agent.position),
+                velocity: Vec2::from_array(agent.velocity),
                 heading: agent.heading,
                 color: agent.color,
                 selection: *snapshot.agent_selection.get(index)?,
@@ -2536,6 +2541,7 @@ impl WorldSnapshot {
             revision: 1,
             tick: snapshot.world.tick,
             reduced_motion: config.render.reduced_motion.unwrap_or(false),
+            paused: snapshot.playback.paused,
             world_size: Vec2::new(width, height),
             agent_radius: config.bot_radius.max(1.0),
             terrain_color: TerrainColorMap {
@@ -2554,6 +2560,7 @@ impl WorldSnapshot {
     fn same_render_content(&self, other: &Self) -> bool {
         self.tick == other.tick
             && self.reduced_motion == other.reduced_motion
+            && self.paused == other.paused
             && self.world_size == other.world_size
             && self.agent_radius == other.agent_radius
             && self.terrain_color == other.terrain_color
@@ -2588,6 +2595,7 @@ impl WorldSnapshot {
         let arena = world.agents();
         let columns = arena.columns();
         let positions = columns.positions();
+        let velocities = columns.velocities();
         let colors = columns.colors();
         let healths = columns.health();
         let ages = columns.ages();
@@ -2672,6 +2680,7 @@ impl WorldSnapshot {
             agents.push(AgentVisual {
                 id: agent_id,
                 position: Vec2::new(positions[idx].x, positions[idx].y),
+                velocity: Vec2::new(velocities[idx].vx, velocities[idx].vy),
                 heading: headings[idx],
                 color: colors[idx],
                 spike_length: spikes[idx],
@@ -2712,6 +2721,7 @@ impl WorldSnapshot {
             revision: 1,
             tick: world.tick().0,
             reduced_motion: config.render.reduced_motion.unwrap_or(false),
+            paused: false,
             world_size: Vec2::new(width, height),
             agent_radius: config.bot_radius.max(1.0),
             terrain_color: TerrainColorMap {
@@ -3221,6 +3231,20 @@ fn poll_snapshots(
     }
 }
 
+fn camera_motion_lead(velocity: Vec2, radius: f32, world_size: Vec2) -> Vec2 {
+    // Velocity is displacement per science tick, not distance per render second.
+    // Keep prediction short and local even for unusually fast agents.
+    const HORIZON_TICKS: f32 = 6.0;
+    if !radius.is_finite() || !world_size.is_finite() {
+        return Vec2::ZERO;
+    }
+    let limit = (radius * 4.0).min(world_size.min_element() * 0.1);
+    if !velocity.length_squared().is_finite() || !limit.is_finite() || limit <= 0.0 {
+        return Vec2::ZERO;
+    }
+    velocity.clamp_length_max(limit / HORIZON_TICKS) * HORIZON_TICKS
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_world(
     mut commands: Commands,
@@ -3252,21 +3276,30 @@ pub(crate) fn sync_world(
     let mut selection_min = Vec2::splat(f32::INFINITY);
     let mut selection_max = Vec2::splat(f32::NEG_INFINITY);
     let mut has_selection = false;
-    let mut oldest: Option<(Vec2, u32)> = None;
+    let mut oldest: Option<(Vec2, u32, Vec2)> = None;
     let mut first_agent = None;
+    let mut first_lead = Vec2::ZERO;
+    let mut selection_lead = Vec2::ZERO;
+    let mut selected_count = 0_u32;
 
     for agent in &snapshot.agents {
+        let lead = camera_motion_lead(agent.velocity, snapshot.agent_radius, world_size);
         if first_agent.is_none() {
             first_agent = Some(agent.position);
+            first_lead = lead;
         }
         if matches!(agent.selection, SelectionState::Selected) {
             selection_min = selection_min.min(agent.position);
             selection_max = selection_max.max(agent.position);
             has_selection = true;
+            selection_lead += lead;
+            selected_count += 1;
         }
         match oldest {
-            None => oldest = Some((agent.position, agent.age)),
-            Some((_, age)) if agent.age > age => oldest = Some((agent.position, agent.age)),
+            None => oldest = Some((agent.position, agent.age, lead)),
+            Some((_, age, _)) if agent.age > age => {
+                oldest = Some((agent.position, agent.age, lead))
+            }
             _ => {}
         }
     }
@@ -3301,8 +3334,14 @@ pub(crate) fn sync_world(
     state.world_center = world_center;
     state.selection_bounds = selection_bounds;
     state.selection_center = selection_center;
-    state.oldest_position = oldest.map(|(pos, _)| pos);
+    state.oldest_position = oldest.map(|(pos, _, _)| pos);
     state.first_agent_position = first_agent;
+    state.selected_lead = if selected_count > 0 {
+        selection_lead / selected_count as f32
+    } else {
+        first_lead
+    };
+    state.oldest_lead = oldest.map_or(state.selected_lead, |(_, _, lead)| lead);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3503,6 +3542,7 @@ mod hud_inspector_tests {
         AgentVisual {
             id: AgentId::null(),
             position: Vec2::new(10.0, 20.0),
+            velocity: Vec2::ZERO,
             heading: 0.0,
             color: [0.2, 0.4, 0.7],
             selection: SelectionState::Selected,
@@ -6616,6 +6656,20 @@ fn control_camera(
             .unwrap_or(state.focus_point)
     };
 
+    if !rig.recenter_now
+        && focus_override.is_none()
+        && state
+            .latest
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.paused)
+        && motion.as_ref().is_none_or(|settings| settings.enabled)
+    {
+        target_focus += match rig.follow_mode {
+            FollowMode::Off => Vec2::ZERO,
+            FollowMode::Selected => state.selected_lead,
+            FollowMode::Oldest => state.oldest_lead,
+        };
+    }
     let world_size = state.world_size;
     if world_size.x > 0.0 && world_size.y > 0.0 {
         let bounded = target_focus.clamp(Vec2::ZERO, world_size);
@@ -7163,6 +7217,7 @@ mod terrain_tests {
         AgentVisual {
             id: AgentId::from(KeyData::from_ffi(1)),
             position: Vec2::new(50.0, 50.0),
+            velocity: Vec2::ZERO,
             heading: 0.75,
             color: [0.2, 0.4, 0.7],
             selection: SelectionState::Selected,
@@ -7248,6 +7303,7 @@ mod terrain_tests {
             revision: 1,
             tick: 42,
             reduced_motion: false,
+            paused: false,
             world_size,
             agent_radius: 12.0,
             terrain_color: color,
@@ -7257,6 +7313,118 @@ mod terrain_tests {
             history: HudHistory::default(),
             brain: BrainOverlay::default(),
         }
+    }
+
+    #[test]
+    fn predictive_follow_bounds_velocity_and_rejects_invalid_inputs() {
+        let world = Vec2::splat(1000.0);
+        assert_eq!(
+            camera_motion_lead(Vec2::new(1.0, -2.0), 12.0, world),
+            Vec2::new(6.0, -12.0)
+        );
+        assert!(
+            (camera_motion_lead(Vec2::splat(100.0), 12.0, world).length() - 48.0).abs() < 0.001
+        );
+        assert!(
+            (camera_motion_lead(Vec2::splat(100.0), 12.0, Vec2::splat(100.0)).length() - 10.0)
+                .abs()
+                < 0.001
+        );
+        for velocity in [
+            Vec2::ZERO,
+            Vec2::splat(f32::NAN),
+            Vec2::splat(f32::INFINITY),
+            Vec2::splat(f32::MAX),
+        ] {
+            assert_eq!(camera_motion_lead(velocity, 12.0, world), Vec2::ZERO);
+        }
+        for radius in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(camera_motion_lead(Vec2::ONE, radius, world), Vec2::ZERO);
+        }
+        assert_eq!(camera_motion_lead(Vec2::ONE, 12.0, Vec2::ZERO), Vec2::ZERO);
+    }
+
+    #[test]
+    fn predictive_follow_obeys_playback_accessibility_and_camera_transform() {
+        for mode in [FollowMode::Selected, FollowMode::Oldest] {
+            for (paused, reduced, recenter, fit) in [
+                (false, false, false, false),
+                (true, false, false, false),
+                (false, true, false, false),
+                (false, false, true, false),
+                (false, false, false, true),
+            ] {
+                let mut app = App::new();
+                let mut time = Time::<()>::default();
+                time.advance_by(Duration::from_secs_f32(0.1));
+                app.insert_resource(time);
+                app.insert_resource(ButtonInput::<KeyCode>::default());
+                app.insert_resource(ButtonInput::<MouseButton>::default());
+                app.add_message::<MouseMotion>();
+                app.add_message::<MouseWheel>();
+                app.insert_resource(AgentMotionSettings { enabled: !reduced });
+                let mut snapshot = sample_world_snapshot();
+                snapshot.paused = paused;
+                let center = Vec2::splat(500.0);
+                app.insert_resource(SnapshotState {
+                    latest: Some(snapshot),
+                    world_size: Vec2::splat(1000.0),
+                    focus_point: center,
+                    world_center: center,
+                    selection_center: Some(center),
+                    oldest_position: Some(center),
+                    selected_lead: Vec2::new(12.0, 0.0),
+                    oldest_lead: Vec2::new(0.0, 18.0),
+                    ..Default::default()
+                });
+                app.insert_resource(CameraRig {
+                    follow_mode: mode,
+                    focus_smoothed: center,
+                    recenter_now: recenter,
+                    pending_fit: fit.then_some(FitCommand::World),
+                    ..Default::default()
+                });
+                let camera = app
+                    .world_mut()
+                    .spawn((Transform::default(), PrimaryCamera))
+                    .id();
+                app.add_systems(Update, control_camera);
+                app.update();
+                let lead = if mode == FollowMode::Selected {
+                    Vec2::new(12.0, 0.0)
+                } else {
+                    Vec2::new(0.0, 18.0)
+                };
+                let expected = if paused || reduced || recenter || fit {
+                    center
+                } else {
+                    center + lead * (1.0 - (-0.1 * CAMERA_SMOOTHING_LERP).exp())
+                };
+                let rig = app.world().resource::<CameraRig>();
+                assert!(
+                    rig.focus_smoothed.distance(expected) < 0.001,
+                    "mode={mode:?}, paused={paused}, reduced={reduced}, recenter={recenter}, fit={fit}"
+                );
+                let transform = app.world().entity(camera).get::<Transform>().unwrap();
+                let look_at = Vec3::new(expected.x - 500.0, 0.0, 500.0 - expected.y);
+                assert!(
+                    transform
+                        .forward()
+                        .dot((look_at - transform.translation).normalize())
+                        > 0.999
+                );
+            }
+        }
+        let previous = sample_world_snapshot();
+        let mut paused = previous.clone();
+        paused.paused = true;
+        let mut revision = 2;
+        assert!(assign_presentation_revision(&mut paused, Some(&previous), &mut revision).unwrap());
+        assert_eq!(paused.tick, previous.tick);
+        let mut unchanged = paused.clone();
+        assert!(
+            !assign_presentation_revision(&mut unchanged, Some(&paused), &mut revision).unwrap()
+        );
     }
 
     fn backend_agreement_snapshot() -> WorldSnapshot {
@@ -7291,6 +7459,7 @@ mod terrain_tests {
             revision: 1,
             tick: 42,
             reduced_motion: false,
+            paused: false,
             world_size: Vec2::splat(150.0),
             agent_radius: 12.0,
             terrain_color: TerrainColorMap {
@@ -8778,7 +8947,9 @@ mod tests {
         for _ in 0..3 {
             world.step().expect("fixture step");
         }
-        let expected = WorldSnapshot::from_world(&world).expect("owned projection");
+        let mut expected = WorldSnapshot::from_world(&world).expect("owned projection");
+        // The owned-world projection has no playback controller; this host is paused.
+        expected.paused = true;
         assert!(expected.reduced_motion);
         assert!(
             !expected.agents.is_empty(),
@@ -9842,6 +10013,8 @@ mod tests {
             selection_bounds: None,
             oldest_position: None,
             first_agent_position: snapshot.agents.first().map(|agent| agent.position),
+            selected_lead: Vec2::ZERO,
+            oldest_lead: Vec2::ZERO,
             hud_prev_tick: 0,
             hud_prev_time: 0.0,
             sim_rate: 0.0,
@@ -10776,6 +10949,8 @@ mod tests {
             selection_bounds: Some(selection_bounds),
             oldest_position: Some(selection_center),
             first_agent_position: Some(selection_center),
+            selected_lead: Vec2::ZERO,
+            oldest_lead: Vec2::ZERO,
             hud_prev_tick: snapshot.tick,
             hud_prev_time: 0.0,
             sim_rate: 0.0,
@@ -10848,10 +11023,16 @@ mod tests {
         world
             .try_spawn_agent(scriptbots_core::AgentData::default())
             .expect("seed visible agent");
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("seed second visible agent for group follow");
         for _ in 0..42 {
             world.step().expect("simulation step");
         }
-        let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
+        let mut snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
+        snapshot.agents[0].velocity = Vec2::X;
+        snapshot.agents[0].age = u32::MAX;
+        let expected_lead = camera_motion_lead(Vec2::X, snapshot.agent_radius, snapshot.world_size);
         let snapshot_state = SnapshotState {
             latest: Some(snapshot),
             ..SnapshotState::default()
@@ -10874,6 +11055,11 @@ mod tests {
         let state = app.world().resource::<SnapshotState>();
         assert_eq!(state.last_applied_revision, 1);
         assert_eq!(state.last_applied_tick, 42);
+        assert_eq!(
+            state.selected_lead, expected_lead,
+            "unselected follow uses the first agent velocity"
+        );
+        assert_eq!(state.oldest_lead, expected_lead);
 
         // The shared sync path must still place capture entities exactly on
         // snapshot poses when the native smoothing system is not installed.
@@ -10972,6 +11158,42 @@ mod tests {
             *body.get::<Transform>().unwrap(),
             target.transform,
             "capture remains exactly at the body base without native idle animation"
+        );
+
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            assert!(snapshot.agents.len() >= 2);
+            snapshot.revision += 1;
+            for agent in &mut snapshot.agents {
+                agent.selection = SelectionState::None;
+            }
+            snapshot.agents[0].selection = SelectionState::Selected;
+            snapshot.agents[1].selection = SelectionState::Selected;
+            snapshot.agents[1].velocity = -Vec2::X;
+        }
+        app.update();
+        let state = app.world().resource::<SnapshotState>();
+        assert_eq!(
+            state.selected_lead,
+            Vec2::ZERO,
+            "opposing selected velocities cancel"
+        );
+        assert_eq!(
+            state.oldest_lead, expected_lead,
+            "oldest follow remains independent of group motion"
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[1].velocity = Vec2::ZERO;
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<SnapshotState>().selected_lead,
+            expected_lead * 0.5,
+            "a stationary selected peer halves the group lead"
         );
 
         Ok(())
