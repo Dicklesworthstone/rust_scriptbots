@@ -708,7 +708,13 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         Update,
         (
             poll_snapshots,
-            (sync_world, smooth_agent_poses, smooth_spike_poses).chain(),
+            (
+                sync_world,
+                smooth_agent_poses,
+                smooth_spike_poses,
+                animate_idle_bodies,
+            )
+                .chain(),
             handle_playback_shortcuts,
             handle_playback_buttons,
             handle_tonemap_mode_buttons,
@@ -1019,6 +1025,33 @@ fn smooth_spike_poses(
         }
         display.tick = target.tick;
         *transform = display.transform;
+    }
+}
+
+#[derive(Component)]
+struct IdleBodyTarget {
+    transform: Transform,
+    phase: f32,
+}
+
+const BODY_IDLE_PERIOD: f64 = 4.0;
+const BODY_IDLE_AMPLITUDE: f32 = 0.008;
+
+fn animate_idle_bodies(
+    time: Res<Time>,
+    motion: Option<Res<AgentMotionSettings>>,
+    mut bodies: Query<(&IdleBodyTarget, &mut Transform)>,
+) {
+    let phase = (time.elapsed_secs_f64().rem_euclid(BODY_IDLE_PERIOD) / BODY_IDLE_PERIOD) as f32
+        * std::f32::consts::TAU;
+    let enabled = motion.as_ref().is_none_or(|settings| settings.enabled);
+    for (target, mut transform) in &mut bodies {
+        // Always start from the snapshot base: repeated paints cannot compound
+        // the deformation, and reduced motion restores the exact base at once.
+        *transform = target.transform;
+        if enabled {
+            transform.scale *= 1.0 + BODY_IDLE_AMPLITUDE * (phase + target.phase).sin();
+        }
     }
 }
 
@@ -8154,6 +8187,12 @@ fn apply_agent_visuals(
     };
     let (body_color, body_emissive) = agent_colors_from_params(&visuals, palette);
     update_part_transform(commands, &record.body, body_transform);
+    commands.entity(record.body.entity).insert(IdleBodyTarget {
+        transform: body_transform,
+        // Stable, distributed phases keep agents from breathing in lockstep.
+        phase: (agent.id.data().as_ffi().wrapping_mul(2_654_435_761) % 1024) as f32
+            * (std::f32::consts::TAU / 1024.0),
+    });
     update_part_colors(materials, &record.body, body_color, body_emissive);
 
     let stripe_rgb = Vec3::from_array(visuals.stripe_color);
@@ -10170,6 +10209,85 @@ mod tests {
     }
 
     #[test]
+    fn idle_body_motion_varies_without_ticks_or_accumulation_and_restores_base() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default());
+        app.insert_resource(AgentMotionSettings { enabled: true });
+        app.add_systems(Update, animate_idle_bodies);
+        let base = Transform::from_translation(Vec3::new(1.0, 2.0, 3.0))
+            .with_rotation(Quat::from_rotation_z(0.5))
+            .with_scale(Vec3::new(2.0, 3.0, 4.0));
+        let first = app
+            .world_mut()
+            .spawn((
+                base,
+                IdleBodyTarget {
+                    transform: base,
+                    phase: 0.0,
+                },
+            ))
+            .id();
+        let second = app
+            .world_mut()
+            .spawn((
+                base,
+                IdleBodyTarget {
+                    transform: base,
+                    phase: std::f32::consts::FRAC_PI_2,
+                },
+            ))
+            .id();
+        app.update();
+        assert_eq!(*app.world().entity(first).get::<Transform>().unwrap(), base);
+        assert!(
+            app.world()
+                .entity(second)
+                .get::<Transform>()
+                .unwrap()
+                .scale
+                .x
+                > base.scale.x
+        );
+        // No world or science driver is installed; render time alone advances.
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+        app.update();
+        let peak = *app.world().entity(first).get::<Transform>().unwrap();
+        assert!((peak.scale - base.scale * (1.0 + BODY_IDLE_AMPLITUDE)).length() < 0.0001);
+        assert_eq!(peak.translation, base.translation);
+        assert_eq!(peak.rotation, base.rotation);
+        assert_eq!(
+            app.world()
+                .entity(first)
+                .get::<IdleBodyTarget>()
+                .unwrap()
+                .transform,
+            base
+        );
+        for _ in 0..10 {
+            app.update();
+        }
+        assert_eq!(*app.world().entity(first).get::<Transform>().unwrap(), peak);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(2));
+        app.update();
+        let trough = app.world().entity(first).get::<Transform>().unwrap().scale;
+        assert!((trough - base.scale * (1.0 - BODY_IDLE_AMPLITUDE)).length() < 0.0001);
+        app.world_mut()
+            .resource_mut::<AgentMotionSettings>()
+            .enabled = false;
+        app.update();
+        for entity in [first, second] {
+            assert_eq!(
+                *app.world().entity(entity).get::<Transform>().unwrap(),
+                base
+            );
+        }
+    }
+
+    #[test]
     fn keyboard_pan_is_inertial_frame_independent_and_respects_reduced_motion() {
         fn run(dt: f32, frames: usize, diagonal: bool, reduced: bool) -> Vec2 {
             let mut app = App::new();
@@ -10842,6 +10960,18 @@ mod tests {
         assert!(
             entity.get::<SpikeDisplayPose>().is_none(),
             "capture does not install native easing"
+        );
+        let body = app.world().resource::<AgentRegistry>().records[&agent.id]
+            .body
+            .entity;
+        let body = app.world().entity(body);
+        let target = body
+            .get::<IdleBodyTarget>()
+            .expect("shared sync publishes body base");
+        assert_eq!(
+            *body.get::<Transform>().unwrap(),
+            target.transform,
+            "capture remains exactly at the body base without native idle animation"
         );
 
         Ok(())
