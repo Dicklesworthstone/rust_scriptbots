@@ -708,7 +708,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         Update,
         (
             poll_snapshots,
-            (sync_world, smooth_agent_poses).chain(),
+            (sync_world, smooth_agent_poses, smooth_spike_poses).chain(),
             handle_playback_shortcuts,
             handle_playback_buttons,
             handle_tonemap_mode_buttons,
@@ -969,6 +969,57 @@ fn displayed_agent_position(
             world_size.y * 0.5 - pose.translation.z,
         )
     })
+}
+
+#[derive(Component)]
+struct SpikePoseTarget {
+    transform: Transform,
+    tick: u64,
+}
+
+#[derive(Component)]
+struct SpikeDisplayPose {
+    transform: Transform,
+    tick: u64,
+}
+
+fn smooth_spike_poses(
+    mut commands: Commands,
+    time: Res<Time>,
+    settings: Option<Res<AgentMotionSettings>>,
+    mut spikes: Query<(
+        Entity,
+        &SpikePoseTarget,
+        Option<&mut SpikeDisplayPose>,
+        &mut Transform,
+    )>,
+) {
+    let blend = -(-time.delta_secs() * AGENT_POSE_RESPONSE).exp_m1();
+    for (entity, target, display, mut transform) in &mut spikes {
+        let Some(mut display) = display else {
+            // First native frame starts at the exact snapshot pose. Capture
+            // never installs this system and therefore has no display state.
+            *transform = target.transform;
+            commands.entity(entity).insert(SpikeDisplayPose {
+                transform: target.transform,
+                tick: target.tick,
+            });
+            continue;
+        };
+        if settings.as_ref().is_some_and(|settings| !settings.enabled) || target.tick < display.tick
+        {
+            display.transform = target.transform;
+        } else {
+            display.transform.translation = display
+                .transform
+                .translation
+                .lerp(target.transform.translation, blend);
+            display.transform.scale = display.transform.scale.lerp(target.transform.scale, blend);
+            display.transform.rotation = target.transform.rotation;
+        }
+        display.tick = target.tick;
+        *transform = display.transform;
+    }
 }
 
 #[derive(Resource, Default)]
@@ -8051,6 +8102,12 @@ fn apply_agent_visuals(
         ),
     };
     update_part_transform(commands, &record.spike, spike_transform);
+    commands
+        .entity(record.spike.entity)
+        .insert(SpikePoseTarget {
+            transform: spike_transform,
+            tick: snapshot.tick,
+        });
     let spike_rgb = Vec3::from_array(visuals.spike_color);
     let spike_color = srgb_from_vec_with_palette(spike_rgb, 1.0, palette);
     let spike_emissive = palette_hdr_emissive_from_srgb(
@@ -9716,6 +9773,88 @@ mod tests {
     }
 
     #[test]
+    fn spike_easing_extends_retracts_and_snaps_without_changing_targets() {
+        fn run(dt: f32, frames: usize) -> Vec3 {
+            let mut app = App::new();
+            let mut time = Time::<()>::default();
+            time.advance_by(Duration::from_secs_f32(dt));
+            app.insert_resource(time);
+            app.add_systems(Update, smooth_spike_poses);
+            let initial = Transform::from_translation(Vec3::X).with_scale(Vec3::ONE);
+            let extended =
+                Transform::from_translation(Vec3::X * 5.0).with_scale(Vec3::new(9.0, 1.0, 1.0));
+            let spike = app
+                .world_mut()
+                .spawn((
+                    initial,
+                    SpikePoseTarget {
+                        transform: initial,
+                        tick: 1,
+                    },
+                ))
+                .id();
+            app.update();
+            assert_eq!(
+                *app.world().entity(spike).get::<Transform>().unwrap(),
+                initial
+            );
+            app.world_mut().entity_mut(spike).insert(SpikePoseTarget {
+                transform: extended,
+                tick: 2,
+            });
+            for _ in 0..frames {
+                app.update();
+            }
+            let pose = *app.world().entity(spike).get::<Transform>().unwrap();
+            assert!(pose.scale.x > initial.scale.x && pose.scale.x < extended.scale.x);
+            assert!(
+                pose.translation.x > initial.translation.x
+                    && pose.translation.x < extended.translation.x
+            );
+            assert_eq!(
+                app.world()
+                    .entity(spike)
+                    .get::<SpikePoseTarget>()
+                    .unwrap()
+                    .transform,
+                extended
+            );
+            app.world_mut().entity_mut(spike).insert(SpikePoseTarget {
+                transform: initial,
+                tick: 3,
+            });
+            app.update();
+            let retracted = app.world().entity(spike).get::<Transform>().unwrap();
+            assert!(retracted.scale.x < pose.scale.x && retracted.scale.x > initial.scale.x);
+            assert!(
+                retracted.translation.x < pose.translation.x
+                    && retracted.translation.x > initial.translation.x
+            );
+            app.world_mut().entity_mut(spike).insert(SpikePoseTarget {
+                transform: extended,
+                tick: 1,
+            });
+            app.update();
+            assert_eq!(
+                *app.world().entity(spike).get::<Transform>().unwrap(),
+                extended
+            );
+            app.insert_resource(AgentMotionSettings { enabled: false });
+            app.world_mut().entity_mut(spike).insert(SpikePoseTarget {
+                transform: initial,
+                tick: 4,
+            });
+            app.update();
+            assert_eq!(
+                *app.world().entity(spike).get::<Transform>().unwrap(),
+                initial
+            );
+            pose.scale
+        }
+        assert!((run(1.0 / 30.0, 1) - run(1.0 / 60.0, 2)).length() < 0.0001);
+    }
+
+    #[test]
     fn agent_pose_easing_uses_render_time_and_shortest_heading_arc() {
         fn run(dt: f32, frames: usize) -> (Vec3, Quat) {
             let mut app = App::new();
@@ -10217,12 +10356,20 @@ mod tests {
             state.last_applied_tick, 42,
             "presentation-only palette changes must not advance science"
         );
+        let previous_spike = {
+            let agent = &state.latest.as_ref().unwrap().agents[0];
+            let spike = app.world().resource::<AgentRegistry>().records[&agent.id]
+                .spike
+                .entity;
+            *app.world().entity(spike).get::<Transform>().unwrap()
+        };
 
         {
             let mut state = app.world_mut().resource_mut::<SnapshotState>();
             let snapshot = state.latest.as_mut().unwrap();
             snapshot.revision += 1;
             snapshot.agents[0].position += Vec2::splat(10.0);
+            snapshot.agents[0].spike_length += 2.0;
         }
         app.update();
         let snapshot = app
@@ -10240,6 +10387,21 @@ mod tests {
             entity.get::<AgentDisplayPose>().unwrap().translation,
             expected,
             "shared sync must publish the exact new pose even without advancing the native display state"
+        );
+        let spike = app.world().resource::<AgentRegistry>().records[&agent.id]
+            .spike
+            .entity;
+        let entity = app.world().entity(spike);
+        let target = entity
+            .get::<SpikePoseTarget>()
+            .expect("shared sync publishes spike target");
+        assert_eq!(*entity.get::<Transform>().unwrap(), target.transform);
+        assert!(target.transform.scale.x > previous_spike.scale.x);
+        assert!(target.transform.translation.x > previous_spike.translation.x);
+        assert_eq!(target.tick, snapshot.tick);
+        assert!(
+            entity.get::<SpikeDisplayPose>().is_none(),
+            "capture does not install native easing"
         );
 
         Ok(())
