@@ -714,7 +714,7 @@ fn trace_digest(trace: &ChaosTraceV1) -> String {
 /// This projection checks the persistence outcome independently of scheduler
 /// bookkeeping. It does not certify scheduler replay or justify randomized
 /// exploration fingerprints. The separate exploration checks retain both hashes
-/// and their certificate-consistency assertion.
+/// and compare them during exact-seed replay, along with the raw events.
 ///
 /// This projection is used ONLY by the stability test. [`trace_digest`] is
 /// unchanged, so the DPOR exploration and negative-control tests keep hashing the
