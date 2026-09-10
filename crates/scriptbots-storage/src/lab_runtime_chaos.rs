@@ -14,6 +14,7 @@ use asupersync::{
 };
 use serde::Serialize;
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
@@ -37,7 +38,7 @@ fn lab_chaos_serial_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ProtocolAction {
     Admit,
     RetryExactA,
@@ -525,8 +526,13 @@ fn run_protocol(seed: u64, mode: ProtocolMode) -> (LabRunMeta, ProtocolObservati
         .with_default_replay_recording();
     let mut runtime = LabRuntime::new(config);
     runtime.advance_time(1_000 + seed % 97);
+    observe_protocol(&mut runtime, mode)
+}
+
+fn observe_protocol(runtime: &mut LabRuntime, mode: ProtocolMode) -> (LabRunMeta, ProtocolObservation) {
+    let seed = runtime.config().seed;
     let mut rig = ProtocolRig::new(mode, seed);
-    let schedule = drive_protocol_on_runtime(&mut runtime, &mut rig);
+    let schedule = drive_protocol_on_runtime(runtime, &mut rig);
     let observation = rig.finish();
     let report = runtime.report();
     assert!(
@@ -545,6 +551,89 @@ fn run_protocol(seed: u64, mode: ProtocolMode) -> (LabRunMeta, ProtocolObservati
         },
         observation,
     )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExplorationObservation {
+    trace: ChaosTraceV1,
+    events: Vec<asupersync::trace::TraceEvent>,
+}
+
+fn observe_exploration(runtime: &mut LabRuntime) -> ExplorationObservation {
+    let (meta, observation) = observe_protocol(runtime, ProtocolMode::Memory);
+    let observed = ExplorationObservation {
+        trace: protocol_trace(meta, observation, "tests::lab_runtime_chaos::lab_runtime_dpor_and_fixed_seed_corpus_drive_real_persistence"),
+        events: runtime.trace().snapshot(),
+    };
+    assert_eq!(first_domain_divergence(&observed.trace), None);
+    observed
+}
+
+fn assert_exact_replay(expected: &ExplorationObservation, actual: &ExplorationObservation) {
+    assert_eq!(actual.trace, expected.trace, "exact-seed protocol replay diverged");
+    assert_eq!(actual.events, expected.events, "exact-seed raw event replay diverged");
+}
+
+fn assert_equivalent_domain(expected: &ChaosTraceV1, actual: &ChaosTraceV1) {
+    assert_eq!(actual.mode, expected.mode, "compared different storage modes");
+    assert_eq!(actual.domain, expected.domain, "equivalent trace class changed persistence outcome");
+}
+
+fn verify_exploration(observations: &[ExplorationObservation]) {
+    assert!(!observations.is_empty(), "exploration recorded no runs");
+    let mut classes = std::collections::BTreeMap::new();
+    for observed in observations {
+        // Reproduce the explorer's actual initial clock (zero), not the offset
+        // used by the separate fixed corpus. Preserve raw events as well as
+        // the canonical hash: canonicalization intentionally erases ordering.
+        let mut runtime = LabRuntime::new(
+            LabConfig::new(observed.trace.seed)
+                .worker_count(LAB_WORKERS)
+                .max_steps(LAB_MAX_STEPS)
+                .with_default_replay_recording(),
+        );
+        let replay = observe_exploration(&mut runtime);
+        assert_exact_replay(observed, &replay);
+        if let Some(reference) = classes.insert(observed.trace.trace_fingerprint, &observed.trace) {
+            assert_equivalent_domain(reference, &observed.trace);
+        }
+        emit_trace(&observed.trace, "explored-exact-replay");
+    }
+}
+
+fn legal_protocol_orders() -> Vec<Vec<ProtocolAction>> {
+    fn permute(prefix: &mut Vec<ProtocolAction>, remaining: &mut [ProtocolAction], orders: &mut Vec<Vec<ProtocolAction>>) {
+        if remaining.is_empty() {
+            orders.push(prefix.clone());
+            return;
+        }
+        for index in 0..remaining.len() {
+            remaining.swap(0, index);
+            prefix.push(remaining[0]);
+            permute(prefix, &mut remaining[1..], orders);
+            prefix.pop();
+            remaining.swap(0, index);
+        }
+    }
+    let mut remaining = ProtocolAction::ALL.into_iter().filter(|action| *action != ProtocolAction::Admit).collect::<Vec<_>>();
+    let mut orders = Vec::new();
+    permute(&mut vec![ProtocolAction::Admit], &mut remaining, &mut orders);
+    orders
+}
+
+fn assert_protocol_coverage(orders: &[Vec<ProtocolAction>]) {
+    let mut expected_members = ProtocolAction::ALL.to_vec();
+    expected_members.sort_unstable();
+    let expected_count = (1..ProtocolAction::ALL.len()).product::<usize>();
+    let mut unique = std::collections::BTreeSet::new();
+    for order in orders {
+        assert_eq!(order.first(), Some(&ProtocolAction::Admit), "dependent action preceded admission");
+        let mut members = order.clone();
+        members.sort_unstable();
+        assert_eq!(members, expected_members, "order lost or duplicated an action");
+        assert!(unique.insert(order), "controller order executed twice");
+    }
+    assert_eq!(unique.len(), expected_count, "controller order coverage incomplete");
 }
 
 fn protocol_trace(
@@ -839,6 +928,77 @@ fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 #[test]
+fn lab_runtime_controller_orders_cover_real_memory_and_file_storage() {
+    let _serial = lab_chaos_serial_guard();
+    let orders = legal_protocol_orders();
+    assert_protocol_coverage(&orders);
+    for mode in [ProtocolMode::Memory, ProtocolMode::File] {
+        let mut executed_orders = Vec::new();
+        for order in &orders {
+            let mut rig = ProtocolRig::new(mode, FIXED_SEEDS[0]);
+            let mut executed = Vec::new();
+            for &action in order {
+                rig.apply(action);
+                executed.push(action);
+            }
+            let observed = rig.finish();
+            println!("{}", serde_json::json!({
+                "controller_order": executed.iter().map(|action| action.label()).collect::<Vec<_>>(),
+                "mode": observed.mode.label(),
+                "batch_id": observed.initial_batch_id.get(),
+                "watermarks": TraceWatermarks::from(observed.final_watermarks),
+                "retry_batch_ids": observed.retry_batch_ids.iter().map(|id| id.get()).collect::<Vec<_>>(),
+                "application_count": observed.application_count,
+                "outbox_after_finalize": observed.outbox_after_finalize,
+            }));
+            executed_orders.push(executed);
+        }
+        // Count actual successful executions, not merely generated candidates.
+        assert_protocol_coverage(&executed_orders);
+    }
+}
+
+#[test]
+fn lab_runtime_controller_coverage_rejects_missing_duplicate_and_illegal_orders() {
+    let orders = legal_protocol_orders();
+    assert_protocol_coverage(&orders);
+    let mut missing = orders.clone();
+    missing.pop();
+    assert!(catch_unwind(|| assert_protocol_coverage(&missing)).is_err());
+    let mut duplicate = orders.clone();
+    duplicate[0] = duplicate[1].clone();
+    assert!(catch_unwind(|| assert_protocol_coverage(&duplicate)).is_err());
+    let mut illegal = orders;
+    illegal[0].swap(0, 1);
+    assert!(catch_unwind(|| assert_protocol_coverage(&illegal)).is_err());
+}
+
+#[test]
+fn lab_runtime_replay_guards_reject_scheduler_event_and_domain_mutations() {
+    let _serial = lab_chaos_serial_guard();
+    let mut runtime = LabRuntime::new(LabConfig::new(FIXED_SEEDS[0]).worker_count(LAB_WORKERS).max_steps(LAB_MAX_STEPS).with_default_replay_recording());
+    let observed = observe_exploration(&mut runtime);
+    assert_exact_replay(&observed, &observed);
+    assert_equivalent_domain(&observed.trace, &observed.trace);
+    let mut changed = observed.clone();
+    changed.trace.schedule_hash ^= 1;
+    assert!(catch_unwind(AssertUnwindSafe(|| assert_exact_replay(&observed, &changed))).is_err());
+    let mut changed = observed.clone();
+    assert!(changed.events.pop().is_some());
+    assert!(catch_unwind(AssertUnwindSafe(|| assert_exact_replay(&observed, &changed))).is_err());
+    for mutation in 0..3 {
+        let mut changed = observed.clone();
+        match mutation {
+            0 => changed.trace.domain.application_count = Some(2),
+            1 => changed.trace.domain.exact_retry_batch_ids.clear(),
+            _ => changed.trace.domain.watermarks.applied = None,
+        }
+        assert!(catch_unwind(AssertUnwindSafe(|| assert_equivalent_domain(&observed.trace, &changed.trace))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| assert_exact_replay(&observed, &changed))).is_err());
+    }
+}
+
+#[test]
 fn lab_runtime_trace_hashing_is_reproducible_before_exploration() {
     use asupersync::trace::{TraceEvent, TraceMonoid, trace_fingerprint};
     use asupersync::types::{RegionId, TaskId, Time};
@@ -864,18 +1024,9 @@ fn lab_runtime_dpor_and_fixed_seed_corpus_drive_real_persistence() {
         .worker_count(LAB_WORKERS)
         .max_steps(LAB_MAX_STEPS);
     let mut dpor = DporExplorer::new(explorer_config.clone());
+    let dpor_observations = RefCell::new(Vec::new());
     let dpor_report = dpor.explore(|runtime| {
-        let mut rig = ProtocolRig::new(ProtocolMode::Memory, runtime.config().seed);
-        let schedule = drive_protocol_on_runtime(runtime, &mut rig);
-        let observation = rig.finish();
-        assert_eq!(observation.application_count, 1);
-        eprintln!(
-            "DPOR trace seed={} steps={} certificate={} actions={schedule:?} events={:?}",
-            runtime.config().seed,
-            runtime.steps(),
-            runtime.certificate().hash(),
-            runtime.trace().snapshot()
-        );
+        dpor_observations.borrow_mut().push(observe_exploration(runtime));
     });
     assert!(
         !dpor_report.has_violations(),
@@ -884,30 +1035,30 @@ fn lab_runtime_dpor_and_fixed_seed_corpus_drive_real_persistence() {
     );
     assert!(dpor_report.total_runs >= 1);
     assert!(dpor_report.total_runs <= DPOR_MAX_RUNS);
-    assert!(
-        dpor_report.certificates_consistent(),
-        "DPOR certificate inconsistency: {}",
-        dpor_report.to_json_pretty().expect("DPOR run diagnostics")
-    );
+    // Upstream compares raw dispatch hashes across Foata-equivalent runs.
+    // Different interleavings may legitimately have different dispatch hashes.
+    // Retain that diagnostic, but require exact replay for EVERY explored seed
+    // and equal persistence outcomes within each class instead.
+    eprintln!("DPOR lifecycle exploration (not protocol-order coverage): {}", dpor_report.to_json_pretty().expect("DPOR run diagnostics"));
+    let dpor_observations = dpor_observations.into_inner();
+    assert_eq!(dpor_observations.len(), dpor_report.total_runs);
+    verify_exploration(&dpor_observations);
 
     let mut seed_explorer = ScheduleExplorer::new(
         ExplorerConfig::new(FIXED_SEEDS[0], FIXED_SEEDS.len())
             .worker_count(LAB_WORKERS)
             .max_steps(LAB_MAX_STEPS),
     );
+    let seed_observations = RefCell::new(Vec::new());
     let seed_report = seed_explorer.explore(|runtime| {
-        let mut rig = ProtocolRig::new(ProtocolMode::Memory, runtime.config().seed);
-        let _schedule = drive_protocol_on_runtime(runtime, &mut rig);
-        let observation = rig.finish();
-        assert_eq!(observation.application_count, 1);
+        seed_observations.borrow_mut().push(observe_exploration(runtime));
     });
     assert!(!seed_report.has_violations());
     assert_eq!(seed_report.total_runs, FIXED_SEEDS.len());
-    assert!(
-        seed_report.certificates_consistent(),
-        "seed corpus certificate inconsistency: {}",
-        seed_report.to_json_pretty().expect("seed run diagnostics")
-    );
+    eprintln!("Seed lifecycle exploration: {}", seed_report.to_json_pretty().expect("seed run diagnostics"));
+    let seed_observations = seed_observations.into_inner();
+    assert_eq!(seed_observations.len(), seed_report.total_runs);
+    verify_exploration(&seed_observations);
 
     for seed in FIXED_SEEDS {
         let (meta, observation) = run_protocol(seed, ProtocolMode::File);
