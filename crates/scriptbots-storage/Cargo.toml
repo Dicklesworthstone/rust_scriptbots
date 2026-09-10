@@ -19,7 +19,8 @@ scriptbots-runtime = { path = "../scriptbots-runtime" }
 crossbeam-channel = "0.5"
 
 [dev-dependencies]
-asupersync = { workspace = true }
+# Lab trace fingerprints must not depend on unrelated packages enabling this.
+asupersync = { workspace = true, features = ["test-internals"] }
 scriptbots-brain = { path = "../scriptbots-brain" }
 tempfile = "3.8"
 tracing-subscriber = { workspace = true }

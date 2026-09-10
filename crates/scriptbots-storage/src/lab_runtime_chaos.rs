@@ -595,13 +595,13 @@ fn trace_digest(trace: &ChaosTraceV1) -> String {
 }
 
 /// The persistence-protocol content of a trace, without the two `asupersync`
-/// runtime identifiers that are not reproducible (bd-vluo).
+/// runtime identifiers excluded by the historical bd-vluo projection.
 ///
 /// # Why two fields are omitted, with the evidence
 ///
-/// `trace_fingerprint` and `schedule_hash` are NOT stable across runs of the
-/// same seed — not merely across compiler releases or machines, but between two
-/// invocations of the same test. Diffing two traces emitted by one process
+/// Before deterministic hashing was explicitly enabled, `trace_fingerprint`
+/// and `schedule_hash` differed between invocations of the same test.
+/// Diffing two traces emitted by one process
 /// showed those two fields as the ONLY difference; every field describing the
 /// persistence protocol was byte-identical:
 ///
@@ -612,20 +612,20 @@ fn trace_digest(trace: &ChaosTraceV1) -> String {
 ///   exact_retry_batch_ids, application_count, outbox_*: all identical
 /// ```
 ///
-/// The first run in a FRESH PROCESS also differs from the first run in another
-/// fresh process, so this is not a counter accumulating within one process. Both
-/// values derive from `asupersync`'s canonical trace fingerprint, which hashes
-/// packed task and region ARENA HANDLES (`pack_arena(task.0)`), so runtime
-/// handle identity is reaching the digest. That is `asupersync` 0.3.9 internal
-/// state, not anything this crate's corpus determines.
+/// Correction (bd-2z0.8.9.16): those historical observations were made without
+/// explicitly enabling `asupersync/test-internals`. In 0.3.9, `DetHasher::default`
+/// otherwise constructs a freshly random-seeded production hasher. The earlier
+/// attribution to arena handles was not established. The storage dev dependency
+/// now enables deterministic hashing regardless of package selection. The raw
+/// dispatch certificate and canonical trace fingerprint are separate hashes;
+/// neither is the persisted scientific outcome checked by this projection.
 ///
 /// # Why exclude rather than assert
 ///
-/// Including them made the test claim something false: it is named for corpus
-/// stability and could not establish it, because its own inputs varied. A green
-/// run would have been luck. Excluding them lets the test assert the invariant it
-/// actually owns — that a fixed corpus drives a reproducible persistence outcome
-/// — over content that genuinely is reproducible.
+/// This projection checks the persistence outcome independently of scheduler
+/// bookkeeping. It does not certify scheduler replay or justify randomized
+/// exploration fingerprints. The separate exploration checks retain both hashes
+/// and their certificate-consistency assertion.
 ///
 /// This projection is used ONLY by the stability test. [`trace_digest`] is
 /// unchanged, so the DPOR exploration and negative-control tests keep hashing the
@@ -839,6 +839,24 @@ fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 #[test]
+fn lab_runtime_trace_hashing_is_reproducible_before_exploration() {
+    use asupersync::trace::{TraceEvent, TraceMonoid, trace_fingerprint};
+    use asupersync::types::{RegionId, TaskId, Time};
+
+    // Compare the same concrete events, not separately allocated runtimes. A
+    // random hasher can make every exploration run appear to be a new class and
+    // make certificates_consistent pass without ever comparing two runs.
+    let task = TaskId::new_for_test(0, 0);
+    let region = RegionId::new_for_test(0, 0);
+    let events = vec![TraceEvent::spawn(0, Time::ZERO, task, region)];
+    let first = trace_fingerprint(&events);
+    assert_eq!(first, trace_fingerprint(&events));
+    assert_eq!(first, TraceMonoid::from_events(&events).class_fingerprint());
+    let changed = vec![TraceEvent::complete(0, Time::ZERO, task, region)];
+    assert_ne!(first, trace_fingerprint(&changed));
+}
+
+#[test]
 fn lab_runtime_dpor_and_fixed_seed_corpus_drive_real_persistence() {
     let _serial = lab_chaos_serial_guard();
 
@@ -848,9 +866,16 @@ fn lab_runtime_dpor_and_fixed_seed_corpus_drive_real_persistence() {
     let mut dpor = DporExplorer::new(explorer_config.clone());
     let dpor_report = dpor.explore(|runtime| {
         let mut rig = ProtocolRig::new(ProtocolMode::Memory, runtime.config().seed);
-        let _schedule = drive_protocol_on_runtime(runtime, &mut rig);
+        let schedule = drive_protocol_on_runtime(runtime, &mut rig);
         let observation = rig.finish();
         assert_eq!(observation.application_count, 1);
+        eprintln!(
+            "DPOR trace seed={} steps={} certificate={} actions={schedule:?} events={:?}",
+            runtime.config().seed,
+            runtime.steps(),
+            runtime.certificate().hash(),
+            runtime.trace().snapshot()
+        );
     });
     assert!(
         !dpor_report.has_violations(),
@@ -990,11 +1015,10 @@ fn lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions() {
             "tests::lab_runtime_chaos::lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions",
         );
         assert_eq!(first_domain_divergence(&expected), None);
-        // bd-vluo: the PERSISTENCE-PROTOCOL content, not the full trace. Two of
-        // the trace's fields are asupersync runtime identifiers that differ on
-        // every run of the same seed, so hashing them made this test unable to
-        // establish the stability it is named for. See `stable_trace_digest`.
+        // Retain the domain-only comparison for a precise failure diagnosis,
+        // but also require full trace replay now that hashing is deterministic.
         let expected_digest = stable_trace_digest(&expected);
+        let expected_full_digest = trace_digest(&expected);
         emit_trace(&expected, "stable-corpus");
 
         for repetition in 1..STABILITY_REPETITIONS {
@@ -1005,7 +1029,8 @@ fn lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions() {
                 "tests::lab_runtime_chaos::lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions",
             );
             let actual_digest = stable_trace_digest(&actual);
-            if actual_digest != expected_digest {
+            let actual_full_digest = trace_digest(&actual);
+            if actual_digest != expected_digest || actual_full_digest != expected_full_digest {
                 let mut divergent = actual;
                 divergent.first_divergence = Some(format!("stable_digest_repetition_{repetition}"));
                 emit_trace(&divergent, "stable-corpus-divergence");
@@ -1013,6 +1038,10 @@ fn lab_runtime_fixed_corpus_digest_is_stable_for_fifty_repetitions() {
             assert_eq!(
                 actual_digest, expected_digest,
                 "seed {seed} diverged at repetition {repetition}"
+            );
+            assert_eq!(
+                actual_full_digest, expected_full_digest,
+                "seed {seed} scheduler trace diverged at repetition {repetition}"
             );
         }
     }
