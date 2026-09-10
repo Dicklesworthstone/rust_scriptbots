@@ -3898,6 +3898,32 @@ impl From<NarrativeInputRecordV1> for NarrativeInputPolicyV1 {
     }
 }
 
+impl NarrativeInputPolicyV1 {
+    fn apply_config_patch(&mut self, patch: &Value) -> Result<(), String> {
+        // Scalar policy fields use replacement semantics in the app merge.
+        // Decode the declared config types, rejecting null/fractions/overflow.
+        if let Some(value) = patch.get("narrative_interval") {
+            self.narrative_interval =
+                serde_json::from_value::<u32>(value.clone()).map_err(|error| error.to_string())?;
+        }
+        if let Some(value) = patch.get("history_capacity") {
+            self.history_capacity = u64::try_from(
+                serde_json::from_value::<usize>(value.clone())
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if let Some(value) = patch.get("narrative_capacity") {
+            self.event_capacity = u64::try_from(
+                serde_json::from_value::<usize>(value.clone())
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 /// Run, contract, configuration, build, and continuity evidence shared by every page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3905,10 +3931,16 @@ pub struct NarrativeInputBindingV1 {
     pub run_id: RunId,
     pub record_schema_version: u32,
     pub input_schema_version: u32,
+    /// Configuration revision of the stream's first record. Later transitions
+    /// are authenticated against the owner journal during binding validation.
     pub config_revision: u64,
     pub config_digest: String,
     pub manifest_digest: String,
+    /// Detector policy of the first record; each returned record and cursor
+    /// carries its own authenticated policy.
     pub policy: NarrativeInputPolicyV1,
+    /// Smallest retained detector-history capacity observed across authenticated policies.
+    pub minimum_history_capacity: u64,
     pub first_tick: u64,
     pub terminal_tick: u64,
     pub input_count: u64,
@@ -10046,6 +10078,8 @@ impl StorageReader {
         let mut after_tick = 0_u64;
         let mut count = 0_u64;
         let mut expected_contract: Option<(u32, u32, u64, NarrativeInputPolicyV1)> = None;
+        let mut first_contract = None;
+        let mut minimum_history_capacity = u64::MAX;
         loop {
             let rows = connection.query_with_params(
                 NARRATIVE_INPUT_SELECT_AFTER,
@@ -10105,19 +10139,13 @@ impl StorageReader {
                         }
                         .into());
                     }
-                    if contract.2 != expected.2 {
-                        return Err(NarrativeInputStreamError::MixedConfiguration {
-                            tick: row_tick,
-                            expected: expected.2,
-                            actual: contract.2,
-                        }
-                        .into());
-                    }
-                    if contract.3 != expected.3 {
-                        return Err(
-                            NarrativeInputStreamError::MixedPolicy { tick: row_tick }.into()
-                        );
-                    }
+                    Storage::validate_narrative_configuration_boundary(
+                        self.finished_connection()?,
+                        self.run_id,
+                        replay_row.island_id,
+                        (expected.2, expected.3),
+                        record,
+                    )?;
                 } else {
                     if (contract.0, contract.1)
                         != (
@@ -10134,8 +10162,11 @@ impl StorageReader {
                         }
                         .into());
                     }
-                    expected_contract = Some(contract);
+                    first_contract = Some(contract);
                 }
+                expected_contract = Some(contract);
+                minimum_history_capacity =
+                    minimum_history_capacity.min(contract.3.history_capacity);
                 after_tick = row_tick;
                 count = count.saturating_add(1);
             }
@@ -10160,8 +10191,8 @@ impl StorageReader {
             }
             .into());
         }
-        let (record_schema_version, input_schema_version, config_revision, policy) =
-            expected_contract.ok_or(NarrativeInputStreamError::MissingEvidence {
+        let (record_schema_version, input_schema_version, config_revision, policy) = first_contract
+            .ok_or(NarrativeInputStreamError::MissingEvidence {
                 first_offending_tick: 1,
             })?;
         let manifest = self.run_manifest()?;
@@ -10174,6 +10205,7 @@ impl StorageReader {
             config_digest: manifest.config_digest,
             manifest_digest,
             policy,
+            minimum_history_capacity,
             first_tick: 1,
             terminal_tick,
             input_count: count,
@@ -10187,7 +10219,7 @@ impl StorageReader {
         binding: &NarrativeInputBindingV1,
         required_complete_history: u64,
     ) -> Result<(), StorageError> {
-        let available = binding.input_count.min(binding.policy.history_capacity);
+        let available = binding.input_count.min(binding.minimum_history_capacity);
         if available < required_complete_history {
             return Err(NarrativeInputStreamError::InsufficientHistory {
                 first_offending_tick: available.saturating_add(1),
@@ -10203,7 +10235,7 @@ impl StorageReader {
     ///
     /// The immutable finished-reader lease prevents the stream from changing between pages.
     /// The first page scans the reserved identities in bounded chunks, proving prefix/suffix
-    /// coverage, adjacency, one stable contract/configuration/policy, and the caller-declared
+    /// coverage, adjacency, stable schema and journal-authenticated configuration/policy transitions, and the caller-declared
     /// history requirement. That binding is cached for the immutable reader lease, so later pages
     /// perform only their bounded row query. A cursor must name an exact retained row and repeat
     /// the selected run's configuration and build/manifest bindings.
@@ -10250,8 +10282,6 @@ impl StorageReader {
                 }
                 if cursor.record_schema_version != binding.record_schema_version
                     || cursor.input_schema_version != binding.input_schema_version
-                    || cursor.config_revision != binding.config_revision
-                    || cursor.policy != binding.policy
                     || cursor.tick == 0
                     || cursor.tick > binding.terminal_tick
                 {
@@ -10338,10 +10368,10 @@ impl StorageReader {
                 tick: record.input.tick.0,
                 record_schema_version: binding.record_schema_version,
                 input_schema_version: binding.input_schema_version,
-                config_revision: binding.config_revision,
+                config_revision: record.config_revision,
                 config_digest: binding.config_digest.clone(),
                 manifest_digest: binding.manifest_digest.clone(),
-                policy: binding.policy,
+                policy: NarrativeInputPolicyV1::from(*record),
             })
         });
         Ok(NarrativeInputPageV1 {
@@ -14251,6 +14281,8 @@ impl Storage {
         let mut committed_events = 0_u64;
         let mut durable_events = 0_u64;
         let mut observed_shutdown = None;
+        let mut last_scheduled_sequence = 0_u64;
+        let mut last_scheduled_tick = None;
         loop {
             let rows = connection.query_with_params(
                 "SELECT archive.journal_sequence, archive.payload_version,
@@ -14431,6 +14463,35 @@ impl Storage {
                     batch_id,
                     MAX_HOST_JOURNAL_ARCHIVE_BYTES,
                 )?;
+                if let Some(evidence) = archive.scheduled_patch() {
+                    let expected = last_scheduled_sequence.checked_add(1).ok_or(
+                        StorageError::InvalidData {
+                            context: "host_journal_archive.scheduled_patch.sequence",
+                            reason: "scheduled owner sequence space is exhausted".to_owned(),
+                        },
+                    )?;
+                    if evidence.scheduled.sequence != expected {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_archive.scheduled_patch.sequence",
+                            reason: format!(
+                                "session {} expected scheduled owner sequence {expected}, found {} at journal {journal_sequence}",
+                                session_id.get(),
+                                evidence.scheduled.sequence,
+                            ),
+                        });
+                    }
+                    if last_scheduled_tick.is_some_and(|tick| evidence.scheduled.due_tick < tick) {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_archive.scheduled_patch.due_tick",
+                            reason: format!(
+                                "scheduled owner sequence {expected} regresses its due tick to {:?} after {last_scheduled_tick:?}",
+                                evidence.scheduled.due_tick,
+                            ),
+                        });
+                    }
+                    last_scheduled_sequence = expected;
+                    last_scheduled_tick = Some(evidence.scheduled.due_tick);
+                }
                 if archive.event_sequence()? != event_sequence {
                     return Err(StorageError::InvalidData {
                         context: "host_journal_batch_ledger.scientific_event_sequence",
@@ -15560,6 +15621,72 @@ impl Storage {
             return Err(mismatch().into());
         }
         let boundary_tick = candidate.input.tick.0.checked_sub(1).ok_or_else(mismatch)?;
+        let mut changes = BTreeMap::new();
+        for (actual, config) in Self::narrative_external_configuration_changes(
+            connection, run_id, previous.0, candidate,
+        )? {
+            if changes.insert(actual, (Some(config), None)).is_some() {
+                return Err(mismatch().into());
+            }
+        }
+        for evidence in
+            Self::narrative_scheduled_configuration_changes(connection, run_id, boundary_tick)?
+        {
+            let actual = evidence.boundary.revisions.config.get();
+            if actual <= previous.0 || actual > candidate.config_revision {
+                continue;
+            }
+            let patch = evidence.scheduled.decode_patch().map_err(|_| mismatch())?;
+            if changes.insert(actual, (None, Some(patch))).is_some() {
+                return Err(mismatch().into());
+            }
+        }
+        let mut revision = previous.0;
+        let mut observed_policy = previous.1;
+        for (actual, (config, patch)) in changes {
+            if revision.checked_add(1) != Some(actual) {
+                return Err(mismatch().into());
+            }
+            revision = actual;
+            if let Some(config) = config {
+                observed_policy = NarrativeInputPolicyV1 {
+                    narrative_interval: config.narrative_interval,
+                    history_capacity: u64::try_from(config.history_capacity)
+                        .map_err(|_| mismatch())?,
+                    event_capacity: u64::try_from(config.narrative_capacity)
+                        .map_err(|_| mismatch())?,
+                };
+            }
+            if let Some(patch) = patch {
+                observed_policy
+                    .apply_config_patch(&patch)
+                    .map_err(|_| mismatch())?;
+            }
+        }
+        if revision != candidate.config_revision {
+            return Err(mismatch().into());
+        }
+        if observed_policy != policy {
+            return Err(NarrativeInputStreamError::MixedPolicy {
+                tick: candidate.input.tick.0,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn narrative_external_configuration_changes(
+        connection: &Connection,
+        run_id: RunId,
+        previous_revision: u64,
+        candidate: NarrativeInputRecordV1,
+    ) -> Result<Vec<(u64, Box<scriptbots_core::ScriptBotsConfig>)>, StorageError> {
+        let mismatch = || NarrativeInputStreamError::MixedConfiguration {
+            tick: candidate.input.tick.0,
+            expected: previous_revision,
+            actual: candidate.config_revision,
+        };
+        let boundary_tick = candidate.input.tick.0.checked_sub(1).ok_or_else(mismatch)?;
         let records = connection.query_with_params(
             "SELECT host_session_id, command_id, terminal_config_revision,
                     application_transition_count
@@ -15571,7 +15698,7 @@ impl Storage {
             &[
                 sqlite_run_id(run_id),
                 encode_journal_u64(boundary_tick).into(),
-                encode_journal_u64(previous.0).into(),
+                encode_journal_u64(previous_revision).into(),
                 encode_journal_u64(candidate.config_revision).into(),
                 checked_i64("narrative.config_commands", MAX_STORAGE_QUERY_PAGE + 1)?.into(),
             ],
@@ -15579,8 +15706,7 @@ impl Storage {
         if records.len() > MAX_STORAGE_QUERY_PAGE {
             return Err(mismatch().into());
         }
-        let mut revision = previous.0;
-        let mut observed_policy = previous.1;
+        let mut changes = Vec::new();
         for row in records {
             let session: String = decode(&row, 0, "host_command_records.host_session_id")?;
             let command: String = decode(&row, 1, "host_command_records.command_id")?;
@@ -15600,26 +15726,101 @@ impl Storage {
             };
             let actual =
                 decode_journal_u64("host_command_records.terminal_config_revision", &terminal)?;
-            if revision.checked_add(1) != Some(actual) {
-                return Err(mismatch().into());
+            changes.push((actual, config));
+        }
+        Ok(changes)
+    }
+
+    fn narrative_scheduled_configuration_changes(
+        connection: &Connection,
+        run_id: RunId,
+        boundary_tick: u64,
+    ) -> Result<Vec<scriptbots_runtime::ScheduledPatchEvidence>, StorageError> {
+        let mut changes = Vec::new();
+        let mut session_cursor = String::new();
+        let mut sequence_cursor = String::new();
+        loop {
+            // Read sizes before payloads. Paging bounds every query even when a
+            // long experiment has more owner actions than its UI history retains.
+            let rows = connection.query_with_params(
+                "SELECT a.host_session_id, a.journal_sequence, a.payload_digest,
+                        length(CAST(a.payload_json AS BLOB))
+                 FROM host_journal_archive a JOIN host_journal_batch_ledger l
+                   ON a.run_id = l.run_id AND a.host_session_id = l.host_session_id
+                  AND a.journal_sequence = l.journal_sequence
+                 WHERE a.run_id = ?1 AND l.scientific_event_sequence IS NULL
+                   AND l.state != 'admitted'
+                   AND (a.host_session_id > ?2 OR (a.host_session_id = ?2 AND a.journal_sequence > ?3))
+                 ORDER BY a.host_session_id, a.journal_sequence LIMIT ?4",
+                &[sqlite_run_id(run_id), session_cursor.as_str().into(), sequence_cursor.as_str().into(),
+                  checked_i64("narrative.owner_page", MAX_STORAGE_QUERY_PAGE)?.into()],
+            )?;
+            for row in &rows {
+                session_cursor = decode(row, 0, "host_journal_archive.host_session_id")?;
+                sequence_cursor = decode(row, 1, "host_journal_archive.journal_sequence")?;
+                let digest: String = decode(row, 2, "host_journal_archive.payload_digest")?;
+                let bytes = checked_u64(
+                    "host_journal_archive.payload_bytes",
+                    decode(row, 3, "host_journal_archive.payload_bytes")?,
+                )?;
+                if bytes == 0
+                    || usize::try_from(bytes)
+                        .map_or(true, |bytes| bytes > MAX_HOST_JOURNAL_ARCHIVE_BYTES)
+                {
+                    return Err(StorageError::InvalidData {
+                        context: "narrative.owner_archive",
+                        reason: "owner archive exceeds the bounded payload reader".to_owned(),
+                    });
+                }
+                let payload_row = connection.query_row_with_params(
+                    "SELECT payload_json FROM host_journal_archive WHERE run_id = ?1
+                     AND host_session_id = ?2 AND journal_sequence = ?3
+                     AND payload_digest = ?4 AND length(CAST(payload_json AS BLOB)) = ?5",
+                    &[
+                        sqlite_run_id(run_id),
+                        session_cursor.as_str().into(),
+                        sequence_cursor.as_str().into(),
+                        digest.as_str().into(),
+                        i64::try_from(bytes)
+                            .map_err(|error| StorageError::InvalidData {
+                                context: "narrative.owner_archive",
+                                reason: error.to_string(),
+                            })?
+                            .into(),
+                    ],
+                )?;
+                let payload: String = decode(&payload_row, 0, "host_journal_archive.payload_json")?;
+                let archive = HostJournalArchive::decode(
+                    &payload,
+                    &digest,
+                    run_id,
+                    JournalBatchId::new(
+                        HostSessionId::new(decode_journal_u64(
+                            "host_journal_archive.host_session_id",
+                            &session_cursor,
+                        )?),
+                        decode_journal_u64(
+                            "host_journal_archive.journal_sequence",
+                            &sequence_cursor,
+                        )?,
+                    ),
+                    MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+                )?;
+                if let Some(evidence) = archive.scheduled_patch()
+                    && evidence.boundary.tick.0 == boundary_tick
+                    && matches!(
+                        evidence.outcome,
+                        scriptbots_runtime::ScheduledPatchOutcome::Applied { .. }
+                    )
+                {
+                    changes.push(evidence.clone());
+                }
             }
-            revision = actual;
-            observed_policy = NarrativeInputPolicyV1 {
-                narrative_interval: config.narrative_interval,
-                history_capacity: u64::try_from(config.history_capacity).map_err(|_| mismatch())?,
-                event_capacity: u64::try_from(config.narrative_capacity).map_err(|_| mismatch())?,
-            };
-        }
-        if revision != candidate.config_revision {
-            return Err(mismatch().into());
-        }
-        if observed_policy != policy {
-            return Err(NarrativeInputStreamError::MixedPolicy {
-                tick: candidate.input.tick.0,
+            if rows.len() < MAX_STORAGE_QUERY_PAGE {
+                break;
             }
-            .into());
         }
-        Ok(())
+        Ok(changes)
     }
 
     fn applied_configuration_command(
@@ -33255,6 +33456,324 @@ mod tests {
         ));
         reader.close()?;
         Ok(())
+    }
+
+    fn narrative_owner_test_archives(
+        session: u64,
+        mixed: bool,
+    ) -> Result<Vec<Arc<JournalBatch>>, Box<dyn std::error::Error>> {
+        use scriptbots_runtime::{
+            HostCore, HostCoreOptions, JournalAdmission, JournalPort, JournalReceipt,
+            ManualHostDriver, ManualInstant, ScheduledConfigPatch, ShutdownCommitRequirement,
+            VolatileJournal,
+        };
+        struct Capture {
+            inner: VolatileJournal,
+            batches: Arc<Mutex<Vec<Arc<JournalBatch>>>>,
+        }
+        impl JournalPort for Capture {
+            fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+                self.batches.lock().unwrap().push(Arc::clone(batch));
+                self.inner.try_admit(batch)
+            }
+            fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+                self.inner.poll_receipts(limit)
+            }
+            fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+                ShutdownCommitRequirement::CommittedVolatile
+            }
+        }
+        fn resolve(
+            config: &scriptbots_core::ScriptBotsConfig,
+            patch: &Value,
+        ) -> Result<scriptbots_core::ScriptBotsConfig, String> {
+            let mut value = serde_json::to_value(config).map_err(|error| error.to_string())?;
+            for (key, field) in patch.as_object().ok_or("object required")? {
+                value
+                    .as_object_mut()
+                    .ok_or("config object required")?
+                    .insert(key.clone(), field.clone());
+            }
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        }
+        let mut world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            persistence_interval: 0,
+            narrative_interval: 3,
+            history_capacity: 8,
+            narrative_capacity: 32,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })?;
+        world.apply_config_update(world.config().clone())?;
+        assert_eq!(world.config_revision(), 1);
+        world.step()?;
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let mut owner = HostCore::with_journal(
+            HostSessionId::new(session),
+            world,
+            HostCoreOptions {
+                tick_period_nanos: 1,
+                ..HostCoreOptions::default()
+            },
+            Box::new(Capture {
+                inner: VolatileJournal::default(),
+                batches: Arc::clone(&batches),
+            }),
+        )?;
+        let patches = if mixed {
+            use scriptbots_runtime::HostPort;
+            let mut config = owner.world().config().clone();
+            config.food_max = 0.61;
+            owner
+                .local_port()
+                .submit(scriptbots_runtime::CommandEnvelope::new(
+                    scriptbots_runtime::CommandId::from_client_sequence(session, 1),
+                    scriptbots_runtime::HostCommand::UpdateConfig(Box::new(config)),
+                ))?;
+            vec![ScheduledConfigPatch::new(
+                1,
+                Tick(1),
+                json!({"food_max": 0.72, "history_capacity": 12}),
+            )?]
+        } else {
+            vec![
+                ScheduledConfigPatch::new(1, Tick(1), json!({"food_max": 0.61}))?,
+                ScheduledConfigPatch::new(
+                    2,
+                    Tick(1),
+                    json!({"food_max": 0.72, "history_capacity": 12}),
+                )?,
+            ]
+        };
+        owner.install_schedule(patches, resolve)?;
+        for now in 0..=if mixed { 1 } else { 2 } {
+            owner.drive(ManualInstant::from_nanos(now))?;
+        }
+        let batches = batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            2,
+            "capture real owner patches before its next science transition"
+        );
+        assert_eq!(batches[0].applied().revisions.config.get(), 2);
+        assert_eq!(batches[1].applied().revisions.config.get(), 3);
+        Ok(batches)
+    }
+
+    #[test]
+    fn narrative_revision_changes_require_complete_scheduled_owner_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let batches = narrative_owner_test_archives(55, false)?;
+        let path = temp_db_path("narrative-scheduled-revisions")
+            .to_string_lossy()
+            .into_owned();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path, 64, 4096, 1024, 1024)?;
+        storage.persist(&sample_narrative_batch(1, 1.0, 1, 8))?;
+        storage.flush()?;
+        storage.register_host_journal_session(HostSessionId::new(55))?;
+        let candidate = sample_narrative_batch(2, 1.0, 3, 12);
+        let before = storage.persistence_watermarks()?;
+        assert!(matches!(
+            storage.persist(&candidate),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MixedConfiguration { .. }
+            ))
+        ));
+        assert_eq!(storage.persistence_watermarks()?, before);
+        for (index, batch) in batches.iter().enumerate() {
+            let mut prepared = prepare_host_journal_archive(
+                storage.run_id,
+                batch,
+                MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+            )?;
+            storage.admit_host_journal_archive(batch, &prepared)?;
+            storage.complete_host_journal_archive(
+                batch.id(),
+                batch.scientific_event_sequence(),
+                batch.applied().tick.0,
+                prepared.persistence.take(),
+                prepared.domain_events.as_ref(),
+                prepared.command.as_ref(),
+            )?;
+            if index == 0 {
+                assert!(matches!(
+                    storage.persist(&candidate),
+                    Err(StorageError::NarrativeInputStream(
+                        NarrativeInputStreamError::MixedConfiguration { .. }
+                    ))
+                ));
+                assert_eq!(storage.persistence_watermarks()?, before);
+            }
+        }
+        assert!(matches!(
+            storage.persist(&sample_narrative_batch(2, 1.0, 3, 9)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MixedPolicy { .. }
+            ))
+        ));
+        assert!(matches!(
+            Storage::validate_narrative_configuration_boundary(
+                storage.connection()?,
+                storage.run_id,
+                0,
+                (
+                    1,
+                    NarrativeInputPolicyV1::from(sample_narrative_record(1, 1.0, 1, 1, 8))
+                ),
+                sample_narrative_record(3, 1.0, 3, 3, 12)
+            ),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::MixedConfiguration { .. }
+            ))
+        ));
+        storage.persist(&candidate)?;
+        storage.persist(&sample_narrative_batch(3, 1.0, 3, 12))?;
+        storage.close()?;
+        verify_finished_narrative_revision_pages(&path)
+    }
+
+    fn verify_finished_narrative_revision_pages(
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let reader = StorageReader::open_finished(path)?;
+        let first = reader.narrative_input_page_v1(None, 1, 0)?;
+        assert_eq!(first.binding.config_revision, 1);
+        assert_eq!(first.binding.minimum_history_capacity, 8);
+        let second = reader.narrative_input_page_v1(first.next_after.as_ref(), 1, 0)?;
+        assert_eq!(second.inputs[0].config_revision, 3);
+        assert_eq!(second.inputs[0].history_capacity, 12);
+        let second_cursor = second
+            .next_after
+            .as_ref()
+            .expect("third narrative tick remains");
+        assert_eq!(second_cursor.config_revision, 3);
+        assert_eq!(second_cursor.policy.history_capacity, 12);
+        let mut forged_cursor = second_cursor.clone();
+        forged_cursor.config_revision = 1;
+        assert!(matches!(
+            reader.narrative_input_page_v1(Some(&forged_cursor), 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::CursorContractMismatch { .. }
+            ))
+        ));
+        assert_eq!(
+            reader
+                .narrative_input_page_v1(Some(second_cursor), 1, 0)?
+                .inputs[0]
+                .input
+                .tick,
+            Tick(3)
+        );
+        reader.close()?;
+        Ok(())
+    }
+
+    fn persist_narrative_owner_test_archive(
+        storage: &mut Storage,
+        batch: &Arc<JournalBatch>,
+    ) -> Result<(), StorageError> {
+        if let Some(envelope) = batch.command() {
+            let request = CommandAuthorityRequest::Submit {
+                envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                    "host_command_claims.envelope_postcard_hex",
+                    envelope,
+                )?,
+                policy: CommandClaimPolicy::ReserveIfAbsent,
+                max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+            };
+            assert_eq!(
+                storage.resolve_command_authority(
+                    batch.id().session_id(),
+                    envelope.command_id,
+                    &request
+                )?,
+                CommandAuthorityLookup::Claimed
+            );
+        }
+        let mut prepared =
+            prepare_host_journal_archive(storage.run_id, batch, MAX_HOST_JOURNAL_ARCHIVE_BYTES)?;
+        storage.admit_host_journal_archive(batch, &prepared)?;
+        storage.complete_host_journal_archive(
+            batch.id(),
+            batch.scientific_event_sequence(),
+            batch.applied().tick.0,
+            prepared.persistence.take(),
+            prepared.domain_events.as_ref(),
+            prepared.command.as_ref(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn narrative_revision_chain_combines_external_and_owner_actions_but_refuses_duplicates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for duplicate in [false, true] {
+            let batches = narrative_owner_test_archives(56, true)?;
+            let mut storage = Storage::unattributed_memory_with_thresholds(64, 4096, 1024, 1024)?;
+            storage.persist(&sample_narrative_batch(1, 1.0, 1, 8))?;
+            storage.flush()?;
+            storage.register_host_journal_session(HostSessionId::new(56))?;
+            for batch in &batches {
+                persist_narrative_owner_test_archive(&mut storage, batch)?;
+            }
+            if duplicate {
+                let conflicting = narrative_owner_test_archives(57, false)?;
+                storage.register_host_journal_session(HostSessionId::new(57))?;
+                // Another valid owner's revision two conflicts with the external
+                // revision two; neither source may silently overwrite the other.
+                persist_narrative_owner_test_archive(&mut storage, &conflicting[0])?;
+            }
+            let before = storage.persistence_watermarks()?;
+            let result = storage.persist(&sample_narrative_batch(2, 1.0, 3, 12));
+            if duplicate {
+                assert!(matches!(
+                    result,
+                    Err(StorageError::NarrativeInputStream(
+                        NarrativeInputStreamError::MixedConfiguration { .. }
+                    ))
+                ));
+                assert_eq!(storage.persistence_watermarks()?, before);
+            } else {
+                result?;
+                assert_ne!(storage.persistence_watermarks()?, before);
+            }
+            storage.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn narrative_policy_patch_decodes_declared_config_scalar_types() {
+        let original = NarrativeInputPolicyV1 {
+            narrative_interval: 3,
+            history_capacity: 8,
+            event_capacity: 32,
+        };
+        for patch in [
+            json!({"history_capacity": null}),
+            json!({"narrative_capacity": -1}),
+            json!({"history_capacity": 1.5}),
+            json!({"narrative_interval": u64::from(u32::MAX) + 1}),
+        ] {
+            let mut policy = original;
+            assert!(policy.apply_config_patch(&patch).is_err());
+        }
+        let mut policy = original;
+        policy
+            .apply_config_patch(&json!({"food_max": 0.72}))
+            .unwrap();
+        assert_eq!(policy, original);
+        policy
+            .apply_config_patch(&json!({"history_capacity": 12, "narrative_interval": 5}))
+            .unwrap();
+        assert_eq!(
+            policy,
+            NarrativeInputPolicyV1 {
+                narrative_interval: 5,
+                history_capacity: 12,
+                event_capacity: 32
+            }
+        );
     }
 
     fn create_complete_narrative_database(

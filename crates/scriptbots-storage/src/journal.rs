@@ -21,7 +21,8 @@ use scriptbots_runtime::{
     EventSequence, EventSequenceRange, HostAccessError, HostCommand, HostRevisions, HostSessionId,
     IslandId, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort,
     JournalReceipt, JournalReceiptState, JournaledScientificEvent, RejectionReason, RunId,
-    ScientificBoundary, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
+    ScheduledPatchEvidence, ScientificBoundary, ScientificEvent, ScientificRevision,
+    ShutdownCommitRequirement,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -40,7 +41,7 @@ const DEFAULT_JOURNAL_INFLIGHT_BYTES: usize = 256 << 20;
 const DEFAULT_JOURNAL_IDENTITY_CAPACITY: usize = 512;
 const DEFAULT_EVENT_PAGE_BYTES: usize = 64 << 20;
 const MAX_JOURNAL_BYTES: usize = 1 << 30;
-pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 2;
+pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 3;
 
 /// Bounded admission and catch-up limits for one HostCore journal adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +174,8 @@ pub struct HostJournalRecord {
     pub batch_id: JournalBatchId,
     /// Complete validated command application lifecycle, when command-driven.
     pub command_lifecycle: Option<CommandLifecycleEvidence>,
+    /// Owner-scheduled configuration action. This has no external command admission identity.
+    pub scheduled_patch: Option<ScheduledPatchEvidence>,
     /// Exact terminal tick and revision boundary of this record.
     ///
     /// For rejected and failed commands this is an observation boundary, not an application.
@@ -1723,9 +1726,54 @@ struct HostJournalArchiveRef<'a> {
     journal_sequence: &'a str,
     scientific_event_sequence: Option<&'a str>,
     command_lifecycle: Option<&'a EncodedCommandLifecycle>,
+    scheduled_patch: Option<&'a ScheduledPatchEvidence>,
     applied: AppliedCommand,
     scientific: Option<&'a ScientificBoundary>,
     persistence: Option<&'a StorageBuffer>,
+}
+
+fn validate_archive_boundary(
+    journal_sequence: u64,
+    event_sequence: Option<EventSequence>,
+    applied: AppliedCommand,
+    scientific: Option<&ScientificBoundary>,
+    command_lifecycle: Option<&CommandLifecycleEvidence>,
+    scheduled_patch: Option<&ScheduledPatchEvidence>,
+    has_persistence: bool,
+) -> Result<(), StorageError> {
+    if let Some(evidence) = scheduled_patch {
+        evidence
+            .validate()
+            .map_err(|reason| StorageError::InvalidData {
+                context: "host_journal_archive.scheduled_patch",
+                reason,
+            })?;
+        if evidence.boundary != applied {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.scheduled_patch.boundary",
+                reason: "scheduled patch observation differs from the archive boundary".to_owned(),
+            });
+        }
+        if command_lifecycle.is_some()
+            || scientific.is_some()
+            || event_sequence.is_some()
+            || has_persistence
+        {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_archive.scheduled_patch",
+                reason: "an owner-scheduled patch cannot carry external command lifecycle, scientific event, or persistence evidence".to_owned(),
+            });
+        }
+        return Ok(());
+    }
+    validate_scientific_archive_boundary(
+        journal_sequence,
+        event_sequence,
+        applied,
+        scientific,
+        command_lifecycle,
+        has_persistence,
+    )
 }
 
 fn validate_scientific_archive_boundary(
@@ -1913,6 +1961,7 @@ pub(super) struct HostJournalArchive {
     journal_sequence: String,
     scientific_event_sequence: Option<String>,
     command_lifecycle: Option<EncodedCommandLifecycle>,
+    scheduled_patch: Option<ScheduledPatchEvidence>,
     applied: AppliedCommand,
     scientific: Option<ScientificBoundary>,
     persistence: Option<StorageBuffer>,
@@ -2022,12 +2071,13 @@ impl HostJournalArchive {
             .as_ref()
             .map(EncodedCommandLifecycle::decode)
             .transpose()?;
-        validate_scientific_archive_boundary(
+        validate_archive_boundary(
             sequence,
             event_sequence,
             self.applied,
             self.scientific.as_ref(),
             command_lifecycle.as_ref(),
+            self.scheduled_patch.as_ref(),
             self.persistence.is_some(),
         )?;
         if let Some(persistence) = &self.persistence {
@@ -2061,6 +2111,10 @@ impl HostJournalArchive {
 
     pub(super) const fn applied(&self) -> AppliedCommand {
         self.applied
+    }
+
+    pub(super) const fn scheduled_patch(&self) -> Option<&ScheduledPatchEvidence> {
+        self.scheduled_patch.as_ref()
     }
 
     pub(super) fn prepare_domain_event_projection(
@@ -2158,6 +2212,7 @@ impl HostJournalArchive {
         let Self {
             applied,
             scientific,
+            scheduled_patch,
             ..
         } = self;
         let event = match (event_sequence, scientific) {
@@ -2189,6 +2244,7 @@ impl HostJournalArchive {
         Ok(HostJournalRecord {
             batch_id,
             command_lifecycle,
+            scheduled_patch,
             applied,
             event,
             state,
@@ -2231,12 +2287,13 @@ pub(super) fn prepare_host_journal_archive(
             reason: "journal sequence must be nonzero".to_owned(),
         });
     }
-    validate_scientific_archive_boundary(
+    validate_archive_boundary(
         batch_id.sequence(),
         batch.scientific_event_sequence(),
         batch.applied(),
         batch.scientific().map(Arc::as_ref),
         batch.command_lifecycle(),
+        batch.scheduled_patch(),
         batch.persistence().is_some(),
     )?;
     let persistence = batch
@@ -2275,6 +2332,7 @@ pub(super) fn prepare_host_journal_archive(
         journal_sequence: &journal_sequence,
         scientific_event_sequence: scientific_event_sequence.as_deref(),
         command_lifecycle: command_lifecycle.as_ref(),
+        scheduled_patch: batch.scheduled_patch(),
         applied: batch.applied(),
         scientific: batch.scientific().map(Arc::as_ref),
         persistence: persistence.as_ref(),
@@ -3446,6 +3504,7 @@ impl JournalPort for StorageJournalPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RowExt;
     use scriptbots_core::{
         MetricSample, PersistenceBatch, ScriptBotsConfig, Tick, TickCombatSummary, TickEvents,
         TickSummary, WorldState,
@@ -3461,6 +3520,847 @@ mod tests {
         AppliedCommand {
             tick: Tick(1),
             revisions: HostRevisions::default(),
+        }
+    }
+
+    fn scheduled_patch_evidence() -> ScheduledPatchEvidence {
+        ScheduledPatchEvidence {
+            scheduled: scriptbots_runtime::ScheduledConfigPatch::new(
+                1,
+                Tick(1),
+                serde_json::json!({ "food_max": 0.75 }),
+            )
+            .expect("canonical scheduled patch fixture"),
+            boundary: AppliedCommand {
+                tick: Tick(1),
+                revisions: HostRevisions {
+                    config: ConfigRevision::new(1),
+                    ..HostRevisions::default()
+                },
+            },
+            outcome: scriptbots_runtime::ScheduledPatchOutcome::Applied {
+                changed_paths: vec!["food_max".to_owned()],
+            },
+        }
+    }
+
+    fn scheduled_archive(evidence: ScheduledPatchEvidence) -> HostJournalArchive {
+        HostJournalArchive {
+            version: HOST_JOURNAL_ARCHIVE_VERSION,
+            run_id: RunId::new(1),
+            host_session_id: encode_journal_u64(1),
+            journal_sequence: encode_journal_u64(1),
+            scientific_event_sequence: None,
+            command_lifecycle: None,
+            applied: evidence.boundary,
+            scheduled_patch: Some(evidence),
+            scientific: None,
+            persistence: None,
+        }
+    }
+
+    fn decode_test_archive(
+        archive: &HostJournalArchive,
+    ) -> Result<HostJournalArchive, StorageError> {
+        let payload =
+            serde_json::to_string(archive).expect("canonical archive fixture serialization");
+        let digest = blake3::hash(payload.as_bytes()).to_hex().to_string();
+        HostJournalArchive::decode(
+            &payload,
+            &digest,
+            RunId::new(1),
+            JournalBatchId::new(HostSessionId::new(1), 1),
+            MAX_JOURNAL_BYTES,
+        )
+    }
+
+    #[test]
+    fn scheduled_patch_archive_roundtrips_success_and_failure_without_external_command_evidence() {
+        let success = scheduled_patch_evidence();
+        let mut failure = success.clone();
+        failure.scheduled.patch = serde_json::json!({ "unknown_config_field": true }).to_string();
+        failure.outcome = scriptbots_runtime::ScheduledPatchOutcome::Failed(ApplicationFailure {
+            code: "scheduled_config_resolution".to_owned(),
+            message: "unknown configuration field".to_owned(),
+        });
+        assert_ne!(
+            success, failure,
+            "outcome matrix must carry distinct observations"
+        );
+        for evidence in [success, failure] {
+            let archive = scheduled_archive(evidence.clone());
+            let decoded = decode_test_archive(&archive).expect("valid owner action archive");
+            assert!(
+                decoded
+                    .prepare_command_projection("unused-no-external-command")
+                    .expect("owner action has no command projection")
+                    .is_none()
+            );
+            let record = decoded
+                .into_public_record(HostJournalRecordState::Admitted)
+                .expect("scheduled owner action public readback");
+            assert_eq!(record.scheduled_patch.as_ref(), Some(&evidence));
+            assert_eq!(record.applied, evidence.boundary);
+            assert!(record.command_lifecycle.is_none());
+            assert!(record.event.is_none());
+            assert_eq!(record.state, HostJournalRecordState::Admitted);
+        }
+    }
+
+    #[test]
+    fn scheduled_patch_archive_bytes_are_bounded_and_digest_bound() {
+        let evidence = scheduled_patch_evidence();
+        let archive = scheduled_archive(evidence.clone());
+        let archive_ref = HostJournalArchiveRef {
+            version: archive.version,
+            run_id: archive.run_id,
+            host_session_id: &archive.host_session_id,
+            journal_sequence: &archive.journal_sequence,
+            scientific_event_sequence: None,
+            command_lifecycle: None,
+            scheduled_patch: Some(&evidence),
+            applied: archive.applied,
+            scientific: None,
+            persistence: None,
+        };
+        let (payload, digest) = encode_host_journal_archive(&archive_ref, MAX_JOURNAL_BYTES)
+            .expect("bounded owner action encode");
+        assert_eq!(
+            encode_host_journal_archive(&archive_ref, payload.len())
+                .expect("exact byte ceiling must fit"),
+            (payload.clone(), digest.clone())
+        );
+        assert!(encode_host_journal_archive(&archive_ref, payload.len() - 1).is_err());
+        assert!(
+            HostJournalArchive::decode(
+                &payload,
+                &digest,
+                archive.run_id,
+                JournalBatchId::new(HostSessionId::new(1), 1),
+                payload.len() - 1
+            )
+            .is_err()
+        );
+        let mut changed = archive;
+        changed
+            .scheduled_patch
+            .as_mut()
+            .expect("owner evidence")
+            .scheduled
+            .patch = serde_json::json!({ "food_max": 0.5 }).to_string();
+        let changed_payload = serde_json::to_string(&changed).expect("changed canonical payload");
+        assert_ne!(changed_payload, payload);
+        assert!(matches!(
+            HostJournalArchive::decode(
+                &changed_payload,
+                &digest,
+                changed.run_id,
+                JournalBatchId::new(HostSessionId::new(1), 1),
+                MAX_JOURNAL_BYTES
+            ),
+            Err(StorageError::InvalidData {
+                context: "host_journal_archive.payload_digest",
+                ..
+            })
+        ));
+        decode_test_archive(&changed).expect("changed valid payload needs its own digest");
+    }
+
+    #[test]
+    fn scheduled_patch_archive_refuses_fabricated_boundaries_and_mixed_provenance() {
+        let evidence = scheduled_patch_evidence();
+        let mut empty = scheduled_archive(evidence.clone());
+        empty.scheduled_patch = None;
+        assert!(
+            decode_test_archive(&empty).is_err(),
+            "empty evidence cannot become an owner action"
+        );
+
+        let mut mismatched = scheduled_archive(evidence.clone());
+        mismatched.applied.revisions.control = ControlRevision::new(9);
+        assert!(
+            decode_test_archive(&mismatched).is_err(),
+            "archive and owner observation must agree"
+        );
+
+        let mut zero_sequence = scheduled_archive(evidence.clone());
+        zero_sequence
+            .scheduled_patch
+            .as_mut()
+            .expect("owner evidence")
+            .scheduled
+            .sequence = 0;
+        assert!(
+            decode_test_archive(&zero_sequence).is_err(),
+            "schedule identity must be nonzero"
+        );
+
+        let mut future = scheduled_archive(evidence.clone());
+        future
+            .scheduled_patch
+            .as_mut()
+            .expect("owner evidence")
+            .scheduled
+            .due_tick = Tick(2);
+        assert!(
+            decode_test_archive(&future).is_err(),
+            "an owner action cannot precede its due tick"
+        );
+
+        for patch in ["[]", "{\"z\":1,\"a\":2}", "{\"food_max\": 0.75}"] {
+            let mut invalid = scheduled_archive(evidence.clone());
+            invalid
+                .scheduled_patch
+                .as_mut()
+                .expect("owner evidence")
+                .scheduled
+                .patch = patch.to_owned();
+            assert!(
+                decode_test_archive(&invalid).is_err(),
+                "non-object or noncanonical patch must be refused: {patch}"
+            );
+        }
+        let mut duplicate_paths = scheduled_archive(evidence.clone());
+        duplicate_paths
+            .scheduled_patch
+            .as_mut()
+            .expect("owner evidence")
+            .outcome = scriptbots_runtime::ScheduledPatchOutcome::Applied {
+            changed_paths: vec!["food_max".to_owned(), "food_max".to_owned()],
+        };
+        assert!(
+            decode_test_archive(&duplicate_paths).is_err(),
+            "changed path evidence must be unique"
+        );
+
+        let mut mixed = scheduled_archive(evidence.clone());
+        mixed.command_lifecycle = Some(
+            EncodedCommandLifecycle::encode(&applied_lifecycle(
+                CommandEnvelope::new(CommandId::new(1), HostCommand::Pause),
+                evidence.boundary,
+            ))
+            .expect("external command fixture"),
+        );
+        assert!(
+            decode_test_archive(&mixed).is_err(),
+            "owner action must not invent external admission"
+        );
+
+        let mut science = scheduled_archive(evidence.clone());
+        science.scientific_event_sequence = Some(encode_journal_u64(1));
+        science.scientific = Some(scientific());
+        assert!(
+            decode_test_archive(&science).is_err(),
+            "owner patch is not a scientific tick"
+        );
+        assert!(
+            validate_archive_boundary(
+                1,
+                None,
+                evidence.boundary,
+                None,
+                None,
+                Some(&evidence),
+                true
+            )
+            .is_err(),
+            "owner patch cannot carry a persistence tail"
+        );
+
+        for version in [2, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
+            let mut stale = scheduled_archive(evidence.clone());
+            stale.version = version;
+            assert!(
+                matches!(
+                    decode_test_archive(&stale),
+                    Err(StorageError::InvalidData {
+                        context: "host_journal_archive.payload_version",
+                        ..
+                    })
+                ),
+                "archive version {version} must be refused explicitly"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_patch_file_worker_readback_preserves_owner_and_external_provenance() {
+        create_scheduled_patch_file_with_verified_readback();
+    }
+
+    fn resolve_food_max(
+        current: &ScriptBotsConfig,
+        patch: &serde_json::Value,
+    ) -> Result<ScriptBotsConfig, String> {
+        let value = patch
+            .get("food_max")
+            .ok_or_else(|| "food_max is required".to_owned())?;
+        let mut next = current.clone();
+        next.food_max =
+            serde_json::from_value::<f32>(value.clone()).map_err(|error| error.to_string())?;
+        Ok(next)
+    }
+
+    #[test]
+    fn scheduled_patch_invalid_file_channel_drains_failure_and_automatic_shutdown() {
+        use scriptbots_runtime::{
+            FixedDeadlineHost, HostPort, ScheduledConfigPatch,
+            channel::{ChannelHostDriver, ChannelHostOptions},
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test wall clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "scriptbots-scheduled-failure-{}-{unique}.sqlite",
+            std::process::id(),
+        ));
+        let path = path.to_str().expect("UTF-8 test database path");
+        let mut pipeline = crate::StoragePipeline::create_unattributed_file(path)
+            .expect("real file storage worker");
+        let run_id = pipeline.run_id();
+        let session = HostSessionId::new(0x5cef);
+        let journal = pipeline
+            .journal_port(session, StorageJournalOptions::default())
+            .expect("real asynchronous file journal");
+        let mut core = HostCore::with_journal(
+            session,
+            timeout_test_world(),
+            timeout_host_options(),
+            Box::new(journal),
+        )
+        .expect("file-backed owner");
+        let original_config = core.latest_snapshot().config.clone();
+        let scheduled =
+            ScheduledConfigPatch::new(1, Tick(0), serde_json::json!({"food_max": "invalid"}))
+                .expect("valid schedule statement with invalid application value");
+        core.install_schedule(vec![scheduled.clone()], resolve_food_max)
+            .expect("install before first drive");
+        let (mut driver, mut port) =
+            ChannelHostDriver::new(FixedDeadlineHost::new(core), ChannelHostOptions::default())
+                .expect("production channel driver");
+        let step = CommandEnvelope::new(
+            CommandId::from_client_sequence(0x5cef, 1),
+            HostCommand::Step,
+        );
+        submit_and_drain_failed_schedule(&mut driver, &port, &step);
+        let snapshot = driver.host().core().latest_snapshot();
+        assert_eq!(snapshot.world.tick, 0);
+        assert_eq!(snapshot.config.as_ref(), original_config.as_ref());
+        assert_eq!(snapshot.scheduled_patches.len(), 1);
+        assert_eq!(snapshot.scheduled_patches[0].journal, JournalState::Durable);
+        assert!(matches!(
+            snapshot.scheduled_patches[0].evidence.outcome,
+            scriptbots_runtime::ScheduledPatchOutcome::Failed(_)
+        ));
+        let status = port
+            .command_status(step.command_id)
+            .expect("Step query")
+            .expect("Step remains queryable after automatic stop");
+        assert!(
+            matches!(status.application(), ApplicationState::Failed(_)),
+            "{status:?}"
+        );
+        assert_eq!(status.journal(), &JournalState::Durable);
+        drop(port);
+        drop(driver);
+        pipeline.shutdown().expect("close real file storage worker");
+        verify_failed_schedule_file(path, run_id, session, &scheduled, &step);
+    }
+
+    fn submit_and_drain_failed_schedule(
+        driver: &mut scriptbots_runtime::channel::ChannelHostDriver,
+        port: &scriptbots_runtime::channel::ChannelHostPort,
+        step: &CommandEnvelope,
+    ) {
+        use scriptbots_runtime::HostPort;
+
+        std::thread::scope(|scope| {
+            let mut submit_port = port.clone();
+            let submitted_step = step.clone();
+            let submitter = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(120);
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "external Step authority did not resolve"
+                    );
+                    match submit_port.submit(submitted_step.clone()) {
+                        Ok(status) => {
+                            assert_eq!(status.command_id(), submitted_step.command_id);
+                            break;
+                        }
+                        Err(HostAccessError::CommandAuthorityLookup {
+                            failure:
+                                CommandAuthorityLookupFailure::Pending
+                                | CommandAuthorityLookupFailure::Busy
+                                | CommandAuthorityLookupFailure::Capacity { .. },
+                            ..
+                        }) => std::thread::sleep(Duration::from_millis(1)),
+                        Err(error) => panic!("external Step submission failed: {error:?}"),
+                    }
+                }
+            });
+            drive_failed_schedule_to_automatic_stop(driver);
+            submitter.join().expect("external Step submitter completes");
+        });
+    }
+
+    fn drive_failed_schedule_to_automatic_stop(
+        driver: &mut scriptbots_runtime::channel::ChannelHostDriver,
+    ) {
+        let epoch = Instant::now();
+        let deadline = epoch + Duration::from_secs(120);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "invalid schedule failed to drain automatically"
+            );
+            let now = u64::try_from(epoch.elapsed().as_nanos()).expect("bounded test clock");
+            let report = driver
+                .step(ManualInstant::from_nanos(now))
+                .expect("asynchronous command authority must not strand the failure archive");
+            if driver.host().core().latest_snapshot().lifecycle
+                == scriptbots_runtime::HostLifecycle::Stopped
+            {
+                assert_eq!(
+                    report.interest,
+                    scriptbots_runtime::HostDriveInterest::Faulted,
+                    "ordered shutdown must retain the failed run outcome"
+                );
+                break;
+            }
+            assert_ne!(
+                report.interest,
+                scriptbots_runtime::HostDriveInterest::Faulted,
+                "channel run would exit before failure/Step/shutdown commitment"
+            );
+            assert_ne!(
+                report.interest,
+                scriptbots_runtime::HostDriveInterest::Terminated,
+                "a failed schedule cannot report successful termination"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn verify_failed_schedule_file(
+        path: &str,
+        run_id: RunId,
+        session: HostSessionId,
+        scheduled: &scriptbots_runtime::ScheduledConfigPatch,
+        step: &CommandEnvelope,
+    ) {
+        let reader = crate::StorageReader::open_finished_for_run(path, run_id)
+            .expect("finished invalid-schedule file readback");
+        let page = reader
+            .host_journal_session_conformance_page(session, None, 4, DEFAULT_JOURNAL_BATCH_BYTES)
+            .expect("validate every failure and shutdown archive");
+        assert_eq!(page.records.len(), 3);
+        assert_eq!(page.progress.journal.durable, 3);
+        assert_eq!(page.progress.events.admitted, 0);
+        assert_eq!(page.progress.events.durable, 0);
+        assert_eq!(
+            page.progress.shutdown,
+            Some(JournalBatchId::new(session, 3))
+        );
+        assert!(
+            page.records
+                .iter()
+                .all(|record| record.state == HostJournalRecordState::Durable
+                    && record.event.is_none()
+                    && record.applied.tick == Tick(0))
+        );
+        let owner = &page.records[0];
+        assert!(owner.command_lifecycle.is_none());
+        let evidence = owner
+            .scheduled_patch
+            .as_ref()
+            .expect("durable owner failure evidence");
+        assert_eq!(&evidence.scheduled, scheduled);
+        assert_eq!(evidence.boundary, owner.applied);
+        assert!(matches!(&evidence.outcome,
+            scriptbots_runtime::ScheduledPatchOutcome::Failed(failure)
+                if failure.code == "scheduled_config_resolution" && !failure.message.is_empty()));
+        let external = reader
+            .command_journal_page(session, None, 3, DEFAULT_JOURNAL_BATCH_BYTES)
+            .expect("read real external Step and automatic shutdown separately");
+        assert_eq!(external.evidence.command_count, 2);
+        assert_eq!(external.commands.len(), 2);
+        assert_eq!(external.commands[0].lifecycle.envelope(), step);
+        assert!(matches!(
+            external.commands[0]
+                .lifecycle
+                .terminal()
+                .expect("terminal Step")
+                .application(),
+            ApplicationState::Failed(_)
+        ));
+        assert_eq!(
+            external.commands[0].lifecycle.admission_sequence(),
+            Some(AdmissionSequence::new(1))
+        );
+        assert_eq!(
+            external.commands[1].lifecycle.envelope().command,
+            HostCommand::Shutdown
+        );
+        assert!(
+            matches!(external.commands[1].lifecycle.terminal().expect("terminal shutdown").application(),
+            ApplicationState::Applied(boundary) if boundary.tick == Tick(0))
+        );
+        assert_eq!(
+            external.commands[1].lifecycle.admission_sequence(),
+            Some(AdmissionSequence::new(2))
+        );
+        assert!(
+            page.records[1..]
+                .iter()
+                .all(|record| record.scheduled_patch.is_none())
+        );
+        reader.close().expect("close failure readback");
+        println!("retained invalid scheduled-owner file evidence: {path}");
+    }
+
+    fn create_scheduled_patch_file_with_verified_readback() -> (String, RunId, HostSessionId) {
+        use scriptbots_runtime::ScheduledConfigPatch;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test wall clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "scriptbots-scheduled-owner-{}-{unique}.sqlite",
+            std::process::id(),
+        ));
+        let path = path.to_str().expect("UTF-8 test database path");
+        let mut pipeline = crate::StoragePipeline::create_unattributed_file(path)
+            .expect("real file storage worker");
+        let run_id = pipeline.run_id();
+        let session = HostSessionId::new(0x5ced);
+        let port = pipeline
+            .journal_port(session, StorageJournalOptions::default())
+            .expect("file journal adapter");
+        let mut core = HostCore::with_journal(
+            session,
+            timeout_test_world(),
+            timeout_host_options(),
+            Box::new(port),
+        )
+        .expect("real owner with file journal");
+        let scheduled =
+            ScheduledConfigPatch::new(1, Tick(0), serde_json::json!({"food_max": 0.75}))
+                .expect("canonical owner action");
+        let later = ScheduledConfigPatch::new(2, Tick(1), serde_json::json!({"food_max": 0.5}))
+            .expect("second canonical owner action");
+        core.install_schedule(vec![scheduled.clone(), later.clone()], resolve_food_max)
+            .expect("install before owner starts");
+        let mut frontend = NullFrontend::new(core.local_port(), 0x5ced);
+        let commands = [
+            CommandEnvelope::new(
+                CommandId::from_client_sequence(0x5ced, 1),
+                HostCommand::Step,
+            ),
+            CommandEnvelope::new(
+                CommandId::from_client_sequence(0x5ced, 2),
+                HostCommand::Step,
+            ),
+            CommandEnvelope::new(
+                CommandId::from_client_sequence(0x5ced, 3),
+                HostCommand::Shutdown,
+            ),
+        ];
+        drive_scheduled_file_commands(&mut frontend, &mut core, &commands);
+        assert_eq!(core.world_tick(), Tick(2));
+        assert_eq!(core.latest_snapshot().config.food_max, 0.5);
+        drop(frontend);
+        drop(core);
+        pipeline.shutdown().expect("close real storage worker");
+        verify_scheduled_file_readback(path, run_id, session, &scheduled, &later, &commands);
+        (path.to_owned(), run_id, session)
+    }
+
+    fn drive_scheduled_file_commands(
+        frontend: &mut NullFrontend<scriptbots_runtime::LocalHostPort>,
+        core: &mut HostCore,
+        commands: &[CommandEnvelope],
+    ) {
+        use scriptbots_runtime::NullFrontendSubmissionError;
+
+        let mut nanos = 0_u64;
+        for envelope in commands {
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            let mut admitted = false;
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "file owner command {:?} did not become applied and durable",
+                    envelope.command_id
+                );
+                if !admitted {
+                    match frontend.submit_envelope(envelope.clone()) {
+                        Ok(status) => {
+                            assert_eq!(status.command_id(), envelope.command_id);
+                            admitted = true;
+                        }
+                        Err(NullFrontendSubmissionError::HostAccess {
+                            source:
+                                HostAccessError::CommandAuthorityLookup {
+                                    failure:
+                                        CommandAuthorityLookupFailure::Pending
+                                        | CommandAuthorityLookupFailure::Busy
+                                        | CommandAuthorityLookupFailure::Capacity { .. },
+                                    ..
+                                },
+                            ..
+                        }) => {}
+                        Err(error) => panic!("terminal command submission failure: {error:?}"),
+                    }
+                }
+                core.retry_retained_journal()
+                    .expect("retry retained file batch honestly");
+                frontend
+                    .drive_at(core, ManualInstant::from_nanos(nanos))
+                    .expect("owner drive");
+                nanos = nanos.checked_add(1).expect("bounded manual clock");
+                if admitted {
+                    let status = frontend
+                        .command_status(envelope.command_id)
+                        .expect("command query")
+                        .expect("admitted command retained");
+                    assert!(
+                        !matches!(
+                            status.application(),
+                            ApplicationState::Failed(_) | ApplicationState::Rejected(_)
+                        ),
+                        "owner command application failed: {status:?}"
+                    );
+                    assert!(
+                        !matches!(status.journal(), JournalState::Failed(_)),
+                        "owner command durability failed: {status:?}"
+                    );
+                    if matches!(status.application(), ApplicationState::Applied(_))
+                        && matches!(status.journal(), JournalState::Durable)
+                    {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    fn verify_scheduled_file_readback(
+        path: &str,
+        run_id: RunId,
+        session: HostSessionId,
+        scheduled: &scriptbots_runtime::ScheduledConfigPatch,
+        later: &scriptbots_runtime::ScheduledConfigPatch,
+        commands: &[CommandEnvelope],
+    ) {
+        use scriptbots_runtime::ScheduledPatchOutcome;
+
+        let reader = crate::StorageReader::open_finished_for_run(path, run_id)
+            .expect("reopen finished file database");
+        let page = reader
+            .host_journal_session_conformance_page(session, None, 6, DEFAULT_JOURNAL_BATCH_BYTES)
+            .expect("validate persisted owner and command archives");
+        assert_eq!(page.records.len(), 5);
+        assert_eq!(page.progress.journal.durable, 5);
+        assert_eq!(page.progress.events.durable, 2);
+        assert_eq!(
+            page.progress.shutdown,
+            Some(JournalBatchId::new(session, 5))
+        );
+        assert!(
+            page.records
+                .iter()
+                .all(|record| record.state == HostJournalRecordState::Durable)
+        );
+        let owner = &page.records[0];
+        assert_eq!(owner.batch_id, JournalBatchId::new(session, 1));
+        assert!(owner.command_lifecycle.is_none());
+        assert!(owner.event.is_none());
+        let evidence = owner
+            .scheduled_patch
+            .as_ref()
+            .expect("persisted scheduled owner evidence");
+        assert_eq!(&evidence.scheduled, scheduled);
+        assert_eq!(evidence.boundary, owner.applied);
+        assert_eq!(
+            evidence.outcome,
+            ScheduledPatchOutcome::Applied {
+                changed_paths: vec!["food_max".to_owned()],
+            }
+        );
+        let later_owner = &page.records[2];
+        let later_evidence = later_owner
+            .scheduled_patch
+            .as_ref()
+            .expect("second owner evidence");
+        assert_eq!(&later_evidence.scheduled, later);
+        assert_eq!(later_evidence.boundary, later_owner.applied);
+        assert_eq!(later_evidence.outcome, evidence.outcome);
+        assert!(later_owner.command_lifecycle.is_none());
+        assert!(later_owner.event.is_none());
+        let external = reader
+            .command_journal_page(session, None, 4, DEFAULT_JOURNAL_BATCH_BYTES)
+            .expect("validate external command projection independently");
+        assert_eq!(external.evidence.command_count, 3);
+        assert_eq!(external.commands.len(), 3);
+        for (index, (record, expected)) in external.commands.iter().zip(commands).enumerate() {
+            assert_eq!(record.lifecycle.envelope(), expected);
+            assert_eq!(
+                record.lifecycle.admission_sequence(),
+                Some(AdmissionSequence::new(index as u64 + 1))
+            );
+            assert_eq!(
+                record.batch_id,
+                JournalBatchId::new(session, [2, 4, 5][index])
+            );
+            assert!(page.records[[1, 3, 4][index]].scheduled_patch.is_none());
+        }
+        println!("retained scheduled-owner file readback evidence: {path}");
+        reader
+            .close()
+            .expect("close verified finished reader before corruption copies");
+    }
+
+    fn rewrite_scheduled_owner_archive(
+        path: &str,
+        run_id: RunId,
+        session: HostSessionId,
+        journal_sequence: u64,
+        owner_sequence: u64,
+        tick: Option<Tick>,
+    ) {
+        // A copied database needs its own persistent companion lease. Hold the
+        // real writer lease during this isolated corruption, then let protected
+        // readers reach the archive guard instead of failing on missing setup.
+        let _lease = crate::StorageWriterLease::acquire(path)
+            .expect("lease isolated corruption copy")
+            .expect("corruption fixture is file-backed");
+        let connection = crate::Connection::open(path).expect("open isolated corruption copy");
+        let encoded_session = encode_journal_u64(session.get());
+        let encoded_sequence = encode_journal_u64(journal_sequence);
+        let original: String = connection
+            .query_row_with_params(
+                "SELECT payload_json FROM host_journal_archive
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                &[
+                    crate::sqlite_run_id(run_id),
+                    encoded_session.as_str().into(),
+                    encoded_sequence.as_str().into(),
+                ],
+            )
+            .expect("read actual persisted owner archive")
+            .get_typed(0)
+            .expect("archive text");
+        let mut archive: HostJournalArchive =
+            serde_json::from_str(&original).expect("decode actual persisted owner archive");
+        let owner = archive
+            .scheduled_patch
+            .as_mut()
+            .expect("selected owner archive");
+        owner.scheduled.sequence = owner_sequence;
+        if let Some(tick) = tick {
+            owner.scheduled.due_tick = tick;
+            owner.boundary.tick = tick;
+            archive.applied.tick = tick;
+        }
+        let payload = serde_json::to_string(&archive).expect("canonical corrupted archive");
+        let digest = blake3::hash(payload.as_bytes()).to_hex().to_string();
+        assert_ne!(
+            payload, original,
+            "corruption matrix must change persisted evidence"
+        );
+        HostJournalArchive::decode(
+            &payload,
+            &digest,
+            run_id,
+            JournalBatchId::new(session, journal_sequence),
+            DEFAULT_JOURNAL_BATCH_BYTES,
+        )
+        .expect("individual archive remains valid; session ordering must reject it");
+        assert_eq!(
+            connection
+                .execute_with_params(
+                    "UPDATE host_journal_archive SET payload_json = ?1, payload_digest = ?2
+                 WHERE run_id = ?3 AND host_session_id = ?4 AND journal_sequence = ?5",
+                    &[
+                        payload.as_str().into(),
+                        digest.as_str().into(),
+                        crate::sqlite_run_id(run_id),
+                        encoded_session.as_str().into(),
+                        encoded_sequence.as_str().into()
+                    ],
+                )
+                .expect("write rehashed owner corruption"),
+            1
+        );
+        connection
+            .close()
+            .expect("close corruption writer before protected open");
+    }
+
+    #[test]
+    fn scheduled_patch_finished_file_and_recovery_refuse_rehashed_owner_order_corruption() {
+        let (source, run_id, session) = create_scheduled_patch_file_with_verified_readback();
+        for (case, journal_sequence, owner_sequence, tick, expected_context) in [
+            (
+                "missing-first",
+                1,
+                2,
+                None,
+                "host_journal_archive.scheduled_patch.sequence",
+            ),
+            (
+                "duplicate",
+                3,
+                1,
+                None,
+                "host_journal_archive.scheduled_patch.sequence",
+            ),
+            (
+                "skipped",
+                3,
+                3,
+                None,
+                "host_journal_archive.scheduled_patch.sequence",
+            ),
+            (
+                "regressing-tick",
+                1,
+                1,
+                Some(Tick(2)),
+                "host_journal_archive.scheduled_patch.due_tick",
+            ),
+        ] {
+            let path = format!("{source}.{case}.sqlite");
+            std::fs::copy(&source, &path).expect("copy closed real worker database for corruption");
+            rewrite_scheduled_owner_archive(
+                &path,
+                run_id,
+                session,
+                journal_sequence,
+                owner_sequence,
+                tick,
+            );
+            let read_error = crate::StorageReader::open_finished_for_run(&path, run_id)
+                .err()
+                .expect("finished reader must refuse cross-record owner corruption");
+            assert!(
+                matches!(read_error, StorageError::InvalidData { context, .. } if context == expected_context),
+                "{case} finished-reader refusal: {read_error:?}"
+            );
+            let recovery_error = Storage::recover_existing_run(&path, run_id)
+                .err()
+                .expect("recovery must refuse cross-record owner corruption");
+            assert!(
+                matches!(recovery_error, StorageError::InvalidData { context, .. } if context == expected_context),
+                "{case} recovery refusal: {recovery_error:?}"
+            );
+            println!("retained {case} scheduled-owner corruption evidence: {path}");
         }
     }
 
@@ -4754,6 +5654,7 @@ mod tests {
             journal_sequence: &journal_sequence,
             scientific_event_sequence: Some(&scientific_event_sequence),
             command_lifecycle: Some(&encoded_command),
+            scheduled_patch: None,
             applied: applied(),
             scientific: Some(&scientific),
             persistence: Some(&persistence),
@@ -5050,7 +5951,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_nonfinite_command_round_trips_losslessly_through_archive_v2() {
+    fn rejected_nonfinite_command_round_trips_losslessly_through_archive() {
         let nan_bits = 0x7fc0_1234_u32;
         let speed = f32::from_bits(nan_bits);
         let lifecycle = rejected_lifecycle(
@@ -5085,6 +5986,7 @@ mod tests {
             journal_sequence: &journal_sequence,
             scientific_event_sequence: None,
             command_lifecycle: Some(&encoded),
+            scheduled_patch: None,
             applied: applied(),
             scientific: None,
             persistence: None,

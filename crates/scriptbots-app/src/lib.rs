@@ -347,12 +347,6 @@ pub enum ScenarioError {
         /// JSON type name of the offending value.
         actual: &'static str,
     },
-    /// Two interventions share one tick with no defined order.
-    #[error("two interventions are scheduled at tick {tick}; at most one per tick is allowed")]
-    DuplicateInterventionTick {
-        /// The duplicated tick.
-        tick: u64,
-    },
     /// The document bytes did not parse as the declared format.
     #[error("failed to parse scenario document: {0}")]
     Parse(String),
@@ -429,6 +423,7 @@ pub struct ScenarioEnvelopeV1 {
 #[serde(deny_unknown_fields)]
 pub struct ScenarioInterventionV1 {
     /// The completed-tick boundary at which the patch applies (0 = before tick 1).
+    /// Patches at the same tick execute in document order.
     pub tick: u64,
     /// Config patch object (same semantics as a configuration layer body).
     pub set: serde_json::Value,
@@ -507,7 +502,6 @@ impl ScenarioDocumentV1 {
         {
             return Err(ScenarioError::EnvelopeZeroTicks { actual: 0 });
         }
-        let mut seen_intervention_ticks = std::collections::HashSet::new();
         for intervention in &self.interventions {
             if let Some(envelope) = &self.envelope
                 && intervention.tick >= envelope.ticks
@@ -521,11 +515,6 @@ impl ScenarioDocumentV1 {
                 return Err(ScenarioError::InterventionNotObject {
                     tick: intervention.tick,
                     actual: json_type_name(&intervention.set),
-                });
-            }
-            if !seen_intervention_ticks.insert(intervention.tick) {
-                return Err(ScenarioError::DuplicateInterventionTick {
-                    tick: intervention.tick,
                 });
             }
         }
@@ -695,19 +684,8 @@ pub fn apply_scenario_interventions(
 ) -> Result<usize, ScenarioRunError> {
     let mut applied = 0;
     for intervention in interventions.iter().filter(|item| item.tick == tick) {
-        let resolved = precedence::resolve_config_layers(
-            current_config_value,
-            &[precedence::ConfigLayerStatement {
-                kind: precedence::ConfigLayerKind::Cli,
-                label: format!("intervention:t{tick}"),
-                fields: intervention.set.clone(),
-            }],
-        );
-        let merged_config: ScriptBotsConfig = serde_json::from_value(resolved.merged.clone())
-            .map_err(|error| ScenarioRunError::Intervention {
-                tick,
-                detail: format!("merged config does not deserialize: {error}"),
-            })?;
+        let merged_config = resolve_scheduled_config_patch(world.config(), &intervention.set)
+            .map_err(|detail| ScenarioRunError::Intervention { tick, detail })?;
         let disposition = scriptbots_core::apply_control_command(
             world,
             scriptbots_core::ControlCommand::UpdateConfig(Box::new(merged_config.clone())),
@@ -723,10 +701,36 @@ pub fn apply_scenario_interventions(
             ),
             "a scenario config intervention must apply to the world, not become a playback command"
         );
-        *current_config_value = resolved.merged;
+        *current_config_value = serde_json::to_value(world.config()).map_err(|error| {
+            ScenarioRunError::Intervention {
+                tick,
+                detail: error.to_string(),
+            }
+        })?;
         applied += 1;
     }
     Ok(applied)
+}
+
+/// Resolve a scheduled patch against the owner's current configuration using
+/// the same pure precedence resolver as launch layers. No world mutation occurs here.
+pub fn resolve_scheduled_config_patch(
+    current: &ScriptBotsConfig,
+    patch: &serde_json::Value,
+) -> Result<ScriptBotsConfig, String> {
+    if !patch.is_object() {
+        return Err("scheduled config patch must be an object".to_owned());
+    }
+    let current = serde_json::to_value(current).map_err(|error| error.to_string())?;
+    let resolved = precedence::resolve_config_layers(
+        &current,
+        &[precedence::ConfigLayerStatement {
+            kind: precedence::ConfigLayerKind::Cli,
+            label: "scheduled-owner-patch".to_owned(),
+            fields: patch.clone(),
+        }],
+    );
+    serde_json::from_value(resolved.merged).map_err(|error| error.to_string())
 }
 
 /// The thread policy a run actually resolved to, and WHICH LAYER decided it.

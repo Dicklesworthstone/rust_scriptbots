@@ -859,7 +859,11 @@ fn lab_runtime_dpor_and_fixed_seed_corpus_drive_real_persistence() {
     );
     assert!(dpor_report.total_runs >= 1);
     assert!(dpor_report.total_runs <= DPOR_MAX_RUNS);
-    assert!(dpor_report.certificates_consistent());
+    assert!(
+        dpor_report.certificates_consistent(),
+        "DPOR certificate inconsistency: {}",
+        dpor_report.to_json_pretty().expect("DPOR run diagnostics")
+    );
 
     let mut seed_explorer = ScheduleExplorer::new(
         ExplorerConfig::new(FIXED_SEEDS[0], FIXED_SEEDS.len())
@@ -874,7 +878,11 @@ fn lab_runtime_dpor_and_fixed_seed_corpus_drive_real_persistence() {
     });
     assert!(!seed_report.has_violations());
     assert_eq!(seed_report.total_runs, FIXED_SEEDS.len());
-    assert!(seed_report.certificates_consistent());
+    assert!(
+        seed_report.certificates_consistent(),
+        "seed corpus certificate inconsistency: {}",
+        seed_report.to_json_pretty().expect("seed run diagnostics")
+    );
 
     for seed in FIXED_SEEDS {
         let (meta, observation) = run_protocol(seed, ProtocolMode::File);

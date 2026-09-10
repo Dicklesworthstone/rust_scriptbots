@@ -288,7 +288,8 @@ impl ControlHandle {
                 ));
             }
             // Rasterization holds an immutable publication, never the owner.
-            let scene = OffscreenScene::capture(&self.read_snapshot()?);
+            let snapshot = self.read_snapshot()?;
+            let scene = OffscreenScene::capture(snapshot.as_ref());
             Ok(render_offscreen_scene(&scene, width, height))
         }
         #[cfg(not(feature = "gui"))]

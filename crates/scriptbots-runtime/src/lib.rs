@@ -664,6 +664,9 @@ pub struct RenderSnapshot {
     /// Configuration audit trail as of this boundary, revision-gated with it.
     #[serde(with = "serde_arc")]
     pub config_audit: Arc<Vec<ConfigAuditEntry>>,
+    /// Bounded owner-action history, independent of external command admission order.
+    #[serde(with = "serde_arc")]
+    pub scheduled_patches: Arc<Vec<ScheduledPatchStatus>>,
 }
 
 impl RenderSnapshot {
@@ -2062,6 +2065,131 @@ pub struct AppliedCommand {
     pub revisions: HostRevisions,
 }
 
+/// One launch-scheduled owner action. Sequence starts at one in stable tick order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledConfigPatch {
+    /// Stable identity within the host session's immutable schedule.
+    pub sequence: u64,
+    /// Completed boundary before the next scientific transition.
+    pub due_tick: Tick,
+    /// Canonical JSON object. Text storage makes retained allocation measurable.
+    /// Arrays, scalars and null replace their standing values during deep merge.
+    pub patch: String,
+}
+
+impl ScheduledConfigPatch {
+    /// Encode an object statement with recursively sorted keys and stable identity.
+    pub fn new(
+        sequence: u64,
+        due_tick: Tick,
+        mut patch: serde_json::Value,
+    ) -> Result<Self, String> {
+        if sequence == 0 || !patch.is_object() {
+            return Err("scheduled patch requires a nonzero sequence and object body".to_owned());
+        }
+        patch.sort_all_objects();
+        Ok(Self {
+            sequence,
+            due_tick,
+            patch: patch.to_string(),
+        })
+    }
+
+    /// Decode and verify the exact canonical object statement.
+    pub fn decode_patch(&self) -> Result<serde_json::Value, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(&self.patch).map_err(|error| error.to_string())?;
+        let canonical = Self::new(self.sequence, self.due_tick, value.clone())?;
+        if canonical.patch != self.patch {
+            return Err("scheduled patch JSON is not canonical".to_owned());
+        }
+        Ok(value)
+    }
+}
+
+/// Observed application result, separate from journal commitment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum ScheduledPatchOutcome {
+    /// Configuration was applied; paths name values that actually changed.
+    Applied {
+        /// Sorted unique dotted paths, empty for an idempotent assignment.
+        changed_paths: Vec<String>,
+    },
+    /// Resolution or application failed before the next scientific transition.
+    Failed(ApplicationFailure),
+}
+
+/// Immutable owner-action evidence. It never invents an external admission sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledPatchEvidence {
+    /// Exact scheduled statement and stable identity.
+    pub scheduled: ScheduledConfigPatch,
+    /// Host boundary at which this result was observed.
+    pub boundary: AppliedCommand,
+    /// Application truth, independent of storage truth.
+    pub outcome: ScheduledPatchOutcome,
+}
+
+impl ScheduledPatchEvidence {
+    /// Validate structural evidence before it enters a journal or read model.
+    ///
+    /// This checks self-consistency, not authenticity or the actual config mutation.
+    pub fn validate(&self) -> Result<(), String> {
+        self.scheduled.decode_patch()?;
+        if self.scheduled.due_tick != self.boundary.tick {
+            return Err("scheduled patch result is not at its due boundary".to_owned());
+        }
+        match &self.outcome {
+            ScheduledPatchOutcome::Applied { changed_paths } => {
+                if changed_paths.iter().any(String::is_empty)
+                    || changed_paths.windows(2).any(|paths| paths[0] >= paths[1])
+                {
+                    return Err(
+                        "changed config paths must be sorted, unique and nonempty".to_owned()
+                    );
+                }
+            }
+            ScheduledPatchOutcome::Failed(failure) => {
+                if failure.code.is_empty() || failure.message.is_empty() {
+                    return Err("scheduled patch failure requires a code and diagnostic".to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Heap storage retained by this evidence, excluding its inline struct.
+    #[must_use]
+    pub fn retained_heap_bytes(&self) -> usize {
+        let outcome = match &self.outcome {
+            ScheduledPatchOutcome::Applied { changed_paths } => changed_paths.iter().fold(
+                changed_paths.capacity().saturating_mul(size_of::<String>()),
+                |total, path| total.saturating_add(path.capacity()),
+            ),
+            ScheduledPatchOutcome::Failed(failure) => failure
+                .code
+                .capacity()
+                .saturating_add(failure.message.capacity()),
+        };
+        outcome.saturating_add(self.scheduled.patch.capacity())
+    }
+}
+
+/// Published application and journal observations for one owner action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledPatchStatus {
+    /// Exact retained journal identity, reused across retries.
+    pub batch_id: JournalBatchId,
+    /// Frozen application result.
+    pub evidence: ScheduledPatchEvidence,
+    /// Independently observed commitment or failure.
+    pub journal: JournalState,
+}
+
 /// Application axis of a command's status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
@@ -2454,6 +2582,7 @@ pub struct JournalBatch {
     id: JournalBatchId,
     scientific_event_sequence: Option<EventSequence>,
     command_lifecycle: Option<CommandLifecycleEvidence>,
+    scheduled_patch: Option<ScheduledPatchEvidence>,
     applied: AppliedCommand,
     scientific: Option<Arc<ScientificBoundary>>,
     persistence: Option<Arc<PersistenceBatch>>,
@@ -2797,11 +2926,35 @@ impl JournalBatch {
             id,
             scientific_event_sequence,
             command_lifecycle,
+            scheduled_patch: None,
             applied,
             scientific,
             persistence,
             retained_bytes,
         }
+    }
+
+    /// Attach a separately ordered owner action to its immutable journal boundary.
+    #[must_use]
+    pub(crate) fn with_scheduled_patch(mut self, evidence: ScheduledPatchEvidence) -> Self {
+        self.scheduled_patch = Some(evidence);
+        self.retained_bytes = journal_batch_retained_bytes(
+            self.command_lifecycle.as_ref(),
+            self.scientific.as_deref(),
+            self.persistence.as_deref(),
+        )
+        .saturating_add(
+            self.scheduled_patch
+                .as_ref()
+                .map_or(0, ScheduledPatchEvidence::retained_heap_bytes),
+        );
+        self
+    }
+
+    /// Owner action evidence, which does not consume external command ingress capacity.
+    #[must_use]
+    pub const fn scheduled_patch(&self) -> Option<&ScheduledPatchEvidence> {
+        self.scheduled_patch.as_ref()
     }
 
     /// Stable identity reused for every admission retry and later receipt.
@@ -2816,7 +2969,7 @@ impl JournalBatch {
         self.scientific_event_sequence
     }
 
-    /// Command id associated with this batch, or `None` for automatic science.
+    /// External command id, or `None` for automatic science and scheduled owner actions.
     #[must_use]
     pub fn command_id(&self) -> Option<CommandId> {
         self.command().map(|command| command.command_id)
@@ -5373,6 +5526,7 @@ mod tests {
     fn projection_snapshot() -> RenderSnapshot {
         let summary_history = Arc::new((1..=10).map(projection_summary).collect::<Vec<_>>());
         RenderSnapshot {
+            scheduled_patches: Arc::new(Vec::new()),
             narrative_events: Arc::new(Vec::new()),
             narrative_dropped_events: 0,
             hybrid_count: 0,
@@ -6144,6 +6298,57 @@ mod tests {
             Some(scientific),
             Some(persistence),
         ))
+    }
+
+    #[test]
+    fn scheduled_patch_charge_includes_retained_capacity_and_validates_canonical_evidence() {
+        let scheduled = ScheduledConfigPatch::new(
+            1,
+            Tick(0),
+            serde_json::json!({"z": 1, "a": {"z": 2, "a": 3}}),
+        )
+        .unwrap();
+        assert_eq!(scheduled.patch, "{\"a\":{\"a\":3,\"z\":2},\"z\":1}");
+        let boundary = AppliedCommand {
+            tick: Tick(0),
+            revisions: HostRevisions::default(),
+        };
+        let evidence = ScheduledPatchEvidence {
+            scheduled,
+            boundary,
+            outcome: ScheduledPatchOutcome::Applied {
+                changed_paths: vec!["a.a".to_owned(), "a.z".to_owned()],
+            },
+        };
+        evidence.validate().unwrap();
+        let empty = JournalBatch::new(
+            JournalBatchId::new(HostSessionId::new(71), 1),
+            None,
+            None,
+            boundary,
+            None,
+            None,
+        );
+        let baseline = empty
+            .clone()
+            .with_scheduled_patch(evidence.clone())
+            .retained_bytes();
+        let mut reserved = evidence.clone();
+        reserved.scheduled.patch.reserve(4096);
+        let reserved_heap = reserved.retained_heap_bytes();
+        assert!(empty.with_scheduled_patch(reserved).retained_bytes() > baseline);
+        assert!(
+            reserved_heap > evidence.retained_heap_bytes(),
+            "spare String capacity is retained even with identical JSON"
+        );
+        let mut malformed = evidence.clone();
+        malformed.scheduled.patch = "{ \"z\": 1 }".to_owned();
+        assert!(malformed.validate().is_err());
+        malformed = evidence;
+        malformed.outcome = ScheduledPatchOutcome::Applied {
+            changed_paths: vec!["a".to_owned(), "a".to_owned()],
+        };
+        assert!(malformed.validate().is_err());
     }
 
     #[test]
@@ -7129,6 +7334,7 @@ mod tests {
                 spike_hits: 0,
             });
             self.latest_snapshot = Some(Arc::new(RenderSnapshot {
+                scheduled_patches: Arc::new(Vec::new()),
                 narrative_events: Arc::new(Vec::new()),
                 narrative_dropped_events: 0,
                 hybrid_count: 0,

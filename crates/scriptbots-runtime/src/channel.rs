@@ -660,7 +660,9 @@ pub enum ChannelRunOutcome {
     Stopped,
     /// Losing every client producer triggered the fail-safe ordered shutdown.
     ControllerDisconnected,
-    /// The host latched a fault before an ordered shutdown completed.
+    /// The host latched a fault. Scheduled application failures drain ordered
+    /// shutdown first; the owner's lifecycle and journal receipts show whether
+    /// finalization completed.
     Faulted,
 }
 

@@ -504,6 +504,7 @@ struct TerminalApp<'a> {
     /// re-read it — the seq field is documented for exactly this. Starting at 0
     /// is correct because core's sequence starts at 1 (bd-16g.10).
     intervention_watermark: u64,
+    scheduled_patch_watermark: u64,
     last_event_tick: u64,
     snapshot: Snapshot,
     baseline: Option<Baseline>,
@@ -675,6 +676,7 @@ impl<'a> TerminalApp<'a> {
             day_night,
             event_log: VecDeque::with_capacity(EVENT_LOG_CAPACITY),
             intervention_watermark: 0,
+            scheduled_patch_watermark: 0,
             last_event_tick: 0,
             snapshot: Snapshot::default(),
             baseline: None,
@@ -1003,25 +1005,64 @@ impl<'a> TerminalApp<'a> {
         }
     }
 
-    /// Name the config keys the interventions due at `tick` actually set.
-    ///
-    /// The scenario format carries a JSON config patch rather than a named
-    /// intervention kind, so the honest description is the set of keys being
-    /// changed — truthful about what the product knows instead of inventing a
-    /// label for it.
-    fn intervention_summary(due: &[crate::ScenarioInterventionV1], tick: u64) -> String {
-        let mut keys: Vec<String> = due
-            .iter()
-            .filter(|item| item.tick == tick)
-            .filter_map(|item| item.set.as_object())
-            .flat_map(|object| object.keys().cloned())
-            .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        if keys.is_empty() {
-            "no config keys".to_owned()
-        } else {
-            keys.join(", ")
+    /// Consume owner-observed outcomes, never the scenario's future declarations.
+    /// Application and journal commitment are independent: an applied patch can
+    /// still have a pending or failed journal receipt.
+    fn report_scheduled_patches(&mut self, snapshot: &RenderSnapshot) {
+        for status in snapshot.scheduled_patches.iter() {
+            let evidence = &status.evidence;
+            let sequence = evidence.scheduled.sequence;
+            if sequence <= self.scheduled_patch_watermark {
+                continue;
+            }
+            if evidence.boundary.tick.0 > snapshot.world.tick
+                || evidence.scheduled.due_tick.0 > evidence.boundary.tick.0
+            {
+                // A future observation cannot establish an application at the
+                // displayed boundary. Keep the cursor so a later valid view can.
+                break;
+            }
+            let Some(expected) = self.scheduled_patch_watermark.checked_add(1) else {
+                break;
+            };
+            if sequence > expected {
+                let last_missing = sequence - 1;
+                warn!(expected, last_missing, "scheduled patch history gap");
+                self.push_event(
+                    snapshot.world.tick,
+                    EventKind::Info,
+                    format!(
+                        "Scheduled patch history gap: sequences {expected}..={last_missing} not retained"
+                    ),
+                );
+            }
+            let tick = evidence.boundary.tick.0;
+            match &evidence.outcome {
+                scriptbots_runtime::ScheduledPatchOutcome::Applied { changed_paths } => {
+                    let changed = if changed_paths.is_empty() {
+                        "no values changed".to_owned()
+                    } else {
+                        changed_paths.join(", ")
+                    };
+                    info!(sequence, tick, batch_id = ?status.batch_id, journal = ?status.journal,
+                        %changed, "scheduled patch applied");
+                    let message =
+                        format!("Scheduled patch #{sequence} applied at t{tick}: {changed}");
+                    self.push_event(tick, EventKind::Info, message.clone());
+                    self.push_toast(message);
+                }
+                scriptbots_runtime::ScheduledPatchOutcome::Failed(failure) => {
+                    warn!(sequence, tick, batch_id = ?status.batch_id, journal = ?status.journal,
+                        code = %failure.code, error = %failure.message, "scheduled patch failed");
+                    let message = format!(
+                        "Scheduled patch #{sequence} failed at t{tick}: {}: {}",
+                        failure.code, failure.message
+                    );
+                    self.push_event(tick, EventKind::Info, message.clone());
+                    self.push_toast(message);
+                }
+            }
+            self.scheduled_patch_watermark = sequence;
         }
     }
 
@@ -1094,7 +1135,9 @@ impl<'a> TerminalApp<'a> {
             self.draw_help(frame);
         }
 
-        self.draw_toasts(frame, frame.area());
+        // Keep transient status inside the map, away from the sidebar titles
+        // and metrics that remain useful while several commands report results.
+        self.draw_toasts(frame, layout.map);
         if self.palette_open {
             self.draw_command_palette(frame, frame.area());
         }
@@ -2747,8 +2790,12 @@ impl<'a> TerminalApp<'a> {
             return;
         }
 
-        let x = area.width.saturating_sub(box_width + 2);
-        let y = area.height.saturating_sub(box_height + 2);
+        let x = area
+            .x
+            .saturating_add(area.width.saturating_sub(box_width + 2));
+        let y = area
+            .y
+            .saturating_add(area.height.saturating_sub(box_height + 2));
         let toast_area = Rect::new(x, y, box_width, box_height);
 
         let border_style = self.palette.accent_style();
@@ -3499,7 +3546,7 @@ impl<'a> TerminalApp<'a> {
         let cached_inspection = self.brain_inspection_cache.clone();
         let mut next_inspection_cache = None;
         let mut request_issued = false;
-        let new_snapshot = match self.host.clone().snapshot_after(None) {
+        let (new_snapshot, source_snapshot) = match self.host.clone().snapshot_after(None) {
             Ok(Some(world)) => {
                 self.paused = world.playback.paused;
                 self.speed_multiplier = world.playback.speed_multiplier;
@@ -3631,7 +3678,7 @@ impl<'a> TerminalApp<'a> {
                         next_inspection_cache = Some(cache);
                     }
                 }
-                snap
+                (snap, world)
             }
             Ok(None) => return,
             Err(error) => {
@@ -3645,6 +3692,7 @@ impl<'a> TerminalApp<'a> {
         }
         self.ingest_events(&new_snapshot);
         self.snapshot = new_snapshot;
+        self.report_scheduled_patches(&source_snapshot);
         self.validate_rail_selection();
         self.maybe_log_rail_first_show();
         self.maybe_log_brain_panel();
@@ -9284,52 +9332,273 @@ mod tests {
         assert_eq!(app.intervention_watermark, watermark);
     }
 
-    /// An applied intervention must name WHAT it changed, not just how many.
-    ///
-    /// A count alone cannot tell a drought from a meteor after the fact, and this
-    /// bead requires an ecosystem crash caused by a mis-parameterised
-    /// intervention to be obvious from the record (bd-16g.10).
-    #[test]
-    fn an_intervention_summary_names_the_config_keys_it_sets() {
-        let due = vec![
-            crate::ScenarioInterventionV1 {
-                tick: 10,
-                set: serde_json::json!({ "food_growth_rate": 0.0, "closed": true }),
+    // Typed publication fixtures exercise the production snapshot consumer;
+    // they do not execute patches or prove journal persistence.
+    fn scheduled_patch_status(
+        snapshot: &RenderSnapshot,
+        sequence: u64,
+        outcome: scriptbots_runtime::ScheduledPatchOutcome,
+        journal: scriptbots_runtime::JournalState,
+    ) -> scriptbots_runtime::ScheduledPatchStatus {
+        scriptbots_runtime::ScheduledPatchStatus {
+            batch_id: scriptbots_runtime::JournalBatchId::new(snapshot.session_id, sequence),
+            evidence: scriptbots_runtime::ScheduledPatchEvidence {
+                scheduled: scriptbots_runtime::ScheduledConfigPatch::new(
+                    sequence,
+                    scriptbots_core::Tick(snapshot.world.tick),
+                    serde_json::json!({ "food_growth_rate": 0.0, "unchanged": 1 }),
+                )
+                .expect("valid scheduled patch fixture"),
+                boundary: scriptbots_runtime::AppliedCommand {
+                    tick: scriptbots_core::Tick(snapshot.world.tick),
+                    revisions: snapshot.revisions,
+                },
+                outcome,
             },
-            crate::ScenarioInterventionV1 {
-                tick: 99,
-                set: serde_json::json!({ "never_mentioned": 1 }),
-            },
-        ];
-
-        let summary = TerminalApp::intervention_summary(&due, 10);
-        assert!(
-            summary.contains("food_growth_rate") && summary.contains("closed"),
-            "the summary must name every key set at this tick; got {summary:?}"
-        );
-        assert!(
-            !summary.contains("never_mentioned"),
-            "a key scheduled for a DIFFERENT tick must not be reported as applied \
-             now; got {summary:?}"
-        );
-        // Deterministic order, so two runs of the same scenario produce the same
-        // text in the log and the rail.
-        assert_eq!(summary, "closed, food_growth_rate");
+            journal,
+        }
     }
 
-    /// An intervention with no keys must say so rather than rendering blank.
     #[test]
-    fn an_empty_intervention_summary_is_stated_not_silent() {
-        let due = vec![crate::ScenarioInterventionV1 {
-            tick: 3,
-            set: serde_json::json!({}),
-        }];
-        assert_eq!(
-            TerminalApp::intervention_summary(&due, 3),
-            "no config keys",
-            "an empty patch must be described, or the feedback line reads as a \
-             truncated message"
-        );
+    fn scheduled_patch_snapshot_reports_same_tick_outcomes_without_inventing_changed_keys() {
+        with_shortcut_app(|app| {
+            let mut snapshot = app
+                .host
+                .snapshot_after(None)
+                .expect("snapshot")
+                .expect("publication")
+                .as_ref()
+                .clone();
+            snapshot.world.tick = 10;
+            app.snapshot.tick = 10;
+            let applied = |paths: Vec<String>| scriptbots_runtime::ScheduledPatchOutcome::Applied {
+                changed_paths: paths,
+            };
+            snapshot.scheduled_patches = Arc::new(vec![
+                scheduled_patch_status(
+                    &snapshot,
+                    1,
+                    applied(vec!["food_growth_rate".to_owned()]),
+                    scriptbots_runtime::JournalState::Pending,
+                ),
+                scheduled_patch_status(
+                    &snapshot,
+                    2,
+                    applied(vec!["closed".to_owned()]),
+                    scriptbots_runtime::JournalState::Durable,
+                ),
+                scheduled_patch_status(
+                    &snapshot,
+                    3,
+                    applied(Vec::new()),
+                    scriptbots_runtime::JournalState::CommittedVolatile,
+                ),
+            ]);
+            let before = app.event_log.len();
+            app.report_scheduled_patches(&snapshot);
+            let events: Vec<_> = app.event_log.iter().skip(before).collect();
+            assert_eq!(
+                events.iter().map(|event| event.tick).collect::<Vec<_>>(),
+                [10, 10, 10]
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.message.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Scheduled patch #1 applied at t10: food_growth_rate",
+                    "Scheduled patch #2 applied at t10: closed",
+                    "Scheduled patch #3 applied at t10: no values changed",
+                ]
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| matches!(event.kind, EventKind::Info))
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !event.message.contains("unchanged"))
+            );
+            let toasts = app.toasts.clone();
+            assert!(toasts.iter().all(|toast| toast.created_tick == 10));
+            app.report_scheduled_patches(&snapshot);
+            assert_eq!(app.event_log.len(), before + 3);
+            assert_eq!(app.toasts, toasts);
+            assert_eq!(app.scheduled_patch_watermark, 3);
+            for status in Arc::make_mut(&mut snapshot.scheduled_patches) {
+                status.journal = scriptbots_runtime::JournalState::Durable;
+            }
+            app.report_scheduled_patches(&snapshot);
+            assert_eq!(
+                app.event_log.len(),
+                before + 3,
+                "journal commitment must not re-report application"
+            );
+            assert_eq!(app.toasts, toasts);
+        });
+    }
+
+    #[test]
+    fn scheduled_patch_snapshot_keeps_application_failure_separate_from_journal_failure() {
+        with_shortcut_app(|app| {
+            let mut snapshot = app
+                .host
+                .snapshot_after(None)
+                .expect("snapshot")
+                .expect("publication")
+                .as_ref()
+                .clone();
+            let failure = scriptbots_runtime::ApplicationFailure {
+                code: "invalid_patch".to_owned(),
+                message: "invalid food growth rate".to_owned(),
+            };
+            snapshot.scheduled_patches = Arc::new(vec![
+                scheduled_patch_status(
+                    &snapshot,
+                    1,
+                    scriptbots_runtime::ScheduledPatchOutcome::Failed(failure),
+                    scriptbots_runtime::JournalState::Durable,
+                ),
+                scheduled_patch_status(
+                    &snapshot,
+                    2,
+                    scriptbots_runtime::ScheduledPatchOutcome::Applied {
+                        changed_paths: vec!["food_growth_rate".to_owned()],
+                    },
+                    scriptbots_runtime::JournalState::Failed(scriptbots_runtime::JournalFailure {
+                        code: "write".to_owned(),
+                        message: "journal unavailable".to_owned(),
+                    }),
+                ),
+            ]);
+            let before = app.event_log.len();
+            app.report_scheduled_patches(&snapshot);
+            let events: Vec<_> = app.event_log.iter().skip(before).collect();
+            assert_eq!(events.len(), 2);
+            assert_eq!(
+                events[0].message,
+                "Scheduled patch #1 failed at t0: invalid_patch: invalid food growth rate"
+            );
+            assert!(matches!(events[0].kind, EventKind::Info));
+            assert_eq!(
+                events[1].message,
+                "Scheduled patch #2 applied at t0: food_growth_rate"
+            );
+            assert!(matches!(events[1].kind, EventKind::Info));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !event.message.contains("persisted"))
+            );
+        });
+    }
+
+    #[test]
+    fn scheduled_patch_snapshot_does_not_report_absent_or_future_observations_as_applied() {
+        with_shortcut_app(|app| {
+            let mut snapshot = app
+                .host
+                .snapshot_after(None)
+                .expect("snapshot")
+                .expect("publication")
+                .as_ref()
+                .clone();
+            let before = app.event_log.len();
+            app.report_scheduled_patches(&snapshot);
+            assert_eq!(app.event_log.len(), before);
+            let mut future = scheduled_patch_status(
+                &snapshot,
+                1,
+                scriptbots_runtime::ScheduledPatchOutcome::Applied {
+                    changed_paths: vec!["future".to_owned()],
+                },
+                scriptbots_runtime::JournalState::Pending,
+            );
+            future.evidence.boundary.tick = scriptbots_core::Tick(1);
+            future.evidence.scheduled.due_tick = scriptbots_core::Tick(1);
+            snapshot.scheduled_patches = Arc::new(vec![future]);
+            app.report_scheduled_patches(&snapshot);
+            assert_eq!(app.event_log.len(), before);
+            assert_eq!(app.scheduled_patch_watermark, 0);
+            snapshot.world.tick = 1;
+            app.report_scheduled_patches(&snapshot);
+            assert_eq!(app.event_log.len(), before + 1);
+            assert_eq!(app.scheduled_patch_watermark, 1);
+        });
+    }
+
+    #[test]
+    fn scheduled_patch_snapshot_reports_retention_gaps_once_and_never_wraps_its_cursor() {
+        with_shortcut_app(|app| {
+            let mut snapshot = app
+                .host
+                .snapshot_after(None)
+                .expect("snapshot")
+                .expect("publication")
+                .as_ref()
+                .clone();
+            let unchanged = || scriptbots_runtime::ScheduledPatchOutcome::Applied {
+                changed_paths: Vec::new(),
+            };
+            snapshot.scheduled_patches = Arc::new(vec![
+                scheduled_patch_status(
+                    &snapshot,
+                    4,
+                    unchanged(),
+                    scriptbots_runtime::JournalState::Pending,
+                ),
+                scheduled_patch_status(
+                    &snapshot,
+                    6,
+                    unchanged(),
+                    scriptbots_runtime::JournalState::Pending,
+                ),
+            ]);
+            let before = app.event_log.len();
+            app.report_scheduled_patches(&snapshot);
+            let messages: Vec<_> = app
+                .event_log
+                .iter()
+                .skip(before)
+                .map(|event| event.message.as_str())
+                .collect();
+            assert_eq!(messages.len(), 4);
+            assert_eq!(
+                messages[0],
+                "Scheduled patch history gap: sequences 1..=3 not retained"
+            );
+            assert_eq!(
+                messages[2],
+                "Scheduled patch history gap: sequences 5..=5 not retained"
+            );
+            app.report_scheduled_patches(&snapshot);
+            assert_eq!(app.event_log.len(), before + 4);
+            app.scheduled_patch_watermark = u64::MAX - 1;
+            snapshot.scheduled_patches = Arc::new(vec![scheduled_patch_status(
+                &snapshot,
+                u64::MAX,
+                unchanged(),
+                scriptbots_runtime::JournalState::Pending,
+            )]);
+            app.report_scheduled_patches(&snapshot);
+            assert_eq!(app.scheduled_patch_watermark, u64::MAX);
+            let after_max = app.event_log.len();
+            app.report_scheduled_patches(&snapshot);
+            let mut wrapped = scheduled_patch_status(
+                &snapshot,
+                1,
+                unchanged(),
+                scriptbots_runtime::JournalState::Pending,
+            );
+            wrapped.evidence.scheduled.sequence = 0;
+            snapshot.scheduled_patches = Arc::new(vec![wrapped]);
+            app.report_scheduled_patches(&snapshot);
+            assert_eq!(app.scheduled_patch_watermark, u64::MAX);
+            assert_eq!(app.event_log.len(), after_max);
+        });
     }
 
     /// Collect the GLYPHS a palette would paint, ignoring colour entirely.
@@ -13188,6 +13457,11 @@ mod tests {
             mode: row.mode,
             depth: row.depth,
         };
+        // This matrix isolates palette depth and glyph capability at one fixed
+        // world boundary. Freeze shimmer explicitly so process color detection
+        // cannot change the colors through the separately resolved motion policy.
+        // Water-shimmer and reduced-motion tests exercise animation independently.
+        app.motion = MotionPolicy::ReducedByConfig;
 
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
@@ -15273,6 +15547,72 @@ mod tests {
             "full motion must still advance the clock, or the freeze assertions \
              above hold for a clock that never ran"
         );
+    }
+
+    #[test]
+    fn stacked_status_toasts_preserve_panel_titles_in_the_actual_buffer() {
+        with_shortcut_app(|app| {
+            app.palette = Palette::test_backend_evidence();
+            for sequence in 1..=4 {
+                app.push_toast(format!("Patch #{sequence} applied"));
+            }
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 36))
+                .expect("toast regression backend");
+            terminal
+                .draw(|frame| app.draw(frame))
+                .expect("draw stacked toasts");
+            let buffer = terminal.backend().buffer();
+            let layout = app.frame_layout(buffer.area);
+            HeadlessBufferEvidence::inspect(buffer, app.snapshot.tick, &layout)
+                .expect("stacked status must preserve every visible panel title");
+            assert!(HeadlessBufferEvidence::region_text(buffer, layout.brains).contains("Brains"));
+            let map = HeadlessBufferEvidence::region_text(buffer, layout.map);
+            assert!(map.contains("Status"), "status overlay must remain visible");
+            for sequence in 1..=4 {
+                assert!(
+                    map.contains(&format!("Patch #{sequence} applied")),
+                    "toast {sequence} vanished"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn toast_overlay_respects_offset_map_bounds_and_tiny_viewports() {
+        with_shortcut_app(|app| {
+            app.push_toast("Bounded toast");
+            for area in [Rect::new(7, 5, 40, 12), Rect::new(7, 5, 3, 2)] {
+                let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 24))
+                    .expect("offset toast backend");
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            Paragraph::new(vec![Line::from("x".repeat(60)); 24]),
+                            frame.area(),
+                        );
+                        app.draw_toasts(frame, area);
+                    })
+                    .expect("draw bounded toast");
+                let buffer = terminal.backend().buffer();
+                for y in 0..buffer.area.height {
+                    for x in 0..buffer.area.width {
+                        if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+                            assert_eq!(
+                                buffer[(x, y)].symbol(),
+                                "x",
+                                "toast escaped {area:?} at {x},{y}"
+                            );
+                        }
+                    }
+                }
+                let inside = HeadlessBufferEvidence::region_text(buffer, area);
+                if area.width == 40 {
+                    assert!(inside.contains("Bounded toast"));
+                } else {
+                    assert_eq!(inside, "xxx\nxxx\n", "too-small map must remain untouched");
+                }
+            }
+        });
     }
 
     #[test]

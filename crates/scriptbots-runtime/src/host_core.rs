@@ -13,7 +13,8 @@ use super::{
     HydrologyLayerSnapshot, HydrologyTileSnapshot, JournalAdmission, JournalBatch, JournalBatchId,
     JournalFailure, JournalPort, JournalReceipt, JournalReceiptState, JournalState,
     JournaledScientificEvent, LayerRevision, ManualHostDriver, ManualInstant, PlaybackSnapshot,
-    ProtocolEventSequence, RejectionReason, RenderSnapshot, ScientificBoundary,
+    ProtocolEventSequence, RejectionReason, RenderSnapshot, ScheduledConfigPatch,
+    ScheduledPatchEvidence, ScheduledPatchOutcome, ScheduledPatchStatus, ScientificBoundary,
     ScientificBoundaryFault, ScientificEvent, ScientificRevision, ShutdownCommitRequirement,
     SnapshotBuildStats, SnapshotHub, SnapshotLayerRevisions, SnapshotLayers, SnapshotRevision,
     StatusCombinationError, TerrainLayerSnapshot, TerrainTileSnapshot,
@@ -1945,6 +1946,50 @@ fn account_narrative_payload(
     }
 }
 
+fn account_scheduled_payload(
+    build: &mut SnapshotBuildStats,
+    history: &Vec<ScheduledPatchStatus>,
+    newly_allocated: bool,
+) {
+    let mut bytes = history
+        .capacity()
+        .saturating_mul(size_of::<ScheduledPatchStatus>());
+    let mut allocations = usize::from(history.capacity() != 0);
+    for status in history {
+        bytes = bytes.saturating_add(status.evidence.retained_heap_bytes());
+        allocations = allocations
+            .saturating_add(usize::from(status.evidence.scheduled.patch.capacity() != 0));
+        match &status.evidence.outcome {
+            ScheduledPatchOutcome::Applied { changed_paths } => {
+                allocations =
+                    allocations.saturating_add(usize::from(changed_paths.capacity() != 0));
+                for path in changed_paths {
+                    allocations = allocations.saturating_add(usize::from(path.capacity() != 0));
+                }
+            }
+            ScheduledPatchOutcome::Failed(failure) => {
+                allocations = allocations
+                    .saturating_add(usize::from(failure.code.capacity() != 0))
+                    .saturating_add(usize::from(failure.message.capacity() != 0));
+            }
+        }
+        if let JournalState::Failed(failure) = &status.journal {
+            bytes = bytes
+                .saturating_add(failure.code.capacity())
+                .saturating_add(failure.message.capacity());
+            allocations = allocations
+                .saturating_add(usize::from(failure.code.capacity() != 0))
+                .saturating_add(usize::from(failure.message.capacity() != 0));
+        }
+    }
+    build.total_payload_capacity_bytes = build.total_payload_capacity_bytes.saturating_add(bytes);
+    if newly_allocated {
+        build.newly_allocated_capacity_bytes =
+            build.newly_allocated_capacity_bytes.saturating_add(bytes);
+        build.bulk_allocations = build.bulk_allocations.saturating_add(allocations);
+    }
+}
+
 /// Pure synchronous authority for command order and scientific time.
 ///
 /// `HostCore` owns its world and persistence-admission session by value. It
@@ -1990,6 +2035,10 @@ pub struct HostCore {
     shutdown_receipt: Option<(JournalBatchId, ShutdownCommitRequirement)>,
     failed_journal_batches: HashSet<JournalBatchId>,
     latched_fault: Option<HostFault>,
+    schedule: Option<ScheduledConfigQueue>,
+    scheduled_patches: Arc<Vec<ScheduledPatchStatus>>,
+    scheduled_barrier: Option<JournalBatchId>,
+    scheduled_failure_shutdown: bool,
     /// An organism this host has removed from its world and not yet handed to a
     /// mover (bd-emcv). While it sits here it belongs to NO world, so the host
     /// refuses a second emigration until it is collected.
@@ -1998,6 +2047,41 @@ pub struct HostCore {
     staged_immigrant: Option<MigratingAgent>,
     /// Provenance and local identity of the most recent completed arrival.
     last_arrival: Option<MigrationArrival>,
+}
+
+type ConfigPatchResolver =
+    fn(&ScriptBotsConfig, &serde_json::Value) -> Result<ScriptBotsConfig, String>;
+
+struct ScheduledConfigQueue {
+    remaining: VecDeque<ScheduledConfigPatch>,
+    resolve: ConfigPatchResolver,
+}
+
+fn changed_config_paths(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    path: &str,
+    changed: &mut Vec<String>,
+) {
+    if before == after {
+        return;
+    }
+    if let (serde_json::Value::Object(before), serde_json::Value::Object(after)) = (before, after) {
+        let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+        for key in keys {
+            let child = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            match (before.get(key), after.get(key)) {
+                (Some(before), Some(after)) => changed_config_paths(before, after, &child, changed),
+                _ => changed.push(child),
+            }
+        }
+    } else {
+        changed.push(path.to_owned());
+    }
 }
 
 /// Both identities of one completed arrival (bd-emcv).
@@ -2146,6 +2230,7 @@ impl HostCore {
         let narrative_events =
             Arc::new(world.narrative_events().iter().cloned().collect::<Vec<_>>());
         account_narrative_payload(&mut build, &narrative_events, true);
+        let scheduled_patches = Arc::new(Vec::new());
         let initial_snapshot = Arc::new(RenderSnapshot {
             narrative_events,
             narrative_dropped_events: world.narrative_dropped_events(),
@@ -2176,6 +2261,7 @@ impl HostCore {
             applied_interventions: Arc::clone(&applied_interventions),
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
+            scheduled_patches: Arc::clone(&scheduled_patches),
         });
         let snapshots = SnapshotHub::new(initial_snapshot);
         let command_archive_requirement = journal.shutdown_commit_requirement();
@@ -2250,6 +2336,10 @@ impl HostCore {
             shutdown_receipt: None,
             failed_journal_batches: HashSet::new(),
             latched_fault: None,
+            schedule: None,
+            scheduled_patches,
+            scheduled_barrier: None,
+            scheduled_failure_shutdown: false,
             outbound_migrant: None,
             staged_immigrant: None,
             last_arrival: None,
@@ -2263,6 +2353,238 @@ impl HostCore {
             shared: Rc::clone(&self.shared),
             snapshots: self.snapshots.clone(),
             events: self.events.clone(),
+        }
+    }
+
+    /// Take ownership of a finite launch schedule before the first drive.
+    /// The launch input is independent of the bounded published outcome history
+    /// (`archived_command_capacity`); it is not a streaming admission queue.
+    /// Snapshot byte accounting covers published outcomes, not this remaining
+    /// launch input or all other owner allocations. External command admission
+    /// order is unchanged: an action gates a science boundary without entering its FIFO.
+    pub fn install_schedule(
+        &mut self,
+        patches: Vec<ScheduledConfigPatch>,
+        resolve: ConfigPatchResolver,
+    ) -> Result<(), HostAccessError> {
+        if self.last_now.is_some() || self.schedule.is_some() {
+            return Err(protocol_violation(
+                "scenario schedule must be installed once before driving",
+            ));
+        }
+        let mut previous_tick = self.world.tick();
+        for (index, patch) in patches.iter().enumerate() {
+            let sequence = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1));
+            let object = patch.decode_patch().map_err(|error| {
+                protocol_violation(format!("invalid scheduled patch JSON: {error}"))
+            })?;
+            if Some(patch.sequence) != sequence
+                || !object.is_object()
+                || patch.due_tick < previous_tick
+            {
+                return Err(protocol_violation(
+                    "scenario schedule requires contiguous sequences from one, ordered non-past ticks, and object patches",
+                ));
+            }
+            previous_tick = patch.due_tick;
+        }
+        self.schedule = Some(ScheduledConfigQueue {
+            remaining: patches.into(),
+            resolve,
+        });
+        Ok(())
+    }
+
+    fn scheduled_commitment_reached(&self, state: &JournalState) -> bool {
+        matches!(state, JournalState::Durable)
+            || (matches!(state, JournalState::CommittedVolatile)
+                && self.journal.shutdown_commit_requirement()
+                    == ShutdownCommitRequirement::CommittedVolatile)
+    }
+
+    fn update_scheduled_journal(&mut self, batch_id: JournalBatchId, journal: JournalState) {
+        if self
+            .scheduled_patches
+            .iter()
+            .any(|status| status.batch_id == batch_id && status.journal != journal)
+            && let Some(status) = Arc::make_mut(&mut self.scheduled_patches)
+                .iter_mut()
+                .find(|status| status.batch_id == batch_id)
+        {
+            status.journal = journal;
+        }
+    }
+
+    /// Poll an already-applied action before considering another science step.
+    /// The external Step is still in its original queue position throughout this barrier.
+    fn service_due_config_patch(&mut self, may_start: bool) -> Result<bool, HostAccessError> {
+        if let Some(batch_id) = self.scheduled_barrier {
+            let status = self
+                .scheduled_patches
+                .iter()
+                .find(|status| status.batch_id == batch_id)
+                .ok_or_else(|| protocol_violation("scheduled action lost its journal status"))?;
+            if !self.scheduled_commitment_reached(&status.journal) {
+                return Ok(false);
+            }
+            self.scheduled_barrier = None;
+            self.schedule
+                .as_mut()
+                .ok_or_else(|| protocol_violation("scheduled action lost its queue"))?
+                .remaining
+                .pop_front();
+        }
+        if !may_start {
+            return Ok(true);
+        }
+        let Some(schedule) = self.schedule.as_ref() else {
+            return Ok(true);
+        };
+        let Some(scheduled) = schedule.remaining.front().cloned() else {
+            return Ok(true);
+        };
+        if scheduled.due_tick > self.world.tick() {
+            return Ok(true);
+        }
+        if self.latched_fault.is_some() {
+            // The failure record has crossed its commitment barrier. Let the
+            // existing command fault path terminalize Steps and admit ordered
+            // shutdown; it cannot execute science while this fault is latched.
+            return Ok(true);
+        }
+        if scheduled.due_tick < self.world.tick() {
+            self.latch_protocol_fault(
+                "scheduled_tick_missed",
+                format!(
+                    "scheduled patch {} was due at {:?}, current tick {:?}",
+                    scheduled.sequence,
+                    scheduled.due_tick,
+                    self.world.tick()
+                ),
+            )?;
+            return Ok(false);
+        }
+        let resolve = schedule.resolve;
+        self.ensure_journal_sequence_available()?;
+        let evidence = self.apply_scheduled_patch(scheduled, resolve)?;
+        self.journal_scheduled_patch(&evidence)?;
+        Ok(false)
+    }
+
+    fn apply_scheduled_patch(
+        &mut self,
+        scheduled: ScheduledConfigPatch,
+        resolve: ConfigPatchResolver,
+    ) -> Result<ScheduledPatchEvidence, HostAccessError> {
+        let next_control = self.revisions.control.checked_next().ok_or_else(|| {
+            protocol_violation("control revision exhausted before scheduled patch")
+        })?;
+        let before = serde_json::to_value(self.world.config())
+            .map_err(|error| protocol_violation(error.to_string()))?;
+        let resolved = scheduled
+            .decode_patch()
+            .and_then(|patch| resolve(self.world.config(), &patch));
+        // Serialize the candidate before mutation so serialization failure cannot
+        // leave an applied configuration without an owner action record.
+        // WorldState::apply_config_update stores this exact candidate in
+        // self.config; its food-cell clamping does not normalize config fields.
+        let candidate = resolved.and_then(|config| {
+            serde_json::to_value(&config)
+                .map(|value| (config, value))
+                .map_err(|error| error.to_string())
+        });
+        let outcome = match candidate {
+            Ok((config, after)) => match self.world.apply_config_update(config) {
+                Ok(()) => {
+                    self.revisions.control = next_control;
+                    self.revisions.config = ConfigRevision::new(self.world.config_revision());
+                    let mut changed_paths = Vec::new();
+                    changed_config_paths(&before, &after, "", &mut changed_paths);
+                    ScheduledPatchOutcome::Applied { changed_paths }
+                }
+                Err(error) => ScheduledPatchOutcome::Failed(ApplicationFailure {
+                    code: "scheduled_config_application".to_owned(),
+                    message: error.to_string(),
+                }),
+            },
+            Err(message) => ScheduledPatchOutcome::Failed(ApplicationFailure {
+                code: "scheduled_config_resolution".to_owned(),
+                message,
+            }),
+        };
+        Ok(ScheduledPatchEvidence {
+            scheduled,
+            boundary: self.applied_boundary(),
+            outcome,
+        })
+    }
+
+    fn journal_scheduled_patch(
+        &mut self,
+        evidence: &ScheduledPatchEvidence,
+    ) -> Result<(), HostAccessError> {
+        let batch_id = JournalBatchId::new(self.session_id, self.next_journal_sequence);
+        self.next_journal_sequence = self
+            .next_journal_sequence
+            .checked_add(1)
+            .ok_or_else(|| protocol_violation("journal sequence exhausted"))?;
+        let batch = Arc::new(
+            JournalBatch::new(batch_id, None, None, evidence.boundary, None, None)
+                .with_scheduled_patch(evidence.clone()),
+        );
+        tracing::info!(
+            sequence = evidence.scheduled.sequence,
+            tick = evidence.boundary.tick.0,
+            control_revision = evidence.boundary.revisions.control.get(),
+            config_revision = evidence.boundary.revisions.config.get(),
+            journal_batch = ?batch_id,
+            outcome = ?evidence.outcome,
+            "Owner scenario patch application observed; journal commitment pending"
+        );
+        let history = Arc::make_mut(&mut self.scheduled_patches);
+        history.push(ScheduledPatchStatus {
+            batch_id,
+            evidence: evidence.clone(),
+            journal: JournalState::Pending,
+        });
+        let capacity = self.options.archived_command_capacity.max(1);
+        if history.len() > capacity {
+            history.drain(..history.len() - capacity);
+        }
+        self.scheduled_barrier = Some(batch_id);
+        if let ScheduledPatchOutcome::Failed(failure) = &evidence.outcome {
+            self.latched_fault = Some(HostFault::Scientific {
+                tick: self.world.tick(),
+                code: failure.code.clone(),
+                message: failure.message.clone(),
+            });
+            self.scheduled_failure_shutdown = true;
+        }
+        self.active_journal_batch = Some(Arc::clone(&batch));
+        let admission = self.journal.try_admit(&batch);
+        self.finish_journal_admission(&batch, admission, false)?;
+        self.active_journal_batch = None;
+        self.synchronize_health()?;
+        self.request_scheduled_failure_shutdown()?;
+        Ok(())
+    }
+
+    fn request_scheduled_failure_shutdown(&mut self) -> Result<(), HostAccessError> {
+        if !self.scheduled_failure_shutdown || self.shutdown_command_id().is_some() {
+            return Ok(());
+        }
+        match self.request_shutdown() {
+            Ok(_)
+            | Err(HostAccessError::CommandAuthorityLookup {
+                failure:
+                    crate::CommandAuthorityLookupFailure::Pending
+                    | crate::CommandAuthorityLookupFailure::Busy
+                    | crate::CommandAuthorityLookupFailure::Capacity { .. },
+                ..
+            }) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -2622,13 +2944,35 @@ impl HostCore {
             return HostDriveInterest::Draining;
         }
         if self.lifecycle == HostLifecycle::Stopped {
-            return HostDriveInterest::Terminated;
+            return if self.scheduled_failure_shutdown {
+                HostDriveInterest::Faulted
+            } else {
+                HostDriveInterest::Terminated
+            };
+        }
+        // A failed scheduled action still owes its own journal commitment,
+        // terminal receipts for earlier admitted Steps, and ordered shutdown.
+        // Keep the native owner alive for those obligations, while a secondary
+        // journal/finalization failure retains the ordinary terminal fault path.
+        if self.scheduled_failure_shutdown
+            && matches!(&self.latched_fault, Some(HostFault::Scientific { code, .. })
+                if code == "scheduled_config_application" || code == "scheduled_config_resolution")
+            && self.failed_journal_batches.is_empty()
+        {
+            return if self.retained_journal.is_some() {
+                HostDriveInterest::WakeOnly
+            } else {
+                HostDriveInterest::Draining
+            };
         }
         if self.health.fault().is_some() {
             return HostDriveInterest::Faulted;
         }
         if self.retained_journal.is_some() {
             return HostDriveInterest::WakeOnly;
+        }
+        if self.scheduled_barrier.is_some() {
+            return HostDriveInterest::Draining;
         }
         if self.event_pressure.is_some() {
             return HostDriveInterest::Draining;
@@ -2770,6 +3114,7 @@ impl HostCore {
             code: "journal_identity_mismatch".to_owned(),
             message: "journal response echoed a different batch identity".to_owned(),
         };
+        self.update_scheduled_journal(batch.id(), JournalState::Failed(failure.clone()));
         if batch.requires_runtime_journal()
             && let Some(command_id) = batch.command_id()
         {
@@ -2818,6 +3163,7 @@ impl HostCore {
             code: "journal_closed".to_owned(),
             message: "journal admission gate is permanently closed".to_owned(),
         };
+        self.update_scheduled_journal(batch.id(), JournalState::Failed(failure.clone()));
         if batch.requires_runtime_journal()
             && let Some(command_id) = batch.command_id()
         {
@@ -2856,6 +3202,7 @@ impl HostCore {
                 JournalReceiptState::Durable => JournalState::Durable,
                 JournalReceiptState::Failed(failure) => JournalState::Failed(failure.clone()),
             };
+            self.update_scheduled_journal(batch_id, journal_state.clone());
             if let Some(command_id) = inflight.command_id {
                 changed |= self.update_command_journal(command_id, journal_state.clone())?;
             }
@@ -3197,6 +3544,7 @@ impl HostCore {
             )
         };
         let narrative_events = self.snapshot_narrative(&mut build);
+        let scheduled_patches = self.snapshot_scheduled(&mut build);
         let snapshot = Arc::new(RenderSnapshot {
             narrative_events,
             narrative_dropped_events: self.world.narrative_dropped_events(),
@@ -3219,6 +3567,7 @@ impl HostCore {
             applied_interventions: Arc::clone(&applied_interventions),
             config: Arc::clone(&config),
             config_audit: Arc::clone(&config_audit),
+            scheduled_patches,
         });
         self.config = config;
         self.config_audit = config_audit;
@@ -3232,6 +3581,18 @@ impl HostCore {
         self.last_published_scientific = self.revisions.scientific;
         self.shared.borrow_mut().visible_boundary = self.applied_boundary();
         Ok(())
+    }
+
+    fn snapshot_scheduled(&self, build: &mut SnapshotBuildStats) -> Arc<Vec<ScheduledPatchStatus>> {
+        account_scheduled_payload(
+            build,
+            &self.scheduled_patches,
+            !Arc::ptr_eq(
+                &self.snapshots.latest().scheduled_patches,
+                &self.scheduled_patches,
+            ),
+        );
+        Arc::clone(&self.scheduled_patches)
     }
 
     fn pop_command(&self) -> Option<AdmittedEnvelope> {
@@ -4235,6 +4596,9 @@ impl ManualHostDriver for HostCore {
         let event_was_pressured = self.event_pressure.is_some();
         self.poll_journal_receipts()?;
         let authority_blocked = self.shared.borrow_mut().poll_pending_command_authority();
+        if !authority_blocked {
+            self.request_scheduled_failure_shutdown()?;
+        }
         if self.event_pressure.is_some() {
             self.prepare_scientific_event_slot()?;
         }
@@ -4253,6 +4617,12 @@ impl ManualHostDriver for HostCore {
         };
         if !audit_blocked {
             loop {
+                let requests_science = self.next_command_requires_scientific_event();
+                if (self.scheduled_barrier.is_some() || requests_science)
+                    && !self.service_due_config_patch(requests_science)?
+                {
+                    break;
+                }
                 if self.next_command_requires_scientific_event()
                     && !self.prepare_scientific_event_slot()?
                 {
@@ -4297,6 +4667,7 @@ impl ManualHostDriver for HostCore {
             && self.lifecycle == HostLifecycle::Running
             && !self.playback.paused
             && self.retained_journal.is_none()
+            && self.scheduled_barrier.is_none()
             && self.latched_fault.is_none()
             && self.event_pressure.is_none()
             && !event_was_pressured
@@ -4306,6 +4677,9 @@ impl ManualHostDriver for HostCore {
             automatic_steps_due = budget.due;
             automatic_steps_skipped = budget.skipped;
             for _ in 0..budget.steps {
+                if !self.service_due_config_patch(true)? {
+                    break;
+                }
                 if !self.prepare_scientific_event_slot()? {
                     break;
                 }
@@ -4339,6 +4713,7 @@ impl ManualHostDriver for HostCore {
             )
         };
         let presentation_changed = latest.revisions.control != self.revisions.control
+            || !Arc::ptr_eq(&latest.scheduled_patches, &self.scheduled_patches)
             || latest.revisions.config != self.revisions.config
             || latest.playback != self.playback
             || latest.lifecycle != self.lifecycle
@@ -7892,6 +8267,660 @@ mod tests {
         suppress_receipts: bool,
         attempts: Vec<Arc<JournalBatch>>,
         receipts: VecDeque<JournalReceipt>,
+    }
+
+    fn resolve_test_schedule(
+        config: &ScriptBotsConfig,
+        patch: &serde_json::Value,
+    ) -> Result<ScriptBotsConfig, String> {
+        // This fixture exercises owner scheduling, not the application's merge resolver.
+        let mut value = serde_json::to_value(config).map_err(|error| error.to_string())?;
+        for (key, field) in patch.as_object().ok_or("object required")? {
+            value
+                .as_object_mut()
+                .ok_or("config object required")?
+                .insert(key.clone(), field.clone());
+        }
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    }
+
+    fn scheduled(sequence: u64, tick: u64, patch: serde_json::Value) -> ScheduledConfigPatch {
+        ScheduledConfigPatch::new(sequence, Tick(tick), patch).unwrap()
+    }
+
+    #[test]
+    fn scheduled_patches_gate_bursts_and_record_actual_changes() {
+        let mut core = HostCore::new(HostSessionId::new(901), world(0), options(true)).unwrap();
+        core.install_schedule(
+            vec![
+                scheduled(1, 0, serde_json::json!({"food_max": 0.61})),
+                scheduled(2, 1, serde_json::json!({"food_max": 0.72})),
+            ],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        submit(&mut port, 2, HostCommand::Step);
+        let first = core.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(first.scientific_steps, 0);
+        assert_eq!(core.world_tick(), Tick(0));
+        assert_eq!(port.queue_depth(), 2);
+        assert!(matches!(
+            core.latest_snapshot().scheduled_patches[0].journal,
+            JournalState::Pending
+        ));
+        assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+        let second = core.drive(ManualInstant::from_nanos(1)).unwrap();
+        assert_eq!(second.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(1));
+        assert_eq!(port.queue_depth(), 1);
+        assert_eq!(
+            core.latest_snapshot().scheduled_patches[1]
+                .evidence
+                .boundary
+                .tick,
+            Tick(1)
+        );
+        assert_eq!(
+            core.drive(ManualInstant::from_nanos(2))
+                .unwrap()
+                .scientific_steps,
+            1
+        );
+        assert_eq!(core.world_tick(), Tick(2));
+        for (index, tick) in [0, 1].into_iter().enumerate() {
+            let publication = core.latest_snapshot();
+            let record = &publication.scheduled_patches[index];
+            assert_eq!(record.evidence.boundary.tick, Tick(tick));
+            assert_eq!(record.journal, JournalState::CommittedVolatile);
+            assert!(
+                matches!(&record.evidence.outcome, ScheduledPatchOutcome::Applied { changed_paths } if changed_paths == &["food_max"])
+            );
+        }
+        assert_eq!(applied(&status(&mut port, 1)).tick, Tick(1));
+        assert_eq!(applied(&status(&mut port, 2)).tick, Tick(2));
+    }
+
+    #[test]
+    fn scheduled_patch_resolves_current_config_and_preserves_unrelated_fields() {
+        let mut core = HostCore::new(HostSessionId::new(902), world(0), options(true)).unwrap();
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": 0.61}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        let mut updated = core.with_world(|world| world.config().clone());
+        updated.closed = true;
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::UpdateConfig(Box::new(updated)));
+        submit(&mut port, 2, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert!(core.with_world(|world| world.config().closed));
+        assert_eq!(core.world_tick(), Tick(0));
+        core.drive(ManualInstant::from_nanos(1)).unwrap();
+        assert_eq!(core.world_tick(), Tick(1));
+        assert!(core.with_world(|world| world.config().closed));
+        assert!(
+            matches!(&core.latest_snapshot().scheduled_patches[0].evidence.outcome, ScheduledPatchOutcome::Applied { changed_paths } if changed_paths == &["food_max"])
+        );
+    }
+
+    #[test]
+    fn scheduled_patches_have_identical_science_in_manual_burst_and_auto_catchup() {
+        let patches = vec![
+            scheduled(1, 0, serde_json::json!({"food_max": 0.61})),
+            scheduled(2, 1, serde_json::json!({"food_max": 0.72})),
+        ];
+        let mut manual = HostCore::new(HostSessionId::new(905), world(0), options(true)).unwrap();
+        let mut automatic =
+            HostCore::new(HostSessionId::new(906), world(0), options(false)).unwrap();
+        manual
+            .install_schedule(patches.clone(), resolve_test_schedule)
+            .unwrap();
+        automatic
+            .install_schedule(patches, resolve_test_schedule)
+            .unwrap();
+        let mut port = manual.local_port();
+        for id in 1..=5 {
+            submit(&mut port, id, HostCommand::Step);
+        }
+        manual.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(
+            manual
+                .drive(ManualInstant::from_nanos(1))
+                .unwrap()
+                .scientific_steps,
+            1
+        );
+        automatic.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(
+            automatic
+                .drive(ManualInstant::from_nanos(100))
+                .unwrap()
+                .scientific_steps,
+            0
+        );
+        assert_eq!(
+            automatic
+                .drive(ManualInstant::from_nanos(100))
+                .unwrap()
+                .scientific_steps,
+            1,
+            "the tick-one patch must interrupt a multi-tick catch-up budget"
+        );
+        assert_eq!(
+            automatic.scientific_digest_v1().unwrap(),
+            manual.scientific_digest_v1().unwrap()
+        );
+        assert_eq!(
+            manual
+                .drive(ManualInstant::from_nanos(2))
+                .unwrap()
+                .scientific_steps,
+            4
+        );
+        assert_eq!(
+            automatic
+                .drive(ManualInstant::from_nanos(110))
+                .unwrap()
+                .scientific_steps,
+            4
+        );
+        assert_eq!(manual.world_tick(), Tick(5));
+        assert_eq!(
+            automatic.scientific_digest_v1().unwrap(),
+            manual.scientific_digest_v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn schedule_installation_refuses_invalid_identity_order_shape_and_late_install() {
+        for patches in [
+            vec![ScheduledConfigPatch {
+                sequence: 0,
+                due_tick: Tick(0),
+                patch: "{}".to_owned(),
+            }],
+            vec![scheduled(2, 0, serde_json::json!({}))],
+            vec![
+                scheduled(1, 1, serde_json::json!({})),
+                scheduled(2, 0, serde_json::json!({})),
+            ],
+            vec![ScheduledConfigPatch {
+                sequence: 1,
+                due_tick: Tick(0),
+                patch: "[]".to_owned(),
+            }],
+        ] {
+            let mut core = HostCore::new(HostSessionId::new(907), world(0), options(true)).unwrap();
+            assert!(
+                core.install_schedule(patches, resolve_test_schedule)
+                    .is_err()
+            );
+            core.install_schedule(Vec::new(), resolve_test_schedule)
+                .unwrap();
+            assert!(
+                core.install_schedule(Vec::new(), resolve_test_schedule)
+                    .is_err()
+            );
+        }
+        let mut core = HostCore::new(HostSessionId::new(908), world(0), options(true)).unwrap();
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert!(
+            core.install_schedule(Vec::new(), resolve_test_schedule)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scheduled_patch_failure_commits_before_failing_step_and_permits_ordered_shutdown() {
+        let mut core = HostCore::new(HostSessionId::new(903), world(0), options(true)).unwrap();
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": "invalid"}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        let before = core.scientific_digest_v1().unwrap();
+        let mut port = core.local_port();
+        let step = submit(&mut port, 1, HostCommand::Step);
+        assert_eq!(
+            core.drive(ManualInstant::from_nanos(0))
+                .unwrap()
+                .scientific_steps,
+            0
+        );
+        assert_eq!(
+            port.queue_depth(),
+            2,
+            "failed Step precedes the owner's shutdown"
+        );
+        assert!(matches!(
+            port.command_status(step.command_id())
+                .unwrap()
+                .unwrap()
+                .application(),
+            ApplicationState::Admitted
+        ));
+        let shutdown = core.request_shutdown().unwrap();
+        for now in 1..=8 {
+            assert_eq!(
+                core.drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            assert_eq!(core.scientific_digest_v1().unwrap(), before);
+            assert!(matches!(
+                core.latest_snapshot().scheduled_patches[0].evidence.outcome,
+                ScheduledPatchOutcome::Failed(_)
+            ));
+            assert!(core.health().fault().is_some());
+        }
+        assert_eq!(core.latest_snapshot().scheduled_patches.len(), 1);
+        assert!(matches!(
+            core.latest_snapshot().scheduled_patches[0].journal,
+            JournalState::CommittedVolatile
+        ));
+        assert!(matches!(
+            port.command_status(step.command_id())
+                .unwrap()
+                .unwrap()
+                .application(),
+            ApplicationState::Failed(_)
+        ));
+        assert!(matches!(
+            port.command_status(shutdown.command_id())
+                .unwrap()
+                .unwrap()
+                .application(),
+            ApplicationState::Applied(_)
+        ));
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+    }
+
+    #[test]
+    fn scheduled_history_accounting_includes_spare_capacity_and_reuses_unchanged_payload() {
+        let mut core = HostCore::new(HostSessionId::new(909), world(0), options(true)).unwrap();
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": 0.61}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        submit(&mut core.local_port(), 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let mut history = core.latest_snapshot().scheduled_patches.as_ref().clone();
+        history.reserve(7);
+        let mut failure_code = String::with_capacity(83);
+        failure_code.push_str("failed");
+        let mut message = String::with_capacity(193);
+        message.push_str("journal refused");
+        let failure_bytes = failure_code.capacity() + message.capacity();
+        history[0].journal = JournalState::Failed(JournalFailure {
+            code: failure_code,
+            message,
+        });
+        let expected = history.capacity() * size_of::<ScheduledPatchStatus>()
+            + history[0].evidence.retained_heap_bytes()
+            + failure_bytes;
+        let mut fresh = SnapshotBuildStats::default();
+        account_scheduled_payload(&mut fresh, &history, true);
+        assert_eq!(fresh.total_payload_capacity_bytes, expected);
+        assert_eq!(fresh.newly_allocated_capacity_bytes, expected);
+        assert!(fresh.bulk_allocations > 3);
+        let mut reused = SnapshotBuildStats::default();
+        account_scheduled_payload(&mut reused, &history, false);
+        assert_eq!(reused.total_payload_capacity_bytes, expected);
+        assert_eq!(reused.newly_allocated_capacity_bytes, 0);
+        assert_eq!(reused.bulk_allocations, 0);
+    }
+
+    #[test]
+    fn finite_launch_schedule_outlives_bounded_published_history() {
+        let mut host_options = options(true);
+        host_options.archived_command_capacity = 2;
+        let mut core = HostCore::new(HostSessionId::new(912), world(0), host_options).unwrap();
+        core.install_schedule(
+            vec![
+                scheduled(1, 0, serde_json::json!({"food_max": 0.61})),
+                scheduled(2, 0, serde_json::json!({"food_max": 0.82})),
+                scheduled(3, 0, serde_json::json!({"food_max": 0.93})),
+            ],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        submit(&mut core.local_port(), 1, HostCommand::Step);
+        for now in 0..2 {
+            assert_eq!(
+                core.drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+        }
+        let earlier = core.latest_snapshot();
+        assert_eq!(earlier.scheduled_patches[0].evidence.scheduled.sequence, 1);
+        assert_eq!(
+            core.drive(ManualInstant::from_nanos(2))
+                .unwrap()
+                .scientific_steps,
+            0
+        );
+        assert_eq!(
+            core.drive(ManualInstant::from_nanos(3))
+                .unwrap()
+                .scientific_steps,
+            1
+        );
+        let latest = core.latest_snapshot();
+        assert_eq!(latest.scheduled_patches.len(), 2);
+        assert_eq!(latest.scheduled_patches[0].evidence.scheduled.sequence, 2);
+        assert_eq!(latest.scheduled_patches[1].evidence.scheduled.sequence, 3);
+        assert!(
+            latest
+                .scheduled_patches
+                .iter()
+                .all(|status| status.journal == JournalState::CommittedVolatile)
+        );
+        assert_eq!(core.world().config().food_max, 0.93);
+        assert_eq!(earlier.scheduled_patches[0].evidence.scheduled.sequence, 1);
+        assert_eq!(earlier.scheduled_patches.len(), 2);
+    }
+
+    #[test]
+    fn channel_owner_drains_failed_schedule_before_returning_faulted() {
+        use crate::channel::{ChannelHostDriver, ChannelHostOptions, ChannelRunOutcome};
+        let mut core = HostCore::new(HostSessionId::new(910), world(0), options(true)).unwrap();
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": "invalid"}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        let mut local = core.local_port();
+        let step = submit(&mut local, 1, HostCommand::Step);
+        let (mut driver, _live_controller) = ChannelHostDriver::new(
+            crate::FixedDeadlineHost::new(core),
+            ChannelHostOptions::default(),
+        )
+        .unwrap();
+        let mut nanos = 0;
+        let receipt = driver
+            .run(|| {
+                nanos += 1;
+                assert!(
+                    nanos < 10_000,
+                    "failed schedule must finish its owner shutdown"
+                );
+                ManualInstant::from_nanos(nanos)
+            })
+            .unwrap();
+        assert_eq!(receipt.outcome, ChannelRunOutcome::Faulted);
+        let core = driver.host().core();
+        assert_eq!(core.world_tick(), Tick(0));
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        assert!(matches!(
+            core.latest_snapshot().scheduled_patches[0].journal,
+            JournalState::CommittedVolatile
+        ));
+        let status = local.command_status(step.command_id()).unwrap().unwrap();
+        assert!(matches!(status.application(), ApplicationState::Failed(_)));
+        assert_eq!(status.journal(), &JournalState::CommittedVolatile);
+        assert!(core.pending_journal_batch().is_none());
+        assert!(core.inflight_journal.is_empty());
+    }
+
+    #[test]
+    fn failed_schedule_journal_survives_transient_shutdown_authority() {
+        // Scripted authority timing is a protocol unit fixture, not durable-storage proof.
+        let shutdown_id = CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, 911);
+        let authority = Arc::new(ScriptedCommandAuthority {
+            outcomes: Mutex::new(HashMap::from([
+                (
+                    CommandId::new(1),
+                    VecDeque::from([CommandAuthorityLookup::Claimed]),
+                ),
+                (
+                    shutdown_id,
+                    VecDeque::from([
+                        CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Busy),
+                        CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Capacity {
+                            capacity: 1,
+                        }),
+                        CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+                        CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+                        CommandAuthorityLookup::Claimed,
+                    ]),
+                ),
+            ])),
+        });
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(911),
+            world(0),
+            options(true),
+            Box::new(AuthorityBackedVolatileJournal {
+                inner: VolatileJournal::with_capacity(64),
+                authority,
+            }),
+        )
+        .unwrap();
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": "invalid"}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let batch_id = core.latest_snapshot().scheduled_patches[0].batch_id;
+        assert_eq!(core.pending_command_authority_id(), None);
+        assert!(core.inflight_journal.contains_key(&batch_id));
+        assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+        core.drive(ManualInstant::from_nanos(1)).unwrap();
+        assert_eq!(core.pending_command_authority_id(), None);
+        assert_eq!(core.shutdown_command_id(), None);
+        assert_eq!(
+            core.latest_snapshot().scheduled_patches[0].journal,
+            JournalState::CommittedVolatile
+        );
+        for now in 2..=3 {
+            assert_eq!(
+                core.drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            assert_eq!(core.pending_command_authority_id(), Some(shutdown_id));
+            assert_eq!(
+                core.latest_snapshot().scheduled_patches[0].batch_id,
+                batch_id
+            );
+            assert_eq!(
+                core.latest_snapshot().scheduled_patches[0].journal,
+                JournalState::CommittedVolatile
+            );
+        }
+        for now in 4..=8 {
+            assert_eq!(
+                core.drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+        }
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        assert_eq!(core.latest_snapshot().scheduled_patches.len(), 1);
+        assert_eq!(
+            core.latest_snapshot().scheduled_patches[0].batch_id,
+            batch_id
+        );
+        assert!(matches!(
+            status(&mut port, 1).application(),
+            ApplicationState::Failed(_)
+        ));
+        assert!(matches!(
+            port.command_status(shutdown_id)
+                .unwrap()
+                .unwrap()
+                .application(),
+            ApplicationState::Applied(_)
+        ));
+        assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+    }
+
+    #[test]
+    fn scheduled_patch_full_and_delayed_journal_require_exact_retry_and_commitment() {
+        // Protocol fault-injection unit test; this adapter is not real storage evidence.
+        let state = Rc::new(RefCell::new(FakeJournalState {
+            full: true,
+            suppress_receipts: true,
+            ..FakeJournalState::default()
+        }));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(904),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&state),
+            }),
+        )
+        .unwrap();
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": 0.61}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let retained = core.pending_journal_batch().unwrap();
+        let digest = core.scientific_digest_v1().unwrap();
+        let config_revision = core.with_world(WorldState::config_revision);
+        let shutdown = core.request_shutdown().unwrap();
+        for now in [1, 2] {
+            assert_eq!(
+                core.drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            assert_eq!(state.borrow().attempts.len(), 1);
+            assert!(Arc::ptr_eq(
+                &retained,
+                &core.pending_journal_batch().unwrap()
+            ));
+        }
+        state.borrow_mut().full = false;
+        assert!(matches!(
+            core.retry_retained_journal().unwrap(),
+            Some(JournalAdmission::Accepted { .. })
+        ));
+        assert!(Arc::ptr_eq(&retained, &state.borrow().attempts[1]));
+        core.drive(ManualInstant::from_nanos(3)).unwrap();
+        assert_eq!(core.world_tick(), Tick(0));
+        assert_eq!(core.scientific_digest_v1().unwrap(), digest);
+        assert!(matches!(
+            port.command_status(shutdown.command_id())
+                .unwrap()
+                .unwrap()
+                .application(),
+            ApplicationState::Admitted
+        ));
+        state.borrow_mut().receipts.push_back(JournalReceipt::new(
+            retained.id(),
+            JournalReceiptState::CommittedVolatile,
+        ));
+        core.drive(ManualInstant::from_nanos(4)).unwrap();
+        assert_eq!(
+            core.world_tick(),
+            Tick(0),
+            "durable adapter's volatile receipt cannot release science"
+        );
+        state.borrow_mut().receipts.push_back(JournalReceipt::new(
+            retained.id(),
+            JournalReceiptState::Durable,
+        ));
+        assert_eq!(
+            core.drive(ManualInstant::from_nanos(5))
+                .unwrap()
+                .scientific_steps,
+            1
+        );
+        assert_eq!(core.latest_snapshot().scheduled_patches.len(), 1);
+        assert_eq!(
+            core.with_world(WorldState::config_revision),
+            config_revision,
+            "retry must not apply the same configuration again, even if its digest is unchanged"
+        );
+        assert_eq!(applied(&status(&mut port, 1)).tick, Tick(1));
+    }
+
+    #[test]
+    fn scheduled_patch_closed_journal_keeps_applied_configuration_distinct_from_commitment() {
+        // Closed protocol adapter: no real database or native failure claim.
+        let state = Rc::new(RefCell::new(FakeJournalState {
+            closed: true,
+            ..FakeJournalState::default()
+        }));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(909),
+            world(0),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&state),
+            }),
+        )
+        .unwrap();
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": 0.61}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let record = core.latest_snapshot().scheduled_patches[0].clone();
+        assert!(matches!(
+            record.evidence.outcome,
+            ScheduledPatchOutcome::Applied { .. }
+        ));
+        assert!(
+            matches!(&record.journal, JournalState::Failed(failure) if failure.code == "journal_closed")
+        );
+        let retained = core.pending_journal_batch().unwrap();
+        let digest = core.scientific_digest_v1().unwrap();
+        for now in [1, 100] {
+            assert_eq!(
+                core.drive(ManualInstant::from_nanos(now))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            assert_eq!(core.scientific_digest_v1().unwrap(), digest);
+            assert_eq!(core.latest_snapshot().scheduled_patches[0], record);
+            assert!(Arc::ptr_eq(
+                &retained,
+                &core.pending_journal_batch().unwrap()
+            ));
+            assert_eq!(port.queue_depth(), 1);
+            assert_eq!(state.borrow().attempts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn scheduled_patch_unchanged_assignments_do_not_invent_changed_paths() {
+        let mut core = HostCore::new(HostSessionId::new(910), world(0), options(true)).unwrap();
+        let current = core.with_world(|world| world.config().food_max);
+        core.install_schedule(
+            vec![scheduled(1, 0, serde_json::json!({"food_max": current}))],
+            resolve_test_schedule,
+        )
+        .unwrap();
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert!(
+            matches!(&core.latest_snapshot().scheduled_patches[0].evidence.outcome, ScheduledPatchOutcome::Applied { changed_paths } if changed_paths.is_empty())
+        );
     }
 
     struct FakeJournal {

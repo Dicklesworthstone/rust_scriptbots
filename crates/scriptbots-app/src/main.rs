@@ -5,13 +5,16 @@ use owo_colors::OwoColorize;
 use ron::ser::PrettyConfig as RonPrettyConfig;
 use scriptbots_app::archipelago_report::{self, ReportArchipelagoArgs};
 use scriptbots_app::economy_audit::{self, EconomyAuditArgs};
-use scriptbots_app::host_thread::{HostThread, HostThreadFaultError, HostThreadReceipt};
+use scriptbots_app::host_thread::{
+    HostBootstrap, HostThread, HostThreadFaultError, HostThreadReceipt,
+};
 #[cfg(feature = "neuro")]
 use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
     BootstrapEvidenceV0, BrainPreset, CharacterizationTraceV2, ControlServerConfig,
     ControlServerReservation, RunIdentityV1, RunManifestV3, ScenarioDocumentV1, ScenarioIdentityV0,
-    SharedAnalytics, ThreadPolicyV0, install_brains,
+    ScenarioInterventionV1, SharedAnalytics, ThreadPolicyV0, apply_scenario_interventions,
+    install_brains,
     precedence::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
@@ -37,7 +40,7 @@ use scriptbots_render::{render_png_offscreen, run_demo};
 use scriptbots_runtime::HostPort;
 use scriptbots_runtime::RunId;
 use scriptbots_runtime::channel::ChannelHostOptions;
-use scriptbots_runtime::{HostCoreOptions, HostSessionId, PlaybackSnapshot};
+use scriptbots_runtime::{HostCoreOptions, HostSessionId, PlaybackSnapshot, ScheduledConfigPatch};
 use scriptbots_storage::{
     INTERACTION_REPLAY_SEQ_BASE, NARRATIVE_INPUT_REPLAY_SEQ, PersistedReplayEvent,
     PersistenceGuarantee, ShutdownReceipt, StoragePipeline, StorageReader,
@@ -209,8 +212,8 @@ fn main() -> Result<()> {
     {
         let ticks_env = env::var("SCRIPTBOTS_DET_TICKS").ok();
         let tick_limit = ticks_env.and_then(|s| s.parse::<u64>().ok()).unwrap_or(500);
-        let config = compose_config(&cli)?;
-        run_det_child(&config, tick_limit, cli.brain)?;
+        let (config, scenario, _) = compose_config_with_scenario(&cli)?;
+        run_det_child(&config, tick_limit, cli.brain, &scenario.interventions)?;
         return Ok(());
     }
     let (config, mut launch_scenario, config_overrides) = compose_config_with_scenario(&cli)?;
@@ -255,7 +258,7 @@ fn main() -> Result<()> {
     }
 
     if cli.replay_db.is_some() {
-        run_replay_cli(&cli, &config)?;
+        run_replay_cli(&cli, &config, &launch_scenario.interventions)?;
         return Ok(());
     }
 
@@ -480,53 +483,42 @@ fn main() -> Result<()> {
 
     // Apply OS-level priority niceness where supported.
     apply_process_niceness(cli.low_power)?;
-    let (mut bootstrapped_world, mut persistence, analytics, mut storage_pipeline) =
-        bootstrap_world(
-            config,
-            BootstrapRequest {
-                brain_preset: cli.brain,
-                storage_mode: cli.storage,
-                thresholds,
-                bootstrap_ticks: effective_bootstrap_ticks,
-                thread_policy: policy,
-                scenario: launch_scenario,
-                config_overrides,
-            },
-        )?;
-    #[cfg(feature = "bevy_render")]
-    if cli.dump_semantic_png.is_some() || cli.dump_scene_png.is_some() {
-        let operation = (|| -> Result<()> {
-            if let Some(path) = &cli.dump_semantic_png {
-                let (w, h) = cli
-                    .png_size
-                    .as_deref()
-                    .and_then(parse_png_size)
-                    .unwrap_or((1600, 900));
-                let bytes = render_bevy_png(&bootstrapped_world, w, h)?;
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(path, bytes)?;
-                println!(
-                    "Wrote semantic projection {} ({w}x{h}; CPU reference raster, NOT GPU-rendered)",
-                    path.display()
-                );
-                Ok(())
-            } else {
-                run_scene_capture_cli(cli.dump_scene_png.as_ref().expect("capture path selected"))
-            }
-        })();
-        let result = finish_with_storage(operation, "scene capture", || {
-            let finalization =
-                finalize_world_persistence(&mut bootstrapped_world, &mut persistence);
-            finalize_then_shutdown_storage(finalization, &mut storage_pipeline)
-        });
-        emit_sense_run_end(
-            SenseRunSummary::capture(&bootstrapped_world),
-            result.is_ok(),
-        );
-        return result;
-    }
+    let mut ordered_interventions = launch_scenario.interventions.iter().collect::<Vec<_>>();
+    ordered_interventions.sort_by_key(|patch| patch.tick);
+    let schedule = ordered_interventions
+        .into_iter()
+        .enumerate()
+        .map(|(index, patch)| {
+            let sequence = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| anyhow!("scenario schedule identity exhausted"))?;
+            ScheduledConfigPatch::new(
+                sequence,
+                scriptbots_core::Tick(patch.tick),
+                patch.set.clone(),
+            )
+            .map_err(anyhow::Error::msg)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (
+        mut bootstrapped_world,
+        mut persistence,
+        analytics,
+        mut storage_pipeline,
+        pending_manifest,
+    ) = bootstrap_world(
+        config,
+        BootstrapRequest {
+            brain_preset: cli.brain,
+            storage_mode: cli.storage,
+            thresholds,
+            bootstrap_ticks: effective_bootstrap_ticks,
+            thread_policy: policy,
+            scenario: launch_scenario,
+            config_overrides,
+        },
+    )?;
     let session_id = HostSessionId::new(rand::random());
     let journal = match storage_pipeline.journal_port(session_id, Default::default()) {
         Ok(journal) => journal,
@@ -542,7 +534,46 @@ fn main() -> Result<()> {
         || resolved_renderer
             .as_ref()
             .is_some_and(|(_, renderer)| renderer.name() != "server");
-    let host = match HostThread::spawn(
+    #[cfg(feature = "bevy_render")]
+    let semantic_capture = cli.dump_semantic_png.clone().map(|path| {
+        (
+            path,
+            cli.png_size
+                .as_deref()
+                .and_then(parse_png_size)
+                .unwrap_or((1600, 900)),
+        )
+    });
+    let bootstrap = HostBootstrap {
+        ticks: effective_bootstrap_ticks,
+        schedule,
+        on_completed: Some(Box::new(move |world| {
+            emit_run_manifest(world, pending_manifest, effective_bootstrap_ticks);
+            if effective_bootstrap_ticks == 0 {
+                info!("Initialized seeded world at tick zero without bootstrap advancement");
+            } else {
+                info!(
+                    tick = world.tick().0,
+                    bootstrap_ticks = effective_bootstrap_ticks,
+                    "Owner completed bootstrap and its journal commitments"
+                );
+            }
+            #[cfg(feature = "bevy_render")]
+            if let Some((path, (width, height))) = semantic_capture {
+                let bytes = render_bevy_png(world, width, height)?;
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, bytes)?;
+                println!(
+                    "Wrote semantic projection {} ({width}x{height}; CPU reference raster, NOT GPU-rendered)",
+                    path.display()
+                );
+            }
+            Ok(())
+        })),
+    };
+    let host = match HostThread::spawn_with_bootstrap(
         session_id,
         bootstrapped_world,
         persistence,
@@ -556,6 +587,7 @@ fn main() -> Result<()> {
             ..Default::default()
         },
         ChannelHostOptions::default(),
+        bootstrap,
     ) {
         Ok(host) => host,
         Err(error) => {
@@ -570,6 +602,14 @@ fn main() -> Result<()> {
     // Capture every ordinary post-bootstrap exit so the exact retained tail is
     // finalized and the worker is acknowledged before this function returns.
     let runtime_result = (|| -> Result<()> {
+        #[cfg(feature = "bevy_render")]
+        if cli.dump_semantic_png.is_some() {
+            return Ok(());
+        }
+        #[cfg(feature = "bevy_render")]
+        if let Some(scene) = &cli.dump_scene_png {
+            return run_scene_capture_cli(scene);
+        }
         // Optional: dump a PNG snapshot and exit (no UI launched).
         if let Some(path) = cli.dump_png.as_ref() {
             #[cfg(feature = "gui")]
@@ -1187,8 +1227,9 @@ fn run_det_child(
     config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
+    interventions: &[ScenarioInterventionV1],
 ) -> Result<()> {
-    let run = run_headless_simulation(config, tick_limit, brain_preset)?;
+    let run = run_headless_simulation(config, tick_limit, brain_preset, interventions)?;
     #[derive(serde::Serialize)]
     struct DetOut {
         events: usize,
@@ -1315,6 +1356,11 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
         child.arg("--config-only"); // avoid launching UI
         child.arg("--config");
         child.arg(&layer_path);
+        if let Some(scenario) = &cli.scenario {
+            // The pinned full config layer controls launch values; the scenario
+            // still supplies the timed interventions that neither child may drop.
+            child.arg("--scenario").arg(scenario);
+        }
         child.arg("--brain");
         child.arg(cli.brain.as_str());
         child.env("SCRIPTBOTS_DET_RUN", "1");
@@ -1325,7 +1371,7 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
             child.env("RAYON_NUM_THREADS", threads);
         }
         child.stdout(Stdio::piped());
-        child.stderr(Stdio::null());
+        child.stderr(Stdio::inherit());
         child.spawn().context("failed to spawn det child")
     };
 
@@ -1885,17 +1931,9 @@ struct BootstrapRequest {
     config_overrides: Vec<ConfigFieldOverride>,
 }
 
-/// Bootstrap the world and return it BY VALUE, unwrapped.
-///
-/// This used to hand back `Arc<Mutex<WorldState>>`, which meant the single point
-/// where sole ownership is given away sat inside this function rather than at
-/// the call site. bd-pcfj moves the world into a HostCore on a dedicated owner
-/// thread, and `HostCore` is `!Send` - its admission state is
-/// `Rc<RefCell<SharedHostState>>` - so the world has to be handed to that thread
-/// as a plain value and the host constructed there. Returning the value keeps
-/// that handover at one visible line instead of buried behind a wrap this
-/// function performed for the caller's convenience.
-///
+/// Prepare a seeded world, storage, and manifest inputs for owner-thread bootstrap.
+/// No science ticks run here: one HostCore applies scheduled interventions and
+/// executes bootstrap before it publishes the interactive port.
 fn bootstrap_world(
     mut config: ScriptBotsConfig,
     request: BootstrapRequest,
@@ -1904,6 +1942,7 @@ fn bootstrap_world(
     PersistenceAdmissionSession,
     SharedAnalytics,
     StoragePipeline,
+    Option<PendingRunManifest>,
 )> {
     let BootstrapRequest {
         brain_preset,
@@ -1914,8 +1953,7 @@ fn bootstrap_world(
         mut scenario,
         config_overrides,
     } = request;
-    // This function owns bootstrap execution, so it also owns the authoritative requested count.
-    // Never trust a caller-populated scenario field that could disagree with the work done here.
+    // Bind manifest inputs to the same requested count passed to the owner.
     scenario.bootstrap_ticks = bootstrap_ticks;
     let (root_seed, generated_seed) = materialize_run_seed(&mut config);
     if generated_seed {
@@ -2022,7 +2060,7 @@ fn bootstrap_world(
         bootstrap_ticks,
     );
     let analytics = pipeline.analytics_provider();
-    let mut persistence = match world.bind_persistence(Box::new(pipeline.sink())) {
+    let persistence = match world.bind_persistence(Box::new(pipeline.sink())) {
         Ok(persistence) => persistence,
         Err(error) => {
             return finish_with_storage(Err(error.into()), "world persistence binding", || {
@@ -2031,40 +2069,8 @@ fn bootstrap_world(
         }
     };
     emit_sense_startup_contract();
-    let bootstrap_result = (|| -> Result<()> {
-        for _ in 0..bootstrap_ticks {
-            persistence.step(&mut world)?;
-        }
-        let completed_bootstrap_ticks = bootstrap_ticks;
-        emit_run_manifest(&world, pending_manifest, completed_bootstrap_ticks);
-
-        if let Some(summary) = world.history().last() {
-            info!(
-                tick = summary.tick.0,
-                agents = summary.agent_count,
-                births = summary.births,
-                deaths = summary.deaths,
-                avg_energy = summary.average_energy,
-                bootstrap_ticks,
-                "Primed world and persisted initial summary",
-            );
-        } else if bootstrap_ticks == 0 {
-            info!("Initialized seeded world at tick zero without bootstrap advancement");
-        } else {
-            warn!("World bootstrap completed without persistence summaries");
-        }
-        Ok(())
-    })();
-    if let Err(error) = bootstrap_result {
-        let result = finish_with_storage(Err(error), "world bootstrap", || {
-            let finalization = finalize_world_persistence(&mut world, &mut persistence);
-            finalize_then_shutdown_storage(finalization, &mut pipeline)
-        });
-        emit_sense_run_end(SenseRunSummary::capture(&world), result.is_ok());
-        return result;
-    }
-
-    Ok((world, persistence, analytics, pipeline))
+    // No science runs here: the same HostCore executes bootstrap and later user steps.
+    Ok((world, persistence, analytics, pipeline, pending_manifest))
 }
 
 fn compose_config(cli: &AppCli) -> Result<ScriptBotsConfig> {
@@ -3649,7 +3655,11 @@ fn run_verify_bundle_cli(bundle_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
+fn run_replay_cli(
+    cli: &AppCli,
+    config: &ScriptBotsConfig,
+    interventions: &[ScenarioInterventionV1],
+) -> Result<()> {
     let db_path = cli
         .replay_db
         .as_ref()
@@ -3686,7 +3696,7 @@ fn run_replay_cli(cli: &AppCli, config: &ScriptBotsConfig) -> Result<()> {
         );
     }
 
-    let replay_run = run_headless_simulation(config, tick_limit, cli.brain)?;
+    let replay_run = run_headless_simulation(config, tick_limit, cli.brain, interventions)?;
     let simulated_tick_count = replay_run.simulated_ticks;
     debug!(
         simulated_ticks = simulated_tick_count,
@@ -4026,6 +4036,7 @@ fn run_headless_simulation(
     config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
+    interventions: &[ScenarioInterventionV1],
 ) -> Result<ReplayRun> {
     let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
     let (mut world, mut persistence) =
@@ -4034,8 +4045,11 @@ fn run_headless_simulation(
     seed_agents(&mut world, &brain_keys)?;
 
     emit_sense_startup_contract();
+    let mut current_config = serde_json::to_value(world.config())?;
     let simulation_result = (|| -> Result<WorldDigestV1> {
         for index in 0..tick_limit {
+            let tick = world.tick().0;
+            apply_scenario_interventions(&mut world, &mut current_config, interventions, tick)?;
             // The final tick's batch carries the canonical world digest so the simulated
             // stream stays structurally aligned with a recorded one.
             if index + 1 == tick_limit {
@@ -5277,22 +5291,26 @@ mod tests {
     ///
     /// This inspects the source because the alternative is asserting on a real
     /// adapter enumeration, which is exactly the side effect under test. The
-    /// scan is scoped to the `dump_semantic_png` block so an unrelated probe
+    /// scan is scoped to the owner bootstrap's semantic capture block so an unrelated probe
     /// elsewhere in `main.rs` — `--dump-scene-png` legitimately needs one —
     /// cannot trip or mask it.
     #[test]
     fn semantic_projection_path_never_probes_the_gpu() {
-        let source = include_str!("main.rs");
+        // Exclude the tests themselves: a stale branch marker must fail, never
+        // accidentally match this guard's own string literal.
+        let source = include_str!("main.rs")
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("production source before unit tests")
+            .0;
         let after = source
-            .split_once("if let Some(path) = &cli.dump_semantic_png {")
+            .split_once("if let Some((path, (width, height))) = semantic_capture {")
             .expect("semantic png branch")
             .1;
-        // The adjacent else arm performs GPU scene capture. Fail if that
-        // boundary disappears instead of scanning the rest of this file,
-        // including this test's own source strings.
+        // The read-only completion observer ends here. GPU scene capture is a
+        // separate post-bootstrap branch and cannot enter this source window.
         let block = after
-            .split_once("\n            } else {")
-            .expect("semantic capture ends before the GPU scene-capture arm")
+            .split_once("\n            Ok(())")
+            .expect("semantic capture ends with the completion observer")
             .0;
         // Comments are stripped before scanning. The block deliberately explains
         // in prose why it does NOT probe, and naming the function there must not
@@ -5303,8 +5321,11 @@ mod tests {
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        let is_cpu_only =
-            |body: &str| body.contains("render_bevy_png") && !body.contains("probe_gpu_capability");
+        let is_cpu_only = |body: &str| {
+            body.contains("render_bevy_png")
+                && !body.contains("probe_gpu_capability")
+                && !body.contains("run_scene_capture_cli")
+        };
         assert!(
             is_cpu_only(&code),
             "the CPU-only semantic projection path must not probe the GPU; \
@@ -5313,6 +5334,10 @@ mod tests {
         assert!(
             !is_cpu_only(&format!("{code}\nprobe_gpu_capability();")),
             "the source guard must reject a GPU probe added to the semantic arm"
+        );
+        assert!(
+            !is_cpu_only(&format!("{code}\nrun_scene_capture_cli(path);")),
+            "the source guard must reject indirect GPU capture too"
         );
     }
 
@@ -5447,6 +5472,7 @@ mod tests {
             },
             2,
             BrainPreset::Ft,
+            &[],
         )
         .expect("headless Ft run");
 
@@ -6764,8 +6790,8 @@ activation = "Sigmoid"
             .expect("durable replay rows must have unique canonical identities");
         assert_eq!(max_tick, 16, "fixture must persist its partial final tail");
 
-        let replay =
-            run_headless_simulation(&config, max_tick, BrainPreset::Mixed).expect("replay run");
+        let replay = run_headless_simulation(&config, max_tick, BrainPreset::Mixed, &[])
+            .expect("replay run");
         assert_eq!(replay.simulated_ticks, max_tick);
         assert_eq!(
             replay

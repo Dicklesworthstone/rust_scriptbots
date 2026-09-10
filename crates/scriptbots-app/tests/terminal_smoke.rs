@@ -151,6 +151,326 @@ fn actual_binary_terminal_test_backend_path_reports_rendered_tick_budget() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum SchedulePerturbation {
+    None,
+    SkipZero,
+    ReverseSameTick,
+    DelayRecovery,
+}
+
+// Explicit assignments form the oracle, independent of the runtime scheduler,
+// scenario resolver, and its sort. Each perturbation must change the result.
+fn schedule_reference(
+    perturbation: SchedulePerturbation,
+) -> (Vec<serde_json::Value>, Vec<scriptbots_core::WorldDigestV1>) {
+    use scriptbots_app::{
+        brains::{BrainPreset, install_brains},
+        seed_founding_population,
+    };
+    use scriptbots_core::{ScriptBotsConfig, WorldState};
+    let config = ScriptBotsConfig {
+        rng_seed: Some(4242),
+        world_width: 600,
+        world_height: 600,
+        food_cell_size: 50,
+        population_minimum: 0,
+        population_spawn_interval: 0,
+        // The oracle advances science directly. WorldDigestV1 explicitly
+        // excludes persistence cadence from its scientific config lane.
+        persistence_interval: 0,
+        history_capacity: 600,
+        metabolism_drain: 0.001,
+        food_growth_rate: 0.01,
+        ..ScriptBotsConfig::default()
+    };
+    let mut world = WorldState::new(config).expect("reference world");
+    let brains = install_brains(&mut world, BrainPreset::Mlp).expect("production MLP installer");
+    seed_founding_population(&mut world, brains.population()).expect("production founders");
+    let mut digests = vec![world.world_digest_v1().expect("reference launch digest")];
+    let mut frames = Vec::new();
+    for boundary in 0..5 {
+        if boundary == 0 && !matches!(perturbation, SchedulePerturbation::SkipZero) {
+            let mut config = world.config().clone();
+            config.metabolism_drain = 0.01;
+            world
+                .apply_config_update(config)
+                .expect("manual tick-zero patch");
+        }
+        if boundary == 1 {
+            let rates = if matches!(perturbation, SchedulePerturbation::ReverseSameTick) {
+                [0.03, 0.02]
+            } else {
+                [0.02, 0.03]
+            };
+            for rate in rates {
+                let mut config = world.config().clone();
+                config.metabolism_drain = rate;
+                config.food_growth_rate = 0.005;
+                world
+                    .apply_config_update(config)
+                    .expect("manual ordered tick-one patch");
+            }
+        }
+        if boundary
+            == if matches!(perturbation, SchedulePerturbation::DelayRecovery) {
+                4
+            } else {
+                3
+            }
+        {
+            let mut config = world.config().clone();
+            config.food_growth_rate = 0.03;
+            config.metabolism_drain = 0.007;
+            world
+                .apply_config_update(config)
+                .expect("manual later patch");
+        }
+        world.step().expect("manual scientific transition");
+        frames.push(serde_json::json!({
+            "tick": world.tick().0,
+            "epoch": world.epoch(),
+            "agent_count": world.agents().len(),
+            "spike_hits": world.last_spike_hits(),
+        }));
+        digests.push(world.world_digest_v1().expect("reference boundary digest"));
+    }
+    assert_eq!(
+        world.config().food_growth_rate.to_bits(),
+        0.03_f32.to_bits()
+    );
+    assert_eq!(
+        world.config().metabolism_drain.to_bits(),
+        0.007_f32.to_bits()
+    );
+    (frames, digests)
+}
+
+fn write_unsorted_schedule(scenario: &Path) {
+    fs::write(
+        scenario,
+        r#"
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "bootstrap-schedule-parity"
+description = "Unsorted boundary patches with ordered tick-one overrides."
+seeds = [4242]
+[config]
+rng_seed = 4242
+world_width = 600
+world_height = 600
+food_cell_size = 50
+population_minimum = 0
+population_spawn_interval = 0
+persistence_interval = 1
+history_capacity = 600
+metabolism_drain = 0.001
+food_growth_rate = 0.01
+[[interventions]]
+tick = 3
+set = { food_growth_rate = 0.03, metabolism_drain = 0.007 }
+[[interventions]]
+tick = 1
+set = { metabolism_drain = 0.02, food_growth_rate = 0.005 }
+[[interventions]]
+tick = 0
+set = { metabolism_drain = 0.01 }
+[[interventions]]
+tick = 1
+set = { metabolism_drain = 0.03, food_growth_rate = 0.005 }
+"#,
+    )
+    .expect("write unsorted scenario");
+}
+
+fn launch_scheduled_terminal(
+    directory: &Path,
+    scenario: &Path,
+) -> (serde_json::Value, serde_json::Value, String) {
+    let database = directory.join("scheduled.sqlite");
+    let report_path = directory.join("headless.json");
+    let output = headless_command()
+        .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", "3")
+        .env("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT", &report_path)
+        .env("SCRIPTBOTS_STORAGE_PATH", &database)
+        .env("RUST_LOG", "info")
+        .args([
+            "--storage",
+            "file",
+            "--threads",
+            "1",
+            "--brain",
+            "mlp",
+            "--bootstrap-ticks",
+            "2",
+            "--scenario",
+        ])
+        .arg(scenario)
+        .output()
+        .expect("launch scheduled headless binary");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+    eprintln!(
+        "scheduled CLI status={}\nstdout:\n{}\nstderr:\n{stderr}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout)
+    );
+    fs::write(directory.join("terminal.stdout.log"), &output.stdout)
+        .expect("retain terminal stdout");
+    fs::write(directory.join("terminal.stderr.log"), &output.stderr)
+        .expect("retain terminal stderr");
+    assert!(output.status.success(), "scheduled CLI failed:\n{stderr}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).expect("actual headless report"))
+            .expect("report JSON");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(database.with_extension("manifest.json")).expect("actual bootstrap manifest"),
+    )
+    .expect("manifest JSON");
+    (report, manifest, stderr)
+}
+
+fn assert_scheduled_terminal_trace(
+    report: &serde_json::Value,
+    manifest: &serde_json::Value,
+    expected_frames: &[serde_json::Value],
+    expected_digests: &[scriptbots_core::WorldDigestV1],
+) {
+    assert_eq!(report["initial"]["tick"], 2);
+    assert_eq!(report["summary"]["ticks_simulated"], 3);
+    assert_eq!(report["summary"]["final_tick"], 5);
+    let frames = report["frames"].as_array().expect("actual frame trace");
+    assert_eq!(frames.len(), 3);
+    for (actual, expected) in frames.iter().zip(&expected_frames[2..]) {
+        for field in ["tick", "epoch", "agent_count", "spike_hits"] {
+            assert_eq!(actual[field], expected[field], "frame field {field}");
+        }
+    }
+    let bootstrap = &manifest["bootstrap_evidence"];
+    assert_eq!(bootstrap["completed"], 2);
+    assert_eq!(
+        bootstrap["start"],
+        serde_json::to_value(&expected_digests[0]).expect("start digest JSON")
+    );
+    assert_eq!(
+        bootstrap["end"],
+        serde_json::to_value(&expected_digests[2]).expect("bootstrap digest JSON")
+    );
+    assert_eq!(
+        report["summary"]["world_digest"],
+        expected_digests[5].overall
+    );
+}
+
+fn assert_scheduled_determinism_trace(
+    directory: &Path,
+    scenario: &Path,
+    expected_frames: &[serde_json::Value],
+    expected_digests: &[scriptbots_core::WorldDigestV1],
+) {
+    // The separate verification entry point must execute the same schedule too;
+    // its output is another subject, never the oracle for the production run.
+    let det_output = headless_command()
+        .env("SCRIPTBOTS_DET_RUN", "1")
+        .env("SCRIPTBOTS_DET_TICKS", "5")
+        .env("RUST_LOG", "info")
+        .args(["--threads", "1", "--brain", "mlp", "--scenario"])
+        .arg(scenario)
+        .output()
+        .expect("launch actual determinism child entry point");
+    eprintln!(
+        "determinism CLI status={}\nstdout:\n{}\nstderr:\n{}",
+        det_output.status,
+        String::from_utf8_lossy(&det_output.stdout),
+        String::from_utf8_lossy(&det_output.stderr)
+    );
+    fs::write(directory.join("det.stdout.log"), &det_output.stdout)
+        .expect("retain determinism stdout");
+    fs::write(directory.join("det.stderr.log"), &det_output.stderr)
+        .expect("retain determinism stderr");
+    assert!(
+        det_output.status.success(),
+        "determinism entry point failed"
+    );
+    let det: serde_json::Value =
+        serde_json::from_slice(&det_output.stdout).expect("actual determinism JSON");
+    assert_eq!(det["ticks"], 5);
+    assert_eq!(det["last_tick"], 5);
+    assert_eq!(
+        det["world_digest"],
+        serde_json::to_value(&expected_digests[5]).expect("final digest JSON")
+    );
+    let summaries = det["summaries"]
+        .as_array()
+        .expect("actual deterministic summaries");
+    assert_eq!(summaries.len(), expected_frames.len());
+    for (actual, expected) in summaries.iter().zip(expected_frames) {
+        for field in ["tick", "agent_count", "spike_hits"] {
+            assert_eq!(
+                actual[field], expected[field],
+                "determinism trace field {field}"
+            );
+        }
+    }
+}
+
+fn assert_scheduled_patch_logs(stderr: &str) {
+    let applied: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.contains("scheduled patch applied"))
+        .collect();
+    assert_eq!(
+        applied.len(),
+        4,
+        "each actual patch must be reported exactly once:\n{stderr}"
+    );
+    for (line, (sequence, tick, changed)) in applied.iter().zip([
+        (1, 0, "metabolism_drain"),
+        (2, 1, "food_growth_rate, metabolism_drain"),
+        (3, 1, "metabolism_drain"),
+        (4, 3, "food_growth_rate, metabolism_drain"),
+    ]) {
+        assert!(
+            line.contains(&format!("sequence={sequence}"))
+                && line.contains(&format!("tick={tick}")),
+            "wrong applied boundary: {line}"
+        );
+        assert!(
+            line.contains(&format!("changed={changed}")),
+            "wrong observed changed paths: {line}"
+        );
+    }
+}
+
+#[test]
+fn headless_scenario_schedule_matches_manual_science_across_bootstrap() {
+    let directory = tempdir().expect("scheduled CLI artifacts").keep();
+    eprintln!(
+        "scheduled CLI artifacts retained at {}",
+        directory.display()
+    );
+    let scenario = directory.join("scheduled.scenario.toml");
+    write_unsorted_schedule(&scenario);
+    let (report, manifest, stderr) = launch_scheduled_terminal(&directory, &scenario);
+    let (expected_frames, expected_digests) = schedule_reference(SchedulePerturbation::None);
+    assert_scheduled_terminal_trace(&report, &manifest, &expected_frames, &expected_digests);
+    assert_scheduled_determinism_trace(&directory, &scenario, &expected_frames, &expected_digests);
+    for (label, perturbation) in [
+        ("omitted tick zero", SchedulePerturbation::SkipZero),
+        (
+            "reversed same-tick order",
+            SchedulePerturbation::ReverseSameTick,
+        ),
+        ("late recovery", SchedulePerturbation::DelayRecovery),
+    ] {
+        let (_, wrong) = schedule_reference(perturbation);
+        assert_ne!(
+            wrong[5].overall, expected_digests[5].overall,
+            "the digest oracle must detect {label}"
+        );
+    }
+    assert_scheduled_patch_logs(&stderr);
+}
+
 #[test]
 fn occupied_rest_port_refuses_before_config_tuning_or_storage() {
     let occupied =
