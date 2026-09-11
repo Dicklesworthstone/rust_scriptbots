@@ -65,25 +65,23 @@ Source of truth: `crates/scriptbots-core/src/lib.rs` (`WorldState`, the `stage_*
 
 ## 2. HostCore ownership (`scriptbots-runtime`)
 
-### Current vs Transitional vs Target State
+### Current production ownership and remaining acceptance
 
-- **[Target State: Dedicated HostCore Ownership (`bd-k7nq`)]**: In the target architecture,
+- **[Implemented native ownership, source checked 2026-09-11]**: In the native application,
   `scriptbots-runtime::HostCore` is the **sole owner** of a running `WorldState`. Frontends, the CLI,
-  the REST surface, and MCP never touch `WorldState` directly; they hold a `HostClient` handle, send
+  the REST surface, and MCP never touch the running `WorldState` directly; they hold a host port
+  or `HostClient` handle, send
   validated commands across a message-passing channel, and read back an immutable snapshot. This
   makes concurrent control surfaces thread-safe and preserves a single simulation authority while
   multiple observers inspect it.
-- **[Current & Transitional State: `SharedWorld` Bridge (`bd-2z0.4.9`)]**: In current production code,
-  `scriptbots-app` wraps `WorldState` in `SharedWorld` (`pub type SharedWorld = Arc<Mutex<WorldState>>`,
-  `crates/scriptbots-app/src/lib.rs`). Control surfaces (`ControlHandle`, `crates/scriptbots-app/src/control.rs`),
-  HTTP/MCP servers (`crates/scriptbots-app/src/servers.rs`), and the TUI loop (`crates/scriptbots-app/src/terminal/mod.rs`)
-  lock this mutex directly. Closed bead `bd-2z0.4.9` completed a vital transitional milestone by
-  migrating control commands to use typed, validated envelopes (`CommandEnvelope`, `CommandId`) and
-  eliminating discarded receipts across Bevy, CLI, REST, and MCP. The September 3 correction
-  inferred migration from closed `bd-k7nq`; source inspection on September 5 contradicts it:
-  `ControlHandle` still stores `SharedWorld` and `with_world` locks it. Host ownership and
-  frontend cutover remain with `bd-pcfj` and `bd-88yj`. The closed preparation bead is not
-  evidence that those production callers were migrated.
+- `main.rs` constructs `HostThread::spawn_with_bootstrap`; `ControlHandle` stores a
+  `ChannelHostPort`. Native terminal, GPUI and Bevy launch contexts receive that port.
+  The September 5 description of production `SharedWorld` ownership is superseded by this
+  source change. Bootstrap and scheduled scenario patches execute at owner tick boundaries.
+- **[Remaining acceptance]** `bd-pcfj`, `bd-88yj` and frontend migration beads remain open for
+  their complete receipt, interaction, lifecycle and native acceptance obligations. A port
+  field does not prove those obligations. The browser demo still advances through its RAF
+  callback; its scheduler migration remains part of `bd-2z0.12.3`.
 
 The runtime control surface (`crates/scriptbots-runtime/src/lib.rs`):
 
@@ -100,18 +98,16 @@ The runtime control surface (`crates/scriptbots-runtime/src/lib.rs`):
 
 **Rules.**
 
-- **[Target Invariant] Ownership is exclusive.** Do not introduce new paths holding `&mut WorldState`
-  outside `HostCore`. Transitional paths must lock `SharedWorld` strictly within bounded helpers and
-  prepare for migration to `HostClient`; `ControlHandle` is among those transitional paths
-  tracked under `bd-pcfj`/`bd-88yj`.
+- **Ownership of a running native session is exclusive.** Do not introduce frontend paths
+  holding `&mut WorldState`. Construction, library examples and test fixtures are distinct
+  from the running session; their direct access does not authorize a frontend world lock.
 - **Commands are validated, not trusted.** New control operations must add a `HostCommand` variant and
   implement validation; they must never bypass the `CommandEnvelope` or discard receipts (`bd-2z0.4.9`).
 
 Source of truth: `crates/scriptbots-runtime/src/lib.rs` (`HostCore`, `HostCommand`, `HostEventKind`,
-`CommandEnvelope`, `CommandId`); `crates/scriptbots-app/src/lib.rs` (`SharedWorld`);
-`crates/scriptbots-app/src/control.rs` (`ControlHandle`); transitional receipt fixes under `bd-2z0.4.9`;
-HostClient migration: preparation in closed `bd-k7nq`; actual ownership transfer under
-`bd-pcfj`/`bd-88yj` (source correction, 2026-09-05).
+`CommandEnvelope`, `CommandId`); `crates/scriptbots-app/src/main.rs` (production spawn);
+`crates/scriptbots-app/src/control.rs` (`ControlHandle`); runtime channel and host-core modules.
+Production migration and its remaining acceptance are tracked by `bd-pcfj`/`bd-88yj`.
 
 ---
 
@@ -357,15 +353,14 @@ Frontends are simulation consumers, never authors of core science state. They re
 
 ### Current vs Target State
 
-- **[Current & Transitional State]**: WGPU (`scriptbots-render` / `scriptbots-world-gfx`), Bevy
-  (`scriptbots-bevy`), and WASM (`scriptbots-web`) consume projected `RenderSnapshot`s and communicate
-  via commands. In `scriptbots-app`, however, the TUI runner (`TerminalRenderer`) and HTTP/MCP servers
-  still hold a `SharedWorld` mutex bridge to drive ticks and query state directly.
-- **[Target State (`bd-k7nq` + `bd-pcfj`/`bd-88yj`)]**: All frontends, including the TUI and headless server runners,
-  interact strictly via `HostClient` over asynchronous channels. No frontend crate will have link or
-  runtime access to `WorldState` or `SharedWorld`. `ControlHandle` still owns the transitional
-  mutex, and Bevy still owns a separate simulation worker. Their cutover remains open under
-  `bd-pcfj`/`bd-88yj` and the frontend migration beads.
+- **[Current native state, 2026-09-11]**: terminal, GPUI, Bevy and HTTP/MCP receive the
+  production host port and immutable publications. Their ordinary render loops do not own
+  the science clock. Bevy's legacy command callback still returns an admitted identity;
+  complete applied/durable interaction feedback remains part of the open migration work.
+- **[Remaining target]**: finish all native input, receipt and lifecycle contracts and their
+  real-window/PTY tests. Migrate the experimental browser's `requestAnimationFrame` loop,
+  which currently calls `simHandle.tick(1)`, to a scheduler whose science is independent of
+  repaint cadence. Keep library construction and capture fixtures separate from live ownership.
 
 Crate responsibilities:
 
@@ -881,8 +876,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The REST status route is `GET /api/control/status/{command_id}`. It exposes separate application
-and journal axes. The transitional `ControlHandle` still holds `SharedWorld`; this example does
-not certify that HTTP path or a GUI/PTY/browser session. `HostCommand::Step` has no count field.
+and journal axes. Production `ControlHandle` now holds `ChannelHostPort`; this library example
+does not certify that HTTP path or a GUI/PTY/browser session. `HostCommand::Step` has no count field.
 Invalid speed, mismatched session, status contradictions and projection limits return typed
 errors. A slow client polls its snapshot subscription for the newest publication; event-stream
 gaps require the separate cursor/catch-up protocol.
@@ -898,7 +893,7 @@ guard or test, or an explicit open tracking bead.
 | :--- | :--- | :--- | :--- | :--- |
 | **Core Science Purity** (no clock, network, or filesystem in ticks) | `scriptbots-core` | `WorldState::step_outcome` (`crates/scriptbots-core/src/lib.rs`) | `tests/world_determinism.rs` | Enforced; closed in `bd-16g.11` |
 | **Deterministic Stage Order** (21 ordered simulation stages) | `scriptbots-core` | `WorldState::step_outcome` (`crates/scriptbots-core/src/lib.rs`) | `tests/world_digest_v1.rs` golden digest | Enforced; closed in `bd-3n7p` |
-| **Exclusive Simulation Ownership** (HostCore sole owner) | `scriptbots-runtime` | `HostCore` (`crates/scriptbots-runtime/src/lib.rs`) | Transitional `SharedWorld` in `crates/scriptbots-app/src/lib.rs` and `ControlHandle` | Production ownership transfer open: `bd-pcfj`/`bd-88yj`; closed preparation is insufficient (corrected 2026-09-05) |
+| **Exclusive Simulation Ownership** (HostCore sole owner) | `scriptbots-runtime` | `HostCore`, `HostThread::spawn_with_bootstrap` in app `main.rs` | Production `ControlHandle` and native launch contexts hold `ChannelHostPort`; host scheduler tests | Native wiring implemented; complete interaction/lifecycle acceptance remains open in `bd-pcfj`/`bd-88yj` (source checked 2026-09-11) |
 | **Command Receipt Accounting** (no discarded receipts) | `scriptbots-app` | `CommandEnvelope`, `CommandId` (`crates/scriptbots-runtime/src/lib.rs`) | `no_control_command_discards_its_receipt` (`crates/scriptbots-app/src/servers.rs`) | Closed in `bd-2z0.4.9`; workspace guard in `bd-d6gv` |
 | **WASM Dependency Purity** (no native franken in WASM graph) | `scriptbots-web` | `crates/scriptbots-web/Cargo.toml` | `ci/check_wasm_graph.sh` | Enforced in CI; purity slice closed in `bd-2z0.12.3`, which has since REOPENED for the broader browser-frontend deliverable (guard itself stays enforced; corrected 2026-09-03) |
 | **Brain Heredity Gate** (copy AND vary proven before founding) | `scriptbots-app` | `install_brains` (`crates/scriptbots-app/src/lib.rs`) | `tests/heredity_gate.rs` | Enforced; closed in `bd-2z0.13.2` |
