@@ -640,15 +640,14 @@ mod tests {
             1024,
             1024,
         )?;
-        storage.record_checkpoint(
-            "cp-001",
-            50,
-            0,
-            "scriptbots.world-checkpoint.v1.3+postcard_hex",
-            "aabbcc",
-            "digest1",
-            "{}",
-        )?;
+        let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(42),
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })?;
+        storage.record_checkpoint("cp-001", 0, &world.checkpoint_v1()?, &serde_json::json!({}))?;
         storage.flush()?;
         storage.close()?;
 

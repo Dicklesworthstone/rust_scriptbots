@@ -1378,7 +1378,10 @@ impl Write for LowerHexWriter {
     }
 }
 
-pub(super) fn decode_lower_hex(context: &'static str, encoded: &str) -> Result<Vec<u8>, StorageError> {
+pub(super) fn decode_lower_hex(
+    context: &'static str,
+    encoded: &str,
+) -> Result<Vec<u8>, StorageError> {
     fn nibble(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),

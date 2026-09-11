@@ -5952,7 +5952,9 @@ impl PersistedCheckpointRecord {
             return Err(invalid("checkpoint identity is empty".to_owned()));
         }
         if self.payload.len() > scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES.saturating_mul(2) {
-            return Err(invalid("checkpoint payload exceeds the core wire limit".to_owned()));
+            return Err(invalid(
+                "checkpoint payload exceeds the core wire limit".to_owned(),
+            ));
         }
         let bytes = journal::decode_lower_hex("checkpoints.payload", &self.payload)?;
         let actual_digest = format!("blake3:{}", blake3::hash(&bytes).to_hex());
@@ -13031,15 +13033,20 @@ impl Storage {
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         metadata: &Value,
     ) -> Result<(), StorageError> {
-        let encoded = checkpoint.encode().map_err(|error| StorageError::InvalidData {
-            context: "checkpoints.payload",
-            reason: error.to_string(),
-        })?;
+        let encoded = checkpoint
+            .encode()
+            .map_err(|error| StorageError::InvalidData {
+                context: "checkpoints.payload",
+                reason: error.to_string(),
+            })?;
         let record = PersistedCheckpointRecord {
             checkpoint_id: checkpoint_id.to_owned(),
             tick: checkpoint.tick().0,
             checkpoint_ordinal,
-            format: format!("{}+postcard_hex", scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA),
+            format: format!(
+                "{}+postcard_hex",
+                scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+            ),
             payload: journal::encode_lower_hex(&encoded),
             payload_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
             metadata_json: metadata.to_string(),
@@ -34221,7 +34228,10 @@ mod tests {
             world.step()?;
         }
         let checkpoint = world.checkpoint_v1()?;
-        assert!(checkpoint.agent_count() > 0, "continuation requires a live population");
+        assert!(
+            checkpoint.agent_count() > 0,
+            "continuation requires a live population"
+        );
         let path = temp_db_path("storage-checkpoint-roundtrip");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
@@ -34235,7 +34245,10 @@ mod tests {
         assert_eq!(checkpoints[0].checkpoint_id, "cp-001");
         assert_eq!(checkpoints[0].tick, 10);
         assert_eq!(checkpoints[0].checkpoint_ordinal, 0);
-        assert_eq!(checkpoints[0].world_checkpoint()?.encode()?, checkpoint.encode()?);
+        assert_eq!(
+            checkpoints[0].world_checkpoint()?.encode()?,
+            checkpoint.encode()?
+        );
         assert_eq!(checkpoints[0].metadata_json, r#"{"test":true}"#);
 
         let latest = reader.load_latest_checkpoint()?;
@@ -34244,21 +34257,27 @@ mod tests {
         reader.close()?;
 
         let mut registry = BrainRegistry::new();
-        assert_eq!(registry.register_family("mlp.baseline", Box::new(MlpBrainFamily::new()))?, brain);
+        assert_eq!(
+            registry.register_family("mlp.baseline", Box::new(MlpBrainFamily::new()))?,
+            brain
+        );
         let mut restored = WorldState::restore_checkpoint_v1(&decoded, registry)?;
         for _ in 0..5 {
             world.step()?;
             restored.step()?;
             assert_eq!(world.world_digest_v1()?, restored.world_digest_v1()?);
         }
-        println!("CHECKPOINT_EVIDENCE: {}", json!({
-            "database": path_string,
-            "checkpoint_tick": decoded.tick().0,
-            "agents": decoded.agent_count(),
-            "continued_through_tick": restored.tick().0,
-            "final_digest": restored.world_digest_v1()?.overall,
-            "scope": "core science save/load/restore; no host-session continuation",
-        }));
+        println!(
+            "CHECKPOINT_EVIDENCE: {}",
+            json!({
+                "database": path_string,
+                "checkpoint_tick": decoded.tick().0,
+                "agents": decoded.agent_count(),
+                "continued_through_tick": restored.tick().0,
+                "final_digest": restored.world_digest_v1()?.overall,
+                "scope": "core science save/load/restore; no host-session continuation",
+            })
+        );
         Ok(())
     }
 
@@ -34275,17 +34294,28 @@ mod tests {
         let checkpoint = world.checkpoint_v1()?;
         let path = temp_db_path("storage-checkpoint-corruption");
         let path_string = path.to_string_lossy().to_string();
-        let mut storage = Storage::create_unattributed_file_with_thresholds(
-            &path_string, 64, 4096, 1024, 1024,
-        )?;
-        assert!(storage.record_checkpoint("", 0, &checkpoint, &json!({})).is_err());
-        assert!(storage.record_checkpoint("bad-meta", 0, &checkpoint, &Value::Null).is_err());
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        assert!(
+            storage
+                .record_checkpoint("", 0, &checkpoint, &json!({}))
+                .is_err()
+        );
+        assert!(
+            storage
+                .record_checkpoint("bad-meta", 0, &checkpoint, &Value::Null)
+                .is_err()
+        );
         storage.record_checkpoint("older", 0, &checkpoint, &json!({}))?;
         storage.record_checkpoint("newest", 1, &checkpoint, &json!({}))?;
         storage.close()?;
         let reader = StorageReader::open(&path_string)?;
         let newest = reader.load_latest_checkpoint()?.expect("newest checkpoint");
-        assert_eq!(reader.load_checkpoints()?.len(), 2, "invalid writes insert no rows");
+        assert_eq!(
+            reader.load_checkpoints()?.len(),
+            2,
+            "invalid writes insert no rows"
+        );
         reader.close()?;
         for (field, value) in [
             ("format", "unknown-format"),
@@ -34304,20 +34334,34 @@ mod tests {
                 "tick" => changed.tick = 1,
                 _ => unreachable!("fixed mutation cases"),
             }
-            assert!(changed.world_checkpoint().is_err(), "accepted mutation of {field}");
+            assert!(
+                changed.world_checkpoint().is_err(),
+                "accepted mutation of {field}"
+            );
         }
         // Rehashing corrupt bytes must still fail the core envelope decoder.
         let mut rehashed = newest.clone();
         rehashed.payload = "aabbccdd".to_owned();
-        rehashed.payload_digest = format!("blake3:{}", blake3::hash(&[0xaa, 0xbb, 0xcc, 0xdd]).to_hex());
+        rehashed.payload_digest = format!(
+            "blake3:{}",
+            blake3::hash(&[0xaa, 0xbb, 0xcc, 0xdd]).to_hex()
+        );
         assert!(rehashed.world_checkpoint().is_err());
 
         let connection = Connection::open(&path_string)?;
-        connection.execute("UPDATE checkpoints SET payload = 'aabbccdd' WHERE checkpoint_id = 'newest'")?;
+        connection.execute(
+            "UPDATE checkpoints SET payload = 'aabbccdd' WHERE checkpoint_id = 'newest'",
+        )?;
         connection.close()?;
         let reader = StorageReader::open(&path_string)?;
-        assert!(reader.load_latest_checkpoint().is_err(), "must not use the older valid checkpoint");
-        assert!(reader.load_checkpoints().is_err(), "must not return a partially valid collection");
+        assert!(
+            reader.load_latest_checkpoint().is_err(),
+            "must not use the older valid checkpoint"
+        );
+        assert!(
+            reader.load_checkpoints().is_err(),
+            "must not return a partially valid collection"
+        );
         reader.close()?;
         Ok(())
     }
