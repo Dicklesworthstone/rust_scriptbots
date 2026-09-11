@@ -120,6 +120,76 @@ fn manifest_digest_for_test(manifest: &RunManifestV3) -> String {
 }
 
 #[test]
+fn persisted_manifests_do_not_claim_unimplemented_checkpoint_continuation() {
+    let mut previous_roster = None;
+    for brain in ["mlp", "mixed"] {
+        let dir = run_dir(&format!("checkpoint_guarantee_{brain}"));
+        let output = launch_with(&dir, &[], &["--brain", brain]);
+        std::fs::write(dir.join("stdout.log"), &output.stdout).expect("retain app stdout");
+        std::fs::write(dir.join("stderr.log"), &output.stderr).expect("retain app stderr");
+        let sidecar = manifest_of(&output, &dir);
+        let database = dir.join("run.sqlite");
+        let reader = StorageReader::open(database.to_str().expect("database path"))
+            .expect("open actual completed run");
+        let persisted = reader
+            .run_manifest()
+            .expect("read persisted launch manifest");
+        let durable: serde_json::Value =
+            serde_json::from_str(&persisted.manifest_json).expect("persisted manifest JSON");
+        assert!(
+            sidecar["agent_rng_counters"]
+                .as_array()
+                .is_some_and(|agents| !agents.is_empty()),
+            "the production case must contain real launch agents"
+        );
+        assert_eq!(sidecar["brain_roster"], durable["brain_roster"]);
+        if let Some(previous) = previous_roster.replace(sidecar["brain_roster"].clone()) {
+            assert_ne!(
+                previous, sidecar["brain_roster"],
+                "MLP and mixed cases must exercise different registered rosters"
+            );
+        }
+
+        for (location, manifest) in [("sidecar", &sidecar), ("database", &durable)] {
+            // Comparing the records alone would miss the same false claim in both.
+            // Missing/null/string values must not pass either.
+            assert_eq!(
+                manifest["limitations"]["checkpoint_replay_guarantee"].as_bool(),
+                Some(false),
+                "{location} must not advertise checkpoint-start replay: {manifest}"
+            );
+            assert_eq!(
+                manifest["limitations"]["rng_state_restorable"].as_bool(),
+                Some(true),
+                "the checkpoint limitation must preserve the separate real RNG capability"
+            );
+        }
+        assert_eq!(sidecar["identity"]["run_id"], durable["identity"]["run_id"]);
+        assert_eq!(sidecar["root_seed"], durable["root_seed"]);
+        assert_eq!(sidecar["bootstrap_evidence"]["completed"].as_u64(), Some(2));
+        println!(
+            "E2E_EVIDENCE: {}",
+            serde_json::json!({
+                "schema": "scriptbots.checkpoint-claim.e2e.v1",
+                "run_id": sidecar["identity"]["run_id"],
+                "source": sidecar["build"]["source_revision"],
+                "seed": sidecar["root_seed"],
+                "brain": brain,
+                "brain_roster": sidecar["brain_roster"],
+                "bootstrap": sidecar["bootstrap_evidence"]["completed"],
+                "database": database.display().to_string(),
+                "sidecar": dir.join("run.manifest.json").display().to_string(),
+                "checkpoint_replay_guarantee": sidecar["limitations"]["checkpoint_replay_guarantee"],
+                "persisted_checkpoint_replay_guarantee": durable["limitations"]["checkpoint_replay_guarantee"],
+                "rng_state_restorable": durable["limitations"]["rng_state_restorable"],
+                "exit_code": output.status.code(),
+            })
+        );
+        reader.close().expect("close actual read-only run");
+    }
+}
+
+#[test]
 fn the_manifest_records_the_thread_policy_the_run_actually_resolved() {
     // A manifest that records the ENVIRONMENT rather than the DECISION describes a run that did
     // not happen.
