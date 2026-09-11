@@ -5933,6 +5933,53 @@ pub struct PersistedCheckpointRecord {
     pub metadata_json: String,
 }
 
+impl PersistedCheckpointRecord {
+    /// Decode and validate the stored science checkpoint, including its row projections.
+    /// This does not reconstruct a host or resume its persistence session.
+    pub fn world_checkpoint(&self) -> Result<scriptbots_core::WorldCheckpointV1, StorageError> {
+        let invalid = |reason: String| StorageError::InvalidData {
+            context: "checkpoints.world_checkpoint",
+            reason: format!("checkpoint {}: {reason}", self.checkpoint_id),
+        };
+        let expected_format = format!(
+            "{}+postcard_hex",
+            scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+        );
+        if self.format != expected_format {
+            return Err(invalid(format!("unsupported format {}", self.format)));
+        }
+        if self.checkpoint_id.trim().is_empty() {
+            return Err(invalid("checkpoint identity is empty".to_owned()));
+        }
+        if self.payload.len() > scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES.saturating_mul(2) {
+            return Err(invalid("checkpoint payload exceeds the core wire limit".to_owned()));
+        }
+        let bytes = journal::decode_lower_hex("checkpoints.payload", &self.payload)?;
+        let actual_digest = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+        if self.payload_digest != actual_digest {
+            return Err(invalid(format!(
+                "payload digest mismatch: expected {}, actual {actual_digest}",
+                self.payload_digest
+            )));
+        }
+        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+            .map_err(|error| invalid(error.to_string()))?;
+        if checkpoint.tick().0 != self.tick {
+            return Err(invalid(format!(
+                "row tick {} differs from payload tick {}",
+                self.tick,
+                checkpoint.tick().0
+            )));
+        }
+        let metadata: Value = serde_json::from_str(&self.metadata_json)
+            .map_err(|error| invalid(format!("invalid metadata: {error}")))?;
+        if !metadata.is_object() {
+            return Err(invalid("checkpoint metadata must be an object".to_owned()));
+        }
+        Ok(checkpoint)
+    }
+}
+
 /// Holds a reservation on the in-flight byte counter and releases it on drop.
 ///
 /// RAII rather than a manual decrement, because "released exactly once on commit,
@@ -10696,7 +10743,7 @@ impl StorageReader {
         for row in rows {
             let tick_val: i64 = decode(&row, 1, "checkpoints.tick")?;
             let ord_val: i64 = decode(&row, 2, "checkpoints.checkpoint_ordinal")?;
-            checkpoints.push(PersistedCheckpointRecord {
+            let checkpoint = PersistedCheckpointRecord {
                 checkpoint_id: decode(&row, 0, "checkpoints.checkpoint_id")?,
                 tick: checked_u64("checkpoints.tick", tick_val)?,
                 checkpoint_ordinal: checked_u64("checkpoints.checkpoint_ordinal", ord_val)?,
@@ -10704,7 +10751,9 @@ impl StorageReader {
                 payload: decode(&row, 4, "checkpoints.payload")?,
                 payload_digest: decode(&row, 5, "checkpoints.payload_digest")?,
                 metadata_json: decode(&row, 6, "checkpoints.metadata_json")?,
-            });
+            };
+            checkpoint.world_checkpoint()?;
+            checkpoints.push(checkpoint);
         }
         Ok(checkpoints)
     }
@@ -10727,7 +10776,7 @@ impl StorageReader {
         let row = &rows[0];
         let tick_val: i64 = decode(row, 1, "checkpoints.tick")?;
         let ord_val: i64 = decode(row, 2, "checkpoints.checkpoint_ordinal")?;
-        Ok(Some(PersistedCheckpointRecord {
+        let checkpoint = PersistedCheckpointRecord {
             checkpoint_id: decode(row, 0, "checkpoints.checkpoint_id")?,
             tick: checked_u64("checkpoints.tick", tick_val)?,
             checkpoint_ordinal: checked_u64("checkpoints.checkpoint_ordinal", ord_val)?,
@@ -10735,7 +10784,9 @@ impl StorageReader {
             payload: decode(row, 4, "checkpoints.payload")?,
             payload_digest: decode(row, 5, "checkpoints.payload_digest")?,
             metadata_json: decode(row, 6, "checkpoints.metadata_json")?,
-        }))
+        };
+        checkpoint.world_checkpoint()?;
+        Ok(Some(checkpoint))
     }
 
     /// Load every agent-arrival ancestry edge recorded in this run for offline rebuild.
@@ -12968,18 +13019,33 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Save a checkpoint record to the checkpoints table.
-    #[allow(clippy::too_many_arguments)]
+    /// Store a real core science checkpoint on the connection-owning thread.
+    ///
+    /// Tick, wire format, payload and digest are derived from the validated core artifact.
+    /// This atomic row write is not a host-session checkpoint or an outbox admission receipt.
+    /// Production worker capture and continuation remain owned by bd-2z0.5.13.
     pub fn record_checkpoint(
         &mut self,
         checkpoint_id: &str,
-        tick: u64,
         checkpoint_ordinal: u64,
-        format: &str,
-        payload: &str,
-        payload_digest: &str,
-        metadata_json: &str,
+        checkpoint: &scriptbots_core::WorldCheckpointV1,
+        metadata: &Value,
     ) -> Result<(), StorageError> {
+        let encoded = checkpoint.encode().map_err(|error| StorageError::InvalidData {
+            context: "checkpoints.payload",
+            reason: error.to_string(),
+        })?;
+        let record = PersistedCheckpointRecord {
+            checkpoint_id: checkpoint_id.to_owned(),
+            tick: checkpoint.tick().0,
+            checkpoint_ordinal,
+            format: format!("{}+postcard_hex", scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA),
+            payload: journal::encode_lower_hex(&encoded),
+            payload_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
+            metadata_json: metadata.to_string(),
+        };
+        record.world_checkpoint()?;
+        let tick = record.tick;
         let tick_i64 = i64::try_from(tick).map_err(|error| StorageError::InvalidData {
             context: "checkpoints.tick",
             reason: error.to_string(),
@@ -12997,10 +13063,10 @@ impl Storage {
                 checkpoint_id.into(),
                 tick_i64.into(),
                 ordinal_i64.into(),
-                format.into(),
-                payload.into(),
-                payload_digest.into(),
-                metadata_json.into(),
+                record.format.as_str().into(),
+                record.payload.as_str().into(),
+                record.payload_digest.as_str().into(),
+                record.metadata_json.as_str().into(),
             ],
         )?;
         Ok(())
@@ -34134,20 +34200,34 @@ mod tests {
 
     #[test]
     fn record_and_load_checkpoint_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_brain::mlp::MlpBrainFamily;
+        use scriptbots_core::{AgentData, BrainRegistry, ScriptBotsConfig, WorldState};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(4242),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            narrative_interval: 0,
+            chart_flush_interval: 0,
+            ..ScriptBotsConfig::default()
+        })?;
+        let brain = world.register_brain_family("mlp.baseline", Box::new(MlpBrainFamily::new()))?;
+        for _ in 0..3 {
+            let agent = world.try_spawn_agent(AgentData::default())?;
+            assert!(world.bind_agent_brain(agent, brain)?);
+        }
+        for _ in 0..10 {
+            world.step()?;
+        }
+        let checkpoint = world.checkpoint_v1()?;
+        assert!(checkpoint.agent_count() > 0, "continuation requires a live population");
         let path = temp_db_path("storage-checkpoint-roundtrip");
         let path_string = path.to_string_lossy().to_string();
         let mut storage =
             Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
-        storage.record_checkpoint(
-            "cp-001",
-            10,
-            0,
-            "scriptbots.world-checkpoint.v1.3+postcard_hex",
-            "aabbccdd",
-            "digest123",
-            r#"{"test":true}"#,
-        )?;
-        storage.flush()?;
+        storage.record_checkpoint("cp-001", 0, &checkpoint, &json!({"test": true}))?;
+        storage.close()?;
 
         let reader = StorageReader::open(&path_string)?;
         let checkpoints = reader.load_checkpoints()?;
@@ -34155,21 +34235,90 @@ mod tests {
         assert_eq!(checkpoints[0].checkpoint_id, "cp-001");
         assert_eq!(checkpoints[0].tick, 10);
         assert_eq!(checkpoints[0].checkpoint_ordinal, 0);
-        assert_eq!(
-            checkpoints[0].format,
-            "scriptbots.world-checkpoint.v1.3+postcard_hex"
-        );
-        assert_eq!(checkpoints[0].payload, "aabbccdd");
-        assert_eq!(checkpoints[0].payload_digest, "digest123");
+        assert_eq!(checkpoints[0].world_checkpoint()?.encode()?, checkpoint.encode()?);
         assert_eq!(checkpoints[0].metadata_json, r#"{"test":true}"#);
 
         let latest = reader.load_latest_checkpoint()?;
-        assert!(latest.is_some());
-        assert_eq!(latest.unwrap(), checkpoints[0]);
-
+        assert_eq!(latest.as_ref(), Some(&checkpoints[0]));
+        let decoded = latest.expect("saved checkpoint").world_checkpoint()?;
         reader.close()?;
+
+        let mut registry = BrainRegistry::new();
+        assert_eq!(registry.register_family("mlp.baseline", Box::new(MlpBrainFamily::new()))?, brain);
+        let mut restored = WorldState::restore_checkpoint_v1(&decoded, registry)?;
+        for _ in 0..5 {
+            world.step()?;
+            restored.step()?;
+            assert_eq!(world.world_digest_v1()?, restored.world_digest_v1()?);
+        }
+        println!("CHECKPOINT_EVIDENCE: {}", json!({
+            "database": path_string,
+            "checkpoint_tick": decoded.tick().0,
+            "agents": decoded.agent_count(),
+            "continued_through_tick": restored.tick().0,
+            "final_digest": restored.world_digest_v1()?.overall,
+            "scope": "core science save/load/restore; no host-session continuation",
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_readback_rejects_corruption_without_falling_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })?;
+        let checkpoint = world.checkpoint_v1()?;
+        let path = temp_db_path("storage-checkpoint-corruption");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage = Storage::create_unattributed_file_with_thresholds(
+            &path_string, 64, 4096, 1024, 1024,
+        )?;
+        assert!(storage.record_checkpoint("", 0, &checkpoint, &json!({})).is_err());
+        assert!(storage.record_checkpoint("bad-meta", 0, &checkpoint, &Value::Null).is_err());
+        storage.record_checkpoint("older", 0, &checkpoint, &json!({}))?;
+        storage.record_checkpoint("newest", 1, &checkpoint, &json!({}))?;
         storage.close()?;
-        let _ = fs::remove_file(path);
+        let reader = StorageReader::open(&path_string)?;
+        let newest = reader.load_latest_checkpoint()?.expect("newest checkpoint");
+        assert_eq!(reader.load_checkpoints()?.len(), 2, "invalid writes insert no rows");
+        reader.close()?;
+        for (field, value) in [
+            ("format", "unknown-format"),
+            ("payload", "aabbccdd"),
+            ("payload_digest", "blake3:wrong"),
+            ("metadata_json", "null"),
+            ("metadata_json", "{"),
+            ("tick", "1"),
+        ] {
+            let mut changed = newest.clone();
+            match field {
+                "format" => changed.format = value.to_owned(),
+                "payload" => changed.payload = value.to_owned(),
+                "payload_digest" => changed.payload_digest = value.to_owned(),
+                "metadata_json" => changed.metadata_json = value.to_owned(),
+                "tick" => changed.tick = 1,
+                _ => unreachable!("fixed mutation cases"),
+            }
+            assert!(changed.world_checkpoint().is_err(), "accepted mutation of {field}");
+        }
+        // Rehashing corrupt bytes must still fail the core envelope decoder.
+        let mut rehashed = newest.clone();
+        rehashed.payload = "aabbccdd".to_owned();
+        rehashed.payload_digest = format!("blake3:{}", blake3::hash(&[0xaa, 0xbb, 0xcc, 0xdd]).to_hex());
+        assert!(rehashed.world_checkpoint().is_err());
+
+        let connection = Connection::open(&path_string)?;
+        connection.execute("UPDATE checkpoints SET payload = 'aabbccdd' WHERE checkpoint_id = 'newest'")?;
+        connection.close()?;
+        let reader = StorageReader::open(&path_string)?;
+        assert!(reader.load_latest_checkpoint().is_err(), "must not use the older valid checkpoint");
+        assert!(reader.load_checkpoints().is_err(), "must not return a partially valid collection");
+        reader.close()?;
         Ok(())
     }
 

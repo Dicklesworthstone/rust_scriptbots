@@ -3679,7 +3679,7 @@ fn run_replay_cli(
             checkpoint_id = %cp.checkpoint_id,
             tick = cp.tick,
             format = %cp.format,
-            "Discovered persisted world checkpoint in replay database"
+            "Validated core checkpoint; replay still starts at tick zero (host-session continuation unavailable)"
         );
     }
     storage.close()?;
