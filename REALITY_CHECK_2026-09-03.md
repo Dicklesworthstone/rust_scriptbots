@@ -1,4 +1,204 @@
-# Reality Check — rust_scriptbots — execution refreshed 2026-09-06
+# Reality Check — rust_scriptbots — reassessed 2026-09-11
+
+## Current assessment and bridge — 2026-09-11
+
+**The simulation is real; the complete Evolution Lab and game-grade GPU experience remain
+unfinished.** The native ownership repair has landed in source. The next work should complete
+observable user journeys on that foundation, rather than repeat the cutover or add infrastructure
+without consumers. This section supersedes the older assessments below; historical failures and
+their later fixes remain evidence, not a list of current defects.
+
+Audit source: `e46e22551e9bfccdf5f30f1c722e2b6515e2d96b`, `main`. Read all of AGENTS.md and README.md,
+the complete recovery plan, all repository plan/spec/design files found by filename, and the
+architecture guide. Older GPUI, Bevy, rendering and WASM plans preserve feature intent but do not
+override the recovery plan's ownership, persistence or evidence boundaries. The investigation
+traced production callers, checked all 675 issue records for coverage, read relevant contracts,
+and inspected retained execution artifacts. It is not a fresh execution of every crate or a
+line-by-line audit of every implementation. CASS was healthy; a checkpoint search's returned raw
+line showed unrelated manifest work, so that hit supplies no checkpoint acceptance evidence.
+
+### Answers to the five questions
+
+1. **What works?** There is an implemented evolutionary kernel, heritable brain families,
+   deterministic scenario execution, real storage, REST/MCP control, scientific readers and
+   multiple actual renderers. The ordinary native app now starts `HostThread::spawn_with_bootstrap`;
+   `ControlHandle` stores `ChannelHostPort`, as do native launch contexts. The retained five-tick
+   production CLI run reaches a matching scientific digest and explicit durable shutdown receipt.
+   These are real implementations and bounded observations, not full product acceptance.
+2. **What is missing?** Production checkpoint-start continuation, complete frontend receipt/input
+   behavior, a proven playable GPU meadow, full experiment/report/notebook composition, real
+   FrankenTUI adoption, browser scheduling/durability, and release acceptance. The default ML
+   fallback copies sensors; the scientific GPU sensing shader still only clears a saturation
+   field. Those must not be described as model inference or GPU-accelerated simulation.
+3. **What blocks completion?** Remaining integration at the owner/client/checkpoint boundaries,
+   unresolved storage latency, and actual native/PTY/browser/hardware proof. The current GPUI
+   compositor performs GPU-to-CPU readback then image upload. Bevy's admitted-ID callback does
+   not itself expose applied/durable completion. More rendering effects will not repair those
+   boundaries. The local default DSR repository profile is absent; that does not mean all
+   external DSR profiles or the fleet are unavailable.
+4. **Would all existing unfinished beads close the gap?** Before this audit, no: the documented
+   procedural-map generation/apply/editor workflow lacked a concrete owner despite a real core
+   implementation. The new map tasks close that planning hole. The expanded backlog covers the
+   identified vision, provided each acceptance contract is actually fulfilled and the final
+   composed journey passes. Ticket closure alone cannot certify this; no completion percentage
+   or delivery forecast follows from counts.
+5. **Which goals had no bead?** V26 below: production WFC map authoring. Full-record searches found
+   closed rand/brain work mentioning tilesets, but no generation/apply/editor delivery contract.
+   `bd-2z0.10.6`–`.8` now own the service, interactive sandbox and companion E2E. This is a concrete
+   coverage correction to September 6's bounded “no additional goal found” conclusion.
+
+### Vision checklist: product status, not component completion credit
+
+IDs V01–V25 preserve the earlier checklist. Each row names a testable missing outcome and its
+existing bridge owners; grouped rows retain all named features. PARTIAL can contain working
+components; UNPROVEN identifies an execution gap. No new whole-product WORKING claim is made.
+
+| Goal | Status and required observable outcome | Bridge owners |
+|---|---|---|
+| V01/V15: living meadow, scenarios and onboarding | PARTIAL: launch a nonempty, visibly evolving default world; retain disclosed seed/config and cohort viability, then complete actual native first-run controls. | `bd-2z0.10.4`, `.10.5`, `.13.3` |
+| V02/V10: sole owner and bounded observations | PARTIAL: native owner/port wiring exists; prove two observers, repaint-independent science, scheduled patch cadence, responsive reads and lifecycle behavior on actual surfaces. | `bd-pcfj`, `bd-pcfj.1`, `bd-2z0.4.11`, `bd-2z0.4.16` |
+| V03: acknowledged control | PARTIAL: preserve command identity through admitted, applied and journal states, disconnect/retry and stream catch-up; show the observed outcome in UI. | `bd-88yj`, `bd-5dkk`, `bd-g6wf`, `bd-ydu8`, `bd-2z0.12.2` |
+| V04/V05: heritable brains and honest ML | PARTIAL: MLP/DWRAON/Assembly are real; NeuroFlow remains explicit legacy selection, FtBrain needs its acceptance, and default `MlBrain::tick` is a sensor-copy STUB. Test installed family heredity and actual inference, not library availability. | `bd-2z0.3`, `bd-2z0.3.12.3`–`.6`, `bd-1bdd` |
+| V06: deterministic science | PARTIAL for full claims: preserve domain RNG/digests and prove documented knobs change their declared consumers with valid null controls; retain sensing baseline review. | `bd-dorx`, `bd-3mul`, `bd-6i23`, `bd-m30b` |
+| V07: checkpoint continuation | PARTIAL: core capture/restore exists; CLI discovers checkpoint metadata then runs from zero. Resume executable host/session at the saved tick and match subsequent stage digests. | `bd-2z0.5.13`, `bd-2z0.11.4` |
+| V08: durable reliable persistence | PARTIAL: real outbox/receipts and successful runs; retained admission/journal stalls are not causally resolved. Separate admission, application, durability, bounded controller wait and worker exit. | `bd-w1oi`, `bd-j8o2`, `bd-2z0.5.14`, `.5.17`, `.8.9.16` |
+| V09/V20: experiments, bundles and autonomous lab | PARTIAL: implemented runners/bundles need interrupted continuation, hard budget enforcement, all-arm/all-seed notebook reproduction and adversarial full-stack execution. | `bd-2z0.11.4`, `bd-16g.1.3`, `.1.7`, `bd-16g.16` |
+| V11: terminal laboratory | PARTIAL: production is Ratatui; prepared ftui dependency has no member consumer. Complete FrankenTUI, acknowledged palette, scientific screens and actual PTY lifecycle/resizes. | `bd-2z0.6.1`, `.6.5`, `.6.6`, `.6.8`, `bd-dkd9`, `bd-2z0.14.2.5` |
+| V12/V13: game-grade native graphics | PARTIAL: real GPU backends; complete resident instancing, terrain/vegetation, creatures, animation, water, lighting, effects, camera, HUD and audio in the ordinary interactive app. Hardware visuals/frame budgets remain UNPROVEN here. | `bd-2z0.7.2`–`.7.4`, `.7.7`, `.7.14`, `bd-2z0.14.1`, `bd-ogcs`, `bd-rl1h` |
+| V14: scientific inspection | PARTIAL: live UID/revision selection, actual brain edges/sensors, lineage and bounded attribution must agree across UI and science. | `bd-16g.4.4`, `.4.5`, `.3.4`, `.3.5`, `bd-r7cz`, `bd-2z0.7.15` |
+| V16/V17: reports, graphs and narrative | PARTIAL: real persistence/readers/exporters; require a whole seeded run through reports plus complete online/offline narrative input parity and usable timeline. | `bd-2z0.11.9`, `.11.6`, `bd-16g.2.9.2`, `.2.9.3`, `.2.11` |
+| V18/V19: information theory, QD, communication and islands | PARTIAL: production consumers, persisted archives/migration, topology and scaling remain; algorithm tests do not prove an experiment workflow. | `bd-xqd5`, `bd-r4ja`, `bd-16g.6`, `.7`, `bd-5tyo`, `bd-16g.5.4`, `.5.5`, `bd-brw4` |
+| V21: browser product | PARTIAL; RAF-owned stepping is WRONG_APPROACH for repaint-independent science. Require real browser scheduler, controls, packaging, durability and platform tests. | `bd-2z0.12.3`, `.12.4`, `.12.7`, `bd-ywtv`, `bd-azi3` |
+| V22: sharing, theater, tournaments and sound | PARTIAL: preserve permalink/fork/gallery, clips/encoders, ratings and live audio delivery with actual consumers and artifacts. | `bd-16g.8`, `.9`, `.12`, `.14` |
+| V23: GPU scientific sensing | STUB: `sense_wgsl.rs` assigns only `outputs[index].saturations = 0u`; a substring test does not prove numerical sensing. Require real GPU accumulation and CPU/GPU parity before adoption. | `bd-16g.15.2`, `.15.3` |
+| V24: performance | UNPROVEN at this audit source: retain exact-class CPU evidence separately; prove 60 TPS at 1k, snapshot p95 budgets, 10k scaling and native 60/30 FPS targets on their declared classes. | `bd-h33`, `bd-kuho`, `bd-2z0.14.1.12`, `.14.3.5.3` |
+| V25: reproducible release | PARTIAL: require compatible source-bound journey evidence, independent bundle reproduction, real product/platform matrix and verified distributed artifacts. No current published-release check was performed here. | `bd-build-farm-reliability-lb19.2`, `bd-1bdd`, `bd-2z0.13.9`, `.13.11` |
+| V26: procedural map authoring | PARTIAL, previously NO_BEAD: core rule-based generation and apply exist; no application caller. Native editor/sample-mode delivery is not established. Temperature bytes alone do not prove a runtime consumer. | New `bd-2z0.10.6`, `.10.7`, `.10.8` |
+
+### Ordered bridge and granular next actions
+
+- [ ] **Finish the native contract, do not redo ownership (P0, medium/large).** Under the existing
+  host/control/frontend beads, exercise ordinary startup, two observers, pause/step/resume,
+  selection, receipt lookup and graceful close. Verify exact owner tick/revision and schedule
+  application before/after bootstrap. Preserve all frontends and typed storage failures.
+- [ ] **Make experiments resumable (P1, large; `bd-2z0.5.13`).** Use current HostCore, persist the
+  complete executable checkpoint/session, and wire CLI restore. Include schedule cursor,
+  pending commands and durable tail. Test checkpoints immediately before/after a scheduled patch;
+  corruption, foreign adapters and duplicate application must fail. This is BR-ready and a major
+  return on already-implemented core machinery; it need not wait for complete visual polish.
+- [ ] **Deliver one playable GPU scene (P1, large integration; `bd-2z0.14.1.21`).** Follow its
+  actual prerequisites: Bevy host contract, instancing, interpolation and look-development.
+  Show 1k living agents, shoreline/terrain, legible creatures, light/contact depth, event cues,
+  inspection and seam-follow in the ordinary app. Reuse scene/capture machinery and resident
+  buffers; record actual adapter/frame observations. Advanced water, vegetation, full animation,
+  post, audio and HUD remain in their original owners, not silently dropped by this milestone.
+- [ ] **Repair persistent-run stalls causally (P1, investigation).** Use the exact retained
+  seeds/hosts and original budgets for `bd-w1oi`/`bd-j8o2`. Separate successful HTTP polling from
+  scientific progress, application, durability and shutdown. Keep bounded reaping and preparation
+  work with `.5.14`/`.5.17`; do not certify repair from a different seed's successful run.
+- [ ] **Connect the scientific payoff (P1/P2, medium/large joins).** Feed actual persisted runs
+  into comparisons, all-seed notebooks, narrative and reports. Assert planted effects and genuine
+  nulls, row/capture accounting, online/offline identity and independent bundle reproduction.
+  Existing report/timeline/lab/archipelago owners retain their full features and budgets.
+- [ ] **Wire map generation, then its editor (P2/P3).** `.10.6` connects the existing generator
+  to bounded CLI/REST/MCP and HostCore application; `.10.7` adds rule/sample authoring, preview,
+  constraints, undo and import/export; `.10.8` supplies real-process and native evidence.
+  Keep expensive generation outside ticks, distinguish wall-clock provenance from canonical
+  science, prove static revisions and the temperature consumer, and reject stale applies atomically.
+- [ ] **Complete terminal/browser and broader creative programs (existing priorities).** Use the
+  V11/V18–V22 owners; keep real PTY/browser execution separate from buffers/WASM compilation.
+  Browser paint frequency must not become the science clock. No framework migration merely to
+  declare a dependency adopted; finish the user-facing behavior required by each existing task.
+- [ ] **Final acceptance and release (large integration).** `.13.9` → `.13.11` joins scenario,
+  controls, inspection, durable run, checkpoint continuation, comparison/report and bundle at one
+  compatible source. Add map evidence where the supported matrix claims it. Require actual
+  GPU/PTY/browser cells, causal failure tests and exact-class performance; missing cells refuse
+  completion. `bd-1bdd` reconciles documentation and release assets without declaring them shipped.
+
+### Evidence boundary and execution attempt
+
+- Rechecked retained RCH logs in `/data/tmp/scriptbots-bevy-window-20260911/`: 226 Bevy tests
+  passed, none failed/ignored/filtered, plus workspace all-target check and strict Clippy finished.
+  Bevy source SHA256 is `f5c4e64b2991572ee5e26e63aca16b9d554ee5beecbf907bd921593d43d610ad`,
+  matching the preceding implementation record. These are diagnostic runs from the preceding
+  work, not fresh DSR acceptance, hardware pixels or a full workspace test run.
+- Rechecked the retained actual CLI artifact under
+  `/data/tmp/scriptbots-scheduled-owner-20260910-0415/actual-cli-0445`: two bootstrap plus three
+  later ticks, 16 agents, digest `e141d508bcaa8bcb`; stderr reports host join and all three batch
+  watermarks at 5 with `Durable`. The visual artifact explicitly says `ratatui_test_backend`.
+  This proves neither a real PTY nor births/deaths in that short fixture (both counts are zero).
+- A fresh local executable search found no `target/debug` directory. `dsr repos list --json`
+  failed because `/home/ubuntu/.config/dsr/repos.yaml` is missing. No new product/build/native
+  execution was launched for this audit. Existing external DSR profiles may still be usable;
+  the failed local discovery is not a fleet-wide diagnosis. Current GPU/PTY/browser/performance
+  acceptance remains unexecuted here, rather than receiving an invented pass.
+- Keyword and Rust AST scans both found five `unimplemented!` sites in tests. Behavioral
+  inspection found the ML and WGSL stubs above despite their normal function bodies. Repository
+  searches with guessed filenames initially failed; corrected module/caller searches supplied
+  the cited findings. No failure output was treated as an empty successful search.
+
+### Skill phases, refinement and anti-ceremony accounting
+
+Phase 1 is the vision/source/evidence cross-check above; phase 2 is the ordered bridge.
+Phase 3a used the unchanged frozen operator below: retain existing owners and add only the
+uncovered map workflow. Three ambition passes strengthened that bridge: (1) require the complete
+interactive laboratory journey rather than another owner helper; (2) add bounded failure,
+generation cancellation, schedule continuation and independent reproduction to the joins;
+(3) make GPU improvements science-neutral with same-state visual comparisons and real hardware
+observations, while keeping scientific GPU sensing a separate numerical program. Phase 3a was
+reapplied to the same map contracts and checkpoint owner; no duplicate visual epic was created.
+
+Five refinement passes used the unchanged frozen operator below:
+
+1. **Coverage:** found and assigned the WFC production/editor gap; kept existing GPU, science,
+   browser, terminal and release owners instead of duplicating them.
+2. **Dependencies:** `.10.7` depends on `.10.6`; `.10.8` depends on both. The API relation to
+   `.12.2` is coordination, not a block on the entire experiment API. Implementation does not
+   depend back on its acceptance task. The scenario parent now derives its child inventory
+   instead of incorrectly requiring “four direct children.” Service acceptance explicitly runs
+   its Stage A/B tests during implementation, without waiting for the later editor proof closure.
+3. **Discrimination:** required changed-input/no-apply controls, a disconnected apply seam,
+   real transports, native input and distinct content-versus-timestamp identity; metadata,
+   helper construction and synthetic captures cannot satisfy these tasks.
+4. **Consumer/claim consistency:** core map application does not consume its temperature field;
+   added an explicit consumer-or-refusal obligation. Corrected architecture's stale SharedWorld
+   account and README's missing `neuro` option, without promoting unfinished acceptance.
+5. **Bounded convergence:** reread these revised contracts, source joins and dependency directions;
+   no further change to this bridge was warranted. This does not mean every issue or line of
+   code is defect-free. Final BR/BV validation found no cycles: 678 issues, 477 closed,
+   186 open, 14 in progress and 1 blocked. BR authorizes 62 ready claims; BV reports 93
+   graph-actionable issues. `bd-2z0.5.13` is BR-ready. BV's top-ranked old macOS/exFAT incident
+   is not evidence that this Linux checkout's toolchain is broken. No implementation item closed.
+
+Process worksheet: this is PROCESS, not runtime feature work. Consumer/gate: the user's explicit
+request for a comprehensive reality check. Observed defects: stale ownership guidance and an
+unowned map workflow. Retirement: this section ceases to be current guidance when its source or
+bridge is superseded; preserve history under the no-deletion rule. No integrity exception needed.
+Opportunity cost: checkpoint continuation and native interaction offer more direct value than
+another audit; return to those after this bounded requested assessment.
+
+Real-work worksheet, last eight commits through `e46e225`: USER `68385bb` (window-specific
+selection fix); PROCESS `e46e225`, `88ce9d9`, `ae5ce16`, `63408fb`, `3cb5054`, `db43075`
+(comment-only test change), `9c71a25`. Tally: 1 USER, 0 ENABLER, 7 PROCESS, 0 UNKNOWN. This is
+**DRIFTING** at that commit window, not a whole-project verdict. Omitting those tracker commits
+would leave the same executable behavior. The user-visible fix could be demonstrated as
+window-scoped selection, but no native demo was executed here. Checkpoint replay is a longstanding
+user-facing open task; this window followed a narrow interaction fix and its evidence recording.
+No swarm throughput or independent review claim is made. Correction: consolidate future evidence
+updates and spend the next implementation block on a complete interaction or checkpoint slice.
+
+Honesty inventory, this audit only: items 1–6 and 11–12: no (checked the audit diff: docs and BR
+changes only, no tests, gates, goldens, implementation or closures). Items 7–10: no (checked cited
+commands and retained raw logs; historical runs are labeled retained, failed discovery and lack
+of fresh execution are disclosed). Items 13–17: not applicable, no delegation this audit.
+Item 18: no (the last-eight-commit window and complete issue inventory are stated, not product
+completion ratios). Item 19: lengthy document reading and failed filename/CASS probes consumed
+time; they are not hidden execution proof. Item 20: the strongest new finding is reproducible
+from the actual generator/apply definitions, absence of app callers and the pre-change issue
+inventory. Disposition: no audit test/gate weakening or false closure found; stale documentation
+was corrected, missing coverage was assigned, and evidence remains qualified. Historical session
+honesty was not comprehensively certified by the unsuccessful CASS follow-up.
+
 
 ## Active implementation TODO — production host cutover, 2026-09-06
 
