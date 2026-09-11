@@ -16,7 +16,8 @@ use bevy::core_pipeline::prepass::{DepthPrepass, NormalPrepass};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::NonSendMut;
-use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
+use bevy::input::ButtonState;
+use bevy::input::mouse::{MouseButtonInput, MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::light::{
     CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap,
     EnvironmentMapLight, LightProbe,
@@ -4992,6 +4993,55 @@ mod quality_tier_consumer_tests {
         );
     }
 
+    #[test]
+    fn selection_clicks_belong_to_the_event_window_and_are_fully_consumed() {
+        let primary = Entity::from_raw_u32(1).unwrap();
+        let secondary = Entity::from_raw_u32(2).unwrap();
+        let press = MouseButtonInput {
+            button: MouseButton::Left,
+            state: ButtonState::Pressed,
+            window: secondary,
+        };
+        assert!(!window_received_selection_click(
+            [press].into_iter(),
+            Some(primary)
+        ));
+        assert!(window_received_selection_click(
+            [press].into_iter(),
+            Some(secondary)
+        ));
+        for event in [
+            MouseButtonInput {
+                state: ButtonState::Released,
+                ..press
+            },
+            MouseButtonInput {
+                button: MouseButton::Right,
+                ..press
+            },
+        ] {
+            assert!(!window_received_selection_click(
+                [event].into_iter(),
+                Some(secondary)
+            ));
+        }
+        for target in [Some(secondary), None] {
+            let mut events = [press, press].into_iter();
+            assert_eq!(
+                window_received_selection_click(events.by_ref(), target),
+                target.is_some()
+            );
+            assert!(
+                events.next().is_none(),
+                "no event may leak into the next frame"
+            );
+        }
+        assert!(!window_received_selection_click(
+            std::iter::empty(),
+            Some(secondary)
+        ));
+    }
+
     /// A camera that renders off-screen has no pointer window at all.
     ///
     /// The positive control is the test above: these same inputs DO resolve for
@@ -6031,8 +6081,24 @@ fn camera_target_window(target: &RenderTarget, primary: Option<Entity>) -> Optio
     }
 }
 
+fn window_received_selection_click(
+    events: impl Iterator<Item = MouseButtonInput>,
+    target_window: Option<Entity>,
+) -> bool {
+    // Consume the entire frame even after a match, or when no camera exists:
+    // an unread click must not become a selection after a later window change.
+    events
+        .filter(|event| {
+            Some(event.window) == target_window
+                && event.button == MouseButton::Left
+                && event.state == ButtonState::Pressed
+        })
+        .count()
+        != 0
+}
+
 fn handle_selection_input(
-    (buttons, keys): (Res<ButtonInput<MouseButton>>, Res<ButtonInput<KeyCode>>),
+    (mut mouse_buttons, keys): (MessageReader<MouseButtonInput>, Res<ButtonInput<KeyCode>>),
     windows: Query<&Window>,
     primary_window: Query<Entity, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<PrimaryCamera>>,
@@ -6044,6 +6110,11 @@ fn handle_selection_input(
     submitter: Option<Res<CommandSubmitter>>,
     mut rig: ResMut<CameraRig>,
 ) {
+    let camera_state = camera_query.single().ok();
+    let target_window = camera_state
+        .and_then(|(camera, _)| camera_target_window(&camera.target, primary_window.single().ok()));
+    let selection_clicked =
+        window_received_selection_click(mouse_buttons.read().copied(), target_window);
     let Some(submitter) = submitter else {
         return;
     };
@@ -6063,7 +6134,7 @@ fn handle_selection_input(
         return;
     }
 
-    if !buttons.just_pressed(MouseButton::Left) {
+    if !selection_clicked {
         return;
     }
 
@@ -6072,7 +6143,7 @@ fn handle_selection_input(
         None => return,
     };
 
-    let Ok((camera, transform)) = camera_query.single() else {
+    let Some((camera, transform)) = camera_state else {
         return;
     };
 
@@ -6080,8 +6151,7 @@ fn handle_selection_input(
     // whichever window happens to hold `PrimaryWindow` (bd-2z0.7.14). The camera
     // is resolved FIRST because it is what names the window; doing it the other
     // way round is what let the two drift apart.
-    let Some(target_window) = camera_target_window(&camera.target, primary_window.single().ok())
-    else {
+    let Some(target_window) = target_window else {
         return;
     };
     let Some(cursor_pos) = windows
