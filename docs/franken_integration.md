@@ -10,9 +10,10 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 
 | Library | Door | Pin | Feature gate | Status |
 |---|---|---|---|---|
-| `fsqlite` (frankensqlite) 0.1.16 | direct (`scriptbots-storage`) | git rev `e536d7f8ca102b3eb5236bef48514582379f9346` — guard: `ci/check_fsqlite_pin.sh` | `default-features=false, features=["native"]` (extensions JSON/FTS5/R-tree still compile in transitively) | **in production** — sole embedded DB; V6 run-scoped base + V7 canonical host archive; code-first V8/V9 projections await centralized DSR proof |
-| `asupersync` 0.3.9 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite | crates.io exact `=0.3.9` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | production native ingress/lifecycle plus bounded legacy-app command ingress |
-| `franken-kernel` / `-evidence` / `-decision` 0.3.x | transitive | crates.io | n/a | in tree via fsqlite |
+| `fsqlite` (frankensqlite) 0.4.0 | direct (`scriptbots-storage`) | git rev `a855a15399a1994943c81e15f284bed780b4f86b` — guard: `ci/check_fsqlite_pin.sh` | defaults disabled; `native,json,fts5,icu,misc,rtree` preserve previous implicit extensions | sole embedded DB; dependency migration native/DSR validation pending; existing V8/V9 proof debt remains |
+| `asupersync` 0.5.0 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite/FastMCP | crates.io exact `=0.5.0` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | native ingress/lifecycle plus bounded legacy-app command ingress; migration validation pending |
+| `franken-kernel` / `-evidence` / `-decision` 0.5.0 | transitive | crates.io | n/a | in tree via fsqlite/asupersync |
+| `fastmcp-rust` 0.9.0 | direct (`scriptbots-app`) | git rev `180a7c88890705217bb8e202d19555adabf24187` | existing default features; custom MCP HTTP dispatch remains legacy 2024 | shares Asupersync 0.5; native protocol/lifecycle validation pending |
 | `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` (`ft-api`, `ft-core`, `ft-kernel-cpu`, `ft-nn`, `ft-optim`) | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | code-first FtBrain implemented; bd-2z0.3.12.3 compile/determinism/benchmark proof pending |
 | everything else (ftui, fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
 
@@ -74,7 +75,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 
 | Library | crates.io? | Toolchain | wasm32 | License |
 |---|---|---|---|---|
-| asupersync | yes (0.3.9 in lock) | stable subset exists; nightly default | **yes** (BrowserRuntime, incl. deterministic profile) | MIT+Rider |
+| asupersync | yes (0.5.0 selected) | stable subset exists; nightly default | **yes** (BrowserRuntime, incl. deterministic profile; migration gate pending) | MIT+Rider |
 | fsqlite | git-pin only | MSRV 1.85 | experimental upstream | MIT+Rider |
 | ftui family | yes (0.5.0) + git rev for lifecycle fix | stable-ish | yes (ftui-web) | MIT+Rider |
 | fnx-classes/-algorithms | **yes 0.2.0 — git repo unusable** (absolute `/dp/frankentui` path dep) | stable-ish | **no** (rayon) | MIT+Rider |
@@ -107,7 +108,7 @@ release-packaging obligation: bd-2z0.13.6).
    Frontends use `AnalyticsSnapshotProvider::snapshot()`. Offline/reporting
    callers that can wait use the create-free, read-only `StorageReader`, whose
    execution is explicitly unbounded (bd-91lr).
-6. **One asupersync universe** — a single 0.3.x in the lock, shared by
+6. **One asupersync universe** — a single 0.5.0 in the lock, shared by
    fsqlite/fastmcp/first-party (`ci/check_asupersync_universe.sh`).
 7. **wasm graph is denylisted + snapshotted** (`ci/check_wasm_graph.sh`):
    no rayon/wide/tokio/rusqlite/franken numeric crates in `scriptbots-web`.

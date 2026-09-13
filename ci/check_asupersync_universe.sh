@@ -5,7 +5,7 @@
 # consumer boundaries. Three consumers of asupersync converge in this
 # workspace: fsqlite (pinned git dep), fastmcp_rust, and our own direct
 # dependencies (scriptbots-runtime, scriptbots-app, and scriptbots-storage;
-# workspace pin is exact =0.3.9). Cargo unifies caret-compatible 0.3.x into
+# workspace pin is exact =0.5.0). Cargo unifies caret-compatible 0.5.x into
 # ONE compiled crate — which is required, because a Cx built by our runtime
 # must be THE SAME TYPE as the Cx fsqlite's AsyncConnection methods take.
 # Two entries in the lock = two type universes = compile errors at best,
@@ -13,12 +13,12 @@
 #
 # Failure directions caught:
 #   1. Split universe: >1 lock entry for the crate (different versions or split sources).
-#   2. Consumer requirement conflict: one or more consumers declare an incompatible semver range.
+#   2. Consumer requirement conflict: an enabled dependency edge has an incompatible semver range.
 #   3. Family discrepancy: members of a crate family (e.g. ftui-*) do not share one uniform release version.
 #   4. Enumerates every consumer and declared requirement on both pass and fail for auditable forensics.
 #
 # Fix playbook (in order):
-#   a. Keep the first-party exact pin (=0.3.9). Coordinate any version advancement with
+#   a. Keep the first-party exact pin (=0.5.0). Coordinate any version advancement with
 #      every boundary consumer through the serialized bd-2z0.8 dependency lane.
 #   b. If two consumers declare incompatible ranges, escalate to that lane;
 #      do not widen ad hoc, vendor, or rename around the type split.
@@ -73,27 +73,82 @@ def satisfies_req(ver_str, req_str):
         return target <= ver < upper
     return satisfies_req(ver_str, '^' + req_str)
 
-if source == "cargo":
-    try:
-        raw = subprocess.check_output(['cargo', 'metadata', '--format-version', '1', '--locked'], stderr=subprocess.DEVNULL)
-        meta = json.loads(raw)
-    except Exception as e:
-        print(f"  note: cargo metadata unavailable: {e}")
-        sys.exit(0)
-else:
-    with open(source, 'r') as f:
-        meta = json.load(f)
+def load_metadata(command):
+    # Preserve Cargo stderr and fail closed if the graph cannot be obtained.
+    return json.loads(subprocess.check_output(command, text=True))
 
-consumers = []
-for pkg in meta.get('packages', []):
-    for dep in pkg.get('dependencies', []):
-        if dep.get('name') == crate:
+def consumer_rows(meta, declaration_fixture=False):
+    packages = meta['packages']
+    if declaration_fixture:
+        nodes = None
+    else:
+        nodes = {node['id']: node for node in meta['resolve']['nodes']}
+    targets = {pkg['id'] for pkg in packages if pkg['name'] == crate and 'id' in pkg}
+    rows = []
+    for pkg in packages:
+        for dep in pkg.get('dependencies', []):
+            if dep.get('name') != crate:
+                continue
+            if nodes is not None:
+                node = nodes.get(pkg['id'])
+                edge_name = (dep.get('rename') or dep['name']).replace('-', '_')
+                active = node is not None and any(
+                    edge['pkg'] in targets and edge['name'] == edge_name
+                    and any(kind.get('kind') == dep.get('kind')
+                            and kind.get('target') == dep.get('target')
+                            for kind in edge['dep_kinds'])
+                    for edge in node['deps']
+                )
+                if not active:
+                    print(f"    inactive declaration: {pkg['name']} requires {dep['req']}")
+                    continue
             req = dep.get('req', '*')
-            sat = satisfies_req(resolved_ver, req)
-            consumers.append((pkg.get('name'), pkg.get('version'), req, sat))
+            rows.append((pkg['name'], pkg['version'], req, satisfies_req(resolved_ver, req)))
+    return rows
+
+if source == 'self-test':
+    target = {'id': 'runtime', 'name': crate, 'version': resolved_ver, 'dependencies': []}
+    consumer = {'id': 'consumer', 'name': 'consumer', 'version': '1.0.0',
+                'dependencies': [{'name': crate, 'req': '^0.3.4', 'optional': True}]}
+    node = {'id': 'consumer', 'deps': []}
+    meta = {'packages': [target, consumer], 'resolve': {'nodes': [node]}}
+    assert consumer_rows(meta) == [], 'inactive optional declaration is not a type edge'
+    node['deps'].append({'name': crate, 'pkg': 'runtime',
+                         'dep_kinds': [{'kind': None, 'target': None}]})
+    assert consumer_rows(meta)[0][3] is False, 'active conflicting edge must fail'
+    consumer['dependencies'][0]['req'] = '=0.5.0'
+    assert consumer_rows(meta)[0][3] is True, 'active compatible edge must pass'
+    consumer['dependencies'].append({'name': crate, 'req': '^0.3.4', 'kind': 'dev'})
+    assert len(consumer_rows(meta)) == 1, 'inactive dev edge must not alias a normal edge'
+    try:
+        consumer_rows({'packages': [consumer]})
+    except KeyError:
+        pass
+    else:
+        raise AssertionError('live metadata without resolve must fail')
+    print('  PASS: active/inactive edges, dependency kinds and missing graph')
+    sys.exit(0)
+
+try:
+    if source == 'cargo':
+        meta = load_metadata(['cargo', 'metadata', '--format-version', '1', '--locked'])
+        consumers = consumer_rows(meta)
+    elif source == 'self-test-failing-metadata':
+        meta = load_metadata(['sh', '-c', 'echo intentional-metadata-failure >&2; exit 101'])
+        consumers = consumer_rows(meta)
+    elif source.startswith('fixture:'):
+        print('  declaration-only historical fixture; not a resolved-graph proof')
+        with open(source.removeprefix('fixture:')) as fixture:
+            consumers = consumer_rows(json.load(fixture), declaration_fixture=True)
+    else:
+        with open(source) as receipt:
+            consumers = consumer_rows(json.load(receipt))
+except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+    print(f'::error::consumer metadata unavailable or invalid: {error}', file=sys.stderr)
+    sys.exit(1)
 
 if not consumers:
-    print(f"  no consumers declaring explicit dependency on {crate}")
+    print(f"  no enabled consumer edges for {crate}")
     sys.exit(0)
 
 print(f"  consumers and declared requirements ({len(consumers)} total):")
@@ -158,7 +213,7 @@ check_crate() {
 Remediation (bd-2z0.8.17 / bd-2d25 playbook):
   1. Run: cargo tree --locked -i $crate   (or cargo tree --locked -i $crate@<ver>)
      to inspect the dependency chains forcing each distinct entry.
-  2. Preserve the first-party exact pin (=0.3.9) and coordinate any advancement across
+  2. Preserve the first-party exact pin (=0.5.0) and coordinate any advancement across
      all consumers through the serialized bd-2z0.8 dependency lane.
   3. If consumer ranges are irreconcilable, escalate to that lane — never
      widen ad hoc, vendor, or rename around the type split.
@@ -196,7 +251,7 @@ check_family_prefix() {
 
   echo "== family check: ${prefix}* =="
   if [[ -z "$pairs" ]]; then
-    echo "  not present in lock (prepared, not yet adopted in workspace: policy =0.5.0)"
+    echo "  no ${prefix}* family members are present in the lock"
     return 0
   fi
 
@@ -260,18 +315,28 @@ self_test() {
   echo "  PASS (correctly caught split family versions)"
 
   echo "== self-test 6: valid consumer metadata requirements must PASS =="
-  evaluate_consumer_requirements "asupersync" "0.3.9" "$FIXTURES_DIR/fixture_valid_metadata.json" >/dev/null 2>&1 || {
+  evaluate_consumer_requirements "asupersync" "0.3.9" "fixture:$FIXTURES_DIR/fixture_valid_metadata.json" >/dev/null 2>&1 || {
     echo "::error::self-test FAILED — valid consumer requirements rejected"
     return 1
   }
   echo "  PASS"
 
   echo "== self-test 7: conflicting consumer metadata requirements must FAIL =="
-  if evaluate_consumer_requirements "asupersync" "0.3.9" "$FIXTURES_DIR/fixture_conflicting_metadata.json" >/dev/null 2>&1; then
+  if evaluate_consumer_requirements "asupersync" "0.3.9" "fixture:$FIXTURES_DIR/fixture_conflicting_metadata.json" >/dev/null 2>&1; then
     echo "::error::self-test FAILED — conflicting consumer requirements was not rejected"
     return 1
   fi
   echo "  PASS (correctly caught incompatible consumer requirements)"
+
+  echo "== self-test 8: resolved edges and fail-closed metadata =="
+  evaluate_consumer_requirements "asupersync" "0.5.0" "self-test" || return 1
+
+  echo "== self-test 9: metadata subprocess failure must fail the checker =="
+  if evaluate_consumer_requirements "asupersync" "0.5.0" "self-test-failing-metadata"; then
+    echo "::error::self-test FAILED — unavailable metadata was accepted"
+    return 1
+  fi
+  echo "  PASS (metadata exit 101 is a checker failure)"
 
   echo "=== ALL SELF-TESTS PASSED ==="
   return 0
