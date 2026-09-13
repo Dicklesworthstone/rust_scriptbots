@@ -34,8 +34,8 @@ fn refusal_is_typed_and_records_the_exact_pin() {
         } => {
             assert_eq!(operation, "async_read_lane.open");
             assert_eq!(requested, Duration::from_millis(17));
-            assert_eq!(engine_version, "=0.1.16");
-            assert_eq!(engine_revision, "e536d7f8ca102b3eb5236bef48514582379f9346");
+            assert_eq!(engine_version, "=0.4.0");
+            assert_eq!(engine_revision, "a855a15399a1994943c81e15f284bed780b4f86b");
         }
         other => panic!("expected typed hard-bound refusal, got {other:?}"),
     }

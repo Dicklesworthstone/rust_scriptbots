@@ -2107,6 +2107,12 @@ async fn prepare_mcp_server(
     );
 
     let server = Arc::new(builder.build());
+    let context_runtime = Arc::new(
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .enable_platform_reactor(false)
+            .build()
+            .context("failed to build the MCP request-context runtime")?,
+    );
     let session = Arc::new(Mutex::new(Session::new(
         server.info().clone(),
         server.capabilities().clone(),
@@ -2134,6 +2140,7 @@ async fn prepare_mcp_server(
         .route("/health", get(handle_mcp_http_health))
         .with_state(McpHttpState {
             server,
+            context_runtime,
             session,
             notification_sender,
             request_sender,
@@ -2349,14 +2356,27 @@ fn register_tool(
 }
 
 /// Shared per-process MCP HTTP state: one negotiated session guarded by
-/// `dispatch_request_concurrent`, which releases the session mutex for
-/// read-only tool calls so parallel `tools/call` probes stay concurrent.
+/// `dispatch_request_concurrent`. FastMCP retains the session mutex while a
+/// handler runs because tool annotations do not guarantee mutation safety.
 #[derive(Clone)]
 struct McpHttpState {
     server: Arc<Server>,
+    // Owns the authority used by synchronous legacy dispatch. This runtime is
+    // not driven as a background executor; registered control tools perform
+    // synchronous calls through ControlHandle and do not spawn Asupersync tasks.
+    context_runtime: Arc<asupersync::runtime::Runtime>,
     session: Arc<Mutex<Session>>,
     notification_sender: NotificationSender,
     request_sender: RequestSender,
+}
+
+impl McpHttpState {
+    fn request_cx(&self) -> Cx {
+        Cx::current().unwrap_or_else(|| {
+            self.context_runtime
+                .request_cx_with_budget(asupersync::types::Budget::INFINITE)
+        })
+    }
 }
 
 /// Dispatch one JSON-RPC request through the real fastmcp router.
@@ -2371,7 +2391,7 @@ async fn handle_mcp_http_request(
 ) -> Response {
     let method = request.method.clone();
     let id = request.id.clone();
-    let cx = Cx::for_request();
+    let cx = state.request_cx();
     match state.server.dispatch_request_concurrent(
         &cx,
         &state.session,
@@ -3123,6 +3143,117 @@ mod tests {
         assert!(message.get("result").is_none(), "{message}");
 
         runtime.shutdown().expect("MCP shutdown");
+    }
+
+    fn mcp_context_test_runtime() -> Arc<asupersync::runtime::Runtime> {
+        Arc::new(
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .enable_time()
+                .enable_platform_reactor(false)
+                .build()
+                .expect("MCP context runtime"),
+        )
+    }
+
+    #[test]
+    fn mcp_request_context_preserves_restrictions_cancellation_and_legacy_dispatch() {
+        use asupersync::cx::cap::None as NoCaps;
+        use asupersync::types::{Budget, CancelKind};
+
+        let runtime = mcp_context_test_runtime();
+        let (handle, _receiver) = handle();
+        let server = Arc::new(
+            register_control_tools(
+                fastmcp_rust::ServerBuilder::new("context-test", "0"),
+                handle,
+            )
+            .build(),
+        );
+        let state = McpHttpState {
+            session: Arc::new(Mutex::new(Session::new(
+                server.info().clone(),
+                server.capabilities().clone(),
+            ))),
+            server,
+            context_runtime: Arc::clone(&runtime),
+            notification_sender: Arc::new(|_| {}),
+            request_sender: RequestSender::new(
+                Arc::new(PendingRequests::new()),
+                Arc::new(|_| Err("no outbound HTTP request channel".into())),
+            ),
+        };
+        assert!(
+            Cx::current().is_none(),
+            "test begins outside a native context"
+        );
+        let request = state.request_cx();
+        request.checkpoint().expect("owned-runtime request context");
+        assert!(request.capabilities().spawn);
+        assert!(Cx::current().is_none());
+        let dispatch = |cx: &Cx, request: Value| {
+            state
+                .server
+                .dispatch_request_concurrent(
+                    cx,
+                    &state.session,
+                    serde_json::from_value(request).expect("JSON-RPC input"),
+                    &state.notification_sender,
+                    &state.request_sender,
+                )
+                .expect("JSON-RPC response")
+        };
+        for version in ["2024-11-05", "2099-01-01"] {
+            let response = dispatch(
+                &request,
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": version, "capabilities": {},
+                        "clientInfo": {"name": "context-test", "version": "0"}}
+                }),
+            );
+            let response = serde_json::to_value(response).expect("response JSON");
+            assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        }
+        let owner = runtime.request_cx_with_budget(Budget::INFINITE);
+        let owner_guard = Cx::set_current(Some(owner.clone()));
+        {
+            let _restriction = owner.restrict::<NoCaps>().set_current_restricted();
+            let inherited = Cx::current().expect("restricted caller");
+            let request = state.request_cx();
+            assert_eq!(request.task_id(), inherited.task_id());
+            assert_eq!(request.budget(), inherited.budget());
+            assert_eq!(request.capabilities(), inherited.capabilities());
+            assert!(request.timer_driver().is_none());
+            assert!(matches!(
+                request.spawn(|_| async {}),
+                Err(asupersync::runtime::SpawnError::RuntimeUnavailable)
+            ));
+            let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "list_presets", "arguments": {}}});
+            let response =
+                serde_json::to_value(dispatch(&request, call.clone())).expect("tool response JSON");
+            assert!(response.get("error").is_none(), "{response}");
+            assert!(response["result"]["content"][0]["text"].as_str().is_some());
+            inherited.cancel_with(CancelKind::User, Some("cancel MCP request"));
+            assert!(request.checkpoint().is_err());
+            let response =
+                serde_json::to_value(dispatch(&request, call)).expect("cancelled response JSON");
+            assert!(response.get("error").is_some(), "{response}");
+            assert!(response.get("result").is_none(), "{response}");
+            assert_eq!(
+                Cx::current().expect("caller restored").capabilities(),
+                inherited.capabilities()
+            );
+        }
+        assert_eq!(
+            Cx::current().expect("owner restored").capabilities(),
+            owner.capabilities()
+        );
+        drop(owner_guard);
+        assert!(
+            Cx::current().is_none(),
+            "MCP test restores the entry context"
+        );
     }
 
     #[tokio::test]

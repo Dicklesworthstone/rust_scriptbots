@@ -772,6 +772,71 @@ fn frankensqlite_in_memory_matches_scriptbots_storage_workload() {
 }
 
 #[test]
+fn frankensqlite_restricted_native_operation_preserves_sql_and_cancellation() {
+    use asupersync::Cx;
+    use asupersync::cx::cap::None as NoCaps;
+    use asupersync::runtime::{RuntimeBuilder, SpawnError};
+    use asupersync::types::{Budget, CancelKind};
+
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_time()
+        .enable_platform_reactor(false)
+        .build()
+        .expect("caller-owned runtime");
+    let owner = runtime.request_cx_with_budget(Budget::INFINITE);
+    let _owner_guard = Cx::set_current(Some(owner.clone()));
+    let connection = Connection::open(":memory:").expect("owner-confined connection");
+    connection
+        .execute("CREATE TABLE migration_probe (value INTEGER)")
+        .expect("real probe schema");
+    {
+        let _restriction = owner.restrict::<NoCaps>().set_current_restricted();
+        let caller = Cx::current().expect("restricted native caller");
+        assert!(!caller.capabilities().spawn);
+        assert!(!caller.capabilities().io);
+        assert!(!caller.capabilities().time);
+        assert!(caller.timer_driver().is_none());
+        assert!(matches!(
+            caller.spawn(|_| async {}),
+            Err(SpawnError::RuntimeUnavailable)
+        ));
+        let operation = connection.root_cx().create_child();
+        operation.set_native_cx(caller.clone());
+        let _operation_guard = connection.bind_operation_cx(&operation);
+        connection
+            .execute("INSERT INTO migration_probe VALUES (42)")
+            .expect("restricted operation uses the already-owned connection");
+        let rows = connection
+            .query("SELECT value FROM migration_probe")
+            .expect("restricted operation reads its inserted row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64>(0).expect("integer result"), 42);
+        caller.cancel_with(CancelKind::User, Some("cancel SQL operation"));
+        assert!(matches!(
+            connection.execute("INSERT INTO migration_probe VALUES (99)"),
+            Err(fsqlite::FrankenError::Abort)
+        ));
+        assert_eq!(
+            Cx::current().expect("caller retained").capabilities(),
+            caller.capabilities()
+        );
+        assert_eq!(caller.budget(), owner.budget());
+    }
+    let rows = connection
+        .query("SELECT value FROM migration_probe")
+        .expect("dropping operation binding restores the uncancelled connection root");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i64>(0).expect("committed integer"), 42);
+    assert_eq!(
+        Cx::current().expect("owner restored").capabilities(),
+        owner.capabilities()
+    );
+    connection
+        .close()
+        .expect("close on the connection-owning thread");
+}
+
+#[test]
 fn frankensqlite_file_backed_round_trips_scriptbots_storage_workload() {
     let path = file_backed_test_path();
     let path = path

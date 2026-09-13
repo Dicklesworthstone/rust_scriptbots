@@ -393,8 +393,8 @@ mod asupersync_runner {
     }
 
     impl ActiveCxGuard {
-        fn install(state: Arc<NativeControlState>, cx: &Cx) -> Self {
-            *state.active_cx() = Some(cx.clone());
+        fn install(state: Arc<NativeControlState>, cancel_target: Option<&Cx>) -> Self {
+            *state.active_cx() = cancel_target.cloned();
             Self { state }
         }
     }
@@ -924,11 +924,20 @@ mod asupersync_runner {
                 return result;
             }
             self.metrics.runtime_runs = self.metrics.runtime_runs.saturating_add(1);
+            // Runtime entry installs its own root context. Preserve an existing
+            // caller's identity, budget, cancellation and runtime restrictions
+            // for every poll, then restore the runtime context on suspension.
+            let caller = Cx::current();
+            let owns_context = caller.is_none();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.block_on(async {
+                let mut run = Box::pin(async {
                     let cx = Cx::current().ok_or(NativeRunError::MissingContext)?;
-                    self.run_loop(cx).await
-                })
+                    self.run_loop(cx, owns_context).await
+                });
+                runtime.block_on(poll_fn(|task_cx| {
+                    let _caller_guard = caller.as_ref().map(|cx| Cx::set_current(Some(cx.clone())));
+                    run.as_mut().poll(task_cx)
+                }))
             }));
             match result {
                 Ok(result) => {
@@ -969,9 +978,17 @@ mod asupersync_runner {
             })
         }
 
-        async fn run_loop(&mut self, cx: Cx) -> Result<NativeRunOutcome, NativeRunError> {
-            let _active = ActiveCxGuard::install(Arc::clone(&self.state), &cx);
-            if self.state.cancel_requested.load(Ordering::Acquire) {
+        async fn run_loop(
+            &mut self,
+            cx: Cx,
+            owns_context: bool,
+        ) -> Result<NativeRunOutcome, NativeRunError> {
+            // Control cancellation belongs to this runner. With an inherited
+            // Cx, the atomic signal and wake handles drive shutdown without
+            // cancelling the caller's shared context in the opposite direction.
+            let _active =
+                ActiveCxGuard::install(Arc::clone(&self.state), owns_context.then_some(&cx));
+            if owns_context && self.state.cancel_requested.load(Ordering::Acquire) {
                 cx.cancel_with(
                     CancelKind::Shutdown,
                     Some("ScriptBots native lifecycle cancellation"),
@@ -1892,6 +1909,8 @@ mod tests {
         cancel_on_science: Option<NativeControl>,
         #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
         enqueue_before_panic: Option<(NativeControl, CommandEnvelope)>,
+        #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+        expected_caller: Option<asupersync::Cx>,
     }
 
     struct CaptureJournal {
@@ -1900,6 +1919,15 @@ mod tests {
 
     impl JournalPort for CaptureJournal {
         fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+            if let Some(expected) = &self.state.borrow().expected_caller {
+                let active = asupersync::Cx::current().expect("journal caller context");
+                assert_eq!(active.task_id(), expected.task_id());
+                assert_eq!(active.budget(), expected.budget());
+                assert_eq!(active.capabilities(), expected.capabilities());
+                assert_eq!(active.is_cancel_requested(), expected.is_cancel_requested());
+                assert!(active.timer_driver().is_none());
+            }
             let batch_id = batch.id();
             self.state.borrow_mut().batches.push(Arc::clone(batch));
             #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
@@ -2545,6 +2573,152 @@ mod tests {
         assert_eq!(
             runner.run_until_terminal().expect("idempotent join"),
             outcome
+        );
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn asupersync_inherited_caller_cancellation_drains_and_restores_context() {
+        use asupersync::Cx;
+        use asupersync::cx::cap::None as NoCaps;
+        use asupersync::types::{Budget, CancelKind};
+
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_time()
+            .enable_platform_reactor(false)
+            .build()
+            .expect("native caller runtime");
+        let owner = runtime.request_cx_with_budget(Budget::INFINITE);
+        let _owner_guard = Cx::set_current(Some(owner.clone()));
+        let (core, journal) = captured_host(351, true, ReceiptMode::Immediate);
+        let (mut runner, _control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("native runner");
+        {
+            let _restriction = owner.restrict::<NoCaps>().set_current_restricted();
+            let inherited = Cx::current().expect("restricted caller");
+            inherited.cancel_with(CancelKind::User, Some("caller cancelled native host"));
+            journal.borrow_mut().expected_caller = Some(inherited.clone());
+            assert!(matches!(
+                runner
+                    .run_on_runtime(&runtime)
+                    .expect("ordered caller cancellation"),
+                NativeRunOutcome::Cancelled { .. }
+            ));
+            let restored = Cx::current().expect("caller restored after runtime entry");
+            assert_eq!(restored.task_id(), inherited.task_id());
+            assert_eq!(restored.capabilities(), inherited.capabilities());
+        }
+        assert!(
+            !journal.borrow().batches.is_empty(),
+            "shutdown reached the journal"
+        );
+        assert_eq!(
+            runner.host().core().latest_snapshot().lifecycle,
+            HostLifecycle::Stopped
+        );
+        assert_eq!(runner.metrics().shutdown_requests, 1);
+        assert_eq!(runner.metrics().owned_tasks_started, 0);
+        assert_eq!(runner.metrics().owned_tasks_joined, 0);
+        assert_eq!(
+            Cx::current().expect("owner restored").capabilities(),
+            owner.capabilities()
+        );
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn asupersync_control_cancellation_does_not_cancel_inherited_caller() {
+        use asupersync::Cx;
+        use asupersync::cx::cap::None as NoCaps;
+        use asupersync::types::Budget;
+
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_time()
+            .enable_platform_reactor(false)
+            .build()
+            .expect("native caller runtime");
+        let owner = runtime.request_cx_with_budget(Budget::INFINITE);
+        let _owner_guard = Cx::set_current(Some(owner.clone()));
+        let (core, journal) = captured_host(352, true, ReceiptMode::Immediate);
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("native runner");
+        {
+            let _restriction = owner.restrict::<NoCaps>().set_current_restricted();
+            let inherited = Cx::current().expect("restricted caller");
+            journal.borrow_mut().expected_caller = Some(inherited.clone());
+            assert!(control.cancel());
+            assert!(matches!(
+                runner
+                    .run_on_runtime(&runtime)
+                    .expect("ordered control cancellation"),
+                NativeRunOutcome::Cancelled { .. }
+            ));
+            inherited
+                .checkpoint()
+                .expect("control did not cancel its caller");
+            assert_eq!(
+                Cx::current().expect("caller restored").capabilities(),
+                inherited.capabilities()
+            );
+        }
+        assert!(
+            !journal.borrow().batches.is_empty(),
+            "shutdown reached the journal"
+        );
+        assert_eq!(runner.metrics().shutdown_requests, 1);
+        owner.checkpoint().expect("owner remains uncancelled");
+    }
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    fn asupersync_inherited_context_restores_after_journal_panic() {
+        use asupersync::Cx;
+        use asupersync::cx::cap::None as NoCaps;
+        use asupersync::types::Budget;
+
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_time()
+            .enable_platform_reactor(false)
+            .build()
+            .expect("native caller runtime");
+        let owner = runtime.request_cx_with_budget(Budget::INFINITE);
+        let _owner_guard = Cx::set_current(Some(owner.clone()));
+        let (core, journal) = captured_host_with_world(
+            353,
+            world_with_persistence_interval(1),
+            options(true),
+            ReceiptMode::Panic,
+        );
+        let (mut runner, control) =
+            NativeRunner::new(FixedDeadlineHost::new(core), NativeRunnerOptions::default())
+                .expect("panic runner");
+        control
+            .try_submit(envelope(1, HostCommand::Step))
+            .expect("step enqueue");
+        {
+            let _restriction = owner.restrict::<NoCaps>().set_current_restricted();
+            let inherited = Cx::current().expect("restricted caller");
+            journal.borrow_mut().expected_caller = Some(inherited.clone());
+            assert!(matches!(
+                runner.run_on_runtime(&runtime),
+                Err(NativeRunError::Panicked { .. })
+            ));
+            assert_eq!(
+                Cx::current().expect("caller after unwind").capabilities(),
+                inherited.capabilities()
+            );
+            inherited
+                .checkpoint()
+                .expect("journal panic did not cancel the caller");
+        }
+        assert!(runner.host().core().indeterminate_journal_batch().is_some());
+        assert!(runner.host().core().pending_journal_batch().is_none());
+        assert_eq!(runner.metrics().owned_tasks_started, 0);
+        assert_eq!(
+            Cx::current().expect("owner restored").capabilities(),
+            owner.capabilities()
         );
     }
 

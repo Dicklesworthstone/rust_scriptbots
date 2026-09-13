@@ -1,10 +1,9 @@
 //! Fail-closed refusal surface for hard-bounded SQL reads (`bd-91lr`).
 //!
-//! The pinned `fsqlite =0.1.16` async query methods check a caller `Cx` before
-//! dispatch, but that context does not reach the statement executing on the
-//! connection-owner worker. The engine has cooperative cancellation checks in
-//! parts of VDBE execution, but they cannot provide a hard wall-clock guarantee
+//! Updating the pinned engine does not establish a hard wall-clock guarantee
 //! across statement execution, blocking I/O, database open, or connection close.
+//! Cooperative cancellation checks do not justify enabling this lane without
+//! qualifying the complete connection-owner execution path.
 //!
 //! A caller-side timeout is not an honest substitute: returning while the owner
 //! worker continues executing would bound only the wait, not the database work.
@@ -16,8 +15,8 @@ use std::time::Duration;
 
 use crate::StorageError;
 
-const FSQLITE_PINNED_VERSION: &str = "=0.1.16";
-const FSQLITE_PINNED_REVISION: &str = "e536d7f8ca102b3eb5236bef48514582379f9346";
+const FSQLITE_PINNED_VERSION: &str = "=0.4.0";
+const FSQLITE_PINNED_REVISION: &str = "a855a15399a1994943c81e15f284bed780b4f86b";
 
 /// Uninhabited marker for the unavailable hard-bounded async SQL lane.
 ///
