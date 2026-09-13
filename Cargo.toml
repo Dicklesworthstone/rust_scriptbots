@@ -29,7 +29,7 @@ repository = "https://github.com/Dicklesworthstone/rust_scriptbots"
 [workspace.dependencies]
 anyhow = "1.0.103"
 arc-swap = "1.9.2"
-asupersync = { version = "=0.3.9", default-features = false }
+asupersync = { version = "=0.5.0", default-features = false }
 blake3 = "1.8.5"
 libc = "0.2.186"
 libm = "0.2.16"
@@ -53,9 +53,11 @@ direction = "0.18.0"
 rand08 = { package = "rand", version = "0.8.5" }
 miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
 
-fastmcp-rust = { version = "=0.3.2", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1038dd4e64cc7df8ea8122dbfb8806b0b04a7130" }
-fsqlite = { version = "=0.1.16", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "e536d7f8ca102b3eb5236bef48514582379f9346", default-features = false, features = ["native"] }
-fsqlite-types = { version = "=0.1.16", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "e536d7f8ca102b3eb5236bef48514582379f9346", default-features = false, features = ["native"] }
+fastmcp-rust = { version = "=0.9.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "180a7c88890705217bb8e202d19555adabf24187" }
+# These extensions were implicit in the previous native feature. Keep the same
+# SQL surface now that FrankenSQLite makes their registration explicit.
+fsqlite = { version = "=0.4.0", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "a855a15399a1994943c81e15f284bed780b4f86b", default-features = false, features = ["native", "json", "fts5", "icu", "misc", "rtree"] }
+fsqlite-types = { version = "=0.4.0", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "a855a15399a1994943c81e15f284bed780b4f86b", default-features = false, features = ["native"] }
 ft-api = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-core = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-kernel-cpu = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
