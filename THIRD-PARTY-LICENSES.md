@@ -1,10 +1,10 @@
 # Third-Party License Notices for ScriptBots Release Artifacts
 
-This file ships inside every ScriptBots release archive (enforced by
-`.github/workflows/release.yml`; kept current by
-`ci/check_franken_licenses.sh --third-party` in CI — see
-`docs/licenses.md` for the full audit this file operationalizes,
-tracked as bd-2z0.13.6).
+This file must ship inside every ScriptBots release archive.
+`ci/check_franken_licenses.sh --third-party` checks its contents, and the DSR
+verification profile in `ci/dsr_verify.yaml` includes it in its artifacts.
+See `docs/licenses.md` for the full audit,
+tracked as bd-2z0.13.6.
 
 ## 1. First-party code
 
@@ -22,6 +22,7 @@ of this software or derivative works, unmodified, per its own terms:
 - `fsqlite` and its `fsqlite-*` member crates (FrankenSQLite)
 - `asupersync`
 - `franken-kernel`, `franken-evidence`, `franken-decision`
+- `fastmcp-rust`, `fastmcp-client`, `fastmcp-console`, `fastmcp-core`, `fastmcp-derive`, `fastmcp-protocol`, `fastmcp-server`, `fastmcp-transport` (FastMCP)
 - `fnx-` family crates (`fnx-classes`, `fnx-algorithms`, `fnx-readwrite`, `fnx-runtime`, `fnx-dispatch`, `fnx-cgse`) (franken_networkx analytics graph library)
 - `fp-` family crates (`fp-columnar`, `fp-frame`, `fp-groupby`, `fp-index`, `fp-runtime`, `fp-types`, `frankenpandas`) (frankenpandas analytics dataframe library)
 
@@ -136,7 +137,7 @@ The following inventory categorizes the locked dependency graph (`Cargo.lock`) b
 
 | License | Crate Count | Notable Dependencies |
 |---|---|---|
-| **MIT OR Apache-2.0** (Dual) | ~600 | `tokio`, `serde`, `rayon`, `wgpu`, `bevy`, `fastmcp-rust`, `tracing`, `syn`, `quote`, `bitflags`, `clap`, `image` |
+| **MIT OR Apache-2.0** (Dual) | ~600 | `tokio`, `serde`, `rayon`, `wgpu`, `bevy`, `tracing`, `syn`, `quote`, `bitflags`, `clap`, `image` |
 | **MIT** | ~280 | `gpui`, `anyhow`, `axum`, `bincode`, `num_cpus`, `ordered-float`, `parking_lot`, `crossbeam`, `futures` |
 | **Apache-2.0** | ~75 | `arrow`, `parquet`, `utoipa`, `ab_glyph`, `approx`, `winit`, `wayland-client` |
 | **BSD-3-Clause** / **BSD-2-Clause** | ~20 | `tiny-skia`, `ravif`, `curve25519-dalek`, `ed25519-dalek`, `exr`, `subtle`, `snap`, `rav1e` |

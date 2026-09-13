@@ -34,6 +34,7 @@ DOC="${REPO_ROOT}/docs/licenses.md"
 FAMILIES=(
   '^fsqlite|fsqlite'
   '^asupersync|asupersync'
+  '^fastmcp-|fastmcp-'
   '^franken-kernel$|franken-kernel'
   '^franken-evidence$|franken-evidence'
   '^franken-decision$|franken-decision'
@@ -380,7 +381,7 @@ verify_archive() {
 # archives to satisfy the rider's include-with-distribution obligation.
 # Invariants:
 # (1) Embedded rider license block matches canonical SHA exactly;
-# (2) Every franken family present in the lock is named in the notice file;
+# (2) Every franken family present in the lock is named in notice section 2;
 # (3) Community dependencies inventory and verbatim texts are complete;
 # (4) README license disclosure links resolve to existing files.
 check_third_party() {
@@ -401,6 +402,8 @@ check_third_party() {
 
   local names
   names="$(grep -E '^name = "' "$lock_file" | sed -E 's/^name = "([^"]+)"$/\1/' | sort -u)"
+  local family_notice
+  family_notice="$(sed -n '/^## 2[.] /,/^## 3[.] /p' "$notice")"
   local missing=0
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
@@ -411,8 +414,8 @@ check_third_party() {
     done
     if [[ -z "$token" && "$name" == franken* ]]; then token="$name"; fi
     [[ -z "$token" ]] && continue
-    if ! grep -q -- "$token" "$notice"; then
-      echo "::error::franken crate '$name' (token '$token') in Cargo.lock but absent from $notice — add it to §2 in this PR"
+    if ! grep -q -- "$token" <<< "$family_notice"; then
+      echo "::error::franken crate '$name' (token '$token') in Cargo.lock but absent from §2 of $notice — add it to §2 in this PR"
       missing=$((missing + 1))
     fi
   done <<< "$names"
@@ -476,6 +479,50 @@ FIXTURE
     echo "  PASS: documented fixture accepted"
   else
     echo "::error::self-test FAILED — documented fixture rejected"
+    return 1
+  fi
+
+  echo "== self-test 2b: FastMCP facade and member crates require documentation =="
+  cat > "$tmp/fastmcp.lock" <<'FIXTURE'
+[[package]]
+name = "fastmcp-rust"
+version = "0.10.0"
+
+[[package]]
+name = "fastmcp-server"
+version = "0.10.0"
+FIXTURE
+  out="$(check "$tmp/fastmcp.lock" "$tmp/licenses2.md" 2>&1 || true)"
+  if grep -q "fastmcp-rust -> token 'fastmcp-'" <<< "$out" \
+     && grep -q "fastmcp-server -> token 'fastmcp-'" <<< "$out" \
+     && ! check "$tmp/fastmcp.lock" "$tmp/licenses2.md" >/dev/null 2>&1; then
+    echo "  PASS: undocumented FastMCP facade and member rejected"
+  else
+    echo "::error::self-test FAILED — undocumented FastMCP family was not caught"
+    printf '%s\n' "$out"
+    return 1
+  fi
+  cat > "$tmp/fastmcp-licenses.md" <<'FIXTURE'
+Documented: fastmcp-rust and its fastmcp- family members.
+FIXTURE
+  if check "$tmp/fastmcp.lock" "$tmp/fastmcp-licenses.md" >/dev/null 2>&1; then
+    echo "  PASS: documented FastMCP family accepted"
+  else
+    echo "::error::self-test FAILED — documented FastMCP family rejected"
+    return 1
+  fi
+
+  echo "== self-test 2c: a community-only FastMCP mention must FAIL =="
+  sed '/^- .*fastmcp-/d' "$REPO_ROOT/THIRD-PARTY-LICENSES.md" > "$tmp/fastmcp-community-only.md"
+  printf '\nCommunity dependency: fastmcp-rust.\n' >> "$tmp/fastmcp-community-only.md"
+  out="$(check_third_party "$tmp/fastmcp.lock" "$tmp/fastmcp-community-only.md" 2>&1 || true)"
+  if grep -q "fastmcp-rust.*absent from §2" <<< "$out" \
+     && grep -q "fastmcp-server.*absent from §2" <<< "$out" \
+     && ! check_third_party "$tmp/fastmcp.lock" "$tmp/fastmcp-community-only.md" >/dev/null 2>&1; then
+    echo "  PASS: community-only mention does not satisfy the family notice"
+  else
+    echo "::error::self-test FAILED — misplaced FastMCP family notice was accepted"
+    printf '%s\n' "$out"
     return 1
   fi
 
