@@ -187,6 +187,26 @@ enum Baseline {
     /// sits behind it, because `distribute_carcass_rewards` early-returns unless the victim
     /// was `spiked`.
     CombatReachable,
+    /// A world where boost is commanded and wheel outputs are asymmetric (bd-6i23).
+    ///
+    /// `boost_multiplier` is read only while `OutputChannel::Boost` is above `0.5`,
+    /// and `locomotion_model` differential steering produces divergence when wheel speeds
+    /// are active.
+    BoostEnabled,
+    /// A world where a temperature gradient and discomfort penalty are active (bd-6i23).
+    ///
+    /// `temperature_discomfort_rate` defaults to 0.0, which disables all temperature
+    /// discomfort calculation. Activating a non-zero rate and gradient unlocks
+    /// `temperature_comfort_band`, `temperature_discomfort_exponent`, and
+    /// `temperature_gradient_exponent`.
+    TemperatureActive,
+    /// A world where the attacker's herbivore tendency sits right at the default diet threshold (bd-6i23).
+    ///
+    /// `stage_combat` evaluates `attacker.herbivore_tendency < carnivore_threshold`.
+    /// With default tendency 0.5 and threshold 0.5, the attacker is an herbivore and cannot
+    /// strike. Perturbing `carnivore_threshold` above 0.5 flips the attacker to carnivore,
+    /// triggering physical combat strikes and health loss on the target.
+    DietThreshold,
 }
 
 /// A brain that always commands a spike, so combat survives `stage_brains`.
@@ -231,6 +251,27 @@ impl BrainRunner for GiverBrain {
     }
 }
 
+/// A brain that always commands asymmetric forward movement and boost (bd-6i23).
+struct BoostBrain;
+
+impl BrainRunner for BoostBrain {
+    fn kind(&self) -> &'static str {
+        "test.bd-6i23-boost"
+    }
+
+    fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+        let mut outputs = [0.0; OUTPUT_SIZE];
+        outputs[0] = 1.0; // OutputChannel::WheelLeft
+        outputs[1] = 0.5; // OutputChannel::WheelRight
+        outputs[6] = 1.0; // OutputChannel::Boost (above BOOST_THRESHOLD 0.5)
+        outputs
+    }
+
+    fn state_digest(&self) -> Option<u64> {
+        Some(0x6264_0623_0001)
+    }
+}
+
 /// Per-agent spawn overrides a baseline needs, applied identically on both sides.
 ///
 /// Expressed at SPAWN TIME through the public `AgentData` fields rather than by reaching
@@ -238,19 +279,30 @@ impl BrainRunner for GiverBrain {
 /// that needed private access would be proving something the real callers cannot do.
 const fn baseline_agent(baseline: Baseline, index: u32, base: AgentData) -> AgentData {
     match (baseline, index) {
-        (Baseline::CombatReachable, 0) => AgentData {
+        (Baseline::CombatReachable | Baseline::DietThreshold, 0) => AgentData {
             // Above stage_combat's 0.5 eligibility floor; decays only 0.005/tick.
             spike_length: 5.0,
             heading: 0.0,
             position: Position::new(40.0, 60.0),
             ..base
         },
-        (Baseline::CombatReachable, 1) => AgentData {
+        (Baseline::CombatReachable | Baseline::DietThreshold, 1) => AgentData {
             // Directly ahead of the attacker, with health for the spike to take.
             position: Position::new(45.0, 60.0),
             health: 2.0,
             ..base
         },
+        (Baseline::TemperatureActive, index) => {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "Witness test world seeds at most six agents; index is well within exact float precision"
+            )]
+            let offset = (index as f32) * 20.0;
+            AgentData {
+                position: Position::new(150.0 + offset, 45.0),
+                ..base
+            }
+        }
         _ => base,
     }
 }
@@ -300,10 +352,21 @@ fn baseline_config(baseline: Baseline, mut config: ScriptBotsConfig) -> ScriptBo
         config.spike_min_length = 0.0;
         config.spike_alignment_cosine = 0.001;
     }
+    if baseline == Baseline::DietThreshold {
+        config.spike_min_length = 0.0;
+        config.spike_alignment_cosine = 0.001;
+    }
+    if baseline == Baseline::TemperatureActive {
+        config.world_width = 1000;
+        config.temperature_discomfort_rate = 0.5;
+        config.temperature_comfort_band = 0.1;
+        config.temperature_discomfort_exponent = 2.0;
+        config.temperature_gradient_exponent = 1.0;
+    }
     config
 }
 
-/// Bind the aggressor brain and make the attacker a carnivore, through public APIs.
+/// Bind baseline brains and runtime state, through public APIs.
 fn arm_baseline(world: &mut WorldState, baseline: Baseline) -> Result<(), String> {
     if baseline == Baseline::SharingEnabled {
         let key = world
@@ -326,6 +389,53 @@ fn arm_baseline(world: &mut WorldState, baseline: Baseline) -> Result<(), String
                 })
                 .map_err(|e| format!("giver runtime: {e:?}"))?;
         }
+        return Ok(());
+    }
+    if baseline == Baseline::BoostEnabled {
+        let key = world
+            .brain_registry_mut()
+            .map_err(|e| format!("registry: {e:?}"))?
+            .register("test.bd-6i23-boost", |_rng| {
+                Ok(Box::new(BoostBrain) as Box<dyn BrainRunner>)
+            });
+        #[expect(
+            clippy::needless_collect,
+            reason = "Snapshot handles before binding and runtime updates mutably borrow world; iter_handles borrows the same arena"
+        )]
+        for handle in world.agents().iter_handles().collect::<Vec<_>>() {
+            world
+                .bind_agent_brain(handle, key)
+                .map_err(|e| format!("bind boost: {e:?}"))?;
+            world
+                .try_update_agent_runtime(handle, |runtime| {
+                    runtime.energy = 1.5;
+                })
+                .map_err(|e| format!("boost runtime: {e:?}"))?;
+        }
+        return Ok(());
+    }
+    if baseline == Baseline::DietThreshold {
+        let attacker = world
+            .agents()
+            .iter_handles()
+            .next()
+            .ok_or_else(|| "diet baseline needs an agent".to_owned())?;
+        let key = world
+            .brain_registry_mut()
+            .map_err(|e| format!("registry: {e:?}"))?
+            .register("test.bd-6i23-aggressor", |_rng| {
+                Ok(Box::new(AggressorBrain) as Box<dyn BrainRunner>)
+            });
+        world
+            .bind_agent_brain(attacker, key)
+            .map_err(|e| format!("bind: {e:?}"))?;
+        world
+            .try_update_agent_runtime(attacker, |runtime| {
+                // Keep tendency at exactly 0.5 so it sits on the carnivore_threshold boundary
+                runtime.herbivore_tendency = 0.5;
+                runtime.energy = 1.5;
+            })
+            .map_err(|e| format!("attacker runtime: {e:?}"))?;
         return Ok(());
     }
     if baseline != Baseline::CombatReachable {
@@ -938,6 +1048,61 @@ static WITNESSES: &[Witness] = &[
         ticks: 8,
         baseline: Baseline::Default,
     },
+    // bd-6i23: The final nine witnesses and baselines.
+    Witness {
+        path: "initial_food",
+        value: || Value::from(0.4),
+        ticks: 4,
+        baseline: Baseline::Default,
+    },
+    Witness {
+        path: "boost_multiplier",
+        value: || Value::from(4.0),
+        ticks: 8,
+        baseline: Baseline::BoostEnabled,
+    },
+    Witness {
+        path: "locomotion_model",
+        value: || Value::String("differential".to_owned()),
+        ticks: 8,
+        baseline: Baseline::BoostEnabled,
+    },
+    Witness {
+        path: "carnivore_threshold",
+        value: || Value::from(0.7),
+        ticks: 16,
+        baseline: Baseline::DietThreshold,
+    },
+    Witness {
+        path: "closed",
+        value: || Value::from(true),
+        ticks: 8,
+        baseline: Baseline::PopulationFloorEnabled,
+    },
+    Witness {
+        path: "food_transfer_rate",
+        value: || Value::from(0.8),
+        ticks: 8,
+        baseline: Baseline::SharingEnabled,
+    },
+    Witness {
+        path: "temperature_comfort_band",
+        value: || Value::from(0.25),
+        ticks: 8,
+        baseline: Baseline::TemperatureActive,
+    },
+    Witness {
+        path: "temperature_discomfort_exponent",
+        value: || Value::from(1.0),
+        ticks: 8,
+        baseline: Baseline::TemperatureActive,
+    },
+    Witness {
+        path: "temperature_gradient_exponent",
+        value: || Value::from(2.0),
+        ticks: 8,
+        baseline: Baseline::TemperatureActive,
+    },
 ];
 
 /// THE WITNESS GATE. Every listed knob must move material, non-config world state.
@@ -974,6 +1139,13 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
         Baseline::PopulationFloorEnabled,
     )
     .expect("the population-floor baseline must build and step a world");
+    let boost_reference = run_material(ScriptBotsConfig::default(), 16, Baseline::BoostEnabled)
+        .expect("the boost baseline must build and step a world");
+    let temperature_reference =
+        run_material(ScriptBotsConfig::default(), 16, Baseline::TemperatureActive)
+            .expect("the temperature baseline must build and step a world");
+    let diet_reference = run_material(ScriptBotsConfig::default(), 16, Baseline::DietThreshold)
+        .expect("the diet threshold baseline must build and step a world");
 
     // Collect every failure rather than panicking on the first. One run then tells you about all
     // 17 witnesses instead of one per run, which matters when a verification cycle is minutes long
@@ -993,6 +1165,9 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
             Baseline::TopographyEnabled => &topography_reference,
             Baseline::ReproductionEnabled => &reproduction_reference,
             Baseline::PopulationFloorEnabled => &population_reference,
+            Baseline::BoostEnabled => &boost_reference,
+            Baseline::TemperatureActive => &temperature_reference,
+            Baseline::DietThreshold => &diet_reference,
         };
         match run_material(config, witness.ticks.max(8), witness.baseline) {
             Err(reason) => broken.push(format!("{}: {reason}", witness.path)),
@@ -1042,24 +1217,37 @@ fn bd_dorx_every_witness_targets_a_scientific_knob() {
     }
 }
 
-/// Ratchet for scientific witness coverage. It may only ever be raised.
+/// Scientific knobs that cannot be witnessed by single-path simulation in this crate's test suite,
+/// paired with the exact structural reason why they are blocked.
 ///
-/// Deliberately a floor rather than an equality with the scientific count: 88 knobs are
-/// classified scientific and far fewer are witnessed today, so asserting completeness would be a
-/// lie of exactly the kind bd-dorx exists to stop. A floor makes the debt visible in the test
-/// output every run while making it impossible to quietly delete a witness.
-///
-/// 76 is the OBSERVED count -- every one of these was seen to move material state on a real run.
-/// It is not an aspiration. An earlier value of 17 was aspirational and left this gate red,
-/// which is the failure it exists to prevent, so the number now tracks evidence only.
-const WITNESS_COVERAGE_FLOOR: usize = 76;
+/// Under bd-dorx / bd-6i23: every scientific knob must EITHER have an activating witness in
+/// `WITNESSES` OR carry an explicit, audited entry here. An unrecorded unwitnessed knob fails
+/// the strict gate.
+struct BlockedKnob {
+    path: &'static str,
+    reason: &'static str,
+}
 
-/// Report scientific coverage, and hold the line against it regressing.
+static BLOCKED_SCIENTIFIC_KNOBS: &[BlockedKnob] = &[
+    BlockedKnob {
+        path: "neuroflow.activation",
+        reason: "Consumer is application-level brain installer in scriptbots-app behind cfg(feature = \"neuro\"); core WorldState has no built-in neuroflow dependency or evaluation",
+    },
+    BlockedKnob {
+        path: "neuroflow.enabled",
+        reason: "Consumer is application-level brain installer in scriptbots-app behind cfg(feature = \"neuro\"); core WorldState has no built-in neuroflow dependency or evaluation",
+    },
+    BlockedKnob {
+        path: "neuroflow.hidden_layers",
+        reason: "Consumer is application-level brain installer in scriptbots-app behind cfg(feature = \"neuro\"); core WorldState has no built-in neuroflow dependency or evaluation",
+    },
+];
+
+/// Strict gate for scientific witness coverage (bd-dorx / bd-6i23).
 ///
-/// This is deliberately NOT an assertion that all 88 scientific knobs are witnessed: they are not,
-/// and claiming otherwise is the exact false assurance this bead exists to prevent. It asserts
-/// that coverage never goes DOWN, so the debt can only shrink. The remaining entries are tracked
-/// on bd-dorx rather than silently tolerated here.
+/// Replaces the interim monotonic floor with the strict assertion: every scientific knob
+/// MUST have an activating behavioral witness in `WITNESSES`, or an explicit documented entry
+/// in `BLOCKED_SCIENTIFIC_KNOBS`. No unwitnessed scientific knob is tolerated.
 #[test]
 fn bd_dorx_scientific_witness_coverage_does_not_regress() {
     let scientific: Vec<&str> = KNOB_ROLES
@@ -1072,28 +1260,57 @@ fn bd_dorx_scientific_witness_coverage_does_not_regress() {
         .filter(|w| scientific.contains(&w.path))
         .map(|w| w.path)
         .collect();
+    let blocked: Vec<&str> = BLOCKED_SCIENTIFIC_KNOBS
+        .iter()
+        .filter(|b| scientific.contains(&b.path))
+        .map(|b| b.path)
+        .collect();
 
     println!(
-        "SCIENTIFIC_KNOBS={} WITNESSED={} UNWITNESSED={}",
+        "SCIENTIFIC_KNOBS={} WITNESSED={} BLOCKED={} UNWITNESSED={}",
         scientific.len(),
         witnessed.len(),
-        scientific.len() - witnessed.len()
+        blocked.len(),
+        scientific
+            .len()
+            .saturating_sub(witnessed.len() + blocked.len())
     );
+
+    for b in BLOCKED_SCIENTIFIC_KNOBS {
+        println!("BLOCKED\t{}\treason={}", b.path, b.reason);
+    }
+
+    let mut unwitnessed = Vec::new();
     for path in &scientific {
-        if !witnessed.contains(path) {
+        let is_witnessed = witnessed.contains(path);
+        let is_blocked = blocked.contains(path);
+        assert!(
+            !(is_witnessed && is_blocked),
+            "{path} is both witnessed and recorded as blocked; remove it from BLOCKED_SCIENTIFIC_KNOBS"
+        );
+        if !is_witnessed && !is_blocked {
             println!("UNWITNESSED\t{path}");
+            unwitnessed.push(*path);
         }
     }
 
     assert!(
-        witnessed.len() >= WITNESS_COVERAGE_FLOOR,
-        "scientific witness coverage regressed: {} witnessed, floor is {WITNESS_COVERAGE_FLOOR}. \
-         Raise the floor when you add witnesses; never lower it to make this pass",
-        witnessed.len()
+        unwitnessed.is_empty(),
+        "scientific knobs lack an activating witness or recorded blocking reason: {unwitnessed:?}. \
+         Add a witness to WITNESSES or document the structural blocker in BLOCKED_SCIENTIFIC_KNOBS"
     );
-    assert!(
-        scientific.len() >= witnessed.len(),
-        "a witness targeted a path the registry does not call scientific"
+    assert_eq!(
+        witnessed.len() + blocked.len(),
+        scientific.len(),
+        "every scientific knob must be accounted for: witnessed ({}) + blocked ({}) != scientific ({})",
+        witnessed.len(),
+        blocked.len(),
+        scientific.len()
+    );
+    assert_eq!(
+        witnessed.len(),
+        85,
+        "exact observed count of active witnesses (85 of 88 scientific knobs)"
     );
 }
 
@@ -1165,4 +1382,84 @@ fn bd_dorx_knob_ranges_declare_no_unexpected_unpublished_path() {
          render.auto_exposure/render.day_night/render.post is a stale range declaring a knob no \
          config can emit. If you fixed one, delete it from KNOB_RANGES_NOT_PUBLISHED_BY_DEFAULT too"
     );
+}
+
+/// Enumerate published knobs from a maximal config where all Option fields are populated.
+fn maximal_knob_paths() -> Vec<String> {
+    let mut config = ScriptBotsConfig::default();
+    config.render.auto_exposure = Some(scriptbots_core::RenderAutoExposureSettings {
+        enabled: true,
+        speed_brighten: Some(1.0),
+        speed_darken: Some(1.0),
+    });
+    config.render.day_night = Some(scriptbots_core::RenderDayNightSettings {
+        cycle_ticks: Some(1000),
+        night_ambient: Some(0.2),
+        start_phase: Some(0.0),
+        stars: Some(true),
+    });
+    config.render.post = Some(scriptbots_core::RenderPostSettings {
+        bloom: Some(scriptbots_core::RenderBloomSettings {
+            enabled: true,
+            threshold: Some(0.8),
+            intensity: Some(0.5),
+        }),
+        vignette: Some(scriptbots_core::RenderVignetteSettings {
+            enabled: true,
+            intensity: Some(0.3),
+            smoothness: Some(0.5),
+        }),
+        fog: None,
+        anti_aliasing: None,
+    });
+    let value = serde_json::to_value(config).expect("maximal config must serialize");
+    let mut paths = Vec::new();
+    flatten_paths(&mut String::new(), &value, &mut paths);
+    paths.sort();
+    paths
+}
+
+/// The default published surface is a strict subset of the maximal surface (bd-6i23 acceptance item 2).
+///
+/// Any completeness claim is relative to a config instance, not a type: `render.post`,
+/// `render.day_night`, and `render.auto_exposure` serialize to null when unset and publish
+/// as one leaf each. In a maximal config, they expand into their subfields.
+#[test]
+fn bd_dorx_maximal_config_surface_is_a_strict_superset_of_default_surface() {
+    let default_paths = default_knob_paths();
+    let maximal_paths = maximal_knob_paths();
+
+    println!(
+        "DEFAULT_KNOB_COUNT={} MAXIMAL_KNOB_COUNT={}",
+        default_paths.len(),
+        maximal_paths.len()
+    );
+
+    assert!(
+        default_paths.len() < maximal_paths.len(),
+        "maximal surface must be strictly larger than default surface (default: {}, maximal: {})",
+        default_paths.len(),
+        maximal_paths.len()
+    );
+
+    // Expanding root paths that serialize to null on default configs
+    let expanding_roots = ["render.auto_exposure", "render.day_night", "render.post"];
+
+    for path in &default_paths {
+        if expanding_roots.contains(&path.as_str()) {
+            // In the maximal config, this null leaf expands into deeper leaves
+            let has_expanded_children = maximal_paths
+                .iter()
+                .any(|m| m.starts_with(&format!("{path}.")));
+            assert!(
+                has_expanded_children,
+                "expanding path {path} must have children in maximal config"
+            );
+        } else {
+            assert!(
+                maximal_paths.contains(path),
+                "non-expanding path {path} in default surface must exist in maximal surface"
+            );
+        }
+    }
 }
