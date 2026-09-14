@@ -5,18 +5,48 @@
 id = "world-quiet-01"
 title = "Quiet Oasis"
 story = "A peaceful ecosystem with balanced food growth where species coexist in harmony."
-permalink = "sbw1.c2IxAAAAEHF1aWV0LW9hc2lzLXNjZW5hcmlvAAAAAACI3Z4AAAAA"
-horizon_ticks = 1000
+permalink = "sbw1.c2IxAQAqAAAAAAAAAAYAbWVhZG93etLVEX86quwAAAEAAAABCQIWAgAAAAEJAhYDAAAAAQkCFqsa7ME"
+horizon_ticks = 300
 added_by = "jemanuel"
 added_at = "2026-07-22"
 blessed_on_build = 1
 
+[[world.expected_timeline]]
+tick = 102
+kind = "CombatSurge"
+metric = "spike_hits"
+
 [[world]]
 id = "world-extinction-01"
 title = "Great Drought"
-story = "A severe environmental collapse causes mass predator extinction."
-permalink = "sbw1.c2IxAAAAEGRyb3VnaHQtc2NlbmFyaW8AAAAAAIjZngAAAAA"
-horizon_ticks = 1000
+story = "A severe environmental collapse causes resource starvation and energy collapse."
+permalink = "sbw1.c2IxAQCJAAAAAAAAAAYAbWVhZG93EoGRC2OdTD0EABAAZm9vZF9ncm93dGhfcmF0ZQAAAAAAAAAAEABtZXRhYm9saXNtX2RyYWlumpmZmZmZuT8SAHBvcHVsYXRpb25fbWluaW11bQAAAAAAADhADABzcGlrZV9kYW1hZ2UAAAAAAAAAQAEAAAABCQIWAgAAAAEJAhYDAAAAAQkCFuuU5Gc"
+horizon_ticks = 300
 added_by = "jemanuel"
 added_at = "2026-07-22"
 blessed_on_build = 1
+
+[[world.expected_timeline]]
+tick = 30
+kind = "EnergyCollapse"
+metric = "average_energy"
+
+[[world]]
+id = "world-speciation-01"
+title = "Bloom and Surge"
+story = "Rich resources and high reproductive pressure trigger population booms and combat surges."
+permalink = "sbw1.c2IxAQBtJzUBAAAAAAYAbWVhZG932tW3WOt_ykkFABAAZm9vZF9ncm93dGhfcmF0ZZqZmZmZmak_CABmb29kX21heAAAAAAAAABAEgBwb3B1bGF0aW9uX21pbmltdW0AAAAAAAA4QBgAcmVwcm9kdWN0aW9uX2VuZXJneV9jb3N0mpmZmZmZqT8dAHJlcHJvZHVjdGlvbl9lbmVyZ3lfdGhyZXNob2xkmpmZmZmZqT8BAAAAAQkCFgIAAAABCQIWAwAAAAEJAhaeePcj"
+horizon_ticks = 300
+added_by = "jemanuel"
+added_at = "2026-07-22"
+blessed_on_build = 1
+
+[[world.expected_timeline]]
+tick = 130
+kind = "EnergyCollapse"
+metric = "average_energy"
+
+[[world.expected_timeline]]
+tick = 196
+kind = "CombatSurge"
+metric = "spike_hits"

@@ -1833,8 +1833,8 @@ fn gallery_manifest_in_repo_is_valid_and_verifiable() {
         .expect("validate gallery/manifest.toml structural bounds");
 
     assert!(
-        !manifest.worlds.is_empty(),
-        "gallery manifest must contain at least one world"
+        manifest.worlds.len() >= 3,
+        "gallery manifest must contain at least three curated worlds"
     );
 
     for world in &manifest.worlds {
@@ -1858,16 +1858,22 @@ fn gallery_manifest_in_repo_is_valid_and_verifiable() {
             "horizon_ticks bound for {}",
             world.id
         );
+        assert!(
+            !world.expected_timeline.is_empty(),
+            "world {} must have a non-empty expected timeline",
+            world.id
+        );
+    }
 
-        // Verify empty timeline produces valid passing report on mock actuals
-        let report = world.verify_timeline(&[]);
-        if world.expected_timeline.is_empty() {
-            assert!(
-                report.passed,
-                "world {} with empty expected timeline must pass",
-                world.id
-            );
-        }
+    let reports = scriptbots_core::gallery::verify_manifest(&manifest)
+        .expect("verify all curated worlds in gallery manifest");
+    for report in reports {
+        assert!(
+            report.passed,
+            "world {} failed verification: {}",
+            report.world_id,
+            report.summary()
+        );
     }
 }
 
