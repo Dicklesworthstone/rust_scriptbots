@@ -12522,6 +12522,22 @@ mod acknowledgement_guard {
         ),
     ];
 
+    /// Past-tense outcome verbs that claim a completed modification (the CLAIM form, bd-m07q).
+    ///
+    /// If a surface submits a command, receiving an admission receipt (or a bool meaning
+    /// enqueued) does not prove the command was applied or persisted. Logging an outcome
+    /// verb inside that submission's success branch claims more than the code observed (bd-0oro).
+    const OUTCOME_VERBS: &[&str] = &[
+        "persisted",
+        "applied",
+        "saved",
+        "created",
+        "written",
+        "updated",
+        "committed",
+        "injected",
+    ];
+
     /// Calls that unambiguously reach the command bus.
     ///
     /// These are the only hand-written entries left, and they are seeds
@@ -12996,6 +13012,308 @@ mod acknowledgement_guard {
                     }
                 }
                 previous = line.to_owned();
+            }
+        }
+        out
+    }
+
+    /// Submitter call patterns that can appear in `file`.
+    fn submitter_call_patterns(
+        file: &str,
+        submitters: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Vec<String> {
+        let mut patterns = Vec::new();
+        for seed in BUS_SEEDS {
+            patterns.push((*seed).to_owned());
+        }
+        for (fragment, _, _) in COMMAND_SUBMITTERS {
+            patterns.push((*fragment).to_owned());
+        }
+        for (name, definitions) in submitters {
+            if definitions.contains(file) {
+                patterns.push(format!("self.{name}("));
+            }
+            if definitions.iter().any(|d| d == CONTROL_HANDLE_FILE) {
+                patterns.push(format!("handle.{name}("));
+                patterns.push(format!("state.handle.{name}("));
+            }
+        }
+        patterns
+    }
+
+    /// Does any string literal in `text` contain one of the past-tense outcome verbs?
+    fn string_literals_contain_outcome_verb(text: &str) -> Option<&'static str> {
+        let mut in_quote = false;
+        let mut escaped = false;
+        let mut current_lit = String::new();
+        let mut literals = Vec::new();
+
+        for ch in text.chars() {
+            if in_quote {
+                if escaped {
+                    escaped = false;
+                    current_lit.push(ch);
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_quote = false;
+                    literals.push(current_lit.clone());
+                    current_lit.clear();
+                } else {
+                    current_lit.push(ch);
+                }
+            } else if ch == '"' {
+                in_quote = true;
+            }
+        }
+
+        for lit in literals {
+            for token in lit.split_whitespace() {
+                let clean = token
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_ascii_lowercase();
+                for &verb in OUTCOME_VERBS {
+                    if clean == verb {
+                        return Some(verb);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Does this line start a logging macro invocation?
+    fn is_logging_macro_start(line: &str) -> bool {
+        const MACROS: &[&str] = &["info!", "warn!", "error!", "debug!", "trace!"];
+        for m in MACROS {
+            if let Some(idx) = line.find(m) {
+                let rest = &line[idx + m.len()..];
+                if rest.starts_with('(') || rest.starts_with('{') || rest.starts_with('[') {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract variable name from a binding of a submitter call: `let [mut] var = ...`
+    fn extract_bound_var(line: &str, submit_patterns: &[String]) -> Option<String> {
+        let (lhs, rhs) = line.split_once('=')?;
+        if rhs.starts_with('=') {
+            return None;
+        }
+        if !submit_patterns.iter().any(|p| rhs.contains(p)) {
+            return None;
+        }
+        let rest = lhs
+            .trim()
+            .strip_prefix("let ")?
+            .trim_start()
+            .strip_prefix("mut ")
+            .unwrap_or(lhs.trim().strip_prefix("let ")?.trim_start());
+        let var = rest
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+            .trim_start_matches("Ok(")
+            .trim_start_matches("Some(")
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+            .trim();
+        if !var.is_empty() && var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            Some(var.to_owned())
+        } else {
+            None
+        }
+    }
+
+    /// Is this condition a success check on a command submitter?
+    fn is_success_condition(
+        condition: &str,
+        submit_patterns: &[String],
+        bound_submitters: &BTreeSet<String>,
+    ) -> bool {
+        let has_submit = submit_patterns.iter().any(|p| condition.contains(p))
+            || bound_submitters.iter().any(|var| {
+                condition
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|token| token == var.as_str())
+            });
+        if !has_submit {
+            return false;
+        }
+
+        // Failure checks
+        if condition.contains("if !")
+            || condition.contains("if(!")
+            || condition.contains("== false")
+            || condition.contains("!= true")
+            || condition.contains(".is_err()")
+            || condition.contains(".is_none()")
+            || condition.contains("let Err(")
+            || condition.contains("let Err {")
+            || condition.contains("let None")
+            || condition.contains("Err(")
+            || condition.contains("None =>")
+            || condition.contains("false =>")
+        {
+            return false;
+        }
+
+        // Success checks
+        condition.contains("if ")
+            || condition.starts_with("if(")
+            || condition.contains("match ")
+            || condition.contains("Ok(")
+            || condition.contains("Some(")
+            || condition.contains("true =>")
+            || condition.contains(".is_ok()")
+            || condition.contains(".is_some()")
+    }
+
+    /// Calls to command submitters whose success branch logs an unobserved outcome verb.
+    #[allow(clippy::too_many_lines)]
+    fn outcome_claims_in_submitter_success_branches(sources: &[(String, String)]) -> Vec<Offence> {
+        let submitters = derived_submitters(sources);
+        let mut out = Vec::new();
+
+        for (file, text) in sources {
+            let submit_patterns = submitter_call_patterns(file, &submitters);
+            let mut bound_submitters = BTreeSet::new();
+            let mut condition_buf = String::new();
+            let mut in_condition = false;
+            let mut success_branch_depth: Option<usize> = None;
+            let mut current_depth: usize = 0;
+            let mut in_macro = false;
+            let mut macro_buf = String::new();
+            let mut macro_start_line = 0;
+            let mut macro_start_raw = String::new();
+
+            for (index, raw) in text.lines().enumerate() {
+                let line = raw.trim();
+                let line_no = index + 1;
+
+                // Function boundary clears local bindings
+                if declared_function_name(raw).is_some() {
+                    bound_submitters.clear();
+                    condition_buf.clear();
+                    in_condition = false;
+                    success_branch_depth = None;
+                    current_depth = 0;
+                    in_macro = false;
+                    macro_buf.clear();
+                }
+
+                // Strip line comments outside of quotes
+                let blanked_all = blank_string_literals(line);
+                let code_line = if let Some(comment_pos) = blanked_all.find("//") {
+                    line[..comment_pos].trim()
+                } else {
+                    line
+                };
+                if code_line.is_empty() {
+                    continue;
+                }
+
+                // Check for bound submitter call: `let [mut] var = ...submitter...;`
+                if code_line.starts_with("let ")
+                    && let Some(var_name) = extract_bound_var(code_line, &submit_patterns)
+                {
+                    bound_submitters.insert(var_name);
+                }
+
+                let blanked = blank_string_literals(code_line);
+
+                // Accumulate condition leading up to `{`
+                if !in_condition
+                    && (blanked.contains("if ")
+                        || blanked.starts_with("if(")
+                        || blanked.contains("match "))
+                {
+                    in_condition = true;
+                    condition_buf.clear();
+                }
+
+                if in_condition {
+                    if !condition_buf.is_empty() {
+                        condition_buf.push(' ');
+                    }
+                    condition_buf.push_str(code_line);
+                }
+
+                // Inspect logging macro calls if inside success branch
+                if success_branch_depth.is_some() {
+                    if !in_macro && is_logging_macro_start(code_line) {
+                        in_macro = true;
+                        macro_buf.clear();
+                        macro_start_line = line_no;
+                        macro_start_raw = code_line.to_owned();
+                    }
+
+                    if in_macro {
+                        if !macro_buf.is_empty() {
+                            macro_buf.push(' ');
+                        }
+                        macro_buf.push_str(code_line);
+
+                        // If logging macro call completes (contains ); or ends with ;)
+                        if macro_buf.contains(");") || macro_buf.ends_with(';') {
+                            if let Some(verb) = string_literals_contain_outcome_verb(&macro_buf) {
+                                out.push(Offence {
+                                    file: file.clone(),
+                                    line_no: macro_start_line,
+                                    line: macro_start_raw.clone(),
+                                    problem: format!(
+                                        "logs that a command was `{verb}` inside the success branch of a submitter; \
+                                         submitting proves only admission/enqueuing, not that the outcome occurred \
+                                         (bd-m07q, bd-0oro)"
+                                    ),
+                                    fix: "log that the command was enqueued or admitted (with its receipt if available), \
+                                          or query the host for applied state"
+                                        .to_owned(),
+                                });
+                            }
+                            in_macro = false;
+                            macro_buf.clear();
+                        }
+                    }
+                }
+
+                // Process braces
+                for ch in blanked.chars() {
+                    if ch == '}' {
+                        current_depth = current_depth.saturating_sub(1);
+                        if let Some(d) = success_branch_depth
+                            && current_depth < d
+                        {
+                            success_branch_depth = None;
+                        }
+                    } else if ch == '{' {
+                        current_depth += 1;
+                        if in_condition {
+                            if is_success_condition(
+                                &condition_buf,
+                                &submit_patterns,
+                                &bound_submitters,
+                            ) {
+                                success_branch_depth = Some(current_depth);
+                            }
+                            in_condition = false;
+                            condition_buf.clear();
+                        }
+                    }
+                }
+
+                // Check for `else` at or below success depth (switches out of success branch)
+                if blanked.contains("else")
+                    && let Some(d) = success_branch_depth
+                    && current_depth <= d
+                    && !blanked.contains("else if")
+                {
+                    success_branch_depth = None;
+                }
+
+                if blanked.contains(';') && in_condition && !blanked.contains('{') {
+                    in_condition = false;
+                    condition_buf.clear();
+                }
             }
         }
         out
@@ -13531,6 +13849,96 @@ mod acknowledgement_guard {
         assert!(
             submitters_returning_a_projection(&foreign).is_empty(),
             "the projection rule demands a type this crate cannot name"
+        );
+    }
+
+    /// A surface that logs an unobserved outcome verb inside a submitter's
+    /// success branch claims more than the code observed (the CLAIM form, bd-m07q, bd-0oro).
+    ///
+    /// Proven against the REAL pre-fix code from bd-0s7x at 94f1271601:
+    /// terminal's `persist_theme_choice` logged "chrome theme persisted to run config"
+    /// inside `if (self.command_submit.as_ref())(...)`, claiming persistence when the
+    /// command was only enqueued.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_claim_rule_fires_on_pre_fix_history_and_spares_the_correction() {
+        let pre_fix = vec![(
+            "crates/scriptbots-app/src/terminal/mod.rs".to_owned(),
+            [
+                "fn persist_theme_choice(&self, theme: CuratedThemeId) {",
+                "    if (self.command_submit.as_ref())(ControlCommand::UpdateConfig(Box::new(config))) {",
+                "        info!(",
+                "            theme = theme.label(),",
+                "            \"chrome theme persisted to run config\"",
+                "        );",
+                "    } else {",
+                "        warn!(",
+                "            theme = theme.label(),",
+                "            \"terminal renderer failed to enqueue the chrome theme config update\"",
+                "        );",
+                "    }",
+                "}",
+            ]
+            .join("\n"),
+        )];
+
+        let offences = outcome_claims_in_submitter_success_branches(&pre_fix);
+        assert_eq!(
+            offences.len(),
+            1,
+            "the CLAIM rule stopped detecting the defect it was written for: {offences:#?}"
+        );
+        assert!(
+            offences[0].problem.contains("persisted"),
+            "problem must name the outcome verb: {}",
+            offences[0].problem
+        );
+
+        // Quiet on the corrected form from bd-0s7x, so it does not forbid its own fix.
+        let corrected = vec![(
+            "crates/scriptbots-app/src/terminal/mod.rs".to_owned(),
+            [
+                "fn persist_theme_choice(&self, theme: CuratedThemeId) -> Option<String> {",
+                "    if let Some(receipt) =",
+                "        (self.command_submit.as_ref())(ControlCommand::UpdateConfig(Box::new(config)))",
+                "    {",
+                "        info!(",
+                "            theme = theme.label(),",
+                "            %receipt,",
+                "            \"chrome theme change enqueued for the run config\"",
+                "        );",
+                "        Some(receipt)",
+                "    } else {",
+                "        warn!(",
+                "            theme = theme.label(),",
+                "            \"terminal renderer failed to enqueue the chrome theme config update\"",
+                "        );",
+                "        None",
+                "    }",
+                "}",
+            ]
+            .join("\n"),
+        )];
+
+        assert!(
+            outcome_claims_in_submitter_success_branches(&corrected).is_empty(),
+            "the CLAIM rule fires on the corrected form"
+        );
+    }
+
+    /// No surface may log an outcome verb on submission without observing it.
+    #[test]
+    fn no_surface_claims_an_unobserved_outcome_on_submission() {
+        let sources = scanned_sources();
+        let offences = outcome_claims_in_submitter_success_branches(&sources);
+        assert!(
+            offences.is_empty(),
+            "a surface logs an unobserved outcome verb inside a submitter's success branch (bd-m07q):{}",
+            offences
+                .iter()
+                .map(Offence::to_string)
+                .collect::<Vec<_>>()
+                .join("")
         );
     }
 }

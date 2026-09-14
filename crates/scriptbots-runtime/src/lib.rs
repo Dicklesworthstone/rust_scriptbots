@@ -620,9 +620,18 @@ pub struct RenderSnapshot {
     /// It is one byte per agent, so publishing it unconditionally costs less
     /// than the branch that would decide whether to.
     ///
-    /// This is deliberately NOT the same thing as `ProjectionRequest::selection`
-    /// and `ProjectedAgent::selected`, which are per-client overlay state. The
-    /// relationship between the two is unspecified today and is `bd-ydu8`.
+    /// This is the shared command-applied world selection state, distinct from client-local
+    /// presentation selection in `ProjectionRequest::selection`.
+    ///
+    /// Relationship and precedence (bd-ydu8):
+    /// `RenderSnapshot::agent_selection` records the world-level selection applied via the
+    /// command bus (`ControlCommand::UpdateSelection`). By default (`ProjectionSelectionSource::Overlay`),
+    /// `project_snapshot` seeds agent selection from this snapshot vector and overlays any
+    /// client-local identities in `ProjectionRequest::selection.selected`. Clients may also explicitly
+    /// choose `ProjectionSelectionSource::ClientOnly` (ignoring world selection) or
+    /// `ProjectionSelectionSource::WorldOnly` (ignoring client-local overrides).
+    /// In the resulting `ProjectedAgent`, `selected` reflects the combined outcome under the
+    /// chosen policy, while `world_selected` and `client_selected` preserve the exact respective inputs.
     #[serde(with = "serde_arc")]
     pub agent_selection: Arc<Vec<SelectionState>>,
     /// Bounded ring of interventions the world applied or let lapse.
@@ -751,13 +760,68 @@ pub struct ProjectionCamera {
     pub zoom: f32,
 }
 
+/// Precedence and combination policy for client projection selection relative to shared world selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionSelectionSource {
+    /// Seed selection from shared world selection (`RenderSnapshot::agent_selection`) and
+    /// overlay client-local `selected` identities (default).
+    ///
+    /// An agent is considered selected if it is marked `SelectionState::Selected` in the
+    /// world snapshot OR explicitly included in `ProjectionRequest::selection.selected`.
+    #[default]
+    Overlay,
+    /// Pure client-local selection: use only `ProjectionRequest::selection.selected`,
+    /// ignoring `RenderSnapshot::agent_selection`.
+    ClientOnly,
+    /// Pure world selection: use only `RenderSnapshot::agent_selection`,
+    /// ignoring `ProjectionRequest::selection.selected`.
+    WorldOnly,
+}
+
 /// Client-owned selection that never mutates scientific or global host state.
+///
+/// Precedence and relationship to shared world selection (`RenderSnapshot::agent_selection`):
+/// By default (`source: ProjectionSelectionSource::Overlay`), the projection seeds selection
+/// from the snapshot's shared `agent_selection` (where `SelectionState::Selected` marks selected agents)
+/// and overlays any client-local identities listed in `selected`. Clients can configure `source`
+/// to `ClientOnly` to ignore world selection and use only client-local identities,
+/// or `WorldOnly` to reflect only the shared world selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectionSelection {
     /// Primary agent shown by an inspector, when present in the source snapshot.
     pub focused: Option<AgentUid>,
     /// Client-local selected identities.
     pub selected: Vec<AgentUid>,
+    /// Precedence and combination policy relative to shared world selection.
+    #[serde(default)]
+    pub source: ProjectionSelectionSource,
+}
+
+impl ProjectionSelection {
+    /// Construct a new client-local selection with default overlay semantics.
+    #[must_use]
+    pub const fn new(focused: Option<AgentUid>, selected: Vec<AgentUid>) -> Self {
+        Self {
+            focused,
+            selected,
+            source: ProjectionSelectionSource::Overlay,
+        }
+    }
+
+    /// Construct a selection with an explicit source policy.
+    #[must_use]
+    pub const fn with_source(
+        focused: Option<AgentUid>,
+        selected: Vec<AgentUid>,
+        source: ProjectionSelectionSource,
+    ) -> Self {
+        Self {
+            focused,
+            selected,
+            source,
+        }
+    }
 }
 
 /// Amount of compact per-agent detail requested for visible and selected agents.
@@ -935,6 +999,7 @@ pub struct ProjectedAgentDetail {
 }
 
 /// One compact visible agent projected into logical canvas coordinates.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectedAgent {
     /// Stable logical identity used by client-local selection.
@@ -949,8 +1014,12 @@ pub struct ProjectedAgent {
     pub wrap_offset: [f64; 2],
     /// Renderer-neutral linear RGB color.
     pub color: [f32; 3],
-    /// Whether this client selected the agent.
+    /// Whether this agent is selected under the effective projection selection policy (`ProjectionSelectionSource`).
     pub selected: bool,
+    /// Whether this agent is selected in the shared world snapshot (`RenderSnapshot::agent_selection`).
+    pub world_selected: bool,
+    /// Whether this agent is explicitly selected in the client's projection request (`ProjectionSelection::selected`).
+    pub client_selected: bool,
     /// Whether this is the client's primary focused agent.
     pub focused: bool,
     /// Optional requested detail.
@@ -1298,12 +1367,12 @@ fn project_normalized_snapshot(
     let mut cells = vec![ProjectionCell::default(); canvas_len];
     let selected = &request.selection.selected;
     let mut visible_agents = Vec::new();
-    let mut selected_agents = Vec::with_capacity(selected.len());
+    let mut selected_agents = Vec::new();
     let mut focused_agent = None;
     let top_k = usize::from(request.top_k);
     let mut top_heap = BinaryHeap::with_capacity(top_k);
 
-    for agent in &snapshot.world.agents {
+    for (index, agent) in snapshot.world.agents.iter().enumerate() {
         let candidate = RankingHeapEntry(ProjectedRankingEntry {
             uid: agent.uid,
             value: ranking_value(agent, request.ranking),
@@ -1328,7 +1397,13 @@ fn project_normalized_snapshot(
             f64::from(delta_x).mul_add(f64::from(scale), f64::from(viewport_width) * 0.5);
         let canvas_y =
             f64::from(delta_y).mul_add(f64::from(scale), f64::from(viewport_height) * 0.5);
-        let is_selected = selected.binary_search(&agent.uid).is_ok();
+        let world_selected = snapshot.agent_selection(index) == SelectionState::Selected;
+        let client_selected = selected.binary_search(&agent.uid).is_ok();
+        let is_selected = match request.selection.source {
+            ProjectionSelectionSource::Overlay => world_selected || client_selected,
+            ProjectionSelectionSource::ClientOnly => client_selected,
+            ProjectionSelectionSource::WorldOnly => world_selected,
+        };
         let is_focused = request.selection.focused == Some(agent.uid);
         let projected = ProjectedAgent {
             uid: agent.uid,
@@ -1338,6 +1413,8 @@ fn project_normalized_snapshot(
             wrap_offset: [wrap_x, wrap_y],
             color: agent.color,
             selected: is_selected,
+            world_selected,
+            client_selected,
             focused: is_focused,
             detail: projected_detail(agent, request.detail),
         };
@@ -5616,6 +5693,7 @@ mod tests {
             selection: ProjectionSelection {
                 focused: Some(AgentUid(1)),
                 selected: vec![AgentUid(3), AgentUid(2), AgentUid(1), AgentUid(1)],
+                ..Default::default()
             },
             detail: ProjectionDetail::Kinematics,
             chart_window: 10,
@@ -5649,6 +5727,7 @@ mod tests {
         request_b.selection = ProjectionSelection {
             focused: Some(AgentUid(3)),
             selected: vec![AgentUid(3)],
+            ..Default::default()
         };
         request_b.chart_window = 3;
         request_b.chart_points = 2;
@@ -5936,6 +6015,137 @@ mod tests {
         assert_eq!(result.chart.len(), 3);
         assert_eq!(result.chart.first().expect("chart first").tick, Tick(1));
         assert_eq!(result.chart.last().expect("chart last").tick, Tick(10));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn projection_selection_precedence_and_combination_modes() {
+        let mut snapshot = projection_snapshot();
+        // Agent 1 is Selected in world, Agent 2 is None, Agent 3 is Hovered
+        snapshot.agent_selection = Arc::new(vec![
+            SelectionState::Selected,
+            SelectionState::None,
+            SelectionState::Hovered,
+        ]);
+
+        let limits = ProjectionLimits::default();
+
+        // 1. Default request with empty selection under Overlay seeds from world selection
+        let default_request = projection_request(100);
+        let mut req_empty_selection = default_request.clone();
+        req_empty_selection.selection = ProjectionSelection::default();
+        assert_eq!(
+            req_empty_selection.selection.source,
+            ProjectionSelectionSource::Overlay
+        );
+        let proj_default =
+            project_snapshot(&snapshot, &req_empty_selection, limits).expect("default projection");
+        assert_eq!(
+            proj_default.selected_agents.len(),
+            1,
+            "world-selected agent must be selected in projection even if not repeated in request"
+        );
+        let p_agent1 = proj_default
+            .selected_agents
+            .iter()
+            .find(|a| a.uid == AgentUid(1))
+            .expect("agent 1 selected");
+        assert!(p_agent1.selected);
+        assert!(p_agent1.world_selected);
+        assert!(!p_agent1.client_selected);
+
+        // 2. Overlay mode with client overlay: Agent 2 added by client
+        let mut req_overlay = default_request.clone();
+        req_overlay.selection = ProjectionSelection::new(Some(AgentUid(2)), vec![AgentUid(2)]);
+        let proj_overlay =
+            project_snapshot(&snapshot, &req_overlay, limits).expect("overlay projection");
+        assert_eq!(
+            proj_overlay.selected_agents.len(),
+            2,
+            "both world-selected (Agent 1) and client-selected (Agent 2) must be present in Overlay"
+        );
+        let a1 = proj_overlay
+            .selected_agents
+            .iter()
+            .find(|a| a.uid == AgentUid(1))
+            .expect("agent 1 in overlay");
+        assert!(a1.selected);
+        assert!(a1.world_selected);
+        assert!(!a1.client_selected);
+
+        let a2 = proj_overlay
+            .selected_agents
+            .iter()
+            .find(|a| a.uid == AgentUid(2))
+            .expect("agent 2 in overlay");
+        assert!(a2.selected);
+        assert!(!a2.world_selected);
+        assert!(a2.client_selected);
+
+        let a3 = proj_overlay
+            .visible_agents
+            .iter()
+            .find(|a| a.uid == AgentUid(3));
+        if let Some(a3) = a3 {
+            assert!(!a3.selected);
+            assert!(!a3.world_selected);
+            assert!(!a3.client_selected);
+        }
+
+        // 3. ClientOnly mode: ignores world selection
+        let mut req_client_only = default_request.clone();
+        req_client_only.selection = ProjectionSelection::with_source(
+            Some(AgentUid(2)),
+            vec![AgentUid(2)],
+            ProjectionSelectionSource::ClientOnly,
+        );
+        let proj_client_only =
+            project_snapshot(&snapshot, &req_client_only, limits).expect("client-only projection");
+        assert_eq!(
+            proj_client_only.selected_agents.len(),
+            1,
+            "only client-selected Agent 2 must be present in ClientOnly mode"
+        );
+        let c_a2 = &proj_client_only.selected_agents[0];
+        assert_eq!(c_a2.uid, AgentUid(2));
+        assert!(c_a2.selected);
+        assert!(!c_a2.world_selected);
+        assert!(c_a2.client_selected);
+
+        // 4. WorldOnly mode: ignores client selection
+        let mut req_world_only = default_request;
+        req_world_only.selection = ProjectionSelection::with_source(
+            None,
+            vec![AgentUid(2)],
+            ProjectionSelectionSource::WorldOnly,
+        );
+        let proj_world_only =
+            project_snapshot(&snapshot, &req_world_only, limits).expect("world-only projection");
+        assert_eq!(
+            proj_world_only.selected_agents.len(),
+            1,
+            "only world-selected Agent 1 must be present in WorldOnly mode"
+        );
+        let w_a1 = &proj_world_only.selected_agents[0];
+        assert_eq!(w_a1.uid, AgentUid(1));
+        assert!(w_a1.selected);
+        assert!(w_a1.world_selected);
+        assert!(!w_a1.client_selected);
+
+        // 5. Serde verification: omitted source defaults to Overlay
+        let json_omitted = r#"{"focused":null,"selected":[1,2]}"#;
+        let decoded: ProjectionSelection =
+            serde_json::from_str(json_omitted).expect("deserialize omitted source");
+        assert_eq!(decoded.source, ProjectionSelectionSource::Overlay);
+        assert_eq!(decoded.selected, vec![AgentUid(1), AgentUid(2)]);
+
+        let json_explicit = r#"{"focused":1,"selected":[2],"source":"client_only"}"#;
+        let decoded_explicit: ProjectionSelection =
+            serde_json::from_str(json_explicit).expect("deserialize client_only source");
+        assert_eq!(
+            decoded_explicit.source,
+            ProjectionSelectionSource::ClientOnly
+        );
     }
 
     #[derive(Debug)]

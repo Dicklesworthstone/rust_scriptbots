@@ -5798,6 +5798,7 @@ mod tests {
             selection: ProjectionSelection {
                 focused: Some(AgentUid(uid)),
                 selected: vec![AgentUid(next_uid), AgentUid(uid)],
+                ..Default::default()
             },
             detail: match client % 3 {
                 0 => ProjectionDetail::Minimal,
@@ -6667,6 +6668,7 @@ mod tests {
             selection: ProjectionSelection {
                 focused: Some(focused),
                 selected,
+                ..Default::default()
             },
             detail: ProjectionDetail::Kinematics,
             chart_window: 64,
