@@ -28,7 +28,6 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::Range;
 
 const DEFAULT_LAYOUT_BYTES: usize = 32 << 20;
-const CONSERVATIVE_NODE_GROWTH_BYTES: usize = 2_048;
 const BTREE_ENTRY_OVERHEAD_BYTES: usize = 48;
 
 /// Stable identifier for a phylogeny tree node (species clade, individual agent, or sentinel).
@@ -47,12 +46,28 @@ pub enum PhyloKey {
 pub struct LayoutIdx(u32);
 
 impl LayoutIdx {
-    fn from_usize(value: usize) -> Option<Self> {
+    /// Create a layout index from a raw 32-bit integer.
+    #[must_use]
+    pub const fn from_u32(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Create a layout index from `usize` if it fits within `u32`.
+    #[must_use]
+    pub fn from_usize(value: usize) -> Option<Self> {
         u32::try_from(value).ok().map(Self)
     }
 
-    fn as_usize(self) -> usize {
-        usize::try_from(self.0).expect("u32 layout index fits usize")
+    /// Numeric index as a 32-bit integer.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Numeric index as `usize`.
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
     }
 }
 
@@ -757,6 +772,18 @@ impl TreeLayout {
         self.index.get(key).map(|idx| &self.nodes[idx.as_usize()])
     }
 
+    /// Looks up a layout node by its internal [`LayoutIdx`].
+    #[must_use]
+    pub fn node_by_idx(&self, idx: LayoutIdx) -> Option<&LayoutNode> {
+        self.nodes.get(idx.as_usize())
+    }
+
+    /// Looks up a layout node by its internal [`LayoutIdx`].
+    #[must_use]
+    pub fn get_by_idx(&self, idx: LayoutIdx) -> Option<&LayoutNode> {
+        self.nodes.get(idx.as_usize())
+    }
+
     /// Conservative allocation-aware memory retained by this layout.
     #[must_use]
     pub fn memory_report(&self) -> MemoryReport {
@@ -817,6 +844,7 @@ impl TreeLayout {
     }
 
     /// Extends the layout without any whole-tree coordinate pass.
+    #[allow(clippy::too_many_lines)]
     pub fn extend(&mut self, delta: &PhyloDelta) -> LayoutDelta {
         let memory_before = self.memory_report().total_retained_bytes;
         let mut report = LayoutDelta {
@@ -849,7 +877,7 @@ impl TreeLayout {
                 }
             }
         }
-        for key in conflicts {
+        for &key in &conflicts {
             canonical.remove(&key);
             report
                 .issues
@@ -865,9 +893,30 @@ impl TreeLayout {
             })
             .collect::<BTreeMap<_, _>>();
 
+        let mut cascaded_invalid = invalid;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (key, update) in &canonical {
+                if cascaded_invalid.contains_key(key) {
+                    continue;
+                }
+                if let ParentRef::Known(parent_key) = update.parent {
+                    if conflicts.contains(&parent_key) {
+                        cascaded_invalid
+                            .insert(*key, LayoutIssue::ConflictingDuplicate { key: parent_key });
+                        changed = true;
+                    } else if let Some(parent_issue) = cascaded_invalid.get(&parent_key).cloned() {
+                        cascaded_invalid.insert(*key, parent_issue);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
         let mut new_nodes = Vec::new();
         for (key, update) in &canonical {
-            if let Some(issue) = invalid.get(key) {
+            if let Some(issue) = cascaded_invalid.get(key) {
                 report.issues.push(issue.clone());
                 continue;
             }
@@ -918,7 +967,7 @@ impl TreeLayout {
         }
         if update
             .death_tick
-            .is_some_and(|death| death < update.birth_tick)
+            .is_some_and(|death| death <= update.birth_tick)
         {
             return Err(LayoutIssue::InvalidLifetime { key: update.key });
         }
@@ -942,7 +991,7 @@ impl TreeLayout {
             });
         }
         if let Some(parent_birth) = self.declared_birth(direct_parent, batch)
-            && parent_birth > update.birth_tick
+            && parent_birth >= update.birth_tick
         {
             return Err(LayoutIssue::ParentBornAfterChild {
                 child: update.key,
@@ -998,12 +1047,50 @@ impl TreeLayout {
                 .budget
                 .max_nodes
                 .min(usize::try_from(u32::MAX).unwrap_or(usize::MAX));
-        let bytes_fit = self
-            .memory_report()
-            .total_retained_bytes
-            .saturating_add(additional_nodes.saturating_mul(CONSERVATIVE_NODE_GROWTH_BYTES))
-            <= self.budget.max_bytes;
-        count_fits && bytes_fit
+        if !count_fits {
+            return false;
+        }
+        let proj_nodes =
+            if self.nodes.len().saturating_add(additional_nodes) > self.nodes.capacity() {
+                (self.nodes.capacity().saturating_mul(2))
+                    .max(self.nodes.len().saturating_add(additional_nodes))
+            } else {
+                self.nodes.capacity()
+            };
+        let proj_node_bytes = proj_nodes.saturating_mul(std::mem::size_of::<LayoutNode>());
+        let proj_agg_bytes = proj_nodes.saturating_mul(std::mem::size_of::<SubtreeAggregate>());
+        let proj_top_bytes = proj_nodes
+            .saturating_mul(std::mem::size_of::<Vec<LayoutIdx>>())
+            .saturating_add(proj_nodes.saturating_mul(std::mem::size_of::<SpatialKey>()));
+        let proj_key_bytes = self
+            .index
+            .len()
+            .saturating_add(additional_nodes)
+            .saturating_mul(
+                std::mem::size_of::<(PhyloKey, LayoutIdx)>()
+                    .saturating_add(BTREE_ENTRY_OVERHEAD_BYTES),
+            );
+        let proj_lod_bytes = self.lod_index.retained_bytes().saturating_add(
+            additional_nodes.saturating_mul(
+                std::mem::size_of::<Option<LodIndexNode>>()
+                    .saturating_add(std::mem::size_of::<usize>()),
+            ),
+        );
+        let projected_total = std::mem::size_of::<Self>()
+            .saturating_add(proj_node_bytes)
+            .saturating_add(proj_agg_bytes)
+            .saturating_add(proj_top_bytes)
+            .saturating_add(self.child_capacity_bytes)
+            .saturating_add(proj_key_bytes)
+            .saturating_add(self.pending_capacity_bytes)
+            .saturating_add(
+                self.pending_by_parent.len().saturating_mul(
+                    std::mem::size_of::<(PhyloKey, Vec<LayoutIdx>)>()
+                        .saturating_add(BTREE_ENTRY_OVERHEAD_BYTES),
+                ),
+            )
+            .saturating_add(proj_lod_bytes);
+        projected_total <= self.budget.max_bytes
     }
 
     fn push_node(&mut self, update: &PhyloNodeUpdate, report: &mut LayoutDelta) -> LayoutIdx {
@@ -1158,12 +1245,11 @@ impl TreeLayout {
         );
         for child in children {
             let child_key = self.nodes[child.as_usize()].key;
-            if self.nodes[parent.as_usize()].first_tick > self.nodes[child.as_usize()].first_tick {
+            if self.nodes[parent.as_usize()].first_tick >= self.nodes[child.as_usize()].first_tick {
                 report.issues.push(LayoutIssue::ParentBornAfterChild {
                     child: child_key,
                     parent: parent_key,
                 });
-                self.insert_pending(parent_key, child, report);
                 continue;
             }
             if self.would_cycle(child, parent) {
@@ -1171,7 +1257,6 @@ impl TreeLayout {
                     key: child_key,
                     parent: parent_key,
                 });
-                self.insert_pending(parent_key, child, report);
                 continue;
             }
             self.attach_child(parent, child, report);
@@ -1450,7 +1535,32 @@ impl TreeLayout {
                 }
             }
         }
-        report.truncated = !candidates.is_empty();
+        let mut has_remaining_match = false;
+        while let Some(candidate) = candidates.pop() {
+            match candidate.kind {
+                CandidateKind::Item(_) => {
+                    has_remaining_match = true;
+                    break;
+                }
+                CandidateKind::Subtree(slot) => {
+                    report.index_nodes_visited = report.index_nodes_visited.saturating_add(1);
+                    let indexed = self.lod_index.node(slot);
+                    if Self::lod_item_matches(indexed, viewport, y_start, y_end) {
+                        has_remaining_match = true;
+                        break;
+                    }
+                    for child in [indexed.left, indexed.right].into_iter().flatten() {
+                        if self.lod_subtree_intersects(child, viewport, y_start, y_end) {
+                            candidates.push(LodCandidate {
+                                rank: self.lod_index.node(child).best_rank,
+                                kind: CandidateKind::Subtree(child),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        report.truncated = has_remaining_match;
         report
     }
 
@@ -1527,6 +1637,30 @@ impl TreeLayout {
         best.map(|(_, key)| key)
     }
 
+    /// Collapses a clade subtree starting at `root`.
+    ///
+    /// Sets `collapsed = true` for the root and all its descendants.
+    /// Returns the number of nodes whose collapsed state changed from `false` to `true`.
+    pub fn collapse(&mut self, root: PhyloKey) -> usize {
+        let Some(&root_idx) = self.index.get(&root) else {
+            return 0;
+        };
+
+        let mut count = 0;
+        let mut stack = vec![root_idx];
+        while let Some(idx) = stack.pop() {
+            let node = &mut self.nodes[idx.as_usize()];
+            if !node.collapsed {
+                node.collapsed = true;
+                count += 1;
+            }
+            for &child_idx in &self.children[idx.as_usize()] {
+                stack.push(child_idx);
+            }
+        }
+        count
+    }
+
     /// Expands a collapsed clade subtree up to the depth and node budget limits.
     pub fn expand(
         &mut self,
@@ -1544,16 +1678,20 @@ impl TreeLayout {
         let effective_depth_budget = depth_budget.min(self.budget.max_depth);
         let effective_node_budget = node_budget.min(self.budget.max_nodes);
         let mut count = 0;
+        let mut visited = 0;
         let mut truncated = false;
         let mut stack = vec![(root_idx, 0)];
 
         while let Some((idx, depth)) = stack.pop() {
-            if count >= effective_node_budget {
+            if visited >= effective_node_budget {
                 truncated = true;
                 break;
             }
-            self.nodes[idx.as_usize()].collapsed = false;
-            count += 1;
+            visited += 1;
+            if self.nodes[idx.as_usize()].collapsed {
+                self.nodes[idx.as_usize()].collapsed = false;
+                count += 1;
+            }
 
             let children = &self.children[idx.as_usize()];
             if depth < effective_depth_budget {
@@ -2945,10 +3083,50 @@ mod tests {
         };
         let lod = layout.lod_report(viewport, 45_000.0..55_000.0, 128);
         let memory = layout.memory_report();
+        let mut first_divergence: Option<(usize, String)> = None;
+        let root_node = &layout.nodes[0];
+        let expected_root_x = 0.0_f32;
+        let expected_root_y = 50001.0_f32;
+        if root_node.x.to_bits() != expected_root_x.to_bits()
+            || root_node.y.to_bits() != expected_root_y.to_bits()
+        {
+            first_divergence = Some((
+                0,
+                format!(
+                    "root expected ({expected_root_x}, {expected_root_y}) found ({}, {})",
+                    root_node.x, root_node.y
+                ),
+            ));
+        } else {
+            for id in 1..NODE_COUNT {
+                let node = &layout.nodes[id];
+                #[allow(clippy::cast_precision_loss)]
+                let expected_x = id as f32;
+                #[allow(clippy::cast_precision_loss)]
+                let expected_y = (id + 1) as f32;
+                if node.x.to_bits() != expected_x.to_bits()
+                    || node.y.to_bits() != expected_y.to_bits()
+                {
+                    first_divergence = Some((
+                        id,
+                        format!(
+                            "node {id} expected ({expected_x}, {expected_y}) found ({}, {})",
+                            node.x, node.y
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+        let divergence_str = match &first_divergence {
+            Some((idx, detail)) => format!("diverged_at_node_{idx}:_{detail}"),
+            None => "none".to_string(),
+        };
+
         eprintln!(
             "phylo_stress nodes={} added={} ancestor_steps={} index_update_visits={} \
              allocation_growths={} allocated_bytes={} elapsed_ms={} lod_visits={} \
-             lod_results={} lod_height={} first_divergence=none",
+             lod_results={} lod_height={} first_divergence={}",
             layout.len(),
             update.added.len(),
             update.ancestor_steps,
@@ -2959,13 +3137,24 @@ mod tests {
             lod.index_nodes_visited,
             lod.nodes.len(),
             lod.index_height,
+            divergence_str,
         );
         assert!(update.issues.is_empty(), "{:?}", update.issues);
+        assert!(
+            first_divergence.is_none(),
+            "unexpected coordinate divergence: {:?}",
+            first_divergence
+        );
         assert_eq!(layout.len(), NODE_COUNT);
         assert_eq!(update.ancestor_steps, NODE_COUNT - 1);
         assert!(!update.full_relayout);
         assert!(update.allocation_growths <= NODE_COUNT.saturating_add(160));
         assert!(memory.total_retained_bytes <= 256 << 20);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "100k stress elapsed {:?} exceeds 10s budget",
+            elapsed
+        );
         assert_eq!(lod.nodes.len(), 128);
         assert!(
             lod.index_nodes_visited
@@ -2978,6 +3167,218 @@ mod tests {
             lod.index_height,
             lod.nodes.len()
         );
+    }
+
+    #[test]
+    fn collapse_and_expand_cycle_is_symmetrical() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+        let root = species(1, ParentRef::Root, 1, 10, None, 50);
+        let child1 = species(2, ParentRef::Known(PhyloKey::Species(1)), 2, 20, None, 20);
+        let child2 = species(3, ParentRef::Known(PhyloKey::Species(1)), 3, 25, None, 30);
+        let grandchild = species(4, ParentRef::Known(PhyloKey::Species(2)), 4, 30, None, 10);
+
+        let report = layout.extend(&PhyloDelta {
+            updates: vec![root, child1, child2, grandchild],
+        });
+        assert!(report.issues.is_empty());
+        assert_eq!(layout.len(), 4);
+
+        // Initially, no nodes are collapsed.
+        assert!(!layout.get_node(&PhyloKey::Species(1)).unwrap().collapsed);
+        assert!(!layout.get_node(&PhyloKey::Species(2)).unwrap().collapsed);
+        assert!(!layout.get_node(&PhyloKey::Species(3)).unwrap().collapsed);
+        assert!(!layout.get_node(&PhyloKey::Species(4)).unwrap().collapsed);
+
+        // Collapsing root collapses all 4 nodes in the subtree.
+        let collapsed_count = layout.collapse(PhyloKey::Species(1));
+        assert_eq!(collapsed_count, 4);
+        assert!(layout.get_node(&PhyloKey::Species(1)).unwrap().collapsed);
+        assert!(layout.get_node(&PhyloKey::Species(2)).unwrap().collapsed);
+        assert!(layout.get_node(&PhyloKey::Species(3)).unwrap().collapsed);
+        assert!(layout.get_node(&PhyloKey::Species(4)).unwrap().collapsed);
+
+        // Collapsing again returns 0 as all nodes are already collapsed.
+        assert_eq!(layout.collapse(PhyloKey::Species(1)), 0);
+
+        // Expand root with budget limiting depth to 0 (only root itself).
+        let exp = layout.expand(PhyloKey::Species(1), 0, 10);
+        assert_eq!(exp.expanded_nodes, 1);
+        assert!(exp.truncated);
+        assert!(!layout.get_node(&PhyloKey::Species(1)).unwrap().collapsed);
+        assert!(layout.get_node(&PhyloKey::Species(2)).unwrap().collapsed);
+        assert!(layout.get_node(&PhyloKey::Species(3)).unwrap().collapsed);
+        assert!(layout.get_node(&PhyloKey::Species(4)).unwrap().collapsed);
+
+        // Expand root fully.
+        let exp_full = layout.expand(PhyloKey::Species(1), 10, 10);
+        assert_eq!(exp_full.expanded_nodes, 3);
+        assert!(!exp_full.truncated);
+        assert!(!layout.get_node(&PhyloKey::Species(1)).unwrap().collapsed);
+        assert!(!layout.get_node(&PhyloKey::Species(2)).unwrap().collapsed);
+        assert!(!layout.get_node(&PhyloKey::Species(3)).unwrap().collapsed);
+        assert!(!layout.get_node(&PhyloKey::Species(4)).unwrap().collapsed);
+
+        // Non-existent key returns 0 for collapse and empty report for expand.
+        assert_eq!(layout.collapse(PhyloKey::Species(999)), 0);
+        let exp_none = layout.expand(PhyloKey::Species(999), 10, 10);
+        assert_eq!(exp_none.expanded_nodes, 0);
+        assert!(!exp_none.truncated);
+    }
+
+    #[test]
+    fn strict_lifecycle_and_ancestry_validation() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+
+        // death == birth is rejected as InvalidLifetime
+        let death_equal_birth = species(1, ParentRef::Root, 1, 10, Some(10), 10);
+        let report = layout.extend(&PhyloDelta {
+            updates: vec![death_equal_birth],
+        });
+        assert_eq!(
+            report.issues,
+            vec![LayoutIssue::InvalidLifetime {
+                key: PhyloKey::Species(1),
+            }]
+        );
+
+        // death < birth is rejected as InvalidLifetime
+        let death_before_birth = species(2, ParentRef::Root, 2, 10, Some(5), 10);
+        let report = layout.extend(&PhyloDelta {
+            updates: vec![death_before_birth],
+        });
+        assert_eq!(
+            report.issues,
+            vec![LayoutIssue::InvalidLifetime {
+                key: PhyloKey::Species(2),
+            }]
+        );
+
+        // Valid parent
+        let parent = species(10, ParentRef::Root, 10, 10, None, 10);
+        let report = layout.extend(&PhyloDelta {
+            updates: vec![parent],
+        });
+        assert!(report.issues.is_empty());
+
+        // parent_birth == child_birth is rejected as ParentBornAfterChild
+        let child_same_tick = species(11, ParentRef::Known(PhyloKey::Species(10)), 11, 10, None, 5);
+        let report = layout.extend(&PhyloDelta {
+            updates: vec![child_same_tick],
+        });
+        assert_eq!(
+            report.issues,
+            vec![LayoutIssue::ParentBornAfterChild {
+                parent: PhyloKey::Species(10),
+                child: PhyloKey::Species(11),
+            }]
+        );
+
+        // parent_birth > child_birth is rejected as ParentBornAfterChild
+        let child_earlier_tick =
+            species(12, ParentRef::Known(PhyloKey::Species(10)), 12, 5, None, 5);
+        let report = layout.extend(&PhyloDelta {
+            updates: vec![child_earlier_tick],
+        });
+        assert_eq!(
+            report.issues,
+            vec![LayoutIssue::ParentBornAfterChild {
+                parent: PhyloKey::Species(10),
+                child: PhyloKey::Species(12),
+            }]
+        );
+    }
+
+    #[test]
+    fn same_batch_parent_rejection_cascades_to_children() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+
+        // Parent has invalid lifetime (death <= birth), child references it in the same batch.
+        let invalid_parent = species(1, ParentRef::Root, 1, 10, Some(10), 10);
+        let child = species(2, ParentRef::Known(PhyloKey::Species(1)), 2, 20, None, 5);
+        let grandchild = species(3, ParentRef::Known(PhyloKey::Species(2)), 3, 30, None, 2);
+
+        let report = layout.extend(&PhyloDelta {
+            updates: vec![invalid_parent, child, grandchild],
+        });
+
+        // Parent is rejected, and both child and grandchild are rejected via cascade.
+        assert_eq!(report.issues.len(), 3);
+        assert_eq!(layout.len(), 0);
+        // Children must not be left pending!
+        assert_eq!(layout.memory_report().pending_index_bytes, 0);
+
+        // Same batch with conflicting duplicate parent:
+        let parent_a = species(10, ParentRef::Root, 10, 10, None, 10);
+        let parent_b = species(10, ParentRef::Root, 10, 10, None, 20); // conflicting population
+        let child_of_conflict =
+            species(11, ParentRef::Known(PhyloKey::Species(10)), 11, 20, None, 5);
+
+        let report2 = layout.extend(&PhyloDelta {
+            updates: vec![parent_a, parent_b, child_of_conflict],
+        });
+        assert_eq!(report2.issues.len(), 2); // 1 ConflictingDuplicate for parent, 1 cascaded for child
+        assert_eq!(layout.len(), 0);
+        assert_eq!(layout.memory_report().pending_index_bytes, 0);
+    }
+
+    #[test]
+    fn lod_report_truncation_flag_is_truthful() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+        let root = species(1, ParentRef::Root, 1, 10, None, 50);
+        let child1 = species(2, ParentRef::Known(PhyloKey::Species(1)), 2, 20, None, 20);
+        let child2 = species(3, ParentRef::Known(PhyloKey::Species(1)), 3, 30, None, 30);
+
+        layout.extend(&PhyloDelta {
+            updates: vec![root, child1, child2],
+        });
+
+        let viewport = TickRange {
+            start: Tick(0),
+            end: Tick(50),
+        };
+
+        // All 3 nodes are in the viewport Y and tick range.
+        // Budget = 1: 1 node returned, truncated MUST be true.
+        let lod1 = layout.lod_report(viewport, 0.0..100.0, 1);
+        assert_eq!(lod1.nodes.len(), 1);
+        assert!(lod1.truncated);
+
+        // Budget = 2: 2 nodes returned, truncated MUST be true (1 node remains).
+        let lod2 = layout.lod_report(viewport, 0.0..100.0, 2);
+        assert_eq!(lod2.nodes.len(), 2);
+        assert!(lod2.truncated);
+
+        // Budget = 3: all 3 nodes returned, truncated MUST be false.
+        let lod3 = layout.lod_report(viewport, 0.0..100.0, 3);
+        assert_eq!(lod3.nodes.len(), 3);
+        assert!(!lod3.truncated);
+
+        // Budget = 10: more budget than matching nodes, truncated MUST be false.
+        let lod10 = layout.lod_report(viewport, 0.0..100.0, 10);
+        assert_eq!(lod10.nodes.len(), 3);
+        assert!(!lod10.truncated);
+    }
+
+    #[test]
+    fn node_by_idx_and_get_by_idx_accessors() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+        let root = species(1, ParentRef::Root, 1, 10, None, 50);
+        let delta = layout.extend(&PhyloDelta {
+            updates: vec![root],
+        });
+        let root_idx = delta.added[0];
+
+        assert_eq!(root_idx.as_u32(), 0);
+        assert_eq!(root_idx.as_usize(), 0);
+
+        let node_a = layout.node_by_idx(root_idx).expect("node exists");
+        let node_b = layout.get_by_idx(root_idx).expect("node exists");
+        assert_eq!(node_a.key, PhyloKey::Species(1));
+        assert_eq!(node_b.key, PhyloKey::Species(1));
+
+        let out_of_bounds = LayoutIdx::from_u32(999);
+        assert!(layout.node_by_idx(out_of_bounds).is_none());
+        assert!(layout.get_by_idx(out_of_bounds).is_none());
     }
 
     // =========================================================================
