@@ -1,0 +1,11 @@
+Bioluminescent Dark-Field v1 Capture Log
+=========================================
+Renderer: scriptbots-world-gfx::WorldRenderer
+Backend: Vulkan
+Device: llvmpipe (LLVM 21.1.8, 256 bits)
+Viewport: 1600x900
+Render Duration: 154.51ms
+Output PNG: /data/projects/rust_scriptbots/crates/scriptbots-world-gfx/../../docs/rendering_reference/bioluminescent_dark_field_v1.png
+PNG Bytes: 83725
+PNG SHA-256: 5ddbd6cc8c22844b302bc5f5e3003a405a0ebda1c537c81d1927d336d5171fba
+Status: SUCCESS

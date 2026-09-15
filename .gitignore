@@ -24,6 +24,7 @@ scriptbots*.db.wal
 crates/scriptbots-render/frames_render_test/*.png
 *.png
 !docs/rendering_reference/golden/*.png
+!docs/rendering_reference/*.png
 !crates/scriptbots-app/tests/scenes/goldens/**/*.png
 # Live render probes are evidence, not build output. Without this every probe has to
 # be force-added, which is why some are tracked and some silently are not (bd-abu3).

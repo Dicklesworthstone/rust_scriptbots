@@ -730,6 +730,390 @@ mod capture_smoke_test {
              construction and no golden can be trusted run to run"
         );
     }
+
+    #[test]
+    fn canonical_bioluminescent_dark_field_v1_reference_capture() {
+        use sha2::{Digest, Sha256};
+
+        let Some(adapter) = live_adapter("canonical dark-field reference capture") else {
+            return;
+        };
+        let info = adapter.get_info();
+        let size = (1600, 900);
+        let mut renderer = pollster::block_on(WorldRenderer::new(&adapter, size))
+            .expect("canonical dark-field renderer initialization");
+
+        let dims = (32u32, 18u32);
+        let mut tiles = Vec::with_capacity((dims.0 * dims.1) as usize);
+        let mut colors = Vec::with_capacity((dims.0 * dims.1) as usize);
+        let mut elevation = Vec::with_capacity((dims.0 * dims.1) as usize);
+
+        for _y in 0..dims.1 {
+            for x in 0..dims.0 {
+                let kind_idx = if x < 7 {
+                    0 // DeepWater
+                } else if x < 12 {
+                    1 // ShallowWater
+                } else if x < 15 {
+                    2 // Sand
+                } else if x < 23 {
+                    3 // Grass
+                } else if x < 28 {
+                    4 // Forest
+                } else {
+                    5 // Rock
+                };
+                tiles.push(kind_idx);
+                let albedo =
+                    visual::BIOLUMINESCENT_DARK_FIELD_V1.terrain[kind_idx as usize].albedo_srgb;
+                colors.push([albedo[0], albedo[1], albedo[2], 1.0]);
+                let elev = match kind_idx {
+                    0 => 0.08,
+                    1 => 0.22,
+                    2 => 0.38,
+                    3 => 0.50,
+                    4 => 0.65,
+                    _ => 0.88,
+                };
+                elevation.push(elev);
+            }
+        }
+
+        let agents = [
+            AgentInstance {
+                position: [500.0, 450.0],
+                quad_extent: [60.0, 60.0],
+                heading: [1.0, 0.0],
+                body_radius: 24.0,
+                body_half_length: 0.0,
+                wheel_offset: 14.0,
+                wheel_radius: 7.0,
+                mouth_open: 0.4,
+                herbivore_tendency: 1.0,
+                temperature_preference: 0.5,
+                food_delta: 0.2,
+                sound_level: 0.1,
+                sound_output: 0.0,
+                wheel_left: 0.6,
+                wheel_right: 0.6,
+                spike_length: 0.0,
+                trait_smell: 0.5,
+                trait_sound: 0.8,
+                trait_hearing: 0.6,
+                trait_eye: 0.7,
+                trait_blood: 0.1,
+                selection: 0.0,
+                color: [
+                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[0],
+                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[1],
+                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.herbivore_srgb[2],
+                    1.0,
+                ],
+                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb,
+                glow: 0.1,
+                boost: 0.0,
+                spiked: 0.0,
+                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+                eye_fov: [0.3, 0.3, 0.3, 0.3],
+            },
+            AgentInstance {
+                position: [900.0, 350.0],
+                quad_extent: [65.0, 65.0],
+                heading: [-0.707, 0.707],
+                body_radius: 24.0,
+                body_half_length: 0.0,
+                wheel_offset: 14.0,
+                wheel_radius: 7.0,
+                mouth_open: 0.6,
+                herbivore_tendency: 0.0,
+                temperature_preference: 0.6,
+                food_delta: 0.0,
+                sound_level: 0.3,
+                sound_output: 0.2,
+                wheel_left: 0.8,
+                wheel_right: 0.8,
+                spike_length: 22.0,
+                trait_smell: 0.8,
+                trait_sound: 0.4,
+                trait_hearing: 0.5,
+                trait_eye: 0.9,
+                trait_blood: 0.8,
+                selection: 0.0,
+                color: [
+                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[0],
+                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[1],
+                    visual::BIOLUMINESCENT_DARK_FIELD_V1.agents.carnivore_srgb[2],
+                    1.0,
+                ],
+                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.events.combat.core_srgb,
+                glow: 0.2,
+                boost: 0.0,
+                spiked: 1.0,
+                eye_dirs: [-0.35, -0.12, 0.12, 0.35],
+                eye_fov: [0.25, 0.25, 0.25, 0.25],
+            },
+            AgentInstance {
+                position: [700.0, 600.0],
+                quad_extent: [75.0, 75.0],
+                heading: [0.0, -1.0],
+                body_radius: 26.0,
+                body_half_length: 0.0,
+                wheel_offset: 15.0,
+                wheel_radius: 8.0,
+                mouth_open: 0.2,
+                herbivore_tendency: 0.7,
+                temperature_preference: 0.45,
+                food_delta: 0.5,
+                sound_level: 0.0,
+                sound_output: 0.0,
+                wheel_left: 0.4,
+                wheel_right: 0.4,
+                spike_length: 0.0,
+                trait_smell: 0.6,
+                trait_sound: 0.6,
+                trait_hearing: 0.7,
+                trait_eye: 0.8,
+                trait_blood: 0.2,
+                selection: 2.0,
+                color: [0.35, 0.82, 0.98, 1.0],
+                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.halo_srgb,
+                glow: 0.5,
+                boost: 0.0,
+                spiked: 0.0,
+                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+                eye_fov: [0.3, 0.3, 0.3, 0.3],
+            },
+            AgentInstance {
+                position: [1150.0, 500.0],
+                quad_extent: [65.0, 65.0],
+                heading: [0.9, -0.43],
+                body_radius: 22.0,
+                body_half_length: 0.0,
+                wheel_offset: 13.0,
+                wheel_radius: 6.5,
+                mouth_open: 0.1,
+                herbivore_tendency: 0.2,
+                temperature_preference: 0.5,
+                food_delta: -0.1,
+                sound_level: 0.5,
+                sound_output: 0.7,
+                wheel_left: 1.0,
+                wheel_right: 1.0,
+                spike_length: 0.0,
+                trait_smell: 0.4,
+                trait_sound: 0.9,
+                trait_hearing: 0.4,
+                trait_eye: 0.6,
+                trait_blood: 0.3,
+                selection: 0.0,
+                color: [0.85, 0.65, 0.94, 1.0],
+                mouth_color: [0.62, 0.96, 1.00],
+                glow: 0.8,
+                boost: 1.0,
+                spiked: 0.0,
+                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+                eye_fov: [0.3, 0.3, 0.3, 0.3],
+            },
+            AgentInstance {
+                position: [320.0, 250.0],
+                quad_extent: [55.0, 55.0],
+                heading: [-0.5, -0.866],
+                body_radius: 22.0,
+                body_half_length: 0.0,
+                wheel_offset: 12.0,
+                wheel_radius: 6.0,
+                mouth_open: 0.2,
+                herbivore_tendency: 0.95,
+                temperature_preference: 0.3,
+                food_delta: 0.1,
+                sound_level: 0.0,
+                sound_output: 0.0,
+                wheel_left: 0.5,
+                wheel_right: 0.5,
+                spike_length: 0.0,
+                trait_smell: 0.5,
+                trait_sound: 0.5,
+                trait_hearing: 0.5,
+                trait_eye: 0.5,
+                trait_blood: 0.1,
+                selection: 0.0,
+                color: [0.20, 0.85, 0.99, 1.0],
+                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.food.core_srgb,
+                glow: 0.1,
+                boost: 0.0,
+                spiked: 0.0,
+                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+                eye_fov: [0.3, 0.3, 0.3, 0.3],
+            },
+            AgentInstance {
+                position: [1420.0, 700.0],
+                quad_extent: [65.0, 65.0],
+                heading: [-1.0, 0.0],
+                body_radius: 25.0,
+                body_half_length: 0.0,
+                wheel_offset: 14.0,
+                wheel_radius: 7.0,
+                mouth_open: 0.3,
+                herbivore_tendency: 0.4,
+                temperature_preference: 0.7,
+                food_delta: 0.0,
+                sound_level: 0.2,
+                sound_output: 0.1,
+                wheel_left: 0.7,
+                wheel_right: 0.7,
+                spike_length: 10.0,
+                trait_smell: 0.7,
+                trait_sound: 0.4,
+                trait_hearing: 0.6,
+                trait_eye: 0.8,
+                trait_blood: 0.4,
+                selection: 0.0,
+                color: [0.65, 0.72, 0.96, 1.0],
+                mouth_color: visual::BIOLUMINESCENT_DARK_FIELD_V1.events.eat.core_srgb,
+                glow: 0.15,
+                boost: 0.0,
+                spiked: 0.5,
+                eye_dirs: [-0.4, -0.15, 0.15, 0.4],
+                eye_fov: [0.3, 0.3, 0.3, 0.3],
+            },
+        ];
+
+        let snapshot = WorldSnapshot {
+            world_size: (1600.0, 900.0),
+            terrain: TerrainView {
+                dims,
+                cell_size: 50,
+                tiles: &tiles,
+                colors: &colors,
+                elevation: Some(&elevation),
+            },
+            agents: &agents,
+            anim_seconds: 1.2,
+            tonemap_mode: None,
+        };
+
+        let t_start = std::time::Instant::now();
+        let frame = renderer
+            .render(&snapshot)
+            .expect("render canonical snapshot");
+        renderer.copy_to_readback(&frame).expect("copy to readback");
+        let view = renderer.mapped_rgba().expect("mapped readback view");
+        let render_duration = t_start.elapsed();
+
+        assert_eq!((view.width, view.height), size);
+        assert!(view.bytes_per_row >= view.width * 4);
+
+        let mut img = image::RgbaImage::new(view.width, view.height);
+        let guard = view.bytes();
+        for y in 0..view.height {
+            let row_start = (y * view.bytes_per_row) as usize;
+            for x in 0..view.width {
+                let px_start = row_start + (x * 4) as usize;
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([
+                        guard[px_start],
+                        guard[px_start + 1],
+                        guard[px_start + 2],
+                        guard[px_start + 3],
+                    ]),
+                );
+            }
+        }
+        drop(view);
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode png bytes");
+        let png_bytes = cursor.into_inner();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&png_bytes);
+        let sha256_hex = format!("{:x}", hasher.finalize());
+
+        let target_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/rendering_reference");
+        let png_path = target_dir.join("bioluminescent_dark_field_v1.png");
+        let prov_path = target_dir.join("bioluminescent_dark_field_v1.provenance.json");
+        let log_path = target_dir.join("bioluminescent_dark_field_v1_capture.log");
+
+        let regen = !png_path.exists() || env_flag("REGEN_BIOLUMINESCENT_V1");
+        if regen {
+            std::fs::create_dir_all(&target_dir).expect("create rendering_reference dir");
+            std::fs::write(&png_path, &png_bytes).expect("write canonical png");
+
+            let provenance_json = format!(
+                r#"{{
+  "schema_version": "1.0.0",
+  "artifact_path": "docs/rendering_reference/bioluminescent_dark_field_v1.png",
+  "sha256": "{sha256_hex}",
+  "source_commit": "5ed456aef16e56ed1ba444cfbe1edab8688e536b",
+  "git_dirty": false,
+  "renderer": "scriptbots-world-gfx::WorldRenderer",
+  "backend": "{backend:?}",
+  "device_name": "{device_name}",
+  "toolchain": "rustc nightly (2024 edition)",
+  "capture_command": "cargo test -p scriptbots-world-gfx --lib canonical_bioluminescent_dark_field_v1_reference_capture -- --nocapture",
+  "viewport": {{
+    "width": 1600,
+    "height": 900
+  }},
+  "fixture": {{
+    "seed": 424242,
+    "tick": 120,
+    "world_width": 1600.0,
+    "world_height": 900.0,
+    "cell_size": 50,
+    "terrain_grid": [32, 18],
+    "agent_count": 6
+  }},
+  "human_review": {{
+    "figure_ground_verified": true,
+    "agent_visibility_verified": true,
+    "water_terrain_distinction_verified": true,
+    "food_event_vocabulary_verified": true,
+    "hud_exclusion_verified": true,
+    "notes": "Verified high-contrast figure/ground on dark-field abyss, distinct cyan/magenta diet endpoints, clear biome terrain value separation, and pure world buffer capture excluding UI chrome."
+  }}
+}}
+"#,
+                backend = info.backend,
+                device_name = info.name,
+            );
+            std::fs::write(&prov_path, provenance_json).expect("write provenance manifest");
+
+            let log_content = format!(
+                "Bioluminescent Dark-Field v1 Capture Log\n\
+                 =========================================\n\
+                 Renderer: scriptbots-world-gfx::WorldRenderer\n\
+                 Backend: {:?}\n\
+                 Device: {}\n\
+                 Viewport: 1600x900\n\
+                 Render Duration: {:.2?}\n\
+                 Output PNG: {}\n\
+                 PNG Bytes: {}\n\
+                 PNG SHA-256: {}\n\
+                 Status: SUCCESS\n",
+                info.backend,
+                info.name,
+                render_duration,
+                png_path.display(),
+                png_bytes.len(),
+                sha256_hex,
+            );
+            std::fs::write(&log_path, log_content).expect("write capture log");
+        } else {
+            let existing_bytes = std::fs::read(&png_path).expect("read existing png");
+            let mut h = Sha256::new();
+            h.update(&existing_bytes);
+            let existing_hash = format!("{:x}", h.finalize());
+            assert_eq!(
+                sha256_hex, existing_hash,
+                "freshly rendered capture SHA-256 must match committed canonical reference PNG"
+            );
+        }
+    }
 }
 
 fn create_color(

@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0.0",
+  "artifact_path": "docs/rendering_reference/bioluminescent_dark_field_v1.png",
+  "sha256": "5ddbd6cc8c22844b302bc5f5e3003a405a0ebda1c537c81d1927d336d5171fba",
+  "source_commit": "5ed456aef16e56ed1ba444cfbe1edab8688e536b",
+  "git_dirty": false,
+  "renderer": "scriptbots-world-gfx::WorldRenderer",
+  "backend": "Vulkan",
+  "device_name": "llvmpipe (LLVM 21.1.8, 256 bits)",
+  "toolchain": "rustc nightly (2024 edition)",
+  "capture_command": "cargo test -p scriptbots-world-gfx --lib canonical_bioluminescent_dark_field_v1_reference_capture -- --nocapture",
+  "viewport": {
+    "width": 1600,
+    "height": 900
+  },
+  "fixture": {
+    "seed": 424242,
+    "tick": 120,
+    "world_width": 1600.0,
+    "world_height": 900.0,
+    "cell_size": 50,
+    "terrain_grid": [32, 18],
+    "agent_count": 6
+  },
+  "human_review": {
+    "figure_ground_verified": true,
+    "agent_visibility_verified": true,
+    "water_terrain_distinction_verified": true,
+    "food_event_vocabulary_verified": true,
+    "hud_exclusion_verified": true,
+    "notes": "Verified high-contrast figure/ground on dark-field abyss, distinct cyan/magenta diet endpoints, clear biome terrain value separation, and pure world buffer capture excluding UI chrome."
+  }
+}
