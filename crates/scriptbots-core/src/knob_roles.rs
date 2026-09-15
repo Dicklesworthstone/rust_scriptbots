@@ -146,6 +146,8 @@ pub static KNOB_ROLES: &[KnobSpec] = &[
     spec("metabolism_ramp_floor", ScientificTransition),
     spec("metabolism_ramp_rate", ScientificTransition),
     spec("movement_drain", ScientificTransition),
+    // --- Evolution and novelty selection (bd-16g.6.2) ---
+    spec("novelty_k", ScientificTransition),
     // --- Population ---
     spec("population_crossover_chance", ScientificTransition),
     spec("population_minimum", ScientificTransition),
@@ -169,6 +171,7 @@ pub static KNOB_ROLES: &[KnobSpec] = &[
     spec("reproduction_rate_herbivore", ScientificTransition),
     spec("reproduction_spawn_back_distance", ScientificTransition),
     spec("reproduction_spawn_jitter", ScientificTransition),
+    spec("selection_mode", ScientificTransition),
     // --- Sensing ---
     spec("sense_radius", ScientificTransition),
     // --- Combat ---

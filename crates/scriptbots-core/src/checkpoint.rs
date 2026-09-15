@@ -2936,13 +2936,12 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_698,
-                "4ae2dd65753a6af8534179c5abc6263504a9cfc966063d1b0b19085e137b19f5",
+                8_700,
+                "4dc51bf6360f10a7635efcfcf5ee5fb4460a93174ddd9edca2b77bbad63b37a4",
             ),
-            "the reviewed V1.3/codec-8 wire must remain byte-identical. bd-6xr2 makes \
-             configuration serialization complete: the seven archive fields add exactly \
-             149 bytes, including the six declared behavioral axes. Pinned DSR25 at \
-             6c89bef produced identical canonical wires in default and economy-fault builds. \
+            "the reviewed V1.3/codec-8 wire must remain byte-identical. bd-16g.6.2 adds \
+             selection_mode and novelty_k to configuration serialization (adding exactly 2 bytes). \
+             Pinned DSR25 at 6c89bef produced identical canonical wires in default and economy-fault builds. \
              Science digest goldens and checkpoint tamper/continuation guards remain unchanged"
         );
     }

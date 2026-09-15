@@ -13,8 +13,8 @@
 
 use scriptbots_core::knob_roles::KNOB_ROLES;
 use scriptbots_core::{
-    AgentData, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, WorldDigestV1,
-    WorldState,
+    AgentData, BrainRunner, EvolutionSelectionMode, INPUT_SIZE, OUTPUT_SIZE, Position,
+    ScriptBotsConfig, WorldDigestV1, WorldState,
 };
 use serde_json::Value;
 
@@ -174,6 +174,12 @@ enum Baseline {
     /// values here are chosen to make births happen within the budget WITHOUT compounding,
     /// and the witness budget is short enough that growth cannot run away.
     ReproductionEnabled,
+    /// A world where novelty-based reproduction is active so novelty knobs are reachable.
+    ///
+    /// When `selection_mode` is `Fitness` (default), `novelty_k` is inert by construction
+    /// (bd-16g.6.2). To witness `novelty_k`, reproduction must be active and `selection_mode`
+    /// must be set to `Novelty`.
+    NoveltyReproductionEnabled,
     /// A world where the population floor actively injects agents.
     ///
     /// `population_minimum` defaults to 0, so the injection path never runs and every
@@ -328,7 +334,8 @@ fn baseline_config(baseline: Baseline, mut config: ScriptBotsConfig) -> ScriptBo
     if baseline == Baseline::TopographyEnabled {
         config.topography_enabled = true;
     }
-    if baseline == Baseline::ReproductionEnabled {
+    if baseline == Baseline::ReproductionEnabled || baseline == Baseline::NoveltyReproductionEnabled
+    {
         // Frequent enough that a short run contains births; NOT the compounding
         // configuration bd-pdx5 diagnosed as a runaway.
         config.reproduction_cooldown = 2;
@@ -336,6 +343,9 @@ fn baseline_config(baseline: Baseline, mut config: ScriptBotsConfig) -> ScriptBo
         config.reproduction_attempt_chance = 1.0;
         config.reproduction_energy_threshold = 0.1;
         config.reproduction_partner_chance = 1.0;
+    }
+    if baseline == Baseline::NoveltyReproductionEnabled {
+        config.selection_mode = EvolutionSelectionMode::Novelty;
     }
     if baseline == Baseline::PopulationFloorEnabled {
         // A floor above the seeded agent count, checked often enough to fire.
@@ -366,81 +376,97 @@ fn baseline_config(baseline: Baseline, mut config: ScriptBotsConfig) -> ScriptBo
     config
 }
 
-/// Bind baseline brains and runtime state, through public APIs.
-fn arm_baseline(world: &mut WorldState, baseline: Baseline) -> Result<(), String> {
-    if baseline == Baseline::SharingEnabled {
-        let key = world
-            .brain_registry_mut()
-            .map_err(|e| format!("registry: {e:?}"))?
-            .register("test.bd-3mul-giver", |_rng| {
-                Ok(Box::new(GiverBrain) as Box<dyn BrainRunner>)
-            });
-        #[expect(
-            clippy::needless_collect,
-            reason = "Snapshot handles before binding and runtime updates mutably borrow world; iter_handles borrows the same arena"
-        )]
-        for handle in world.agents().iter_handles().collect::<Vec<_>>() {
-            world
-                .bind_agent_brain(handle, key)
-                .map_err(|e| format!("bind giver: {e:?}"))?;
-            world
-                .try_update_agent_runtime(handle, |runtime| {
-                    runtime.energy = 1.5;
-                })
-                .map_err(|e| format!("giver runtime: {e:?}"))?;
-        }
-        return Ok(());
-    }
-    if baseline == Baseline::BoostEnabled {
-        let key = world
-            .brain_registry_mut()
-            .map_err(|e| format!("registry: {e:?}"))?
-            .register("test.bd-6i23-boost", |_rng| {
-                Ok(Box::new(BoostBrain) as Box<dyn BrainRunner>)
-            });
-        #[expect(
-            clippy::needless_collect,
-            reason = "Snapshot handles before binding and runtime updates mutably borrow world; iter_handles borrows the same arena"
-        )]
-        for handle in world.agents().iter_handles().collect::<Vec<_>>() {
-            world
-                .bind_agent_brain(handle, key)
-                .map_err(|e| format!("bind boost: {e:?}"))?;
-            world
-                .try_update_agent_runtime(handle, |runtime| {
-                    runtime.energy = 1.5;
-                })
-                .map_err(|e| format!("boost runtime: {e:?}"))?;
-        }
-        return Ok(());
-    }
-    if baseline == Baseline::DietThreshold {
-        let attacker = world
-            .agents()
-            .iter_handles()
-            .next()
-            .ok_or_else(|| "diet baseline needs an agent".to_owned())?;
-        let key = world
-            .brain_registry_mut()
-            .map_err(|e| format!("registry: {e:?}"))?
-            .register("test.bd-6i23-aggressor", |_rng| {
-                Ok(Box::new(AggressorBrain) as Box<dyn BrainRunner>)
-            });
+fn arm_sharing(world: &mut WorldState) -> Result<(), String> {
+    let key = world
+        .brain_registry_mut()
+        .map_err(|e| format!("registry: {e:?}"))?
+        .register("test.bd-3mul-giver", |_rng| {
+            Ok(Box::new(GiverBrain) as Box<dyn BrainRunner>)
+        });
+    #[expect(
+        clippy::needless_collect,
+        reason = "Snapshot handles before binding and runtime updates mutably borrow world; iter_handles borrows the same arena"
+    )]
+    for handle in world.agents().iter_handles().collect::<Vec<_>>() {
         world
-            .bind_agent_brain(attacker, key)
-            .map_err(|e| format!("bind: {e:?}"))?;
+            .bind_agent_brain(handle, key)
+            .map_err(|e| format!("bind giver: {e:?}"))?;
         world
-            .try_update_agent_runtime(attacker, |runtime| {
-                // Keep tendency at exactly 0.5 so it sits on the carnivore_threshold boundary
-                runtime.herbivore_tendency = 0.5;
+            .try_update_agent_runtime(handle, |runtime| {
                 runtime.energy = 1.5;
             })
-            .map_err(|e| format!("attacker runtime: {e:?}"))?;
-        return Ok(());
+            .map_err(|e| format!("giver runtime: {e:?}"))?;
     }
-    if baseline != Baseline::CombatReachable {
-        return Ok(());
+    Ok(())
+}
+
+fn arm_boost(world: &mut WorldState) -> Result<(), String> {
+    let key = world
+        .brain_registry_mut()
+        .map_err(|e| format!("registry: {e:?}"))?
+        .register("test.bd-6i23-boost", |_rng| {
+            Ok(Box::new(BoostBrain) as Box<dyn BrainRunner>)
+        });
+    #[expect(
+        clippy::needless_collect,
+        reason = "Snapshot handles before binding and runtime updates mutably borrow world; iter_handles borrows the same arena"
+    )]
+    for handle in world.agents().iter_handles().collect::<Vec<_>>() {
+        world
+            .bind_agent_brain(handle, key)
+            .map_err(|e| format!("bind boost: {e:?}"))?;
+        world
+            .try_update_agent_runtime(handle, |runtime| {
+                runtime.energy = 1.5;
+            })
+            .map_err(|e| format!("boost runtime: {e:?}"))?;
     }
+    Ok(())
+}
+
+fn arm_diet(world: &mut WorldState) -> Result<(), String> {
+    let attacker = world
+        .agents()
+        .iter_handles()
+        .next()
+        .ok_or_else(|| "diet baseline needs an agent".to_owned())?;
+    let key = world
+        .brain_registry_mut()
+        .map_err(|e| format!("registry: {e:?}"))?
+        .register("test.bd-6i23-aggressor", |_rng| {
+            Ok(Box::new(AggressorBrain) as Box<dyn BrainRunner>)
+        });
+    world
+        .bind_agent_brain(attacker, key)
+        .map_err(|e| format!("bind: {e:?}"))?;
+    world
+        .try_update_agent_runtime(attacker, |runtime| {
+            // Keep tendency at exactly 0.5 so it sits on the carnivore_threshold boundary
+            runtime.herbivore_tendency = 0.5;
+            runtime.energy = 1.5;
+        })
+        .map_err(|e| format!("attacker runtime: {e:?}"))?;
+    Ok(())
+}
+
+fn arm_novelty_reproduction(world: &mut WorldState) -> Result<(), String> {
+    let handles: Vec<_> = world.agents().iter_handles().collect();
+    for (i, handle) in handles.into_iter().enumerate() {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "Witness test world seeds at most six agents; index is well within exact float precision"
+        )]
+        let diet = (i as f32) / 5.0;
+        world
+            .try_update_agent_runtime(handle, |runtime| {
+                runtime.herbivore_tendency = diet;
+            })
+            .map_err(|e| format!("novelty runtime: {e:?}"))?;
+    }
+    Ok(())
+}
+
+fn arm_combat(world: &mut WorldState) -> Result<(), String> {
     let attacker = world
         .agents()
         .iter_handles()
@@ -462,6 +488,18 @@ fn arm_baseline(world: &mut WorldState, baseline: Baseline) -> Result<(), String
         })
         .map_err(|e| format!("attacker runtime: {e:?}"))?;
     Ok(())
+}
+
+/// Bind baseline brains and runtime state, through public APIs.
+fn arm_baseline(world: &mut WorldState, baseline: Baseline) -> Result<(), String> {
+    match baseline {
+        Baseline::SharingEnabled => arm_sharing(world),
+        Baseline::BoostEnabled => arm_boost(world),
+        Baseline::DietThreshold => arm_diet(world),
+        Baseline::NoveltyReproductionEnabled => arm_novelty_reproduction(world),
+        Baseline::CombatReachable => arm_combat(world),
+        _ => Ok(()),
+    }
 }
 
 /// Deterministic world for a witness run: fixed seed, fixed agent layout, fixed tick budget.
@@ -966,6 +1004,18 @@ static WITNESSES: &[Witness] = &[
         ticks: 16,
         baseline: Baseline::ReproductionEnabled,
     },
+    Witness {
+        path: "selection_mode",
+        value: || serde_json::to_value(EvolutionSelectionMode::Novelty).expect("json"),
+        ticks: 16,
+        baseline: Baseline::ReproductionEnabled,
+    },
+    Witness {
+        path: "novelty_k",
+        value: || Value::from(1),
+        ticks: 16,
+        baseline: Baseline::NoveltyReproductionEnabled,
+    },
     // The population-floor family: injection never runs while the floor is zero.
     Witness {
         path: "population_minimum",
@@ -1133,6 +1183,12 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
         Baseline::ReproductionEnabled,
     )
     .expect("the reproduction baseline must build and step a world");
+    let novelty_reproduction_reference = run_material(
+        ScriptBotsConfig::default(),
+        16,
+        Baseline::NoveltyReproductionEnabled,
+    )
+    .expect("the novelty reproduction baseline must build and step a world");
     let population_reference = run_material(
         ScriptBotsConfig::default(),
         16,
@@ -1164,6 +1220,7 @@ fn bd_dorx_every_witnessed_knob_moves_material_world_state() {
             Baseline::SharingEnabled => &sharing_reference,
             Baseline::TopographyEnabled => &topography_reference,
             Baseline::ReproductionEnabled => &reproduction_reference,
+            Baseline::NoveltyReproductionEnabled => &novelty_reproduction_reference,
             Baseline::PopulationFloorEnabled => &population_reference,
             Baseline::BoostEnabled => &boost_reference,
             Baseline::TemperatureActive => &temperature_reference,
@@ -1309,8 +1366,8 @@ fn bd_dorx_scientific_witness_coverage_does_not_regress() {
     );
     assert_eq!(
         witnessed.len(),
-        85,
-        "exact observed count of active witnesses (85 of 88 scientific knobs)"
+        87,
+        "exact observed count of active witnesses (87 of 90 scientific knobs)"
     );
 }
 

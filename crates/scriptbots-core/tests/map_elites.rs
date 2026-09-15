@@ -2,9 +2,9 @@
 
 use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::map_elites::{
-    ArchiveEntry, ArchiveProvenance, Axis, BehaviorDescriptor, BehaviorSpaceV0, InsertionResult,
-    MAX_ARCHIVE_CELLS, MapElitesArchive, PhenotypeFeature, QdError, QualityMetric,
-    compute_novelty_score,
+    ArchiveEntry, ArchiveProvenance, Axis, BehaviorDescriptor, BehaviorSpaceV0,
+    EvolutionSelectionMode, InsertionResult, MAX_ARCHIVE_CELLS, MapElitesArchive, PhenotypeFeature,
+    QdError, QualityMetric, compute_novelty_score,
 };
 use scriptbots_core::{
     AgentData, AgentUid, BrainFamilyId, BrainGenomeEnvelope, BrainProvenance, Generation,
@@ -671,6 +671,10 @@ fn test_negative_5k_tick_pinned_seed_archive_inertness() {
         .expect("digest_enabled");
 
     assert_eq!(
+        digest_disabled.rng_probe, digest_enabled.rng_probe,
+        "RNG probe words must remain byte-identical: enabling the archive under Fitness mode introduced zero extra RNG draws"
+    );
+    assert_eq!(
         digest_disabled, digest_enabled,
         "Archive must be purely an observer: enabling the MAP-Elites archive MUST NOT change characterization_digest_v0"
     );
@@ -680,5 +684,159 @@ fn test_negative_5k_tick_pinned_seed_archive_inertness() {
     assert!(
         archive_b.coverage_count() > 0,
         "archive must have evaluated and inserted elites across 5k ticks"
+    );
+}
+
+#[test]
+fn test_draw_count_contract_across_selection_modes() {
+    let make_world = |mode: EvolutionSelectionMode| -> (WorldState, Vec<scriptbots_core::AgentId>) {
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_cooldown: 5,
+            reproduction_energy_threshold: 2.0,
+            reproduction_energy_cost: 1.0,
+            reproduction_attempt_chance: 0.5,
+            reproduction_attempt_interval: 1,
+            selection_mode: mode,
+            archive_enabled: true,
+            archive_interval: 1,
+            rng_seed: Some(1337_4242),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let key = world
+            .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+            .expect("register MLP");
+
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let data = AgentData {
+                age: 20,
+                ..AgentData::default()
+            };
+            let id = world.try_spawn_agent(data).expect("spawn agent");
+            world.bind_agent_brain(id, key).expect("bind brain");
+            world
+                .try_update_agent_runtime(id, |rt| {
+                    rt.energy = 10.0;
+                    rt.reproduction_counter = 50.0;
+                    #[allow(clippy::cast_precision_loss)]
+                    let tend = (i as f32) * 0.1;
+                    rt.herbivore_tendency = tend;
+                })
+                .expect("update runtime");
+            ids.push(id);
+        }
+        (world, ids)
+    };
+
+    let (mut world_fitness, ids_fitness) = make_world(EvolutionSelectionMode::Fitness);
+    let (mut world_novelty, ids_novelty) = make_world(EvolutionSelectionMode::Novelty);
+    let (mut world_curiosity, ids_curiosity) =
+        make_world(EvolutionSelectionMode::Curiosity { w: 0.5 });
+
+    // Step 1 tick
+    world_fitness.step().expect("step fitness");
+    world_novelty.step().expect("step novelty");
+    world_curiosity.step().expect("step curiosity");
+
+    // Assert every agent has identical reproduction attempt draw count across all three modes
+    for i in 0..10 {
+        let fitness_counters = world_fitness
+            .agent_rng_counters(ids_fitness[i])
+            .expect("fitness counters");
+        let novelty_counters = world_novelty
+            .agent_rng_counters(ids_novelty[i])
+            .expect("novelty counters");
+        let curiosity_counters = world_curiosity
+            .agent_rng_counters(ids_curiosity[i])
+            .expect("curiosity counters");
+
+        assert_eq!(
+            fitness_counters.reproduction_attempt_ordinal(),
+            novelty_counters.reproduction_attempt_ordinal(),
+            "Novelty mode must consume the exact same number of reproduction attempt draws as Fitness"
+        );
+        assert_eq!(
+            fitness_counters.reproduction_attempt_ordinal(),
+            curiosity_counters.reproduction_attempt_ordinal(),
+            "Curiosity mode must consume the exact same number of reproduction attempt draws as Fitness"
+        );
+        assert_eq!(
+            fitness_counters.reproduction_attempt_ordinal(),
+            1,
+            "Each eligible agent must have taken exactly 1 reproduction attempt draw"
+        );
+    }
+}
+
+#[test]
+fn test_novelty_selection_modulates_reproduction_and_alters_lineages() {
+    let make_sim = |mode: EvolutionSelectionMode| -> WorldState {
+        let config = ScriptBotsConfig {
+            population_minimum: 10,
+            population_spawn_interval: 20,
+            reproduction_cooldown: 5,
+            reproduction_energy_threshold: 2.0,
+            reproduction_energy_cost: 1.0,
+            reproduction_attempt_chance: 0.6,
+            selection_mode: mode,
+            archive_enabled: true,
+            archive_interval: 10,
+            rng_seed: Some(999_888),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let key = world
+            .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+            .expect("register MLP");
+
+        for i in 0..10 {
+            let data = AgentData {
+                age: 10,
+                ..AgentData::default()
+            };
+            let id = world.try_spawn_agent(data).expect("spawn agent");
+            world.bind_agent_brain(id, key).expect("bind brain");
+            world
+                .try_update_agent_runtime(id, |rt| {
+                    rt.energy = 8.0;
+                    rt.reproduction_counter = 10.0;
+                    #[allow(clippy::cast_precision_loss)]
+                    let tend = (i as f32) * 0.1;
+                    rt.herbivore_tendency = tend;
+                })
+                .expect("update runtime");
+        }
+        world
+    };
+
+    let mut world_fitness = make_sim(EvolutionSelectionMode::Fitness);
+    let mut world_novelty = make_sim(EvolutionSelectionMode::Novelty);
+
+    for _ in 0..100 {
+        world_fitness.step().expect("step fitness");
+        world_novelty.step().expect("step novelty");
+    }
+
+    // World Novelty must have active novelty state cached
+    let novelty_state = world_novelty.novelty_state().expect("novelty state cached");
+    assert!(!novelty_state.scores.is_empty(), "scores must be populated");
+    assert!(
+        novelty_state.last_recompute_tick.0 > 0,
+        "recompute tick must advance"
+    );
+
+    // World trajectories must diverge because novelty modulated reproduction probabilities
+    let digest_fitness = world_fitness
+        .characterization_digest_v0()
+        .expect("digest fitness");
+    let digest_novelty = world_novelty
+        .characterization_digest_v0()
+        .expect("digest novelty");
+    assert_ne!(
+        digest_fitness.agents, digest_novelty.agents,
+        "Novelty selection must select different reproducing agents and alter agent trajectories"
     );
 }

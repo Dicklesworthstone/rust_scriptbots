@@ -88,8 +88,10 @@ pub mod visual;
 pub use map_elites as qd;
 pub use map_elites::{
     AgentAccumulatedStats, ArchiveCellRow, ArchiveEntry, ArchiveProvenance, ArchiveSpaceRow, Axis,
-    BehaviorDescriptor, BehaviorSpaceV0, CellId, InsertionResult, MAX_ARCHIVE_CELLS,
-    MapElitesArchive, PhenotypeFeature, QdError, QualityMetric, compute_novelty_score,
+    BehaviorDescriptor, BehaviorSpaceV0, CandidateDescriptor, CellId, EvolutionSelectionMode,
+    InsertionResult, MAX_ARCHIVE_CELLS, MapElitesArchive, NoveltyState, PhenotypeFeature, QdError,
+    QualityMetric, combine_curiosity, compute_novelty_score, compute_population_novelty,
+    normalize_scores, normalized_distance,
 };
 
 pub use economy::{
@@ -8235,6 +8237,12 @@ const fn default_archive_quality_metric() -> QualityMetric {
 fn default_archive_space() -> BehaviorSpaceV0 {
     BehaviorSpaceV0::default()
 }
+const fn default_selection_mode() -> EvolutionSelectionMode {
+    EvolutionSelectionMode::Fitness
+}
+const fn default_novelty_k() -> usize {
+    15
+}
 
 /// Persistence event kind recording pairwise interactions observed by the simulation.
 pub const INTERACTION_EVENTS_OBSERVED_KIND: &str = "interaction_events_observed";
@@ -12918,6 +12926,12 @@ pub struct ScriptBotsConfig {
     /// Behavioral space definition for MAP-Elites grid discretization.
     #[serde(default = "default_archive_space")]
     pub archive_space: BehaviorSpaceV0,
+    /// Evolution selection mode governing reproduction probability modulation (bd-16g.6.2).
+    #[serde(default = "default_selection_mode")]
+    pub selection_mode: EvolutionSelectionMode,
+    /// Number of nearest neighbors k for behavior-space novelty scoring (default 15) (bd-16g.6.2).
+    #[serde(default = "default_novelty_k")]
+    pub novelty_k: usize,
     }
 }
 }
@@ -13041,6 +13055,8 @@ impl Default for ScriptBotsConfig {
             archive_max_bytes: 64 * 1024 * 1024,
             archive_quality_metric: QualityMetric::LifetimeIntake,
             archive_space: BehaviorSpaceV0::default(),
+            selection_mode: EvolutionSelectionMode::Fitness,
+            novelty_k: 15,
         }
     }
 }
@@ -13802,6 +13818,17 @@ impl ScriptBotsConfig {
                     "archive_space violates capacity or validity",
                 ));
             }
+        }
+        if let Err(err) = self.selection_mode.validate() {
+            return Err(WorldStateError::InvalidConfig(match err {
+                QdError::InvalidCuriosityWeight { .. } => {
+                    "curiosity weight w must be finite and within [0.0, 1.0]"
+                }
+                _ => "invalid evolution selection mode",
+            }));
+        }
+        if self.novelty_k == 0 {
+            return Err(WorldStateError::InvalidConfig("novelty_k must be non-zero"));
         }
         Ok(())
     }
@@ -18341,6 +18368,8 @@ pub struct WorldState {
     archive: Option<MapElitesArchive>,
     agent_stats: BTreeMap<AgentUid, AgentAccumulatedStats>,
     archive_evaluations: u64,
+    novelty_state: Option<NoveltyState>,
+    consecutive_zero_novelty_samples: u32,
 }
 
 // bd-tqpj: intentional curated summary — a full-field Debug would dump entire world
@@ -19123,6 +19152,13 @@ impl WorldState {
         } else {
             None
         };
+        if config.selection_mode != EvolutionSelectionMode::Fitness {
+            tracing::warn!(
+                target: "scriptbots::qd::novelty",
+                mode = ?config.selection_mode,
+                "novelty/curiosity selection mode enabled: world trajectories will not match fitness-mode fixtures"
+            );
+        }
         Ok(Self {
             food,
             terrain,
@@ -19215,6 +19251,8 @@ impl WorldState {
             archive,
             agent_stats: BTreeMap::new(),
             archive_evaluations: 0,
+            novelty_state: None,
+            consecutive_zero_novelty_samples: 0,
         })
     }
 
@@ -21671,6 +21709,203 @@ impl WorldState {
                 }
             }
         }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Novelty recompute aggregates population descriptors, k-NN evaluation, score normalization, percentile tracking, and diagnostic logging in one pass"
+    )]
+    fn stage_novelty_recompute(&mut self, next_tick: Tick) {
+        if self.config.selection_mode == EvolutionSelectionMode::Fitness {
+            self.novelty_state = None;
+            return;
+        }
+
+        // Budget note: naive k-NN is O(N^2) (N <= 8k, k = 15, D <= 8).
+        let space = self.config.archive_space.clone();
+        let k = self.config.novelty_k;
+
+        let mut live_agents: Vec<(AgentUid, AgentId)> = Vec::with_capacity(self.agents.len());
+        for handle in self.agents.iter_handles() {
+            if let Some(identity) = self.identities.get(handle) {
+                live_agents.push((identity.uid, handle));
+            }
+        }
+        live_agents.sort_unstable_by_key(|(uid, _)| uid.0);
+
+        let mut candidates = Vec::with_capacity(live_agents.len());
+        let mut raw_fitness = Vec::with_capacity(live_agents.len());
+
+        for &(uid, handle) in &live_agents {
+            let Some(runtime) = self.runtime.get(handle) else {
+                continue;
+            };
+            let Some(data) = self.agents.snapshot(handle) else {
+                continue;
+            };
+            let stats = self.agent_stats.get(&uid);
+            let default_stats = AgentAccumulatedStats::default();
+            let stats_ref = stats.unwrap_or(&default_stats);
+
+            let descriptor = match stats_ref.compute_descriptor(&space, runtime) {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "scriptbots::qd::novelty",
+                        tick = %next_tick.0,
+                        uid = %uid.0,
+                        error = %err,
+                        "failed to compute behavior descriptor for novelty"
+                    );
+                    continue;
+                }
+            };
+
+            candidates.push(CandidateDescriptor::new(uid, descriptor));
+
+            if matches!(
+                self.config.selection_mode,
+                EvolutionSelectionMode::Curiosity { .. }
+            ) {
+                let quality = self
+                    .config
+                    .archive_quality_metric
+                    .compute(runtime, &data, stats_ref);
+                raw_fitness.push((uid, quality));
+            }
+        }
+
+        let raw_novelty =
+            match compute_population_novelty(&candidates, self.archive.as_ref(), &space, k) {
+                Ok(scores) => scores,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "scriptbots::qd::novelty",
+                        tick = %next_tick.0,
+                        error = %err,
+                        "failed to compute population novelty"
+                    );
+                    return;
+                }
+            };
+
+        let raw_novelty_map: BTreeMap<AgentUid, f32> = raw_novelty.iter().copied().collect();
+        let novelty_norm = normalize_scores(&raw_novelty);
+
+        let effective_norm = match self.config.selection_mode {
+            EvolutionSelectionMode::Fitness => unreachable!(),
+            EvolutionSelectionMode::Novelty => novelty_norm,
+            EvolutionSelectionMode::Curiosity { w } => {
+                let fitness_norm = normalize_scores(&raw_fitness);
+                match combine_curiosity(w, &novelty_norm, &fitness_norm) {
+                    Ok(combined) => combined,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "scriptbots::qd::novelty",
+                            tick = %next_tick.0,
+                            error = %err,
+                            "failed to combine curiosity scores; falling back to novelty"
+                        );
+                        novelty_norm
+                    }
+                }
+            }
+        };
+
+        let normalized_scores: BTreeMap<AgentUid, f32> = effective_norm.iter().copied().collect();
+
+        // Calculate distribution metrics across raw novelty scores
+        let mut sorted_scores: Vec<f32> = raw_novelty.iter().map(|(_, s)| *s).collect();
+        sorted_scores.sort_by(f32::total_cmp);
+
+        let n = sorted_scores.len();
+        let (mean_novelty, p50_novelty, p95_novelty, max_novelty) = if n == 0 {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            let sum: f32 = sorted_scores.iter().sum();
+            #[allow(clippy::cast_precision_loss)]
+            let mean = sum / (n as f32);
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "Percentile indices are bounded by population size"
+            )]
+            let p50_idx = ((n as f32) * 0.5).floor() as usize;
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "Percentile indices are bounded by population size"
+            )]
+            let p95_idx = ((n as f32) * 0.95).floor() as usize;
+            let p50 = sorted_scores[p50_idx.min(n - 1)];
+            let p95 = sorted_scores[p95_idx.min(n - 1)];
+            let max = *sorted_scores.last().unwrap_or(&0.0);
+            (mean, p50, p95, max)
+        };
+
+        if mean_novelty == 0.0 {
+            self.consecutive_zero_novelty_samples =
+                self.consecutive_zero_novelty_samples.saturating_add(1);
+            if self.consecutive_zero_novelty_samples >= 3 {
+                tracing::warn!(
+                    target: "scriptbots::qd::novelty",
+                    tick = %next_tick.0,
+                    consecutive_zero_samples = %self.consecutive_zero_novelty_samples,
+                    "mean novelty score is 0.0 for 3 or more consecutive samples (novelty search is on but scoring nothing)"
+                );
+            }
+        } else {
+            self.consecutive_zero_novelty_samples = 0;
+        }
+
+        let archive_size = self
+            .archive
+            .as_ref()
+            .map_or(0, MapElitesArchive::coverage_count);
+        tracing::info!(
+            target: "scriptbots::qd::novelty",
+            tick = %next_tick.0,
+            mode = ?self.config.selection_mode,
+            k = %k,
+            population = %candidates.len(),
+            archive_size = %archive_size,
+            mean_novelty = %mean_novelty,
+            p50 = %p50_novelty,
+            p95 = %p95_novelty,
+            max = %max_novelty,
+            "population novelty recomputed"
+        );
+
+        if tracing::enabled!(target: "scriptbots::qd::novelty", tracing::Level::DEBUG) {
+            let mut by_novelty: Vec<(&CandidateDescriptor, f32)> = candidates
+                .iter()
+                .filter_map(|c| raw_novelty_map.get(&c.uid).map(|&s| (c, s)))
+                .collect();
+            by_novelty.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.uid.0.cmp(&b.0.uid.0)));
+            for (c, score) in by_novelty.iter().take(5) {
+                tracing::debug!(
+                    target: "scriptbots::qd::novelty",
+                    tick = %next_tick.0,
+                    uid = %c.uid.0,
+                    score = %score,
+                    descriptor = ?c.descriptor.as_slice(),
+                    "top novel agent"
+                );
+            }
+        }
+
+        self.novelty_state = Some(NoveltyState {
+            last_recompute_tick: next_tick,
+            scores: raw_novelty_map,
+            normalized_scores,
+            mean_novelty,
+            p50_novelty,
+            p95_novelty,
+            max_novelty,
+            consecutive_zero_samples: self.consecutive_zero_novelty_samples,
+        });
     }
 
     fn stage_reset_events(&mut self, preserve_persistence_tail: bool) {
@@ -24149,6 +24384,11 @@ impl WorldState {
         let reproduction_chance = self.cadence.reproduction_chance();
         if reproduction_window && reproduction_chance > 0.0 {
             self.validate_live_generation_headroom()?;
+            if self.config.selection_mode != EvolutionSelectionMode::Fitness
+                && self.novelty_state.is_none()
+            {
+                self.stage_novelty_recompute(self.tick.next());
+            }
         }
 
         let columns = self.agents.columns();
@@ -24204,10 +24444,21 @@ impl WorldState {
                 AgentRngOperationV1::ReproductionAdmission,
                 attempt_ordinal,
             );
-            if reproduction_chance < 1.0
-                && admission_rng.random_range(0.0..1.0) >= reproduction_chance
-            {
-                continue;
+            let modulator = match self.config.selection_mode {
+                EvolutionSelectionMode::Fitness => 1.0,
+                EvolutionSelectionMode::Novelty | EvolutionSelectionMode::Curiosity { .. } => self
+                    .novelty_state
+                    .as_ref()
+                    .and_then(|state| state.normalized_scores.get(&parent_uid))
+                    .copied()
+                    .unwrap_or(0.0),
+            };
+            let p = (reproduction_chance * modulator).clamp(0.0, 1.0);
+            if reproduction_chance < 1.0 {
+                let draw: f32 = admission_rng.random_range(0.0..1.0);
+                if draw >= p {
+                    continue;
+                }
             }
 
             let mut partner_rng = agent_substream(
@@ -25857,12 +26108,19 @@ impl WorldState {
         let summary = observed_stage!(WorldStepStage::Bookkeeping, {
             self.stage_accumulate_food_balance();
             self.stage_accumulate_tick_events();
-            if self.config.archive_enabled {
+            if self.config.archive_enabled
+                || self.config.selection_mode != EvolutionSelectionMode::Fitness
+            {
                 self.stage_accumulate_agent_stats();
                 if self.config.archive_interval != 0
                     && next_tick.0.is_multiple_of(self.config.archive_interval)
                 {
-                    self.stage_archive_maintenance(next_tick);
+                    if self.config.archive_enabled {
+                        self.stage_archive_maintenance(next_tick);
+                    }
+                    if self.config.selection_mode != EvolutionSelectionMode::Fitness {
+                        self.stage_novelty_recompute(next_tick);
+                    }
                 }
             }
             let summary = self.stage_record_history(next_tick);
@@ -27021,6 +27279,23 @@ impl WorldState {
             self.archive = None;
         }
 
+        if new_config.selection_mode != self.config.selection_mode
+            || new_config.novelty_k != self.config.novelty_k
+            || new_config.archive_space != self.config.archive_space
+        {
+            self.novelty_state = None;
+            self.consecutive_zero_novelty_samples = 0;
+            if new_config.selection_mode != EvolutionSelectionMode::Fitness
+                && self.config.selection_mode == EvolutionSelectionMode::Fitness
+            {
+                tracing::warn!(
+                    target: "scriptbots::qd::novelty",
+                    mode = ?new_config.selection_mode,
+                    "novelty/curiosity selection mode enabled: world trajectories will not match fitness-mode fixtures"
+                );
+            }
+        }
+
         self.config = new_config;
         self.food_profiles = food_profiles;
         self.cadence = TickCadence::from_config(&self.config);
@@ -27449,6 +27724,12 @@ impl WorldState {
     #[must_use]
     pub const fn agent_stats(&self) -> &BTreeMap<AgentUid, AgentAccumulatedStats> {
         &self.agent_stats
+    }
+
+    /// Access the currently cached novelty state across the population, if evaluated (bd-16g.6.2).
+    #[must_use]
+    pub const fn novelty_state(&self) -> Option<&NoveltyState> {
+        self.novelty_state.as_ref()
     }
 
     /// Resolve a live handle's stable `AgentUid`, or name the exact path that lacked one.

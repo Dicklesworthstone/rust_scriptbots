@@ -123,6 +123,15 @@ pub enum QdError {
         /// Minimum lifetime in ticks required.
         min_lifetime_ticks: u32,
     },
+    /// Novelty k-NN parameter k must be strictly positive.
+    #[error("novelty k-NN parameter k must be non-zero")]
+    ZeroK,
+    /// Curiosity weight w is invalid (must be finite and in [0.0, 1.0]).
+    #[error("curiosity weight w must be finite and within [0.0, 1.0], got {w}")]
+    InvalidCuriosityWeight {
+        /// Configured weight.
+        w: f32,
+    },
     /// Serialization or deserialization error.
     #[error("archive serialization error: {0}")]
     Serialization(String),
@@ -1019,6 +1028,380 @@ pub fn compute_novelty_score(
     }
 }
 
+/// Evolution selection mode governing reproduction probability modulation (bd-16g.6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum EvolutionSelectionMode {
+    /// Standard Darwinian fitness-based selection (energy/food balance drives reproduction directly).
+    /// Reproduction probability modulator is identically 1.0.
+    #[default]
+    Fitness,
+    /// Novelty search selection: reproduction probability is modulated by normalized k-NN novelty
+    /// in behavior space against the combined population and MAP-Elites behavioral archive.
+    Novelty,
+    /// Curiosity-driven selection: combines normalized novelty and normalized fitness with weight `w`:
+    /// `score = w * novelty_norm + (1.0 - w) * fitness_norm` where `w` is in `[0.0, 1.0]`.
+    Curiosity {
+        /// Weight placed on novelty vs fitness in `[0.0, 1.0]`.
+        w: f32,
+    },
+}
+
+impl EvolutionSelectionMode {
+    /// Validate evolution selection mode invariants.
+    ///
+    /// # Errors
+    /// Returns [`QdError::InvalidCuriosityWeight`] if `w` in `Curiosity` is non-finite or outside `[0.0, 1.0]`.
+    pub fn validate(&self) -> Result<(), QdError> {
+        match self {
+            Self::Fitness | Self::Novelty => Ok(()),
+            Self::Curiosity { w } => {
+                if !w.is_finite() || !(0.0..=1.0).contains(w) {
+                    Err(QdError::InvalidCuriosityWeight { w: *w })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// Compute domain-normalized Euclidean distance between two behavior descriptors.
+///
+/// For each dimension `i`, the distance contribution is `((a[i] - b[i]) / (hi[i] - lo[i]))^2`.
+/// Returns `Ok(distance)` or [`QdError`] on dimension mismatch or non-finite values.
+///
+/// # Errors
+/// Returns [`QdError::DimensionMismatch`] if descriptor lengths do not match `space.axes.len()`,
+/// or [`QdError::NonFiniteValue`] if any descriptor element is non-finite.
+#[allow(clippy::suboptimal_flops)]
+pub fn normalized_distance(
+    a: &BehaviorDescriptor,
+    b: &BehaviorDescriptor,
+    space: &BehaviorSpaceV0,
+) -> Result<f32, QdError> {
+    if a.0.len() != space.axes.len() {
+        return Err(QdError::DimensionMismatch {
+            expected: space.axes.len(),
+            actual: a.0.len(),
+        });
+    }
+    if b.0.len() != space.axes.len() {
+        return Err(QdError::DimensionMismatch {
+            expected: space.axes.len(),
+            actual: b.0.len(),
+        });
+    }
+    let mut sum_sq = 0.0_f32;
+    for (i, (axis, (&val_a, &val_b))) in space
+        .axes
+        .iter()
+        .zip(a.0.iter().zip(b.0.iter()))
+        .enumerate()
+    {
+        if !val_a.is_finite() {
+            return Err(QdError::NonFiniteValue {
+                name: axis.name.clone(),
+                index: i,
+                value: val_a,
+            });
+        }
+        if !val_b.is_finite() {
+            return Err(QdError::NonFiniteValue {
+                name: axis.name.clone(),
+                index: i,
+                value: val_b,
+            });
+        }
+        let span = axis.domain.1 - axis.domain.0;
+        let diff = (val_a - val_b) / span;
+        sum_sq += diff * diff;
+    }
+    Ok(sum_sq.sqrt())
+}
+
+/// Candidate agent behavior descriptor for population-wide novelty evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateDescriptor {
+    /// Stable logical identity of the agent.
+    pub uid: AgentUid,
+    /// Behavior descriptor vector.
+    pub descriptor: BehaviorDescriptor,
+}
+
+impl CandidateDescriptor {
+    /// Construct a new candidate descriptor record.
+    #[must_use]
+    pub const fn new(uid: AgentUid, descriptor: BehaviorDescriptor) -> Self {
+        Self { uid, descriptor }
+    }
+}
+
+struct NeighborCandidate {
+    distance: f32,
+    uid: AgentUid,
+    is_archive: bool,
+    original_index: usize,
+}
+
+/// Compute k-NN novelty score in normalized behavior space for an entire population against
+/// both other population members (self-excluded) and all archive entries (bd-16g.6.2).
+///
+/// Ties in distance are broken deterministically by neighbor UID, archive provenance,
+/// and index order.
+///
+/// # Errors
+/// Returns [`QdError::ZeroK`] if `k == 0`, [`QdError::EmptySpace`] if space has no axes,
+/// or descriptor errors on dimension mismatch / non-finite values.
+pub fn compute_population_novelty(
+    population: &[CandidateDescriptor],
+    archive: Option<&MapElitesArchive>,
+    space: &BehaviorSpaceV0,
+    k: usize,
+) -> Result<Vec<(AgentUid, f32)>, QdError> {
+    if k == 0 {
+        return Err(QdError::ZeroK);
+    }
+    if space.axes.is_empty() {
+        return Err(QdError::EmptySpace);
+    }
+    if population.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Pre-validate all population descriptors
+    for cand in population {
+        if cand.descriptor.0.len() != space.axes.len() {
+            return Err(QdError::DimensionMismatch {
+                expected: space.axes.len(),
+                actual: cand.descriptor.0.len(),
+            });
+        }
+        for (i, (axis, &val)) in space.axes.iter().zip(cand.descriptor.0.iter()).enumerate() {
+            if !val.is_finite() {
+                return Err(QdError::NonFiniteValue {
+                    name: axis.name.clone(),
+                    index: i,
+                    value: val,
+                });
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity(population.len());
+
+    for cand in population {
+        let mut neighbors = Vec::new();
+
+        // 1. Other population members (self-excluded by UID)
+        for (other_idx, other) in population.iter().enumerate() {
+            if other.uid == cand.uid {
+                continue;
+            }
+            let dist = normalized_distance(&cand.descriptor, &other.descriptor, space)?;
+            neighbors.push(NeighborCandidate {
+                distance: dist,
+                uid: other.uid,
+                is_archive: false,
+                original_index: other_idx,
+            });
+        }
+
+        // 2. Archive entries (self-excluded if an archive entry has the same UID)
+        if let Some(arch) = archive {
+            for (cell_idx, entry) in arch.cells.values().enumerate() {
+                if entry.uid == cand.uid {
+                    continue;
+                }
+                let dist = normalized_distance(&cand.descriptor, &entry.descriptor, space)?;
+                neighbors.push(NeighborCandidate {
+                    distance: dist,
+                    uid: entry.uid,
+                    is_archive: true,
+                    original_index: cell_idx,
+                });
+            }
+        }
+
+        if neighbors.is_empty() {
+            // A single agent with an empty archive scores 0.0 with no division by zero
+            results.push((cand.uid, 0.0_f32));
+            continue;
+        }
+
+        // Deterministic sorting with stable tie-breaking
+        neighbors.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.uid.cmp(&b.uid))
+                .then_with(|| a.is_archive.cmp(&b.is_archive))
+                .then_with(|| a.original_index.cmp(&b.original_index))
+        });
+
+        // Clamp k to available neighbors (k > population-1 clamps to what exists)
+        let take_k = k.min(neighbors.len());
+        let sum: f32 = neighbors.iter().take(take_k).map(|n| n.distance).sum();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "take_k is bounded by population size which easily fits in f32 exact integer range"
+        )]
+        let mean = sum / (take_k as f32);
+        results.push((cand.uid, mean));
+    }
+
+    Ok(results)
+}
+
+/// Normalize scores into `[0.0, 1.0]` across a population with documented degenerate semantics.
+///
+/// If `max > min`: `(score - min) / (max - min)`.
+/// If `max == min`:
+/// - if `max == 0.0`: returns `0.0` for all individuals (e.g. all-identical population or empty archive).
+/// - if `max > 0.0`: returns `1.0` for all individuals.
+#[must_use]
+pub fn normalize_scores(scores: &[(AgentUid, f32)]) -> Vec<(AgentUid, f32)> {
+    if scores.is_empty() {
+        return Vec::new();
+    }
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+    for &(_, s) in scores {
+        if s < min_val {
+            min_val = s;
+        }
+        if s > max_val {
+            max_val = s;
+        }
+    }
+    if !min_val.is_finite() || !max_val.is_finite() {
+        return scores.iter().map(|&(uid, _)| (uid, 0.0)).collect();
+    }
+    let range = max_val - min_val;
+    if range > f32::EPSILON {
+        scores
+            .iter()
+            .map(|&(uid, s)| {
+                let norm = ((s - min_val) / range).clamp(0.0, 1.0);
+                (uid, norm)
+            })
+            .collect()
+    } else {
+        let default_val = if max_val > 0.0 { 1.0 } else { 0.0 };
+        scores.iter().map(|&(uid, _)| (uid, default_val)).collect()
+    }
+}
+
+/// Combine normalized novelty and normalized fitness with weight `w` in `[0.0, 1.0]`.
+///
+/// `curiosity = w * novelty_norm + (1.0 - w) * fitness_norm`.
+/// Returns [`QdError::InvalidCuriosityWeight`] if `w` is non-finite or outside `0.0..=1.0`.
+///
+/// # Errors
+/// Returns [`QdError::InvalidCuriosityWeight`] if `w` is non-finite or outside `0.0..=1.0`.
+#[allow(clippy::suboptimal_flops)]
+pub fn combine_curiosity(
+    w: f32,
+    novelty_norm: &[(AgentUid, f32)],
+    fitness_norm: &[(AgentUid, f32)],
+) -> Result<Vec<(AgentUid, f32)>, QdError> {
+    if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+        return Err(QdError::InvalidCuriosityWeight { w });
+    }
+    let fitness_map: BTreeMap<AgentUid, f32> = fitness_norm.iter().copied().collect();
+    let mut results = Vec::with_capacity(novelty_norm.len());
+    for &(uid, n) in novelty_norm {
+        let f = fitness_map.get(&uid).copied().unwrap_or(0.0);
+        let score = (w * n + (1.0 - w) * f).clamp(0.0, 1.0);
+        results.push((uid, score));
+    }
+    Ok(results)
+}
+
+/// Cached novelty state across the live population (bd-16g.6.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoveltyState {
+    /// Simulation tick when this novelty state was evaluated.
+    pub last_recompute_tick: Tick,
+    /// Raw novelty scores mapped by `AgentUid`.
+    pub scores: BTreeMap<AgentUid, f32>,
+    /// Normalized scores in `[0.0, 1.0]` mapped by `AgentUid`.
+    pub normalized_scores: BTreeMap<AgentUid, f32>,
+    /// Arithmetic mean novelty across the population.
+    pub mean_novelty: f32,
+    /// 50th percentile (median) novelty score.
+    pub p50_novelty: f32,
+    /// 95th percentile novelty score.
+    pub p95_novelty: f32,
+    /// Maximum novelty score observed.
+    pub max_novelty: f32,
+    /// Number of consecutive recompute samples where `mean_novelty == 0.0`.
+    pub consecutive_zero_samples: u32,
+}
+
+impl NoveltyState {
+    /// Construct a new `NoveltyState` from raw scores and normalized scores.
+    #[must_use]
+    pub fn new(
+        tick: Tick,
+        raw_scores: &[(AgentUid, f32)],
+        normalized: &[(AgentUid, f32)],
+        prev_consecutive_zeros: u32,
+    ) -> Self {
+        let mut scores_map = BTreeMap::new();
+        let mut vals = Vec::with_capacity(raw_scores.len());
+        for &(uid, s) in raw_scores {
+            scores_map.insert(uid, s);
+            vals.push(s);
+        }
+        vals.sort_by(f32::total_cmp);
+
+        let (mean, p50, p95, max) = if vals.is_empty() {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            let sum: f32 = vals.iter().sum();
+            #[expect(clippy::cast_precision_loss)]
+            let mean = sum / (vals.len() as f32);
+            let max = vals[vals.len() - 1];
+
+            let mid = vals.len() / 2;
+            let p50 = if vals.len() % 2 == 1 {
+                vals[mid]
+            } else {
+                f32::midpoint(vals[mid - 1], vals[mid])
+            };
+
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let p95_idx = (((vals.len() as f64) * 0.95).ceil() as usize)
+                .saturating_sub(1)
+                .min(vals.len() - 1);
+            let p95 = vals[p95_idx];
+            (mean, p50, p95, max)
+        };
+
+        let consecutive_zeros = if mean == 0.0 {
+            prev_consecutive_zeros.saturating_add(1)
+        } else {
+            0
+        };
+
+        let normalized_map: BTreeMap<AgentUid, f32> = normalized.iter().copied().collect();
+
+        Self {
+            last_recompute_tick: tick,
+            scores: scores_map,
+            normalized_scores: normalized_map,
+            mean_novelty: mean,
+            p50_novelty: p50,
+            p95_novelty: p95,
+            max_novelty: max,
+            consecutive_zero_samples: consecutive_zeros,
+        }
+    }
+}
+
 /// Row representation of the behavior space configuration for database persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveSpaceRow {
@@ -1562,5 +1945,301 @@ mod tests {
         assert_eq!(restored_entry.quality, entry.quality);
         assert_eq!(restored_entry.descriptor, entry.descriptor);
         assert_eq!(restored_entry.genome, entry.genome);
+    }
+
+    #[test]
+    fn test_knn_1d_fixture_exact_distances() {
+        let space = BehaviorSpaceV0::new(
+            0,
+            vec![Axis::new("x", PhenotypeFeature::MeanSpeed, (0.0, 10.0), 10).expect("axis")],
+        );
+        let points = [1.0_f32, 2.0, 4.0, 7.0, 9.0];
+        let population: Vec<CandidateDescriptor> = points
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                CandidateDescriptor::new(AgentUid(i as u64 + 1), BehaviorDescriptor::new(vec![x]))
+            })
+            .collect();
+
+        let scores = compute_population_novelty(&population, None, &space, 2).expect("scores");
+        assert_eq!(scores.len(), 5);
+
+        // Expected hand-computed mean distances for k=2 with self-exclusion:
+        // x=1: nearest {2, 4}, normalized distances {0.1, 0.3} -> mean 0.20
+        // x=2: nearest {1, 4}, normalized distances {0.1, 0.2} -> mean 0.15
+        // x=4: nearest {2, 1}, normalized distances {0.2, 0.3} -> mean 0.25
+        // x=7: nearest {9, 4}, normalized distances {0.2, 0.3} -> mean 0.25
+        // x=9: nearest {7, 4}, normalized distances {0.2, 0.5} -> mean 0.35
+        let expected = [0.20_f32, 0.15, 0.25, 0.25, 0.35];
+        for (i, &(_, score)) in scores.iter().enumerate() {
+            assert!(
+                (score - expected[i]).abs() < 1e-5,
+                "index {i} expected {}, got {score}",
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_knn_3d_fixture_exact_distances() {
+        let space = BehaviorSpaceV0::new(
+            0,
+            vec![
+                Axis::new("x", PhenotypeFeature::MeanSpeed, (0.0, 10.0), 10).expect("axis 0"),
+                Axis::new("y", PhenotypeFeature::TurnRate, (0.0, 20.0), 10).expect("axis 1"),
+                Axis::new("z", PhenotypeFeature::SensingMean, (0.0, 5.0), 10).expect("axis 2"),
+            ],
+        );
+        let p1 =
+            CandidateDescriptor::new(AgentUid(1), BehaviorDescriptor::new(vec![0.0, 0.0, 0.0]));
+        let p2 =
+            CandidateDescriptor::new(AgentUid(2), BehaviorDescriptor::new(vec![10.0, 0.0, 0.0]));
+        let p3 =
+            CandidateDescriptor::new(AgentUid(3), BehaviorDescriptor::new(vec![0.0, 20.0, 0.0]));
+        let p4 =
+            CandidateDescriptor::new(AgentUid(4), BehaviorDescriptor::new(vec![0.0, 0.0, 5.0]));
+        let population = vec![p1, p2, p3, p4];
+
+        let scores = compute_population_novelty(&population, None, &space, 2).expect("scores");
+        assert_eq!(scores.len(), 4);
+
+        // Every neighbor of p1 is at normalized distance sqrt(1.0^2 + 0 + 0) = 1.0
+        // With k=2, nearest 2 neighbors have mean distance 1.0 exactly
+        assert!((scores[0].1 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_domain_normalization_inverts_raw_euclidean_ranking() {
+        let space = BehaviorSpaceV0::new(
+            0,
+            vec![
+                Axis::new("large_axis", PhenotypeFeature::MeanSpeed, (0.0, 1000.0), 10)
+                    .expect("axis 0"),
+                Axis::new("small_axis", PhenotypeFeature::DietTendency, (0.0, 1.0), 10)
+                    .expect("axis 1"),
+            ],
+        );
+        let target = BehaviorDescriptor::new(vec![500.0, 0.5]);
+        let cand_a = BehaviorDescriptor::new(vec![510.0, 0.5]);
+        let cand_b = BehaviorDescriptor::new(vec![500.0, 0.9]);
+
+        // Raw Euclidean distances:
+        // dist(T, A) = sqrt(10^2 + 0^2) = 10.0
+        // dist(T, B) = sqrt(0^2 + 0.4^2) = 0.4
+        // Raw ranking: B is MUCH closer than A (0.4 < 10.0).
+        let raw_a = (target.0[0] - cand_a.0[0]).hypot(target.0[1] - cand_a.0[1]);
+        let raw_b = (target.0[0] - cand_b.0[0]).hypot(target.0[1] - cand_b.0[1]);
+        assert!(raw_b < raw_a, "raw Euclidean must rank B closer than A");
+
+        // Domain-normalized distances:
+        // dist_norm(T, A) = sqrt((10/1000)^2 + 0) = 0.01
+        // dist_norm(T, B) = sqrt(0 + (0.4/1.0)^2) = 0.40
+        // Normalized ranking: A is MUCH closer than B (0.01 < 0.40).
+        let norm_a = normalized_distance(&target, &cand_a, &space).expect("norm_a");
+        let norm_b = normalized_distance(&target, &cand_b, &space).expect("norm_b");
+        assert!(
+            norm_a < norm_b,
+            "domain-normalized distance must invert ranking: A ({norm_a}) is closer than B ({norm_b})"
+        );
+    }
+
+    #[test]
+    fn test_population_plus_archive_membership_and_self_exclusion() {
+        let space = BehaviorSpaceV0::new(
+            0,
+            vec![Axis::new("x", PhenotypeFeature::MeanSpeed, (0.0, 10.0), 10).expect("axis")],
+        );
+        let mut archive = MapElitesArchive::new(
+            space.clone(),
+            QualityMetric::default(),
+            0,
+            DEFAULT_MAX_ARCHIVE_BYTES,
+        )
+        .expect("archive");
+
+        // Insert an elite with UID 100 at x = 5.0
+        let elite = ArchiveEntry {
+            uid: AgentUid(100),
+            tick_inserted: Tick(10),
+            descriptor: BehaviorDescriptor::new(vec![5.0]),
+            quality: 50.0,
+            genome: make_test_genome(1),
+            provenance: ArchiveProvenance {
+                run_id: "test".to_string(),
+                parent_uid: None,
+                generation: Generation(1),
+            },
+        };
+        archive.insert(elite).expect("insert elite");
+
+        // Population: Agent 1 at x=5.1, Agent 2 at x=9.0
+        let pop = vec![
+            CandidateDescriptor::new(AgentUid(1), BehaviorDescriptor::new(vec![5.1])),
+            CandidateDescriptor::new(AgentUid(2), BehaviorDescriptor::new(vec![9.0])),
+        ];
+
+        // For Agent 1, neighbors are Agent 2 (dist |5.1-9.0|/10 = 0.39) and Elite 100 (dist |5.1-5.0|/10 = 0.01).
+        // With k=1, Agent 1's nearest neighbor is Elite 100 with distance 0.01.
+        let scores = compute_population_novelty(&pop, Some(&archive), &space, 1).expect("scores");
+        assert!((scores[0].1 - 0.01).abs() < 1e-4);
+
+        // Self-exclusion test: if an agent in population has UID 100 (same as archive entry),
+        // it must NOT compare against itself in the archive (distance 0.0 to self must be excluded).
+        let pop_with_same_uid = vec![CandidateDescriptor::new(
+            AgentUid(100),
+            BehaviorDescriptor::new(vec![5.0]),
+        )];
+        let self_excluded_scores =
+            compute_population_novelty(&pop_with_same_uid, Some(&archive), &space, 1)
+                .expect("scores");
+        // Only one agent, and archive has only UID 100, which is self -> pool is empty -> score 0.0
+        assert_eq!(self_excluded_scores[0].1, 0.0);
+    }
+
+    #[test]
+    fn test_degenerate_cases_exhaustive() {
+        let space = BehaviorSpaceV0::new(
+            0,
+            vec![Axis::new("x", PhenotypeFeature::MeanSpeed, (0.0, 10.0), 10).expect("axis")],
+        );
+
+        // 1. k = 0 -> typed error
+        let pop = vec![CandidateDescriptor::new(
+            AgentUid(1),
+            BehaviorDescriptor::new(vec![1.0]),
+        )];
+        assert_eq!(
+            compute_population_novelty(&pop, None, &space, 0),
+            Err(QdError::ZeroK)
+        );
+
+        // 2. Empty population -> empty result
+        let empty_scores =
+            compute_population_novelty(&[], None, &space, 5).expect("empty pop scores");
+        assert_eq!(empty_scores, Vec::new());
+
+        // 3. Singleton population with empty archive -> 0.0, no division by zero
+        let single_scores = compute_population_novelty(&pop, None, &space, 5).expect("single");
+        assert_eq!(single_scores, vec![(AgentUid(1), 0.0)]);
+
+        // 4. k > N -> clamps to N available neighbors without panic
+        let pop3 = vec![
+            CandidateDescriptor::new(AgentUid(1), BehaviorDescriptor::new(vec![1.0])),
+            CandidateDescriptor::new(AgentUid(2), BehaviorDescriptor::new(vec![2.0])),
+            CandidateDescriptor::new(AgentUid(3), BehaviorDescriptor::new(vec![3.0])),
+        ];
+        let clamped = compute_population_novelty(&pop3, None, &space, 100).expect("clamped");
+        assert_eq!(clamped.len(), 3);
+        // Agent 1: neighbors 2 (0.1) and 3 (0.2) -> mean 0.15
+        assert!((clamped[0].1 - 0.15).abs() < 1e-5);
+
+        // 5. All-identical descriptors -> all zeros, no NaN
+        let identical_pop = vec![
+            CandidateDescriptor::new(AgentUid(1), BehaviorDescriptor::new(vec![4.0])),
+            CandidateDescriptor::new(AgentUid(2), BehaviorDescriptor::new(vec![4.0])),
+            CandidateDescriptor::new(AgentUid(3), BehaviorDescriptor::new(vec![4.0])),
+        ];
+        let zeros = compute_population_novelty(&identical_pop, None, &space, 2).expect("identical");
+        for (_, score) in zeros {
+            assert_eq!(score, 0.0);
+            assert!(!score.is_nan());
+        }
+
+        // 6. Dimension mismatch -> typed error
+        let wrong_dim = vec![CandidateDescriptor::new(
+            AgentUid(1),
+            BehaviorDescriptor::new(vec![1.0, 2.0]),
+        )];
+        assert!(matches!(
+            compute_population_novelty(&wrong_dim, None, &space, 1),
+            Err(QdError::DimensionMismatch { .. })
+        ));
+
+        // 7. Non-finite descriptor value -> typed error
+        let nan_val = vec![CandidateDescriptor::new(
+            AgentUid(1),
+            BehaviorDescriptor::new(vec![f32::NAN]),
+        )];
+        assert!(matches!(
+            compute_population_novelty(&nan_val, None, &space, 1),
+            Err(QdError::NonFiniteValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_curiosity_weights_and_normalization() {
+        let novelty_raw = vec![(AgentUid(1), 0.2_f32), (AgentUid(2), 0.8_f32)];
+        let fitness_raw = vec![(AgentUid(1), 10.0_f32), (AgentUid(2), 30.0_f32)];
+
+        let novelty_norm = normalize_scores(&novelty_raw);
+        let fitness_norm = normalize_scores(&fitness_raw);
+
+        // Min-max normalization:
+        // Novelty: (0.2 -> 0.0, 0.8 -> 1.0)
+        assert!((novelty_norm[0].1 - 0.0).abs() < 1e-5);
+        assert!((novelty_norm[1].1 - 1.0).abs() < 1e-5);
+        // Fitness: (10 -> 0.0, 30 -> 1.0)
+        assert!((fitness_norm[0].1 - 0.0).abs() < 1e-5);
+        assert!((fitness_norm[1].1 - 1.0).abs() < 1e-5);
+
+        // w = 1.0 -> pure novelty
+        let pure_novelty =
+            combine_curiosity(1.0, &novelty_norm, &fitness_norm).expect("pure novelty");
+        assert_eq!(pure_novelty, novelty_norm);
+
+        // w = 0.0 -> pure fitness
+        let pure_fitness =
+            combine_curiosity(0.0, &novelty_norm, &fitness_norm).expect("pure fitness");
+        assert_eq!(pure_fitness, fitness_norm);
+
+        // w = 0.5 -> average
+        let mixed = combine_curiosity(0.5, &novelty_norm, &fitness_norm).expect("mixed");
+        assert!((mixed[0].1 - 0.0).abs() < 1e-5);
+        assert!((mixed[1].1 - 1.0).abs() < 1e-5);
+
+        // Out-of-range weights:
+        assert!(matches!(
+            combine_curiosity(-0.1, &novelty_norm, &fitness_norm),
+            Err(QdError::InvalidCuriosityWeight { .. })
+        ));
+        assert!(matches!(
+            combine_curiosity(1.1, &novelty_norm, &fitness_norm),
+            Err(QdError::InvalidCuriosityWeight { .. })
+        ));
+        assert!(matches!(
+            combine_curiosity(f32::NAN, &novelty_norm, &fitness_norm),
+            Err(QdError::InvalidCuriosityWeight { .. })
+        ));
+    }
+
+    #[test]
+    fn test_evolution_selection_mode_validation() {
+        assert_eq!(EvolutionSelectionMode::Fitness.validate(), Ok(()));
+        assert_eq!(EvolutionSelectionMode::Novelty.validate(), Ok(()));
+        assert_eq!(
+            EvolutionSelectionMode::Curiosity { w: 0.0 }.validate(),
+            Ok(())
+        );
+        assert_eq!(
+            EvolutionSelectionMode::Curiosity { w: 0.5 }.validate(),
+            Ok(())
+        );
+        assert_eq!(
+            EvolutionSelectionMode::Curiosity { w: 1.0 }.validate(),
+            Ok(())
+        );
+        assert!(matches!(
+            EvolutionSelectionMode::Curiosity { w: -0.01 }.validate(),
+            Err(QdError::InvalidCuriosityWeight { .. })
+        ));
+        assert!(matches!(
+            EvolutionSelectionMode::Curiosity { w: 1.01 }.validate(),
+            Err(QdError::InvalidCuriosityWeight { .. })
+        ));
+        assert!(matches!(
+            EvolutionSelectionMode::Curiosity { w: f32::NAN }.validate(),
+            Err(QdError::InvalidCuriosityWeight { .. })
+        ));
     }
 }
