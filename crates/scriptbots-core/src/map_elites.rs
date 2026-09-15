@@ -3318,15 +3318,15 @@ mod tests {
         let metrics_orig = archive.metrics();
 
         let mut csv_buf = Vec::new();
-        let rows = archive.export_csv("run_csv_test", &mut csv_buf).expect("export_csv");
+        let rows = archive.export_csv("test", &mut csv_buf).expect("export_csv");
         assert_eq!(rows, 2);
 
         let csv_text = String::from_utf8(csv_buf.clone()).expect("valid utf8");
         assert!(csv_text.starts_with("# PROVENANCE: "));
-        assert!(csv_text.contains("run_csv_test"));
+        assert!(csv_text.contains("\"run_id\":\"test\""));
 
         let (run_id, imported) = MapElitesArchive::import_csv(csv_buf.as_slice(), 50_000).expect("import_csv");
-        assert_eq!(run_id, "run_csv_test");
+        assert_eq!(run_id, "test");
         assert_eq!(archive.cells, imported.cells);
         assert_eq!(metrics_orig, imported.metrics());
     }
