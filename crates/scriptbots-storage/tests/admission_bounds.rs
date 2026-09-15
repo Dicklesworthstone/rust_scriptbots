@@ -11,9 +11,13 @@ use scriptbots_core::{
     ReplayInteractionKind, Tick, TickSummary,
 };
 use scriptbots_storage::{
-    PayloadBudget, StorageDeadlines, StorageError, StoragePipeline, StorageReader,
-    estimate_batch_size, estimate_narrative_size,
+    AnalyticsSnapshotProvider, FailureCommitState, PayloadBudget, PreparationFaultPoint, Storage,
+    StorageDeadlines, StorageError, StorageOperation, StoragePipeline, StorageReader,
+    StorageWaitPhase, StorageWorkerError, arm_preparation_fault, cleanup_handoff_stats,
+    clear_all_preparation_faults, clear_preparation_fault, drain_cleanup_handoffs_for_test,
+    estimate_batch_size, estimate_narrative_size, handoff_cleanup,
 };
+use serde_json::json;
 use std::borrow::Cow;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -145,6 +149,7 @@ fn a_narration_burst_cannot_starve_simulation_admission_through_the_real_path() 
         max_batch_bytes: 64 << 10,
         max_batch_events: 128,
         max_inflight_bytes: 1 << 20,
+        ..PayloadBudget::default()
     });
 
     let mut loud = batch(1, 8);
@@ -317,6 +322,7 @@ fn derived_interaction_rows_are_charged_to_the_scientific_budget() {
         max_batch_bytes: ordinary_bytes,
         max_batch_events: ordinary_events,
         max_inflight_bytes: usize::MAX,
+        ..PayloadBudget::default()
     });
     pipeline
         .submit(&ordinary)
@@ -530,6 +536,7 @@ fn long_dynamic_strings_and_nested_brain_outputs_cross_the_byte_cap() {
         max_batch_bytes: baseline_bytes.saturating_add(1_024),
         max_batch_events: long_metric_events.max(long_event_events),
         max_inflight_bytes: usize::MAX,
+        ..PayloadBudget::default()
     });
     assert!(matches!(
         pipeline.submit(&long_metric),
@@ -544,6 +551,7 @@ fn long_dynamic_strings_and_nested_brain_outputs_cross_the_byte_cap() {
         max_batch_bytes: empty_output_bytes,
         max_batch_events: nested_output_events,
         max_inflight_bytes: usize::MAX,
+        ..PayloadBudget::default()
     });
     assert!(matches!(
         pipeline.submit(&nested_outputs),
@@ -564,6 +572,7 @@ fn an_oversized_batch_is_refused_before_it_is_ever_allocated() {
         max_batch_bytes: 1_024,
         max_batch_events: 4,
         max_inflight_bytes: 1 << 20,
+        ..PayloadBudget::default()
     });
 
     let oversized = batch(1, 64);
@@ -678,6 +687,7 @@ fn the_boundary_is_exact_at_the_cap_and_one_record_past_it() {
         max_batch_bytes: bytes,
         max_batch_events: events,
         max_inflight_bytes: 1 << 20,
+        ..PayloadBudget::default()
     });
 
     // Exactly at the cap: ADMITTED. An off-by-one here would refuse a batch the
@@ -721,6 +731,7 @@ fn the_in_flight_permit_is_released_on_every_path_including_the_refusal_path() -
         max_batch_bytes: 1 << 20,
         max_batch_events: 1_000,
         max_inflight_bytes: small_bytes * 2,
+        ..PayloadBudget::default()
     });
 
     for tick in 0..200u64 {
@@ -767,6 +778,7 @@ fn a_buffered_batch_holds_its_permit_until_flush_or_shutdown() {
         max_batch_bytes: bytes,
         max_batch_events: events,
         max_inflight_bytes: max_inflight,
+        ..PayloadBudget::default()
     });
 
     pipeline.submit(&first).expect("first admission");
@@ -808,4 +820,473 @@ fn a_buffered_batch_holds_its_permit_until_flush_or_shutdown() {
         0,
         "shutdown finalization must release the final buffered permit"
     );
+}
+
+#[test]
+fn tiny_scientific_with_oversized_narrative_refused_without_scientific_leak() {
+    clear_all_preparation_faults();
+    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("pipeline");
+
+    // Sized with large scientific budget, but small narrative budget.
+    pipeline.set_payload_budget(PayloadBudget {
+        max_batch_bytes: 1 << 20,
+        max_batch_events: 1_000,
+        max_inflight_bytes: 1 << 20,
+        max_narrative_batch_bytes: 8_192,
+        max_narrative_batch_events: 2,
+        max_narrative_inflight_bytes: 16_384,
+    });
+
+    let mut loud = batch(1, 4);
+    loud.narrative_events = (0..5).map(narrative_event).collect();
+    let (loud_bytes, loud_events) = estimate_batch_size(&loud);
+    let (loud_narrative_bytes, loud_narrative_events) = estimate_narrative_size(&loud);
+    assert!(loud_narrative_bytes > 8_192);
+    assert!(loud_narrative_events > 2);
+
+    let error = pipeline
+        .submit(&loud)
+        .expect_err("oversized narrative must be refused before allocation");
+    assert!(
+        matches!(
+            error,
+            StorageError::NarrativePayloadTooLarge {
+                context,
+                would_be,
+                max_batch,
+                events,
+                max_events,
+                ..
+            } if context == "storage.submit.narrative_measure"
+                && would_be == loud_narrative_bytes
+                && max_batch == 8_192
+                && events == loud_narrative_events
+                && max_events == 2
+        ),
+        "expected NarrativePayloadTooLarge, got: {error:?}"
+    );
+
+    // Assert zero permit leak:
+    assert_eq!(
+        pipeline.inflight_bytes(),
+        0,
+        "scientific permit leaked on narrative refusal"
+    );
+    assert_eq!(
+        pipeline.inflight_narrative_bytes(),
+        0,
+        "narrative permit leaked on refusal"
+    );
+
+    // Exact retry contract: the rejected payload was not modified
+    assert_eq!(loud.summary.tick.0, 1);
+    assert_eq!(loud.metrics.len(), 4);
+    assert_eq!(loud.narrative_events.len(), 5);
+
+    // A valid scientific batch with narrative within cap admits cleanly
+    let mut modest = batch(2, 4);
+    modest.narrative_events = vec![narrative_event(2)];
+    let (modest_bytes, _) = estimate_batch_size(&modest);
+    let (modest_narrative_bytes, _) = estimate_narrative_size(&modest);
+    pipeline
+        .submit(&modest)
+        .expect("modest narrative batch must be admitted");
+
+    assert_eq!(pipeline.inflight_bytes(), modest_bytes);
+    assert_eq!(pipeline.inflight_narrative_bytes(), modest_narrative_bytes);
+
+    pipeline.flush_and_wait().expect("flush");
+    assert_eq!(pipeline.inflight_bytes(), 0);
+    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+
+    pipeline.shutdown().expect("shutdown");
+    assert_eq!(pipeline.inflight_bytes(), 0);
+    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+}
+
+#[test]
+fn narrative_inflight_saturation_backpressure_and_permit_release() {
+    clear_all_preparation_faults();
+    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("pipeline");
+
+    let first = {
+        let mut b = batch(1, 2);
+        b.narrative_events = vec![narrative_event(1)];
+        b
+    };
+    let (first_bytes, _) = estimate_batch_size(&first);
+    let (narrative_bytes, _) = estimate_narrative_size(&first);
+
+    // Sized so exactly one narrative event fits in-flight.
+    let max_narrative_inflight = narrative_bytes.saturating_mul(2).saturating_sub(1);
+    pipeline.set_payload_budget(PayloadBudget {
+        max_batch_bytes: 1 << 20,
+        max_batch_events: 1_000,
+        max_inflight_bytes: 1 << 20,
+        max_narrative_batch_bytes: narrative_bytes.saturating_mul(2),
+        max_narrative_batch_events: 10,
+        max_narrative_inflight_bytes: max_narrative_inflight,
+    });
+
+    pipeline.submit(&first).expect("first batch admission");
+    assert_eq!(pipeline.inflight_bytes(), first_bytes);
+    assert_eq!(pipeline.inflight_narrative_bytes(), narrative_bytes);
+
+    let second = {
+        let mut b = batch(2, 2);
+        b.narrative_events = vec![narrative_event(2)];
+        b
+    };
+    let error = pipeline
+        .submit(&second)
+        .expect_err("second narrative batch must exceed in-flight narrative ceiling");
+
+    assert!(
+        matches!(
+            error,
+            StorageError::InFlightNarrativeBytesExhausted {
+                tick: 2,
+                would_be,
+                max_inflight,
+            } if would_be == narrative_bytes.saturating_mul(2) && max_inflight == max_narrative_inflight
+        ),
+        "expected InFlightNarrativeBytesExhausted, got: {error:?}"
+    );
+
+    // Refusal of second batch did not disturb first batch's permits nor leak anything:
+    assert_eq!(pipeline.inflight_bytes(), first_bytes);
+    assert_eq!(pipeline.inflight_narrative_bytes(), narrative_bytes);
+
+    // Flush releases narrative permits:
+    pipeline.flush_and_wait().expect("flush");
+    assert_eq!(pipeline.inflight_bytes(), 0);
+    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+
+    // After release, exact retry of the second batch succeeds:
+    pipeline
+        .submit(&second)
+        .expect("retry after flush succeeds");
+    assert_eq!(pipeline.inflight_bytes(), first_bytes);
+    assert_eq!(pipeline.inflight_narrative_bytes(), narrative_bytes);
+
+    pipeline.shutdown().expect("shutdown");
+    assert_eq!(pipeline.inflight_bytes(), 0);
+    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+}
+
+#[test]
+fn fallible_reservation_failure_returns_typed_not_admitted_without_panic() {
+    clear_all_preparation_faults();
+    let pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("pipeline");
+
+    let test_batch = batch(10, 8);
+    arm_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+
+    let error = pipeline
+        .submit(&test_batch)
+        .expect_err("reservation failure must return typed error without panic");
+
+    assert!(
+        matches!(
+            error,
+            StorageError::ReservationFailed { context, .. } if context.starts_with("storage.prepare.")
+        ),
+        "expected ReservationFailed error, got: {error:?}"
+    );
+
+    // In-flight permits were not leaked:
+    assert_eq!(pipeline.inflight_bytes(), 0);
+    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+
+    clear_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+
+    // Retry of the exact same batch succeeds cleanly:
+    pipeline
+        .submit(&test_batch)
+        .expect("retry after clearing fault must succeed");
+
+    pipeline.shutdown().expect("shutdown");
+}
+
+#[test]
+fn caller_return_and_cleanup_handoff_are_bounded_independently() {
+    clear_all_preparation_faults();
+    drain_cleanup_handoffs_for_test();
+
+    let stats_before = cleanup_handoff_stats();
+
+    // Create a large batch to simulate deallocation overhead
+    let mut large_batch = batch(1, 100);
+    large_batch.narrative_events = (0..50).map(narrative_event).collect();
+
+    let started = Instant::now();
+    handoff_cleanup(large_batch);
+    let elapsed = started.elapsed();
+
+    // Caller must return immediately without waiting for synchronous drop
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "handoff_cleanup took too long: {elapsed:?}"
+    );
+
+    let stats_mid = cleanup_handoff_stats();
+    assert!(
+        stats_mid.handed_off_count >= stats_before.handed_off_count + 1,
+        "handed_off_count did not increment"
+    );
+
+    drain_cleanup_handoffs_for_test();
+    let stats_after = cleanup_handoff_stats();
+    assert_eq!(stats_after.active_count, 0);
+    assert!(stats_after.completed_count >= stats_mid.handed_off_count);
+}
+
+#[test]
+fn bounded_error_publication_under_forced_contention() {
+    clear_all_preparation_faults();
+    let analytics = AnalyticsSnapshotProvider::empty();
+    let worker_error = StorageWorkerError::Internal {
+        operation: StorageOperation::Admit,
+        path: ":memory:".to_string(),
+        tick: Some(42),
+        commit_state: FailureCommitState::NotAdmitted,
+        detail: "simulated error".to_string(),
+    };
+
+    arm_preparation_fault(PreparationFaultPoint::ForceErrorPublicationContention);
+
+    let started = Instant::now();
+    // Bounded publication with 8 max attempts must terminate immediately
+    analytics.publish_worker_error_bounded(&worker_error, false, 8);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "publish_worker_error_bounded under contention took too long: {elapsed:?}"
+    );
+
+    clear_preparation_fault(PreparationFaultPoint::ForceErrorPublicationContention);
+}
+
+#[test]
+fn direct_same_thread_persistence_boundary_policy_and_fallible_reservation() {
+    clear_all_preparation_faults();
+    let mut storage = Storage::unattributed_memory().expect("in-memory storage");
+
+    let valid_batch = batch(1, 4);
+
+    // 1. Same-thread API persists directly without background threads or timeouts:
+    let receipt = storage
+        .persist(&valid_batch)
+        .expect("direct same-thread persistence must succeed");
+    assert_eq!(receipt.tick.0, 1);
+    assert_eq!(
+        storage.persistence_watermarks().unwrap().durable,
+        Some(receipt.batch_id)
+    );
+
+    // 2. Same-thread API respects fallible container reservations:
+    arm_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+    let fail_batch = batch(2, 4);
+    let error = storage
+        .persist(&fail_batch)
+        .expect_err("forced reservation failure must be caught and returned");
+    assert!(
+        matches!(error, StorageError::ReservationFailed { .. }),
+        "expected ReservationFailed, got: {error:?}"
+    );
+
+    clear_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+
+    // 3. Exact retry after reservation failure succeeds:
+    let retry_receipt = storage
+        .persist(&fail_batch)
+        .expect("exact retry after cleared reservation fault must succeed");
+    assert_eq!(retry_receipt.tick.0, 2);
+
+    storage.close().expect("close");
+}
+
+#[test]
+fn narrative_preparation_bounds_and_timeout_cleanup_e2e() -> Result<(), Box<dyn std::error::Error>>
+{
+    clear_all_preparation_faults();
+    drain_cleanup_handoffs_for_test();
+
+    let path_string = temp_db("storage-narrative-preparation-e2e");
+    let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(
+        &path_string,
+        64,
+        4_096,
+        1_024,
+        1_024,
+    )?;
+
+    // Phase 1: Oversized Narrative Refusal
+    // Configure finite narrative budget (8 KiB narrative cap, while science allows 1 MiB)
+    pipeline.set_payload_budget(PayloadBudget {
+        max_batch_bytes: 1 << 20,
+        max_batch_events: 1_000,
+        max_inflight_bytes: 1 << 20,
+        max_narrative_batch_bytes: 8_192,
+        max_narrative_batch_events: 2,
+        max_narrative_inflight_bytes: 16_384,
+    });
+
+    let mut oversized_narrative_batch = batch(101, 4);
+    let mut ev1 = narrative_event(101);
+    ev1.human_text = "x".repeat(5_000);
+    let mut ev2 = narrative_event(101);
+    ev2.metric = "population.b".to_string();
+    ev2.human_text = "x".repeat(5_000);
+    let mut ev3 = narrative_event(101);
+    ev3.metric = "population.c".to_string();
+    ev3.human_text = "x".repeat(5_000);
+    oversized_narrative_batch.narrative_events = vec![ev1, ev2, ev3];
+
+    let (scientific_bytes, scientific_records) = estimate_batch_size(&oversized_narrative_batch);
+    let (narrative_bytes, narrative_records) = estimate_narrative_size(&oversized_narrative_batch);
+    assert!(narrative_bytes > 8_192);
+
+    let refusal = pipeline
+        .submit(&oversized_narrative_batch)
+        .expect_err("oversized narrative must be refused");
+    assert!(matches!(
+        refusal,
+        StorageError::NarrativePayloadTooLarge { .. }
+    ));
+    assert_eq!(pipeline.inflight_bytes(), 0);
+    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+
+    println!(
+        "{}",
+        json!({
+            "schema": "scriptbots.narrative-preparation.evidence.v1",
+            "phase": "oversized_narrative_refusal",
+            "stage": "narrative_measure",
+            "disposition": "not_admitted",
+            "error": "NarrativePayloadTooLarge",
+            "narrative_bytes": narrative_bytes,
+            "narrative_records": narrative_records,
+            "scientific_bytes": scientific_bytes,
+            "scientific_records": scientific_records,
+            "inflight_bytes_before": 0,
+            "inflight_bytes_after": 0,
+            "inflight_narrative_bytes_before": 0,
+            "inflight_narrative_bytes_after": 0,
+            "tick": 101,
+            "durable_tick_count": 0
+        })
+    );
+
+    // Phase 2: Fallible Reservation Refusal
+    arm_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+    let mut fail_batch = batch(102, 4);
+    fail_batch.narrative_events = vec![narrative_event(102)];
+    let res_error = pipeline
+        .submit(&fail_batch)
+        .expect_err("reservation failure must return typed error without panic");
+    assert!(matches!(res_error, StorageError::ReservationFailed { .. }));
+    assert_eq!(pipeline.inflight_bytes(), 0);
+    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+
+    println!(
+        "{}",
+        json!({
+            "schema": "scriptbots.narrative-preparation.evidence.v1",
+            "phase": "fallible_reservation_refusal",
+            "stage": "prepare_buffer",
+            "disposition": "not_admitted",
+            "error": "ReservationFailed",
+            "tick": 102,
+            "durable_tick_count": 0
+        })
+    );
+    clear_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+
+    // Phase 3: Cleanup Handoff
+    let stats_before = cleanup_handoff_stats();
+    let large_payload = Box::new(batch(103, 100));
+    let started = Instant::now();
+    handoff_cleanup(large_payload);
+    let handoff_elapsed = started.elapsed();
+    assert!(handoff_elapsed < Duration::from_millis(100));
+    let stats_mid = cleanup_handoff_stats();
+    assert!(stats_mid.handed_off_count >= stats_before.handed_off_count + 1);
+    drain_cleanup_handoffs_for_test();
+    let stats_after = cleanup_handoff_stats();
+
+    println!(
+        "{}",
+        json!({
+            "schema": "scriptbots.narrative-preparation.evidence.v1",
+            "phase": "cleanup_handoff",
+            "stage": "background_worker",
+            "disposition": "async_cleanup",
+            "handed_off_count": stats_after.handed_off_count,
+            "completed_count": stats_after.completed_count,
+            "active_count": stats_after.active_count,
+            "tick": 103
+        })
+    );
+
+    // Phase 4: Healthy Admission and Exact Retry
+    let mut healthy_batch = batch(104, 4);
+    healthy_batch.narrative_events = vec![narrative_event(104)];
+    let (h_sci_bytes, _) = estimate_batch_size(&healthy_batch);
+    let (h_narr_bytes, _) = estimate_narrative_size(&healthy_batch);
+
+    let receipt = pipeline.submit_with_receipt(&healthy_batch)?;
+    let duplicate = pipeline.submit_with_receipt(&healthy_batch)?;
+    assert_eq!(receipt.batch_id, duplicate.batch_id);
+    assert_eq!(pipeline.inflight_bytes(), h_sci_bytes);
+    assert_eq!(pipeline.inflight_narrative_bytes(), h_narr_bytes);
+
+    let flush = pipeline.flush_and_wait()?;
+    assert_eq!(flush.watermarks.durable, Some(receipt.batch_id));
+    assert_eq!(pipeline.inflight_bytes(), 0);
+    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+
+    pipeline.shutdown()?;
+
+    let reader = StorageReader::open(&path_string)?;
+    let ledger = reader.run_ledger_summary()?;
+    assert_eq!(ledger.tick_count, 1);
+    assert_eq!(ledger.latest_tick.map(|t| t.tick), Some(104));
+    reader.close()?;
+
+    println!(
+        "{}",
+        json!({
+            "schema": "scriptbots.narrative-preparation.evidence.v1",
+            "phase": "healthy_admission_and_retry",
+            "stage": "outbox_admission",
+            "disposition": "admitted",
+            "receipt": "durable",
+            "batch_id": receipt.batch_id.get(),
+            "tick": 104,
+            "durable_tick_count": ledger.tick_count
+        })
+    );
+
+    let _ = std::fs::remove_file(&path_string);
+    Ok(())
 }
