@@ -81,6 +81,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
@@ -4004,6 +4005,48 @@ pub enum StorageError {
         /// The ceiling.
         max_inflight: usize,
     },
+    /// The narrative payload was refused BEFORE it was prepared, because it is too large.
+    #[error(
+        "narrative batch at tick {tick} is too large to admit: {bytes} bytes across {events} records exceeds the narrative cap of {max_bytes} bytes / {max_events} records"
+    )]
+    NarrativePayloadTooLarge {
+        /// Which tick was refused.
+        tick: u64,
+        /// Estimated size of the narrative payload.
+        bytes: usize,
+        /// Narrative record count.
+        events: usize,
+        /// The narrative byte ceiling.
+        max_bytes: usize,
+        /// The narrative record ceiling.
+        max_events: usize,
+    },
+    /// Admitting this batch would push in-flight narrative persistence past its byte ceiling.
+    #[error(
+        "narrative batch at tick {tick} would push in-flight narrative persistence to {would_be} bytes, over the cap of {max_inflight}"
+    )]
+    InFlightNarrativeBytesExhausted {
+        /// Which tick was refused.
+        tick: u64,
+        /// What the in-flight narrative total would have become.
+        would_be: usize,
+        /// The ceiling.
+        max_inflight: usize,
+    },
+    /// A proportional container allocation or capacity reservation failed.
+    #[error(
+        "failed to reserve {capacity} elements of size {element_bytes} for {context}: {reason}"
+    )]
+    ReservationFailed {
+        /// The container or field context.
+        context: &'static str,
+        /// Requested element capacity.
+        capacity: usize,
+        /// Size in bytes of each element.
+        element_bytes: usize,
+        /// Underlying failure reason.
+        reason: String,
+    },
     #[error("FrankenSQLite error: {0}")]
     Database(#[from] FrankenError),
     /// A caller requested a hard wall-clock bound that the pinned read facade cannot supply.
@@ -5225,29 +5268,58 @@ impl AnalyticsSnapshotProvider {
     }
 
     fn publish_worker_error(&self, error: &StorageWorkerError, stopped: bool) {
+        let _ = self.publish_worker_error_bounded(error, stopped, usize::MAX);
+    }
+
+    fn publish_worker_error_bounded(
+        &self,
+        error: &StorageWorkerError,
+        stopped: bool,
+        max_attempts: usize,
+    ) -> bool {
+        if has_preparation_fault(PreparationFaultPoint::ForceErrorPublicationContention) {
+            warn!("simulated publication contention via ForceErrorPublicationContention");
+            return false;
+        }
         let incoming = Arc::new(error.status());
         let error_text: Arc<str> = Arc::from(error.to_string());
-        self.inner.rcu(|current| {
-            let preserve_existing = current.stopped
-                && current
+        let mut attempts = 0usize;
+        let mut cur = self.inner.load();
+        loop {
+            attempts = attempts.saturating_add(1);
+            let preserve_existing = cur.stopped
+                && cur
                     .last_failure
                     .as_ref()
                     .is_some_and(|existing| existing.kind >= incoming.kind);
             if preserve_existing {
-                return Arc::clone(current);
+                return true;
             }
-            Arc::new(AnalyticsSnapshot {
-                run_id: current.run_id,
-                revision: current.revision.saturating_add(1),
-                committed_tick: current.committed_tick,
-                committed_agent_count: current.committed_agent_count,
-                watermarks: current.watermarks,
-                readings: Arc::clone(&current.readings),
+            let next = Arc::new(AnalyticsSnapshot {
+                run_id: cur.run_id,
+                revision: cur.revision.saturating_add(1),
+                committed_tick: cur.committed_tick,
+                committed_agent_count: cur.committed_agent_count,
+                watermarks: cur.watermarks,
+                readings: Arc::clone(&cur.readings),
                 last_error: Some(Arc::clone(&error_text)),
                 last_failure: Some(Arc::clone(&incoming)),
                 stopped,
-            })
-        });
+            });
+            let prev = self.inner.compare_and_swap(&*cur, next);
+            if std::sync::Arc::ptr_eq(&cur, &prev) {
+                return true;
+            }
+            cur = prev;
+            if attempts >= max_attempts {
+                warn!(
+                    attempts,
+                    max_attempts,
+                    "bounded preparation error publication abandoned under contention"
+                );
+                return false;
+            }
+        }
     }
 
     fn publish_stopped(&self) {
@@ -5277,6 +5349,236 @@ struct PendingAnalytics {
     readings: Arc<[MetricReading]>,
 }
 
+/// Test-only deterministic fault points for persistence preparation and error publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PreparationFaultPoint {
+    /// Injects a capacity reservation / allocation failure.
+    ForceReservationFailure,
+    /// Simulates contention during worker error publication.
+    ForceErrorPublicationContention,
+}
+
+fn preparation_faults() -> &'static Mutex<BTreeSet<PreparationFaultPoint>> {
+    static FAULTS: OnceLock<Mutex<BTreeSet<PreparationFaultPoint>>> = OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Arm a preparation fault point for testing.
+#[doc(hidden)]
+pub fn arm_preparation_fault(point: PreparationFaultPoint) {
+    let mut faults = preparation_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    faults.insert(point);
+}
+
+/// Clear a preparation fault point for testing.
+#[doc(hidden)]
+pub fn clear_preparation_fault(point: PreparationFaultPoint) {
+    let mut faults = preparation_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    faults.remove(&point);
+}
+
+/// Clear all preparation fault points for testing.
+#[doc(hidden)]
+pub fn clear_all_preparation_faults() {
+    let mut faults = preparation_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    faults.clear();
+}
+
+/// Check if a preparation fault point is armed.
+#[doc(hidden)]
+pub fn has_preparation_fault(point: PreparationFaultPoint) -> bool {
+    preparation_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&point)
+}
+
+/// Fallible vector capacity reservation helper.
+fn fallible_vec_with_capacity<T>(
+    context: &'static str,
+    capacity: usize,
+) -> Result<Vec<T>, StorageError> {
+    if has_preparation_fault(PreparationFaultPoint::ForceReservationFailure) {
+        return Err(StorageError::ReservationFailed {
+            context,
+            capacity,
+            element_bytes: std::mem::size_of::<T>(),
+            reason: "simulated reservation failure via ForceReservationFailure fault seam"
+                .to_owned(),
+        });
+    }
+    let mut vec = Vec::new();
+    if capacity > 0 {
+        vec.try_reserve_exact(capacity)
+            .map_err(|error| StorageError::ReservationFailed {
+                context,
+                capacity,
+                element_bytes: std::mem::size_of::<T>(),
+                reason: error.to_string(),
+            })?;
+    }
+    Ok(vec)
+}
+
+/// Fallible string capacity reservation helper.
+fn fallible_string_with_capacity(
+    context: &'static str,
+    capacity: usize,
+) -> Result<String, StorageError> {
+    if has_preparation_fault(PreparationFaultPoint::ForceReservationFailure) {
+        return Err(StorageError::ReservationFailed {
+            context,
+            capacity,
+            element_bytes: 1,
+            reason: "simulated string reservation failure via ForceReservationFailure fault seam"
+                .to_owned(),
+        });
+    }
+    let mut string = String::new();
+    if capacity > 0 {
+        string
+            .try_reserve_exact(capacity)
+            .map_err(|error| StorageError::ReservationFailed {
+                context,
+                capacity,
+                element_bytes: 1,
+                reason: error.to_string(),
+            })?;
+    }
+    Ok(string)
+}
+
+/// Global statistics for preparation cleanup handoffs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CleanupHandoffStats {
+    /// Total number of payloads handed off to background cleanup.
+    pub handed_off_count: u64,
+    /// Total number of payloads whose cleanup was completed.
+    pub completed_count: u64,
+    /// Current number of payloads actively queued or being cleaned up.
+    pub active_count: usize,
+}
+
+static CLEANUP_STATS: Mutex<CleanupHandoffStats> = Mutex::new(CleanupHandoffStats {
+    handed_off_count: 0,
+    completed_count: 0,
+    active_count: 0,
+});
+
+static CLEANUP_CHANNEL: OnceLock<std::sync::mpsc::SyncSender<Box<dyn Any + Send + 'static>>> =
+    OnceLock::new();
+
+fn cleanup_channel() -> &'static std::sync::mpsc::SyncSender<Box<dyn Any + Send + 'static>> {
+    CLEANUP_CHANNEL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Box<dyn Any + Send + 'static>>(4096);
+        let _ = thread::Builder::new()
+            .name("storage-cleanup-worker".to_string())
+            .spawn(move || {
+                while let Ok(item) = rx.recv() {
+                    drop(item);
+                    if let Ok(mut stats) = CLEANUP_STATS.lock() {
+                        stats.completed_count = stats.completed_count.saturating_add(1);
+                        stats.active_count = stats.active_count.saturating_sub(1);
+                    }
+                }
+            });
+        tx
+    })
+}
+
+/// Hands off cleanup of an arbitrarily large allocated payload to the background cleanup
+/// worker so the caller thread does not stall performing deallocations after a timeout or refusal.
+pub fn handoff_cleanup<T: Send + 'static>(value: T) {
+    let boxed: Box<dyn Any + Send + 'static> = Box::new(value);
+    if let Ok(mut stats) = CLEANUP_STATS.lock() {
+        stats.handed_off_count = stats.handed_off_count.saturating_add(1);
+        stats.active_count = stats.active_count.saturating_add(1);
+    }
+    let sender = cleanup_channel();
+    if sender.try_send(boxed).is_err() {
+        let _ = thread::Builder::new()
+            .name("storage-cleanup-overflow".to_string())
+            .spawn(move || {
+                if let Ok(mut stats) = CLEANUP_STATS.lock() {
+                    stats.completed_count = stats.completed_count.saturating_add(1);
+                    stats.active_count = stats.active_count.saturating_sub(1);
+                }
+            });
+    }
+}
+
+/// Snapshot of current cleanup handoff statistics.
+#[must_use]
+pub fn cleanup_handoff_stats() -> CleanupHandoffStats {
+    *CLEANUP_STATS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wait for all pending cleanup handoffs to drain (for tests).
+pub fn drain_cleanup_handoffs_for_test() {
+    let started = Instant::now();
+    while Instant::now().duration_since(started) < Duration::from_secs(2) {
+        let stats = cleanup_handoff_stats();
+        if stats.active_count == 0 && stats.completed_count >= stats.handed_off_count {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// RAII guard that holds a [`StorageBuffer`] during incremental preparation and
+/// automatically hands off deallocation to the background cleanup thread if preparation
+/// unwinds or errors out before completion.
+struct PartialBufferGuard {
+    buffer: StorageBuffer,
+    armed: bool,
+}
+
+impl PartialBufferGuard {
+    fn new(buffer: StorageBuffer) -> Self {
+        Self {
+            buffer,
+            armed: true,
+        }
+    }
+
+    fn defuse(mut self) -> StorageBuffer {
+        self.armed = false;
+        std::mem::take(&mut self.buffer)
+    }
+}
+
+impl std::ops::Deref for PartialBufferGuard {
+    type Target = StorageBuffer;
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl std::ops::DerefMut for PartialBufferGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
+}
+
+impl Drop for PartialBufferGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let buffer = std::mem::take(&mut self.buffer);
+            if !buffer.is_empty() {
+                handoff_cleanup(buffer);
+            }
+        }
+    }
+}
+
 fn clone_preparation_string<Observer>(
     source: &str,
     observer: &mut Observer,
@@ -5289,7 +5591,7 @@ where
     const CHECKPOINT_BYTES: usize = 4_096;
 
     observer.checkpoint(stage, progress)?;
-    let mut cloned = String::with_capacity(source.len());
+    let mut cloned = fallible_string_with_capacity("string.clone", source.len())?;
     observer.checkpoint(stage, progress)?;
     let mut next_checkpoint = CHECKPOINT_BYTES;
     for (offset, character) in source.char_indices() {
@@ -5331,7 +5633,7 @@ impl PendingAnalytics {
             values.insert(name, metric.value);
             observer.checkpoint(PreparationStage::Analytics, progress)?;
         }
-        let mut readings = Vec::with_capacity(values.len());
+        let mut readings = fallible_vec_with_capacity("analytics.readings", values.len())?;
         for (name, value) in values {
             observer.checkpoint(PreparationStage::Analytics, progress)?;
             readings.push(MetricReading {
@@ -5381,11 +5683,12 @@ impl PreparedPersistenceBatch {
         Observer: PreparationObserver,
     {
         let storage = Storage::prepare_batch_observed(batch, island, observer, progress)?;
+        let mut storage_guard = PartialBufferGuard::new(storage);
         let analytics = PendingAnalytics::from_batch_observed(batch, observer, progress)?;
         observer.checkpoint(PreparationStage::Complete, progress)?;
         Ok(Self {
             tick: batch.summary.tick.0,
-            storage,
+            storage: storage_guard.defuse(),
             analytics,
         })
     }
@@ -6089,6 +6392,12 @@ pub struct PayloadBudget {
     pub max_batch_events: usize,
     /// Largest total in-flight (buffered, not yet flushed) payload, in bytes.
     pub max_inflight_bytes: usize,
+    /// Largest single batch narrative payload, in estimated bytes.
+    pub max_narrative_batch_bytes: usize,
+    /// Largest single batch narrative payload, in records.
+    pub max_narrative_batch_events: usize,
+    /// Largest total in-flight narrative payload, in bytes.
+    pub max_narrative_inflight_bytes: usize,
 }
 
 impl Default for PayloadBudget {
@@ -6101,6 +6410,13 @@ impl Default for PayloadBudget {
             max_batch_events: 1_000_000,
             // 256 MiB of buffered payload is the ceiling before back-pressure.
             max_inflight_bytes: 256 << 20,
+            // Narrative events are operational commentary. 16 MiB and 100,000 events
+            // provide a generous finite budget that prevents memory exhaustion while
+            // remaining independent of scientific admission.
+            max_narrative_batch_bytes: 16 << 20,
+            max_narrative_batch_events: 100_000,
+            // 64 MiB buffered narrative commentary ceiling before back-pressure.
+            max_narrative_inflight_bytes: 64 << 20,
         }
     }
 }
@@ -18390,20 +18706,26 @@ impl Storage {
         // domain exactly, matching the V15 column's CHECK bound. Converting through a smaller
         // type here would reintroduce the narrowing that bd-8djh's u16 bound already cost once.
         let island_id = i64::from(island.0);
-        let mut prepared = StorageBuffer {
-            ticks: Vec::with_capacity(1),
-            metrics: Vec::with_capacity(payload.metrics.len()),
-            events: Vec::with_capacity(payload.events.len()),
-            agents: Vec::with_capacity(payload.agents.len()),
-            births: Vec::with_capacity(payload.births.len()),
-            deaths: Vec::with_capacity(payload.deaths.len()),
-            replay_events: Vec::with_capacity(payload.replay_events.len()),
-            run_events: Vec::with_capacity(payload.narrative_events.len()),
-            genomes: Vec::with_capacity(payload.genomes.len()),
+        let mut prepared = PartialBufferGuard::new(StorageBuffer {
+            ticks: fallible_vec_with_capacity("storage.ticks", 1)?,
+            metrics: fallible_vec_with_capacity("storage.metrics", payload.metrics.len())?,
+            events: fallible_vec_with_capacity("storage.events", payload.events.len())?,
+            agents: fallible_vec_with_capacity("storage.agents", payload.agents.len())?,
+            births: fallible_vec_with_capacity("storage.births", payload.births.len())?,
+            deaths: fallible_vec_with_capacity("storage.deaths", payload.deaths.len())?,
+            replay_events: fallible_vec_with_capacity(
+                "storage.replay_events",
+                payload.replay_events.len(),
+            )?,
+            run_events: fallible_vec_with_capacity(
+                "storage.run_events",
+                payload.narrative_events.len(),
+            )?,
+            genomes: fallible_vec_with_capacity("storage.genomes", payload.genomes.len())?,
             migrations: Vec::new(),
             archive_spaces: Vec::new(),
             archive_cells: Vec::new(),
-        };
+        });
         observer.checkpoint(PreparationStage::Materialize, progress)?;
 
         observer.checkpoint(PreparationStage::Materialize, progress)?;
@@ -18497,7 +18819,7 @@ impl Storage {
         }
 
         prepared.validate_contents_observed(summary.tick.0, observer, progress)?;
-        Ok(prepared)
+        Ok(prepared.defuse())
     }
 
     /// Buffer one admitted batch for application without triggering a flush
@@ -18533,6 +18855,20 @@ impl Storage {
     /// asynchronous worker, buffering scientific rows until thresholds or an explicit flush.
     ///
     /// Attributes the batch to [`IslandId`] 0; see [`Self::persist_for_island`].
+    ///
+    /// # Direct Same-Thread Persistence Boundary Specification
+    ///
+    /// `Storage::persist` is the direct same-thread persistence interface intended for
+    /// administrative, migration, reporting, and deterministic synchronous test workflows.
+    /// Unlike [`StoragePipeline`] and [`StorageSink`], which enforce backpressure through
+    /// [`PayloadBudget`], in-flight byte permits, command channels, and caller preparation
+    /// deadlines, `Storage::persist` operates synchronously on the calling thread without
+    /// wall-clock deadlines (using [`UnboundedPreparation`]).
+    ///
+    /// However, `Storage::persist` enforces fallible container capacity reservations during
+    /// batch preparation (`prepare_batch_observed`), ensuring that pathological batches or
+    /// allocation failures return a typed [`StorageError::ReservationFailed`] error rather
+    /// than panicking or crashing the process.
     pub fn persist(&mut self, payload: &PersistenceBatch) -> Result<(), StorageError> {
         self.persist_for_island(payload, IslandId(0))
     }
@@ -20234,6 +20570,7 @@ enum StorageCommand {
     Persist {
         batch: Box<PreparedPersistenceBatch>,
         permit: InFlightPermit,
+        narrative_permit: Option<InFlightPermit>,
         reply: xchan::Sender<Result<AdmissionReceipt, StorageWorkerError>>,
     },
     RegisterJournal {
@@ -20379,6 +20716,7 @@ struct WorkerState {
     /// permit beside its admitted batch makes every terminal return and panic
     /// release the outstanding total automatically when `WorkerState` drops.
     pending_permits: Vec<(PersistenceBatchId, InFlightPermit)>,
+    pending_narrative_permits: Vec<(PersistenceBatchId, InFlightPermit)>,
     journal_sessions: BTreeMap<HostSessionId, WorkerJournalSession>,
 }
 
@@ -20480,6 +20818,8 @@ pub struct StorageSink {
     /// the sink eventually refuses everything, and persistence dies quietly in a
     /// long run rather than loudly in a test.
     inflight_bytes: Arc<AtomicUsize>,
+    /// Narrative bytes admitted but not yet flushed.
+    inflight_narrative_bytes: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy)]
@@ -20538,6 +20878,18 @@ impl StorageSink {
         self.run_id
     }
 
+    /// Bytes admitted but not yet flushed.
+    #[must_use]
+    pub fn inflight_bytes(&self) -> usize {
+        self.inflight_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Narrative bytes admitted but not yet flushed.
+    #[must_use]
+    pub fn inflight_narrative_bytes(&self) -> usize {
+        self.inflight_narrative_bytes.load(Ordering::SeqCst)
+    }
+
     fn publish_preparation_error(&self, error: &StorageError, tick: u64) {
         let worker_error = match error {
             StorageError::Worker(worker_error) => worker_error.clone(),
@@ -20549,7 +20901,11 @@ impl StorageSink {
                 detail: other.to_string(),
             },
         };
-        self.analytics.publish_worker_error(&worker_error, false);
+        self.analytics.publish_worker_error_bounded(
+            &worker_error,
+            false,
+            DEFAULT_ERROR_PUBLICATION_ATTEMPTS,
+        );
     }
 
     /// Admit a persistence batch and wait until its exact payload is in the worker outbox.
@@ -20650,8 +21006,33 @@ impl StorageSink {
                 max_events: self.budget.max_batch_events,
             });
         }
-        let _ = estimate_narrative_size_observed(payload, &mut preparation, &mut progress)
-            .inspect_err(|error| self.publish_preparation_error(error, tick))?;
+        let (narrative_bytes, narrative_events) =
+            estimate_narrative_size_observed(payload, &mut preparation, &mut progress)
+                .inspect_err(|error| self.publish_preparation_error(error, tick))?;
+        if narrative_bytes > self.budget.max_narrative_batch_bytes
+            || narrative_events > self.budget.max_narrative_batch_events
+        {
+            warn!(
+                schema = "scriptbots.persistence-preparation.v1",
+                phase = "refusal",
+                stage = PreparationStage::NarrativeMeasure.as_str(),
+                narrative_bytes,
+                narrative_records = narrative_events,
+                path = %self.path,
+                tick,
+                identity_state = "unassigned",
+                disposition = "not_admitted",
+                reason = "narrative_payload_too_large",
+                "narrative persistence payload refused before materialization"
+            );
+            return Err(StorageError::NarrativePayloadTooLarge {
+                tick,
+                bytes: narrative_bytes,
+                events: narrative_events,
+                max_bytes: self.budget.max_narrative_batch_bytes,
+                max_events: self.budget.max_narrative_batch_events,
+            });
+        }
 
         // Total in-flight back-pressure. A stream of individually-legal batches
         // can still exhaust memory if the writer falls behind, so the buffered
@@ -20670,6 +21051,25 @@ impl StorageSink {
             would_be,
             max_inflight: self.budget.max_inflight_bytes,
         })?;
+
+        let narrative_permit = if narrative_bytes > 0 {
+            let permit = InFlightPermit::try_acquire_observed(
+                &self.inflight_narrative_bytes,
+                narrative_bytes,
+                self.budget.max_narrative_inflight_bytes,
+                &mut preparation,
+                progress,
+            )
+            .inspect_err(|error| self.publish_preparation_error(error, tick))?
+            .map_err(|would_be| StorageError::InFlightNarrativeBytesExhausted {
+                tick,
+                would_be,
+                max_inflight: self.budget.max_narrative_inflight_bytes,
+            })?;
+            Some(permit)
+        } else {
+            None
+        };
 
         let prepared = PreparedPersistenceBatch::from_batch_observed(
             payload,
@@ -20728,6 +21128,7 @@ impl StorageSink {
             StorageCommand::Persist {
                 batch: Box::new(prepared),
                 permit,
+                narrative_permit,
                 reply: reply_tx,
             },
             enqueue_deadline,
@@ -20735,7 +21136,10 @@ impl StorageSink {
         drop(admission);
         match send_result {
             Ok(()) => {}
-            Err(xchan::SendTimeoutError::Timeout(_)) => {
+            Err(xchan::SendTimeoutError::Timeout(command)) => {
+                if let StorageCommand::Persist { batch, .. } = command {
+                    handoff_cleanup(batch);
+                }
                 let worker_error = StorageWorkerError::Timeout {
                     operation: StorageOperation::Admit,
                     phase: StorageWaitPhase::CommandEnqueue,
@@ -20744,10 +21148,17 @@ impl StorageSink {
                     waited: self.deadlines.command_enqueue,
                     commit_state: FailureCommitState::NotAdmitted,
                 };
-                self.analytics.publish_worker_error(&worker_error, false);
+                self.analytics.publish_worker_error_bounded(
+                    &worker_error,
+                    false,
+                    DEFAULT_ERROR_PUBLICATION_ATTEMPTS,
+                );
                 return Err(StorageError::Worker(worker_error));
             }
-            Err(xchan::SendTimeoutError::Disconnected(_)) => {
+            Err(xchan::SendTimeoutError::Disconnected(command)) => {
+                if let StorageCommand::Persist { batch, .. } = command {
+                    handoff_cleanup(batch);
+                }
                 let worker_error = StorageWorkerError::Channel {
                     operation: StorageOperation::Admit,
                     path: self.path.to_string(),
@@ -20755,7 +21166,11 @@ impl StorageSink {
                     commit_state: FailureCommitState::NotAdmitted,
                     detail: "storage worker command channel is disconnected".to_owned(),
                 };
-                self.analytics.publish_worker_error(&worker_error, true);
+                self.analytics.publish_worker_error_bounded(
+                    &worker_error,
+                    true,
+                    DEFAULT_ERROR_PUBLICATION_ATTEMPTS,
+                );
                 return Err(StorageError::Worker(worker_error));
             }
         }
@@ -21970,6 +22385,7 @@ impl StoragePipeline {
                     deadlines,
                     budget: PayloadBudget::default(),
                     inflight_bytes: Arc::new(AtomicUsize::new(0)),
+                    inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
                 },
                 handle: Some(handle),
                 pending_shutdown: None,
@@ -22195,6 +22611,12 @@ impl StoragePipeline {
     #[must_use]
     pub fn inflight_bytes(&self) -> usize {
         self.sink.inflight_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Narrative bytes admitted but not yet flushed.
+    #[must_use]
+    pub fn inflight_narrative_bytes(&self) -> usize {
+        self.sink.inflight_narrative_bytes.load(Ordering::SeqCst)
     }
 
     pub fn submit(&self, payload: &PersistenceBatch) -> Result<(), StorageError> {
@@ -22779,6 +23201,7 @@ fn storage_worker(
             StorageCommand::Persist {
                 batch,
                 permit,
+                narrative_permit,
                 reply,
             } => {
                 let PreparedPersistenceBatch {
@@ -22811,6 +23234,11 @@ fn storage_worker(
                         match storage.append_staged(receipt.batch_id, prepared) {
                             Ok(()) => {
                                 state.pending_permits.push((receipt.batch_id, permit));
+                                if let Some(narrative_permit) = narrative_permit {
+                                    state
+                                        .pending_narrative_permits
+                                        .push((receipt.batch_id, narrative_permit));
+                                }
                                 if storage.flush_due()
                                     && let Err(error) = flush_one_worker_storage(
                                         &mut storage,
@@ -23236,6 +23664,10 @@ fn release_finalized_permits(state: &mut WorkerState) {
         .pending_permits
         .partition_point(|(batch_id, _)| batch_id.get() <= finalized);
     drop(state.pending_permits.drain(..eligible));
+    let eligible_narrative = state
+        .pending_narrative_permits
+        .partition_point(|(batch_id, _)| batch_id.get() <= finalized);
+    drop(state.pending_narrative_permits.drain(..eligible_narrative));
 }
 
 /// Refresh watermarks, publish committed analytics, finalize the applied
@@ -26792,6 +27224,7 @@ mod tests {
                 },
                 budget: PayloadBudget::default(),
                 inflight_bytes: Arc::new(AtomicUsize::new(0)),
+                inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
             };
             let payload = sample_batch(89, 8.9);
             let expected_estimate = estimate_batch_size(&payload);
@@ -26865,6 +27298,7 @@ mod tests {
             },
             budget: PayloadBudget::default(),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let mut payload = sample_batch(90, 9.0);
         payload.replay_events.push(ReplayEvent {
@@ -27041,6 +27475,23 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    fn sample_narrative_event_record(tick: u64, text_len: usize) -> EventRecord {
+        EventRecord {
+            schema_version: EVENT_RECORD_SCHEMA_VERSION,
+            tick: Tick(tick),
+            kind: EventKind::PopulationCrash,
+            severity: 0.5,
+            magnitude: 1.0,
+            window: (tick.saturating_sub(1), tick),
+            metric: "population".to_owned(),
+            before: 100.0,
+            after: 10.0,
+            score: 1.0,
+            subject: None,
+            human_text: "x".repeat(text_len),
+        }
     }
 
     #[test]
@@ -36644,6 +37095,7 @@ mod tests {
             deadlines: StorageDeadlines::default(),
             budget: PayloadBudget::default(),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let worker = thread::spawn(move || -> Result<(), std::io::Error> {
             match rx
@@ -36682,6 +37134,7 @@ mod tests {
             deadlines: short_deadlines(),
             budget: PayloadBudget::default(),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let started = Instant::now();
         let error = sink
@@ -36709,6 +37162,7 @@ mod tests {
             deadlines: short_deadlines(),
             budget: PayloadBudget::default(),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let admission = Arc::clone(&sink.admission);
         let guard = admission.lock().expect("test admission gate");
