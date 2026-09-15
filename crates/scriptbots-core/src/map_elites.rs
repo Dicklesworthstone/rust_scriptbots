@@ -1977,8 +1977,8 @@ impl MapElitesArchive {
 
     /// Reconstitute an archive from a JSON export bundle string.
     pub fn import_json(json_str: &str) -> Result<(String, Self), QdError> {
-        let bundle: ArchiveExportBundle = serde_json::from_str(json_str)
-            .map_err(|e| QdError::Serialization(e.to_string()))?;
+        let bundle: ArchiveExportBundle =
+            serde_json::from_str(json_str).map_err(|e| QdError::Serialization(e.to_string()))?;
         let run_id = bundle.run_id.clone();
         let archive = Self::from_bundle(bundle)?;
         Ok((run_id, archive))
@@ -1989,7 +1989,11 @@ impl MapElitesArchive {
     /// The first line contains a structured `# PROVENANCE:` header encoding metadata,
     /// space definition, and quality metric. Subsequent lines contain elite rows ordered
     /// strictly by ascending [`CellId`].
-    pub fn export_csv<W: std::io::Write>(&self, run_id: &str, writer: &mut W) -> Result<usize, QdError> {
+    pub fn export_csv<W: std::io::Write>(
+        &self,
+        run_id: &str,
+        writer: &mut W,
+    ) -> Result<usize, QdError> {
         let header = CsvProvenanceHeader {
             run_id: run_id.to_string(),
             space_version: self.space.version,
@@ -1997,8 +2001,8 @@ impl MapElitesArchive {
             min_lifetime_ticks: self.min_lifetime_ticks,
             space: self.space.clone(),
         };
-        let prov_json = serde_json::to_string(&header)
-            .map_err(|e| QdError::Serialization(e.to_string()))?;
+        let prov_json =
+            serde_json::to_string(&header).map_err(|e| QdError::Serialization(e.to_string()))?;
         writeln!(writer, "# PROVENANCE: {prov_json}")
             .map_err(|e| QdError::Serialization(e.to_string()))?;
         writeln!(
@@ -2033,11 +2037,14 @@ impl MapElitesArchive {
             .map_err(|e| QdError::Serialization(e.to_string()))?;
             rows += 1;
         }
-        writer.flush().map_err(|e| QdError::Serialization(e.to_string()))?;
+        writer
+            .flush()
+            .map_err(|e| QdError::Serialization(e.to_string()))?;
         Ok(rows)
     }
 
     /// Reconstitute an archive from an RFC 4180 CSV reader written by [`Self::export_csv`].
+    #[allow(clippy::too_many_lines)]
     pub fn import_csv<R: std::io::BufRead>(
         reader: R,
         byte_cap: usize,
@@ -2120,11 +2127,9 @@ impl MapElitesArchive {
             let parent_uid = if fields[5].is_empty() {
                 None
             } else {
-                Some(AgentUid(
-                    fields[5]
-                        .parse()
-                        .map_err(|e| QdError::Serialization(format!("invalid parent_uid: {e}")))?,
-                ))
+                Some(AgentUid(fields[5].parse().map_err(|e| {
+                    QdError::Serialization(format!("invalid parent_uid: {e}"))
+                })?))
             };
             let generation: u32 = fields[6]
                 .parse()
@@ -2169,7 +2174,7 @@ pub struct ArchiveExportBundle {
     pub min_lifetime_ticks: u32,
     /// Maximum allowed memory footprint in bytes.
     pub max_bytes: usize,
-    /// Vector of (cell_id, entry) pairs in ascending CellId order.
+    /// Vector of (`cell_id`, entry) pairs in ascending `CellId` order.
     pub cells: Vec<(CellId, ArchiveEntry)>,
 }
 
@@ -3272,7 +3277,8 @@ mod tests {
     #[test]
     fn test_archive_export_import_bundle_and_json_roundtrip() {
         let axis0 = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis0");
-        let axis1 = Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 2).expect("axis1");
+        let axis1 =
+            Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 2).expect("axis1");
         let space = BehaviorSpaceV0 {
             version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
             axes: vec![axis0, axis1],
@@ -3280,9 +3286,15 @@ mod tests {
         let mut archive = MapElitesArchive::new(space, QualityMetric::LifetimeIntake, 100, 100_000)
             .expect("archive");
 
-        archive.insert(make_test_entry(1, 15.5, vec![0.5, 0.25])).expect("insert 1");
-        archive.insert(make_test_entry(2, 42.0, vec![2.5, 0.75])).expect("insert 2");
-        archive.insert(make_test_entry(3, 8.0, vec![3.5, 0.1])).expect("insert 3");
+        archive
+            .insert(make_test_entry(1, 15.5, vec![0.5, 0.25]))
+            .expect("insert 1");
+        archive
+            .insert(make_test_entry(2, 42.0, vec![2.5, 0.75]))
+            .expect("insert 2");
+        archive
+            .insert(make_test_entry(3, 8.0, vec![3.5, 0.1]))
+            .expect("insert 3");
 
         let metrics_orig = archive.metrics();
         assert_eq!(metrics_orig.occupied_cells, 3);
@@ -3296,7 +3308,8 @@ mod tests {
 
         // 2. JSON roundtrip
         let json_str = archive.export_json("run_alpha").expect("export_json");
-        let (run_id_json, json_restored) = MapElitesArchive::import_json(&json_str).expect("import_json");
+        let (run_id_json, json_restored) =
+            MapElitesArchive::import_json(&json_str).expect("import_json");
         assert_eq!(run_id_json, "run_alpha");
         assert_eq!(archive.cells, json_restored.cells);
         assert_eq!(metrics_orig, json_restored.metrics());
@@ -3312,20 +3325,27 @@ mod tests {
         let mut archive = MapElitesArchive::new(space, QualityMetric::LifetimeIntake, 50, 50_000)
             .expect("archive");
 
-        archive.insert(make_test_entry(10, 20.0, vec![0.5])).expect("insert");
-        archive.insert(make_test_entry(20, 60.0, vec![1.5])).expect("insert");
+        archive
+            .insert(make_test_entry(10, 20.0, vec![0.5]))
+            .expect("insert");
+        archive
+            .insert(make_test_entry(20, 60.0, vec![1.5]))
+            .expect("insert");
 
         let metrics_orig = archive.metrics();
 
         let mut csv_buf = Vec::new();
-        let rows = archive.export_csv("test", &mut csv_buf).expect("export_csv");
+        let rows = archive
+            .export_csv("test", &mut csv_buf)
+            .expect("export_csv");
         assert_eq!(rows, 2);
 
         let csv_text = String::from_utf8(csv_buf.clone()).expect("valid utf8");
         assert!(csv_text.starts_with("# PROVENANCE: "));
         assert!(csv_text.contains("\"run_id\":\"test\""));
 
-        let (run_id, imported) = MapElitesArchive::import_csv(csv_buf.as_slice(), 50_000).expect("import_csv");
+        let (run_id, imported) =
+            MapElitesArchive::import_csv(csv_buf.as_slice(), 50_000).expect("import_csv");
         assert_eq!(run_id, "test");
         assert_eq!(archive.cells, imported.cells);
         assert_eq!(metrics_orig, imported.metrics());

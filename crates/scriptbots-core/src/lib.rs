@@ -2967,7 +2967,6 @@ impl BrainRegistry {
         self.key_and_family_by_id(family_id).map(|(key, _)| key)
     }
 
-
     /// Stable family-owned semantic identity captured when the protocol adapter was admitted.
     #[must_use]
     pub fn adapter_identity(&self, key: u64) -> Option<BrainAdapterIdentityV1> {
@@ -5393,6 +5392,7 @@ impl Intervention {
     ///
     /// Returns [`WorldStateError::InvalidConfig`] for a non-finite or negative
     /// magnitude, or an unusable region.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), WorldStateError> {
         match self {
             Self::Drought {
@@ -5498,19 +5498,19 @@ impl Intervention {
                 ..
             } => {
                 placement.region().validate_basic()?;
-                if let Some(diet) = herbivore_tendency {
-                    if !diet.is_finite() || !(0.0..=1.0).contains(diet) {
-                        return Err(WorldStateError::InvalidConfig(
-                            "resurrection herbivore_tendency must be finite and lie in [0, 1]",
-                        ));
-                    }
+                if let Some(diet) = herbivore_tendency
+                    && (!diet.is_finite() || !(0.0..=1.0).contains(diet))
+                {
+                    return Err(WorldStateError::InvalidConfig(
+                        "resurrection herbivore_tendency must be finite and lie in [0, 1]",
+                    ));
                 }
-                if let Some(cap) = headroom {
-                    if *cap == 0 {
-                        return Err(WorldStateError::InvalidConfig(
-                            "resurrection headroom must be at least 1",
-                        ));
-                    }
+                if let Some(cap) = headroom
+                    && *cap == 0
+                {
+                    return Err(WorldStateError::InvalidConfig(
+                        "resurrection headroom must be at least 1",
+                    ));
                 }
                 Ok(())
             }
@@ -5539,10 +5539,11 @@ impl Intervention {
             | Self::PaintTerrain { region, .. } => {
                 region.validate_for_world(world_width, world_height)
             }
-            Self::InjectCohort { placement, .. }
-            | Self::SpawnFromArchive { placement, .. } => placement
-                .region()
-                .validate_for_world(world_width, world_height),
+            Self::InjectCohort { placement, .. } | Self::SpawnFromArchive { placement, .. } => {
+                placement
+                    .region()
+                    .validate_for_world(world_width, world_height)
+            }
             Self::SetClosedWorld { .. } => Ok(()),
         }
     }
@@ -22193,8 +22194,9 @@ impl WorldState {
                     );
                     return Err(error.into());
                 };
-                if let Err(BrainProtocolError::SchemaVersionMismatch { found, expected, .. }) =
-                    adapter.validate_genome(&entry.genome)
+                if let Err(BrainProtocolError::SchemaVersionMismatch {
+                    found, expected, ..
+                }) = adapter.validate_genome(&entry.genome)
                 {
                     let error = InterventionError::UnsupportedGenomeVersion {
                         supported: expected,
@@ -22583,7 +22585,11 @@ impl WorldState {
                     ..
                 } => {
                     let Some(entries) = self.archive.as_ref().map(|archive| {
-                        archive.select_entries(&selector).into_iter().cloned().collect::<Vec<_>>()
+                        archive
+                            .select_entries(&selector)
+                            .into_iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
                     }) else {
                         continue;
                     };
@@ -22616,7 +22622,7 @@ impl WorldState {
                             world_width,
                             world_height,
                         );
-                        let id = match self.try_inject_agent_with(
+                        let Ok(id) = self.try_inject_agent_with(
                             AgentData {
                                 position,
                                 ..AgentData::default()
@@ -22624,12 +22630,9 @@ impl WorldState {
                             |runtime| {
                                 runtime.herbivore_tendency = diet;
                             },
-                        ) {
-                            Ok(id) => id,
-                            Err(_) => {
-                                breach_count += 1;
-                                continue;
-                            }
+                        ) else {
+                            breach_count += 1;
+                            continue;
                         };
                         match self.bind_agent_brain_genome(id, &entry.genome) {
                             Ok(true) => {
@@ -28577,6 +28580,11 @@ impl WorldState {
     }
 
     /// Bind an exact versioned heritable genome to the specified agent. Returns `true` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldStateError`] if scientific mutations are blocked, the agent is unknown,
+    /// the brain family is not registered, genome validation fails, or RNG counter state is missing.
     pub fn bind_agent_brain_genome(
         &mut self,
         id: AgentId,
@@ -28606,7 +28614,9 @@ impl WorldState {
         let ordinal = self
             .agent_rng_counters
             .get_mut(id)
-            .expect("counter presence was checked above")
+            .ok_or_else(|| ScientificStateError::MissingAgentRngCounters {
+                path: format!("agents[uid={}].rng_counters", uid.get()),
+            })?
             .take_brain_initialization()
             .map_err(|error| Self::agent_rng_counter_error(uid, error))?;
         let mut rng = agent_substream(
@@ -28627,19 +28637,14 @@ impl WorldState {
             .kind(key)
             .unwrap_or("unknown")
             .to_owned();
-        let binding = match Self::instantiate_protocol_binding(
-            adapter,
-            key,
-            kind,
-            genome.clone(),
-            &state,
-        ) {
-            Ok(binding) => binding,
-            Err(error) => {
-                self.agent_rng_counters.insert(id, counters_before);
-                return Err(error.into());
-            }
-        };
+        let binding =
+            match Self::instantiate_protocol_binding(adapter, key, kind, genome.clone(), &state) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    self.agent_rng_counters.insert(id, counters_before);
+                    return Err(error.into());
+                }
+            };
         let Some(runtime) = self.runtime.get_mut(id) else {
             self.agent_rng_counters.insert(id, counters_before);
             return Ok(false);

@@ -2,10 +2,10 @@
 
 use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::map_elites::{
-    ArchiveEntry, ArchiveProvenance, Axis, BehaviorDescriptor, BehaviorSpaceV0,
-    CellId, CellSelector, EvolutionSelectionMode, InsertionResult, MAX_ARCHIVE_CELLS,
-    MapElitesArchive, PhenotypeFeature, QdError, QualityMetric, compute_novelty_score,
-    BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+    ArchiveEntry, ArchiveProvenance, Axis, BEHAVIOR_SPACE_SCHEMA_VERSION_V0, BehaviorDescriptor,
+    BehaviorSpaceV0, CellId, CellSelector, EvolutionSelectionMode, InsertionResult,
+    MAX_ARCHIVE_CELLS, MapElitesArchive, PhenotypeFeature, QdError, QualityMetric,
+    compute_novelty_score,
 };
 use scriptbots_core::{
     AgentData, AgentUid, BrainFamilyId, BrainGenomeEnvelope, BrainProvenance, Generation,
@@ -843,7 +843,10 @@ fn test_novelty_selection_modulates_reproduction_and_alters_lineages() {
     );
 }
 
-fn setup_test_world_with_mlp(seed: u64, archive_enabled: bool) -> (WorldState, BrainGenomeEnvelope) {
+fn setup_test_world_with_mlp(
+    seed: u64,
+    archive_enabled: bool,
+) -> (WorldState, BrainGenomeEnvelope) {
     let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis");
     let space = BehaviorSpaceV0 {
         version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
@@ -865,7 +868,9 @@ fn setup_test_world_with_mlp(seed: u64, archive_enabled: bool) -> (WorldState, B
         .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
         .expect("register MLP");
 
-    let id = world.try_spawn_agent(AgentData::default()).expect("spawn agent");
+    let id = world
+        .try_spawn_agent(AgentData::default())
+        .expect("spawn agent");
     world.bind_agent_brain(id, key).expect("bind brain");
     let genome = world.agent_brain_genome(id).expect("agent genome").clone();
 
@@ -873,11 +878,7 @@ fn setup_test_world_with_mlp(seed: u64, archive_enabled: bool) -> (WorldState, B
 }
 
 fn populate_archive(world: &mut WorldState, genome: &BrainGenomeEnvelope) {
-    let entries = [
-        (101, 10.0, 0.5),
-        (102, 50.0, 1.5),
-        (103, 30.0, 2.5),
-    ];
+    let entries = [(101, 10.0, 0.5), (102, 50.0, 1.5), (103, 30.0, 2.5)];
     let archive = world.archive_mut().expect("archive must be present");
     for (uid, quality, speed) in entries {
         let entry = ArchiveEntry {
@@ -915,7 +916,9 @@ fn test_spawn_from_archive_positive_all_and_top_k() {
         herbivore_tendency: Some(0.8),
     };
 
-    world.enqueue_intervention(intervention).expect("enqueue intervention");
+    world
+        .enqueue_intervention(intervention)
+        .expect("enqueue intervention");
     world.step().expect("step 1");
 
     assert_eq!(world.agent_count(), pop_init + 2);
@@ -948,7 +951,11 @@ fn test_spawn_from_archive_negative_unsupported_genome_version_atomic() {
             generation: Generation(0),
         },
     };
-    world.archive_mut().expect("archive").insert(entry).expect("insert bad entry");
+    world
+        .archive_mut()
+        .expect("archive")
+        .insert(entry)
+        .expect("insert bad entry");
 
     let pop_before = world.agent_count();
     let intervention = Intervention::SpawnFromArchive {
@@ -1020,7 +1027,9 @@ fn test_spawn_from_archive_negative_archive_disabled() {
     let res = world.enqueue_intervention(intervention);
     assert!(matches!(
         res,
-        Err(WorldStateError::Intervention(InterventionError::ArchiveDisabled))
+        Err(WorldStateError::Intervention(
+            InterventionError::ArchiveDisabled
+        ))
     ));
 }
 
@@ -1040,7 +1049,9 @@ fn test_spawn_from_archive_shortfall_explicit_selector() {
         herbivore_tendency: None,
     };
 
-    world.enqueue_intervention(intervention).expect("enqueue explicit");
+    world
+        .enqueue_intervention(intervention)
+        .expect("enqueue explicit");
     world.step().expect("step");
     assert_eq!(world.agent_count(), pop_before + 1);
 }
@@ -1072,8 +1083,12 @@ fn test_spawn_from_archive_determinism() {
         herbivore_tendency: Some(0.6),
     };
 
-    world1.enqueue_intervention(intervention1).expect("enqueue 1");
-    world2.enqueue_intervention(intervention2).expect("enqueue 2");
+    world1
+        .enqueue_intervention(intervention1)
+        .expect("enqueue 1");
+    world2
+        .enqueue_intervention(intervention2)
+        .expect("enqueue 2");
 
     for _ in 0..5 {
         world1.step().expect("step 1");
@@ -1084,4 +1099,3 @@ fn test_spawn_from_archive_determinism() {
     let digest2 = world2.characterization_digest_v0().expect("digest 2");
     assert_eq!(digest1, digest2);
 }
-
