@@ -50,3 +50,11 @@ beads_compliance_audit/
 # NTM pane logs, pids, and crash inbox (local swarm runtime).
 .ntm/
 __pycache__/
+
+# === agent ephemeral residue 2026-09-15 ===
+# br vacuum/WAL-cert sidecars from schema-migration probes.
+.beads/*.vacuum-wal-cert*
+.beads/.beads.db.*
+# Per-host gate wrappers at the repo root.
+/.gate_*.sh
+/.verify_*.sh
