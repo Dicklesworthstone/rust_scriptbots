@@ -18409,6 +18409,7 @@ pub struct WorldState {
     capture_budget: CaptureBudget,
     probe_stats: ProbeStats,
     active_activation_probe: Option<(AgentId, AgentUid)>,
+    last_captured_probe_agents: Vec<AgentId>,
     history: VecDeque<TickSummary>,
 
     narrative: narrative::RunNarrative,
@@ -19298,6 +19299,7 @@ impl WorldState {
             capture_budget: CaptureBudget::default(),
             probe_stats: ProbeStats::default(),
             active_activation_probe: None,
+            last_captured_probe_agents: Vec::new(),
             history: VecDeque::with_capacity(history_capacity),
 
             narrative: narrative::RunNarrative::default(),
@@ -19432,6 +19434,29 @@ impl WorldState {
         } else {
             None
         }
+    }
+
+    /// Returns the stable logical UID of the active activation probe target, if still alive (bd-16g.4.4).
+    #[must_use]
+    pub fn active_activation_probe_uid(&self) -> Option<AgentUid> {
+        if let Some((id, uid)) = self.active_activation_probe {
+            if self.agent_uid(id) == Some(uid) {
+                Some(uid)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Returns the agents captured for activation inspection in the last tick (bd-16g.4.4).
+    ///
+    /// Deterministically ordered: explicit probed agent first, then selection-driven
+    /// agents in handle order up to `capture_budget.max_agents`.
+    #[must_use]
+    pub fn last_captured_probe_agents(&self) -> &[AgentId] {
+        &self.last_captured_probe_agents
     }
 
     /// Updates probe statistics for the current tick under the bounded capture budget (bd-16g.4.4).
@@ -20774,10 +20799,43 @@ impl WorldState {
         }
 
         let probed_agent = self.active_activation_probe();
-        let selected_total = usize::from(probed_agent.is_some());
         let max_agents = self.capture_budget.max_agents;
-        let captured = usize::from(selected_total > 0 && max_agents > 0);
+
+        let mut captured_agents = Vec::with_capacity(max_agents);
+        if let Some(id) = probed_agent {
+            if max_agents > 0 {
+                captured_agents.push(id);
+            }
+        }
+
+        let mut selected_total = usize::from(probed_agent.is_some());
+        for handle in self.agents.iter_handles() {
+            if Some(handle) == probed_agent {
+                continue;
+            }
+            if let Some(runtime) = self.runtime.get(handle) {
+                if matches!(runtime.selection, SelectionState::Selected) {
+                    selected_total += 1;
+                    if captured_agents.len() < max_agents {
+                        captured_agents.push(handle);
+                    }
+                }
+            }
+        }
+
+        let captured = captured_agents.len();
+        let dropped = selected_total.saturating_sub(captured);
+        if dropped > 0 {
+            diag_warn!(
+                tick = self.tick.next().0,
+                captured,
+                budget = max_agents,
+                dropped,
+                "probe activation capture saturated; dropping selected agents exceeding budget"
+            );
+        }
         self.update_probe_stats(captured, selected_total);
+        self.last_captured_probe_agents = captured_agents;
 
         first_error.map_or(Ok(()), Err)
     }
@@ -24525,6 +24583,11 @@ impl WorldState {
                 self.agent_stats.remove(&identity.uid);
             }
             self.agent_rng_counters.remove(*id);
+        }
+        if let Some((probed_id, _)) = self.active_activation_probe {
+            if dead_ids.contains(&probed_id) {
+                self.active_activation_probe = None;
+            }
         }
         let removed = self.agents.remove_many(&dead_ids);
         self.last_deaths = removed;
@@ -51579,6 +51642,186 @@ mod tests {
         assert_eq!(stats.captured, 4);
         assert_eq!(stats.budget, 0);
         assert_eq!(stats.dropped, 496);
+    }
+
+    #[test]
+    fn test_probe_selection_driven_capture_budget_and_priority() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xCA97),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let handles: Vec<_> = (0..500)
+            .map(|seed| world.spawn_agent(sample_agent(seed)))
+            .collect();
+
+        // Select all 500 agents.
+        let raw_ids: Vec<u64> = handles.iter().map(|id| id.data().as_ffi()).collect();
+        world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: raw_ids,
+            state: SelectionState::Selected,
+        });
+
+        // Hard ceiling of 4 agents.
+        world.set_capture_budget(CaptureBudget { max_agents: 4 });
+        world.step().expect("step with 500 selected agents");
+
+        let stats = world.probe_stats();
+        assert_eq!(stats.captured, 4);
+        assert_eq!(stats.dropped, 496);
+        assert_eq!(stats.budget, 4);
+        assert_eq!(world.last_captured_probe_agents().len(), 4);
+
+        // All 4 captured agents should match the first 4 handles in iter_handles order.
+        let first_4_handles: Vec<_> = world.agents.iter_handles().take(4).collect();
+        assert_eq!(world.last_captured_probe_agents(), first_4_handles.as_slice());
+
+        // Now set explicit probe on the 100th agent (which is also selected).
+        let probed_target = handles[100];
+        world.set_activation_probe(Some(probed_target));
+        assert_eq!(world.active_activation_probe(), Some(probed_target));
+
+        world.step().expect("step with probed + selected agents");
+        let stats_probed = world.probe_stats();
+        // Total selected remains 500 (probed is not double counted).
+        assert_eq!(stats_probed.captured, 4);
+        assert_eq!(stats_probed.dropped, 496);
+        assert_eq!(stats_probed.budget, 4);
+
+        let captured_probed = world.last_captured_probe_agents();
+        assert_eq!(captured_probed.len(), 4);
+        // Explicit probed agent must come FIRST.
+        assert_eq!(captured_probed[0], probed_target);
+        // Next 3 must be the earliest handles skipping probed_target.
+        let expected_next_3: Vec<_> = world
+            .agents
+            .iter_handles()
+            .filter(|h| *h != probed_target)
+            .take(3)
+            .collect();
+        assert_eq!(&captured_probed[1..], expected_next_3.as_slice());
+    }
+
+    #[test]
+    fn test_probe_death_lifecycle_and_slot_reuse_safety() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xDEAD),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let agent_a = world.spawn_agent(sample_agent(1));
+        let agent_b = world.spawn_agent(sample_agent(2));
+        let uid_a = world.agent_uid(agent_a).expect("uid a");
+
+        world.set_activation_probe(Some(agent_a));
+        assert_eq!(world.active_activation_probe(), Some(agent_a));
+        assert_eq!(world.active_activation_probe_uid(), Some(uid_a));
+
+        // Kill agent a.
+        world
+            .try_update_agent(agent_a, |data, runtime| {
+                data.health = 0.0;
+                runtime.energy = 0.0;
+            })
+            .expect("drain agent a");
+
+        world.step().expect("step causing death cleanup");
+        assert_eq!(world.last_deaths, 1);
+        let death = world.pending_death_records.last().expect("death record");
+        assert_eq!(death.agent_uid, uid_a);
+
+        // Probe should automatically clear to None.
+        assert_eq!(world.active_activation_probe(), None);
+        assert_eq!(world.active_activation_probe_uid(), None);
+
+        // Inspecting dead agent returns typed Unavailable::MissingAgent.
+        let inspect_res = world
+            .inspect_brains(&BrainInspectionRequest::single(
+                BrainInspectionClientId::new(1),
+                BrainInspectionRevision::new(1),
+                uid_a,
+            ))
+            .expect("inspect dead agent");
+        assert!(matches!(
+            inspect_res.telemetry.as_slice(),
+            [SelectedBrainTelemetryOutcome::Unavailable {
+                agent_uid,
+                reason: BrainInspectionUnavailable::MissingAgent
+            }] if *agent_uid == uid_a
+        ));
+
+        // Unknown and unborn UIDs also return typed Unavailable::MissingAgent.
+        let unknown_uid = AgentUid(0x9999_9999);
+        let inspect_unknown = world
+            .inspect_brains(&BrainInspectionRequest::single(
+                BrainInspectionClientId::new(1),
+                BrainInspectionRevision::new(2),
+                unknown_uid,
+            ))
+            .expect("inspect unknown agent");
+        assert!(matches!(
+            inspect_unknown.telemetry.as_slice(),
+            [SelectedBrainTelemetryOutcome::Unavailable {
+                agent_uid,
+                reason: BrainInspectionUnavailable::MissingAgent
+            }] if *agent_uid == unknown_uid
+        ));
+
+        // Spawn new agent: active probe remains None and does not inspect new agent.
+        let agent_c = world.spawn_agent(sample_agent(3));
+        assert_eq!(world.active_activation_probe(), None);
+        assert_ne!(world.agent_uid(agent_c), Some(uid_a));
+
+        // Surviving agent b remains untouched.
+        assert!(world.agents().contains(agent_b));
+    }
+
+    #[test]
+    fn test_probe_observational_neutrality_multi_tick() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xF00D),
+            ..ScriptBotsConfig::default()
+        };
+
+        // World A: Probe is OFF and budget default.
+        let mut world_a = WorldState::new(config.clone()).expect("world a init");
+        for seed in 0..16 {
+            world_a.spawn_agent(sample_agent(seed));
+        }
+
+        // World B: Probe is ON, with active probe and selections.
+        let mut world_b = WorldState::new(config).expect("world b init");
+        let mut b_handles = Vec::new();
+        for seed in 0..16 {
+            b_handles.push(world_b.spawn_agent(sample_agent(seed)));
+        }
+        world_b.set_activation_probe(Some(b_handles[3]));
+        world_b.set_capture_budget(CaptureBudget { max_agents: 2 });
+        world_b.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: vec![b_handles[1].data().as_ffi(), b_handles[5].data().as_ffi()],
+            state: SelectionState::Selected,
+        });
+
+        // Run both for 50 ticks.
+        for _ in 0..50 {
+            world_a.step().expect("step world a");
+            world_b.step().expect("step world b");
+        }
+
+        let digest_a = world_a.world_digest_v1().expect("digest a");
+        let digest_b = world_b.world_digest_v1().expect("digest b");
+        assert_eq!(
+            digest_a, digest_b,
+            "activation probing and selection must be completely observationally neutral"
+        );
     }
 
     #[test]
