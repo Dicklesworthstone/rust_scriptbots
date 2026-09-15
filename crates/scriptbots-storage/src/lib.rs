@@ -20946,7 +20946,9 @@ pub struct ReaperRequestReceipt {
 /// Structured diagnostic errors returned by the reaper accounting ledger audit.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReaperAccountingError {
-    #[error("stranded reap request: request_id={request_id} path={path} was never drained or joined")]
+    #[error(
+        "stranded reap request: request_id={request_id} path={path} was never drained or joined"
+    )]
     StrandedRequest { request_id: u64, path: String },
     #[error("double consumption: request_id={request_id} path={path} was consumed multiple times")]
     DoubleConsumption { request_id: u64, path: String },
@@ -21091,9 +21093,8 @@ fn reap_storage_request(request: StorageReapRequest) -> (u64, String, ReaperJoin
             );
             match handle.join() {
                 Err(panic) => {
-                    let detail = format!(
-                        "storage worker panicked during supervised reap: {panic:?}"
-                    );
+                    let detail =
+                        format!("storage worker panicked during supervised reap: {panic:?}");
                     analytics.publish_worker_error(
                         &StorageWorkerError::Internal {
                             operation: StorageOperation::Join,
@@ -21245,7 +21246,10 @@ impl ReaperStats {
                 ));
             }
             if self.oldest_active_age.is_some() {
-                return Err("invariant violation: oldest_active_age is Some with 0 active reapers".to_string());
+                return Err(
+                    "invariant violation: oldest_active_age is Some with 0 active reapers"
+                        .to_string(),
+                );
             }
         } else if self.oldest_active_age.is_none() {
             return Err(format!(
@@ -22558,23 +22562,27 @@ impl StoragePipeline {
                 entered: entered_tx,
                 release: release_rx,
             })
-            .map_err(|err| StorageError::Worker(StorageWorkerError::Channel {
-                operation: StorageOperation::Shutdown,
-                path: self.sink.path.to_string(),
-                tick: None,
-                commit_state: FailureCommitState::NotAdmitted,
-                detail: format!("failed to pause worker: {err}"),
-            }))?;
+            .map_err(|err| {
+                StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Shutdown,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    commit_state: FailureCommitState::NotAdmitted,
+                    detail: format!("failed to pause worker: {err}"),
+                })
+            })?;
         entered_rx
             .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| StorageError::Worker(StorageWorkerError::Timeout {
-                operation: StorageOperation::Shutdown,
-                phase: StorageWaitPhase::Acknowledgement,
-                path: self.sink.path.to_string(),
-                tick: None,
-                waited: Duration::from_secs(5),
-                commit_state: FailureCommitState::Indeterminate,
-            }))?;
+            .map_err(|_| {
+                StorageError::Worker(StorageWorkerError::Timeout {
+                    operation: StorageOperation::Shutdown,
+                    phase: StorageWaitPhase::Acknowledgement,
+                    path: self.sink.path.to_string(),
+                    tick: None,
+                    waited: Duration::from_secs(5),
+                    commit_state: FailureCommitState::Indeterminate,
+                })
+            })?;
         Ok(WorkerPauseGuard {
             release_tx: Some(release_tx),
         })
