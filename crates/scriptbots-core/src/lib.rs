@@ -87,12 +87,13 @@ pub mod visual;
 
 pub use map_elites as qd;
 pub use map_elites::{
-    AgentAccumulatedStats, ArchiveCellRow, ArchiveDiff, ArchiveEntry, ArchiveProvenance,
-    ArchiveSpaceRow, Axis, BehaviorDescriptor, BehaviorSpaceV0, CandidateDescriptor,
-    CellComparison, CellId, CellSelector, EvolutionSelectionMode, InsertionResult,
-    MAX_ARCHIVE_CELLS, MapElitesArchive, NoveltyState, PhenotypeFeature, QdDiffError, QdError,
-    QdMetrics, QualityMetric, archive_diff, combine_curiosity, compute_novelty_score,
-    compute_population_novelty, neumaier_sum, normalize_scores, normalized_distance,
+    AgentAccumulatedStats, ArchiveCellRow, ArchiveDiff, ArchiveEntry, ArchiveExportBundle,
+    ArchiveProvenance, ArchiveSpaceRow, Axis, BehaviorDescriptor, BehaviorSpaceV0,
+    CandidateDescriptor, CellComparison, CellId, CellSelector, EvolutionSelectionMode,
+    InsertionResult, MAX_ARCHIVE_CELLS, MapElitesArchive, NoveltyState, PhenotypeFeature,
+    QdDiffError, QdError, QdMetrics, QualityMetric, archive_diff, combine_curiosity,
+    compute_novelty_score, compute_population_novelty, neumaier_sum, normalize_scores,
+    normalized_distance,
 };
 
 pub use economy::{
@@ -2945,6 +2946,28 @@ impl BrainRegistry {
         })
     }
 
+    /// Look up the registered key and protocol adapter by family ID.
+    #[must_use]
+    pub fn key_and_family_by_id(
+        &self,
+        family_id: &BrainFamilyId,
+    ) -> Option<(u64, &dyn BrainFamilyAdapter)> {
+        self.entries.iter().find_map(|(&key, entry)| {
+            entry
+                .protocol_adapter
+                .as_deref()
+                .filter(|a| a.family_id() == family_id)
+                .map(|adapter| (key, adapter))
+        })
+    }
+
+    /// Look up the registered key by family ID.
+    #[must_use]
+    pub fn key_for_family_id(&self, family_id: &BrainFamilyId) -> Option<u64> {
+        self.key_and_family_by_id(family_id).map(|(key, _)| key)
+    }
+
+
     /// Stable family-owned semantic identity captured when the protocol adapter was admitted.
     #[must_use]
     pub fn adapter_identity(&self, key: u64) -> Option<BrainAdapterIdentityV1> {
@@ -5187,7 +5210,7 @@ impl Placement {
 }
 
 /// A deliberate perturbation of the world was rejected as unhonourable.
-#[derive(Debug, Clone, Copy, PartialEq, Error)]
+#[derive(Debug, Clone, PartialEq, Error)]
 pub enum InterventionError {
     /// The disc radius exceeds the world's injectivity radius, so membership would be
     /// ambiguous where the disc wraps onto itself.
@@ -5224,6 +5247,23 @@ pub enum InterventionError {
         /// Registry key that has no brain family bound to it.
         key: u64,
     },
+    /// MAP-Elites behavioral archive evaluation is disabled in this world.
+    #[error("MAP-Elites behavioral archive is disabled")]
+    ArchiveDisabled,
+    /// Resurrection from archive requested an unsupported genome schema version.
+    #[error("unsupported genome schema version: supported {supported}, requested {requested}")]
+    UnsupportedGenomeVersion {
+        /// Schema version supported by this build's registered brain family.
+        supported: u32,
+        /// Schema version found in the archive genome.
+        requested: u32,
+    },
+    /// A brain family required for resurrection is not registered.
+    #[error("no brain family is registered for family identifier `{family}`")]
+    UnknownBrainFamily {
+        /// Brain family identifier.
+        family: BrainFamilyId,
+    },
 }
 
 /// A deliberate perturbation of the world.
@@ -5247,7 +5287,7 @@ const fn neutral_cohort_diet() -> f32 {
 }
 
 /// An operator intervention applied at a simulation tick boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Intervention {
     /// Suppress food regrowth in a region for a while.
@@ -5305,18 +5345,6 @@ pub enum Intervention {
         placement: Placement,
         /// Diet the cohort is spawned with, in `[0, 1]`: 0 is a pure carnivore,
         /// 1 a pure herbivore.
-        ///
-        /// Explicit because it was previously absent, and the absence was silent
-        /// (bd-7akp). Every member used to land on `AgentRuntime`'s default of
-        /// exactly 0.5, and the carnivore test is `tendency < carnivore_threshold`
-        /// with that threshold also defaulting to 0.5 — so `0.5 < 0.5` is false
-        /// and a "predator injection" produced a cohort that was not carnivorous.
-        /// The experiment reported one thing and the world did another.
-        ///
-        /// Defaulted on deserialize to that same 0.5 SPECIFICALLY so already
-        /// recorded journals replay bit-identically. Replay must reproduce what
-        /// actually happened, including when what happened was this bug; only new
-        /// commands get to choose.
         #[serde(default = "neutral_cohort_diet")]
         herbivore_tendency: f32,
     },
@@ -5324,6 +5352,21 @@ pub enum Intervention {
     SetClosedWorld {
         /// The closed-world flag the world must hold after this intervention lands.
         closed: bool,
+    },
+    /// Resurrect agents from the MAP-Elites behavioral archive using a selector (bd-16g.6.3).
+    SpawnFromArchive {
+        /// Which cells to select from the archive.
+        selector: CellSelector,
+        /// Spatial placement for the resurrected cohort.
+        placement: Placement,
+        /// Maximum population headroom allowed for this resurrection.
+        /// If omitted, defaults to [`MAX_COHORT_INJECTION`].
+        #[serde(default)]
+        headroom: Option<u32>,
+        /// Diet tendency for resurrected agents in `[0, 1]`.
+        /// If omitted, defaults to 0.5.
+        #[serde(default)]
+        herbivore_tendency: Option<f32>,
     },
 }
 
@@ -5339,6 +5382,7 @@ impl Intervention {
             Self::PaintTerrain { .. } => "paint_terrain",
             Self::SetClosedWorld { .. } => "set_closed_world",
             Self::InjectCohort { .. } => "inject_cohort",
+            Self::SpawnFromArchive { .. } => "spawn_from_archive",
         }
     }
 
@@ -5350,19 +5394,19 @@ impl Intervention {
     /// Returns [`WorldStateError::InvalidConfig`] for a non-finite or negative
     /// magnitude, or an unusable region.
     pub fn validate(&self) -> Result<(), WorldStateError> {
-        match *self {
+        match self {
             Self::Drought {
                 region,
                 growth_scale,
                 ticks,
             } => {
                 region.validate_basic()?;
-                if ticks == 0 {
+                if *ticks == 0 {
                     return Err(WorldStateError::InvalidConfig(
                         "drought ticks must be at least 1",
                     ));
                 }
-                if !(0.0..=1.0).contains(&growth_scale) {
+                if !(0.0..=1.0).contains(growth_scale) {
                     return Err(WorldStateError::InvalidConfig(
                         "drought growth_scale must lie in [0, 1]",
                     ));
@@ -5371,7 +5415,7 @@ impl Intervention {
             }
             Self::Embargo { region, ticks } => {
                 region.validate_basic()?;
-                if ticks == 0 {
+                if *ticks == 0 {
                     return Err(WorldStateError::InvalidConfig(
                         "embargo ticks must be at least 1",
                     ));
@@ -5380,7 +5424,7 @@ impl Intervention {
             }
             Self::Bloom { region, amount } => {
                 region.validate_basic()?;
-                if !amount.is_finite() || amount < 0.0 {
+                if !amount.is_finite() || *amount < 0.0 {
                     return Err(WorldStateError::InvalidConfig(
                         "bloom amount must be finite and non-negative",
                     ));
@@ -5393,12 +5437,12 @@ impl Intervention {
                 scorch,
             } => {
                 region.validate_basic()?;
-                if !lethality.is_finite() || lethality < 0.0 {
+                if !lethality.is_finite() || *lethality < 0.0 {
                     return Err(WorldStateError::InvalidConfig(
                         "meteor lethality must be finite and non-negative",
                     ));
                 }
-                if !(0.0..=1.0).contains(&scorch) {
+                if !(0.0..=1.0).contains(scorch) {
                     return Err(WorldStateError::InvalidConfig(
                         "meteor scorch must lie in [0, 1]",
                     ));
@@ -5412,7 +5456,7 @@ impl Intervention {
             } => {
                 region.validate_basic()?;
                 if let Some(bias) = fertility_bias
-                    && (!bias.is_finite() || !(-1.0..=1.0).contains(&bias))
+                    && (!bias.is_finite() || !(-1.0..=1.0).contains(bias))
                 {
                     return Err(WorldStateError::InvalidConfig(
                         "paint-terrain fertility_bias must be finite and lie in [-1, 1]",
@@ -5427,22 +5471,19 @@ impl Intervention {
                 ..
             } => {
                 placement.region().validate_basic()?;
-                if !herbivore_tendency.is_finite() || !(0.0..=1.0).contains(&herbivore_tendency) {
-                    // Rejected rather than clamped: a clamp would run a different
-                    // experiment than the one asked for and say nothing about it,
-                    // which this bead family explicitly forbids.
+                if !herbivore_tendency.is_finite() || !(0.0..=1.0).contains(herbivore_tendency) {
                     return Err(WorldStateError::InvalidConfig(
                         "cohort injection herbivore_tendency must be finite and lie in [0, 1]",
                     ));
                 }
-                if count == 0 {
+                if *count == 0 {
                     return Err(WorldStateError::InvalidConfig(
                         "cohort injection count must be at least 1",
                     ));
                 }
-                if u32::from(count) > MAX_COHORT_INJECTION {
+                if u32::from(*count) > MAX_COHORT_INJECTION {
                     return Err(InterventionError::PopulationCapExceeded {
-                        requested: u32::from(count),
+                        requested: u32::from(*count),
                         headroom: MAX_COHORT_INJECTION,
                     }
                     .into());
@@ -5450,6 +5491,29 @@ impl Intervention {
                 Ok(())
             }
             Self::SetClosedWorld { .. } => Ok(()),
+            Self::SpawnFromArchive {
+                placement,
+                herbivore_tendency,
+                headroom,
+                ..
+            } => {
+                placement.region().validate_basic()?;
+                if let Some(diet) = herbivore_tendency {
+                    if !diet.is_finite() || !(0.0..=1.0).contains(diet) {
+                        return Err(WorldStateError::InvalidConfig(
+                            "resurrection herbivore_tendency must be finite and lie in [0, 1]",
+                        ));
+                    }
+                }
+                if let Some(cap) = headroom {
+                    if *cap == 0 {
+                        return Err(WorldStateError::InvalidConfig(
+                            "resurrection headroom must be at least 1",
+                        ));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -5467,7 +5531,7 @@ impl Intervention {
         world_height: u32,
     ) -> Result<(), WorldStateError> {
         self.validate()?;
-        match *self {
+        match self {
             Self::Drought { region, .. }
             | Self::Embargo { region, .. }
             | Self::Bloom { region, .. }
@@ -5475,7 +5539,8 @@ impl Intervention {
             | Self::PaintTerrain { region, .. } => {
                 region.validate_for_world(world_width, world_height)
             }
-            Self::InjectCohort { placement, .. } => placement
+            Self::InjectCohort { placement, .. }
+            | Self::SpawnFromArchive { placement, .. } => placement
                 .region()
                 .validate_for_world(world_width, world_height),
             Self::SetClosedWorld { .. } => Ok(()),
@@ -22079,6 +22144,73 @@ impl WorldState {
             );
             return Err(error.into());
         }
+        if let Intervention::SpawnFromArchive {
+            ref selector,
+            headroom,
+            ..
+        } = intervention
+        {
+            let Some(archive) = self.archive.as_ref() else {
+                let error = InterventionError::ArchiveDisabled;
+                diag_error!(
+                    target: "scriptbots::intervention",
+                    tick = self.tick.0,
+                    kind = intervention.kind_label(),
+                    %error,
+                    "intervention rejected"
+                );
+                return Err(error.into());
+            };
+            let matched_entries = archive.select_entries(selector);
+            let requested = u32::try_from(matched_entries.len()).unwrap_or(u32::MAX);
+            let limit = headroom.unwrap_or(MAX_COHORT_INJECTION);
+            if requested > limit {
+                let error = InterventionError::PopulationCapExceeded {
+                    requested,
+                    headroom: limit,
+                };
+                diag_error!(
+                    target: "scriptbots::intervention",
+                    tick = self.tick.0,
+                    kind = intervention.kind_label(),
+                    %error,
+                    "intervention rejected"
+                );
+                return Err(error.into());
+            }
+            for entry in &matched_entries {
+                let family_id = entry.genome.family_id();
+                let Some(adapter) = self.brain_registry.family_by_id(family_id) else {
+                    let error = InterventionError::UnknownBrainFamily {
+                        family: family_id.clone(),
+                    };
+                    diag_error!(
+                        target: "scriptbots::intervention",
+                        tick = self.tick.0,
+                        kind = intervention.kind_label(),
+                        %error,
+                        "intervention rejected"
+                    );
+                    return Err(error.into());
+                };
+                if let Err(BrainProtocolError::SchemaVersionMismatch { found, expected, .. }) =
+                    adapter.validate_genome(&entry.genome)
+                {
+                    let error = InterventionError::UnsupportedGenomeVersion {
+                        supported: expected,
+                        requested: found,
+                    };
+                    diag_error!(
+                        target: "scriptbots::intervention",
+                        tick = self.tick.0,
+                        kind = intervention.kind_label(),
+                        %error,
+                        "intervention rejected"
+                    );
+                    return Err(error.into());
+                }
+            }
+        }
         self.pending_interventions.push(intervention);
         Ok(())
     }
@@ -22440,6 +22572,94 @@ impl WorldState {
                         placement_region,
                         spawned_count,
                         0,
+                        None,
+                        false,
+                    );
+                }
+                Intervention::SpawnFromArchive {
+                    selector,
+                    placement,
+                    herbivore_tendency,
+                    ..
+                } => {
+                    let Some(entries) = self.archive.as_ref().map(|archive| {
+                        archive.select_entries(&selector).into_iter().cloned().collect::<Vec<_>>()
+                    }) else {
+                        continue;
+                    };
+                    let Placement::Seeded { region, seed } = placement;
+                    let placement_region = region;
+                    let cells_matched = entries.len();
+                    let cells_requested = match &selector {
+                        CellSelector::Explicit(ids) => ids.len(),
+                        CellSelector::TopKByQuality(k) => usize::from(*k),
+                        CellSelector::All | CellSelector::AxisRange(_) => cells_matched,
+                    };
+                    if cells_matched < cells_requested {
+                        tracing::warn!(
+                            target: "scriptbots::qd",
+                            tick = self.tick.next().0,
+                            cells_requested,
+                            cells_matched,
+                            shortfall = cells_requested.saturating_sub(cells_matched),
+                            "resurrection selector matched fewer cells than requested"
+                        );
+                    }
+                    let mut rng = SmallRngStream::seed_from_u64(seed);
+                    let mut spawned_count = 0_usize;
+                    let mut breach_count = 0_u32;
+                    let diet = herbivore_tendency.unwrap_or(0.5);
+                    for entry in entries {
+                        let position = Self::sample_position_in_region(
+                            region,
+                            &mut rng,
+                            world_width,
+                            world_height,
+                        );
+                        let id = match self.try_inject_agent_with(
+                            AgentData {
+                                position,
+                                ..AgentData::default()
+                            },
+                            |runtime| {
+                                runtime.herbivore_tendency = diet;
+                            },
+                        ) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                breach_count += 1;
+                                continue;
+                            }
+                        };
+                        match self.bind_agent_brain_genome(id, &entry.genome) {
+                            Ok(true) => {
+                                spawned_count += 1;
+                            }
+                            _ => {
+                                breach_count += 1;
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        target: "scriptbots::qd",
+                        tick = self.tick.next().0,
+                        selector = ?selector,
+                        cells_requested,
+                        cells_matched,
+                        agents_spawned = spawned_count,
+                        agents_rejected = breach_count,
+                        reason = if breach_count > 0 {
+                            "internal_breach"
+                        } else {
+                            "ok"
+                        },
+                        "resurrection applied"
+                    );
+                    self.record_intervention(
+                        "spawn_from_archive",
+                        placement_region,
+                        spawned_count,
+                        cells_matched,
                         None,
                         false,
                     );
@@ -28351,6 +28571,94 @@ impl WorldState {
                     envelope: genome.clone(),
                 });
             }
+        }
+        self.refresh_current_tick_origin_record(id);
+        Ok(true)
+    }
+
+    /// Bind an exact versioned heritable genome to the specified agent. Returns `true` on success.
+    pub fn bind_agent_brain_genome(
+        &mut self,
+        id: AgentId,
+        genome: &BrainGenomeEnvelope,
+    ) -> Result<bool, WorldStateError> {
+        self.ensure_scientific_mutation_allowed(&format!(
+            "agents[{}].runtime.brain",
+            id.data().as_ffi()
+        ))?;
+        if !self.agents.contains(id) {
+            return Ok(false);
+        }
+        let family_id = genome.family_id();
+        let Some((key, adapter)) = self.brain_registry.key_and_family_by_id(family_id) else {
+            return Err(InterventionError::UnknownBrainFamily {
+                family: family_id.clone(),
+            }
+            .into());
+        };
+        adapter.validate_genome(genome)?;
+        let uid = self.require_agent_uid(id, || "bind_agent_brain_genome.agent".to_owned())?;
+        let counters_before = self.agent_rng_counters.get(id).copied().ok_or_else(|| {
+            ScientificStateError::MissingAgentRngCounters {
+                path: format!("agents[uid={}].rng_counters", uid.get()),
+            }
+        })?;
+        let ordinal = self
+            .agent_rng_counters
+            .get_mut(id)
+            .expect("counter presence was checked above")
+            .take_brain_initialization()
+            .map_err(|error| Self::agent_rng_counter_error(uid, error))?;
+        let mut rng = agent_substream(
+            self.rng.root_seed(),
+            uid,
+            AgentRngOperationV1::BrainInitialization,
+            ordinal,
+        );
+        let state = match adapter.initial_state(genome, &mut rng) {
+            Ok(state) => state,
+            Err(error) => {
+                self.agent_rng_counters.insert(id, counters_before);
+                return Err(BrainSpawnError::new(family_id.to_string(), error).into());
+            }
+        };
+        let kind = self
+            .brain_registry
+            .kind(key)
+            .unwrap_or("unknown")
+            .to_owned();
+        let binding = match Self::instantiate_protocol_binding(
+            adapter,
+            key,
+            kind,
+            genome.clone(),
+            &state,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.agent_rng_counters.insert(id, counters_before);
+                return Err(error.into());
+            }
+        };
+        let Some(runtime) = self.runtime.get_mut(id) else {
+            self.agent_rng_counters.insert(id, counters_before);
+            return Ok(false);
+        };
+        runtime.brain = binding;
+        if let Some(existing) = self
+            .pending_genomes
+            .iter_mut()
+            .rev()
+            .find(|g| g.agent_uid == uid)
+        {
+            existing.envelope = genome.clone();
+            existing.created_at_tick = self.tick;
+        } else {
+            self.pending_genomes.push(PersistedGenome {
+                agent_uid: uid,
+                created_at_tick: self.tick,
+                envelope: genome.clone(),
+            });
         }
         self.refresh_current_tick_origin_record(id);
         Ok(true)
