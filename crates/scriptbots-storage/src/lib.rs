@@ -79,14 +79,14 @@ use scriptbots_runtime::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tracing::{debug, debug_span, info, warn};
@@ -20848,8 +20848,24 @@ impl WorldPersistence for StorageSink {
 type ShutdownReply = Result<ShutdownReceipt, StorageWorkerError>;
 type ShutdownReplyReceiver = xchan::Receiver<ShutdownReply>;
 
+/// Unique monotonically increasing identifier for a storage reap request.
+static NEXT_REAP_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a new globally unique reap request identifier.
+pub fn next_reap_request_id() -> u64 {
+    NEXT_REAP_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn current_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 enum StorageReapRequest {
     Pipeline {
+        request_id: u64,
         tx: xchan::Sender<StorageCommand>,
         admission: Arc<Mutex<AdmissionState>>,
         pending_shutdown: Option<ShutdownReplyReceiver>,
@@ -20858,10 +20874,137 @@ enum StorageReapRequest {
         analytics: AnalyticsSnapshotProvider,
     },
     JoinOnly {
+        request_id: u64,
         handle: thread::JoinHandle<Option<StorageWorkerError>>,
         path: Arc<str>,
         analytics: AnalyticsSnapshotProvider,
     },
+}
+
+impl StorageReapRequest {
+    fn request_id(&self) -> u64 {
+        match self {
+            Self::Pipeline { request_id, .. } | Self::JoinOnly { request_id, .. } => *request_id,
+        }
+    }
+}
+
+/// Lifecycle state of a storage reap request receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReaperReceiptState {
+    /// Request submitted to the reaper supervisor.
+    Submitted,
+    /// Request coalesced behind an existing active reaper on the same storage path.
+    Coalesced,
+    /// Request queued waiting for the active reaper to drain.
+    Queued,
+    /// A reaper thread was spawned and began execution for this path.
+    Started,
+    /// Currently being drained by the active reaper thread from the path's FIFO queue.
+    DrainingQueued,
+    /// Ran synchronously on the caller thread due to registry bounds or spawn failure.
+    FallbackSynchronous(ReaperFallbackReason),
+    /// Reaping completed; worker has been joined.
+    Reaped,
+    /// Work completed, lease released, and request receipt retired.
+    Retired,
+}
+
+/// Reason for falling back to synchronous execution on the caller thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReaperFallbackReason {
+    /// The number of concurrent reapers has reached MAX_CONCURRENT_REAPERS.
+    Saturation,
+    /// The OS refused to spawn a new reaper thread.
+    SpawnFailure,
+    /// Registry admission refused the request.
+    AdmissionRefusal,
+}
+
+/// Terminal outcome of joining a reaped worker thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReaperJoinOutcome {
+    /// Worker thread exited cleanly and acknowledged shutdown.
+    Clean,
+    /// Worker thread exited with a structured storage worker error.
+    WorkerError(String),
+    /// Worker thread panicked during execution.
+    Panicked(String),
+}
+
+/// Exact receipt for a storage reap request, guaranteeing exactly-once accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReaperRequestReceipt {
+    pub request_id: u64,
+    pub path: String,
+    pub state: ReaperReceiptState,
+    pub fallback_reason: Option<ReaperFallbackReason>,
+    pub join_outcome: Option<ReaperJoinOutcome>,
+    pub timestamp_epoch_ms: u64,
+}
+
+/// Structured diagnostic errors returned by the reaper accounting ledger audit.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReaperAccountingError {
+    #[error("stranded reap request: request_id={request_id} path={path} was never drained or joined")]
+    StrandedRequest { request_id: u64, path: String },
+    #[error("double consumption: request_id={request_id} path={path} was consumed multiple times")]
+    DoubleConsumption { request_id: u64, path: String },
+    #[error("missing receipt: request_id={request_id} path={path} has no recorded receipt")]
+    MissingReceipt { request_id: u64, path: String },
+    #[error("unretired request: request_id={request_id} path={path} state={state:?} still active")]
+    UnretiredRequest {
+        request_id: u64,
+        path: String,
+        state: ReaperReceiptState,
+    },
+}
+
+/// Test-only deterministic fault points for the storage reaper supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReaperFaultPoint {
+    /// Injects a thread spawn failure when attempting to spawn a reaper thread.
+    ForceSpawnFailure,
+    /// Forces registry admission into synchronous fallback (simulating admission refusal).
+    ForceRegistryAdmissionFallback,
+}
+
+#[cfg(test)]
+fn reaper_faults() -> &'static Mutex<BTreeSet<ReaperFaultPoint>> {
+    static FAULTS: OnceLock<Mutex<BTreeSet<ReaperFaultPoint>>> = OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+pub fn arm_reaper_fault(point: ReaperFaultPoint) {
+    let mut faults = reaper_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    faults.insert(point);
+}
+
+#[cfg(test)]
+pub fn clear_reaper_fault(point: ReaperFaultPoint) {
+    let mut faults = reaper_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    faults.remove(&point);
+}
+
+#[cfg(test)]
+pub fn clear_all_reaper_faults() {
+    let mut faults = reaper_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    faults.clear();
+}
+
+#[cfg(test)]
+fn has_reaper_fault(point: ReaperFaultPoint) -> bool {
+    reaper_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&point)
 }
 
 fn join_reaped_worker(
@@ -20869,33 +21012,48 @@ fn join_reaped_worker(
     path: &str,
     analytics: &AnalyticsSnapshotProvider,
     response: Option<ShutdownReply>,
-) {
+) -> ReaperJoinOutcome {
     match handle.join() {
-        Err(panic) => analytics.publish_worker_error(
-            &StorageWorkerError::Internal {
-                operation: StorageOperation::Join,
-                path: path.to_owned(),
-                tick: None,
-                commit_state: FailureCommitState::Indeterminate,
-                detail: format!("storage worker panicked during supervised reap: {panic:?}"),
-            },
-            true,
-        ),
-        Ok(Some(terminal_error)) => analytics.publish_worker_error(&terminal_error, true),
+        Err(panic) => {
+            let detail = format!("storage worker panicked during supervised reap: {panic:?}");
+            analytics.publish_worker_error(
+                &StorageWorkerError::Internal {
+                    operation: StorageOperation::Join,
+                    path: path.to_owned(),
+                    tick: None,
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: detail.clone(),
+                },
+                true,
+            );
+            ReaperJoinOutcome::Panicked(detail)
+        }
+        Ok(Some(terminal_error)) => {
+            let detail = terminal_error.to_string();
+            analytics.publish_worker_error(&terminal_error, true);
+            ReaperJoinOutcome::WorkerError(detail)
+        }
         Ok(None) => {
             if let Some(Err(error)) = response {
+                let detail = error.to_string();
                 analytics.publish_worker_error(&error, true);
+                ReaperJoinOutcome::WorkerError(detail)
+            } else {
+                ReaperJoinOutcome::Clean
             }
         }
     }
 }
 
-fn reap_storage_request(request: StorageReapRequest) {
-    match request {
+fn reap_storage_request(request: StorageReapRequest) -> (u64, String, ReaperJoinOutcome) {
+    let request_id = request.request_id();
+    let path = request_path(&request);
+    let outcome = match request {
         StorageReapRequest::JoinOnly {
             handle,
             path,
             analytics,
+            ..
         } => join_reaped_worker(handle, &path, &analytics, None),
         StorageReapRequest::Pipeline {
             tx,
@@ -20904,6 +21062,7 @@ fn reap_storage_request(request: StorageReapRequest) {
             handle,
             path,
             analytics,
+            ..
         } => {
             let receiver = pending_shutdown.map_or_else(
                 || -> Result<ShutdownReplyReceiver, StorageWorkerError> {
@@ -20930,24 +21089,27 @@ fn reap_storage_request(request: StorageReapRequest) {
                 },
                 Ok,
             );
-            // The bounded reply channel lets a healthy worker acknowledge before exiting. Join
-            // first so a command stranded behind a terminal worker cannot keep its own reply
-            // sender alive forever inside the disconnected command queue.
             match handle.join() {
-                Err(panic) => analytics.publish_worker_error(
-                    &StorageWorkerError::Internal {
-                        operation: StorageOperation::Join,
-                        path: path.to_string(),
-                        tick: None,
-                        commit_state: FailureCommitState::Indeterminate,
-                        detail: format!(
-                            "storage worker panicked during supervised reap: {panic:?}"
-                        ),
-                    },
-                    true,
-                ),
+                Err(panic) => {
+                    let detail = format!(
+                        "storage worker panicked during supervised reap: {panic:?}"
+                    );
+                    analytics.publish_worker_error(
+                        &StorageWorkerError::Internal {
+                            operation: StorageOperation::Join,
+                            path: path.to_string(),
+                            tick: None,
+                            commit_state: FailureCommitState::Indeterminate,
+                            detail: detail.clone(),
+                        },
+                        true,
+                    );
+                    ReaperJoinOutcome::Panicked(detail)
+                }
                 Ok(Some(terminal_error)) => {
+                    let detail = terminal_error.to_string();
                     analytics.publish_worker_error(&terminal_error, true);
+                    ReaperJoinOutcome::WorkerError(detail)
                 }
                 Ok(None) => {
                     let response = receiver.and_then(|receiver| {
@@ -20961,41 +21123,38 @@ fn reap_storage_request(request: StorageReapRequest) {
                             ),
                         })
                     });
-                    if let Err(error) = response.and_then(|response| response) {
-                        analytics.publish_worker_error(&error, true);
+                    match response.and_then(|response| response) {
+                        Err(error) => {
+                            let detail = error.to_string();
+                            analytics.publish_worker_error(&error, true);
+                            ReaperJoinOutcome::WorkerError(detail)
+                        }
+                        Ok(_) => ReaperJoinOutcome::Clean,
                     }
                 }
             }
         }
-    }
+    };
+    (request_id, path, outcome)
 }
 
 /// Most reaper threads that may exist at once, across every storage path.
-///
-/// The old handoff spawned ONE INDEPENDENT OS THREAD PER TIMEOUT, with no bound.
-/// A slow or wedged disk does not time out once; it times out over and over, and
-/// each timeout spawned another thread that then blocked on the same sick disk.
-/// The failure mode is a thread-count explosion caused BY the thing that was
-/// already failing — the process runs out of threads while trying to clean up
-/// after a disk that stopped answering.
-const MAX_CONCURRENT_REAPERS: usize = 4;
+pub const MAX_CONCURRENT_REAPERS: usize = 4;
+
+/// Default duration after which an active reaper is classified as hung.
+pub const DEFAULT_HUNG_REAPER_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The supervisor registry: who is being reaped, and who is waiting.
 ///
 /// Keyed by storage PATH, which is what makes coalescing correct. Two timeouts on
 /// the same path do not need two reapers — the second is queued behind the first
-/// and drained by it. Two timeouts on DIFFERENT paths must not block each other,
-/// which is why the key is the path and not a single global lock on "reaping".
-#[derive(Default)]
+/// and drained by it in FIFO order. Two timeouts on DIFFERENT paths must not block
+/// each other, which is why the key is the path and not a single global lock on "reaping".
 struct ReaperRegistry {
-    /// Paths with a live reaper thread.
-    active: BTreeSet<String>,
-    /// Requests waiting behind an active reaper, per path.
-    ///
-    /// A queued request is NEVER dropped: the reaper that owns the path drains
-    /// this before it retires. Dropping one would leak a `JoinHandle` and lose a
-    /// receipt, which is the one thing the storage contract cannot tolerate.
-    queued: BTreeMap<String, Vec<StorageReapRequest>>,
+    /// Paths with a live reaper thread, mapped to start time.
+    active: BTreeMap<String, Instant>,
+    /// Requests waiting behind an active reaper, per path, in FIFO order.
+    queued: BTreeMap<String, VecDeque<StorageReapRequest>>,
     /// Reaper threads started.
     started: u64,
     /// Handoffs folded into an existing reaper rather than spawning a new thread.
@@ -21003,10 +21162,28 @@ struct ReaperRegistry {
     /// Handoffs run on the CALLER's thread because the registry was saturated or
     /// the spawn failed.
     synchronous: u64,
+    /// Threshold beyond which an active reaper thread is counted as hung.
+    hung_threshold: Duration,
+    /// Monotonic request receipts ledger for accounting validation.
+    receipts: BTreeMap<u64, ReaperRequestReceipt>,
+}
+
+impl Default for ReaperRegistry {
+    fn default() -> Self {
+        Self {
+            active: BTreeMap::new(),
+            queued: BTreeMap::new(),
+            started: 0,
+            coalesced: 0,
+            synchronous: 0,
+            hung_threshold: DEFAULT_HUNG_REAPER_TIMEOUT,
+            receipts: BTreeMap::new(),
+        }
+    }
 }
 
 /// A snapshot of the reaper registry, for operators and tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReaperStats {
     /// Paths currently being reaped.
     pub active: usize,
@@ -21016,8 +21193,68 @@ pub struct ReaperStats {
     pub started: u64,
     /// Handoffs coalesced onto an existing reaper.
     pub coalesced: u64,
-    /// Handoffs that fell back to running synchronously.
+    /// Handoffs that fell back to running synchronously on the caller thread.
     pub synchronous: u64,
+    /// Active reapers considered hung (elapsed >= hung_threshold).
+    pub hung: usize,
+    /// Age of the oldest active reaper thread, if any.
+    pub oldest_active_age: Option<Duration>,
+}
+
+impl ReaperStats {
+    /// Alias for synchronous count.
+    #[must_use]
+    pub fn synchronous_fallback(&self) -> u64 {
+        self.synchronous
+    }
+
+    /// Check that the snapshot satisfies structural supervisor invariants.
+    ///
+    /// # Invariants
+    /// 1. `hung <= active`: hung reaper count cannot exceed active count.
+    /// 2. `active <= MAX_CONCURRENT_REAPERS`: active reaper count must never exceed concurrency bound.
+    /// 3. If `active == 0`, then `queued == 0`, `hung == 0`, and `oldest_active_age.is_none()`:
+    ///    counters must never claim a clean queue while a retained request or handle is stranded,
+    ///    and queued work cannot exist without an active reaper to drain it.
+    /// 4. If `active > 0`, then `oldest_active_age.is_some()`.
+    /// 5. If `hung > 0`, then `oldest_active_age.is_some()`.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        if self.hung > self.active {
+            return Err(format!(
+                "invariant violation: hung count ({}) exceeds active count ({})",
+                self.hung, self.active
+            ));
+        }
+        if self.active > MAX_CONCURRENT_REAPERS {
+            return Err(format!(
+                "invariant violation: active reapers ({}) exceeds MAX_CONCURRENT_REAPERS ({})",
+                self.active, MAX_CONCURRENT_REAPERS
+            ));
+        }
+        if self.active == 0 {
+            if self.queued > 0 {
+                return Err(format!(
+                    "invariant violation: queued requests ({}) exist with 0 active reapers — JoinHandles stranded",
+                    self.queued
+                ));
+            }
+            if self.hung > 0 {
+                return Err(format!(
+                    "invariant violation: hung count ({}) is non-zero with 0 active reapers",
+                    self.hung
+                ));
+            }
+            if self.oldest_active_age.is_some() {
+                return Err("invariant violation: oldest_active_age is Some with 0 active reapers".to_string());
+            }
+        } else if self.oldest_active_age.is_none() {
+            return Err(format!(
+                "invariant violation: active reapers ({}) present but oldest_active_age is None",
+                self.active
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn reaper_registry() -> &'static Mutex<ReaperRegistry> {
@@ -21039,12 +21276,140 @@ fn lock_reaper_registry() -> std::sync::MutexGuard<'static, ReaperRegistry> {
 #[must_use]
 pub fn storage_reaper_stats() -> ReaperStats {
     let registry = lock_reaper_registry();
-    ReaperStats {
+    let now = Instant::now();
+    let hung_threshold = registry.hung_threshold;
+    let mut hung = 0;
+    let mut oldest_active_age = None;
+
+    for &started_at in registry.active.values() {
+        let age = now.saturating_duration_since(started_at);
+        if age >= hung_threshold {
+            hung += 1;
+        }
+        oldest_active_age = match oldest_active_age {
+            None => Some(age),
+            Some(oldest) => Some(oldest.max(age)),
+        };
+    }
+
+    let stats = ReaperStats {
         active: registry.active.len(),
-        queued: registry.queued.values().map(Vec::len).sum(),
+        queued: registry.queued.values().map(VecDeque::len).sum(),
         started: registry.started,
         coalesced: registry.coalesced,
         synchronous: registry.synchronous,
+        hung,
+        oldest_active_age,
+    };
+    let _ = stats.check_invariants();
+    stats
+}
+
+/// Set the threshold beyond which an active reaper thread is counted as hung.
+pub fn set_reaper_hung_threshold_for_test(threshold: Duration) {
+    let mut registry = lock_reaper_registry();
+    registry.hung_threshold = threshold;
+}
+
+/// Return all tracked reaper receipts for accounting verification.
+#[must_use]
+pub fn reaper_accounting_receipts() -> Vec<ReaperRequestReceipt> {
+    let registry = lock_reaper_registry();
+    registry.receipts.values().cloned().collect()
+}
+
+/// Verify that every tracked reap request was consumed and retired exactly once with no stranded handles.
+pub fn verify_reaper_accounting() -> Result<(), ReaperAccountingError> {
+    let registry = lock_reaper_registry();
+    if !registry.queued.is_empty() {
+        for (path, queue) in &registry.queued {
+            if let Some(front) = queue.front() {
+                return Err(ReaperAccountingError::StrandedRequest {
+                    request_id: front.request_id(),
+                    path: path.clone(),
+                });
+            }
+        }
+    }
+    for (&id, receipt) in &registry.receipts {
+        match receipt.state {
+            ReaperReceiptState::Retired => {
+                if receipt.join_outcome.is_none() {
+                    return Err(ReaperAccountingError::StrandedRequest {
+                        request_id: id,
+                        path: receipt.path.clone(),
+                    });
+                }
+            }
+            state => {
+                return Err(ReaperAccountingError::UnretiredRequest {
+                    request_id: id,
+                    path: receipt.path.clone(),
+                    state,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn reset_reaper_registry_for_test() {
+    let mut registry = lock_reaper_registry();
+    registry.active.clear();
+    registry.queued.clear();
+    registry.started = 0;
+    registry.coalesced = 0;
+    registry.synchronous = 0;
+    registry.hung_threshold = DEFAULT_HUNG_REAPER_TIMEOUT;
+    registry.receipts.clear();
+    clear_all_reaper_faults();
+}
+
+#[cfg(test)]
+pub fn poison_reaper_registry_for_test() {
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = reaper_registry().lock().unwrap();
+        panic!("intentional test poison for reaper registry");
+    });
+}
+
+#[cfg(test)]
+pub fn simulate_negative_skipped_drain_for_test(request_id: u64, path: &str) {
+    let mut registry = lock_reaper_registry();
+    registry.receipts.insert(
+        request_id,
+        ReaperRequestReceipt {
+            request_id,
+            path: path.to_owned(),
+            state: ReaperReceiptState::Queued,
+            fallback_reason: None,
+            join_outcome: None,
+            timestamp_epoch_ms: current_epoch_millis(),
+        },
+    );
+}
+
+#[cfg(test)]
+pub fn simulate_negative_double_consumption_for_test(
+    request_id: u64,
+    path: &str,
+) -> Result<(), ReaperAccountingError> {
+    let mut registry = lock_reaper_registry();
+    if let Some(existing) = registry.receipts.get_mut(&request_id) {
+        if existing.state == ReaperReceiptState::Retired {
+            return Err(ReaperAccountingError::DoubleConsumption {
+                request_id,
+                path: path.to_owned(),
+            });
+        }
+        existing.state = ReaperReceiptState::Retired;
+        Ok(())
+    } else {
+        Err(ReaperAccountingError::MissingReceipt {
+            request_id,
+            path: path.to_owned(),
+        })
     }
 }
 
@@ -21057,6 +21422,7 @@ fn request_path(request: &StorageReapRequest) -> String {
 }
 
 fn handoff_storage_reap(request: StorageReapRequest) {
+    let request_id = request.request_id();
     let path = request_path(&request);
 
     // Decide under the lock, then act outside it: reaping JOINS a worker thread,
@@ -21064,36 +21430,82 @@ fn handoff_storage_reap(request: StorageReapRequest) {
     // every other path's handoff — the exact cross-path blocking this bead forbids.
     let action = {
         let mut registry = lock_reaper_registry();
-        if registry.active.contains(&path) {
+        if registry.active.contains_key(&path) {
             // COALESCE. A path already has a reaper; a second thread would just
             // queue behind the same worker. Hand the request to the running reaper,
             // which drains this before it retires.
-            registry.coalesced += 1;
+            registry.coalesced = registry.coalesced.saturating_add(1);
+            registry.receipts.insert(
+                request_id,
+                ReaperRequestReceipt {
+                    request_id,
+                    path: path.clone(),
+                    state: ReaperReceiptState::Coalesced,
+                    fallback_reason: None,
+                    join_outcome: None,
+                    timestamp_epoch_ms: current_epoch_millis(),
+                },
+            );
             registry
                 .queued
                 .entry(path.clone())
                 .or_default()
-                .push(request);
+                .push_back(request);
             return;
         }
-        if registry.active.len() >= MAX_CONCURRENT_REAPERS {
-            // SATURATED. Run on the caller's thread rather than spawning past the
-            // bound. This is the same fallback the old code used when `spawn`
-            // failed, and it is what makes the bound a real bound: the work still
-            // happens, the handle is still joined, and no receipt is dropped — the
-            // caller simply pays for it.
-            registry.synchronous += 1;
+
+        #[cfg(test)]
+        let force_admission_fallback =
+            has_reaper_fault(ReaperFaultPoint::ForceRegistryAdmissionFallback);
+        #[cfg(not(test))]
+        let force_admission_fallback = false;
+
+        if registry.active.len() >= MAX_CONCURRENT_REAPERS || force_admission_fallback {
+            // SATURATED or admission fallback. Run on caller's thread rather than spawning past bound.
+            registry.synchronous = registry.synchronous.saturating_add(1);
+            let reason = if force_admission_fallback {
+                ReaperFallbackReason::AdmissionRefusal
+            } else {
+                ReaperFallbackReason::Saturation
+            };
+            registry.receipts.insert(
+                request_id,
+                ReaperRequestReceipt {
+                    request_id,
+                    path: path.clone(),
+                    state: ReaperReceiptState::FallbackSynchronous(reason),
+                    fallback_reason: Some(reason),
+                    join_outcome: None,
+                    timestamp_epoch_ms: current_epoch_millis(),
+                },
+            );
             ReaperAction::Synchronous(request)
         } else {
-            registry.active.insert(path.clone());
-            registry.started += 1;
+            registry.active.insert(path.clone(), Instant::now());
+            registry.started = registry.started.saturating_add(1);
+            registry.receipts.insert(
+                request_id,
+                ReaperRequestReceipt {
+                    request_id,
+                    path: path.clone(),
+                    state: ReaperReceiptState::Started,
+                    fallback_reason: None,
+                    join_outcome: None,
+                    timestamp_epoch_ms: current_epoch_millis(),
+                },
+            );
             ReaperAction::Spawn(request)
         }
     };
 
     let request = match action {
         ReaperAction::Synchronous(request) => {
-            reap_storage_request(request);
+            let (reaped_id, _reaped_path, outcome) = reap_storage_request(request);
+            let mut registry = lock_reaper_registry();
+            if let Some(receipt) = registry.receipts.get_mut(&reaped_id) {
+                receipt.state = ReaperReceiptState::Retired;
+                receipt.join_outcome = Some(outcome);
+            }
             return;
         }
         ReaperAction::Spawn(request) => request,
@@ -21106,29 +21518,79 @@ fn handoff_storage_reap(request: StorageReapRequest) {
     // the very thread we are trying to reap. The slot lets the caller take it back.
     let slot = Arc::new(Mutex::new(Some(request)));
     let thread_slot = Arc::clone(&slot);
-    let spawned = thread::Builder::new()
-        .name("scriptbots-storage-reaper".into())
-        .spawn(move || {
-            let mut current = match thread_slot.lock() {
-                Ok(mut slot) => slot.take(),
-                Err(poisoned) => poisoned.into_inner().take(),
-            };
-            while let Some(request) = current.take() {
-                reap_storage_request(request);
-                // Drain anything that arrived for this path while we were joining.
-                // Retiring with a queued request still in the registry would leak
-                // its JoinHandle forever.
-                let mut registry = lock_reaper_registry();
-                current = registry
-                    .queued
-                    .get_mut(&thread_path)
-                    .and_then(std::vec::Vec::pop);
-                if current.is_none() {
-                    registry.queued.remove(&thread_path);
-                    registry.active.remove(&thread_path);
+
+    #[cfg(test)]
+    let force_spawn_failure = has_reaper_fault(ReaperFaultPoint::ForceSpawnFailure);
+    #[cfg(not(test))]
+    let force_spawn_failure = false;
+
+    let spawned = if force_spawn_failure {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "injected thread spawn failure for test",
+        ))
+    } else {
+        thread::Builder::new()
+            .name("scriptbots-storage-reaper".into())
+            .spawn(move || {
+                struct ReaperThreadGuard {
+                    path: String,
                 }
-            }
-        });
+                impl Drop for ReaperThreadGuard {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            let mut registry = lock_reaper_registry();
+                            registry.active.remove(&self.path);
+                            let queued = registry.queued.remove(&self.path).unwrap_or_default();
+                            drop(registry);
+                            for req in queued {
+                                let (id, _p, outcome) = reap_storage_request(req);
+                                let mut reg = lock_reaper_registry();
+                                if let Some(receipt) = reg.receipts.get_mut(&id) {
+                                    receipt.state = ReaperReceiptState::Retired;
+                                    receipt.join_outcome = Some(outcome);
+                                }
+                            }
+                        }
+                    }
+                }
+                let _guard = ReaperThreadGuard {
+                    path: thread_path.clone(),
+                };
+
+                let mut current = match thread_slot.lock() {
+                    Ok(mut slot) => slot.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                while let Some(req) = current.take() {
+                    let (reaped_id, _reaped_path, outcome) = reap_storage_request(req);
+                    {
+                        let mut registry = lock_reaper_registry();
+                        if let Some(receipt) = registry.receipts.get_mut(&reaped_id) {
+                            receipt.state = ReaperReceiptState::Retired;
+                            receipt.join_outcome = Some(outcome);
+                        }
+                    }
+
+                    // Drain anything that arrived for this path in FIFO order.
+                    // Retiring with a queued request still in the registry would leak
+                    // its JoinHandle forever.
+                    let mut registry = lock_reaper_registry();
+                    current = registry
+                        .queued
+                        .get_mut(&thread_path)
+                        .and_then(std::collections::VecDeque::pop_front);
+                    if let Some(ref next_req) = current {
+                        if let Some(receipt) = registry.receipts.get_mut(&next_req.request_id()) {
+                            receipt.state = ReaperReceiptState::DrainingQueued;
+                        }
+                    } else {
+                        registry.queued.remove(&thread_path);
+                        registry.active.remove(&thread_path);
+                    }
+                }
+            })
+    };
 
     if let Err(error) = spawned {
         // The spawn failed, so nobody owns this path. Release it and do the work
@@ -21136,8 +21598,20 @@ fn handoff_storage_reap(request: StorageReapRequest) {
         // leak the very worker we were trying to clean up after.
         let mut registry = lock_reaper_registry();
         registry.active.remove(&path);
-        registry.synchronous += 1;
+        registry.synchronous = registry.synchronous.saturating_add(1);
         let queued = registry.queued.remove(&path).unwrap_or_default();
+        if let Some(receipt) = registry.receipts.get_mut(&request_id) {
+            receipt.state =
+                ReaperReceiptState::FallbackSynchronous(ReaperFallbackReason::SpawnFailure);
+            receipt.fallback_reason = Some(ReaperFallbackReason::SpawnFailure);
+        }
+        for q in &queued {
+            if let Some(receipt) = registry.receipts.get_mut(&q.request_id()) {
+                receipt.state =
+                    ReaperReceiptState::FallbackSynchronous(ReaperFallbackReason::SpawnFailure);
+                receipt.fallback_reason = Some(ReaperFallbackReason::SpawnFailure);
+            }
+        }
         drop(registry);
         tracing::warn!(
             path = %path,
@@ -21149,10 +21623,20 @@ fn handoff_storage_reap(request: StorageReapRequest) {
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(request) = request {
-            reap_storage_request(request);
+            let (reaped_id, _p, outcome) = reap_storage_request(request);
+            let mut reg = lock_reaper_registry();
+            if let Some(receipt) = reg.receipts.get_mut(&reaped_id) {
+                receipt.state = ReaperReceiptState::Retired;
+                receipt.join_outcome = Some(outcome);
+            }
         }
         for request in queued {
-            reap_storage_request(request);
+            let (reaped_id, _p, outcome) = reap_storage_request(request);
+            let mut reg = lock_reaper_registry();
+            if let Some(receipt) = reg.receipts.get_mut(&reaped_id) {
+                receipt.state = ReaperReceiptState::Retired;
+                receipt.join_outcome = Some(outcome);
+            }
         }
     }
 }
@@ -21527,6 +22011,7 @@ impl StoragePipeline {
                 drop(startup_rx);
                 drop(tx);
                 handoff_storage_reap(StorageReapRequest::JoinOnly {
+                    request_id: next_reap_request_id(),
                     handle,
                     path: storage_path,
                     analytics,
@@ -22036,6 +22521,106 @@ impl StoragePipeline {
             }
         }
     }
+
+    /// Modify wait deadlines for this pipeline.
+    pub fn set_deadlines(&mut self, deadlines: StorageDeadlines) -> Result<(), StorageError> {
+        deadlines.validate()?;
+        self.sink.deadlines = deadlines;
+        Ok(())
+    }
+
+    /// Explicitly hand off this pipeline's worker to the supervised reaper.
+    ///
+    /// This returns the assigned reap request ID, or None if the handle was already taken.
+    pub fn handoff_to_reaper(&mut self) -> Option<u64> {
+        let handle = self.handle.take()?;
+        let request_id = next_reap_request_id();
+        handoff_storage_reap(StorageReapRequest::Pipeline {
+            request_id,
+            tx: self.sink.tx.clone(),
+            admission: Arc::clone(&self.sink.admission),
+            pending_shutdown: self.pending_shutdown.take(),
+            handle,
+            path: Arc::clone(&self.sink.path),
+            analytics: self.sink.analytics.clone(),
+        });
+        Some(request_id)
+    }
+
+    /// Test-only deterministic seam: pause the worker thread until the returned guard is released.
+    #[cfg(test)]
+    pub fn pause_worker_for_test(&self) -> Result<WorkerPauseGuard, StorageError> {
+        let (entered_tx, entered_rx) = xchan::bounded(1);
+        let (release_tx, release_rx) = xchan::bounded(1);
+        self.sink
+            .tx
+            .send(StorageCommand::PauseForAdmissionRace {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .map_err(|err| StorageError::Worker(StorageWorkerError::Channel {
+                operation: StorageOperation::Shutdown,
+                path: self.sink.path.to_string(),
+                tick: None,
+                commit_state: FailureCommitState::NotAdmitted,
+                detail: format!("failed to pause worker: {err}"),
+            }))?;
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| StorageError::Worker(StorageWorkerError::Timeout {
+                operation: StorageOperation::Shutdown,
+                phase: StorageWaitPhase::Acknowledgement,
+                path: self.sink.path.to_string(),
+                tick: None,
+                waited: Duration::from_secs(5),
+                commit_state: FailureCommitState::Indeterminate,
+            }))?;
+        Ok(WorkerPauseGuard {
+            release_tx: Some(release_tx),
+        })
+    }
+}
+
+/// RAII guard holding a worker paused in test mode until released or dropped.
+#[cfg(test)]
+pub struct WorkerPauseGuard {
+    release_tx: Option<xchan::Sender<()>>,
+}
+
+#[cfg(test)]
+impl WorkerPauseGuard {
+    /// Explicitly release the worker from its paused state.
+    pub fn release(mut self) {
+        if let Some(tx) = self.release_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for WorkerPauseGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.release_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Test helper to submit a JoinOnly reap request directly.
+#[cfg(test)]
+pub fn handoff_join_only_for_test(
+    handle: thread::JoinHandle<Option<StorageWorkerError>>,
+    path: Arc<str>,
+    analytics: AnalyticsSnapshotProvider,
+) -> u64 {
+    let request_id = next_reap_request_id();
+    handoff_storage_reap(StorageReapRequest::JoinOnly {
+        request_id,
+        handle,
+        path,
+        analytics,
+    });
+    request_id
 }
 
 impl Drop for StoragePipeline {
@@ -22045,7 +22630,9 @@ impl Drop for StoragePipeline {
             // unwind can double-panic and take the whole process down, so a Drop on
             // the panic path never flushes — it hands the worker to the reaper.
             if let Some(handle) = self.handle.take() {
+                let request_id = next_reap_request_id();
                 handoff_storage_reap(StorageReapRequest::Pipeline {
+                    request_id,
                     tx: self.sink.tx.clone(),
                     admission: Arc::clone(&self.sink.admission),
                     pending_shutdown: self.pending_shutdown.take(),
@@ -22061,7 +22648,9 @@ impl Drop for StoragePipeline {
         {
             eprintln!("failed to shut down storage worker cleanly: {error}");
             if let Some(handle) = self.handle.take() {
+                let request_id = next_reap_request_id();
                 handoff_storage_reap(StorageReapRequest::Pipeline {
+                    request_id,
                     tx: self.sink.tx.clone(),
                     admission: Arc::clone(&self.sink.admission),
                     pending_shutdown: self.pending_shutdown.take(),
