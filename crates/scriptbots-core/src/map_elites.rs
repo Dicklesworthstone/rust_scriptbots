@@ -137,6 +137,49 @@ pub enum QdError {
     Serialization(String),
 }
 
+/// Errors occurring when diffing two MAP-Elites archives.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum QdDiffError {
+    /// Behavior space schema versions differ between archives.
+    #[error(
+        "behavior space version mismatch: archive A has version {a}, archive B has version {b}"
+    )]
+    SpaceVersionMismatch {
+        /// Version in archive A.
+        a: u16,
+        /// Version in archive B.
+        b: u16,
+    },
+    /// Quality metrics differ between archives.
+    #[error("quality metric mismatch: archive A uses {a:?}, archive B uses {b:?}")]
+    QualityMetricMismatch {
+        /// Metric in archive A.
+        a: QualityMetric,
+        /// Metric in archive B.
+        b: QualityMetric,
+    },
+    /// Axis counts differ between archives.
+    #[error("behavior space axis count mismatch: archive A has {a} axes, archive B has {b} axes")]
+    AxisCountMismatch {
+        /// Count in archive A.
+        a: usize,
+        /// Count in archive B.
+        b: usize,
+    },
+    /// Specific axis configuration differs between archives.
+    #[error(
+        "behavior space axis mismatch at index {index}: archive A has '{a_name}', archive B has '{b_name}'"
+    )]
+    AxisMismatch {
+        /// Mismatched index.
+        index: usize,
+        /// Name in archive A.
+        a_name: String,
+        /// Name in archive B.
+        b_name: String,
+    },
+}
+
 /// Canonical phenotype features used as behavioral axes (bd-2z0.11.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PhenotypeFeature {
@@ -582,6 +625,30 @@ pub enum InsertionResult {
     RejectedWorseOrEqual,
 }
 
+/// Compensated summation using Neumaier's variant of Kahan summation.
+///
+/// Handles large numbers added to small numbers without losing low-order bits,
+/// ensuring high numerical stability and exact reproducibility across floating-point orders.
+#[inline]
+#[must_use]
+pub fn neumaier_sum<I>(iter: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut sum = 0.0f64;
+    let mut c = 0.0f64;
+    for val in iter {
+        let t = sum + val;
+        if sum.abs() >= val.abs() {
+            c += (sum - t) + val;
+        } else {
+            c += (val - t) + sum;
+        }
+        sum = t;
+    }
+    sum + c
+}
+
 /// MAP-Elites behavioral grid archive.
 ///
 /// Backed by [`BTreeMap<CellId, ArchiveEntry>`] to guarantee deterministic, sorted iteration
@@ -761,12 +828,38 @@ impl MapElitesArchive {
         Ok(())
     }
 
+    /// Compute raw Quality-Diversity (QD) score (compensated sum of all elite qualities).
+    ///
+    /// Summation is evaluated in strictly sorted [`CellId`] order using Neumaier compensated
+    /// summation to eliminate numerical drift.
+    #[must_use]
+    pub fn qd_score_raw(&self) -> f64 {
+        neumaier_sum(self.cells.values().map(|r| f64::from(r.quality)))
+    }
+
     /// Compute Quality-Diversity (QD) score (sum of all elite qualities).
     ///
-    /// Summation is done in sorted [`CellId`] iteration order.
+    /// Delegates to [`Self::qd_score_raw`] using Neumaier compensated summation in sorted [`CellId`] order.
     #[must_use]
     pub fn qd_score(&self) -> f64 {
-        self.cells.values().map(|r| f64::from(r.quality)).sum()
+        self.qd_score_raw()
+    }
+
+    /// Compute normalized Quality-Diversity (QD) score in `[0.0, 1.0]` (or non-negative).
+    ///
+    /// Defined as `qd_score_raw / total_cells`. Returns `0.0` if `total_cells == 0` or if the
+    /// archive is empty, never NaN. For a full archive where every elite has quality 1.0,
+    /// this evaluates to exactly 1.0.
+    #[must_use]
+    pub fn qd_score_norm(&self) -> f64 {
+        let total = self.total_cells();
+        if total == 0 || self.cells.is_empty() {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let norm = self.qd_score_raw() / total as f64;
+            if norm.is_finite() { norm.max(0.0) } else { 0.0 }
+        }
     }
 
     /// Number of distinct occupied cells in the archive.
@@ -818,6 +911,40 @@ impl MapElitesArchive {
         }
     }
 
+    /// Compute binary Shannon entropy of cell occupancy in bits `[0.0, 1.0]`.
+    ///
+    /// Given occupancy probability `p = coverage_count / total_cells`:
+    /// `H(p) = -p * log2(p) - (1 - p) * log2(1 - p)`.
+    ///
+    /// Returns `0.0` for empty (`p = 0.0`) and full (`p = 1.0`) archives (zero uncertainty).
+    /// Returns `1.0` for a half-full archive (`p = 0.5`, maximum uncertainty).
+    /// Never produces NaN.
+    #[must_use]
+    pub fn occupancy_entropy(&self) -> f64 {
+        let total = self.total_cells();
+        if total == 0 || self.cells.is_empty() {
+            return 0.0;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let count = self.cells.len() as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let p = (count / total as f64).clamp(0.0, 1.0);
+        if p <= 0.0 || p >= 1.0 {
+            0.0
+        } else {
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "Explicit separate operations preserve exact binary entropy evaluation without architecture-dependent FMA variation"
+            )]
+            let h = -p * p.log2() - (1.0 - p) * (1.0 - p).log2();
+            if h.is_finite() {
+                h.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
+    }
+
     /// Arithmetic mean quality across all occupied cells.
     #[must_use]
     pub fn mean_quality(&self) -> f32 {
@@ -825,7 +952,7 @@ impl MapElitesArchive {
             0.0
         } else {
             #[allow(clippy::cast_precision_loss)]
-            let mean = self.qd_score() / self.cells.len() as f64;
+            let mean = self.qd_score_raw() / self.cells.len() as f64;
             #[allow(clippy::cast_possible_truncation)]
             {
                 mean as f32
@@ -847,6 +974,261 @@ impl MapElitesArchive {
     pub fn cell_ids_sorted(&self) -> Vec<CellId> {
         self.cells.keys().copied().collect()
     }
+
+    /// Generate the comprehensive Quality-Diversity metrics report.
+    #[must_use]
+    pub fn metrics(&self) -> QdMetrics {
+        QdMetrics {
+            space_version: self.space.version,
+            quality_metric: self.quality_metric,
+            total_cells: self.total_cells(),
+            occupied_cells: self.cells.len(),
+            coverage: self.coverage_ratio(),
+            qd_score_raw: self.qd_score_raw(),
+            qd_score_norm: self.qd_score_norm(),
+            occupancy_entropy: self.occupancy_entropy(),
+            mean_quality: self.mean_quality(),
+            max_quality: self.max_quality(),
+        }
+    }
+
+    /// Compute the structured difference between this archive and another archive.
+    pub fn diff(&self, other: &Self) -> Result<ArchiveDiff, QdDiffError> {
+        archive_diff(self, other)
+    }
+
+    /// Select cell IDs according to a [`CellSelector`].
+    ///
+    /// The returned list contains only cell IDs actually present in the archive,
+    /// sorted in deterministic order.
+    #[must_use]
+    pub fn select_cells(&self, selector: &CellSelector) -> Vec<CellId> {
+        match selector {
+            CellSelector::All => self.cell_ids_sorted(),
+            CellSelector::TopKByQuality(k) => {
+                let mut entries: Vec<(&CellId, &ArchiveEntry)> = self.cells.iter().collect();
+                entries.sort_unstable_by(|(id_a, a), (id_b, b)| {
+                    b.quality
+                        .total_cmp(&a.quality)
+                        .then_with(|| a.uid.cmp(&b.uid))
+                        .then_with(|| id_a.cmp(id_b))
+                });
+                entries
+                    .into_iter()
+                    .take(*k as usize)
+                    .map(|(&id, _)| id)
+                    .collect()
+            }
+            CellSelector::AxisRange(ranges) => {
+                let mut matched = Vec::new();
+                for (&cell_id, entry) in &self.cells {
+                    let mut in_range = true;
+                    for &(axis_idx, lo, hi) in ranges {
+                        if let Some(&val) = entry.descriptor.0.get(axis_idx) {
+                            if val < lo || val > hi {
+                                in_range = false;
+                                break;
+                            }
+                        } else {
+                            in_range = false;
+                            break;
+                        }
+                    }
+                    if in_range {
+                        matched.push(cell_id);
+                    }
+                }
+                matched
+            }
+            CellSelector::Explicit(ids) => ids
+                .iter()
+                .copied()
+                .filter(|id| self.cells.contains_key(id))
+                .collect(),
+        }
+    }
+
+    /// Select archive entries according to a [`CellSelector`].
+    #[must_use]
+    pub fn select_entries(&self, selector: &CellSelector) -> Vec<&ArchiveEntry> {
+        self.select_cells(selector)
+            .into_iter()
+            .filter_map(|id| self.get(id))
+            .collect()
+    }
+}
+
+/// Comprehensive Quality-Diversity (QD) metrics report for an archive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QdMetrics {
+    /// Behavior space schema version.
+    pub space_version: u16,
+    /// Quality metric evaluated by this archive.
+    pub quality_metric: QualityMetric,
+    /// Total potential cells defined by the behavior space.
+    pub total_cells: u64,
+    /// Number of occupied cells in the archive.
+    pub occupied_cells: usize,
+    /// Ratio of occupied cells to total cells in `[0.0, 1.0]`.
+    pub coverage: f32,
+    /// Raw QD score (compensated sum of all elite qualities).
+    pub qd_score_raw: f64,
+    /// Normalized QD score (`qd_score_raw / total_cells`).
+    pub qd_score_norm: f64,
+    /// Binary Shannon occupancy entropy in bits `[0.0, 1.0]`.
+    pub occupancy_entropy: f64,
+    /// Arithmetic mean quality across occupied cells (`0.0` if empty).
+    pub mean_quality: f32,
+    /// Maximum quality observed across occupied cells (`None` if empty).
+    pub max_quality: Option<f32>,
+}
+
+/// Selector specifying which archive cells are targeted for inspection or resurrection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CellSelector {
+    /// Select every occupied cell in the archive.
+    All,
+    /// Select the top K cells ordered by quality descending (tie-broken by lower UID).
+    TopKByQuality(u16),
+    /// Select cells whose continuous feature coordinates fall within `[lo, hi]` on specified axes.
+    AxisRange(Vec<(usize, f32, f32)>),
+    /// Select specific cells by explicit [`CellId`] list.
+    Explicit(Vec<CellId>),
+}
+
+/// Comparison detail for a single cell present in both archives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CellComparison {
+    /// Discretized cell identifier.
+    pub cell_id: CellId,
+    /// Quality of elite in archive A.
+    pub quality_a: f32,
+    /// Quality of elite in archive B.
+    pub quality_b: f32,
+    /// Quality delta (`quality_b - quality_a`).
+    pub delta: f32,
+}
+
+/// Difference report between two MAP-Elites archives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveDiff {
+    /// Cell IDs present only in archive A.
+    pub only_in_a: Vec<CellId>,
+    /// Cell IDs present only in archive B.
+    pub only_in_b: Vec<CellId>,
+    /// Cells present in both where archive B has strictly higher quality.
+    pub improved_in_b: Vec<CellComparison>,
+    /// Cells present in both where archive B has strictly lower quality.
+    pub regressed_in_b: Vec<CellComparison>,
+    /// Cells present in both where quality is exactly equal.
+    pub unchanged: Vec<CellId>,
+}
+
+/// Compute the structured difference between two MAP-Elites archives.
+///
+/// Requires identical behavior space versions, axis definitions, and quality metrics.
+/// Comparing archives across differing behavior spaces or quality metrics is a category error
+/// and returns a typed [`QdDiffError`] rather than performing a silent join.
+pub fn archive_diff(
+    a: &MapElitesArchive,
+    b: &MapElitesArchive,
+) -> Result<ArchiveDiff, QdDiffError> {
+    if a.space.version != b.space.version {
+        return Err(QdDiffError::SpaceVersionMismatch {
+            a: a.space.version,
+            b: b.space.version,
+        });
+    }
+    if a.quality_metric != b.quality_metric {
+        return Err(QdDiffError::QualityMetricMismatch {
+            a: a.quality_metric,
+            b: b.quality_metric,
+        });
+    }
+    if a.space.axes.len() != b.space.axes.len() {
+        return Err(QdDiffError::AxisCountMismatch {
+            a: a.space.axes.len(),
+            b: b.space.axes.len(),
+        });
+    }
+    for (i, (axis_a, axis_b)) in a.space.axes.iter().zip(&b.space.axes).enumerate() {
+        if axis_a != axis_b {
+            return Err(QdDiffError::AxisMismatch {
+                index: i,
+                a_name: axis_a.name.clone(),
+                b_name: axis_b.name.clone(),
+            });
+        }
+    }
+
+    let mut only_in_a = Vec::new();
+    let mut only_in_b = Vec::new();
+    let mut improved_in_b = Vec::new();
+    let mut regressed_in_b = Vec::new();
+    let mut unchanged = Vec::new();
+
+    let mut iter_a = a.cells.iter();
+    let mut iter_b = b.cells.iter();
+    let mut item_a = iter_a.next();
+    let mut item_b = iter_b.next();
+
+    while let (Some((&id_a, entry_a)), Some((&id_b, entry_b))) = (item_a, item_b) {
+        match id_a.cmp(&id_b) {
+            std::cmp::Ordering::Less => {
+                only_in_a.push(id_a);
+                item_a = iter_a.next();
+            }
+            std::cmp::Ordering::Greater => {
+                only_in_b.push(id_b);
+                item_b = iter_b.next();
+            }
+            std::cmp::Ordering::Equal => {
+                let qa = entry_a.quality;
+                let qb = entry_b.quality;
+                let delta = qb - qa;
+                match qb.total_cmp(&qa) {
+                    std::cmp::Ordering::Greater => {
+                        improved_in_b.push(CellComparison {
+                            cell_id: id_a,
+                            quality_a: qa,
+                            quality_b: qb,
+                            delta,
+                        });
+                    }
+                    std::cmp::Ordering::Less => {
+                        regressed_in_b.push(CellComparison {
+                            cell_id: id_a,
+                            quality_a: qa,
+                            quality_b: qb,
+                            delta,
+                        });
+                    }
+                    std::cmp::Ordering::Equal => {
+                        unchanged.push(id_a);
+                    }
+                }
+                item_a = iter_a.next();
+                item_b = iter_b.next();
+            }
+        }
+    }
+
+    while let Some((&id_a, _)) = item_a {
+        only_in_a.push(id_a);
+        item_a = iter_a.next();
+    }
+    while let Some((&id_b, _)) = item_b {
+        only_in_b.push(id_b);
+        item_b = iter_b.next();
+    }
+
+    Ok(ArchiveDiff {
+        only_in_a,
+        only_in_b,
+        improved_in_b,
+        regressed_in_b,
+        unchanged,
+    })
 }
 
 /// Accumulator tracking lifetime statistics for an agent.
@@ -2241,5 +2623,363 @@ mod tests {
             EvolutionSelectionMode::Curiosity { w: f32::NAN }.validate(),
             Err(QdError::InvalidCuriosityWeight { .. })
         ));
+    }
+
+    fn make_test_entry(uid: u64, quality: f32, descriptor: Vec<f32>) -> ArchiveEntry {
+        ArchiveEntry {
+            uid: AgentUid(uid),
+            tick_inserted: Tick(100),
+            descriptor: BehaviorDescriptor::new(descriptor),
+            quality,
+            #[allow(clippy::cast_possible_truncation)]
+            genome: make_test_genome((uid & 0xff) as u8),
+            provenance: ArchiveProvenance {
+                run_id: "test".to_string(),
+                parent_uid: None,
+                generation: Generation(0),
+            },
+        }
+    }
+
+    #[test]
+    fn test_qd_metrics_empty_full_partial_and_zero_qualities() {
+        let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis],
+        };
+        let mut archive = MapElitesArchive::new(space, QualityMetric::LifetimeIntake, 100, 100_000)
+            .expect("archive");
+
+        // 1. Empty archive metrics: coverage 0, qd 0, no NaN
+        let empty_metrics = archive.metrics();
+        assert_eq!(empty_metrics.total_cells, 4);
+        assert_eq!(empty_metrics.occupied_cells, 0);
+        assert_eq!(empty_metrics.coverage, 0.0);
+        assert_eq!(empty_metrics.qd_score_raw, 0.0);
+        assert_eq!(empty_metrics.qd_score_norm, 0.0);
+        assert_eq!(empty_metrics.occupancy_entropy, 0.0);
+        assert_eq!(empty_metrics.mean_quality, 0.0);
+        assert_eq!(empty_metrics.max_quality, None);
+        assert!(!empty_metrics.qd_score_norm.is_nan());
+        assert!(!empty_metrics.occupancy_entropy.is_nan());
+
+        // 2. Full archive with quality 1.0
+        // Axis (0..4) with 4 bins: centers 0.5, 1.5, 2.5, 3.5
+        for (i, &center) in [0.5, 1.5, 2.5, 3.5].iter().enumerate() {
+            let entry = make_test_entry((i + 1) as u64, 1.0, vec![center]);
+            archive.insert(entry).expect("insert full");
+        }
+        let full_metrics = archive.metrics();
+        assert_eq!(full_metrics.total_cells, 4);
+        assert_eq!(full_metrics.occupied_cells, 4);
+        assert_eq!(full_metrics.coverage, 1.0);
+        assert_eq!(full_metrics.qd_score_raw, 4.0);
+        assert_eq!(full_metrics.qd_score_norm, 1.0);
+        assert_eq!(full_metrics.occupancy_entropy, 0.0); // full has zero uncertainty
+        assert_eq!(full_metrics.mean_quality, 1.0);
+        assert_eq!(full_metrics.max_quality, Some(1.0));
+
+        // 3. Half-full archive (2 of 4 cells occupied with quality 1.0)
+        let mut half_archive = MapElitesArchive::new(
+            archive.space.clone(),
+            QualityMetric::LifetimeIntake,
+            100,
+            100_000,
+        )
+        .expect("archive");
+        half_archive
+            .insert(make_test_entry(1, 1.0, vec![0.5]))
+            .expect("insert");
+        half_archive
+            .insert(make_test_entry(2, 1.0, vec![1.5]))
+            .expect("insert");
+
+        let half_metrics = half_archive.metrics();
+        assert_eq!(half_metrics.total_cells, 4);
+        assert_eq!(half_metrics.occupied_cells, 2);
+        assert_eq!(half_metrics.coverage, 0.5);
+        assert_eq!(half_metrics.qd_score_raw, 2.0);
+        assert_eq!(half_metrics.qd_score_norm, 0.5);
+        assert_eq!(half_metrics.occupancy_entropy, 1.0); // binary entropy of p=0.5 is 1.0 bit
+        assert_eq!(half_metrics.mean_quality, 1.0);
+        assert_eq!(half_metrics.max_quality, Some(1.0));
+
+        // 4. All-zero archive (2 of 4 cells occupied with quality 0.0)
+        let mut zero_archive = MapElitesArchive::new(
+            archive.space.clone(),
+            QualityMetric::LifetimeIntake,
+            100,
+            100_000,
+        )
+        .expect("archive");
+        zero_archive
+            .insert(make_test_entry(1, 0.0, vec![0.5]))
+            .expect("insert");
+        zero_archive
+            .insert(make_test_entry(2, 0.0, vec![1.5]))
+            .expect("insert");
+
+        let zero_metrics = zero_archive.metrics();
+        assert_eq!(zero_metrics.total_cells, 4);
+        assert_eq!(zero_metrics.occupied_cells, 2);
+        assert_eq!(zero_metrics.coverage, 0.5);
+        assert_eq!(zero_metrics.qd_score_raw, 0.0);
+        assert_eq!(zero_metrics.qd_score_norm, 0.0);
+        assert_eq!(zero_metrics.occupancy_entropy, 1.0); // same occupancy -> same entropy
+        assert_eq!(zero_metrics.mean_quality, 0.0);
+        assert_eq!(zero_metrics.max_quality, Some(0.0));
+        assert!(!zero_metrics.qd_score_norm.is_nan());
+        assert!(!zero_metrics.occupancy_entropy.is_nan());
+    }
+
+    #[test]
+    fn test_compensated_sum_permutation_invariance() {
+        let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 30.0), 30).expect("axis");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis],
+        };
+
+        // 20 diverse floats across orders of magnitude
+        let qualities = [
+            1e-7_f32,
+            2.5,
+            1000.0,
+            0.003,
+            42.125,
+            0.00005,
+            99.9,
+            0.1,
+            777.7,
+            13.333,
+            0.000_000_1,
+            5.55,
+            300.0,
+            0.04,
+            12.0,
+            0.0008,
+            55.5,
+            1.11,
+            888.8,
+            7.77,
+        ];
+        let entries: Vec<ArchiveEntry> = qualities
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| {
+                #[allow(clippy::cast_precision_loss)]
+                let pos = i as f32 + 0.5;
+                make_test_entry((i + 1) as u64, q, vec![pos])
+            })
+            .collect();
+
+        // Compute baseline qd_score_raw
+        let mut baseline_archive =
+            MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 100, 100_000)
+                .expect("archive");
+        for entry in &entries {
+            baseline_archive.insert(entry.clone()).expect("insert");
+        }
+        let expected_raw = baseline_archive.qd_score_raw();
+        let expected_bits = expected_raw.to_bits();
+
+        // Test 20 different insertion permutations
+        for seed_perm in 1..=20u64 {
+            let mut permuted = entries.clone();
+            // Deterministic Fisher-Yates shuffle using simple LCG
+            let mut state = seed_perm
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            for i in (1..permuted.len()).rev() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let j = (state >> 33) as usize % (i + 1);
+                permuted.swap(i, j);
+            }
+
+            let mut test_archive =
+                MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 100, 100_000)
+                    .expect("archive");
+            for entry in permuted {
+                test_archive.insert(entry).expect("insert permuted");
+            }
+
+            let test_raw = test_archive.qd_score_raw();
+            assert_eq!(
+                test_raw.to_bits(),
+                expected_bits,
+                "permutation {seed_perm} produced different bits for qd_score_raw: {test_raw} vs {expected_raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_archive_diff_and_typed_refusal() {
+        let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis],
+        };
+
+        // Archive A: cells 0 (q=1.0), 1 (q=2.0), 2 (q=3.0)
+        let mut archive_a =
+            MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 100, 100_000)
+                .expect("archive a");
+        archive_a
+            .insert(make_test_entry(1, 1.0, vec![0.5]))
+            .expect("insert");
+        archive_a
+            .insert(make_test_entry(2, 2.0, vec![1.5]))
+            .expect("insert");
+        archive_a
+            .insert(make_test_entry(3, 3.0, vec![2.5]))
+            .expect("insert");
+
+        // Archive B: cells 1 (q=2.5, improved), 2 (q=1.5, regressed), 3 (q=4.0, only in B)
+        let mut archive_b =
+            MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 100, 100_000)
+                .expect("archive b");
+        archive_b
+            .insert(make_test_entry(20, 2.5, vec![1.5]))
+            .expect("insert");
+        archive_b
+            .insert(make_test_entry(30, 1.5, vec![2.5]))
+            .expect("insert");
+        archive_b
+            .insert(make_test_entry(40, 4.0, vec![3.5]))
+            .expect("insert");
+
+        let diff = archive_a.diff(&archive_b).expect("diff");
+        assert_eq!(diff.only_in_a, vec![CellId(0)]);
+        assert_eq!(diff.only_in_b, vec![CellId(3)]);
+        assert_eq!(diff.improved_in_b.len(), 1);
+        assert_eq!(diff.improved_in_b[0].cell_id, CellId(1));
+        assert_eq!(diff.improved_in_b[0].quality_a, 2.0);
+        assert_eq!(diff.improved_in_b[0].quality_b, 2.5);
+        assert!((diff.improved_in_b[0].delta - 0.5).abs() < 1e-5);
+
+        assert_eq!(diff.regressed_in_b.len(), 1);
+        assert_eq!(diff.regressed_in_b[0].cell_id, CellId(2));
+        assert_eq!(diff.regressed_in_b[0].quality_a, 3.0);
+        assert_eq!(diff.regressed_in_b[0].quality_b, 1.5);
+        assert!((diff.regressed_in_b[0].delta - (-1.5)).abs() < 1e-5);
+
+        assert_eq!(diff.unchanged, Vec::new());
+
+        // Identical diff
+        let self_diff = archive_a.diff(&archive_a).expect("self diff");
+        assert_eq!(self_diff.only_in_a, Vec::new());
+        assert_eq!(self_diff.only_in_b, Vec::new());
+        assert_eq!(self_diff.improved_in_b, Vec::new());
+        assert_eq!(self_diff.regressed_in_b, Vec::new());
+        assert_eq!(self_diff.unchanged.len(), 3);
+
+        // Version mismatch refusal
+        let mut wrong_version_space = space.clone();
+        wrong_version_space.version = 1;
+        let archive_wrong_version = MapElitesArchive::new(
+            wrong_version_space,
+            QualityMetric::LifetimeIntake,
+            100,
+            100_000,
+        )
+        .expect("archive");
+        let version_err = archive_a
+            .diff(&archive_wrong_version)
+            .expect_err("version mismatch");
+        assert_eq!(
+            version_err,
+            QdDiffError::SpaceVersionMismatch { a: 0, b: 1 }
+        );
+
+        // Metric mismatch refusal
+        let archive_wrong_metric =
+            MapElitesArchive::new(space, QualityMetric::OffspringCount, 100, 100_000)
+                .expect("archive");
+        let metric_err = archive_a
+            .diff(&archive_wrong_metric)
+            .expect_err("metric mismatch");
+        assert_eq!(
+            metric_err,
+            QdDiffError::QualityMetricMismatch {
+                a: QualityMetric::LifetimeIntake,
+                b: QualityMetric::OffspringCount,
+            }
+        );
+
+        // Axis mismatch refusal
+        let different_axis =
+            Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 4).expect("axis");
+        let different_space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![different_axis],
+        };
+        let archive_different_axis =
+            MapElitesArchive::new(different_space, QualityMetric::LifetimeIntake, 100, 100_000)
+                .expect("archive");
+        let axis_err = archive_a
+            .diff(&archive_different_axis)
+            .expect_err("axis mismatch");
+        assert!(matches!(axis_err, QdDiffError::AxisMismatch { .. }));
+    }
+
+    #[test]
+    fn test_cell_selectors() {
+        let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis],
+        };
+        let mut archive = MapElitesArchive::new(space, QualityMetric::LifetimeIntake, 100, 100_000)
+            .expect("archive");
+
+        // Cell 0: q=10.0, center=0.5, UID=1
+        // Cell 1: q=50.0, center=1.5, UID=2
+        // Cell 2: q=30.0, center=2.5, UID=3
+        archive
+            .insert(make_test_entry(1, 10.0, vec![0.5]))
+            .expect("insert");
+        archive
+            .insert(make_test_entry(2, 50.0, vec![1.5]))
+            .expect("insert");
+        archive
+            .insert(make_test_entry(3, 30.0, vec![2.5]))
+            .expect("insert");
+
+        // 1. Selector::All
+        assert_eq!(
+            archive.select_cells(&CellSelector::All),
+            vec![CellId(0), CellId(1), CellId(2)]
+        );
+
+        // 2. Selector::TopKByQuality(2) -> cells 1 (q=50) and 2 (q=30)
+        assert_eq!(
+            archive.select_cells(&CellSelector::TopKByQuality(2)),
+            vec![CellId(1), CellId(2)]
+        );
+
+        // 3. Selector::AxisRange -> range [1.0, 3.0] matches cells 1 and 2
+        assert_eq!(
+            archive.select_cells(&CellSelector::AxisRange(vec![(0, 1.0, 3.0)])),
+            vec![CellId(1), CellId(2)]
+        );
+
+        // 4. Selector::Explicit -> matches existing cells, filters non-existent cells without error
+        assert_eq!(
+            archive.select_cells(&CellSelector::Explicit(vec![
+                CellId(0),
+                CellId(999), // does not exist
+                CellId(2)
+            ])),
+            vec![CellId(0), CellId(2)]
+        );
+
+        // 5. select_entries
+        let entries = archive.select_entries(&CellSelector::TopKByQuality(1));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uid, AgentUid(2));
+        assert_eq!(entries[0].quality, 50.0);
     }
 }

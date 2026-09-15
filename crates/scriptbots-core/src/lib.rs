@@ -87,11 +87,12 @@ pub mod visual;
 
 pub use map_elites as qd;
 pub use map_elites::{
-    AgentAccumulatedStats, ArchiveCellRow, ArchiveEntry, ArchiveProvenance, ArchiveSpaceRow, Axis,
-    BehaviorDescriptor, BehaviorSpaceV0, CandidateDescriptor, CellId, EvolutionSelectionMode,
-    InsertionResult, MAX_ARCHIVE_CELLS, MapElitesArchive, NoveltyState, PhenotypeFeature, QdError,
-    QualityMetric, combine_curiosity, compute_novelty_score, compute_population_novelty,
-    normalize_scores, normalized_distance,
+    AgentAccumulatedStats, ArchiveCellRow, ArchiveDiff, ArchiveEntry, ArchiveProvenance,
+    ArchiveSpaceRow, Axis, BehaviorDescriptor, BehaviorSpaceV0, CandidateDescriptor,
+    CellComparison, CellId, CellSelector, EvolutionSelectionMode, InsertionResult,
+    MAX_ARCHIVE_CELLS, MapElitesArchive, NoveltyState, PhenotypeFeature, QdDiffError, QdError,
+    QdMetrics, QualityMetric, archive_diff, combine_curiosity, compute_novelty_score,
+    compute_population_novelty, neumaier_sum, normalize_scores, normalized_distance,
 };
 
 pub use economy::{
