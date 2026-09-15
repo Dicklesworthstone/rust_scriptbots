@@ -1933,6 +1933,292 @@ impl MapElitesArchive {
         }
         Ok(archive)
     }
+
+    /// Export the archive and its configuration as a self-describing bundle.
+    #[must_use]
+    pub fn export_bundle(&self, run_id: &str) -> ArchiveExportBundle {
+        let cells: Vec<(CellId, ArchiveEntry)> = self
+            .cells
+            .iter()
+            .map(|(&id, entry)| (id, entry.clone()))
+            .collect();
+        ArchiveExportBundle {
+            run_id: run_id.to_string(),
+            space: self.space.clone(),
+            quality_metric: self.quality_metric,
+            min_lifetime_ticks: self.min_lifetime_ticks,
+            max_bytes: self.max_archive_bytes,
+            cells,
+        }
+    }
+
+    /// Reconstitute an archive from an export bundle.
+    pub fn from_bundle(bundle: ArchiveExportBundle) -> Result<Self, QdError> {
+        let mut archive = Self::new(
+            bundle.space,
+            bundle.quality_metric,
+            bundle.min_lifetime_ticks,
+            bundle.max_bytes,
+        )?;
+        for (cell_id, entry) in bundle.cells {
+            archive.current_bytes = archive
+                .current_bytes
+                .saturating_add(entry.approximate_bytes());
+            archive.cells.insert(cell_id, entry);
+        }
+        Ok(archive)
+    }
+
+    /// Serialize the archive bundle to a deterministic, indented JSON string.
+    pub fn export_json(&self, run_id: &str) -> Result<String, QdError> {
+        let bundle = self.export_bundle(run_id);
+        serde_json::to_string_pretty(&bundle).map_err(|e| QdError::Serialization(e.to_string()))
+    }
+
+    /// Reconstitute an archive from a JSON export bundle string.
+    pub fn import_json(json_str: &str) -> Result<(String, Self), QdError> {
+        let bundle: ArchiveExportBundle = serde_json::from_str(json_str)
+            .map_err(|e| QdError::Serialization(e.to_string()))?;
+        let run_id = bundle.run_id.clone();
+        let archive = Self::from_bundle(bundle)?;
+        Ok((run_id, archive))
+    }
+
+    /// Export the archive to a self-describing, canonically ordered RFC 4180 CSV stream.
+    ///
+    /// The first line contains a structured `# PROVENANCE:` header encoding metadata,
+    /// space definition, and quality metric. Subsequent lines contain elite rows ordered
+    /// strictly by ascending [`CellId`].
+    pub fn export_csv<W: std::io::Write>(&self, run_id: &str, writer: &mut W) -> Result<usize, QdError> {
+        let header = CsvProvenanceHeader {
+            run_id: run_id.to_string(),
+            space_version: self.space.version,
+            quality_metric: self.quality_metric,
+            min_lifetime_ticks: self.min_lifetime_ticks,
+            space: self.space.clone(),
+        };
+        let prov_json = serde_json::to_string(&header)
+            .map_err(|e| QdError::Serialization(e.to_string()))?;
+        writeln!(writer, "# PROVENANCE: {prov_json}")
+            .map_err(|e| QdError::Serialization(e.to_string()))?;
+        writeln!(
+            writer,
+            "cell_id,uid,tick_inserted,quality,genome_version,parent_uid,generation,descriptor,genome"
+        )
+        .map_err(|e| QdError::Serialization(e.to_string()))?;
+
+        let mut rows = 0_usize;
+        for (&cell_id, entry) in &self.cells {
+            let descriptor_json = serde_json::to_string(&entry.descriptor)
+                .map_err(|e| QdError::Serialization(e.to_string()))?;
+            let genome_json = serde_json::to_string(&entry.genome)
+                .map_err(|e| QdError::Serialization(e.to_string()))?;
+            let parent_uid_str = entry
+                .provenance
+                .parent_uid
+                .map_or_else(String::new, |u| u.get().to_string());
+            writeln!(
+                writer,
+                "{},{},{},{},{},{},{},{},{}",
+                cell_id.0,
+                entry.uid.get(),
+                entry.tick_inserted.0,
+                entry.quality,
+                entry.genome.schema_version(),
+                parent_uid_str,
+                entry.provenance.generation.0,
+                escape_csv_field(&descriptor_json),
+                escape_csv_field(&genome_json)
+            )
+            .map_err(|e| QdError::Serialization(e.to_string()))?;
+            rows += 1;
+        }
+        writer.flush().map_err(|e| QdError::Serialization(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Reconstitute an archive from an RFC 4180 CSV reader written by [`Self::export_csv`].
+    pub fn import_csv<R: std::io::BufRead>(
+        reader: R,
+        byte_cap: usize,
+    ) -> Result<(String, Self), QdError> {
+        let mut lines = reader.lines();
+        let mut first_line = None;
+        for line in &mut lines {
+            let l = line.map_err(|e| QdError::Serialization(e.to_string()))?;
+            let trimmed = l.trim();
+            if !trimmed.is_empty() {
+                first_line = Some(trimmed.to_string());
+                break;
+            }
+        }
+        let Some(first_line) = first_line else {
+            return Err(QdError::Serialization("empty CSV input".to_string()));
+        };
+        if !first_line.starts_with("# PROVENANCE: ") {
+            return Err(QdError::Serialization(format!(
+                "missing '# PROVENANCE: ' header line, found: {first_line:?}"
+            )));
+        }
+        let prov_str = &first_line["# PROVENANCE: ".len()..];
+        let header: CsvProvenanceHeader = serde_json::from_str(prov_str)
+            .map_err(|e| QdError::Serialization(format!("invalid provenance JSON: {e}")))?;
+
+        let mut header_line = None;
+        for line in &mut lines {
+            let l = line.map_err(|e| QdError::Serialization(e.to_string()))?;
+            let trimmed = l.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                header_line = Some(l);
+                break;
+            }
+        }
+        let Some(header_line) = header_line else {
+            return Err(QdError::Serialization(
+                "missing CSV column header line".to_string(),
+            ));
+        };
+        let col_headers = parse_csv_line(&header_line);
+        if col_headers.len() < 9 {
+            return Err(QdError::Serialization(format!(
+                "expected at least 9 columns, found {}: {col_headers:?}",
+                col_headers.len()
+            )));
+        }
+
+        let mut archive = Self::new(
+            header.space,
+            header.quality_metric,
+            header.min_lifetime_ticks,
+            byte_cap,
+        )?;
+
+        for line_res in lines {
+            let line = line_res.map_err(|e| QdError::Serialization(e.to_string()))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let fields = parse_csv_line(&line);
+            if fields.len() < 9 {
+                return Err(QdError::Serialization(format!(
+                    "row has fewer than 9 fields: {fields:?}"
+                )));
+            }
+            let cell_id: u64 = fields[0]
+                .parse()
+                .map_err(|e| QdError::Serialization(format!("invalid cell_id: {e}")))?;
+            let uid: u64 = fields[1]
+                .parse()
+                .map_err(|e| QdError::Serialization(format!("invalid uid: {e}")))?;
+            let tick_inserted: u64 = fields[2]
+                .parse()
+                .map_err(|e| QdError::Serialization(format!("invalid tick_inserted: {e}")))?;
+            let quality: f32 = fields[3]
+                .parse()
+                .map_err(|e| QdError::Serialization(format!("invalid quality: {e}")))?;
+            let parent_uid = if fields[5].is_empty() {
+                None
+            } else {
+                Some(AgentUid(
+                    fields[5]
+                        .parse()
+                        .map_err(|e| QdError::Serialization(format!("invalid parent_uid: {e}")))?,
+                ))
+            };
+            let generation: u32 = fields[6]
+                .parse()
+                .map_err(|e| QdError::Serialization(format!("invalid generation: {e}")))?;
+            let descriptor: BehaviorDescriptor = serde_json::from_str(&fields[7])
+                .map_err(|e| QdError::Serialization(format!("invalid descriptor JSON: {e}")))?;
+            let genome: BrainGenomeEnvelope = serde_json::from_str(&fields[8])
+                .map_err(|e| QdError::Serialization(format!("invalid genome JSON: {e}")))?;
+
+            let entry = ArchiveEntry {
+                uid: AgentUid(uid),
+                tick_inserted: Tick(tick_inserted),
+                descriptor,
+                quality,
+                genome,
+                provenance: ArchiveProvenance {
+                    run_id: header.run_id.clone(),
+                    parent_uid,
+                    generation: Generation(generation),
+                },
+            };
+            archive.current_bytes = archive
+                .current_bytes
+                .saturating_add(entry.approximate_bytes());
+            archive.cells.insert(CellId(cell_id), entry);
+        }
+
+        Ok((header.run_id, archive))
+    }
+}
+
+/// Self-describing export bundle for a complete MAP-Elites archive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArchiveExportBundle {
+    /// Identifier of the simulation run that generated the archive.
+    pub run_id: String,
+    /// Behavior space defining the axes and discretization bins.
+    pub space: BehaviorSpaceV0,
+    /// Quality metric function used to rank candidates.
+    pub quality_metric: QualityMetric,
+    /// Minimum lifetime ticks filter applied to candidates.
+    pub min_lifetime_ticks: u32,
+    /// Maximum allowed memory footprint in bytes.
+    pub max_bytes: usize,
+    /// Vector of (cell_id, entry) pairs in ascending CellId order.
+    pub cells: Vec<(CellId, ArchiveEntry)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CsvProvenanceHeader {
+    run_id: String,
+    space_version: u16,
+    quality_metric: QualityMetric,
+    min_lifetime_ticks: u32,
+    space: BehaviorSpaceV0,
+}
+
+fn escape_csv_field(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    current.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ',' {
+            fields.push(current);
+            current = String::new();
+        } else {
+            current.push(c);
+        }
+    }
+    fields.push(current);
+    fields
 }
 
 #[cfg(test)]
@@ -2981,5 +3267,80 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].uid, AgentUid(2));
         assert_eq!(entries[0].quality, 50.0);
+    }
+
+    #[test]
+    fn test_archive_export_import_bundle_and_json_roundtrip() {
+        let axis0 = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis0");
+        let axis1 = Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 2).expect("axis1");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis0, axis1],
+        };
+        let mut archive = MapElitesArchive::new(space, QualityMetric::LifetimeIntake, 100, 100_000)
+            .expect("archive");
+
+        archive.insert(make_test_entry(1, 15.5, vec![0.5, 0.25])).expect("insert 1");
+        archive.insert(make_test_entry(2, 42.0, vec![2.5, 0.75])).expect("insert 2");
+        archive.insert(make_test_entry(3, 8.0, vec![3.5, 0.1])).expect("insert 3");
+
+        let metrics_orig = archive.metrics();
+        assert_eq!(metrics_orig.occupied_cells, 3);
+
+        // 1. Bundle roundtrip
+        let bundle = archive.export_bundle("run_alpha");
+        assert_eq!(bundle.run_id, "run_alpha");
+        let restored = MapElitesArchive::from_bundle(bundle).expect("from_bundle");
+        assert_eq!(archive.cells, restored.cells);
+        assert_eq!(metrics_orig, restored.metrics());
+
+        // 2. JSON roundtrip
+        let json_str = archive.export_json("run_alpha").expect("export_json");
+        let (run_id_json, json_restored) = MapElitesArchive::import_json(&json_str).expect("import_json");
+        assert_eq!(run_id_json, "run_alpha");
+        assert_eq!(archive.cells, json_restored.cells);
+        assert_eq!(metrics_orig, json_restored.metrics());
+    }
+
+    #[test]
+    fn test_archive_export_import_csv_roundtrip() {
+        let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis],
+        };
+        let mut archive = MapElitesArchive::new(space, QualityMetric::LifetimeIntake, 50, 50_000)
+            .expect("archive");
+
+        archive.insert(make_test_entry(10, 20.0, vec![0.5])).expect("insert");
+        archive.insert(make_test_entry(20, 60.0, vec![1.5])).expect("insert");
+
+        let metrics_orig = archive.metrics();
+
+        let mut csv_buf = Vec::new();
+        let rows = archive.export_csv("run_csv_test", &mut csv_buf).expect("export_csv");
+        assert_eq!(rows, 2);
+
+        let csv_text = String::from_utf8(csv_buf.clone()).expect("valid utf8");
+        assert!(csv_text.starts_with("# PROVENANCE: "));
+        assert!(csv_text.contains("run_csv_test"));
+
+        let (run_id, imported) = MapElitesArchive::import_csv(csv_buf.as_slice(), 50_000).expect("import_csv");
+        assert_eq!(run_id, "run_csv_test");
+        assert_eq!(archive.cells, imported.cells);
+        assert_eq!(metrics_orig, imported.metrics());
+    }
+
+    #[test]
+    fn test_archive_import_csv_malformed_errors() {
+        // Missing provenance line
+        let invalid_csv = "cell_id,uid,tick_inserted,quality,genome_version,parent_uid,generation,descriptor,genome\n";
+        let err = MapElitesArchive::import_csv(invalid_csv.as_bytes(), 50_000).unwrap_err();
+        assert!(matches!(err, QdError::Serialization(_)));
+
+        // Empty CSV
+        let empty_csv = "";
+        let err = MapElitesArchive::import_csv(empty_csv.as_bytes(), 50_000).unwrap_err();
+        assert!(matches!(err, QdError::Serialization(_)));
     }
 }
