@@ -3184,6 +3184,10 @@ mod tests {
     /// Overflow boundaries and extreme float inputs must evaluate safely without panic,
     /// infinite loops, or NaN leakage.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Comprehensive boundary and extreme float test matrix covering ticks, inf, subnormals, and precision limits"
+    )]
     fn bd_16g_2_11_overflow_boundaries_and_extreme_floats_survive_safely() {
         // 1. Ticks up to u64::MAX.
         let boundary_ticks = [
@@ -3344,8 +3348,8 @@ mod tests {
             let n = 200;
             let values: Vec<f64> = if case < 25 {
                 // Gaussian noise.
-                let mean = 100.0 + (case as f64) * 5.0;
-                let sigma = 10.0 + (case as f64) * 0.5;
+                let mean = 100.0 + f64::from(case) * 5.0;
+                let sigma = 10.0 + f64::from(case) * 0.5;
                 (0..n)
                     .map(|_| {
                         let u1 = rng.next_f64().max(f64::MIN_POSITIVE);
@@ -3356,7 +3360,7 @@ mod tests {
                     .collect()
             } else {
                 // Uniform noise.
-                let width = 50.0 + (case as f64) * 2.0;
+                let width = 50.0 + f64::from(case) * 2.0;
                 (0..n).map(|_| rng.next_f64() * width).collect()
             };
 
@@ -3422,7 +3426,7 @@ mod tests {
             let cps = change_points_cusum(&series, cusum_params).expect("valid");
             cusum_false_positives += cps.len();
         }
-        let rate_per_10k = cusum_false_positives as f64 / runs as f64;
+        let rate_per_10k = cusum_false_positives as f64 / f64::from(runs);
         println!(
             "FALSE_POSITIVE_BUDGET multi_seed cusum total={cusum_false_positives} per_10k={rate_per_10k:.2}"
         );

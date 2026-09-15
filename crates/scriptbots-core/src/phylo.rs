@@ -3053,6 +3053,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "100k node stress benchmark test requires linear setup, assertions, and diagnostic formatting"
+    )]
     fn deterministic_hundred_thousand_node_stress_stays_incremental() {
         const NODE_COUNT: usize = 100_000;
         let mut layout = TreeLayout::new(LayoutBudget {
@@ -3098,8 +3102,7 @@ mod tests {
                 ),
             ));
         } else {
-            for id in 1..NODE_COUNT {
-                let node = &layout.nodes[id];
+            for (id, node) in layout.nodes.iter().enumerate().take(NODE_COUNT).skip(1) {
                 #[allow(clippy::cast_precision_loss)]
                 let expected_x = id as f32;
                 #[allow(clippy::cast_precision_loss)]
@@ -3142,8 +3145,7 @@ mod tests {
         assert!(update.issues.is_empty(), "{:?}", update.issues);
         assert!(
             first_divergence.is_none(),
-            "unexpected coordinate divergence: {:?}",
-            first_divergence
+            "unexpected coordinate divergence: {first_divergence:?}"
         );
         assert_eq!(layout.len(), NODE_COUNT);
         assert_eq!(update.ancestor_steps, NODE_COUNT - 1);
@@ -3152,8 +3154,7 @@ mod tests {
         assert!(memory.total_retained_bytes <= 256 << 20);
         assert!(
             elapsed < std::time::Duration::from_secs(10),
-            "100k stress elapsed {:?} exceeds 10s budget",
-            elapsed
+            "100k stress elapsed {elapsed:?} exceeds 10s budget"
         );
         assert_eq!(lod.nodes.len(), 128);
         assert!(
@@ -3180,7 +3181,7 @@ mod tests {
         let report = layout.extend(&PhyloDelta {
             updates: vec![root, child1, child2, grandchild],
         });
-        assert!(report.issues.is_empty());
+        assert_eq!(report.issues, [] as [LayoutIssue; 0]);
         assert_eq!(layout.len(), 4);
 
         // Initially, no nodes are collapsed.
@@ -3258,7 +3259,7 @@ mod tests {
         let report = layout.extend(&PhyloDelta {
             updates: vec![parent],
         });
-        assert!(report.issues.is_empty());
+        assert_eq!(report.issues, [] as [LayoutIssue; 0]);
 
         // parent_birth == child_birth is rejected as ParentBornAfterChild
         let child_same_tick = species(11, ParentRef::Known(PhyloKey::Species(10)), 11, 10, None, 5);
