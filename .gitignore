@@ -47,3 +47,6 @@ beads_compliance_audit/
 .beads/last-touched
 .rch-tmp/
 .doctor/
+# NTM pane logs, pids, and crash inbox (local swarm runtime).
+.ntm/
+__pycache__/
