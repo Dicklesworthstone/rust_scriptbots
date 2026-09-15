@@ -807,7 +807,7 @@ fn bimodality_inner(
     for value in values {
         work.value_visits += 1;
         work.bin_visits += 1;
-        let bin = bimodality_bin(*value, min, span);
+        let bin = bimodality_bin(*value, min, max, span);
         counts[bin] += 1;
         sums[bin] += *value;
         if *value < mins[bin] {
@@ -834,7 +834,7 @@ fn bimodality_inner(
     for value in values {
         work.value_visits += 1;
         work.bin_visits += 1;
-        let bin = bimodality_bin(*value, min, span);
+        let bin = bimodality_bin(*value, min, max, span);
         let d = *value - mean;
         sq_sums[bin] += d * d;
     }
@@ -920,12 +920,16 @@ fn bimodality_inner(
         }
     }
 
-    let score = if total_variance > 0.0 {
+    let score = if total_variance > 0.0 && total_variance.is_finite() && best_between.is_finite() {
         (best_between / total_variance).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let separation = (upper_mean - lower_mean).abs() / total_sigma;
+    let separation = if total_sigma.is_finite() && total_sigma > 0.0 {
+        (upper_mean - lower_mean).abs() / total_sigma
+    } else {
+        0.0
+    };
     let smaller = lower_count.min(upper_count) as f64 / n;
     let is_bimodal = score >= params.min_score
         && separation >= params.min_separation
@@ -956,9 +960,21 @@ const BIMODALITY_BINS: usize = 1024;
 /// Clamped rather than asserted: floating-point rounding can put `max` itself at
 /// index `BIMODALITY_BINS`, and a detector that panics on its own maximum would
 /// be worse than one that puts it in the top bin where it belongs.
-fn bimodality_bin(value: f64, min: f64, span: f64) -> usize {
-    let scaled = (value - min) / span * BIMODALITY_BINS as f64;
-    if scaled <= 0.0 {
+///
+/// Handles extreme float spans where `max - min` overflows to infinity by
+/// evaluating in half-scale space.
+fn bimodality_bin(value: f64, min: f64, max: f64, span: f64) -> usize {
+    let scaled = if span.is_finite() && span > 0.0 {
+        (value - min) / span * BIMODALITY_BINS as f64
+    } else {
+        let half_span = max * 0.5 - min * 0.5;
+        if half_span > 0.0 {
+            (value * 0.5 - min * 0.5) / half_span * BIMODALITY_BINS as f64
+        } else {
+            0.0
+        }
+    };
+    if scaled <= 0.0 || !scaled.is_finite() {
         return 0;
     }
     let index = scaled as usize;
@@ -3018,5 +3034,401 @@ mod tests {
     #[test]
     fn bd_16g_2_a_quiet_timeline_is_empty() {
         assert_eq!(narrate_timeline(&[]), Vec::<String>::new());
+    }
+
+    // ---- bd-16g.2.11 item 4 remainder: repeated ticks, overflow boundaries, noise budget ----
+
+    /// Repeated and decreasing ticks must be rejected at ANY position across all three
+    /// series primitives.
+    ///
+    /// Ticks must be strictly increasing for temporal windows and rates to be well-defined.
+    /// A detector that permits repeated ticks could silently compute zero or negative spans.
+    #[test]
+    fn bd_16g_2_11_repeated_and_decreasing_ticks_are_rejected_across_all_primitives() {
+        let cusum = CusumParams::default();
+        let thresholds = [Threshold {
+            name: "lvl",
+            level: 5.0,
+            direction: CrossDirection::Either,
+        }];
+        let regime_params = RegimeParams {
+            window: 16,
+            ..RegimeParams::default()
+        };
+
+        // Test repeated and decreasing ticks at start (index 1), middle, and end.
+        let n = 64usize;
+        for bad_idx in [1usize, n / 2, n - 1] {
+            // Case A: repeated tick.
+            let mut repeated: Vec<Sample> =
+                (0..n).map(|i| Sample::new(i as u64 * 10, 1.0)).collect();
+            repeated[bad_idx].tick = repeated[bad_idx - 1].tick;
+
+            assert_eq!(
+                change_points_cusum(&repeated, cusum),
+                Err(DetectError::UnorderedTicks { index: bad_idx })
+            );
+            assert_eq!(
+                threshold_crossings(&repeated, &thresholds),
+                Err(DetectError::UnorderedTicks { index: bad_idx })
+            );
+            assert_eq!(
+                regimes(&repeated, regime_params),
+                Err(DetectError::UnorderedTicks { index: bad_idx })
+            );
+
+            // Case B: decreasing tick.
+            let mut decreasing: Vec<Sample> =
+                (0..n).map(|i| Sample::new(i as u64 * 10, 1.0)).collect();
+            decreasing[bad_idx].tick = decreasing[bad_idx - 1].tick.saturating_sub(1);
+
+            assert_eq!(
+                change_points_cusum(&decreasing, cusum),
+                Err(DetectError::UnorderedTicks { index: bad_idx })
+            );
+            assert_eq!(
+                threshold_crossings(&decreasing, &thresholds),
+                Err(DetectError::UnorderedTicks { index: bad_idx })
+            );
+            assert_eq!(
+                regimes(&decreasing, regime_params),
+                Err(DetectError::UnorderedTicks { index: bad_idx })
+            );
+        }
+    }
+
+    /// Strictly increasing ticks with irregular or large gaps must be accepted.
+    #[test]
+    fn bd_16g_2_11_strictly_increasing_sparse_ticks_are_accepted() {
+        let ticks = [
+            0u64,
+            1,
+            5,
+            20,
+            100,
+            1_000,
+            50_000,
+            1_000_000,
+            100_000_000,
+            u64::MAX - 10,
+            u64::MAX,
+        ];
+        let series: Vec<Sample> = ticks.iter().map(|&t| Sample::new(t, 42.0)).collect();
+
+        assert!(change_points_cusum(&series, CusumParams::default()).is_ok());
+        assert!(threshold_crossings(&series, &[]).is_ok());
+
+        // For regimes, need at least window samples with strictly increasing ticks.
+        let sparse_64: Vec<Sample> = (0..64u64).map(|i| Sample::new(i * i + i, 10.0)).collect();
+        assert!(
+            regimes(
+                &sparse_64,
+                RegimeParams {
+                    window: 16,
+                    ..RegimeParams::default()
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    /// Property test: injected repeated ticks at arbitrary indices always fail with
+    /// the exact offending index.
+    #[test]
+    fn bd_16g_2_11_property_test_injected_repeated_ticks_fail_at_exact_index() {
+        let mut rng = Lcg(0x71C0_1234_5678_9ABC);
+        let thresholds = [Threshold {
+            name: "lvl",
+            level: 0.5,
+            direction: CrossDirection::Either,
+        }];
+        let regime_params = RegimeParams {
+            window: 16,
+            ..RegimeParams::default()
+        };
+
+        for case in 0..100 {
+            let n = 16 + (case % 65);
+            let mut current_tick = 0u64;
+            let mut series = Vec::with_capacity(n);
+            for _ in 0..n {
+                let step = 1 + (rng.next_f64() * 20.0) as u64;
+                current_tick += step;
+                series.push(Sample::new(current_tick, rng.next_f64()));
+            }
+
+            // Verify clean series passes.
+            assert!(change_points_cusum(&series, CusumParams::default()).is_ok());
+            assert!(threshold_crossings(&series, &thresholds).is_ok());
+            assert!(regimes(&series, regime_params).is_ok());
+
+            // Inject repeated tick at random position k in 1..n.
+            let k = 1 + ((rng.next_f64() * (n - 1) as f64) as usize).min(n - 1);
+            series[k].tick = series[k - 1].tick;
+
+            assert_eq!(
+                change_points_cusum(&series, CusumParams::default()),
+                Err(DetectError::UnorderedTicks { index: k })
+            );
+            assert_eq!(
+                threshold_crossings(&series, &thresholds),
+                Err(DetectError::UnorderedTicks { index: k })
+            );
+            assert_eq!(
+                regimes(&series, regime_params),
+                Err(DetectError::UnorderedTicks { index: k })
+            );
+        }
+    }
+
+    /// Overflow boundaries and extreme float inputs must evaluate safely without panic,
+    /// infinite loops, or NaN leakage.
+    #[test]
+    fn bd_16g_2_11_overflow_boundaries_and_extreme_floats_survive_safely() {
+        // 1. Ticks up to u64::MAX.
+        let boundary_ticks = [
+            Sample::new(u64::MAX - 2, 10.0),
+            Sample::new(u64::MAX - 1, 20.0),
+            Sample::new(u64::MAX, 30.0),
+        ];
+        let cusum_res = change_points_cusum(&boundary_ticks, CusumParams::default());
+        assert!(cusum_res.is_ok());
+        let crossing_res = threshold_crossings(
+            &boundary_ticks,
+            &[Threshold {
+                name: "mid",
+                level: 15.0,
+                direction: CrossDirection::Rising,
+            }],
+        );
+        assert!(crossing_res.is_ok());
+        let crossings = crossing_res.expect("valid");
+        assert_eq!(crossings.len(), 1);
+        assert_eq!(crossings[0].tick, u64::MAX - 1);
+        let evidence = crossings[0].evidence("m", boundary_ticks.len());
+        assert!(evidence.finite);
+        assert_eq!(evidence.end_tick, u64::MAX - 1);
+
+        // 2. Extreme values in bimodality:
+        // A. All values equal at f64::MAX.
+        let all_max = vec![f64::MAX; 50];
+        let split_max = bimodality(&all_max, BimodalityParams::default()).expect("valid");
+        assert!(!split_max.is_bimodal);
+        assert_eq!(split_max.score, 0.0);
+        assert!(split_max.split.is_finite());
+        assert!(
+            split_max
+                .evidence("m", 0, 49, BimodalityParams::default())
+                .finite
+        );
+
+        // B. Clusters near float limits: 1e150 and 2e150.
+        let mut high_clusters = vec![1e150; 25];
+        high_clusters.extend(vec![2e150; 25]);
+        let split_high = bimodality(&high_clusters, BimodalityParams::default()).expect("valid");
+        assert!(split_high.is_bimodal);
+        assert!(split_high.score > 0.80);
+        assert!(split_high.separation.is_finite());
+        assert!(
+            split_high
+                .evidence("m", 0, 49, BimodalityParams::default())
+                .finite
+        );
+
+        // C. Huge span: [-1e308, 1e308] where max - min overflows to infinity.
+        let mut overflow_span = vec![-1e308; 20];
+        overflow_span.extend(vec![1e308; 20]);
+        let split_overflow =
+            bimodality(&overflow_span, BimodalityParams::default()).expect("valid");
+        assert!(split_overflow.score.is_finite());
+        assert!(split_overflow.separation.is_finite());
+        // Sums overflowed f64::MAX to infinity, so the resulting evidence correctly marks finite as false:
+        let overflow_ev = split_overflow.evidence("m", 0, 39, BimodalityParams::default());
+        assert!(
+            !overflow_ev.finite,
+            "overflowed cluster sums must report finite == false"
+        );
+
+        // C2. Huge span where sums remain finite: [-1e307, 1e307].
+        let bounded_span = [-1e307, 1e307];
+        let split_bounded = bimodality(&bounded_span, BimodalityParams::default()).expect("valid");
+        assert!(split_bounded.score.is_finite());
+        assert!(split_bounded.separation.is_finite());
+        assert!(
+            split_bounded
+                .evidence("m", 0, 1, BimodalityParams::default())
+                .finite
+        );
+
+        // D. Subnormal / min positive values: tests min_sigma guard against division by zero.
+        let mut tiny_clusters = vec![f64::MIN_POSITIVE; 20];
+        tiny_clusters.extend(vec![2.0 * f64::MIN_POSITIVE; 20]);
+        let split_tiny = bimodality(&tiny_clusters, BimodalityParams::default()).expect("valid");
+        assert!(split_tiny.score.is_finite());
+        assert!(split_tiny.separation.is_finite());
+        assert!(
+            split_tiny
+                .evidence("m", 0, 39, BimodalityParams::default())
+                .finite
+        );
+
+        // E. Signed zeros.
+        let zeros = [0.0, -0.0, 0.0, -0.0];
+        let split_zeros = bimodality(&zeros, BimodalityParams::default()).expect("valid");
+        assert!(!split_zeros.is_bimodal);
+        assert_eq!(split_zeros.score, 0.0);
+
+        // 3. Extreme values in CUSUM:
+        // Step at 1e150.
+        let mut step_high = vec![Sample::new(0, 1e150); 50];
+        for i in 0..50u64 {
+            step_high[i as usize].tick = i;
+        }
+        for i in 50..100u64 {
+            step_high.push(Sample::new(i, 3e150));
+        }
+        let cusum_high = change_points_cusum(&step_high, CusumParams::default()).expect("valid");
+        assert_eq!(cusum_high.len(), 1);
+        assert_eq!(cusum_high[0].direction, Direction::Up);
+        assert!(cusum_high[0].score.is_finite());
+        assert!(cusum_high[0].magnitude.is_finite());
+        let cp_ev = cusum_high[0].evidence("high", step_high.len(), CusumParams::default());
+        assert!(cp_ev.finite);
+
+        // 4. Extreme values in threshold_crossings:
+        let extreme_crossing = [Sample::new(0, 0.0), Sample::new(1, 1.5e300)];
+        let crossed = threshold_crossings(
+            &extreme_crossing,
+            &[Threshold {
+                name: "near_limit",
+                level: 1e300,
+                direction: CrossDirection::Rising,
+            }],
+        )
+        .expect("valid");
+        assert_eq!(crossed.len(), 1);
+        assert_eq!(crossed[0].direction, Direction::Up);
+        assert!(crossed[0].evidence("cross", 2).finite);
+
+        // 5. Extreme values in regimes:
+        let high_regime: Vec<Sample> = (0..64u64)
+            .map(|i| Sample::new(i, 1e150 + (i as f64) * 1e148))
+            .collect();
+        let windows = regimes(
+            &high_regime,
+            RegimeParams {
+                window: 64,
+                ..RegimeParams::default()
+            },
+        )
+        .expect("valid");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].regime, Regime::Growth);
+        assert!(windows[0].relative_slope.is_finite());
+        assert!(windows[0].autocorrelation.is_finite());
+        assert!(windows[0].evidence("regime", 64).finite);
+    }
+
+    /// Noise false-positive budget: across multi-seed evaluations, pure unimodal noise
+    /// must never trigger speciation bimodality, and white noise must never trigger
+    /// regime oscillation.
+    #[test]
+    fn bd_16g_2_11_noise_false_positive_budget_multi_seed() {
+        let mut rng = Lcg(0xFEED_CAFE_0123_4567);
+        let bimodal_params = BimodalityParams::default();
+
+        // 1. Bimodality on 50 seeds of unimodal noise distributions:
+        // 25 Gaussian + 25 Uniform.
+        let mut bimodal_false_positives = 0usize;
+        for case in 0..50 {
+            let n = 200;
+            let values: Vec<f64> = if case < 25 {
+                // Gaussian noise.
+                let mean = 100.0 + (case as f64) * 5.0;
+                let sigma = 10.0 + (case as f64) * 0.5;
+                (0..n)
+                    .map(|_| {
+                        let u1 = rng.next_f64().max(f64::MIN_POSITIVE);
+                        let u2 = rng.next_f64();
+                        let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                        mean + z * sigma
+                    })
+                    .collect()
+            } else {
+                // Uniform noise.
+                let width = 50.0 + (case as f64) * 2.0;
+                (0..n).map(|_| rng.next_f64() * width).collect()
+            };
+
+            let score = bimodality(&values, bimodal_params).expect("valid");
+            // Every unimodal sample must stay below the min_score threshold (0.80).
+            assert!(
+                score.score < bimodal_params.min_score,
+                "case {case}: unimodal noise scored {} >= threshold {}",
+                score.score,
+                bimodal_params.min_score
+            );
+            if score.is_bimodal {
+                bimodal_false_positives += 1;
+            }
+        }
+        assert_eq!(
+            bimodal_false_positives, 0,
+            "unimodal noise must produce 0 false-positive bimodal detections across 50 seeds"
+        );
+
+        // 2. Regimes on 20 seeds of Gaussian white noise:
+        // Pure noise has lag-1 autocorrelation ~ 0, well below 0.6.
+        let mut oscillation_false_positives = 0usize;
+        let regime_params = RegimeParams::default();
+        for _ in 0..20 {
+            let mut noise_series = Vec::with_capacity(1000);
+            for t in 0..1000u64 {
+                let u1 = rng.next_f64().max(f64::MIN_POSITIVE);
+                let u2 = rng.next_f64();
+                let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                noise_series.push(Sample::new(t, 100.0 + z * 5.0));
+            }
+            let windows = regimes(&noise_series, regime_params).expect("valid");
+            for w in windows {
+                if w.regime == Regime::Oscillation {
+                    oscillation_false_positives += 1;
+                }
+            }
+        }
+        let total_windows = 20 * (1000 / regime_params.window);
+        let oscillation_rate_per_10k = (oscillation_false_positives as f64 / 20_000.0) * 10_000.0;
+        println!(
+            "FALSE_POSITIVE_BUDGET regimes oscillation={oscillation_false_positives} windows={total_windows} per_10k={oscillation_rate_per_10k:.2}"
+        );
+        assert!(
+            oscillation_rate_per_10k <= 2.0,
+            "white noise oscillation false positive rate must be <= 2.0 per 10k ticks, got {oscillation_rate_per_10k}"
+        );
+
+        // 3. CUSUM on 5 seeds of 10,000 samples of quiet Gaussian noise:
+        // Must stay within the <= 2 per 10k ticks budget.
+        let cusum_params = CusumParams::default();
+        let mut cusum_false_positives = 0usize;
+        let runs = 5;
+        for _ in 0..runs {
+            let mut series = Vec::with_capacity(10_000);
+            for t in 0..10_000u64 {
+                let u1 = rng.next_f64().max(f64::MIN_POSITIVE);
+                let u2 = rng.next_f64();
+                let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                series.push(Sample::new(t, 100.0 + z * 5.0));
+            }
+            let cps = change_points_cusum(&series, cusum_params).expect("valid");
+            cusum_false_positives += cps.len();
+        }
+        let rate_per_10k = cusum_false_positives as f64 / runs as f64;
+        println!(
+            "FALSE_POSITIVE_BUDGET multi_seed cusum total={cusum_false_positives} per_10k={rate_per_10k:.2}"
+        );
+        assert!(
+            rate_per_10k <= 2.0,
+            "CUSUM false positive rate must be <= 2.0 per 10k ticks, got {rate_per_10k}"
+        );
     }
 }
