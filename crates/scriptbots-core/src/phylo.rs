@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::Range;
+use std::time::Instant;
 
 const DEFAULT_LAYOUT_BYTES: usize = 32 << 20;
 const BTREE_ENTRY_OVERHEAD_BYTES: usize = 48;
@@ -1634,7 +1635,25 @@ impl TreeLayout {
             }
         }
 
-        best.map(|(_, key)| key)
+        best.map(|(_, key)| self.resolve_hit_key(key))
+    }
+
+    fn resolve_hit_key(&self, key: PhyloKey) -> PhyloKey {
+        let Some(&idx) = self.index.get(&key) else {
+            return key;
+        };
+        if !self.nodes[idx.as_usize()].collapsed {
+            return key;
+        }
+        let mut curr = idx;
+        while let Some(parent_idx) = self.nodes[curr.as_usize()].parent {
+            if self.nodes[parent_idx.as_usize()].collapsed {
+                curr = parent_idx;
+            } else {
+                break;
+            }
+        }
+        self.nodes[curr.as_usize()].key
     }
 
     /// Collapses a clade subtree starting at `root`.
@@ -1707,6 +1726,325 @@ impl TreeLayout {
             expanded_nodes: count,
             truncated,
         }
+    }
+
+    /// Computes a pure bounded [`TreeDrawList`] for a given viewport and node budget (bd-16g.3.5).
+    ///
+    /// - `viewport`: 2D rectangle in layout coordinates (x = tick, y = vertical leaf layout).
+    /// - `budget`: maximum number of branches to emit.
+    /// - `scrub_tick`: optional timeline scrub tick. When `Some(s)`:
+    ///   - Species born after `s` are omitted (`ABSENT`).
+    ///   - Species extinct before `s` are rendered as terminated in the past.
+    ///   - Species alive at `s` terminate at `s`.
+    /// - `events`: slice of historical phylogeny events.
+    /// - `species_table`: optional current species table for name and diet lookups.
+    #[must_use]
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+    pub fn draw_list(
+        &self,
+        viewport: Rect,
+        budget: usize,
+        scrub_tick: Option<u64>,
+        events: &[PhyloEvent],
+        species_table: Option<&SpeciesTable>,
+    ) -> TreeDrawList {
+        let start_time = Instant::now();
+
+        // Safe boundary checks: empty layout or degenerate viewport
+        if self.nodes.is_empty()
+            || !viewport.x_min.is_finite()
+            || !viewport.x_max.is_finite()
+            || !viewport.y_min.is_finite()
+            || !viewport.y_max.is_finite()
+            || viewport.x_min > viewport.x_max
+            || viewport.y_min > viewport.y_max
+        {
+            return TreeDrawList::default();
+        }
+
+        // Emit diagnostics when opening / computing view
+        diag_info!(
+            node_count = self.nodes.len(),
+            budget,
+            scrub_tick,
+            "computing phylogeny draw list"
+        );
+
+        // Filter and evaluate candidate nodes that intersect the viewport & scrub range
+        let mut candidates: Vec<(&LayoutNode, f32, CladeState)> = Vec::new();
+
+        for node in &self.nodes {
+            let birth = node.first_tick.0;
+            let death = node.last_tick.map(|t| t.0);
+
+            // Scrubbing filter
+            let (end_x, clade_state) = match scrub_tick {
+                Some(scrub) => {
+                    // NEGATIVE requirement: scrub to a tick before a species existed -> ABSENT
+                    if birth > scrub {
+                        continue;
+                    }
+                    match death {
+                        Some(d) if scrub >= d => (tick_x(Tick(d)), CladeState::Extinct),
+                        _ => {
+                            let state = if node.collapsed {
+                                CladeState::Collapsed
+                            } else {
+                                CladeState::Active
+                            };
+                            (tick_x(Tick(scrub)), state)
+                        }
+                    }
+                }
+                None => death.map_or_else(
+                    || {
+                        let state = if node.collapsed {
+                            CladeState::Collapsed
+                        } else {
+                            CladeState::Active
+                        };
+                        (viewport.x_max.max(node.x), state)
+                    },
+                    |d| (tick_x(Tick(d)), CladeState::Extinct),
+                ),
+            };
+
+            // Viewport intersection check
+            let branch_start_x = node.x;
+            let branch_end_x = end_x.max(node.x);
+            let branch_y = node.y;
+
+            let x_intersects = branch_end_x >= viewport.x_min && branch_start_x <= viewport.x_max;
+            let y_intersects = branch_y >= viewport.y_min && branch_y <= viewport.y_max;
+
+            if x_intersects && y_intersects {
+                candidates.push((node, branch_end_x, clade_state));
+            }
+        }
+
+        let total_candidates = candidates.len();
+
+        // Truncation if candidates exceed budget
+        let (retained_candidates, truncated) = if budget == 0 {
+            let affordance = if total_candidates > 0 {
+                diag_warn!(
+                    visible_nodes = 0,
+                    budget = 0,
+                    collapsed_clades = total_candidates,
+                    "phylogeny draw list truncated by budget"
+                );
+                Some(TruncationAffordance {
+                    collapsed_clades: total_candidates,
+                    bounds: viewport,
+                })
+            } else {
+                None
+            };
+            (Vec::new(), affordance)
+        } else if total_candidates > budget {
+            let collapsed_clades = total_candidates - budget;
+            diag_warn!(
+                visible_nodes = budget,
+                budget,
+                collapsed_clades,
+                "phylogeny draw list truncated by budget"
+            );
+            // Rank candidates by LOD priority
+            candidates.sort_by(|(a, _, _), (b, _, _)| {
+                lod_rank(b)
+                    .cmp(&lod_rank(a))
+                    .then_with(|| a.key.cmp(&b.key))
+            });
+            candidates.truncate(budget);
+            (
+                candidates,
+                Some(TruncationAffordance {
+                    collapsed_clades,
+                    bounds: viewport,
+                }),
+            )
+        } else {
+            (candidates, None)
+        };
+
+        // Sort retained candidates deterministically by (x, y, key)
+        let mut sorted_candidates = retained_candidates;
+        sorted_candidates.sort_by(|(a, _, _), (b, _, _)| {
+            a.x.total_cmp(&b.x)
+                .then_with(|| a.y.total_cmp(&b.y))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+
+        let mut branches = Vec::with_capacity(sorted_candidates.len());
+        let mut labels = Vec::with_capacity(sorted_candidates.len());
+        let mut retained_keys = BTreeSet::new();
+
+        for (node, end_x, clade_state) in &sorted_candidates {
+            retained_keys.insert(node.key);
+            let species_id = match node.key {
+                PhyloKey::Species(id) => SpeciesId(id),
+                PhyloKey::Agent(uid) => SpeciesId(uid.get()),
+                PhyloKey::PrunedAncestor => SpeciesId(0),
+            };
+
+            let stroke_width = node.thickness.clamp(1.0, 10.0);
+            let color = species_color(species_id, *clade_state);
+
+            branches.push(BranchCmd {
+                start: (node.x, node.y),
+                end: (*end_x, node.y),
+                species_id,
+                color,
+                stroke_width,
+                clade_state: *clade_state,
+            });
+
+            let text = species_table
+                .and_then(|t| t.find_species(species_id))
+                .map_or_else(|| format!("Species-{}", species_id.0), |s| s.name.clone());
+
+            labels.push(LabelCmd {
+                text,
+                pos: (*end_x + 4.0, node.y),
+                anchor: TextAnchor::Start,
+                species_id,
+            });
+        }
+
+        // Warn if species table has living species not in the layout
+        if let Some(table) = species_table {
+            for sp in &table.species {
+                if !self.index.contains_key(&PhyloKey::Species(sp.id.0)) {
+                    diag_warn!(
+                        species_id = sp.id.0,
+                        "species present in table but absent from phylogeny layout"
+                    );
+                }
+            }
+        }
+
+        // Event markers projection
+        let mut event_markers = Vec::new();
+        for event in events {
+            let sp_id = event.species_id();
+            let key = PhyloKey::Species(sp_id.0);
+            if !retained_keys.contains(&key) {
+                continue;
+            }
+            if scrub_tick.is_some_and(|scrub| event.tick().0 > scrub) {
+                continue;
+            }
+            let event_x = tick_x(event.tick());
+            if event_x < viewport.x_min || event_x > viewport.x_max {
+                continue;
+            }
+
+            if let Some(node) = self
+                .get_node(&key)
+                .filter(|n| (viewport.y_min..=viewport.y_max).contains(&n.y))
+            {
+                event_markers.push(EventMarkerCmd {
+                    pos: (event_x, node.y),
+                    tick: event.tick().0,
+                    kind: PhyloEventKind::from(event),
+                    species_id: sp_id,
+                });
+            }
+        }
+
+        // Deterministic sorting of event markers
+        event_markers.sort_by(|a, b| {
+            a.tick
+                .cmp(&b.tick)
+                .then_with(|| a.species_id.0.cmp(&b.species_id.0))
+                .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
+                .then_with(|| a.pos.0.total_cmp(&b.pos.0))
+        });
+
+        let elapsed = start_time.elapsed();
+        diag_debug!(
+            build_duration_us = elapsed.as_micros(),
+            branches_len = branches.len(),
+            labels_len = labels.len(),
+            markers_len = event_markers.len(),
+            "phylogeny draw list built"
+        );
+
+        TreeDrawList {
+            branches,
+            labels,
+            event_markers,
+            truncated,
+        }
+    }
+
+    /// Produces a detailed inspection report for a given species (bd-16g.3.5).
+    #[must_use]
+    pub fn inspect_species(
+        &self,
+        species_id: SpeciesId,
+        species_table: Option<&SpeciesTable>,
+        events: &[PhyloEvent],
+    ) -> Option<SpeciesInspector> {
+        let node = self.get_node(&PhyloKey::Species(species_id.0))?;
+        let sp_in_table = species_table.and_then(|t| t.find_species(species_id));
+
+        let name =
+            sp_in_table.map_or_else(|| format!("Species-{}", species_id.0), |s| s.name.clone());
+        let founders = sp_in_table.map_or_else(|| vec![node.founder_uid], |s| s.founders.clone());
+        let member_count = sp_in_table.map_or(node.population as usize, |s| s.members.len());
+
+        let mut sibling_clade = None;
+        let mut separation_evidence = None;
+
+        for event in events {
+            if let PhyloEvent::Speciation {
+                children,
+                separation,
+                cross_mating_rate,
+                persisted_samples,
+                hint,
+                ..
+            } = event
+            {
+                if children[0] == species_id {
+                    sibling_clade = Some(children[1]);
+                    separation_evidence = Some(SeparationEvidenceSummary {
+                        confirmed: true,
+                        separation_kind: *separation,
+                        cross_mating_rate: *cross_mating_rate,
+                        persisted_samples: *persisted_samples,
+                        hint_id: *hint,
+                    });
+                    break;
+                } else if children[1] == species_id {
+                    sibling_clade = Some(children[0]);
+                    separation_evidence = Some(SeparationEvidenceSummary {
+                        confirmed: true,
+                        separation_kind: *separation,
+                        cross_mating_rate: *cross_mating_rate,
+                        persisted_samples: *persisted_samples,
+                        hint_id: *hint,
+                    });
+                    break;
+                }
+            }
+        }
+
+        Some(SpeciesInspector {
+            species_id,
+            name,
+            founders,
+            first_tick: node.first_tick,
+            last_tick: node.last_tick,
+            generation_range: (0, 0),
+            brain_kinds: Vec::new(),
+            member_count,
+            peak_population: node.peak_population,
+            sibling_clade,
+            separation_evidence,
+            mutation_diff_hook: Some(format!("bd-16g.13:mutation_diff(species={})", species_id.0)),
+        })
     }
 }
 
@@ -2459,9 +2797,455 @@ pub fn step_phylo_events(
     }
 }
 
+// =========================================================================
+// Phylogeny Views: TreeDrawList, Inspector & Clade Table (bd-16g.3.5)
+// =========================================================================
+
+/// Lifecycle state of a clade in the tree view (bd-16g.3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CladeState {
+    /// Actively living clade with living member agents.
+    Active,
+    /// Extinct clade whose members have all died.
+    Extinct,
+    /// Clade collapsed by user interaction or LOD budget.
+    Collapsed,
+}
+
+/// Horizontal text alignment anchor for label placement (bd-16g.3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum TextAnchor {
+    /// Align text start (left) at coordinates.
+    Start,
+    /// Center text horizontally at coordinates.
+    Middle,
+    /// Align text end (right) at coordinates.
+    End,
+}
+
+/// Category of phylogeny timeline event (bd-16g.3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PhyloEventKind {
+    /// Speciation event (lineage divergence).
+    Speciation,
+    /// Extinction event (all members died).
+    Extinction,
+    /// Radiation event (rapid population expansion).
+    Radiation,
+}
+
+impl From<&PhyloEvent> for PhyloEventKind {
+    fn from(event: &PhyloEvent) -> Self {
+        match event {
+            PhyloEvent::Speciation { .. } => Self::Speciation,
+            PhyloEvent::Extinction { .. } => Self::Extinction,
+            PhyloEvent::Radiation { .. } => Self::Radiation,
+        }
+    }
+}
+
+/// A 2D branch line segment command in the tree view (bd-16g.3.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchCmd {
+    /// Start coordinate (x, y) in layout coordinates.
+    pub start: (f32, f32),
+    /// End coordinate (x, y) in layout coordinates.
+    pub end: (f32, f32),
+    /// Identified species clade ID.
+    pub species_id: SpeciesId,
+    /// RGBA color `[r, g, b, a]`.
+    pub color: [f32; 4],
+    /// Visual stroke width in pixels/points.
+    pub stroke_width: f32,
+    /// Clade lifecycle state.
+    pub clade_state: CladeState,
+}
+
+/// A text label command anchored at a 2D position (bd-16g.3.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelCmd {
+    /// Human-readable label string.
+    pub text: String,
+    /// Position (x, y) in layout coordinates.
+    pub pos: (f32, f32),
+    /// Text anchor alignment.
+    pub anchor: TextAnchor,
+    /// Associated species ID.
+    pub species_id: SpeciesId,
+}
+
+/// An event marker placed along a branch at a specific tick (bd-16g.3.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventMarkerCmd {
+    /// Position (x, y) in layout coordinates.
+    pub pos: (f32, f32),
+    /// Simulation tick at which the event occurred.
+    pub tick: u64,
+    /// Kind of event.
+    pub kind: PhyloEventKind,
+    /// Associated species ID.
+    pub species_id: SpeciesId,
+}
+
+/// Visible affordance indicating that some clades have been collapsed/pruned by budget (bd-16g.3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TruncationAffordance {
+    /// Count of clades collapsed or omitted by the budget limit.
+    pub collapsed_clades: usize,
+    /// Bounding rectangle in layout coordinates where truncation occurred.
+    pub bounds: Rect,
+}
+
+/// Pure bounded rendering draw list containing all primitives for phylogeny visualization (bd-16g.3.5).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TreeDrawList {
+    /// Branch line segments.
+    pub branches: Vec<BranchCmd>,
+    /// Clade labels.
+    pub labels: Vec<LabelCmd>,
+    /// Event markers along branches.
+    pub event_markers: Vec<EventMarkerCmd>,
+    /// Visible truncation affordance when clades are collapsed by budget.
+    pub truncated: Option<TruncationAffordance>,
+}
+
+impl TreeDrawList {
+    /// Returns `true` if the draw list contains no branches or labels.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.branches.is_empty() && self.labels.is_empty() && self.event_markers.is_empty()
+    }
+
+    /// Number of branch segments in the draw list.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.branches.len()
+    }
+}
+
+/// Summary of separation evidence confirming or rejecting speciation (bd-16g.3.5 / bd-16g.3.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeparationEvidenceSummary {
+    /// Whether speciation was confirmed.
+    pub confirmed: bool,
+    /// Mechanism of reproductive isolation.
+    pub separation_kind: SeparationKind,
+    /// Realized cross-cluster mating rate.
+    pub cross_mating_rate: f32,
+    /// Consecutive samples held.
+    pub persisted_samples: usize,
+    /// Cross-validated detector hint ID, if any.
+    pub hint_id: Option<HintId>,
+}
+
+/// Detailed inspection payload for an inspected species clade (bd-16g.3.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeciesInspector {
+    /// Species ID.
+    pub species_id: SpeciesId,
+    /// Human-readable species name.
+    pub name: String,
+    /// Founder agent UIDs.
+    pub founders: Vec<AgentUid>,
+    /// First tick observed.
+    pub first_tick: Tick,
+    /// Last tick observed (None if extant).
+    pub last_tick: Option<Tick>,
+    /// Observed generation range (min, max).
+    pub generation_range: (u32, u32),
+    /// Brain family kind(s) present in the clade.
+    pub brain_kinds: Vec<String>,
+    /// Currently living member count.
+    pub member_count: usize,
+    /// Historical peak population size.
+    pub peak_population: u32,
+    /// Sibling clade it split from (if speciation event recorded).
+    pub sibling_clade: Option<SpeciesId>,
+    /// Confirmed/rejected separation evidence from detector.
+    pub separation_evidence: Option<SeparationEvidenceSummary>,
+    /// Hook for genome mutation diff of bd-16g.13.
+    pub mutation_diff_hook: Option<String>,
+}
+
+/// Deterministic RGBA color for a species clade based on its ID and lifecycle state (bd-16g.3.5).
+#[must_use]
+pub fn species_color(id: SpeciesId, state: CladeState) -> [f32; 4] {
+    let raw = id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    #[allow(clippy::cast_precision_loss)]
+    let hue = ((raw >> 32) as u32 % 360) as f32 / 360.0;
+    let (sat, val, alpha) = match state {
+        CladeState::Active => (0.85, 0.95, 1.0),
+        CladeState::Extinct => (0.30, 0.55, 0.5),
+        CladeState::Collapsed => (0.50, 0.75, 0.8),
+    };
+    let (r, g, b) = hsv_to_rgb(hue, sat, val);
+    [r, g, b, alpha]
+}
+
+#[allow(
+    clippy::many_single_char_names,
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops
+)]
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    if s <= 0.0 {
+        return (v, v, v);
+    }
+    let h_deg = (h * 6.0).rem_euclid(6.0);
+    #[allow(clippy::cast_possible_truncation)]
+    let i = h_deg.floor() as i32;
+    let f = h_deg - (i as f32);
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    match i {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}
+
+/// Generates a unicode sparkline string from numeric observations (bd-16g.3.5).
+#[must_use]
+pub fn generate_sparkline(samples: &[u64]) -> String {
+    const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if samples.is_empty() {
+        return " ".to_string();
+    }
+    let max = samples.iter().copied().max().unwrap_or(1).max(1);
+    samples
+        .iter()
+        .map(|&val| {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let ratio = (val as f64) / (max as f64);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let idx = ((ratio * 7.0).round() as usize).min(7);
+            BARS[idx]
+        })
+        .collect()
+}
+
+/// A single row in the deterministic TUI clade table (bd-16g.3.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CladeTableRow {
+    /// Species ID.
+    pub species_id: SpeciesId,
+    /// Name of the species.
+    pub name: String,
+    /// Current member count.
+    pub size: usize,
+    /// Size delta compared to previous snapshot.
+    pub delta_size: i64,
+    /// Primary founder UID.
+    pub founder_uid: AgentUid,
+    /// Clade age in ticks.
+    pub age: u64,
+    /// Mean normalized diet (e.g. centroid[0]).
+    pub mean_diet: f32,
+    /// Unicode sparkline representing population history.
+    pub sparkline: String,
+}
+
+/// Clade table view model for terminal presentation (bd-16g.3.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CladeTableView {
+    /// Sorted rows in the table.
+    pub rows: Vec<CladeTableRow>,
+    /// Current simulation tick.
+    pub current_tick: u64,
+    /// Timeline scrub tick if scrubbing.
+    pub scrub_tick: Option<u64>,
+    /// Explicit empty state message when no species exist.
+    pub empty_message: Option<String>,
+}
+
+impl CladeTableView {
+    /// Builds a deterministic clade table view from species snapshots (bd-16g.3.5).
+    #[must_use]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    pub fn build(
+        species_table: Option<&SpeciesTable>,
+        previous_table: Option<&SpeciesTable>,
+        scrub_tick: Option<u64>,
+        current_tick: u64,
+    ) -> Self {
+        let Some(table) = species_table else {
+            return Self {
+                rows: Vec::new(),
+                current_tick,
+                scrub_tick,
+                empty_message: Some("no species yet".to_string()),
+            };
+        };
+
+        if table.species.is_empty() {
+            return Self {
+                rows: Vec::new(),
+                current_tick,
+                scrub_tick,
+                empty_message: Some("no species yet".to_string()),
+            };
+        }
+
+        let prev_map: BTreeMap<SpeciesId, usize> = previous_table
+            .map_or_else(BTreeMap::new, |pt| {
+                pt.species.iter().map(|s| (s.id, s.members.len())).collect()
+            });
+
+        let mut rows = Vec::new();
+
+        for sp in &table.species {
+            // Scrubbing filters
+            if let Some(scrub) = scrub_tick {
+                if sp.first_tick.0 > scrub {
+                    continue;
+                }
+                // Extinct species before/at scrub tick are absent from present clade table
+                if sp.members.is_empty() && sp.last_seen_tick.0 <= scrub {
+                    continue;
+                }
+            }
+
+            // Clade table displays active clades
+            if sp.members.is_empty() {
+                continue;
+            }
+
+            let size = sp.members.len();
+            let prev_size = prev_map.get(&sp.id).copied().unwrap_or(size);
+            let delta_size = (size as i64) - (prev_size as i64);
+
+            let founder_uid = sp.founders.first().copied().unwrap_or(AgentUid(0));
+            let age = current_tick.saturating_sub(sp.first_tick.0);
+            let mean_diet = sp.centroid.first().copied().unwrap_or(0.5);
+
+            // Synthesize population history sample for sparkline (prev, current)
+            let sparkline = generate_sparkline(&[prev_size as u64, size as u64]);
+
+            rows.push(CladeTableRow {
+                species_id: sp.id,
+                name: sp.name.clone(),
+                size,
+                delta_size,
+                founder_uid,
+                age,
+                mean_diet,
+                sparkline,
+            });
+        }
+
+        // Deterministic sort order: size desc, tie-break species_id asc (never HashMap order)
+        rows.sort_by(|a, b| {
+            b.size
+                .cmp(&a.size)
+                .then_with(|| a.species_id.0.cmp(&b.species_id.0))
+        });
+
+        let empty_message = if rows.is_empty() {
+            Some("no species yet".to_string())
+        } else {
+            None
+        };
+
+        Self {
+            rows,
+            current_tick,
+            scrub_tick,
+            empty_message,
+        }
+    }
+
+    /// Renders the clade table as formatted plain text with scrolling support (bd-16g.3.5).
+    #[must_use]
+    pub fn render_plain_text(
+        &self,
+        _max_width: usize,
+        max_rows: usize,
+        scroll_offset: usize,
+    ) -> String {
+        use std::fmt::Write as _;
+
+        if let Some(msg) = &self.empty_message {
+            return msg.clone();
+        }
+        if self.rows.is_empty() {
+            return "no species yet".to_string();
+        }
+
+        let mut out = String::new();
+        out.push_str("ID     NAME             SIZE   DELTA  FOUNDER  AGE    DIET  SPARKLINE\n");
+        out.push_str("-----------------------------------------------------------------------\n");
+
+        let visible_rows = self.rows.iter().skip(scroll_offset).take(max_rows);
+        for row in visible_rows {
+            let truncated_name = if row.name.len() > 16 {
+                format!("{}…", &row.name[..15])
+            } else {
+                format!("{:<16}", row.name)
+            };
+
+            let _ = writeln!(
+                out,
+                "{:<6} {} {:<6} {:<6} {:<8} {:<6} {:<5.2} {}",
+                row.species_id.0,
+                truncated_name,
+                row.size,
+                row.delta_size,
+                row.founder_uid.get(),
+                row.age,
+                row.mean_diet,
+                row.sparkline
+            );
+        }
+
+        out
+    }
+}
+
+/// View-local highlight selection for phylogeny views (bd-16g.3.5).
+///
+/// Highlighting is purely local to the phylogeny view and MUST NEVER mutate
+/// `AgentRuntime.selection`, which would trigger expensive per-tick brain activation
+/// capture across entire clades (bd-16g.4.4 / bd-16g.3.5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhyloViewHighlight {
+    /// Set of highlighted species IDs.
+    pub highlighted_species: BTreeSet<SpeciesId>,
+    /// Focused species ID, if any.
+    pub focused_species: Option<SpeciesId>,
+}
+
+impl PhyloViewHighlight {
+    /// Selects a species clade locally within the view.
+    pub fn select_species(&mut self, species_id: SpeciesId) {
+        self.focused_species = Some(species_id);
+        self.highlighted_species.insert(species_id);
+    }
+
+    /// Clears all view-local highlights.
+    pub fn clear(&mut self) {
+        self.highlighted_species.clear();
+        self.focused_species = None;
+    }
+
+    /// Returns `true` if the given species is highlighted.
+    #[must_use]
+    pub fn is_highlighted(&self, species_id: SpeciesId) -> bool {
+        self.highlighted_species.contains(&species_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::species::Species;
     use std::time::Instant;
 
     fn species(
@@ -4101,5 +4885,511 @@ mod tests {
             bytes_a, bytes_b,
             "same fixture twice must produce byte-identical serialized events and verdicts"
         );
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_headless_golden_3_species() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+        let delta = PhyloDelta {
+            updates: vec![
+                species(1, ParentRef::Root, 10, 0, None, 50),
+                species(
+                    2,
+                    ParentRef::Known(PhyloKey::Species(1)),
+                    20,
+                    100,
+                    Some(200),
+                    0,
+                ),
+                species(3, ParentRef::Known(PhyloKey::Species(1)), 30, 150, None, 40),
+            ],
+        };
+        let rep = layout.extend(&delta);
+        assert_eq!(rep.issues, Vec::<LayoutIssue>::new());
+
+        let events = vec![
+            PhyloEvent::Speciation {
+                parent: SpeciesId(1),
+                children: [SpeciesId(1), SpeciesId(2)],
+                founders: vec![AgentUid(20)],
+                separation: SeparationKind::Phenotypic,
+                cross_mating_rate: 0.05,
+                persisted_samples: 3,
+                hint: None,
+                tick: Tick(100),
+            },
+            PhyloEvent::Speciation {
+                parent: SpeciesId(1),
+                children: [SpeciesId(1), SpeciesId(3)],
+                founders: vec![AgentUid(30)],
+                separation: SeparationKind::BrainKindGated,
+                cross_mating_rate: 0.02,
+                persisted_samples: 3,
+                hint: None,
+                tick: Tick(150),
+            },
+            PhyloEvent::Extinction {
+                species: SpeciesId(2),
+                last_member: AgentUid(20),
+                peak_size: 30,
+                cause_histogram: BTreeMap::new(),
+                tick: Tick(200),
+            },
+        ];
+
+        let viewport = Rect {
+            x_min: 0.0,
+            y_min: -500.0,
+            x_max: 300.0,
+            y_max: 500.0,
+        };
+
+        let draw = layout.draw_list(viewport, 50, None, &events, None);
+        assert_eq!(draw.branches.len(), 3);
+        assert_eq!(draw.labels.len(), 3);
+        assert_eq!(draw.event_markers.len(), 3);
+        assert!(draw.truncated.is_none());
+
+        // Verify exact branch properties
+        let sp1_branch = draw
+            .branches
+            .iter()
+            .find(|b| b.species_id == SpeciesId(1))
+            .unwrap();
+        assert_eq!(sp1_branch.clade_state, CladeState::Active);
+        assert_eq!(sp1_branch.start.0, 0.0);
+        assert_eq!(sp1_branch.end.0, 300.0);
+
+        let sp2_branch = draw
+            .branches
+            .iter()
+            .find(|b| b.species_id == SpeciesId(2))
+            .unwrap();
+        assert_eq!(sp2_branch.clade_state, CladeState::Extinct);
+        assert_eq!(sp2_branch.start.0, 100.0);
+        assert_eq!(sp2_branch.end.0, 200.0);
+
+        let sp3_branch = draw
+            .branches
+            .iter()
+            .find(|b| b.species_id == SpeciesId(3))
+            .unwrap();
+        assert_eq!(sp3_branch.clade_state, CladeState::Active);
+        assert_eq!(sp3_branch.start.0, 150.0);
+        assert_eq!(sp3_branch.end.0, 300.0);
+
+        // Verify event marker ticks
+        assert_eq!(draw.event_markers[0].tick, 100);
+        assert_eq!(draw.event_markers[0].kind, PhyloEventKind::Speciation);
+        assert_eq!(draw.event_markers[1].tick, 150);
+        assert_eq!(draw.event_markers[1].kind, PhyloEventKind::Speciation);
+        assert_eq!(draw.event_markers[2].tick, 200);
+        assert_eq!(draw.event_markers[2].kind, PhyloEventKind::Extinction);
+
+        // Determinism: second call must be byte-for-byte identical
+        let draw2 = layout.draw_list(viewport, 50, None, &events, None);
+        let bytes1 = serde_json::to_vec(&draw).expect("serialize draw1");
+        let bytes2 = serde_json::to_vec(&draw2).expect("serialize draw2");
+        assert_eq!(
+            bytes1, bytes2,
+            "draw list must be byte-identical across runs"
+        );
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_budget_truncation_10k_nodes() {
+        let mut layout = TreeLayout::new(LayoutBudget {
+            max_nodes: 20000,
+            max_bytes: 128 << 20,
+            ..LayoutBudget::default()
+        });
+
+        let mut updates = Vec::with_capacity(10000);
+        updates.push(species(1, ParentRef::Root, 1, 0, None, 100));
+        for i in 2..=10000 {
+            let parent_id = (i / 2).max(1);
+            updates.push(species(
+                i,
+                ParentRef::Known(PhyloKey::Species(parent_id)),
+                i,
+                i,
+                None,
+                10,
+            ));
+        }
+        layout.extend(&PhyloDelta { updates });
+        assert_eq!(layout.len(), 10000);
+
+        let viewport = Rect {
+            x_min: 0.0,
+            y_min: -1_000_000.0,
+            x_max: 10000.0,
+            y_max: 1_000_000.0,
+        };
+
+        let draw = layout.draw_list(viewport, 200, None, &[], None);
+        assert!(
+            draw.branches.len() <= 200,
+            "draw list branches ({}) must be <= budget (200)",
+            draw.branches.len()
+        );
+        assert!(
+            draw.truncated.is_some(),
+            "truncation affordance must be present"
+        );
+        let trunc = draw.truncated.unwrap();
+        assert_eq!(trunc.collapsed_clades, 10000 - draw.branches.len());
+        assert_eq!(trunc.bounds, viewport);
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_hit_test_integration_and_collapsed_root() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+        let delta = PhyloDelta {
+            updates: vec![
+                species(1, ParentRef::Root, 10, 0, None, 50),
+                species(2, ParentRef::Known(PhyloKey::Species(1)), 20, 50, None, 30),
+                species(3, ParentRef::Known(PhyloKey::Species(2)), 30, 100, None, 20),
+            ],
+        };
+        layout.extend(&delta);
+
+        let node_2 = layout.get_node(&PhyloKey::Species(2)).unwrap();
+        let node_2_x = node_2.x;
+        let node_2_y = node_2.y;
+
+        let node_3 = layout.get_node(&PhyloKey::Species(3)).unwrap();
+        let node_3_x = node_3.x;
+        let node_3_y = node_3.y;
+
+        // 1. Click at species 2 coordinates returns species 2
+        assert_eq!(
+            layout.hit_test(node_2_x, node_2_y, 1.0),
+            Some(PhyloKey::Species(2))
+        );
+
+        // 2. Click at empty space returns None
+        assert_eq!(layout.hit_test(99999.0, 99999.0, 1.0), None);
+
+        // 3. Collapse species 2 subtree (which hides species 2 and species 3)
+        let collapsed_count = layout.collapse(PhyloKey::Species(2));
+        assert_eq!(collapsed_count, 2);
+
+        // Clicking at hidden species 3 coordinates returns the collapse root (species 2), not 3!
+        assert_eq!(
+            layout.hit_test(node_3_x, node_3_y, 1.0),
+            Some(PhyloKey::Species(2)),
+            "clicking a collapsed child must return the collapse root"
+        );
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_clade_table_tui_snapshot_and_long_names() {
+        let mut table = SpeciesTable {
+            tick: Tick(100),
+            ..SpeciesTable::default()
+        };
+        table.species.push(Species {
+            id: SpeciesId(1),
+            name: "Short-1".to_string(),
+            founders: vec![AgentUid(10)],
+            members: vec![AgentUid(10), AgentUid(11)],
+            centroid: vec![0.3],
+            spread: 0.1,
+            first_tick: Tick(10),
+            last_seen_tick: Tick(100),
+        });
+        table.species.push(Species {
+            id: SpeciesId(2),
+            name: "Supercalifragilisticexpialidocious-2".to_string(),
+            founders: vec![AgentUid(20)],
+            members: (20..30).map(AgentUid).collect(),
+            centroid: vec![0.8],
+            spread: 0.2,
+            first_tick: Tick(20),
+            last_seen_tick: Tick(100),
+        });
+        table.species.push(Species {
+            id: SpeciesId(3),
+            name: "Medium-3".to_string(),
+            founders: vec![AgentUid(30)],
+            members: (30..35).map(AgentUid).collect(),
+            centroid: vec![0.5],
+            spread: 0.15,
+            first_tick: Tick(50),
+            last_seen_tick: Tick(100),
+        });
+
+        let view = CladeTableView::build(Some(&table), None, None, 100);
+        // Deterministic sort: size desc -> Species 2 (size 10), Species 3 (size 5), Species 1 (size 2)
+        assert_eq!(view.rows[0].species_id, SpeciesId(2));
+        assert_eq!(view.rows[1].species_id, SpeciesId(3));
+        assert_eq!(view.rows[2].species_id, SpeciesId(1));
+
+        let rendered = view.render_plain_text(80, 20, 0);
+        assert!(
+            rendered.contains("Supercalifragil…"),
+            "long species name must be truncated with ellipsis"
+        );
+        assert!(rendered.contains("Short-1"));
+        assert!(rendered.contains("Medium-3"));
+
+        // Determinism
+        let rendered2 = view.render_plain_text(80, 20, 0);
+        assert_eq!(rendered, rendered2);
+
+        // 200 species fixture
+        let mut large_table = SpeciesTable {
+            tick: Tick(500),
+            ..SpeciesTable::default()
+        };
+        for i in 1..=200 {
+            large_table.species.push(Species {
+                id: SpeciesId(i),
+                name: format!("SpeciesClade-{i}"),
+                founders: vec![AgentUid(i)],
+                members: (0..=(i % 50)).map(|m| AgentUid(i * 1000 + m)).collect(),
+                centroid: vec![0.5],
+                spread: 0.1,
+                first_tick: Tick(i),
+                last_seen_tick: Tick(500),
+            });
+        }
+        let large_view = CladeTableView::build(Some(&large_table), None, None, 500);
+        assert_eq!(large_view.rows.len(), 200);
+
+        // Scrolling must not panic
+        let scrolled = large_view.render_plain_text(80, 20, 50);
+        // header (2 lines) + 20 rows = 22 lines
+        assert_eq!(scrolled.lines().count(), 22);
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_negative_empty_world_renders_explicit_string() {
+        let layout = TreeLayout::new(LayoutBudget::default());
+        let viewport = Rect {
+            x_min: 0.0,
+            y_min: 0.0,
+            x_max: 100.0,
+            y_max: 100.0,
+        };
+        let draw = layout.draw_list(viewport, 100, None, &[], None);
+        assert!(draw.is_empty());
+        assert!(draw.truncated.is_none());
+
+        // Empty clade table
+        let empty_view = CladeTableView::build(None, None, None, 0);
+        let rendered = empty_view.render_plain_text(80, 25, 0);
+        assert_eq!(rendered, "no species yet");
+
+        let empty_table = SpeciesTable::default();
+        let empty_view2 = CladeTableView::build(Some(&empty_table), None, None, 0);
+        let rendered2 = empty_view2.render_plain_text(80, 25, 0);
+        assert_eq!(rendered2, "no species yet");
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_negative_scrub_before_birth_and_after_extinction() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+        layout.extend(&PhyloDelta {
+            updates: vec![species(10, ParentRef::Root, 100, 100, Some(200), 0)],
+        });
+
+        let mut table = SpeciesTable {
+            tick: Tick(150),
+            ..SpeciesTable::default()
+        };
+        table.species.push(Species {
+            id: SpeciesId(10),
+            name: "Ancient-10".to_string(),
+            founders: vec![AgentUid(100)],
+            members: vec![AgentUid(100)],
+            centroid: vec![0.5],
+            spread: 0.1,
+            first_tick: Tick(100),
+            last_seen_tick: Tick(150),
+        });
+
+        let viewport = Rect {
+            x_min: 0.0,
+            y_min: -500.0,
+            x_max: 500.0,
+            y_max: 500.0,
+        };
+
+        // 1. Scrub to tick 50 (BEFORE BIRTH): must be ABSENT from both tree and clade table
+        let draw_before = layout.draw_list(viewport, 50, Some(50), &[], Some(&table));
+        assert!(
+            draw_before.branches.is_empty(),
+            "species before birth must be ABSENT from draw list"
+        );
+        let table_before = CladeTableView::build(Some(&table), None, Some(50), 50);
+        assert!(
+            table_before.rows.is_empty(),
+            "species before birth must be ABSENT from clade table"
+        );
+
+        // 2. Scrub to tick 150 (ALIVE): present in both
+        let draw_during = layout.draw_list(viewport, 50, Some(150), &[], Some(&table));
+        assert_eq!(draw_during.branches.len(), 1);
+        assert_eq!(draw_during.branches[0].clade_state, CladeState::Active);
+        assert_eq!(draw_during.branches[0].end.0, 150.0);
+        let table_during = CladeTableView::build(Some(&table), None, Some(150), 150);
+        assert_eq!(table_during.rows.len(), 1);
+
+        // 3. Scrub to tick 250 (AFTER EXTINCTION): terminated branch in past in tree, ABSENT from clade table
+        let mut extinct_table = table.clone();
+        extinct_table.species[0].members.clear();
+        extinct_table.species[0].last_seen_tick = Tick(200);
+
+        let draw_after = layout.draw_list(viewport, 50, Some(250), &[], Some(&extinct_table));
+        assert_eq!(draw_after.branches.len(), 1);
+        assert_eq!(draw_after.branches[0].clade_state, CladeState::Extinct);
+        assert_eq!(draw_after.branches[0].start.0, 100.0);
+        assert_eq!(
+            draw_after.branches[0].end.0, 200.0,
+            "extinct branch must terminate in the past at death tick"
+        );
+
+        let table_after = CladeTableView::build(Some(&extinct_table), None, Some(250), 250);
+        assert!(
+            table_after.rows.is_empty(),
+            "extinct species must be ABSENT from present active clade table"
+        );
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_negative_no_agent_runtime_selection_mutation() {
+        use crate::{ScriptBotsConfig, SelectionState, WorldState};
+
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        for _ in 0..10 {
+            let _ = world.try_spawn_agent(crate::AgentData::default());
+        }
+        assert!(!world.agents.is_empty());
+
+        // Verify initial state: no agents have selection
+        for handle in world.agents.iter_handles() {
+            let runtime = world.runtime.get(handle).unwrap();
+            assert_eq!(runtime.selection, SelectionState::None);
+        }
+        assert_eq!(world.last_captured_probe_agents.as_slice(), &[]);
+
+        // Highlight a clade using the view-local highlight set
+        let mut highlight = PhyloViewHighlight::default();
+        highlight.select_species(SpeciesId(1));
+        highlight.select_species(SpeciesId(2));
+        assert!(highlight.is_highlighted(SpeciesId(1)));
+        assert!(highlight.is_highlighted(SpeciesId(2)));
+        assert!(!highlight.is_highlighted(SpeciesId(3)));
+
+        // HARD REQUIREMENT: phylogeny highlighting must NOT mutate AgentRuntime.selection
+        for handle in world.agents.iter_handles() {
+            let runtime = world.runtime.get(handle).unwrap();
+            assert_eq!(
+                runtime.selection,
+                SelectionState::None,
+                "view-local phylogeny highlight must not write AgentRuntime.selection"
+            );
+        }
+        assert_eq!(world.last_captured_probe_agents.as_slice(), &[]);
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_species_inspector() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+        layout.extend(&PhyloDelta {
+            updates: vec![
+                species(1, ParentRef::Root, 10, 0, None, 50),
+                species(2, ParentRef::Known(PhyloKey::Species(1)), 20, 100, None, 30),
+            ],
+        });
+
+        let events = vec![PhyloEvent::Speciation {
+            parent: SpeciesId(1),
+            children: [SpeciesId(1), SpeciesId(2)],
+            founders: vec![AgentUid(20)],
+            separation: SeparationKind::Phenotypic,
+            cross_mating_rate: 0.03,
+            persisted_samples: 4,
+            hint: Some(HintId(42)),
+            tick: Tick(100),
+        }];
+
+        let mut table = SpeciesTable {
+            tick: Tick(100),
+            ..SpeciesTable::default()
+        };
+        table.species.push(Species {
+            id: SpeciesId(2),
+            name: "Niche-2".to_string(),
+            founders: vec![AgentUid(20)],
+            members: (0..30).map(|i| AgentUid(200 + i)).collect(),
+            centroid: vec![0.9],
+            spread: 0.05,
+            first_tick: Tick(100),
+            last_seen_tick: Tick(100),
+        });
+
+        let inspector = layout
+            .inspect_species(SpeciesId(2), Some(&table), &events)
+            .unwrap();
+        assert_eq!(inspector.species_id, SpeciesId(2));
+        assert_eq!(inspector.name, "Niche-2");
+        assert_eq!(inspector.founders, vec![AgentUid(20)]);
+        assert_eq!(inspector.member_count, 30);
+        assert_eq!(inspector.sibling_clade, Some(SpeciesId(1)));
+
+        let evidence = inspector.separation_evidence.unwrap();
+        assert!(evidence.confirmed);
+        assert_eq!(evidence.separation_kind, SeparationKind::Phenotypic);
+        assert_eq!(evidence.hint_id, Some(HintId(42)));
+        assert_eq!(
+            inspector.mutation_diff_hook,
+            Some("bd-16g.13:mutation_diff(species=2)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_bd_16g_3_5_edge_cases_safety() {
+        let mut layout = TreeLayout::new(LayoutBudget::default());
+
+        // 1. Fresh world with zero species
+        let draw_empty = layout.draw_list(Rect::default(), 50, None, &[], None);
+        assert!(draw_empty.is_empty());
+
+        // 2. Viewport with zero area
+        let zero_area_viewport = Rect {
+            x_min: 10.0,
+            y_min: 10.0,
+            x_max: 10.0,
+            y_max: 10.0,
+        };
+        let draw_zero = layout.draw_list(zero_area_viewport, 50, None, &[], None);
+        assert!(draw_zero.is_empty());
+
+        // 3. World with exactly one species
+        layout.extend(&PhyloDelta {
+            updates: vec![species(1, ParentRef::Root, 10, 0, None, 50)],
+        });
+        let normal_viewport = Rect {
+            x_min: 0.0,
+            y_min: -100.0,
+            x_max: 100.0,
+            y_max: 100.0,
+        };
+        let draw_one = layout.draw_list(normal_viewport, 50, None, &[], None);
+        assert_eq!(draw_one.branches.len(), 1);
+
+        // 4. Scrubbing past last tick
+        let draw_past = layout.draw_list(normal_viewport, 50, Some(u64::MAX), &[], None);
+        assert_eq!(draw_past.branches.len(), 1);
+
+        // 5. Species with a pruned ancestor
+        layout.extend(&PhyloDelta {
+            updates: vec![species(2, ParentRef::Pruned, 20, 50, None, 20)],
+        });
+        let draw_pruned = layout.draw_list(normal_viewport, 50, None, &[], None);
+        assert_eq!(draw_pruned.branches.len(), 3);
     }
 }

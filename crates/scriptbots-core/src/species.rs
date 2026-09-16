@@ -143,6 +143,12 @@ impl SpeciesTable {
         self.species.iter().find(|s| s.members.contains(&uid))
     }
 
+    /// Finds a species by its ID, if present.
+    #[must_use]
+    pub fn find_species(&self, id: SpeciesId) -> Option<&Species> {
+        self.species.iter().find(|s| s.id == id)
+    }
+
     /// Number of active species currently living in the table.
     #[must_use]
     pub const fn species_count(&self) -> usize {
