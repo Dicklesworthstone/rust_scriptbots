@@ -15215,6 +15215,248 @@ mod tests {
         assert_eq!(explanations[3].output_name, "color_green");
     }
 
+    /// bd-16g.4.4 Acceptance Requirement 5 / bd-16g.4 Acceptance Test:
+    /// A headless TUI harness selects an agent and steps 100 ticks, dumping one JSONL
+    /// row per tick containing all 25 NAMED sensors (bd-16g.4.1), the raw/clamped/saturated
+    /// attribution summary (bd-16g.4.2), the activation layer digest and the 9 NAMED
+    /// outputs with effective values (bd-16g.4.3).
+    /// Assert every row is complete and self-consistent:
+    ///   - clamped == world.runtime[agent].sensors
+    ///   - outputs == runtime.outputs
+    ///   - boost == (outputs[6] > 0.5).
+    /// This log IS the debugging artifact when a brain misbehaves.
+    #[test]
+    fn headless_inspector_100_ticks_jsonl_artifact() {
+        use scriptbots_core::channels::{BOOST_THRESHOLD, OutputChannel};
+        use std::collections::BTreeMap;
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct InspectorArtifactRow {
+            tick: u64,
+            agent_uid: u64,
+            sensors: BTreeMap<String, f32>,
+            attribution_summary: AttributionSummaryRecord,
+            activation_layer_digest: String,
+            outputs: BTreeMap<String, OutputExplanationRecord>,
+        }
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct AttributionSummaryRecord {
+            raw: Vec<f32>,
+            clamped: Vec<f32>,
+            saturated: Vec<bool>,
+            contributions_count: usize,
+            truncated: usize,
+        }
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct OutputExplanationRecord {
+            raw_value: f32,
+            effective: String,
+            boost_active: Option<bool>,
+            method: String,
+            top_inputs: Vec<InputAttributionRecord>,
+        }
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct InputAttributionRecord {
+            sensor_name: String,
+            contribution: f32,
+        }
+
+        let config = ScriptBotsConfig {
+            world_width: 100,
+            world_height: 100,
+            food_cell_size: 50,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            spike_damage: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            closed: true,
+            rng_seed: Some(0x1604_4E42),
+            ..ScriptBotsConfig::default()
+        };
+
+        let mut initial_world = WorldState::new(config).expect("world");
+        let agent = initial_world
+            .try_spawn_agent(AgentData {
+                position: Position::new(50.0, 50.0),
+                health: 100.0,
+                ..AgentData::default()
+            })
+            .expect("spawn agent");
+        let target_uid = initial_world.agent_uid(agent).expect("target uid");
+
+        let world = Arc::new(std::sync::Mutex::new(initial_world));
+        rail_test_app!(world, app, _backend);
+
+        app.probe_enabled = true;
+        app.focused_agent_cursor = 0;
+        app.refresh_snapshot();
+
+        let artifact_dir = std::env::var("SCRIPTBOTS_INSPECTOR_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_inspector_artifacts"));
+        std::fs::create_dir_all(&artifact_dir).expect("create inspector artifact dir");
+        let artifact_file = artifact_dir.join("headless_inspector_100_ticks.jsonl");
+
+        let mut jsonl_lines = Vec::with_capacity(100);
+
+        for _ in 1..=100 {
+            app.submit_and_wait(ControlCommand::Step).expect("step");
+            app.refresh_snapshot();
+
+            let detail = app
+                .host
+                .inspect_agent(target_uid, PROBE_MAX_CONTRIBUTORS)
+                .expect("inspect agent")
+                .expect("agent must exist");
+
+            assert_eq!(detail.uid, target_uid);
+            let runtime_sensors = detail.sensors;
+            let runtime_outputs = detail.outputs;
+
+            // 1. All 25 NAMED sensors (bd-16g.4.1)
+            let mut named_sensors = BTreeMap::new();
+            for channel in &SENSOR_LAYOUT {
+                named_sensors.insert(channel.name.to_string(), runtime_sensors[channel.index]);
+            }
+            assert_eq!(named_sensors.len(), 25, "must name all 25 sensors");
+
+            // 2. The raw/clamped/saturated attribution summary (bd-16g.4.2)
+            let probe_snap = app
+                .snapshot
+                .probe
+                .as_ref()
+                .expect("probe snapshot must be active");
+            let attr = &probe_snap.attribution;
+            let attribution_summary = AttributionSummaryRecord {
+                raw: attr.raw.to_vec(),
+                clamped: attr.clamped.to_vec(),
+                saturated: attr.saturated.to_vec(),
+                contributions_count: attr.contributions.len(),
+                truncated: attr.truncated,
+            };
+            assert_eq!(attribution_summary.raw.len(), 25);
+            assert_eq!(attribution_summary.clamped.len(), 25);
+            assert_eq!(attribution_summary.saturated.len(), 25);
+
+            // 3. Activation layer digest
+            let mut hasher = blake3::Hasher::new();
+            if let Some(acts) = &app.snapshot.focused_activations {
+                for layer in &acts.layers {
+                    hasher.update(layer.name.as_bytes());
+                    hasher.update(&layer.width.to_le_bytes());
+                    hasher.update(&layer.height.to_le_bytes());
+                    for v in &layer.values {
+                        hasher.update(&v.to_le_bytes());
+                    }
+                }
+            }
+            let activation_layer_digest = hasher.finalize().to_hex().to_string();
+
+            // 4. All 9 NAMED outputs with effective values (bd-16g.4.3)
+            let explanations = app
+                .output_explanations(&app.snapshot)
+                .expect("output explanations");
+            assert_eq!(explanations.len(), 9, "must explain all 9 outputs");
+
+            let mut named_outputs = BTreeMap::new();
+            for expl in &explanations {
+                let (eff_str, boost_active) = match &expl.effective {
+                    EffectiveOutput::Continuous(v) => (format!("{v:.4}"), None),
+                    EffectiveOutput::Thresholded { active, .. } => (
+                        if *active {
+                            "ON".to_string()
+                        } else {
+                            "OFF".to_string()
+                        },
+                        Some(*active),
+                    ),
+                    EffectiveOutput::Clamped { applied, .. } => (format!("{applied:.4}"), None),
+                };
+                let top_inputs = expl
+                    .inputs
+                    .iter()
+                    .map(|inp| InputAttributionRecord {
+                        sensor_name: inp.sensor_name.to_string(),
+                        contribution: inp.contribution,
+                    })
+                    .collect();
+                named_outputs.insert(
+                    expl.output_name.to_string(),
+                    OutputExplanationRecord {
+                        raw_value: expl.raw_value,
+                        effective: eff_str,
+                        boost_active,
+                        method: format!("{:?}", expl.method),
+                        top_inputs,
+                    },
+                );
+            }
+
+            let row = InspectorArtifactRow {
+                tick: app.snapshot.tick,
+                agent_uid: target_uid.get(),
+                sensors: named_sensors,
+                attribution_summary,
+                activation_layer_digest,
+                outputs: named_outputs,
+            };
+
+            // Assert every row is complete and self-consistent:
+            // clamped == world.runtime[agent].sensors
+            for i in 0..25 {
+                assert_eq!(
+                    row.attribution_summary.clamped[i], runtime_sensors[i],
+                    "row clamped[{i}] must equal runtime_sensors[{i}] at tick {}",
+                    row.tick
+                );
+            }
+            // outputs == runtime.outputs
+            for (i, channel) in OutputChannel::ALL.iter().enumerate() {
+                let expl_rec = &row.outputs[channel.name()];
+                assert_eq!(
+                    expl_rec.raw_value,
+                    runtime_outputs[i],
+                    "row outputs[{:?}] raw must equal runtime_outputs[{i}] at tick {}",
+                    channel.name(),
+                    row.tick
+                );
+            }
+            // boost == (outputs[6] > 0.5)
+            let boost_rec = &row.outputs["boost"];
+            assert_eq!(
+                boost_rec.boost_active,
+                Some(runtime_outputs[6] > BOOST_THRESHOLD),
+                "boost_active must equal (outputs[6] > 0.5) at tick {}",
+                row.tick
+            );
+
+            let line = serde_json::to_string(&row).expect("serialize row JSON");
+            jsonl_lines.push(line);
+        }
+
+        assert_eq!(jsonl_lines.len(), 100);
+        let artifact_content = jsonl_lines.join("\n") + "\n";
+        std::fs::write(&artifact_file, &artifact_content).expect("write inspector JSONL artifact");
+
+        // Verify artifact is fully readable and self-consistent on disk
+        let disk_content =
+            std::fs::read_to_string(&artifact_file).expect("read artifact from disk");
+        let parsed_rows: Vec<InspectorArtifactRow> = disk_content
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("parse JSONL row from disk"))
+            .collect();
+        assert_eq!(parsed_rows.len(), 100);
+        assert_eq!(parsed_rows[0].tick, 1);
+        assert_eq!(parsed_rows[99].tick, 100);
+    }
+
     #[test]
     fn auto_pause_on_population_threshold() {
         let mut config = ScriptBotsConfig::default();

@@ -1384,4 +1384,49 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn test_probe_and_selection_neutrality_over_replay_event_stream() {
+        const INTERVAL: u32 = 1;
+        const AGENTS: usize = 8;
+        const SEED: u64 = 0xCAFE_BABE;
+
+        let (mut world_a, mut session_a, batches_a) =
+            world_with_sink(quiescent_config(INTERVAL, 64, SEED));
+        let _uids_a = seed_agents(&mut world_a, AGENTS);
+
+        let (mut world_b, mut session_b, batches_b) =
+            world_with_sink(quiescent_config(INTERVAL, 64, SEED));
+        let uids_b = seed_agents(&mut world_b, AGENTS);
+
+        let probed_handle = world_b.find_agent_by_uid(uids_b[0]).expect("probed handle");
+        world_b.set_activation_probe(Some(probed_handle));
+        world_b.set_capture_budget(crate::CaptureBudget { max_agents: 2 });
+        let selected_handle = world_b
+            .find_agent_by_uid(uids_b[2])
+            .expect("selected handle");
+        let _ = world_b.apply_selection_update(crate::SelectionUpdate {
+            mode: crate::SelectionMode::Replace,
+            agent_ids: vec![selected_handle.raw()],
+            state: crate::SelectionState::Selected,
+        });
+
+        for _ in 0..20 {
+            session_a.step(&mut world_a).expect("step a");
+            session_b.step(&mut world_b).expect("step b");
+        }
+
+        let digest_a = world_a.world_digest_v1().expect("digest a");
+        let digest_b = world_b.world_digest_v1().expect("digest b");
+        assert_eq!(digest_a, digest_b, "world digests must be identical");
+
+        let b_a = batches_a.lock().expect("batches a");
+        let b_b = batches_b.lock().expect("batches b");
+        assert_eq!(b_a.len(), 20, "20 batches emitted");
+        assert_eq!(b_a.len(), b_b.len());
+        for (batch_a, batch_b) in b_a.iter().zip(b_b.iter()) {
+            assert_eq!(batch_a.replay_events, batch_b.replay_events);
+            assert_ne!(batch_a.replay_events.len(), 0);
+        }
+    }
 }

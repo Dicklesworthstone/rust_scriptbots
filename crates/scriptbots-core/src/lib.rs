@@ -20893,7 +20893,6 @@ impl WorldState {
             );
         }
         self.update_probe_stats(captured, selected_total);
-        self.last_captured_probe_agents = captured_agents;
 
         if self.tick.0.is_multiple_of(100) {
             diag_debug!(
