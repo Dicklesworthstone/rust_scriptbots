@@ -79,8 +79,12 @@ pub mod narrative_text;
 pub mod permalink;
 pub mod phylo;
 pub mod reel;
-mod replay;
+pub mod replay;
 pub mod rng_domains;
+
+pub use replay::{
+    ReplayScrubError, ReplayScrubFrame, ReplayScrubOutcome, replay_scrub_from_checkpoint,
+};
 pub mod sense_fixed;
 pub mod species;
 pub mod visual;
@@ -6179,7 +6183,7 @@ impl ResourceLedgerState {
                 LedgerFault::CorruptGiveTransfer if kind == K::EnergySharing => {
                     // The giver is debited in full but the recipient credited half:
                     // the strictly conserved flow's net delta is no longer zero.
-                    delta.energy -= activity.energy * 0.5;
+                    delta.energy = activity.energy.mul_add(-0.5, delta.energy);
                 }
                 LedgerFault::ForgetEnergyCapSpill | LedgerFault::ForgetHealthCapSpill
                     if kind == K::CapacityRejection =>
@@ -18409,6 +18413,8 @@ pub struct WorldState {
     capture_budget: CaptureBudget,
     probe_stats: ProbeStats,
     active_activation_probe: Option<(AgentId, AgentUid)>,
+    last_captured_probe_agents: Vec<AgentId>,
+    last_probed_agent_death: Option<(AgentUid, Tick)>,
     history: VecDeque<TickSummary>,
 
     narrative: narrative::RunNarrative,
@@ -19298,6 +19304,8 @@ impl WorldState {
             capture_budget: CaptureBudget::default(),
             probe_stats: ProbeStats::default(),
             active_activation_probe: None,
+            last_captured_probe_agents: Vec::new(),
+            last_probed_agent_death: None,
             history: VecDeque::with_capacity(history_capacity),
 
             narrative: narrative::RunNarrative::default(),
@@ -19409,13 +19417,48 @@ impl WorldState {
 
     /// Sets or clears the active activation probe target, binding `AgentUid` for death detection (bd-16g.4.4).
     pub fn set_activation_probe(&mut self, probe: Option<AgentId>) {
+        self.set_activation_probe_with_reason(probe, "user selection");
+    }
+
+    /// Sets or clears the active activation probe target with a documented reason (bd-16g.4.4).
+    pub fn set_activation_probe_with_reason(
+        &mut self,
+        probe: Option<AgentId>,
+        reason: &'static str,
+    ) {
         if let Some(id) = probe {
             if let Some(uid) = self.agent_uid(id) {
+                diag_info!(
+                    tick = self.tick.0,
+                    agent_uid = uid.0,
+                    agent_id = ?id,
+                    reason,
+                    "activation probe set"
+                );
                 self.active_activation_probe = Some((id, uid));
+                self.last_probed_agent_death = None;
             } else {
+                if let Some((prev_id, prev_uid)) = self.active_activation_probe {
+                    diag_info!(
+                        tick = self.tick.0,
+                        agent_uid = prev_uid.0,
+                        agent_id = ?prev_id,
+                        reason,
+                        "activation probe cleared (unknown agent)"
+                    );
+                }
                 self.active_activation_probe = None;
             }
         } else {
+            if let Some((prev_id, prev_uid)) = self.active_activation_probe {
+                diag_info!(
+                    tick = self.tick.0,
+                    agent_uid = prev_uid.0,
+                    agent_id = ?prev_id,
+                    reason,
+                    "activation probe cleared"
+                );
+            }
             self.active_activation_probe = None;
         }
     }
@@ -19432,6 +19475,41 @@ impl WorldState {
         } else {
             None
         }
+    }
+
+    /// Returns the stable logical UID of the active activation probe target, if still alive (bd-16g.4.4).
+    #[must_use]
+    pub fn active_activation_probe_uid(&self) -> Option<AgentUid> {
+        if let Some((id, uid)) = self.active_activation_probe {
+            if self.agent_uid(id) == Some(uid) {
+                Some(uid)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Returns the agent UID and simulation tick of the most recently probed agent's death (bd-16g.4.4).
+    #[must_use]
+    pub const fn last_probed_agent_death(&self) -> Option<(AgentUid, Tick)> {
+        self.last_probed_agent_death
+    }
+
+    /// Resolves an `AgentUid` to its current `AgentId` handle if alive (bd-16g.4.4).
+    #[must_use]
+    pub fn find_agent_by_uid(&self, uid: AgentUid) -> Option<AgentId> {
+        self.agent_id_for_control_uid(uid)
+    }
+
+    /// Returns the agents captured for activation inspection in the last tick (bd-16g.4.4).
+    ///
+    /// Deterministically ordered: explicit probed agent first, then selection-driven
+    /// agents in handle order up to `capture_budget.max_agents`.
+    #[must_use]
+    pub fn last_captured_probe_agents(&self) -> &[AgentId] {
+        &self.last_captured_probe_agents
     }
 
     /// Updates probe statistics for the current tick under the bounded capture budget (bd-16g.4.4).
@@ -20774,10 +20852,59 @@ impl WorldState {
         }
 
         let probed_agent = self.active_activation_probe();
-        let selected_total = usize::from(probed_agent.is_some());
         let max_agents = self.capture_budget.max_agents;
-        let captured = usize::from(selected_total > 0 && max_agents > 0);
+
+        self.last_captured_probe_agents.clear();
+        if self.last_captured_probe_agents.capacity() < max_agents {
+            self.last_captured_probe_agents
+                .reserve(max_agents.saturating_sub(self.last_captured_probe_agents.capacity()));
+        }
+        if let Some(id) = probed_agent
+            && max_agents > 0
+        {
+            self.last_captured_probe_agents.push(id);
+        }
+
+        let mut selected_total = usize::from(probed_agent.is_some());
+        for handle in self.agents.iter_handles() {
+            if Some(handle) == probed_agent {
+                continue;
+            }
+            if let Some(runtime) = self.runtime.get(handle)
+                && matches!(runtime.selection, SelectionState::Selected)
+            {
+                selected_total += 1;
+                if self.last_captured_probe_agents.len() < max_agents {
+                    self.last_captured_probe_agents.push(handle);
+                }
+            }
+        }
+
+        let captured = self.last_captured_probe_agents.len();
+        let dropped = selected_total.saturating_sub(captured);
+        if dropped > 0 {
+            diag_warn!(
+                tick = self.tick.next().0,
+                captured,
+                budget = max_agents,
+                dropped,
+                trigger = selected_total,
+                "probe activation capture saturated; dropping selected agents exceeding budget"
+            );
+        }
         self.update_probe_stats(captured, selected_total);
+
+        if self.tick.0.is_multiple_of(100) {
+            diag_debug!(
+                target: "scriptbots::probe",
+                tick = self.tick.0,
+                captured = self.probe_stats.captured,
+                budget = self.probe_stats.budget,
+                dropped = self.probe_stats.dropped,
+                explain_calls = self.probe_stats.explain_calls,
+                "probe activation stats"
+            );
+        }
 
         first_error.map_or(Ok(()), Err)
     }
@@ -24526,6 +24653,19 @@ impl WorldState {
             }
             self.agent_rng_counters.remove(*id);
         }
+        if let Some((probed_id, probed_uid)) = self.active_activation_probe
+            && dead_ids.contains(&probed_id)
+        {
+            diag_info!(
+                tick = tick.0,
+                agent_uid = probed_uid.0,
+                agent_id = ?probed_id,
+                reason = "agent death",
+                "activation probe cleared"
+            );
+            self.last_probed_agent_death = Some((probed_uid, tick));
+            self.active_activation_probe = None;
+        }
         let removed = self.agents.remove_many(&dead_ids);
         self.last_deaths = removed;
         let after_removal = before_removal.map(|_| self.resource_amounts());
@@ -26517,7 +26657,7 @@ impl WorldState {
     /// (bd-16g.11.2). Test/feature-gated; never available in a production build
     /// without the `economy-faults` feature.
     #[cfg(feature = "economy-faults")]
-    pub fn inject_ledger_fault(&mut self, fault: LedgerFault) {
+    pub const fn inject_ledger_fault(&mut self, fault: LedgerFault) {
         self.resource_ledger.fault = Some(fault);
     }
 
@@ -48003,35 +48143,37 @@ mod tests {
                             *health = 2.0;
                         }
                     }
-                    for handle in world.agents().iter_handles().collect::<Vec<_>>() {
+                    let handles: Vec<_> = world.agents().iter_handles().collect();
+                    for handle in handles {
                         let _ = world.try_update_agent_runtime(handle, |runtime| {
                             runtime.energy = 1.99;
                             runtime.herbivore_tendency = 1.0;
                         });
                     }
                 }
-                if matches!(fault, LedgerFault::MislabelCarcassAsTransfer) {
-                    if world.agents().len() >= 2 && world.runtime.values().all(|r| !r.spiked) {
-                        let victim = world.agents().iter_handles().next();
-                        if let Some(victim) = victim {
-                            let idx = world.agents().index_of(victim);
-                            if let Some(idx) = idx {
-                                let arena = world.agents.columns_mut();
-                                if let Some(health) = arena.health_mut().get_mut(idx) {
-                                    *health = 0.0;
-                                }
-                                if let Some(age) = arena.ages_mut().get_mut(idx) {
-                                    *age = 1000;
-                                }
+                if matches!(fault, LedgerFault::MislabelCarcassAsTransfer)
+                    && world.agents().len() >= 2
+                    && world.runtime.values().all(|r| !r.spiked)
+                {
+                    let victim = world.agents().iter_handles().next();
+                    if let Some(victim) = victim {
+                        let idx = world.agents().index_of(victim);
+                        if let Some(idx) = idx {
+                            let arena = world.agents.columns_mut();
+                            if let Some(health) = arena.health_mut().get_mut(idx) {
+                                *health = 0.0;
                             }
-                            if let Some(runtime) = world.runtime.get_mut(victim) {
-                                runtime.spiked = true;
-                                runtime.combat.was_spiked_by_carnivore = true;
+                            if let Some(age) = arena.ages_mut().get_mut(idx) {
+                                *age = 1000;
                             }
-                            for (id, runtime) in world.runtime.iter_mut() {
-                                if id != victim {
-                                    runtime.herbivore_tendency = 0.0;
-                                }
+                        }
+                        if let Some(runtime) = world.runtime.get_mut(victim) {
+                            runtime.spiked = true;
+                            runtime.combat.was_spiked_by_carnivore = true;
+                        }
+                        for (id, runtime) in &mut world.runtime {
+                            if id != victim {
+                                runtime.herbivore_tendency = 0.0;
                             }
                         }
                     }
@@ -48120,6 +48262,7 @@ mod tests {
             // Per bd-16g.11.2 & QuietBeaver: table typed by fault shape.
             // Distortion faults assert the corrupt flow category when direct.
             // Omission faults assert stock and first-breach bound only (omitted flows cannot rank highest).
+            #[allow(clippy::match_same_arms)]
             match fault {
                 LedgerFault::DoubleCreditIntake => {
                     assert_eq!(first_breach.stock, economy::EconomyStock::AgentEnergy);
@@ -51579,6 +51722,204 @@ mod tests {
         assert_eq!(stats.captured, 4);
         assert_eq!(stats.budget, 0);
         assert_eq!(stats.dropped, 496);
+    }
+
+    #[test]
+    fn test_probe_selection_driven_capture_budget_and_priority() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xCA97),
+            spike_damage: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let handles: Vec<_> = (0..500)
+            .map(|seed| world.spawn_agent(sample_agent(seed)))
+            .collect();
+
+        // Select all 500 agents.
+        let raw_ids: Vec<u64> = handles.iter().map(|id| id.data().as_ffi()).collect();
+        let _ = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: raw_ids,
+            state: SelectionState::Selected,
+        });
+
+        // Hard ceiling of 4 agents.
+        world.set_capture_budget(CaptureBudget { max_agents: 4 });
+        world.step().expect("step with 500 selected agents");
+
+        let stats = world.probe_stats();
+        assert_eq!(stats.captured, 4);
+        assert_eq!(stats.dropped, 496);
+        assert_eq!(stats.budget, 4);
+        assert_eq!(world.last_captured_probe_agents().len(), 4);
+
+        // All 4 captured agents should match the first 4 handles in iter_handles order.
+        let first_4_handles: Vec<_> = world.agents.iter_handles().take(4).collect();
+        assert_eq!(
+            world.last_captured_probe_agents(),
+            first_4_handles.as_slice()
+        );
+
+        // Now set explicit probe on the 100th agent (which is also selected).
+        let probed_target = handles[100];
+        world.set_activation_probe(Some(probed_target));
+        assert_eq!(world.active_activation_probe(), Some(probed_target));
+
+        world.step().expect("step with probed + selected agents");
+        let stats_probed = world.probe_stats();
+        // Total selected remains 500 (probed is not double counted).
+        assert_eq!(stats_probed.captured, 4);
+        assert_eq!(stats_probed.dropped, 496);
+        assert_eq!(stats_probed.budget, 4);
+
+        let captured_probed = world.last_captured_probe_agents();
+        assert_eq!(captured_probed.len(), 4);
+        // Explicit probed agent must come FIRST.
+        assert_eq!(captured_probed[0], probed_target);
+        // Next 3 must be the earliest handles skipping probed_target.
+        let expected_next_3: Vec<_> = world
+            .agents
+            .iter_handles()
+            .filter(|h| *h != probed_target)
+            .take(3)
+            .collect();
+        assert_eq!(&captured_probed[1..], expected_next_3.as_slice());
+    }
+
+    #[test]
+    fn test_probe_death_lifecycle_and_slot_reuse_safety() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xDEAD),
+            spike_damage: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let agent_a = world.spawn_agent(sample_agent(1));
+        let agent_b = world.spawn_agent(sample_agent(2));
+        let uid_a = world.agent_uid(agent_a).expect("uid a");
+
+        world.set_activation_probe(Some(agent_a));
+        assert_eq!(world.active_activation_probe(), Some(agent_a));
+        assert_eq!(world.active_activation_probe_uid(), Some(uid_a));
+
+        // Kill agent a by exhausting health.
+        let idx_a = world.agents.index_of(agent_a).expect("index of agent a");
+        world.agents.columns_mut().health_mut()[idx_a] = 0.0;
+
+        world.step().expect("step causing death cleanup");
+        assert_eq!(world.agent_count(), 1);
+        assert!(!world.agents().contains(agent_a));
+        assert!(world.agents().contains(agent_b));
+
+        // Probe should automatically clear to None and record death tick.
+        assert_eq!(world.active_activation_probe(), None);
+        assert_eq!(world.active_activation_probe_uid(), None);
+        assert_eq!(world.last_probed_agent_death(), Some((uid_a, world.tick)));
+
+        // Inspecting dead agent returns typed Unavailable::MissingAgent.
+        let inspect_res = world
+            .inspect_brains(&BrainInspectionRequest::single(
+                BrainInspectionClientId::new(1),
+                BrainInspectionRevision::new(1),
+                uid_a,
+            ))
+            .expect("inspect dead agent");
+        assert!(matches!(
+            inspect_res.telemetry.as_slice(),
+            [SelectedBrainTelemetryOutcome::Unavailable {
+                agent_uid,
+                reason: BrainInspectionUnavailable::MissingAgent
+            }] if *agent_uid == uid_a
+        ));
+
+        // Unknown and unborn UIDs also return typed Unavailable::MissingAgent.
+        let unknown_uid = AgentUid(0x9999_9999);
+        let inspect_unknown = world
+            .inspect_brains(&BrainInspectionRequest::single(
+                BrainInspectionClientId::new(1),
+                BrainInspectionRevision::new(2),
+                unknown_uid,
+            ))
+            .expect("inspect unknown agent");
+        assert!(matches!(
+            inspect_unknown.telemetry.as_slice(),
+            [SelectedBrainTelemetryOutcome::Unavailable {
+                agent_uid,
+                reason: BrainInspectionUnavailable::MissingAgent
+            }] if *agent_uid == unknown_uid
+        ));
+
+        // Spawn new agent: active probe remains None and does not inspect new agent.
+        let agent_c = world.spawn_agent(sample_agent(3));
+        assert_eq!(world.active_activation_probe(), None);
+        assert_ne!(world.agent_uid(agent_c), Some(uid_a));
+
+        // Surviving agent b remains untouched.
+        assert!(world.agents().contains(agent_b));
+    }
+
+    #[test]
+    fn test_probe_observational_neutrality_multi_tick() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xF00D),
+            ..ScriptBotsConfig::default()
+        };
+
+        // World A: Probe is OFF and budget default.
+        let mut world_a = WorldState::new(config.clone()).expect("world a init");
+        for seed in 0..16 {
+            world_a.spawn_agent(sample_agent(seed));
+        }
+
+        // World B: Probe is ON, with active probe and selections.
+        let mut world_b = WorldState::new(config).expect("world b init");
+        let mut b_handles = Vec::new();
+        for seed in 0..16 {
+            b_handles.push(world_b.spawn_agent(sample_agent(seed)));
+        }
+        world_b.set_activation_probe(Some(b_handles[3]));
+        world_b.set_capture_budget(CaptureBudget { max_agents: 2 });
+        let _ = world_b.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: vec![b_handles[1].data().as_ffi(), b_handles[5].data().as_ffi()],
+            state: SelectionState::Selected,
+        });
+
+        // Run both for 50 ticks.
+        for _ in 0..50 {
+            world_a.step().expect("step world a");
+            world_b.step().expect("step world b");
+        }
+
+        let digest_a = world_a.world_digest_v1().expect("digest a");
+        let digest_b = world_b.world_digest_v1().expect("digest b");
+        assert_eq!(
+            digest_a, digest_b,
+            "activation probing and selection must be completely observationally neutral"
+        );
+        assert_eq!(
+            world_a.replay_events, world_b.replay_events,
+            "replay event streams must be completely identical"
+        );
+        assert!(
+            !world_a.replay_events.is_empty(),
+            "replay event streams must not be empty"
+        );
     }
 
     #[test]
