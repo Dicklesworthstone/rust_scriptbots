@@ -272,6 +272,187 @@ impl WorldState {
             }
         }
     }
+
+    /// Replay scrub starting from current world state to `target_tick` with probe set (bd-16g.4.4).
+    pub fn scrub_to_tick(
+        &mut self,
+        target_tick: Tick,
+        target_uid: crate::AgentUid,
+        max_tick: Tick,
+    ) -> Result<ReplayScrubOutcome, ReplayScrubError> {
+        if target_tick < self.tick || target_tick > max_tick {
+            return Err(ReplayScrubError::UnreachableTick {
+                requested: target_tick,
+                base: self.tick,
+                max: max_tick,
+            });
+        }
+
+        let mut death_tick = None;
+        let mut born = false;
+
+        if let Some(agent_id) = self.find_agent_by_uid(target_uid) {
+            born = true;
+            self.set_activation_probe_with_reason(Some(agent_id), "replay scrub");
+        }
+
+        while self.tick < target_tick {
+            let pre_probe = self.active_activation_probe();
+            self.step().map_err(|e| ReplayScrubError::Simulation {
+                tick: self.tick,
+                error: e.to_string(),
+            })?;
+
+            if pre_probe.is_some()
+                && self.active_activation_probe().is_none()
+                && death_tick.is_none()
+            {
+                death_tick = self
+                    .last_probed_agent_death
+                    .map(|(_, t)| t)
+                    .or(Some(self.tick));
+            }
+
+            if !born && let Some(agent_id) = self.find_agent_by_uid(target_uid) {
+                born = true;
+                self.set_activation_probe_with_reason(Some(agent_id), "replay scrub");
+            }
+        }
+
+        if let Some(agent_id) = self.find_agent_by_uid(target_uid) {
+            let runtime = self.runtime.get(agent_id);
+            let sensors = runtime.map_or([0.0; crate::INPUT_SIZE], |r| r.sensors);
+            let outputs = runtime.map_or([0.0; crate::OUTPUT_SIZE], |r| r.outputs);
+            let boost_engaged =
+                outputs[OutputChannel::Boost.index()] > crate::channels::BOOST_THRESHOLD;
+
+            let activations = self
+                .inspect_brains(&crate::BrainInspectionRequest::single(
+                    crate::BrainInspectionClientId::new(1),
+                    crate::BrainInspectionRevision::new(1),
+                    target_uid,
+                ))
+                .ok()
+                .and_then(|resp| {
+                    resp.telemetry.into_iter().find_map(|item| match item {
+                        crate::SelectedBrainTelemetryOutcome::Ready { telemetry } => {
+                            Some(*telemetry)
+                        }
+                        crate::SelectedBrainTelemetryOutcome::Unavailable { .. } => None,
+                    })
+                });
+
+            let sensor_attribution = self.explain_sensors(agent_id, 10);
+            let brain_bound = runtime.is_some_and(|r| r.brain.is_bound());
+            let act_ref = activations.as_ref().map(|a| &a.inspection.activations);
+            let output_explanations =
+                crate::attribution::explain_outputs(&outputs, brain_bound, act_ref, 4);
+
+            Ok(ReplayScrubOutcome::Inspected(Box::new(ReplayScrubFrame {
+                tick: self.tick,
+                agent_uid: target_uid,
+                agent_id,
+                sensors,
+                outputs,
+                boost_engaged,
+                activations,
+                sensor_attribution,
+                output_explanations,
+            })))
+        } else if let Some(tick) = death_tick {
+            Ok(ReplayScrubOutcome::AgentDied {
+                death_tick: Some(tick),
+            })
+        } else if !born {
+            Ok(ReplayScrubOutcome::AgentUnborn)
+        } else {
+            Ok(ReplayScrubOutcome::AgentDied { death_tick: None })
+        }
+    }
+}
+
+/// Typed error for replay scrub operations (bd-16g.4.4).
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayScrubError {
+    /// Requested tick is outside reachable bounds (e.g. earlier than base checkpoint or past run max).
+    #[error("requested tick {requested:?} is unreachable (base {base:?}, max {max:?})")]
+    UnreachableTick {
+        /// Requested scrub tick.
+        requested: Tick,
+        /// Starting base tick.
+        base: Tick,
+        /// Maximum reachable tick.
+        max: Tick,
+    },
+    /// Checkpoint restoration failed.
+    #[error("checkpoint error: {0}")]
+    Checkpoint(#[from] crate::WorldCheckpointError),
+    /// Simulation step error.
+    #[error("simulation step error at tick {tick:?}: {error}")]
+    Simulation {
+        /// Tick where failure occurred.
+        tick: Tick,
+        /// Stringified error description.
+        error: String,
+    },
+}
+
+/// Re-derived inspection snapshot produced by replay scrub (bd-16g.4.4).
+#[derive(Debug, Clone)]
+pub struct ReplayScrubFrame {
+    /// Simulation tick of this snapshot.
+    pub tick: Tick,
+    /// Stable agent UID.
+    pub agent_uid: crate::AgentUid,
+    /// Transient agent handle.
+    pub agent_id: crate::AgentId,
+    /// Re-derived sensor vector.
+    pub sensors: [f32; crate::INPUT_SIZE],
+    /// Re-derived output vector.
+    pub outputs: [f32; crate::OUTPUT_SIZE],
+    /// Whether boost actuator is engaged.
+    pub boost_engaged: bool,
+    /// Brain activation inspection telemetry.
+    pub activations: Option<crate::SelectedBrainTelemetry>,
+    /// Sensor attribution summary.
+    pub sensor_attribution: Option<crate::SensorAttribution>,
+    /// Output explanation summary.
+    pub output_explanations: Vec<crate::attribution::OutputExplanation>,
+}
+
+/// Scrub outcome at target tick for the requested agent (bd-16g.4.4).
+#[derive(Debug, Clone)]
+pub enum ReplayScrubOutcome {
+    /// Agent is alive at target tick with re-derived inspection telemetry.
+    Inspected(Box<ReplayScrubFrame>),
+    /// Agent died before or at target tick.
+    AgentDied {
+        /// Tick of death if known.
+        death_tick: Option<Tick>,
+    },
+    /// Agent was not yet born at target tick.
+    AgentUnborn,
+}
+
+/// Replay scrub starting from a recorded checkpoint to `target_tick` with probe set (bd-16g.4.4).
+pub fn replay_scrub_from_checkpoint(
+    checkpoint: &crate::WorldCheckpointV1,
+    registry: crate::BrainRegistry,
+    target_tick: Tick,
+    target_uid: crate::AgentUid,
+    max_tick: Tick,
+) -> Result<ReplayScrubOutcome, ReplayScrubError> {
+    let base_tick = checkpoint.tick();
+    if target_tick < base_tick || target_tick > max_tick {
+        return Err(ReplayScrubError::UnreachableTick {
+            requested: target_tick,
+            base: base_tick,
+            max: max_tick,
+        });
+    }
+
+    let mut world = WorldState::restore_checkpoint_v1(checkpoint, registry)?;
+    world.scrub_to_tick(target_tick, target_uid, max_tick)
 }
 
 #[cfg(test)]
@@ -1000,5 +1181,207 @@ mod tests {
             }),
             Some(PAIRS)
         );
+    }
+
+    #[test]
+    fn test_replay_scrub_alive_agent_produces_full_frame() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x1234),
+            spike_damage: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let target_handle = world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            ..AgentData::default()
+        });
+        let target_uid = world.agent_uid(target_handle).expect("uid");
+
+        let outcome = world
+            .scrub_to_tick(Tick(5), target_uid, Tick(10))
+            .expect("scrub success");
+        match outcome {
+            super::ReplayScrubOutcome::Inspected(frame) => {
+                assert_eq!(frame.tick, Tick(5));
+                assert_eq!(frame.agent_uid, target_uid);
+                assert_eq!(frame.agent_id, target_handle);
+                assert_eq!(world.tick, Tick(5));
+                assert_eq!(world.active_activation_probe(), Some(target_handle));
+                assert_eq!(frame.sensors.len(), crate::INPUT_SIZE);
+                assert_eq!(frame.outputs.len(), crate::OUTPUT_SIZE);
+            }
+            other => panic!("expected Inspected outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replay_scrub_agent_death_records_death_tick() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x5678),
+            spike_damage: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let target_handle = world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            ..AgentData::default()
+        });
+        let target_uid = world.agent_uid(target_handle).expect("uid");
+
+        let _ = world.step();
+        let _ = world.step();
+        assert_eq!(world.tick, Tick(2));
+
+        let idx = world
+            .agents
+            .index_of(target_handle)
+            .expect("index of agent");
+        world.agents.columns_mut().health_mut()[idx] = 0.0;
+
+        let outcome = world
+            .scrub_to_tick(Tick(5), target_uid, Tick(10))
+            .expect("scrub should return Ok(AgentDied)");
+        match outcome {
+            super::ReplayScrubOutcome::AgentDied { death_tick } => {
+                assert_eq!(death_tick, Some(Tick(3)));
+            }
+            other => panic!("expected AgentDied outcome, got {other:?}"),
+        }
+        assert_eq!(world.tick, Tick(5));
+        assert_eq!(world.active_activation_probe(), None);
+    }
+
+    #[test]
+    fn test_replay_scrub_unborn_agent() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0x9ABC),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let nonexistent_uid = AgentUid(0xDEAD_BEEF);
+
+        let outcome = world
+            .scrub_to_tick(Tick(3), nonexistent_uid, Tick(10))
+            .expect("scrub outcome");
+        assert!(matches!(outcome, super::ReplayScrubOutcome::AgentUnborn));
+        assert_eq!(world.tick, Tick(3));
+    }
+
+    #[test]
+    fn test_replay_scrub_unreachable_ticks() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(0xDEF0),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let target_handle = world.spawn_agent(AgentData::default());
+        let target_uid = world.agent_uid(target_handle).expect("uid");
+
+        let _ = world.step();
+        let _ = world.step();
+        let _ = world.step();
+        assert_eq!(world.tick, Tick(3));
+
+        let err_earlier = world.scrub_to_tick(Tick(2), target_uid, Tick(10));
+        assert!(matches!(
+            err_earlier,
+            Err(super::ReplayScrubError::UnreachableTick {
+                requested: Tick(2),
+                base: Tick(3),
+                max: Tick(10),
+            })
+        ));
+
+        let err_past_max = world.scrub_to_tick(Tick(15), target_uid, Tick(10));
+        assert!(matches!(
+            err_past_max,
+            Err(super::ReplayScrubError::UnreachableTick {
+                requested: Tick(15),
+                base: Tick(3),
+                max: Tick(10),
+            })
+        ));
+    }
+
+    #[test]
+    fn test_replay_scrub_from_checkpoint_success_and_bounds() {
+        let config = ScriptBotsConfig {
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(0x1337),
+            spike_damage: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world init");
+        let target_handle = world.spawn_agent(AgentData {
+            position: Position::new(25.0, 25.0),
+            ..AgentData::default()
+        });
+        let target_uid = world.agent_uid(target_handle).expect("uid");
+
+        let _ = world.step();
+        let _ = world.step();
+        assert_eq!(world.tick, Tick(2));
+
+        let checkpoint = world.checkpoint_v1().expect("capture checkpoint");
+
+        let outcome = super::replay_scrub_from_checkpoint(
+            &checkpoint,
+            crate::BrainRegistry::new(),
+            Tick(4),
+            target_uid,
+            Tick(10),
+        )
+        .expect("checkpoint scrub success");
+
+        match outcome {
+            super::ReplayScrubOutcome::Inspected(frame) => {
+                assert_eq!(frame.tick, Tick(4));
+                assert_eq!(frame.agent_uid, target_uid);
+            }
+            other => panic!("expected Inspected outcome, got {other:?}"),
+        }
+
+        let err_before = super::replay_scrub_from_checkpoint(
+            &checkpoint,
+            crate::BrainRegistry::new(),
+            Tick(1),
+            target_uid,
+            Tick(10),
+        );
+        assert!(matches!(
+            err_before,
+            Err(super::ReplayScrubError::UnreachableTick {
+                requested: Tick(1),
+                base: Tick(2),
+                max: Tick(10),
+            })
+        ));
     }
 }
