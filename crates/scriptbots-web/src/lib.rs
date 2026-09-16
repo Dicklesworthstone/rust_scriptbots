@@ -1,6 +1,7 @@
 #![cfg(any(target_arch = "wasm32", test))]
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, ensure};
@@ -8,6 +9,10 @@ use js_sys::Uint8Array;
 use postcard::{from_bytes, to_allocvec};
 use rand::Rng;
 use scriptbots_brain::{MlpBrain, mlp::MlpBrainFamily};
+use scriptbots_core::gallery::{
+    base_config_for_scenario, canonical_build_link, reconstruct_config_from_permalink,
+};
+use scriptbots_core::permalink::{BuildMatch, Permalink, config_digest_with_diff};
 use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::{
     AgentData, AgentId, BrainBinding, BrainRunner, DynamicWorldSnapshot as SimulationSnapshot,
@@ -26,6 +31,57 @@ use wasm_bindgen::prelude::*;
 use scriptbots_runtime::{
     HostCore, HostCoreOptions, HostSessionId, ManualHostDriver, ManualInstant, PlaybackSnapshot,
 };
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn info(s: &str);
+    #[wasm_bindgen(js_namespace = console)]
+    fn warn(s: &str);
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(s: &str);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+fn info(s: &str) {
+    println!("[INFO] {s}");
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+fn warn(s: &str) {
+    eprintln!("[WARN] {s}");
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+fn error(s: &str) {
+    eprintln!("[ERROR] {s}");
+}
+
+static PANIC_HOOK_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn ensure_panic_hook_installed() {
+    if !PANIC_HOOK_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        std::panic::set_hook(Box::new(|info| {
+            let msg = format!("PANIC: {info}");
+            error(&msg);
+            tracing::error!(target: "scriptbots::web", payload = %info, "WASM panic hook fired");
+        }));
+    }
+}
+
+/// A row in the parent diff comparison view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffRow {
+    /// Dot-separated configuration knob path.
+    pub knob: String,
+    /// Value configured in the base scenario.
+    pub parent_value: f64,
+    /// Value configured in this permalink world.
+    pub this_value: f64,
+}
 
 #[wasm_bindgen]
 pub struct SimHandle {
@@ -69,6 +125,8 @@ struct SimSpec {
     snapshot_format: SnapshotFormat,
     seed_strategy: SeedStrategy,
     default_brain: Option<BrainPreset>,
+    permalink: Option<Permalink>,
+    preserve_population_config: bool,
 }
 
 impl SimSpec {
@@ -87,14 +145,32 @@ impl SimSpec {
             snapshot_format,
             seed_strategy,
             default_brain,
+            permalink: None,
+            preserve_population_config: false,
+        }
+    }
+
+    fn from_permalink(permalink: Permalink, config: ScriptBotsConfig) -> Self {
+        let seed = permalink.seed;
+        Self {
+            base_config: config,
+            initial_population: 0,
+            seed: Some(seed),
+            snapshot_format: SnapshotFormat::Json,
+            seed_strategy: SeedStrategy::None,
+            default_brain: None,
+            permalink: Some(permalink),
+            preserve_population_config: true,
         }
     }
 
     fn with_seed(&self, seed: Option<u64>) -> Self {
-        Self {
-            seed,
-            ..self.clone()
+        let mut next = self.clone();
+        next.seed = seed;
+        if let (Some(link), Some(s)) = (&mut next.permalink, seed) {
+            link.seed = s;
         }
+        next
     }
 
     fn effective_seed(&self) -> Option<u64> {
@@ -104,8 +180,10 @@ impl SimSpec {
     fn config(&self) -> ScriptBotsConfig {
         let mut config = self.base_config.clone();
         config.rng_seed = self.effective_seed();
-        config.population_minimum = 0;
-        config.population_spawn_interval = 0;
+        if !self.preserve_population_config {
+            config.population_minimum = 0;
+            config.population_spawn_interval = 0;
+        }
         config
     }
 }
@@ -306,10 +384,98 @@ impl SimHandle {
             other => Err(js_error(format!("unknown brain preset: {other}"))),
         }
     }
+
+    #[wasm_bindgen(js_name = permalinkOf)]
+    pub fn permalink_of(&self) -> Result<String, JsValue> {
+        let sim = self.inner.borrow();
+        if let Some(ref link) = sim.spec.permalink {
+            return Ok(link.to_url_string());
+        }
+        let seed = sim.spec.effective_seed().unwrap_or(0);
+        let config_val = serde_json::to_value(sim.spec.config()).map_err(js_error)?;
+        let digest = config_digest_with_diff(&config_val, &[]);
+        let link = Permalink {
+            scenario_id: "default".to_string(),
+            seed,
+            knob_diff: Vec::new(),
+            config_digest: digest,
+            build: canonical_build_link(),
+        };
+        Ok(link.to_url_string())
+    }
+
+    #[wasm_bindgen]
+    pub fn fork(&self, knob_patch: JsValue) -> Result<String, JsValue> {
+        let patch_entries = parse_knob_patch(knob_patch)?;
+        self.fork_patch(&patch_entries).map_err(js_error)
+    }
+}
+
+impl SimHandle {
+    /// Advance the simulation and return the strongly-typed snapshot directly.
+    pub fn tick_snapshot(&self, steps: u32) -> Result<SimulationSnapshot> {
+        let mut simulation = self.inner.borrow_mut();
+        simulation.tick(steps)
+    }
+
+    /// Fork this world with an explicit slice of knob assignments without converting to JsValue.
+    pub fn fork_patch(&self, patch: &[(String, f64)]) -> Result<String, String> {
+        let sim = self.inner.borrow();
+        let parent_link = if let Some(ref link) = sim.spec.permalink {
+            link.clone()
+        } else {
+            let seed = sim.spec.effective_seed().unwrap_or(0);
+            let config_val = serde_json::to_value(sim.spec.config()).map_err(|e| e.to_string())?;
+            let digest = config_digest_with_diff(&config_val, &[]);
+            Permalink {
+                scenario_id: "default".to_string(),
+                seed,
+                knob_diff: Vec::new(),
+                config_digest: digest,
+                build: canonical_build_link(),
+            }
+        };
+
+        let mut merged: BTreeMap<String, f64> = parent_link.knob_diff.into_iter().collect();
+
+        for (path, value) in patch {
+            if !value.is_finite() {
+                return Err(format!("knob value for '{path}' must be finite"));
+            }
+            let Some(range) = scriptbots_core::knob_range(path) else {
+                return Err(format!("unknown knob id '{path}' not in registry"));
+            };
+            if *value < range.min || *value > range.max {
+                return Err(format!(
+                    "knob '{path}' = {value} is outside [{min}, {max}]",
+                    min = range.min,
+                    max = range.max
+                ));
+            }
+            merged.insert(path.clone(), *value);
+        }
+
+        let child_diff: Vec<(String, f64)> = merged.into_iter().collect();
+        let base_config = base_config_for_scenario(&parent_link.scenario_id);
+        let scenario_json = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
+        let config_digest = config_digest_with_diff(&scenario_json, &child_diff);
+
+        let child_link = Permalink {
+            scenario_id: parent_link.scenario_id,
+            seed: parent_link.seed,
+            knob_diff: child_diff,
+            config_digest,
+            build: canonical_build_link(),
+        };
+        child_link.validate_knobs().map_err(|e| e.to_string())?;
+
+        Ok(child_link.to_url_string())
+    }
 }
 
 #[wasm_bindgen]
 pub fn init_sim(config: JsValue) -> Result<SimHandle, JsValue> {
+    ensure_panic_hook_installed();
     let options = if config.is_null() || config.is_undefined() {
         InitOptions::default()
     } else {
@@ -419,7 +585,15 @@ fn normalize_seed(seed: Option<f64>) -> Result<Option<u64>> {
 }
 
 fn js_error(err: impl std::fmt::Display) -> JsValue {
-    JsError::new(&err.to_string()).into()
+    #[cfg(target_arch = "wasm32")]
+    {
+        JsError::new(&err.to_string()).into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = err;
+        JsValue::NULL
+    }
 }
 
 fn encode_snapshot(
@@ -450,6 +624,275 @@ pub fn decode_snapshot_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let snapshot: SimulationSnapshot =
         from_bytes(bytes).map_err(|err| js_error(format!("postcard decode failed: {err}")))?;
     to_value(&snapshot).map_err(js_error)
+}
+
+/// Initialize a simulation from a shareable permalink string (`sbw1...`).
+///
+/// Guarantees:
+/// - Evaluates using the exact shared config composition path as native runs.
+/// - Never panics: returns a typed JS error on hostile or corrupted links.
+/// - The module instance survives errors without poisoning.
+/// - Bounded work: bounds-checks geometry and population before allocating world state.
+/// - Logs one-line diagnostic info on success and structured warning on rejection.
+#[wasm_bindgen]
+pub fn init_from_permalink(link: &str) -> Result<SimHandle, JsValue> {
+    ensure_panic_hook_installed();
+    let hex_prefix = hex_first_16(link.as_bytes());
+    let permalink = match Permalink::from_url_string(link) {
+        Ok(p) => p,
+        Err(err) => {
+            let msg = format!("rejected permalink: error='{err}', payload_hex='{hex_prefix}'");
+            warn(&msg);
+            tracing::warn!(target: "scriptbots::web", error = %err, payload_hex = %hex_prefix, "rejected permalink");
+            return Err(js_error(err));
+        }
+    };
+
+    let config = match reconstruct_config_from_permalink(&permalink) {
+        Ok(c) => c,
+        Err(err) => {
+            let msg =
+                format!("rejected permalink config: error='{err}', payload_hex='{hex_prefix}'");
+            warn(&msg);
+            tracing::warn!(target: "scriptbots::web", error = %err, payload_hex = %hex_prefix, "rejected permalink config");
+            return Err(js_error(err));
+        }
+    };
+
+    if config.population_minimum > 50_000 {
+        let err = "population_minimum must be 50,000 agents or fewer for browser builds";
+        warn(&format!("rejected permalink: {err}"));
+        return Err(js_error(err));
+    }
+    if config.world_width > 4096 || config.world_height > 4096 {
+        let err = "world dimensions must not exceed 4096 for browser builds";
+        warn(&format!("rejected permalink: {err}"));
+        return Err(js_error(err));
+    }
+
+    let running_build = canonical_build_link();
+    let match_state = permalink.build_match(&running_build);
+    let match_state_str = match match_state {
+        BuildMatch::Exact => "exact",
+        BuildMatch::Compatible => "compatible",
+        BuildMatch::Mismatch => "mismatch",
+    };
+
+    let load_info = format!(
+        "loaded permalink: link_len={}, scenario_id='{}', seed={}, config_digest={:#018x}, link_build={:?}, running_build={:?}, match_state='{}', knob_diff_count={}",
+        link.len(),
+        permalink.scenario_id,
+        permalink.seed,
+        permalink.config_digest,
+        permalink.build,
+        running_build,
+        match_state_str,
+        permalink.knob_diff.len()
+    );
+    info(&load_info);
+    tracing::info!(
+        target: "scriptbots::web",
+        link_len = link.len(),
+        scenario_id = %permalink.scenario_id,
+        seed = permalink.seed,
+        config_digest = format!("{:#018x}", permalink.config_digest),
+        ?permalink.build,
+        ?running_build,
+        match_state = match_state_str,
+        knob_diff_count = permalink.knob_diff.len(),
+        "loaded permalink"
+    );
+
+    if match_state == BuildMatch::Mismatch {
+        let mismatch_msg = format!(
+            "build mismatch: link_build={:?}, running_build={:?}",
+            permalink.build, running_build
+        );
+        warn(&mismatch_msg);
+        tracing::warn!(
+            target: "scriptbots::web",
+            link_build = ?permalink.build,
+            running_build = ?running_build,
+            "build mismatch between permalink and running build"
+        );
+    }
+
+    let spec = SimSpec::from_permalink(permalink, config);
+    let simulation = Simulation::new(spec).map_err(js_error)?;
+    Ok(SimHandle {
+        inner: Rc::new(RefCell::new(simulation)),
+    })
+}
+
+/// Standalone binding to obtain the permalink of a simulation handle.
+#[wasm_bindgen]
+pub fn permalink_of(handle: &SimHandle) -> Result<String, JsValue> {
+    handle.permalink_of()
+}
+
+/// Standalone binding to fork a running world with an inline knob patch.
+#[wasm_bindgen]
+pub fn fork(handle: &SimHandle, knob_patch: JsValue) -> Result<String, JsValue> {
+    handle.fork(knob_patch)
+}
+
+/// Strongly-typed rows of a permalink's diff against its base scenario.
+pub fn permalink_diff_rows(link: &str) -> Result<Vec<DiffRow>, String> {
+    let permalink = Permalink::from_url_string(link).map_err(|e| e.to_string())?;
+    let base_config = base_config_for_scenario(&permalink.scenario_id);
+    let base_json = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
+
+    let mut rows = Vec::with_capacity(permalink.knob_diff.len());
+    for (knob, this_value) in permalink.knob_diff {
+        let parent_value = extract_json_number(&base_json, &knob).unwrap_or(0.0);
+        rows.push(DiffRow {
+            knob,
+            parent_value,
+            this_value,
+        });
+    }
+
+    Ok(rows)
+}
+
+/// Return an array of [`DiffRow`] objects `[{ knob, parent_value, this_value }]`
+/// comparing this permalink's knobs against its base scenario.
+#[wasm_bindgen]
+pub fn permalink_diff(link: &str) -> Result<JsValue, JsValue> {
+    let rows = permalink_diff_rows(link).map_err(js_error)?;
+    to_value(&rows).map_err(js_error)
+}
+
+/// Information about the running build identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildIdentityResult {
+    pub toolchain_digest: String,
+    pub lockfile_digest: String,
+    pub core_digest: String,
+}
+
+/// Return the local running build identity as a JS object.
+#[wasm_bindgen]
+pub fn build_identity() -> Result<JsValue, JsValue> {
+    let build = canonical_build_link();
+    let res = BuildIdentityResult {
+        toolchain_digest: format!("{:#018x}", build.toolchain_digest),
+        lockfile_digest: format!("{:#018x}", build.lockfile_digest),
+        core_digest: format!("{:#018x}", build.core_digest),
+    };
+    to_value(&res).map_err(js_error)
+}
+
+/// Structured build match assessment result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildMatchResult {
+    pub status: String,
+    pub link_core_digest: String,
+    pub local_core_digest: String,
+    pub link_toolchain_digest: String,
+    pub local_toolchain_digest: String,
+    pub link_lockfile_digest: String,
+    pub local_lockfile_digest: String,
+}
+
+/// Evaluate the build match between a permalink and the local WASM build identity without JS conversions.
+pub fn check_build_match_identity(link: &str) -> Result<BuildMatchResult, String> {
+    let permalink = Permalink::from_url_string(link).map_err(|e| e.to_string())?;
+    let local = canonical_build_link();
+    let match_state = permalink.build_match(&local);
+    let state_str = match match_state {
+        BuildMatch::Exact => "exact",
+        BuildMatch::Compatible => "compatible",
+        BuildMatch::Mismatch => "mismatch",
+    };
+
+    Ok(BuildMatchResult {
+        status: state_str.to_string(),
+        link_core_digest: format!("{:#018x}", permalink.build.core_digest),
+        local_core_digest: format!("{:#018x}", local.core_digest),
+        link_toolchain_digest: format!("{:#018x}", permalink.build.toolchain_digest),
+        local_toolchain_digest: format!("{:#018x}", local.toolchain_digest),
+        link_lockfile_digest: format!("{:#018x}", permalink.build.lockfile_digest),
+        local_lockfile_digest: format!("{:#018x}", local.lockfile_digest),
+    })
+}
+
+/// Evaluate the build match between a permalink and the local WASM build identity.
+#[wasm_bindgen]
+pub fn check_build_match(link: &str) -> Result<JsValue, JsValue> {
+    let res = check_build_match_identity(link).map_err(js_error)?;
+    to_value(&res).map_err(js_error)
+}
+
+fn hex_first_16(bytes: &[u8]) -> String {
+    let take_len = bytes.len().min(16);
+    let mut s = String::with_capacity(take_len * 2);
+    for &b in &bytes[..take_len] {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn extract_json_number(value: &serde_json::Value, path: &str) -> Option<f64> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = value;
+    for part in parts {
+        current = current.get(part)?;
+    }
+    current
+        .as_f64()
+        .or_else(|| current.as_i64().map(|i| i as f64))
+        .or_else(|| current.as_u64().map(|u| u as f64))
+}
+
+fn parse_knob_patch(patch_val: JsValue) -> Result<Vec<(String, f64)>, JsValue> {
+    if patch_val.is_null() || patch_val.is_undefined() {
+        return Ok(Vec::new());
+    }
+    if let Some(s) = patch_val.as_string() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Ok(map) = serde_json::from_str::<BTreeMap<String, f64>>(trimmed) {
+            return Ok(map.into_iter().collect());
+        }
+        #[derive(Deserialize)]
+        struct PatchItem {
+            knob: String,
+            value: f64,
+        }
+        if let Ok(list) = serde_json::from_str::<Vec<PatchItem>>(trimmed) {
+            return Ok(list
+                .into_iter()
+                .map(|item| (item.knob, item.value))
+                .collect());
+        }
+        if let Ok(pairs) = serde_json::from_str::<Vec<(String, f64)>>(trimmed) {
+            return Ok(pairs);
+        }
+    }
+    if let Ok(map) = serde_wasm_bindgen::from_value::<BTreeMap<String, f64>>(patch_val.clone()) {
+        return Ok(map.into_iter().collect());
+    }
+    #[derive(Deserialize)]
+    struct PatchItem {
+        knob: String,
+        value: f64,
+    }
+    if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<PatchItem>>(patch_val.clone()) {
+        return Ok(list
+            .into_iter()
+            .map(|item| (item.knob, item.value))
+            .collect());
+    }
+    if let Ok(pairs) = serde_wasm_bindgen::from_value::<Vec<(String, f64)>>(patch_val) {
+        return Ok(pairs);
+    }
+    Err(js_error(
+        "knob_patch must be a JSON string, object { [knob]: value }, or array of { knob, value }",
+    ))
 }
 
 fn bind_wander_brain(world: &mut WorldState, agent: AgentId, seed: u64) -> Result<()> {
@@ -516,6 +959,7 @@ fn clamp01(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scriptbots_core::permalink::BuildLink;
     use scriptbots_core::{BirthOrigin, DYNAMIC_WORLD_SNAPSHOT_SCHEMA, ScriptBotsConfig};
     use std::sync::{Arc, Mutex};
     use wasm_bindgen_test::*;
@@ -715,6 +1159,84 @@ mod tests {
         assert!(
             stdout.contains("\"cases_passed\":3"),
             "DOM test must pass all 3 cases (camelCase, snake_case negative control, scheduling negative control): {}",
+            stdout
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn browser_demo_executes_fork_and_mismatch_banner_through_real_dom() {
+        // Execute the real-browser DOM permalink & fork UX verification (bd-16g.8.2).
+        // Verifies the non-dismissible honest build-mismatch warning banner,
+        // parent-diff table rendering, child permalink generation via fork without mutating running world,
+        // and negative control bad permalink rejection without instance poisoning.
+        let bun_candidate = std::env::var("BUN_PATH")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let p = std::path::PathBuf::from("/home/ubuntu/.bun/bin/bun");
+                if p.exists() { Some(p) } else { None }
+            })
+            .or_else(|| {
+                let home = std::env::var("HOME").ok()?;
+                let p = std::path::PathBuf::from(home).join(".bun/bin/bun");
+                if p.exists() { Some(p) } else { None }
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("bun"));
+
+        let probe = std::process::Command::new(&bun_candidate)
+            .arg("--version")
+            .output();
+
+        if probe.is_err() || !probe.unwrap().status.success() {
+            eprintln!(
+                "skipping browser DOM fork test: bun runtime is not available in test environment"
+            );
+            return;
+        }
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let test_script = manifest_dir.join("web/tests/permalink_fork_dom.test.js");
+        let output = std::process::Command::new(&bun_candidate)
+            .arg(&test_script)
+            .output()
+            .expect("execute permalink_fork_dom.test.js via bun");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success()
+            && (stderr.contains("Executable doesn't exist")
+                || stderr.contains("Looks like Playwright was just installed")
+                || stderr.contains("playwright install"))
+        {
+            eprintln!(
+                "skipping browser DOM fork test: playwright browser executable is not installed on this worker"
+            );
+            return;
+        }
+
+        assert!(
+            output.status.success(),
+            "real browser DOM fork execution failed (exit code {:?}):\nSTDOUT:\n{}\nSTDERR:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        );
+
+        assert!(
+            stdout.contains("\"schema\":\"scriptbots.browser-permalink-fork-dom.v1\""),
+            "DOM test must emit structured scriptbots.browser-permalink-fork-dom.v1 evidence: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("\"status\":\"pass\""),
+            "DOM test must report passing status: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("\"cases_passed\":4"),
+            "DOM test must pass all 4 cases (mismatch warning, parent-diff, fork, negative poison control): {}",
             stdout
         );
     }
@@ -1992,5 +2514,179 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn make_test_permalink(scenario_id: &str, seed: u64, knob_diff: Vec<(String, f64)>) -> String {
+        scriptbots_core::gallery::create_gallery_permalink(scenario_id, seed, knob_diff)
+            .expect("create test permalink")
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn fixture_link_init_from_permalink_and_ticks() {
+        let link_str = make_test_permalink("meadow", 42, vec![("food_max".to_string(), 0.6)]);
+        let handle = init_from_permalink(&link_str).expect("initialize from valid permalink");
+        let snap = handle.tick_snapshot(100).expect("tick 100 times");
+        assert_eq!(snap.tick, 100);
+        assert!(
+            snap.summary.agent_count >= 1,
+            "world must have active agents"
+        );
+        assert!(snap.summary.total_energy > 0.0);
+        assert!(snap.summary.average_health > 0.0);
+        let current_link = handle.permalink_of().expect("permalink_of");
+        assert_eq!(current_link, link_str);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn fork_and_permalink_diff_single_and_chained() {
+        let root_str = make_test_permalink("meadow", 42, vec![]);
+        let handle = init_from_permalink(&root_str).expect("init root");
+
+        // Fork 1: patch exactly one knob
+        let child1_str = handle
+            .fork_patch(&[("food_growth_rate".to_string(), 0.05)])
+            .expect("fork child 1");
+        assert_ne!(child1_str, root_str);
+
+        // Assert root world was not mutated
+        assert_eq!(handle.permalink_of().unwrap(), root_str);
+
+        // Decode child1 diff
+        let diff1 = permalink_diff_rows(&child1_str).expect("permalink diff child 1");
+        assert_eq!(diff1.len(), 1);
+        assert_eq!(diff1[0].knob, "food_growth_rate");
+        assert!((diff1[0].parent_value - 0.01).abs() < 1e-6);
+        assert_eq!(diff1[0].this_value, 0.05);
+
+        // Fork 2 (fork of fork): patch a second knob
+        let handle2 = init_from_permalink(&child1_str).expect("init child 1");
+        let child2_str = handle2
+            .fork_patch(&[("population_minimum".to_string(), 32.0)])
+            .expect("fork child 2");
+
+        // Assert child2 diff has exactly 2 rows in stable sorted knob order
+        let diff2 = permalink_diff_rows(&child2_str).expect("permalink diff child 2");
+        assert_eq!(diff2.len(), 2);
+        assert_eq!(diff2[0].knob, "food_growth_rate");
+        assert_eq!(diff2[0].this_value, 0.05);
+        assert_eq!(diff2[1].knob, "population_minimum");
+        assert_eq!(diff2[1].parent_value, 24.0);
+        assert_eq!(diff2[1].this_value, 32.0);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn reconstruction_parity_native_and_wasm() {
+        let link_str = make_test_permalink(
+            "meadow",
+            20260717,
+            vec![
+                ("food_growth_rate".to_string(), 0.02),
+                ("population_minimum".to_string(), 30.0),
+            ],
+        );
+        let link = Permalink::from_url_string(&link_str).expect("decode permalink");
+        let native_config = reconstruct_config_from_permalink(&link).expect("native reconstruct");
+        let native_json = serde_json::to_value(&native_config).expect("serialize native config");
+
+        let wasm_handle = init_from_permalink(&link_str).expect("wasm init");
+        let wasm_sim = wasm_handle.inner.borrow();
+        let wasm_config = wasm_sim.spec.config();
+        let wasm_json = serde_json::to_value(&wasm_config).expect("serialize wasm config");
+
+        assert_eq!(
+            native_json, wasm_json,
+            "native and wasm config trees must match exactly"
+        );
+        let native_digest = config_digest_with_diff(&native_json, &[]);
+        let wasm_digest = config_digest_with_diff(&wasm_json, &[]);
+        assert_eq!(
+            native_digest, wasm_digest,
+            "config digests must match bit-for-bit"
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn negative_build_mismatch_surfaced_and_still_runs() {
+        let mut permalink = Permalink {
+            scenario_id: "meadow".to_string(),
+            seed: 42,
+            knob_diff: vec![("food_max".to_string(), 0.6)],
+            config_digest: 0,
+            build: BuildLink {
+                toolchain_digest: 0x1111,
+                lockfile_digest: 0x2222,
+                core_digest: 0x3333, // deliberate mismatch
+            },
+        };
+        let base = base_config_for_scenario("meadow");
+        let base_json = serde_json::to_value(&base).unwrap();
+        permalink.config_digest = config_digest_with_diff(&base_json, &permalink.knob_diff);
+        let link_str = permalink.to_url_string();
+
+        // Check build match reports mismatch
+        let match_res = check_build_match_identity(&link_str).expect("check_build_match");
+        assert_eq!(match_res.status, "mismatch");
+
+        // Assert that simulation still initializes and runs without panic
+        let handle = init_from_permalink(&link_str).expect("init despite mismatch");
+        let snap = handle.tick_snapshot(5).expect("step world");
+        assert_eq!(snap.tick, 5);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn negative_fuzz_corpus_rejected_and_instance_not_poisoned() {
+        let bad_cases = vec![
+            "",
+            "invalid_prefix",
+            "sbw1.bad_base64!!!",
+            "sbw1.",
+            "sbw1.AAAA",
+            "sbw1.c2J3MQEAAAAAAAAAAAAAAAAAAAAA", // truncated payload
+        ];
+
+        for bad in bad_cases {
+            let res = init_from_permalink(bad);
+            assert!(res.is_err(), "bad input '{bad}' must be rejected");
+        }
+
+        // Prove the SAME instance is not poisoned: subsequent valid init succeeds
+        let valid_link = make_test_permalink("meadow", 42, vec![]);
+        let handle =
+            init_from_permalink(&valid_link).expect("subsequent init_from_permalink must succeed");
+        let snap = handle
+            .tick_snapshot(2)
+            .expect("subsequent tick must succeed");
+        assert_eq!(snap.tick, 2);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn negative_unknown_knob_rejected_no_silent_repair() {
+        let mut permalink = Permalink {
+            scenario_id: "meadow".to_string(),
+            seed: 42,
+            knob_diff: vec![("completely_unknown_knob_xyz".to_string(), 123.0)],
+            config_digest: 0,
+            build: canonical_build_link(),
+        };
+        let base = base_config_for_scenario("meadow");
+        let base_json = serde_json::to_value(&base).unwrap();
+        permalink.config_digest = config_digest_with_diff(&base_json, &permalink.knob_diff);
+        let link_str = permalink.to_url_string();
+
+        let res = init_from_permalink(&link_str);
+        assert!(res.is_err(), "unknown knob must fail init_from_permalink");
+
+        let err = reconstruct_config_from_permalink(&permalink)
+            .expect_err("reconstruct must reject unknown knob");
+        assert!(
+            err.contains("completely_unknown_knob_xyz") || err.contains("unknown knob"),
+            "error message must name the unknown knob: {err}"
+        );
     }
 }

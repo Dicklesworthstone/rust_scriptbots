@@ -151,6 +151,64 @@
             text-transform: uppercase;
             letter-spacing: 0.08em;
         }
+
+        #mismatch-banner {
+            padding: 0.85rem 1.5rem;
+            font-size: 0.85rem;
+            line-height: 1.4;
+            display: none;
+            border-bottom: 2px solid transparent;
+        }
+
+        #mismatch-banner.banner-mismatch {
+            display: block;
+            background: #451a03;
+            border-bottom-color: #f59e0b;
+            color: #fef3c7;
+        }
+
+        #mismatch-banner.banner-compatible {
+            display: block;
+            background: #142e1d;
+            border-bottom-color: #10b981;
+            color: #d1fae5;
+        }
+
+        #mismatch-banner .banner-title {
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        #mismatch-banner .banner-details {
+            font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, monospace;
+            font-size: 0.75rem;
+            margin-top: 0.4rem;
+            background: rgba(0, 0, 0, 0.35);
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.3rem;
+            word-break: break-all;
+            line-height: 1.5;
+        }
+
+        .controls input[type="text"] {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 0.45rem 0.6rem;
+            border-radius: 0.4rem;
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid #1f2a44;
+            color: #e2e8f0;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.75rem;
+        }
+
+        .controls input[type="text"]:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
     </style>
 </head>
 <body>
@@ -158,6 +216,7 @@
         <h1>ScriptBots WASM Harness</h1>
         <span id="version">initializing…</span>
     </header>
+    <div id="mismatch-banner" role="alert" aria-live="polite"></div>
     <main>
         <section id="sim-container">
             <canvas id="sim-canvas" width="1280" height="720" aria-label="Simulation canvas"></canvas>
@@ -192,6 +251,46 @@
                     <input id="population" type="range" min="32" max="1024" step="32" value="256" />
                 </label>
                 <button id="reset-btn" type="button">Reset Simulation</button>
+            </div>
+            <div class="controls">
+                <div class="chip">Share &amp; Fork</div>
+                <label>
+                    Load Permalink
+                    <input id="permalink-input" type="text" placeholder="Paste sbw1... permalink" spellcheck="false" />
+                </label>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button id="load-permalink-btn" type="button" style="flex: 1;">Load Permalink</button>
+                    <button id="copy-permalink-btn" type="button" style="flex: 1; background: #334155;">Copy Current</button>
+                </div>
+                <div id="permalink-status" style="font-size: 0.75rem; opacity: 0.85;"></div>
+
+                <label>
+                    Fork Knob Patch (JSON)
+                    <input id="fork-patch-input" type="text" placeholder='{"food_growth_rate": 0.05}' spellcheck="false" />
+                </label>
+                <button id="fork-btn" type="button" style="background: #059669;">Fork This World</button>
+                <div id="fork-output" style="display: none; font-size: 0.75rem; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); padding: 0.5rem; border-radius: 0.25rem; word-break: break-all;">
+                    <div style="font-weight: 600; margin-bottom: 0.25rem; color: #6ee7b7;">Fork Created:</div>
+                    <div id="fork-child-link" style="font-family: monospace; font-size: 0.7rem;"></div>
+                    <div style="margin-top: 0.4rem; display: flex; gap: 0.4rem;">
+                        <button id="load-forked-btn" type="button" style="padding: 0.3rem 0.5rem; font-size: 0.7rem; background: #059669;">Load Forked</button>
+                        <button id="copy-fork-btn" type="button" style="padding: 0.3rem 0.5rem; font-size: 0.7rem; background: #334155;">Copy Link</button>
+                    </div>
+                </div>
+            </div>
+            <div id="diff-container" class="controls">
+                <div class="chip">Parent Scenario Diff</div>
+                <div id="diff-empty" style="font-size: 0.8rem; opacity: 0.7;">No knob differences from base scenario.</div>
+                <table id="diff-table" style="width: 100%; border-collapse: collapse; font-size: 0.75rem; display: none;">
+                    <thead>
+                        <tr style="border-bottom: 1px solid #1f2a44; text-align: left; opacity: 0.7;">
+                            <th style="padding: 0.25rem 0.4rem;">Knob</th>
+                            <th style="padding: 0.25rem 0.4rem;">Base</th>
+                            <th style="padding: 0.25rem 0.4rem;">This World</th>
+                        </tr>
+                    </thead>
+                    <tbody id="diff-tbody"></tbody>
+                </table>
             </div>
             <div class="chip">Timeline</div>
             <div id="log" aria-live="polite"></div>

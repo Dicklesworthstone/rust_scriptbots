@@ -520,6 +520,14 @@ impl Permalink {
     /// naming the offending knob. Runs before any world allocation.
     pub fn validate_knobs(&self) -> Result<(), PermalinkError> {
         let assignments: Vec<(String, f64)> = self.knob_diff.clone();
+        for (path, _) in &assignments {
+            if crate::knob_range(path).is_none() {
+                return Err(PermalinkError::InvalidKnobPath {
+                    path: path.clone(),
+                    reason: "unknown knob id not in registry",
+                });
+            }
+        }
         if let Some(violation) = crate::check_knob_ranges(&assignments).into_iter().next() {
             return Err(PermalinkError::OutOfRange {
                 path: violation.path,
@@ -993,6 +1001,15 @@ mod tests {
         assert!(matches!(
             error,
             PermalinkError::OutOfRange { ref path, .. } if path == "food_max"
+        ));
+
+        link.knob_diff = vec![("unknown_knob_id".to_owned(), 1.0)];
+        let error = link
+            .validate_knobs()
+            .expect_err("unknown knob id must be rejected");
+        assert!(matches!(
+            error,
+            PermalinkError::InvalidKnobPath { ref path, .. } if path == "unknown_knob_id"
         ));
     }
 

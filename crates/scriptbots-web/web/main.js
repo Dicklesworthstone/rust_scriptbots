@@ -1,4 +1,16 @@
-import initWasm, { init_sim, default_init_options, version } from "./pkg/scriptbots_web.js";
+import initWasm, * as wasm from "./pkg/scriptbots_web.js";
+
+const {
+    init_sim,
+    default_init_options,
+    version,
+    init_from_permalink,
+    permalink_of,
+    fork,
+    permalink_diff,
+    build_identity,
+    check_build_match,
+} = wasm;
 
 const canvas = document.getElementById("sim-canvas");
 const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
@@ -15,6 +27,25 @@ const stepsSlider = document.getElementById("steps-per-frame");
 const populationSlider = document.getElementById("population");
 const logView = document.getElementById("log");
 const versionEl = document.getElementById("version");
+
+const mismatchBannerEl = document.getElementById("mismatch-banner");
+const permalinkInput = document.getElementById("permalink-input");
+const loadPermalinkBtn = document.getElementById("load-permalink-btn");
+const copyPermalinkBtn = document.getElementById("copy-permalink-btn");
+const permalinkStatus = document.getElementById("permalink-status");
+const forkPatchInput = document.getElementById("fork-patch-input");
+const forkBtn = document.getElementById("fork-btn");
+const forkOutput = document.getElementById("fork-output");
+const forkChildLink = document.getElementById("fork-child-link");
+const loadForkedBtn = document.getElementById("load-forked-btn");
+const copyForkBtn = document.getElementById("copy-fork-btn");
+const diffContainer = document.getElementById("diff-container");
+const diffEmpty = document.getElementById("diff-empty");
+const diffTable = document.getElementById("diff-table");
+const diffTbody = document.getElementById("diff-tbody");
+
+let currentPermalink = null;
+let latestForkedLink = null;
 
 const metrics = {
     lastFrameTs: performance.now(),
@@ -48,6 +79,9 @@ populationSlider.addEventListener("input", () => {
 
 resetButton.addEventListener("click", () => {
     queuedReset = true;
+    if (permalinkStatus) {
+        permalinkStatus.textContent = "";
+    }
     appendLog("Reset requested");
 });
 
@@ -174,8 +208,283 @@ function stepSimulation(now) {
     requestAnimationFrame(stepSimulation);
 }
 
+function updateMismatchBanner(matchResult) {
+    if (!mismatchBannerEl) return;
+
+    if (!matchResult || matchResult.status === "exact") {
+        mismatchBannerEl.className = "";
+        mismatchBannerEl.style.display = "none";
+        mismatchBannerEl.innerHTML = "";
+        return;
+    }
+
+    if (matchResult.status === "compatible") {
+        mismatchBannerEl.className = "banner-compatible";
+        mismatchBannerEl.style.display = "block";
+        mismatchBannerEl.innerHTML = `
+            <div class="banner-title">
+                <span>&#9432;</span>
+                <span>Compatible Build Note</span>
+            </div>
+            <div>This world was recorded on a compatible build. Toolchain or lockfile differ, but core simulation digest matches.</div>
+            <div class="banner-details">
+                <div>Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}</div>
+                <div>Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}</div>
+            </div>
+        `;
+        return;
+    }
+
+    if (matchResult.status === "mismatch") {
+        mismatchBannerEl.className = "banner-mismatch";
+        mismatchBannerEl.style.display = "block";
+        mismatchBannerEl.innerHTML = `
+            <div class="banner-title">
+                <span>&#9888;</span>
+                <span>Build Mismatch Warning</span>
+            </div>
+            <div>This world was recorded on a different build (core digest ${matchResult.link_core_digest}). You are on build (core digest ${matchResult.local_core_digest}). Trajectories may diverge after tick 0.</div>
+            <div class="banner-details">
+                <div>Link Build: toolchain=${matchResult.link_toolchain_digest}, lockfile=${matchResult.link_lockfile_digest}, core=${matchResult.link_core_digest}</div>
+                <div>Running Build: toolchain=${matchResult.local_toolchain_digest}, lockfile=${matchResult.local_lockfile_digest}, core=${matchResult.local_core_digest}</div>
+                <div style="margin-top: 0.35rem; font-style: italic; opacity: 0.85;">Cross-target floating point equivalence between native and WebAssembly is an open research area (bd-2wj).</div>
+            </div>
+        `;
+    }
+}
+
+function updateDiffTable(linkStr) {
+    if (!diffTable || !diffTbody || !diffEmpty) return;
+
+    if (!linkStr || !permalink_diff) {
+        diffTable.style.display = "none";
+        diffEmpty.style.display = "block";
+        diffEmpty.textContent = "No knob differences from base scenario.";
+        return;
+    }
+
+    try {
+        const rows = permalink_diff(linkStr);
+        if (!rows || rows.length === 0) {
+            diffTable.style.display = "none";
+            diffEmpty.style.display = "block";
+            diffEmpty.textContent = "No knob differences from base scenario (0 diffs).";
+            diffTbody.innerHTML = "";
+            return;
+        }
+
+        diffEmpty.style.display = "none";
+        diffTable.style.display = "table";
+        diffTbody.innerHTML = "";
+
+        for (const row of rows) {
+            const tr = document.createElement("tr");
+            tr.style.borderBottom = "1px solid rgba(255,255,255,0.05)";
+
+            const tdKnob = document.createElement("td");
+            tdKnob.style.padding = "0.25rem 0.4rem";
+            tdKnob.style.fontFamily = "monospace";
+            tdKnob.textContent = row.knob;
+
+            const tdParent = document.createElement("td");
+            tdParent.style.padding = "0.25rem 0.4rem";
+            tdParent.textContent = (row.parent_value ?? row.parentValue ?? 0).toString();
+
+            const tdThis = document.createElement("td");
+            tdThis.style.padding = "0.25rem 0.4rem";
+            tdThis.style.fontWeight = "600";
+            tdThis.style.color = "#93c5fd";
+            tdThis.textContent = (row.this_value ?? row.thisValue ?? 0).toString();
+
+            tr.appendChild(tdKnob);
+            tr.appendChild(tdParent);
+            tr.appendChild(tdThis);
+            diffTbody.appendChild(tr);
+        }
+    } catch (err) {
+        console.warn("Could not compute permalink diff:", err);
+        diffTable.style.display = "none";
+        diffEmpty.style.display = "block";
+        diffEmpty.textContent = `Could not compute diff: ${err}`;
+    }
+}
+
+async function loadWorldFromPermalink(linkStr) {
+    if (!linkStr) return;
+    try {
+        if (permalinkStatus) {
+            permalinkStatus.textContent = "Loading permalink...";
+            permalinkStatus.style.color = "#93c5fd";
+        }
+
+        let matchResult = null;
+        if (check_build_match) {
+            try {
+                matchResult = check_build_match(linkStr);
+            } catch (e) {
+                console.warn("Failed to check build match:", e);
+            }
+        }
+
+        if (!init_from_permalink) {
+            throw new Error("init_from_permalink is not exported by wasm module");
+        }
+
+        const handle = init_from_permalink(linkStr);
+        simHandle = handle;
+        currentPermalink = linkStr;
+        if (permalinkInput) {
+            permalinkInput.value = linkStr;
+        }
+
+        try {
+            if (permalink_of) {
+                currentPermalink = permalink_of(simHandle);
+            } else if (simHandle.permalinkOf) {
+                currentPermalink = simHandle.permalinkOf();
+            }
+        } catch (_) {}
+
+        updateMismatchBanner(matchResult);
+        updateDiffTable(linkStr);
+        resetPerformanceWindows();
+
+        if (permalinkStatus) {
+            permalinkStatus.textContent = "World loaded from permalink";
+            permalinkStatus.style.color = "#34d399";
+        }
+        appendLog(`Loaded permalink world (${linkStr.slice(0, 20)}…)`);
+
+        try {
+            const url = new URL(window.location.href);
+            url.searchParams.set("world", linkStr);
+            window.history.replaceState({}, "", url.toString());
+        } catch (_) {}
+    } catch (err) {
+        console.error("Failed to load permalink:", err);
+        if (permalinkStatus) {
+            permalinkStatus.textContent = `Error: ${err}`;
+            permalinkStatus.style.color = "#f87171";
+        }
+        appendLog(`Failed to load permalink: ${err}`);
+    }
+}
+
+async function handleFork() {
+    if (!simHandle) {
+        appendLog("Cannot fork: simulation not running");
+        return;
+    }
+
+    let patch = {};
+    const patchText = forkPatchInput ? forkPatchInput.value.trim() : "";
+    if (patchText) {
+        try {
+            patch = JSON.parse(patchText);
+        } catch (e) {
+            if (permalinkStatus) {
+                permalinkStatus.textContent = "Invalid JSON in fork knob patch";
+                permalinkStatus.style.color = "#f87171";
+            }
+            appendLog(`Fork error: invalid JSON: ${e.message}`);
+            return;
+        }
+    }
+
+    try {
+        let childLink = null;
+        if (fork) {
+            childLink = fork(simHandle, patch);
+        } else if (simHandle.fork) {
+            childLink = simHandle.fork(patch);
+        } else {
+            throw new Error("fork is not exported by wasm module");
+        }
+
+        latestForkedLink = childLink;
+        if (forkChildLink) {
+            forkChildLink.textContent = childLink;
+        }
+        if (forkOutput) {
+            forkOutput.style.display = "block";
+        }
+        if (permalinkStatus) {
+            permalinkStatus.textContent = "Fork created successfully";
+            permalinkStatus.style.color = "#34d399";
+        }
+        appendLog(`Created fork child link (${childLink.slice(0, 20)}…)`);
+    } catch (err) {
+        console.error("Fork failed:", err);
+        if (permalinkStatus) {
+            permalinkStatus.textContent = `Fork error: ${err}`;
+            permalinkStatus.style.color = "#f87171";
+        }
+        appendLog(`Fork failed: ${err}`);
+    }
+}
+
+if (loadPermalinkBtn) {
+    loadPermalinkBtn.addEventListener("click", () => {
+        const link = permalinkInput ? permalinkInput.value.trim() : "";
+        if (link) {
+            loadWorldFromPermalink(link);
+        }
+    });
+}
+
+if (copyPermalinkBtn) {
+    copyPermalinkBtn.addEventListener("click", () => {
+        if (!currentPermalink && simHandle) {
+            try {
+                if (permalink_of) {
+                    currentPermalink = permalink_of(simHandle);
+                } else if (simHandle.permalinkOf) {
+                    currentPermalink = simHandle.permalinkOf();
+                }
+            } catch (_) {}
+        }
+        if (currentPermalink) {
+            navigator.clipboard.writeText(currentPermalink).then(() => {
+                if (permalinkStatus) {
+                    permalinkStatus.textContent = "Permalink copied to clipboard";
+                    permalinkStatus.style.color = "#34d399";
+                }
+            }).catch(() => {
+                if (permalinkInput) {
+                    permalinkInput.select();
+                }
+            });
+        }
+    });
+}
+
+if (forkBtn) {
+    forkBtn.addEventListener("click", handleFork);
+}
+
+if (loadForkedBtn) {
+    loadForkedBtn.addEventListener("click", () => {
+        if (latestForkedLink) {
+            loadWorldFromPermalink(latestForkedLink);
+        }
+    });
+}
+
+if (copyForkBtn) {
+    copyForkBtn.addEventListener("click", () => {
+        if (latestForkedLink) {
+            navigator.clipboard.writeText(latestForkedLink).then(() => {
+                if (permalinkStatus) {
+                    permalinkStatus.textContent = "Fork link copied to clipboard";
+                    permalinkStatus.style.color = "#34d399";
+                }
+            });
+        }
+    });
+}
+
 async function resetSimulation(populationOverride) {
-    const defaults = default_init_options();
+    const defaults = default_init_options ? default_init_options() : {};
     const seed = Math.floor(Math.random() * 1_000_000);
     const options = {
         ...defaults,
@@ -187,16 +496,56 @@ async function resetSimulation(populationOverride) {
 
     simHandle = init_sim(options);
     resetPerformanceWindows();
+
+    currentPermalink = null;
+    try {
+        if (permalink_of) {
+            currentPermalink = permalink_of(simHandle);
+        } else if (simHandle && simHandle.permalinkOf) {
+            currentPermalink = simHandle.permalinkOf();
+        }
+        if (currentPermalink && permalinkInput) {
+            permalinkInput.value = currentPermalink;
+        }
+    } catch (_) {}
+
+    updateMismatchBanner(null);
+    updateDiffTable(currentPermalink);
+
+    if (permalinkStatus) {
+        permalinkStatus.textContent = "";
+    }
+    if (forkOutput) {
+        forkOutput.style.display = "none";
+    }
+
+    try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("world");
+        url.searchParams.delete("permalink");
+        window.history.replaceState({}, "", url.toString());
+    } catch (_) {}
+
     appendLog(`Simulation reset (seed=${seed}, population=${populationOverride})`);
 }
 
 async function bootstrap() {
     try {
         await initWasm();
-        const tag = version();
-        versionEl.textContent = tag;
+        const tag = version ? version() : "unknown";
+        if (versionEl) {
+            versionEl.textContent = tag;
+        }
         appendLog(`Loaded ${tag}`);
-        await resetSimulation(population);
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const worldParam = urlParams.get("world") || urlParams.get("permalink");
+        if (worldParam && init_from_permalink) {
+            await loadWorldFromPermalink(worldParam);
+        } else {
+            await resetSimulation(population);
+        }
+
         requestAnimationFrame(stepSimulation);
     } catch (err) {
         console.error("Failed to initialise wasm module", err);

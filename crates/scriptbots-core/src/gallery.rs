@@ -496,13 +496,13 @@ pub fn create_gallery_permalink(
     Ok(permalink.to_url_string())
 }
 
-/// Run a simulation from a permalink up to `horizon_ticks` and return all narrative events.
-pub fn run_world_from_permalink(
-    permalink_str: &str,
-    horizon_ticks: u64,
-) -> Result<Vec<EventRecord>, String> {
-    let link =
-        Permalink::from_url_string(permalink_str).map_err(|e| format!("decode permalink: {e}"))?;
+/// Reconstruct a `ScriptBotsConfig` from a `Permalink`.
+///
+/// This is the shared composition path used across native and browser targets.
+/// It validates knobs against the registry, resolves the scenario's base configuration,
+/// verifies the embedded configuration digest, applies the inline knob diff, sets the root RNG seed,
+/// and validates the resulting configuration invariants before allocation.
+pub fn reconstruct_config_from_permalink(link: &Permalink) -> Result<ScriptBotsConfig, String> {
     link.validate_knobs()
         .map_err(|e| format!("validate knobs: {e}"))?;
 
@@ -514,7 +514,21 @@ pub fn run_world_from_permalink(
 
     apply_knob_diff(&mut config, &link.knob_diff)?;
     config.rng_seed = Some(link.seed);
+    config
+        .validate()
+        .map_err(|e| format!("validate composed config: {e}"))?;
 
+    Ok(config)
+}
+
+/// Run a simulation from a permalink up to `horizon_ticks` and return all narrative events.
+pub fn run_world_from_permalink(
+    permalink_str: &str,
+    horizon_ticks: u64,
+) -> Result<Vec<EventRecord>, String> {
+    let link =
+        Permalink::from_url_string(permalink_str).map_err(|e| format!("decode permalink: {e}"))?;
+    let config = reconstruct_config_from_permalink(&link)?;
     let mut world = WorldState::new(config).map_err(|e| format!("construct world: {e}"))?;
 
     for _ in 0..horizon_ticks {

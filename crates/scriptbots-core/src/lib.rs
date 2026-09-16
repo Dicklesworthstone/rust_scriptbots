@@ -82,6 +82,7 @@ pub mod reel;
 pub mod replay;
 pub mod rng_domains;
 
+pub use gallery::reconstruct_config_from_permalink;
 pub use replay::{
     ReplayScrubError, ReplayScrubFrame, ReplayScrubOutcome, replay_scrub_from_checkpoint,
 };
