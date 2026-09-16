@@ -96,8 +96,8 @@ pub use map_elites::{
     CandidateDescriptor, CellComparison, CellId, CellSelector, EvolutionSelectionMode,
     InsertionResult, MAX_ARCHIVE_CELLS, MapElitesArchive, NoveltyState, PhenotypeFeature,
     QdDiffError, QdError, QdMetrics, QualityMetric, archive_diff, combine_curiosity,
-    compute_novelty_score, compute_population_novelty, neumaier_sum, normalize_scores,
-    normalized_distance,
+    compute_novelty_score, compute_population_novelty, diff_csv, diff_json, format_stats_report,
+    neumaier_sum, normalize_scores, normalized_distance,
 };
 
 pub use economy::{

@@ -178,6 +178,9 @@ pub enum QdDiffError {
         /// Name in archive B.
         b_name: String,
     },
+    /// Archive deserialization error encountered during diff comparison.
+    #[error("archive deserialization error: {0}")]
+    Serialization(String),
 }
 
 /// Canonical phenotype features used as behavioral axes (bd-2z0.11.2).
@@ -598,6 +601,16 @@ impl QualityMetric {
             Self::LifetimeIntake => runtime.food_balance_total,
             Self::AgeAtEvaluation => data.age as f32,
             Self::OffspringCount => stats.offspring_count as f32,
+        }
+    }
+
+    /// Return the canonical string identifier for this quality metric.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LifetimeIntake => "lifetime_intake",
+            Self::AgeAtEvaluation => "age_at_evaluation",
+            Self::OffspringCount => "offspring_count",
         }
     }
 }
@@ -1229,6 +1242,66 @@ pub fn archive_diff(
         regressed_in_b,
         unchanged,
     })
+}
+
+/// Format a clean, self-describing human-readable and structured text table of QD metrics.
+#[must_use]
+pub fn format_stats_report(archive: &MapElitesArchive, run_id: &str) -> String {
+    let m = archive.metrics();
+    let max_q_str = m
+        .max_quality
+        .map_or_else(|| "N/A".to_string(), |q| format!("{q:.4}"));
+    format!(
+        "=== MAP-Elites Behavioral Archive Metrics ===\n\
+         Run ID:             {run_id}\n\
+         Space Version:      {}\n\
+         Quality Metric:     {}\n\
+         Min Lifetime Ticks: {}\n\
+         Occupied Cells:     {}\n\
+         Total Cells:        {}\n\
+         Coverage:           {:.4} ({:.2}%)\n\
+         Raw QD Score:       {:.4}\n\
+         Normalized QD:      {:.6}\n\
+         Mean Quality:       {:.4}\n\
+         Max Quality:        {max_q_str}\n\
+         Occupancy Entropy:  {:.6} bits\n\
+         Approx Bytes:       {} / {} bytes\n",
+        m.space_version,
+        m.quality_metric.as_str(),
+        archive.min_lifetime_ticks,
+        m.occupied_cells,
+        m.total_cells,
+        m.coverage,
+        m.coverage * 100.0,
+        m.qd_score_raw,
+        m.qd_score_norm,
+        m.mean_quality,
+        m.occupancy_entropy,
+        archive.current_bytes,
+        archive.max_archive_bytes,
+    )
+}
+
+/// Compute the structured difference between two serialized CSV archives.
+pub fn diff_csv<R1: std::io::BufRead, R2: std::io::BufRead>(
+    reader_a: R1,
+    reader_b: R2,
+    byte_cap: usize,
+) -> Result<ArchiveDiff, QdDiffError> {
+    let (_, archive_a) = MapElitesArchive::import_csv(reader_a, byte_cap)
+        .map_err(|e| QdDiffError::Serialization(e.to_string()))?;
+    let (_, archive_b) = MapElitesArchive::import_csv(reader_b, byte_cap)
+        .map_err(|e| QdDiffError::Serialization(e.to_string()))?;
+    archive_diff(&archive_a, &archive_b)
+}
+
+/// Compute the structured difference between two serialized JSON archives.
+pub fn diff_json(json_a: &str, json_b: &str) -> Result<ArchiveDiff, QdDiffError> {
+    let (_, archive_a) = MapElitesArchive::import_json(json_a)
+        .map_err(|e| QdDiffError::Serialization(e.to_string()))?;
+    let (_, archive_b) = MapElitesArchive::import_json(json_b)
+        .map_err(|e| QdDiffError::Serialization(e.to_string()))?;
+    archive_diff(&archive_a, &archive_b)
 }
 
 /// Accumulator tracking lifetime statistics for an agent.
@@ -1969,10 +2042,43 @@ impl MapElitesArchive {
         Ok(archive)
     }
 
+    /// Emit structured log of all current QD metrics under target `scriptbots::qd`.
+    pub fn log_metrics(&self, run_id: &str) {
+        let m = self.metrics();
+        diag_info!(
+            target: "scriptbots::qd",
+            run_id,
+            occupied_cells = m.occupied_cells,
+            total_cells = m.total_cells,
+            coverage = m.coverage,
+            qd_score_raw = m.qd_score_raw,
+            qd_score_norm = m.qd_score_norm,
+            mean_quality = m.mean_quality,
+            max_quality = m.max_quality,
+            occupancy_entropy = m.occupancy_entropy,
+            "archive stats"
+        );
+    }
+
     /// Serialize the archive bundle to a deterministic, indented JSON string.
     pub fn export_json(&self, run_id: &str) -> Result<String, QdError> {
         let bundle = self.export_bundle(run_id);
-        serde_json::to_string_pretty(&bundle).map_err(|e| QdError::Serialization(e.to_string()))
+        let s = serde_json::to_string_pretty(&bundle)
+            .map_err(|e| QdError::Serialization(e.to_string()))?;
+        let m = self.metrics();
+        diag_info!(
+            target: "scriptbots::qd",
+            run_id,
+            rows = self.cells.len(),
+            bytes = s.len(),
+            coverage = m.coverage,
+            qd_score_raw = m.qd_score_raw,
+            qd_score_norm = m.qd_score_norm,
+            space_version = self.space.version,
+            quality_version = self.quality_metric.as_str(),
+            "archive exported json"
+        );
+        Ok(s)
     }
 
     /// Reconstitute an archive from a JSON export bundle string.
@@ -1981,6 +2087,18 @@ impl MapElitesArchive {
             serde_json::from_str(json_str).map_err(|e| QdError::Serialization(e.to_string()))?;
         let run_id = bundle.run_id.clone();
         let archive = Self::from_bundle(bundle)?;
+        let m = archive.metrics();
+        diag_info!(
+            target: "scriptbots::qd",
+            run_id = %run_id,
+            rows = archive.cells.len(),
+            coverage = m.coverage,
+            qd_score_raw = m.qd_score_raw,
+            qd_score_norm = m.qd_score_norm,
+            space_version = archive.space.version,
+            quality_version = archive.quality_metric.as_str(),
+            "archive imported json"
+        );
         Ok((run_id, archive))
     }
 
@@ -2040,6 +2158,18 @@ impl MapElitesArchive {
         writer
             .flush()
             .map_err(|e| QdError::Serialization(e.to_string()))?;
+        let m = self.metrics();
+        diag_info!(
+            target: "scriptbots::qd",
+            run_id,
+            rows,
+            coverage = m.coverage,
+            qd_score_raw = m.qd_score_raw,
+            qd_score_norm = m.qd_score_norm,
+            space_version = self.space.version,
+            quality_version = self.quality_metric.as_str(),
+            "archive exported csv"
+        );
         Ok(rows)
     }
 
@@ -2156,6 +2286,19 @@ impl MapElitesArchive {
                 .saturating_add(entry.approximate_bytes());
             archive.cells.insert(CellId(cell_id), entry);
         }
+
+        let m = archive.metrics();
+        diag_info!(
+            target: "scriptbots::qd",
+            run_id = %header.run_id,
+            rows = archive.cells.len(),
+            coverage = m.coverage,
+            qd_score_raw = m.qd_score_raw,
+            qd_score_norm = m.qd_score_norm,
+            space_version = archive.space.version,
+            quality_version = archive.quality_metric.as_str(),
+            "archive imported csv"
+        );
 
         Ok((header.run_id, archive))
     }
@@ -3362,5 +3505,85 @@ mod tests {
         let empty_csv = "";
         let err = MapElitesArchive::import_csv(empty_csv.as_bytes(), 50_000).unwrap_err();
         assert!(matches!(err, QdError::Serialization(_)));
+    }
+
+    #[test]
+    fn test_format_stats_report_and_logging() {
+        let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis],
+        };
+        let mut archive = MapElitesArchive::new(space, QualityMetric::LifetimeIntake, 10, 50_000)
+            .expect("archive");
+        archive
+            .insert(make_test_entry(1, 15.0, vec![1.0]))
+            .expect("insert");
+
+        let report = format_stats_report(&archive, "test_run_123");
+        assert!(report.contains("test_run_123"));
+        assert!(report.contains("Coverage:"));
+        assert!(report.contains("Normalized QD:"));
+        assert!(report.contains("lifetime_intake"));
+
+        // Logging invocation shouldn't panic
+        archive.log_metrics("test_run_123");
+    }
+
+    #[test]
+    fn test_diff_csv_and_diff_json_success_and_failures() {
+        let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis],
+        };
+        let mut archive_a =
+            MapElitesArchive::new(space.clone(), QualityMetric::LifetimeIntake, 10, 50_000)
+                .expect("archive");
+        let mut archive_b = MapElitesArchive::new(space, QualityMetric::LifetimeIntake, 10, 50_000)
+            .expect("archive");
+
+        archive_a
+            .insert(make_test_entry(10, 20.0, vec![0.5]))
+            .expect("insert");
+        archive_a
+            .insert(make_test_entry(20, 50.0, vec![1.5]))
+            .expect("insert");
+
+        // B has cell 0 with higher quality (improved), lacks cell 1 (only_in_a), and has cell 2 (only_in_b)
+        archive_b
+            .insert(make_test_entry(10, 35.0, vec![0.5]))
+            .expect("insert");
+        archive_b
+            .insert(make_test_entry(30, 40.0, vec![2.5]))
+            .expect("insert");
+
+        // 1. CSV diff
+        let mut csv_a = Vec::new();
+        let mut csv_b = Vec::new();
+        archive_a.export_csv("run_a", &mut csv_a).expect("csv a");
+        archive_b.export_csv("run_b", &mut csv_b).expect("csv b");
+
+        let diff_csv_res = diff_csv(csv_a.as_slice(), csv_b.as_slice(), 50_000).expect("diff csv");
+        assert_eq!(diff_csv_res.improved_in_b.len(), 1);
+        assert_eq!(diff_csv_res.improved_in_b[0].cell_id, CellId(0));
+        assert_eq!(diff_csv_res.only_in_a.len(), 1);
+        assert_eq!(diff_csv_res.only_in_a[0], CellId(1));
+        assert_eq!(diff_csv_res.only_in_b.len(), 1);
+        assert_eq!(diff_csv_res.only_in_b[0], CellId(2));
+
+        // 2. JSON diff
+        let json_a = archive_a.export_json("run_a").expect("json a");
+        let json_b = archive_b.export_json("run_b").expect("json b");
+        let diff_json_res = diff_json(&json_a, &json_b).expect("diff json");
+        assert_eq!(diff_json_res, diff_csv_res);
+
+        // 3. Version mismatch failure
+        let diff_version_err = diff_json(&json_a, "{\"run_id\":\"b\",\"space\":{\"version\":999,\"axes\":[]},\"quality_metric\":\"LifetimeIntake\",\"min_lifetime_ticks\":10,\"max_bytes\":50000,\"cells\":[]}").unwrap_err();
+        assert!(matches!(diff_version_err, QdDiffError::Serialization(_)));
+
+        // 4. Missing run / malformed CSV
+        let malformed_err = diff_csv(b"".as_slice(), csv_b.as_slice(), 50_000).unwrap_err();
+        assert!(matches!(malformed_err, QdDiffError::Serialization(_)));
     }
 }

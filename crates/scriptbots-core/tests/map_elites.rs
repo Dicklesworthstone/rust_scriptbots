@@ -4,8 +4,8 @@ use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::map_elites::{
     ArchiveEntry, ArchiveProvenance, Axis, BEHAVIOR_SPACE_SCHEMA_VERSION_V0, BehaviorDescriptor,
     BehaviorSpaceV0, CellId, CellSelector, EvolutionSelectionMode, InsertionResult,
-    MAX_ARCHIVE_CELLS, MapElitesArchive, PhenotypeFeature, QdError, QualityMetric,
-    compute_novelty_score,
+    MAX_ARCHIVE_CELLS, MapElitesArchive, PhenotypeFeature, QdError, QualityMetric, archive_diff,
+    compute_novelty_score, diff_csv, diff_json, format_stats_report,
 };
 use scriptbots_core::{
     AgentData, AgentUid, BrainFamilyId, BrainGenomeEnvelope, BrainProvenance, Generation,
@@ -877,7 +877,7 @@ fn setup_test_world_with_mlp(
     (world, genome)
 }
 
-fn populate_archive(world: &mut WorldState, genome: &BrainGenomeEnvelope) {
+fn populate_archive_for_run(world: &mut WorldState, genome: &BrainGenomeEnvelope, run_id: &str) {
     let entries = [(101, 10.0, 0.5), (102, 50.0, 1.5), (103, 30.0, 2.5)];
     let archive = world.archive_mut().expect("archive must be present");
     for (uid, quality, speed) in entries {
@@ -888,13 +888,17 @@ fn populate_archive(world: &mut WorldState, genome: &BrainGenomeEnvelope) {
             quality,
             genome: genome.clone(),
             provenance: ArchiveProvenance {
-                run_id: "test_run".to_string(),
+                run_id: run_id.to_string(),
                 parent_uid: None,
                 generation: Generation(0),
             },
         };
         archive.insert(entry).expect("insert elite");
     }
+}
+
+fn populate_archive(world: &mut WorldState, genome: &BrainGenomeEnvelope) {
+    populate_archive_for_run(world, genome, "test_run");
 }
 
 #[test]
@@ -1098,4 +1102,174 @@ fn test_spawn_from_archive_determinism() {
     let digest1 = world1.characterization_digest_v0().expect("digest 1");
     let digest2 = world2.characterization_digest_v0().expect("digest 2");
     assert_eq!(digest1, digest2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_map_elites_export_reload_diff_resurrect_replay_e2e() {
+    println!(r#"{{"schema":"scriptbots.qd-archive.e2e.v1","phase":"start"}}"#);
+
+    let (mut world1, genome1) = setup_test_world_with_mlp(9999, true);
+    let (mut world2, genome2) = setup_test_world_with_mlp(9999, true);
+
+    populate_archive_for_run(&mut world1, &genome1, "e2e_run_9999");
+    populate_archive_for_run(&mut world2, &genome2, "e2e_run_9999");
+
+    let metrics = world1.archive().expect("archive").metrics();
+    assert_eq!(metrics.occupied_cells, 3);
+    assert!(metrics.coverage > 0.0);
+
+    // 1. Log metrics and check formatted stats report
+    world1
+        .archive()
+        .expect("archive")
+        .log_metrics("e2e_run_9999");
+    let report_str = format_stats_report(world1.archive().expect("archive"), "e2e_run_9999");
+    assert!(report_str.contains("e2e_run_9999"));
+    assert!(report_str.contains("Coverage:"));
+    assert!(report_str.contains("Occupied Cells:     3"));
+
+    println!(
+        r#"{{"schema":"scriptbots.qd-archive.e2e.v1","phase":"archive_populated","occupied_cells":3}}"#
+    );
+
+    // 2. Export to CSV and JSON
+    let mut csv_bytes = Vec::new();
+    let csv_rows = world1
+        .archive()
+        .expect("archive")
+        .export_csv("e2e_run_9999", &mut csv_bytes)
+        .expect("export csv");
+    assert_eq!(csv_rows, 3);
+
+    let json_str = world1
+        .archive()
+        .expect("archive")
+        .export_json("e2e_run_9999")
+        .expect("export json");
+
+    // 3. Reload from CSV and JSON into fresh archives
+    let (csv_run_id, reloaded_csv) =
+        MapElitesArchive::import_csv(csv_bytes.as_slice(), 50_000).expect("import csv");
+    assert_eq!(csv_run_id, "e2e_run_9999");
+    assert_eq!(reloaded_csv.cells, world1.archive().expect("archive").cells);
+    assert_eq!(reloaded_csv.metrics(), metrics);
+
+    let (json_run_id, reloaded_json) =
+        MapElitesArchive::import_json(&json_str).expect("import json");
+    assert_eq!(json_run_id, "e2e_run_9999");
+    assert_eq!(
+        reloaded_json.cells,
+        world1.archive().expect("archive").cells
+    );
+    assert_eq!(reloaded_json.metrics(), metrics);
+
+    println!(
+        r#"{{"schema":"scriptbots.qd-archive.e2e.v1","phase":"archive_exported_and_reloaded","verified":true}}"#
+    );
+
+    // 4. Create perturbed archive B and verify diff
+    let mut archive_b = reloaded_csv.clone();
+    // Improve cell 0 from 10.0 to 90.0
+    if let Some(entry) = archive_b.cells.get_mut(&CellId(0)) {
+        entry.quality = 90.0;
+    }
+    // Remove cell 1 (so it becomes only_in_a)
+    archive_b.cells.remove(&CellId(1));
+    // Insert new cell 3 (so it becomes only_in_b)
+    let entry3 = ArchiveEntry {
+        uid: AgentUid(303),
+        tick_inserted: Tick(15),
+        descriptor: BehaviorDescriptor::new(vec![3.2]),
+        quality: 75.0,
+        genome: genome1.clone(),
+        provenance: ArchiveProvenance {
+            run_id: "e2e_run_9999".to_string(),
+            parent_uid: None,
+            generation: Generation(1),
+        },
+    };
+    archive_b.insert(entry3).expect("insert cell 3");
+
+    let mut csv_b = Vec::new();
+    archive_b
+        .export_csv("e2e_run_b", &mut csv_b)
+        .expect("export b");
+
+    let diff = diff_csv(csv_bytes.as_slice(), csv_b.as_slice(), 50_000).expect("diff csv");
+    assert_eq!(diff.improved_in_b.len(), 1);
+    assert_eq!(diff.improved_in_b[0].cell_id, CellId(0));
+    assert_eq!(diff.only_in_a, vec![CellId(1)]);
+    assert_eq!(diff.only_in_b, vec![CellId(3)]);
+
+    let diff_json_res = diff_json(
+        &json_str,
+        &archive_b.export_json("e2e_run_b").expect("json b"),
+    )
+    .expect("diff json");
+    assert_eq!(diff, diff_json_res);
+
+    let diff_archive = archive_diff(&reloaded_csv, &archive_b).expect("diff archive");
+    assert_eq!(diff, diff_archive);
+
+    println!(
+        r#"{{"schema":"scriptbots.qd-archive.e2e.v1","phase":"archive_diff_verified","improved":1,"only_in_a":1,"only_in_b":1}}"#
+    );
+
+    // 5. Resurrect agents from archive into live world
+    let pop_before = world1.agent_count();
+    let intervention1 = Intervention::SpawnFromArchive {
+        selector: CellSelector::TopKByQuality(2),
+        placement: Placement::Seeded {
+            region: Region::All,
+            seed: 4321,
+        },
+        headroom: None,
+        herbivore_tendency: Some(0.75),
+    };
+    let intervention2 = Intervention::SpawnFromArchive {
+        selector: CellSelector::TopKByQuality(2),
+        placement: Placement::Seeded {
+            region: Region::All,
+            seed: 4321,
+        },
+        headroom: None,
+        herbivore_tendency: Some(0.75),
+    };
+
+    world1
+        .enqueue_intervention(intervention1)
+        .expect("enqueue 1");
+    world2
+        .enqueue_intervention(intervention2)
+        .expect("enqueue 2");
+
+    world1.step().expect("step 1");
+    world2.step().expect("step 2");
+
+    assert_eq!(world1.agent_count(), pop_before + 2);
+    assert_eq!(world2.agent_count(), pop_before + 2);
+
+    println!(
+        r#"{{"schema":"scriptbots.qd-archive.e2e.v1","phase":"resurrect_applied","agents_spawned":2}}"#
+    );
+
+    // 6. Step more and assert bit-identical determinism
+    for _ in 0..10 {
+        world1.step().expect("step world 1");
+        world2.step().expect("step world 2");
+    }
+
+    let digest1 = world1.characterization_digest_v0().expect("digest 1");
+    let digest2 = world2.characterization_digest_v0().expect("digest 2");
+    assert_eq!(digest1, digest2);
+
+    let world_digest1 = world1.world_digest_v1().expect("world digest 1");
+    let world_digest2 = world2.world_digest_v1().expect("world digest 2");
+    assert_eq!(world_digest1, world_digest2);
+
+    println!(
+        r#"{{"schema":"scriptbots.qd-archive.e2e.v1","phase":"replay_digest_verified","bit_exact":true}}"#
+    );
+    println!(r#"{{"schema":"scriptbots.qd-archive.e2e.v1","phase":"completed"}}"#);
 }
