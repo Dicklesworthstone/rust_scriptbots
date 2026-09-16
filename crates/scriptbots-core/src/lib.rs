@@ -6179,7 +6179,7 @@ impl ResourceLedgerState {
                 LedgerFault::CorruptGiveTransfer if kind == K::EnergySharing => {
                     // The giver is debited in full but the recipient credited half:
                     // the strictly conserved flow's net delta is no longer zero.
-                    delta.energy -= activity.energy * 0.5;
+                    delta.energy = activity.energy.mul_add(-0.5, delta.energy);
                 }
                 LedgerFault::ForgetEnergyCapSpill | LedgerFault::ForgetHealthCapSpill
                     if kind == K::CapacityRejection =>
@@ -20802,10 +20802,10 @@ impl WorldState {
         let max_agents = self.capture_budget.max_agents;
 
         let mut captured_agents = Vec::with_capacity(max_agents);
-        if let Some(id) = probed_agent {
-            if max_agents > 0 {
-                captured_agents.push(id);
-            }
+        if let Some(id) = probed_agent
+            && max_agents > 0
+        {
+            captured_agents.push(id);
         }
 
         let mut selected_total = usize::from(probed_agent.is_some());
@@ -20813,12 +20813,12 @@ impl WorldState {
             if Some(handle) == probed_agent {
                 continue;
             }
-            if let Some(runtime) = self.runtime.get(handle) {
-                if matches!(runtime.selection, SelectionState::Selected) {
-                    selected_total += 1;
-                    if captured_agents.len() < max_agents {
-                        captured_agents.push(handle);
-                    }
+            if let Some(runtime) = self.runtime.get(handle)
+                && matches!(runtime.selection, SelectionState::Selected)
+            {
+                selected_total += 1;
+                if captured_agents.len() < max_agents {
+                    captured_agents.push(handle);
                 }
             }
         }
@@ -24584,10 +24584,10 @@ impl WorldState {
             }
             self.agent_rng_counters.remove(*id);
         }
-        if let Some((probed_id, _)) = self.active_activation_probe {
-            if dead_ids.contains(&probed_id) {
-                self.active_activation_probe = None;
-            }
+        if let Some((probed_id, _)) = self.active_activation_probe
+            && dead_ids.contains(&probed_id)
+        {
+            self.active_activation_probe = None;
         }
         let removed = self.agents.remove_many(&dead_ids);
         self.last_deaths = removed;
@@ -26580,7 +26580,7 @@ impl WorldState {
     /// (bd-16g.11.2). Test/feature-gated; never available in a production build
     /// without the `economy-faults` feature.
     #[cfg(feature = "economy-faults")]
-    pub fn inject_ledger_fault(&mut self, fault: LedgerFault) {
+    pub const fn inject_ledger_fault(&mut self, fault: LedgerFault) {
         self.resource_ledger.fault = Some(fault);
     }
 
@@ -51650,6 +51650,11 @@ mod tests {
             closed: true,
             population_spawn_interval: 0,
             rng_seed: Some(0xCA97),
+            spike_damage: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
             ..ScriptBotsConfig::default()
         };
         let mut world = WorldState::new(config).expect("world init");
@@ -51659,7 +51664,7 @@ mod tests {
 
         // Select all 500 agents.
         let raw_ids: Vec<u64> = handles.iter().map(|id| id.data().as_ffi()).collect();
-        world.apply_selection_update(SelectionUpdate {
+        let _ = world.apply_selection_update(SelectionUpdate {
             mode: SelectionMode::Replace,
             agent_ids: raw_ids,
             state: SelectionState::Selected,
@@ -51711,6 +51716,11 @@ mod tests {
             closed: true,
             population_spawn_interval: 0,
             rng_seed: Some(0xDEAD),
+            spike_damage: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
             ..ScriptBotsConfig::default()
         };
         let mut world = WorldState::new(config).expect("world init");
@@ -51722,18 +51732,14 @@ mod tests {
         assert_eq!(world.active_activation_probe(), Some(agent_a));
         assert_eq!(world.active_activation_probe_uid(), Some(uid_a));
 
-        // Kill agent a.
-        world
-            .try_update_agent(agent_a, |data, runtime| {
-                data.health = 0.0;
-                runtime.energy = 0.0;
-            })
-            .expect("drain agent a");
+        // Kill agent a by exhausting health.
+        let idx_a = world.agents.index_of(agent_a).expect("index of agent a");
+        world.agents.columns_mut().health_mut()[idx_a] = 0.0;
 
         world.step().expect("step causing death cleanup");
-        assert_eq!(world.last_deaths, 1);
-        let death = world.pending_death_records.last().expect("death record");
-        assert_eq!(death.agent_uid, uid_a);
+        assert_eq!(world.agent_count(), 1);
+        assert!(!world.agents().contains(agent_a));
+        assert!(world.agents().contains(agent_b));
 
         // Probe should automatically clear to None.
         assert_eq!(world.active_activation_probe(), None);
@@ -51804,7 +51810,7 @@ mod tests {
         }
         world_b.set_activation_probe(Some(b_handles[3]));
         world_b.set_capture_budget(CaptureBudget { max_agents: 2 });
-        world_b.apply_selection_update(SelectionUpdate {
+        let _ = world_b.apply_selection_update(SelectionUpdate {
             mode: SelectionMode::Replace,
             agent_ids: vec![b_handles[1].data().as_ffi(), b_handles[5].data().as_ffi()],
             state: SelectionState::Selected,
