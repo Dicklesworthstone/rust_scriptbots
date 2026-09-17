@@ -147,17 +147,23 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    match run(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err @ AnalyticsError::UnknownReport(_)) => {
-            eprintln!("error: {err}");
-            ExitCode::from(2)
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    let builder = std::thread::Builder::new()
+        .name("sb-analyze-main".into())
+        .stack_size(32 * 1024 * 1024);
+    let handler = builder
+        .spawn(move || match run(&cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err @ AnalyticsError::UnknownReport(_)) => {
+                eprintln!("error: {err}");
+                ExitCode::from(2)
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        })
+        .expect("spawn sb-analyze executor thread");
+    handler.join().unwrap_or(ExitCode::FAILURE)
 }
 
 fn run(cli: &Cli) -> Result<(), AnalyticsError> {
