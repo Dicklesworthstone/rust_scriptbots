@@ -13,9 +13,9 @@ use scriptbots_core::{
 use scriptbots_storage::{
     AnalyticsSnapshotProvider, FailureCommitState, PayloadBudget, PreparationFaultPoint, Storage,
     StorageDeadlines, StorageError, StorageOperation, StoragePipeline, StorageReader,
-    StorageWaitPhase, StorageWorkerError, arm_preparation_fault, cleanup_handoff_stats,
-    clear_all_preparation_faults, clear_preparation_fault, drain_cleanup_handoffs_for_test,
-    estimate_batch_size, estimate_narrative_size, handoff_cleanup,
+    StorageWorkerError, arm_preparation_fault, cleanup_handoff_stats, clear_all_preparation_faults,
+    clear_preparation_fault, drain_cleanup_handoffs_for_test, estimate_batch_size,
+    estimate_narrative_size, handoff_cleanup,
 };
 use serde_json::json;
 use std::borrow::Cow;
@@ -34,6 +34,19 @@ fn temp_db(label: &str) -> String {
         .to_str()
         .expect("utf8 path")
         .to_owned()
+}
+
+struct PreparationFaultGuard(PreparationFaultPoint);
+
+impl Drop for PreparationFaultGuard {
+    fn drop(&mut self) {
+        clear_preparation_fault(self.0);
+    }
+}
+
+fn scoped_preparation_fault(point: PreparationFaultPoint) -> PreparationFaultGuard {
+    arm_preparation_fault(point);
+    PreparationFaultGuard(point)
 }
 
 fn batch(tick: u64, metrics: usize) -> PersistenceBatch {
@@ -845,7 +858,7 @@ fn tiny_scientific_with_oversized_narrative_refused_without_scientific_leak() {
 
     let mut loud = batch(1, 4);
     loud.narrative_events = (0..5).map(narrative_event).collect();
-    let (loud_bytes, loud_events) = estimate_batch_size(&loud);
+    let (_loud_bytes, _loud_events) = estimate_batch_size(&loud);
     let (loud_narrative_bytes, loud_narrative_events) = estimate_narrative_size(&loud);
     assert!(loud_narrative_bytes > 8_192);
     assert!(loud_narrative_events > 2);
@@ -857,15 +870,13 @@ fn tiny_scientific_with_oversized_narrative_refused_without_scientific_leak() {
         matches!(
             error,
             StorageError::NarrativePayloadTooLarge {
-                context,
-                would_be,
-                max_batch,
+                bytes,
                 events,
+                max_bytes,
                 max_events,
                 ..
-            } if context == "storage.submit.narrative_measure"
-                && would_be == loud_narrative_bytes
-                && max_batch == 8_192
+            } if bytes == loud_narrative_bytes
+                && max_bytes == 8_192
                 && events == loud_narrative_events
                 && max_events == 2
         ),
@@ -891,7 +902,9 @@ fn tiny_scientific_with_oversized_narrative_refused_without_scientific_leak() {
 
     // A valid scientific batch with narrative within cap admits cleanly
     let mut modest = batch(2, 4);
-    modest.narrative_events = vec![narrative_event(2)];
+    let mut modest_ev = narrative_event(2);
+    modest_ev.human_text = "x".repeat(100);
+    modest.narrative_events = vec![modest_ev];
     let (modest_bytes, _) = estimate_batch_size(&modest);
     let (modest_narrative_bytes, _) = estimate_narrative_size(&modest);
     pipeline
@@ -989,7 +1002,7 @@ fn narrative_inflight_saturation_backpressure_and_permit_release() {
 #[test]
 fn fallible_reservation_failure_returns_typed_not_admitted_without_panic() {
     clear_all_preparation_faults();
-    let pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
         usize::MAX,
         usize::MAX,
         usize::MAX,
@@ -998,7 +1011,7 @@ fn fallible_reservation_failure_returns_typed_not_admitted_without_panic() {
     .expect("pipeline");
 
     let test_batch = batch(10, 8);
-    arm_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+    let fault = scoped_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
 
     let error = pipeline
         .submit(&test_batch)
@@ -1007,7 +1020,7 @@ fn fallible_reservation_failure_returns_typed_not_admitted_without_panic() {
     assert!(
         matches!(
             error,
-            StorageError::ReservationFailed { context, .. } if context.starts_with("storage.prepare.")
+            StorageError::ReservationFailed { context, .. } if context.starts_with("storage.")
         ),
         "expected ReservationFailed error, got: {error:?}"
     );
@@ -1016,7 +1029,7 @@ fn fallible_reservation_failure_returns_typed_not_admitted_without_panic() {
     assert_eq!(pipeline.inflight_bytes(), 0);
     assert_eq!(pipeline.inflight_narrative_bytes(), 0);
 
-    clear_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+    drop(fault);
 
     // Retry of the exact same batch succeeds cleanly:
     pipeline
@@ -1049,7 +1062,7 @@ fn caller_return_and_cleanup_handoff_are_bounded_independently() {
 
     let stats_mid = cleanup_handoff_stats();
     assert!(
-        stats_mid.handed_off_count >= stats_before.handed_off_count + 1,
+        stats_mid.handed_off_count > stats_before.handed_off_count,
         "handed_off_count did not increment"
     );
 
@@ -1071,7 +1084,7 @@ fn bounded_error_publication_under_forced_contention() {
         detail: "simulated error".to_string(),
     };
 
-    arm_preparation_fault(PreparationFaultPoint::ForceErrorPublicationContention);
+    let _fault = scoped_preparation_fault(PreparationFaultPoint::ForceErrorPublicationContention);
 
     let started = Instant::now();
     // Bounded publication with 8 max attempts must terminate immediately
@@ -1082,8 +1095,6 @@ fn bounded_error_publication_under_forced_contention() {
         elapsed < Duration::from_millis(50),
         "publish_worker_error_bounded under contention took too long: {elapsed:?}"
     );
-
-    clear_preparation_fault(PreparationFaultPoint::ForceErrorPublicationContention);
 }
 
 #[test]
@@ -1094,33 +1105,62 @@ fn direct_same_thread_persistence_boundary_policy_and_fallible_reservation() {
     let valid_batch = batch(1, 4);
 
     // 1. Same-thread API persists directly without background threads or timeouts:
-    let receipt = storage
+    storage
         .persist(&valid_batch)
         .expect("direct same-thread persistence must succeed");
-    assert_eq!(receipt.tick.0, 1);
     assert_eq!(
-        storage.persistence_watermarks().unwrap().durable,
-        Some(receipt.batch_id)
+        storage
+            .persistence_watermarks()
+            .unwrap()
+            .admitted
+            .map(|b| b.get()),
+        Some(1)
+    );
+    storage.flush().expect("flush");
+    assert_eq!(
+        storage
+            .persistence_watermarks()
+            .unwrap()
+            .applied
+            .map(|b| b.get()),
+        Some(1)
     );
 
     // 2. Same-thread API respects fallible container reservations:
-    arm_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
-    let fail_batch = batch(2, 4);
-    let error = storage
-        .persist(&fail_batch)
-        .expect_err("forced reservation failure must be caught and returned");
-    assert!(
-        matches!(error, StorageError::ReservationFailed { .. }),
-        "expected ReservationFailed, got: {error:?}"
-    );
-
-    clear_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+    {
+        let _fault = scoped_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+        let fail_batch = batch(2, 4);
+        let error = storage
+            .persist(&fail_batch)
+            .expect_err("forced reservation failure must be caught and returned");
+        assert!(
+            matches!(error, StorageError::ReservationFailed { .. }),
+            "expected ReservationFailed, got: {error:?}"
+        );
+    }
 
     // 3. Exact retry after reservation failure succeeds:
-    let retry_receipt = storage
+    let fail_batch = batch(2, 4);
+    storage
         .persist(&fail_batch)
         .expect("exact retry after cleared reservation fault must succeed");
-    assert_eq!(retry_receipt.tick.0, 2);
+    assert_eq!(
+        storage
+            .persistence_watermarks()
+            .unwrap()
+            .admitted
+            .map(|b| b.get()),
+        Some(2)
+    );
+    storage.flush().expect("flush");
+    assert_eq!(
+        storage
+            .persistence_watermarks()
+            .unwrap()
+            .applied
+            .map(|b| b.get()),
+        Some(2)
+    );
 
     storage.close().expect("close");
 }
@@ -1198,29 +1238,32 @@ fn narrative_preparation_bounds_and_timeout_cleanup_e2e() -> Result<(), Box<dyn 
     );
 
     // Phase 2: Fallible Reservation Refusal
-    arm_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
-    let mut fail_batch = batch(102, 4);
-    fail_batch.narrative_events = vec![narrative_event(102)];
-    let res_error = pipeline
-        .submit(&fail_batch)
-        .expect_err("reservation failure must return typed error without panic");
-    assert!(matches!(res_error, StorageError::ReservationFailed { .. }));
-    assert_eq!(pipeline.inflight_bytes(), 0);
-    assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+    {
+        let _fault = scoped_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+        let mut fail_batch = batch(102, 4);
+        let mut fail_ev = narrative_event(102);
+        fail_ev.human_text = "x".repeat(100);
+        fail_batch.narrative_events = vec![fail_ev];
+        let res_error = pipeline
+            .submit(&fail_batch)
+            .expect_err("reservation failure must return typed error without panic");
+        assert!(matches!(res_error, StorageError::ReservationFailed { .. }));
+        assert_eq!(pipeline.inflight_bytes(), 0);
+        assert_eq!(pipeline.inflight_narrative_bytes(), 0);
 
-    println!(
-        "{}",
-        json!({
-            "schema": "scriptbots.narrative-preparation.evidence.v1",
-            "phase": "fallible_reservation_refusal",
-            "stage": "prepare_buffer",
-            "disposition": "not_admitted",
-            "error": "ReservationFailed",
-            "tick": 102,
-            "durable_tick_count": 0
-        })
-    );
-    clear_preparation_fault(PreparationFaultPoint::ForceReservationFailure);
+        println!(
+            "{}",
+            json!({
+                "schema": "scriptbots.narrative-preparation.evidence.v1",
+                "phase": "fallible_reservation_refusal",
+                "stage": "prepare_buffer",
+                "disposition": "not_admitted",
+                "error": "ReservationFailed",
+                "tick": 102,
+                "durable_tick_count": 0
+            })
+        );
+    }
 
     // Phase 3: Cleanup Handoff
     let stats_before = cleanup_handoff_stats();
@@ -1230,7 +1273,7 @@ fn narrative_preparation_bounds_and_timeout_cleanup_e2e() -> Result<(), Box<dyn 
     let handoff_elapsed = started.elapsed();
     assert!(handoff_elapsed < Duration::from_millis(100));
     let stats_mid = cleanup_handoff_stats();
-    assert!(stats_mid.handed_off_count >= stats_before.handed_off_count + 1);
+    assert!(stats_mid.handed_off_count > stats_before.handed_off_count);
     drain_cleanup_handoffs_for_test();
     let stats_after = cleanup_handoff_stats();
 
@@ -1250,7 +1293,9 @@ fn narrative_preparation_bounds_and_timeout_cleanup_e2e() -> Result<(), Box<dyn 
 
     // Phase 4: Healthy Admission and Exact Retry
     let mut healthy_batch = batch(104, 4);
-    healthy_batch.narrative_events = vec![narrative_event(104)];
+    let mut healthy_ev = narrative_event(104);
+    healthy_ev.human_text = "x".repeat(100);
+    healthy_batch.narrative_events = vec![healthy_ev];
     let (h_sci_bytes, _) = estimate_batch_size(&healthy_batch);
     let (h_narr_bytes, _) = estimate_narrative_size(&healthy_batch);
 

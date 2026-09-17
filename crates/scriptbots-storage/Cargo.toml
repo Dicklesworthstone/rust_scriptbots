@@ -17,6 +17,7 @@ tracing = { workspace = true }
 scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-runtime = { path = "../scriptbots-runtime" }
 crossbeam-channel = "0.5"
+futures-lite = "2.6"
 
 [dev-dependencies]
 # Lab trace fingerprints must not depend on unrelated packages enabling this.

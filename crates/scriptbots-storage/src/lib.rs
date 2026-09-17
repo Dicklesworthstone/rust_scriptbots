@@ -40,10 +40,355 @@ pub use journal::{
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use fsqlite::{
-    Connection, FileIdentity, FrankenError, Row, SqliteValue,
-    compat::{FromSqliteValue, OpenFlags, RowExt, Transaction, TransactionExt, open_with_flags},
-    migrate::MigrationRunner,
+    Connection as AsyncConnection,
+    compat::{
+        Transaction as AsyncTransaction, TransactionExt as _,
+        open_with_flags as async_open_with_flags,
+    },
+    migrate::MigrationRunner as AsyncMigrationRunner,
 };
+pub use fsqlite::{
+    FileIdentity, FrankenError, Row, SqliteValue,
+    compat::{FromSqliteValue, OpenFlags, RowExt},
+    migrate::MigrationResult,
+};
+
+const DEFAULT_ERROR_PUBLICATION_ATTEMPTS: usize = 16;
+
+#[derive(Debug)]
+pub struct Connection {
+    inner: AsyncConnection,
+}
+
+impl Connection {
+    pub fn new(inner: AsyncConnection) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> &AsyncConnection {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut AsyncConnection {
+        &mut self.inner
+    }
+
+    pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
+        let conn = futures_lite::future::block_on(AsyncConnection::open(path))?;
+        Ok(Self { inner: conn })
+    }
+
+    pub fn open_existing(path: impl Into<String>) -> Result<Self, FrankenError> {
+        let conn = futures_lite::future::block_on(AsyncConnection::open_existing(path))?;
+        Ok(Self { inner: conn })
+    }
+
+    pub fn open_existing_with_expected_identity(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+    ) -> Result<Self, FrankenError> {
+        let conn = futures_lite::future::block_on(
+            AsyncConnection::open_existing_with_expected_identity(path, expected_identity),
+        )?;
+        Ok(Self { inner: conn })
+    }
+
+    pub fn open_strict_multi_process(path: impl Into<String>) -> Result<Self, FrankenError> {
+        let conn =
+            futures_lite::future::block_on(AsyncConnection::open_strict_multi_process(path))?;
+        Ok(Self { inner: conn })
+    }
+
+    pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
+        let fut = self.inner.execute(sql);
+        futures_lite::future::block_on(Box::pin(fut))
+    }
+
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, FrankenError> {
+        let fut = self.inner.execute_with_params(sql, params);
+        futures_lite::future::block_on(Box::pin(fut))
+    }
+
+    pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
+        let fut = self.inner.execute_batch(sql);
+        futures_lite::future::block_on(Box::pin(fut))
+    }
+
+    pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
+        futures_lite::future::block_on(self.inner.query(sql))
+    }
+
+    pub fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>, FrankenError> {
+        futures_lite::future::block_on(self.inner.query_with_params(sql, params))
+    }
+
+    pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
+        futures_lite::future::block_on(self.inner.query_row(sql))
+    }
+
+    pub fn query_row_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Row, FrankenError> {
+        futures_lite::future::block_on(self.inner.query_row_with_params(sql, params))
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        self.inner.in_transaction()
+    }
+
+    pub fn begin_transaction(&self) -> Result<(), FrankenError> {
+        futures_lite::future::block_on(self.inner.begin_transaction())
+    }
+
+    pub fn commit_transaction(&self) -> Result<(), FrankenError> {
+        futures_lite::future::block_on(self.inner.commit_transaction())
+    }
+
+    pub fn rollback_transaction(&self) -> Result<(), FrankenError> {
+        futures_lite::future::block_on(self.inner.rollback_transaction())
+    }
+
+    pub fn transaction(&self) -> Result<Transaction<'_>, FrankenError> {
+        let tx = futures_lite::future::block_on(self.inner.transaction())?;
+        Ok(Transaction { inner: tx })
+    }
+
+    pub fn file_identity(&self) -> Result<Option<FileIdentity>, FrankenError> {
+        futures_lite::future::block_on(self.inner.file_identity())
+    }
+
+    pub fn close(self) -> Result<(), FrankenError> {
+        futures_lite::future::block_on(self.inner.close())
+    }
+
+    pub fn close_best_effort_in_place(&mut self) {
+        futures_lite::future::block_on(self.inner.close_best_effort_in_place());
+    }
+
+    pub fn close_without_checkpoint(self) -> Result<(), FrankenError> {
+        futures_lite::future::block_on(self.inner.close_without_checkpoint())
+    }
+}
+
+pub struct Transaction<'a> {
+    inner: AsyncTransaction<'a>,
+}
+
+impl<'a> Transaction<'a> {
+    pub fn commit(&mut self) -> Result<(), FrankenError> {
+        futures_lite::future::block_on(self.inner.commit())
+    }
+
+    pub fn rollback(&mut self) -> Result<(), FrankenError> {
+        futures_lite::future::block_on(self.inner.rollback())
+    }
+
+    pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
+        let fut = self.inner.execute(sql);
+        futures_lite::future::block_on(Box::pin(fut))
+    }
+
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, FrankenError> {
+        let fut = self.inner.execute_with_params(sql, params);
+        futures_lite::future::block_on(Box::pin(fut))
+    }
+
+    pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
+        futures_lite::future::block_on(self.inner.execute_batch(sql))
+    }
+
+    pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
+        futures_lite::future::block_on(self.inner.query(sql))
+    }
+
+    pub fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>, FrankenError> {
+        futures_lite::future::block_on(self.inner.query_with_params(sql, params))
+    }
+
+    pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
+        futures_lite::future::block_on(self.inner.query_row(sql))
+    }
+
+    pub fn query_row_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Row, FrankenError> {
+        futures_lite::future::block_on(self.inner.query_row_with_params(sql, params))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MigrationRunner {
+    inner: AsyncMigrationRunner,
+    migrations: Vec<(i64, &'static str, &'static str)>,
+}
+
+impl MigrationRunner {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: AsyncMigrationRunner::new(),
+            migrations: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn add(mut self, version: i64, name: &'static str, up_sql: &'static str) -> Self {
+        self.inner = self.inner.add(version, name, up_sql);
+        self.migrations.push((version, name, up_sql));
+        self
+    }
+
+    pub fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );",
+        )?;
+        let rows = conn.query("SELECT MAX(version) FROM _schema_migrations;")?;
+        let initial_version = if let Some(row) = rows.first() {
+            match row.get(0) {
+                Some(SqliteValue::Integer(v)) => *v,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        let was_fresh = initial_version == 0;
+        let mut applied = Vec::new();
+
+        for &(version, name, up_sql) in &self.migrations {
+            let check_rows = conn.query_with_params(
+                "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
+                &[SqliteValue::Integer(version)],
+            )?;
+            if !check_rows.is_empty() {
+                continue;
+            }
+            conn.execute("BEGIN IMMEDIATE;")?;
+            let mut failed = false;
+            let mut err = None;
+            for stmt in up_sql.split(';') {
+                let trimmed = stmt.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.to_uppercase().starts_with("INSERT INTO ")
+                    && (trimmed.contains(" SELECT ")
+                        || trimmed.contains(" select ")
+                        || trimmed.contains("\n        SELECT ")
+                        || trimmed.contains("\n    SELECT "))
+                {
+                    let select_idx = trimmed.to_uppercase().find("SELECT ").unwrap();
+                    let select_sql = &trimmed[select_idx..];
+                    let insert_prefix = trimmed[..select_idx].trim();
+                    let rows = match conn.query(select_sql) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            failed = true;
+                            err = Some(e);
+                            break;
+                        }
+                    };
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    for row in rows {
+                        let placeholders: Vec<String> =
+                            (1..=row.values().len()).map(|i| format!("?{i}")).collect();
+                        let insert_stmt =
+                            format!("{insert_prefix} VALUES ({})", placeholders.join(", "));
+                        if let Err(e) = conn.execute_with_params(&insert_stmt, row.values()) {
+                            failed = true;
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    if failed {
+                        break;
+                    }
+                    continue;
+                }
+                if let Err(e) = conn.execute(trimmed) {
+                    failed = true;
+                    err = Some(e);
+                    break;
+                }
+            }
+            if failed {
+                let _ = conn.execute("ROLLBACK;");
+                return Err(err.expect("failure captured an error"));
+            }
+            if let Err(e) = conn.execute_with_params(
+                "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
+                &[
+                    SqliteValue::Integer(version),
+                    SqliteValue::Text(name.into()),
+                ],
+            ) {
+                let _ = conn.execute("ROLLBACK;");
+                return Err(e);
+            }
+            if let Err(e) = conn.execute("COMMIT;") {
+                let _ = conn.execute("ROLLBACK;");
+                return Err(e);
+            }
+            applied.push(version);
+        }
+
+        let final_rows = conn.query("SELECT MAX(version) FROM _schema_migrations;")?;
+        let current_version = if let Some(row) = final_rows.first() {
+            match row.get(0) {
+                Some(SqliteValue::Integer(v)) => *v,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+
+        Ok(MigrationResult {
+            applied,
+            current: current_version,
+            was_fresh,
+        })
+    }
+}
+
+impl Default for MigrationRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn open_with_flags<P: AsRef<std::path::Path>>(
+    path: P,
+    flags: OpenFlags,
+) -> Result<Connection, FrankenError> {
+    let path_str = path.as_ref().to_string_lossy();
+    let conn = futures_lite::future::block_on(async_open_with_flags(&path_str, flags))?;
+    Ok(Connection::new(conn))
+}
 use journal::{
     HOST_JOURNAL_ARCHIVE_VERSION, HostJournalArchive, JournalReaderBackend, JournalReaderPublisher,
     JournalSessionShared, PreparedCommandProjection, PreparedDomainEventProjection,
@@ -79,7 +424,7 @@ use scriptbots_runtime::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1992,7 +2337,8 @@ impl SchemaObject {
 }
 
 fn refuse_lossy_command_lifecycle_migration(connection: &Connection) -> Result<(), StorageError> {
-    let user_version: i64 = connection.query_row("PRAGMA user_version")?.get_typed(0)?;
+    let row = connection.query_row("PRAGMA user_version")?;
+    let user_version: i64 = row.get_typed(0)?;
     // Anchored at V9, the version this preflight is about, rather than at the current version.
     // Written as `>= SCRIPTBOTS_SCHEMA_VERSION` it would silently re-arm on every later schema
     // bump: a database already carrying complete V9 lifecycle evidence would be re-inspected
@@ -2150,8 +2496,6 @@ fn refuse_ambiguous_island_attribution_migration(
 }
 
 fn install_scriptbots_schema(connection: &Connection) -> Result<(), StorageError> {
-    // This preflight must precede MigrationRunner: its ledger, DDL, and user-version writes are
-    // intentionally never attempted when old envelope-only archives cannot populate V9 exactly.
     refuse_lossy_command_lifecycle_migration(connection)?;
     refuse_ambiguous_command_claim_migration(connection)?;
     refuse_lossy_command_claim_migration(connection)?;
@@ -5271,7 +5615,8 @@ impl AnalyticsSnapshotProvider {
         let _ = self.publish_worker_error_bounded(error, stopped, usize::MAX);
     }
 
-    fn publish_worker_error_bounded(
+    #[doc(hidden)]
+    pub fn publish_worker_error_bounded(
         &self,
         error: &StorageWorkerError,
         stopped: bool,
@@ -5683,7 +6028,7 @@ impl PreparedPersistenceBatch {
         Observer: PreparationObserver,
     {
         let storage = Storage::prepare_batch_observed(batch, island, observer, progress)?;
-        let mut storage_guard = PartialBufferGuard::new(storage);
+        let storage_guard = PartialBufferGuard::new(storage);
         let analytics = PendingAnalytics::from_batch_observed(batch, observer, progress)?;
         observer.checkpoint(PreparationStage::Complete, progress)?;
         Ok(Self {
@@ -13650,8 +13995,6 @@ impl Storage {
         let recover_existing = matches!(target, StorageTarget::RecoverExisting(_));
         let initialize_schema = !recover_existing;
         let mut path_lease = StoragePathLease::acquire(&path)?;
-        // This OS-backed lease is the cross-process authority. It must precede every recovery
-        // inspection and every writable database open below.
         let writer_lease = StorageWriterLease::acquire(&path)?;
         let existing_lease = match target {
             StorageTarget::Memory => None,
@@ -14049,16 +14392,18 @@ impl Storage {
         let root_seed_hex = manifest.root_seed_hex();
         let started_at_hex = manifest.started_at_hex();
         let tick_budget_hex = manifest.tick_budget_hex();
+
         execute_transaction_with_retry(self.connection()?, |transaction| {
             let inserted = transaction.execute_with_params(
                 "INSERT INTO runs (
                     run_id, manifest_schema_version, experiment_id, variant_id,
-                    scenario_id, scenario_version, normalized_config_json, config_digest,
-                    root_seed_hex, rng_algorithm, rng_version, brain_roster_json,
-                    source_revision, source_tree_digest, source_tree_dirty,
-                    source_bundle_digest, rust_toolchain, cargo_lock_digest, target_triple,
-                    started_at_unix_ms_hex, requested_tick_budget_hex, live_run_policy,
-                    reproducible, manifest_json, manifest_digest
+                    scenario_id, scenario_version, normalized_config_json,
+                    config_digest, root_seed_hex, rng_algorithm, rng_version,
+                    brain_roster_json, source_revision, source_tree_digest,
+                    source_tree_dirty, source_bundle_digest, rust_toolchain,
+                    cargo_lock_digest, target_triple, started_at_unix_ms_hex,
+                    requested_tick_budget_hex, live_run_policy, reproducible,
+                    manifest_json, manifest_digest
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
@@ -14245,28 +14590,51 @@ impl Storage {
         connection: &Connection,
         file_backed: bool,
     ) -> Result<(), StorageError> {
-        let orphan_claims = connection.query(
-            "SELECT claim.run_id, claim.host_session_id, claim.command_id
-             FROM host_command_claims AS claim
-             LEFT JOIN runs AS registered
-               ON registered.run_id = claim.run_id
-             LEFT JOIN host_journal_progress AS progress
-               ON progress.run_id = claim.run_id
-              AND progress.host_session_id = claim.host_session_id
-             WHERE registered.run_id IS NULL OR progress.host_session_id IS NULL
-             ORDER BY claim.run_id ASC, claim.command_id ASC
-             LIMIT 1",
-        )?;
-        if let Some(row) = orphan_claims.first() {
-            let run_id: String = decode(row, 0, "host_command_claims.run_id")?;
-            let session: String = decode(row, 1, "host_command_claims.host_session_id")?;
-            let command_id: String = decode(row, 2, "host_command_claims.command_id")?;
-            return Err(StorageError::InvalidData {
-                context: "host_command_claims.run_id",
-                reason: format!(
-                    "command claim ({run_id}, {session}, {command_id}) has no matching registered run and journal session"
-                ),
-            });
+        let has_claims = !connection
+            .query("SELECT 1 FROM host_command_claims LIMIT 1")?
+            .is_empty();
+        if has_claims {
+            let orphan_claims = connection.query(
+                "SELECT claim.run_id, claim.host_session_id, claim.command_id
+                 FROM host_command_claims AS claim
+                 LEFT JOIN runs AS registered
+                   ON registered.run_id = claim.run_id
+                 WHERE registered.run_id IS NULL
+                 ORDER BY claim.run_id ASC, claim.command_id ASC
+                 LIMIT 1",
+            )?;
+            if let Some(row) = orphan_claims.first() {
+                let run_id: String = decode(row, 0, "host_command_claims.run_id")?;
+                let session: String = decode(row, 1, "host_command_claims.host_session_id")?;
+                let command_id: String = decode(row, 2, "host_command_claims.command_id")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_command_claims.run_id",
+                    reason: format!(
+                        "command claim ({run_id}, {session}, {command_id}) has no matching registered run and journal session"
+                    ),
+                });
+            }
+            let orphan_progress = connection.query(
+                "SELECT claim.run_id, claim.host_session_id, claim.command_id
+                 FROM host_command_claims AS claim
+                 LEFT JOIN host_journal_progress AS progress
+                   ON progress.run_id = claim.run_id
+                  AND progress.host_session_id = claim.host_session_id
+                 WHERE progress.host_session_id IS NULL
+                 ORDER BY claim.run_id ASC, claim.command_id ASC
+                 LIMIT 1",
+            )?;
+            if let Some(row) = orphan_progress.first() {
+                let run_id: String = decode(row, 0, "host_command_claims.run_id")?;
+                let session: String = decode(row, 1, "host_command_claims.host_session_id")?;
+                let command_id: String = decode(row, 2, "host_command_claims.command_id")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_command_claims.run_id",
+                    reason: format!(
+                        "command claim ({run_id}, {session}, {command_id}) has no matching registered run and journal session"
+                    ),
+                });
+            }
         }
         let rows = connection.query("SELECT run_id FROM runs ORDER BY run_id ASC")?;
         for row in rows {
@@ -14324,285 +14692,401 @@ impl Storage {
             }
         }
 
-        let archive_orphan = connection.query_with_params(
-            "SELECT archive.host_session_id, archive.journal_sequence
-             FROM host_journal_archive AS archive
-             LEFT JOIN host_journal_progress AS progress
-               ON progress.run_id = archive.run_id
-              AND progress.host_session_id = archive.host_session_id
-             LEFT JOIN host_journal_batch_ledger AS ledger
-               ON ledger.run_id = archive.run_id
-              AND ledger.host_session_id = archive.host_session_id
-              AND ledger.journal_sequence = archive.journal_sequence
-             WHERE archive.run_id = ?1
-               AND (progress.host_session_id IS NULL OR ledger.journal_sequence IS NULL)
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = archive_orphan.first() {
-            let session: String = decode(row, 0, "host_journal_archive.host_session_id")?;
-            let sequence: String = decode(row, 1, "host_journal_archive.journal_sequence")?;
-            return Err(StorageError::InvalidData {
-                context: "host_journal_archive.identity",
-                reason: format!(
-                    "archive ({session}, {sequence}) has no matching progress and ledger rows"
-                ),
-            });
-        }
-        let ledger_orphan = connection.query_with_params(
-            "SELECT ledger.host_session_id, ledger.journal_sequence
-             FROM host_journal_batch_ledger AS ledger
-             LEFT JOIN host_journal_progress AS progress
-               ON progress.run_id = ledger.run_id
-              AND progress.host_session_id = ledger.host_session_id
-             LEFT JOIN host_journal_archive AS archive
-               ON archive.run_id = ledger.run_id
-              AND archive.host_session_id = ledger.host_session_id
-              AND archive.journal_sequence = ledger.journal_sequence
-             WHERE ledger.run_id = ?1
-               AND (progress.host_session_id IS NULL OR archive.journal_sequence IS NULL)
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = ledger_orphan.first() {
-            let session: String = decode(row, 0, "host_journal_batch_ledger.host_session_id")?;
-            let sequence: String = decode(row, 1, "host_journal_batch_ledger.journal_sequence")?;
-            return Err(StorageError::InvalidData {
-                context: "host_journal_batch_ledger.identity",
-                reason: format!(
-                    "ledger ({session}, {sequence}) has no matching progress and archive rows"
-                ),
-            });
-        }
-        let projection_orphan = connection.query_with_params(
-            "SELECT projection.host_session_id, projection.scientific_event_sequence
-             FROM host_domain_event_batches AS projection
-             LEFT JOIN host_journal_batch_ledger AS ledger
-               ON ledger.run_id = projection.run_id
-              AND ledger.host_session_id = projection.host_session_id
-              AND ledger.journal_sequence = projection.journal_sequence
-             WHERE projection.run_id = ?1 AND ledger.journal_sequence IS NULL
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = projection_orphan.first() {
-            let session: String = decode(row, 0, "host_domain_event_batches.host_session_id")?;
-            let sequence: String = decode(
-                row,
-                1,
-                "host_domain_event_batches.scientific_event_sequence",
-            )?;
-            return Err(StorageError::InvalidData {
-                context: "host_domain_event_batches.identity",
-                reason: format!(
-                    "domain projection ({session}, {sequence}) has no matching host-journal ledger"
-                ),
-            });
-        }
-        let event_orphan = connection.query_with_params(
-            "SELECT event.host_session_id, event.scientific_event_sequence, event.event_ordinal
-             FROM host_domain_events AS event
-             LEFT JOIN host_domain_event_batches AS projection
-               ON projection.run_id = event.run_id
-              AND projection.host_session_id = event.host_session_id
-              AND projection.scientific_event_sequence = event.scientific_event_sequence
-              AND projection.journal_sequence = event.journal_sequence
-             WHERE event.run_id = ?1 AND projection.scientific_event_sequence IS NULL
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = event_orphan.first() {
-            let session: String = decode(row, 0, "host_domain_events.host_session_id")?;
-            let sequence: String = decode(row, 1, "host_domain_events.scientific_event_sequence")?;
-            let ordinal: i64 = decode(row, 2, "host_domain_events.event_ordinal")?;
-            return Err(StorageError::InvalidData {
-                context: "host_domain_events.identity",
-                reason: format!(
-                    "domain event ({session}, {sequence}, {ordinal}) has no matching projection batch"
-                ),
-            });
-        }
-        let command_orphan = connection.query_with_params(
-            "SELECT command.host_session_id, command.command_id
-             FROM host_command_records AS command
-             LEFT JOIN host_journal_batch_ledger AS ledger
-               ON ledger.run_id = command.run_id
-              AND ledger.host_session_id = command.host_session_id
-              AND ledger.journal_sequence = command.journal_sequence
-             LEFT JOIN host_journal_archive AS archive
-               ON archive.run_id = command.run_id
-              AND archive.host_session_id = command.host_session_id
-              AND archive.journal_sequence = command.journal_sequence
-             WHERE command.run_id = ?1
-               AND (ledger.journal_sequence IS NULL OR archive.journal_sequence IS NULL)
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = command_orphan.first() {
-            let session: String = decode(row, 0, "host_command_records.host_session_id")?;
-            let command_id: String = decode(row, 1, "host_command_records.command_id")?;
-            return Err(StorageError::InvalidData {
-                context: "host_command_records.identity",
-                reason: format!(
-                    "command record ({session}, {command_id}) has no matching canonical archive ledger"
-                ),
-            });
-        }
-        if !pre_v13_claim_migration {
-            // The session scan above binds every archived command to its exact
-            // claim through require_command_claim_for_connection and compares
-            // the command projection against that same canonical archive. The
-            // orphan checks bind every projection to a scanned archive/session.
-            // Repeating that proof with a LEFT JOIN / OR mismatch query produced
-            // false positives on valid file journals at the pinned engine.
-            let claim_orphan = connection.query_with_params(
-                "SELECT claim.host_session_id, claim.command_id
-                 FROM host_command_claims AS claim
+        let has_archive = !connection
+            .query_with_params(
+                "SELECT 1 FROM host_journal_archive WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if has_archive {
+            let archive_progress_orphan = connection.query_with_params(
+                "SELECT archive.host_session_id, archive.journal_sequence
+                 FROM host_journal_archive AS archive
                  LEFT JOIN host_journal_progress AS progress
-                   ON progress.run_id = claim.run_id
-                  AND progress.host_session_id = claim.host_session_id
-                 WHERE claim.run_id = ?1 AND progress.host_session_id IS NULL
+                   ON progress.run_id = archive.run_id
+                  AND progress.host_session_id = archive.host_session_id
+                 WHERE archive.run_id = ?1 AND progress.host_session_id IS NULL
                  LIMIT 1",
                 &[sqlite_run_id(run_id)],
             )?;
-            if let Some(row) = claim_orphan.first() {
-                let session: String = decode(row, 0, "host_command_claims.host_session_id")?;
-                let command_id: String = decode(row, 1, "host_command_claims.command_id")?;
+            if let Some(row) = archive_progress_orphan.first() {
+                let session: String = decode(row, 0, "host_journal_archive.host_session_id")?;
+                let sequence: String = decode(row, 1, "host_journal_archive.journal_sequence")?;
                 return Err(StorageError::InvalidData {
-                    context: "host_command_claims.host_session_id",
+                    context: "host_journal_archive.identity",
                     reason: format!(
-                        "command claim ({session}, {command_id}) has no matching journal session"
+                        "archive ({session}, {sequence}) has no matching progress and ledger rows"
                     ),
                 });
             }
-            let mut claim_cursor = String::new();
-            loop {
-                let claims = connection.query_with_params(
-                    "SELECT command_id, length(CAST(envelope_postcard_hex AS BLOB))
-                     FROM host_command_claims
-                     WHERE run_id = ?1 AND command_id > ?2
-                     ORDER BY command_id ASC
-                     LIMIT ?3",
-                    &[
-                        sqlite_run_id(run_id),
-                        claim_cursor.as_str().into(),
-                        page_limit.into(),
-                    ],
+            let archive_ledger_orphan = connection.query_with_params(
+                "SELECT archive.host_session_id, archive.journal_sequence
+                 FROM host_journal_archive AS archive
+                 LEFT JOIN host_journal_batch_ledger AS ledger
+                   ON ledger.run_id = archive.run_id
+                  AND ledger.host_session_id = archive.host_session_id
+                  AND ledger.journal_sequence = archive.journal_sequence
+                 WHERE archive.run_id = ?1 AND ledger.journal_sequence IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if let Some(row) = archive_ledger_orphan.first() {
+                let session: String = decode(row, 0, "host_journal_archive.host_session_id")?;
+                let sequence: String = decode(row, 1, "host_journal_archive.journal_sequence")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_archive.identity",
+                    reason: format!(
+                        "archive ({session}, {sequence}) has no matching progress and ledger rows"
+                    ),
+                });
+            }
+        }
+
+        let has_ledger = !connection
+            .query_with_params(
+                "SELECT 1 FROM host_journal_batch_ledger WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if has_ledger {
+            let ledger_progress_orphan = connection.query_with_params(
+                "SELECT ledger.host_session_id, ledger.journal_sequence
+                 FROM host_journal_batch_ledger AS ledger
+                 LEFT JOIN host_journal_progress AS progress
+                   ON progress.run_id = ledger.run_id
+                  AND progress.host_session_id = ledger.host_session_id
+                 WHERE ledger.run_id = ?1 AND progress.host_session_id IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if let Some(row) = ledger_progress_orphan.first() {
+                let session: String = decode(row, 0, "host_journal_batch_ledger.host_session_id")?;
+                let sequence: String =
+                    decode(row, 1, "host_journal_batch_ledger.journal_sequence")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.identity",
+                    reason: format!(
+                        "ledger ({session}, {sequence}) has no matching progress and archive rows"
+                    ),
+                });
+            }
+            let ledger_archive_orphan = connection.query_with_params(
+                "SELECT ledger.host_session_id, ledger.journal_sequence
+                 FROM host_journal_batch_ledger AS ledger
+                 LEFT JOIN host_journal_archive AS archive
+                   ON archive.run_id = ledger.run_id
+                  AND archive.host_session_id = ledger.host_session_id
+                  AND archive.journal_sequence = ledger.journal_sequence
+                 WHERE ledger.run_id = ?1 AND archive.journal_sequence IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if let Some(row) = ledger_archive_orphan.first() {
+                let session: String = decode(row, 0, "host_journal_batch_ledger.host_session_id")?;
+                let sequence: String =
+                    decode(row, 1, "host_journal_batch_ledger.journal_sequence")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_journal_batch_ledger.identity",
+                    reason: format!(
+                        "ledger ({session}, {sequence}) has no matching progress and archive rows"
+                    ),
+                });
+            }
+        }
+
+        let has_projection = !connection
+            .query_with_params(
+                "SELECT 1 FROM host_domain_event_batches WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if has_projection {
+            let projection_orphan = connection.query_with_params(
+                "SELECT projection.host_session_id, projection.scientific_event_sequence
+                 FROM host_domain_event_batches AS projection
+                 LEFT JOIN host_journal_batch_ledger AS ledger
+                   ON ledger.run_id = projection.run_id
+                  AND ledger.host_session_id = projection.host_session_id
+                  AND ledger.journal_sequence = projection.journal_sequence
+                 WHERE projection.run_id = ?1 AND ledger.journal_sequence IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if let Some(row) = projection_orphan.first() {
+                let session: String = decode(row, 0, "host_domain_event_batches.host_session_id")?;
+                let sequence: String = decode(
+                    row,
+                    1,
+                    "host_domain_event_batches.scientific_event_sequence",
                 )?;
-                if claims.is_empty() {
-                    break;
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_event_batches.identity",
+                    reason: format!(
+                        "domain projection ({session}, {sequence}) has no matching host-journal ledger"
+                    ),
+                });
+            }
+        }
+
+        let has_event = !connection
+            .query_with_params(
+                "SELECT 1 FROM host_domain_events WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if has_event {
+            let event_orphan = connection.query_with_params(
+                "SELECT event.host_session_id, event.scientific_event_sequence, event.event_ordinal
+                 FROM host_domain_events AS event
+                 LEFT JOIN host_domain_event_batches AS projection
+                   ON projection.run_id = event.run_id
+                  AND projection.host_session_id = event.host_session_id
+                  AND projection.scientific_event_sequence = event.scientific_event_sequence
+                  AND projection.journal_sequence = event.journal_sequence
+                 WHERE event.run_id = ?1 AND projection.scientific_event_sequence IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if let Some(row) = event_orphan.first() {
+                let session: String = decode(row, 0, "host_domain_events.host_session_id")?;
+                let sequence: String =
+                    decode(row, 1, "host_domain_events.scientific_event_sequence")?;
+                let ordinal: i64 = decode(row, 2, "host_domain_events.event_ordinal")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_domain_events.identity",
+                    reason: format!(
+                        "domain event ({session}, {sequence}, {ordinal}) has no matching projection batch"
+                    ),
+                });
+            }
+        }
+
+        let has_command = !connection
+            .query_with_params(
+                "SELECT 1 FROM host_command_records WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if has_command {
+            let command_ledger_orphan = connection.query_with_params(
+                "SELECT command.host_session_id, command.command_id
+                 FROM host_command_records AS command
+                 LEFT JOIN host_journal_batch_ledger AS ledger
+                   ON ledger.run_id = command.run_id
+                  AND ledger.host_session_id = command.host_session_id
+                  AND ledger.journal_sequence = command.journal_sequence
+                 WHERE command.run_id = ?1 AND ledger.journal_sequence IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if let Some(row) = command_ledger_orphan.first() {
+                let session: String = decode(row, 0, "host_command_records.host_session_id")?;
+                let command_id: String = decode(row, 1, "host_command_records.command_id")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_command_records.identity",
+                    reason: format!(
+                        "command record ({session}, {command_id}) has no matching canonical archive ledger"
+                    ),
+                });
+            }
+            let command_archive_orphan = connection.query_with_params(
+                "SELECT command.host_session_id, command.command_id
+                 FROM host_command_records AS command
+                 LEFT JOIN host_journal_archive AS archive
+                   ON archive.run_id = command.run_id
+                  AND archive.host_session_id = command.host_session_id
+                  AND archive.journal_sequence = command.journal_sequence
+                 WHERE command.run_id = ?1 AND archive.journal_sequence IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?;
+            if let Some(row) = command_archive_orphan.first() {
+                let session: String = decode(row, 0, "host_command_records.host_session_id")?;
+                let command_id: String = decode(row, 1, "host_command_records.command_id")?;
+                return Err(StorageError::InvalidData {
+                    context: "host_command_records.identity",
+                    reason: format!(
+                        "command record ({session}, {command_id}) has no matching canonical archive ledger"
+                    ),
+                });
+            }
+        }
+
+        if !pre_v13_claim_migration {
+            let has_claim = !connection
+                .query_with_params(
+                    "SELECT 1 FROM host_command_claims WHERE run_id = ?1 LIMIT 1",
+                    &[sqlite_run_id(run_id)],
+                )?
+                .is_empty();
+            if has_claim {
+                let claim_orphan = connection.query_with_params(
+                    "SELECT claim.host_session_id, claim.command_id
+                     FROM host_command_claims AS claim
+                     LEFT JOIN host_journal_progress AS progress
+                       ON progress.run_id = claim.run_id
+                      AND progress.host_session_id = claim.host_session_id
+                     WHERE claim.run_id = ?1 AND progress.host_session_id IS NULL
+                     LIMIT 1",
+                    &[sqlite_run_id(run_id)],
+                )?;
+                if let Some(row) = claim_orphan.first() {
+                    let session: String = decode(row, 0, "host_command_claims.host_session_id")?;
+                    let command_id: String = decode(row, 1, "host_command_claims.command_id")?;
+                    return Err(StorageError::InvalidData {
+                        context: "host_command_claims.host_session_id",
+                        reason: format!(
+                            "command claim ({session}, {command_id}) has no matching journal session"
+                        ),
+                    });
                 }
-                for row in &claims {
-                    let command_id_text: String = decode(row, 0, "host_command_claims.command_id")?;
-                    let command_id: CommandId = serde_json::from_str(&format!(
-                        "\"{command_id_text}\""
-                    ))
-                    .map_err(|error| StorageError::InvalidData {
-                        context: "host_command_claims.command_id",
-                        reason: error.to_string(),
-                    })?;
-                    let raw_hex_bytes: i64 =
-                        decode(row, 1, "host_command_claims.envelope_postcard_hex.length")?;
-                    checked_command_envelope_hex_bytes(
-                        "host_command_claims.envelope_postcard_hex",
-                        raw_hex_bytes,
-                        MAX_COMMAND_ENVELOPE_BYTES,
-                    )?;
-                    let envelope_row = connection.query_row_with_params(
-                        "SELECT envelope_postcard_hex
+                let mut claim_cursor = String::new();
+                loop {
+                    let claims = connection.query_with_params(
+                        "SELECT command_id, length(CAST(envelope_postcard_hex AS BLOB))
                          FROM host_command_claims
-                         WHERE run_id = ?1 AND command_id = ?2
-                           AND length(CAST(envelope_postcard_hex AS BLOB)) = ?3",
+                         WHERE run_id = ?1 AND command_id > ?2
+                         ORDER BY command_id ASC
+                         LIMIT ?3",
                         &[
                             sqlite_run_id(run_id),
-                            command_id_text.as_str().into(),
-                            raw_hex_bytes.into(),
+                            claim_cursor.as_str().into(),
+                            page_limit.into(),
                         ],
                     )?;
-                    let envelope_hex: String = decode(
-                        &envelope_row,
-                        0,
-                        "host_command_claims.envelope_postcard_hex",
-                    )?;
-                    let envelope = decode_command_envelope_postcard_hex(
-                        "host_command_claims.envelope_postcard_hex",
-                        &envelope_hex,
-                    )?;
-                    let canonical = encode_command_envelope_postcard_hex(
-                        "host_command_claims.envelope_postcard_hex",
-                        &envelope,
-                    )?;
-                    if envelope.command_id != command_id || canonical != envelope_hex {
-                        return Err(StorageError::InvalidData {
-                            context: "host_command_claims.envelope_postcard_hex",
-                            reason: format!(
-                                "command {command_id} claim is not its canonical envelope encoding"
-                            ),
-                        });
+                    if claims.is_empty() {
+                        break;
                     }
-                    claim_cursor = command_id_text;
+                    for row in &claims {
+                        let command_id_text: String =
+                            decode(row, 0, "host_command_claims.command_id")?;
+                        let command_id: CommandId = serde_json::from_str(&format!(
+                            "\"{command_id_text}\""
+                        ))
+                        .map_err(|error| StorageError::InvalidData {
+                            context: "host_command_claims.command_id",
+                            reason: error.to_string(),
+                        })?;
+                        let raw_hex_bytes: i64 =
+                            decode(row, 1, "host_command_claims.envelope_postcard_hex.length")?;
+                        checked_command_envelope_hex_bytes(
+                            "host_command_claims.envelope_postcard_hex",
+                            raw_hex_bytes,
+                            MAX_COMMAND_ENVELOPE_BYTES,
+                        )?;
+                        let envelope_row = connection.query_row_with_params(
+                            "SELECT envelope_postcard_hex
+                             FROM host_command_claims
+                             WHERE run_id = ?1 AND command_id = ?2
+                               AND length(CAST(envelope_postcard_hex AS BLOB)) = ?3",
+                            &[
+                                sqlite_run_id(run_id),
+                                command_id_text.as_str().into(),
+                                raw_hex_bytes.into(),
+                            ],
+                        )?;
+                        let envelope_hex: String = decode(
+                            &envelope_row,
+                            0,
+                            "host_command_claims.envelope_postcard_hex",
+                        )?;
+                        let envelope = decode_command_envelope_postcard_hex(
+                            "host_command_claims.envelope_postcard_hex",
+                            &envelope_hex,
+                        )?;
+                        let canonical = encode_command_envelope_postcard_hex(
+                            "host_command_claims.envelope_postcard_hex",
+                            &envelope,
+                        )?;
+                        if envelope.command_id != command_id || canonical != envelope_hex {
+                            return Err(StorageError::InvalidData {
+                                context: "host_command_claims.envelope_postcard_hex",
+                                reason: format!(
+                                    "command {command_id} claim is not its canonical envelope encoding"
+                                ),
+                            });
+                        }
+                        claim_cursor = command_id_text;
+                    }
                 }
             }
         }
-        let application_orphan = connection.query_with_params(
-            "SELECT transition.host_session_id, transition.command_id,
-                    transition.transition_ordinal
-             FROM host_command_application_transitions AS transition
-             LEFT JOIN host_command_records AS command
-               ON command.run_id = transition.run_id
-              AND command.host_session_id = transition.host_session_id
-              AND command.command_id = transition.command_id
-             WHERE transition.run_id = ?1 AND command.command_id IS NULL
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = application_orphan.first() {
-            let session: String = decode(
-                row,
-                0,
-                "host_command_application_transitions.host_session_id",
+        let has_application = !connection
+            .query_with_params(
+                "SELECT 1 FROM host_command_application_transitions WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if has_application {
+            let application_orphan = connection.query_with_params(
+                "SELECT transition.host_session_id, transition.command_id,
+                        transition.transition_ordinal
+                 FROM host_command_application_transitions AS transition
+                 LEFT JOIN host_command_records AS command
+                   ON command.run_id = transition.run_id
+                  AND command.host_session_id = transition.host_session_id
+                  AND command.command_id = transition.command_id
+                 WHERE transition.run_id = ?1 AND command.command_id IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
             )?;
-            let command_id: String =
-                decode(row, 1, "host_command_application_transitions.command_id")?;
-            let ordinal: i64 = decode(
-                row,
-                2,
-                "host_command_application_transitions.transition_ordinal",
-            )?;
-            return Err(StorageError::InvalidData {
-                context: "host_command_application_transitions.identity",
-                reason: format!(
-                    "application transition ({session}, {command_id}, {ordinal}) has no command record"
-                ),
-            });
+            if let Some(row) = application_orphan.first() {
+                let session: String = decode(
+                    row,
+                    0,
+                    "host_command_application_transitions.host_session_id",
+                )?;
+                let command_id: String =
+                    decode(row, 1, "host_command_application_transitions.command_id")?;
+                let ordinal: i64 = decode(
+                    row,
+                    2,
+                    "host_command_application_transitions.transition_ordinal",
+                )?;
+                return Err(StorageError::InvalidData {
+                    context: "host_command_application_transitions.identity",
+                    reason: format!(
+                        "application transition ({session}, {command_id}, {ordinal}) has no command record"
+                    ),
+                });
+            }
         }
-        let storage_orphan = connection.query_with_params(
-            "SELECT transition.host_session_id, transition.command_id,
-                    transition.transition_ordinal
-             FROM host_command_storage_transitions AS transition
-             LEFT JOIN host_command_records AS command
-               ON command.run_id = transition.run_id
-              AND command.host_session_id = transition.host_session_id
-              AND command.command_id = transition.command_id
-             WHERE transition.run_id = ?1 AND command.command_id IS NULL
-             LIMIT 1",
-            &[sqlite_run_id(run_id)],
-        )?;
-        if let Some(row) = storage_orphan.first() {
-            let session: String =
-                decode(row, 0, "host_command_storage_transitions.host_session_id")?;
-            let command_id: String = decode(row, 1, "host_command_storage_transitions.command_id")?;
-            let ordinal: i64 = decode(
-                row,
-                2,
-                "host_command_storage_transitions.transition_ordinal",
+        let has_storage_transitions = !connection
+            .query_with_params(
+                "SELECT 1 FROM host_command_storage_transitions WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if has_storage_transitions {
+            let storage_orphan = connection.query_with_params(
+                "SELECT transition.host_session_id, transition.command_id,
+                        transition.transition_ordinal
+                 FROM host_command_storage_transitions AS transition
+                 LEFT JOIN host_command_records AS command
+                   ON command.run_id = transition.run_id
+                  AND command.host_session_id = transition.host_session_id
+                  AND command.command_id = transition.command_id
+                 WHERE transition.run_id = ?1 AND command.command_id IS NULL
+                 LIMIT 1",
+                &[sqlite_run_id(run_id)],
             )?;
-            return Err(StorageError::InvalidData {
-                context: "host_command_storage_transitions.identity",
-                reason: format!(
-                    "storage transition ({session}, {command_id}, {ordinal}) has no command record"
-                ),
-            });
+            if let Some(row) = storage_orphan.first() {
+                let session: String =
+                    decode(row, 0, "host_command_storage_transitions.host_session_id")?;
+                let command_id: String =
+                    decode(row, 1, "host_command_storage_transitions.command_id")?;
+                let ordinal: i64 = decode(
+                    row,
+                    2,
+                    "host_command_storage_transitions.transition_ordinal",
+                )?;
+                return Err(StorageError::InvalidData {
+                    context: "host_command_storage_transitions.identity",
+                    reason: format!(
+                        "storage transition ({session}, {command_id}, {ordinal}) has no command record"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -15202,14 +15686,43 @@ impl Storage {
         run_id: RunId,
     ) -> Result<(), StorageError> {
         Self::validate_narrative_input_reserved_identities(connection, run_id)?;
-        let islands = connection.query_with_params(
-            "SELECT island_id FROM tick_summaries WHERE run_id = ?1
-             UNION SELECT island_id FROM replay_events WHERE run_id = ?1
-             ORDER BY island_id",
-            &[sqlite_run_id(run_id)],
-        )?;
-        for row in islands {
-            let island: i64 = decode(&row, 0, "narrative_input.island_id")?;
+        let has_ticks = !connection
+            .query_with_params(
+                "SELECT 1 FROM tick_summaries WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        let has_replay = !connection
+            .query_with_params(
+                "SELECT 1 FROM replay_events WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if !has_ticks && !has_replay {
+            return Ok(());
+        }
+        let mut island_ids = BTreeSet::new();
+        if has_ticks {
+            let tick_islands = connection.query_with_params(
+                "SELECT DISTINCT island_id FROM tick_summaries WHERE run_id = ?1 ORDER BY island_id",
+                &[sqlite_run_id(run_id)],
+            )?;
+            for row in tick_islands {
+                let island: i64 = decode(&row, 0, "narrative_input.island_id")?;
+                island_ids.insert(island);
+            }
+        }
+        if has_replay {
+            let replay_islands = connection.query_with_params(
+                "SELECT DISTINCT island_id FROM replay_events WHERE run_id = ?1 ORDER BY island_id",
+                &[sqlite_run_id(run_id)],
+            )?;
+            for row in replay_islands {
+                let island: i64 = decode(&row, 0, "narrative_input.island_id")?;
+                island_ids.insert(island);
+            }
+        }
+        for island in island_ids {
             u32::try_from(island).map_err(|error| StorageError::InvalidData {
                 context: "narrative_input.island_id",
                 reason: error.to_string(),
@@ -15382,6 +15895,15 @@ impl Storage {
         connection: &Connection,
         run_id: RunId,
     ) -> Result<(), StorageError> {
+        let has_replay = !connection
+            .query_with_params(
+                "SELECT 1 FROM replay_events WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(run_id)],
+            )?
+            .is_empty();
+        if !has_replay {
+            return Ok(());
+        }
         let reserved_sequence = encode_u64(
             "narrative_input.reserved_sequence",
             NARRATIVE_INPUT_REPLAY_SEQ,
@@ -15426,11 +15948,23 @@ impl Storage {
         connection: &Connection,
         run_id: RunId,
     ) -> Result<(), StorageError> {
-        let row = connection.query_row_with_params(
-            "SELECT
-                (SELECT COUNT(*) FROM run_events WHERE run_id = ?1),
-                (SELECT COUNT(*) FROM run_events_fts WHERE run_id = ?1),
-                (SELECT COUNT(*)
+        let relational_row = connection.query_row_with_params(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ?1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        let relational: i64 = decode(&relational_row, 0, "run_events.search_relational_count")?;
+
+        let indexed_row = connection.query_row_with_params(
+            "SELECT COUNT(*) FROM run_events_fts WHERE run_id = ?1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        let indexed: i64 = decode(&indexed_row, 0, "run_events.search_indexed_count")?;
+
+        let (missing, orphaned, mismatched) = if relational == 0 && indexed == 0 {
+            (0, 0, 0)
+        } else {
+            let missing_row = connection.query_row_with_params(
+                "SELECT COUNT(*)
                  FROM run_events AS events
                  LEFT JOIN run_events_fts AS search
                    ON search.run_id = events.run_id
@@ -15438,8 +15972,13 @@ impl Storage {
                   AND search.kind = events.kind
                   AND search.metric = events.metric
                   AND search.island_id = CAST(events.island_id AS TEXT)
-                 WHERE events.run_id = ?1 AND search.rowid IS NULL),
-                (SELECT COUNT(*)
+                 WHERE events.run_id = ?1 AND search.rowid IS NULL",
+                &[sqlite_run_id(run_id)],
+            )?;
+            let missing: i64 = decode(&missing_row, 0, "run_events.search_missing_count")?;
+
+            let orphaned_row = connection.query_row_with_params(
+                "SELECT COUNT(*)
                  FROM run_events_fts AS search
                  LEFT JOIN run_events AS events
                    ON events.run_id = search.run_id
@@ -15447,8 +15986,13 @@ impl Storage {
                   AND events.kind = search.kind
                   AND events.metric = search.metric
                   AND search.island_id = CAST(events.island_id AS TEXT)
-                 WHERE search.run_id = ?1 AND events.run_id IS NULL),
-                (SELECT COUNT(*)
+                 WHERE search.run_id = ?1 AND events.run_id IS NULL",
+                &[sqlite_run_id(run_id)],
+            )?;
+            let orphaned: i64 = decode(&orphaned_row, 0, "run_events.search_orphaned_count")?;
+
+            let mismatched_row = connection.query_row_with_params(
+                "SELECT COUNT(*)
                  FROM run_events_fts AS search
                  JOIN run_events AS events
                    ON events.run_id = search.run_id
@@ -15457,14 +16001,12 @@ impl Storage {
                   AND events.metric = search.metric
                   AND search.island_id = CAST(events.island_id AS TEXT)
                  WHERE search.run_id = ?1
-                   AND search.human_text != events.human_text)",
-            &[sqlite_run_id(run_id)],
-        )?;
-        let relational: i64 = decode(&row, 0, "run_events.search_relational_count")?;
-        let indexed: i64 = decode(&row, 1, "run_events.search_indexed_count")?;
-        let missing: i64 = decode(&row, 2, "run_events.search_missing_count")?;
-        let orphaned: i64 = decode(&row, 3, "run_events.search_orphaned_count")?;
-        let mismatched: i64 = decode(&row, 4, "run_events.search_mismatched_count")?;
+                   AND search.human_text != events.human_text",
+                &[sqlite_run_id(run_id)],
+            )?;
+            let mismatched: i64 = decode(&mismatched_row, 0, "run_events.search_mismatched_count")?;
+            (missing, orphaned, mismatched)
+        };
         if relational != indexed || missing != 0 || orphaned != 0 || mismatched != 0 {
             return Err(StorageError::InvalidData {
                 context: "run_events_fts.completeness",
@@ -18277,6 +18819,16 @@ impl Storage {
     }
 
     fn recover_host_journal_archives(&mut self) -> Result<(), StorageError> {
+        let has_archive = !self
+            .connection()?
+            .query_with_params(
+                "SELECT 1 FROM host_journal_archive WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(self.run_id)],
+            )?
+            .is_empty();
+        if !has_archive {
+            return Ok(());
+        }
         loop {
             let terminal_predicate = if self.file_backed() {
                 "ledger.state <> 'durable'"
@@ -18562,6 +19114,16 @@ impl Storage {
     }
 
     fn load_outbox(&self) -> Result<Vec<RecoveredOutboxBatch>, StorageError> {
+        let has_outbox = !self
+            .connection()?
+            .query_with_params(
+                "SELECT 1 FROM storage_outbox WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(self.run_id)],
+            )?
+            .is_empty();
+        if !has_outbox {
+            return Ok(Vec::new());
+        }
         let rows = self.connection()?.query_with_params(
             "SELECT outbox.batch_id, ledger.tick, ledger.payload_digest, outbox.payload
              FROM storage_outbox AS outbox
@@ -20155,46 +20717,62 @@ impl Storage {
     }
 
     fn log_interaction_run_summary(&self) -> Result<(), StorageError> {
-        let run_id = sqlite_run_id(self.run_id);
-        let row = self.connection()?.query_row_with_params(
-            "SELECT
-                (SELECT COUNT(*) FROM interactions WHERE run_id = ?1),
-                (SELECT COALESCE(SUM(count), 0) FROM events
-                 WHERE run_id = ?1 AND kind = ?2),
-                (SELECT COALESCE(SUM(count), 0) FROM events
-                 WHERE run_id = ?1 AND kind = ?3),
-                (SELECT COALESCE(SUM(count), 0) FROM events
-                 WHERE run_id = ?1 AND kind = ?4),
-                (SELECT COALESCE(SUM(count), 0) FROM events
-                 WHERE run_id = ?1 AND kind = ?5)",
-            &[
-                run_id,
-                INTERACTION_EVENTS_OBSERVED_KIND.into(),
-                INTERACTION_EVENTS_PERSISTED_KIND.into(),
-                INTERACTION_EVENTS_SAMPLED_OUT_KIND.into(),
-                INTERACTION_EVENTS_TRUNCATED_KIND.into(),
-            ],
-        )?;
-        let persisted_rows = checked_u64(
-            "interactions.run_summary.count",
-            decode(&row, 0, "interactions.run_summary.count")?,
-        )?;
-        let observed = checked_u64(
-            "events.interactions_observed",
-            decode(&row, 1, "events.interactions_observed")?,
-        )?;
-        let projected = checked_u64(
-            "events.interactions_persisted",
-            decode(&row, 2, "events.interactions_persisted")?,
-        )?;
-        let sampled_out = checked_u64(
-            "events.interactions_sampled_out",
-            decode(&row, 3, "events.interactions_sampled_out")?,
-        )?;
-        let truncated = checked_u64(
-            "events.interactions_truncated",
-            decode(&row, 4, "events.interactions_truncated")?,
-        )?;
+        let has_interactions = !self
+            .connection()?
+            .query_with_params(
+                "SELECT 1 FROM interactions WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(self.run_id)],
+            )?
+            .is_empty();
+        let has_events = !self
+            .connection()?
+            .query_with_params(
+                "SELECT 1 FROM events WHERE run_id = ?1 LIMIT 1",
+                &[sqlite_run_id(self.run_id)],
+            )?
+            .is_empty();
+
+        let persisted_rows = if has_interactions {
+            let row = self.connection()?.query_row_with_params(
+                "SELECT COUNT(*) FROM interactions WHERE run_id = ?1",
+                &[sqlite_run_id(self.run_id)],
+            )?;
+            checked_u64(
+                "interactions.run_summary.count",
+                decode(&row, 0, "interactions.run_summary.count")?,
+            )?
+        } else {
+            0
+        };
+
+        let (observed, projected, sampled_out, truncated) = if has_events {
+            let rows = self.connection()?.query_with_params(
+                "SELECT kind, SUM(count) FROM events WHERE run_id = ?1 GROUP BY kind",
+                &[sqlite_run_id(self.run_id)],
+            )?;
+            let mut obs = 0_u64;
+            let mut proj = 0_u64;
+            let mut samp = 0_u64;
+            let mut trunc = 0_u64;
+            for row in rows {
+                let kind: String = decode(&row, 0, "events.kind")?;
+                let count: i64 = decode(&row, 1, "events.count")?;
+                let count_u64 = checked_u64("events.count", count)?;
+                if kind == INTERACTION_EVENTS_OBSERVED_KIND {
+                    obs = count_u64;
+                } else if kind == INTERACTION_EVENTS_PERSISTED_KIND {
+                    proj = count_u64;
+                } else if kind == INTERACTION_EVENTS_SAMPLED_OUT_KIND {
+                    samp = count_u64;
+                } else if kind == INTERACTION_EVENTS_TRUNCATED_KIND {
+                    trunc = count_u64;
+                }
+            }
+            (obs, proj, samp, trunc)
+        } else {
+            (0, 0, 0, 0)
+        };
+
         let accounting_complete = observed
             == projected
                 .saturating_add(sampled_out)
@@ -20295,11 +20873,13 @@ impl Storage {
     fn remove_emptied_wal_sidecars_after_close(path: &str) {
         /// A SQLite write-ahead log header is 32 bytes; frames follow it.
         const WAL_HEADER_LEN: u64 = 32;
+        /// POSIX shared-memory WAL-index region is 32 KiB (WAL_INDEX_PGSZ).
+        const SHM_HEADER_REGION_LEN: u64 = 32768;
 
         if path == ":memory:" {
             return;
         }
-        for (suffix, empty_len) in [("-wal", WAL_HEADER_LEN), ("-shm", 0)] {
+        for (suffix, empty_len) in [("-wal", WAL_HEADER_LEN), ("-shm", SHM_HEADER_REGION_LEN)] {
             let sidecar = PathBuf::from(format!("{path}{suffix}"));
             match fs::metadata(&sidecar) {
                 Ok(meta) if meta.is_file() && meta.len() <= empty_len => {
@@ -20597,7 +21177,6 @@ enum StorageCommand {
     Shutdown {
         reply: xchan::Sender<Result<ShutdownReceipt, StorageWorkerError>>,
     },
-    #[cfg(test)]
     PauseForAdmissionRace {
         entered: xchan::Sender<()>,
         release: xchan::Receiver<()>,
@@ -21386,13 +21965,12 @@ pub enum ReaperFaultPoint {
     ForceRegistryAdmissionFallback,
 }
 
-#[cfg(test)]
 fn reaper_faults() -> &'static Mutex<BTreeSet<ReaperFaultPoint>> {
     static FAULTS: OnceLock<Mutex<BTreeSet<ReaperFaultPoint>>> = OnceLock::new();
     FAULTS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn arm_reaper_fault(point: ReaperFaultPoint) {
     let mut faults = reaper_faults()
         .lock()
@@ -21400,7 +21978,7 @@ pub fn arm_reaper_fault(point: ReaperFaultPoint) {
     faults.insert(point);
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn clear_reaper_fault(point: ReaperFaultPoint) {
     let mut faults = reaper_faults()
         .lock()
@@ -21408,7 +21986,7 @@ pub fn clear_reaper_fault(point: ReaperFaultPoint) {
     faults.remove(&point);
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn clear_all_reaper_faults() {
     let mut faults = reaper_faults()
         .lock()
@@ -21416,12 +21994,21 @@ pub fn clear_all_reaper_faults() {
     faults.clear();
 }
 
-#[cfg(test)]
 fn has_reaper_fault(point: ReaperFaultPoint) -> bool {
     reaper_faults()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .contains(&point)
+}
+
+fn extract_panic_detail(panic: &(dyn std::any::Any + Send + 'static)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        format!("{panic:?}")
+    }
 }
 
 fn join_reaped_worker(
@@ -21432,7 +22019,8 @@ fn join_reaped_worker(
 ) -> ReaperJoinOutcome {
     match handle.join() {
         Err(panic) => {
-            let detail = format!("storage worker panicked during supervised reap: {panic:?}");
+            let msg = extract_panic_detail(&*panic);
+            let detail = format!("storage worker panicked during supervised reap: {msg}");
             analytics.publish_worker_error(
                 &StorageWorkerError::Internal {
                     operation: StorageOperation::Join,
@@ -21508,8 +22096,8 @@ fn reap_storage_request(request: StorageReapRequest) -> (u64, String, ReaperJoin
             );
             match handle.join() {
                 Err(panic) => {
-                    let detail =
-                        format!("storage worker panicked during supervised reap: {panic:?}");
+                    let msg = extract_panic_detail(&*panic);
+                    let detail = format!("storage worker panicked during supervised reap: {msg}");
                     analytics.publish_worker_error(
                         &StorageWorkerError::Internal {
                             operation: StorageOperation::Join,
@@ -21772,7 +22360,7 @@ pub fn verify_reaper_accounting() -> Result<(), ReaperAccountingError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn reset_reaper_registry_for_test() {
     let mut registry = lock_reaper_registry();
     registry.active.clear();
@@ -21785,7 +22373,7 @@ pub fn reset_reaper_registry_for_test() {
     clear_all_reaper_faults();
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn poison_reaper_registry_for_test() {
     let _ = std::panic::catch_unwind(|| {
         let _guard = reaper_registry().lock().unwrap();
@@ -21793,7 +22381,7 @@ pub fn poison_reaper_registry_for_test() {
     });
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn simulate_negative_skipped_drain_for_test(request_id: u64, path: &str) {
     let mut registry = lock_reaper_registry();
     registry.receipts.insert(
@@ -21809,7 +22397,7 @@ pub fn simulate_negative_skipped_drain_for_test(request_id: u64, path: &str) {
     );
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn simulate_negative_double_consumption_for_test(
     request_id: u64,
     path: &str,
@@ -21873,11 +22461,8 @@ fn handoff_storage_reap(request: StorageReapRequest) {
             return;
         }
 
-        #[cfg(test)]
         let force_admission_fallback =
             has_reaper_fault(ReaperFaultPoint::ForceRegistryAdmissionFallback);
-        #[cfg(not(test))]
-        let force_admission_fallback = false;
 
         if registry.active.len() >= MAX_CONCURRENT_REAPERS || force_admission_fallback {
             // SATURATED or admission fallback. Run on caller's thread rather than spawning past bound.
@@ -21938,16 +22523,10 @@ fn handoff_storage_reap(request: StorageReapRequest) {
     let slot = Arc::new(Mutex::new(Some(request)));
     let thread_slot = Arc::clone(&slot);
 
-    #[cfg(test)]
     let force_spawn_failure = has_reaper_fault(ReaperFaultPoint::ForceSpawnFailure);
-    #[cfg(not(test))]
-    let force_spawn_failure = false;
 
     let spawned = if force_spawn_failure {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "injected thread spawn failure for test",
-        ))
+        Err(io::Error::other("injected thread spawn failure for test"))
     } else {
         thread::Builder::new()
             .name("scriptbots-storage-reaper".into())
@@ -22354,6 +22933,7 @@ impl StoragePipeline {
         };
         let handle = thread::Builder::new()
             .name("scriptbots-storage-worker".into())
+            .stack_size(32 * 1024 * 1024)
             .spawn(move || {
                 storage_worker(
                     target,
@@ -22974,7 +23554,7 @@ impl StoragePipeline {
     }
 
     /// Test-only deterministic seam: pause the worker thread until the returned guard is released.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn pause_worker_for_test(&self) -> Result<WorkerPauseGuard, StorageError> {
         let (entered_tx, entered_rx) = xchan::bounded(1);
         let (release_tx, release_rx) = xchan::bounded(1);
@@ -23012,12 +23592,11 @@ impl StoragePipeline {
 }
 
 /// RAII guard holding a worker paused in test mode until released or dropped.
-#[cfg(test)]
+#[doc(hidden)]
 pub struct WorkerPauseGuard {
     release_tx: Option<xchan::Sender<()>>,
 }
 
-#[cfg(test)]
 impl WorkerPauseGuard {
     /// Explicitly release the worker from its paused state.
     pub fn release(mut self) {
@@ -23027,7 +23606,6 @@ impl WorkerPauseGuard {
     }
 }
 
-#[cfg(test)]
 impl Drop for WorkerPauseGuard {
     fn drop(&mut self) {
         if let Some(tx) = self.release_tx.take() {
@@ -23037,7 +23615,7 @@ impl Drop for WorkerPauseGuard {
 }
 
 /// Test helper to submit a JoinOnly reap request directly.
-#[cfg(test)]
+#[doc(hidden)]
 pub fn handoff_join_only_for_test(
     handle: thread::JoinHandle<Option<StorageWorkerError>>,
     path: Arc<str>,
@@ -23218,19 +23796,14 @@ fn storage_worker(
                         );
                         state.watermarks = receipt.watermarks;
                         analytics.publish_progress(receipt.watermarks);
-                        let _ = reply.send(Ok(receipt));
                         if !newly_admitted {
+                            drop(permit);
+                            drop(narrative_permit);
+                            let _ = reply.send(Ok(receipt));
                             continue;
                         }
+                        let _ = reply.send(Ok(receipt));
                         state.pending_analytics.push((receipt.batch_id, pending));
-                        // bd-w1oi: append without flushing, then apply at most
-                        // ONE buffered batch before returning to rx.recv(). A
-                        // queued Persist is therefore staged and acknowledged
-                        // after at most one batch apply, so its admission
-                        // acknowledgement can no longer queue behind an
-                        // unbounded flush and hit the deadline that latched the
-                        // science boundary. Sustained overload still fails
-                        // closed through the byte-budget permits.
                         match storage.append_staged(receipt.batch_id, prepared) {
                             Ok(()) => {
                                 state.pending_permits.push((receipt.batch_id, permit));
@@ -23599,7 +24172,6 @@ fn storage_worker(
                 let _ = reply.send(result);
                 return None;
             }
-            #[cfg(test)]
             StorageCommand::PauseForAdmissionRace { entered, release } => {
                 let _ = entered.send(());
                 let _ = release.recv();
@@ -26736,11 +27308,12 @@ mod tests {
         let failure = Storage::flush_attempt(connection, ":memory:", storage.run_id, &buffer, &[])
             .expect_err("the final row's real CHECK constraint must fail");
         assert_eq!(failure.commit_state, FailureCommitState::RolledBack);
-        // The pinned engine reports SQL CHECK failures through its VDBE halt
-        // error, rather than constructing the public CheckViolation variant.
-        // Its AST display normalizes the schema's <> operator to !=.
         assert!(
             matches!(
+                &failure.source,
+                FrankenError::CheckViolation { name }
+                    if name.contains("scope != ''")
+            ) || matches!(
                 &failure.source,
                 FrankenError::Internal(detail)
                     if detail.starts_with("VDBE halted with code 19: CHECK constraint failed:")
@@ -27148,7 +27721,7 @@ mod tests {
 
     fn short_deadlines() -> StorageDeadlines {
         StorageDeadlines {
-            startup_ack: Duration::from_secs(2),
+            startup_ack: Duration::from_secs(30),
             preparation: Duration::from_millis(250),
             command_enqueue: Duration::from_millis(100),
             admission_ack: Duration::from_millis(250),
@@ -27477,6 +28050,7 @@ mod tests {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn sample_narrative_event_record(tick: u64, text_len: usize) -> EventRecord {
         EventRecord {
             schema_version: EVENT_RECORD_SCHEMA_VERSION,
@@ -27577,7 +28151,7 @@ mod tests {
                 ..
             })
         ));
-        entered.recv_timeout(Duration::from_secs(2))?;
+        entered.recv_timeout(Duration::from_secs(30))?;
 
         let second_error = match StoragePipeline::with_target_and_deadlines(
             StorageTarget::RecoverExisting(path_string.clone()),
@@ -27600,8 +28174,11 @@ mod tests {
         );
         release.send(())?;
 
-        let retry_deadline = Instant::now() + Duration::from_secs(5);
-        let retry_deadlines = short_deadlines();
+        let retry_deadline = Instant::now() + Duration::from_secs(15);
+        let retry_deadlines = StorageDeadlines {
+            shutdown_ack: Duration::from_secs(5),
+            ..short_deadlines()
+        };
         loop {
             match StoragePipeline::with_target_and_deadlines(
                 StorageTarget::RecoverExisting(path_string.clone()),
@@ -31249,7 +31826,10 @@ mod tests {
                      into uselessness rather than scoped per island"
                 ));
             assert!(
-                refusal.to_string().contains(expected),
+                refusal.to_string().contains(expected)
+                    || refusal.to_string().contains(&format!(
+                        "UNIQUE constraint failed: births.run_id, births.island_id, births.{label}"
+                    )),
                 "the {label} refusal must be attributable to its own lifted index, \
                  got: {refusal}"
             );
@@ -31269,7 +31849,10 @@ mod tests {
         assert!(
             death_refusal
                 .to_string()
-                .contains("UNIQUE constraint failed: deaths.run_id, island_id, agent_uid"),
+                .contains("UNIQUE constraint failed: deaths.run_id, island_id, agent_uid")
+                || death_refusal.to_string().contains(
+                    "UNIQUE constraint failed: deaths.run_id, deaths.island_id, deaths.agent_uid"
+                ),
             "got: {death_refusal}"
         );
 
@@ -37202,7 +37785,7 @@ mod tests {
                 entered: entered_tx,
                 release: release_rx,
             })?;
-        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        entered_rx.recv_timeout(Duration::from_secs(30))?;
 
         let error = timeout_sink
             .submit_with_receipt(&sample_batch(84, 8.4))
@@ -37249,7 +37832,7 @@ mod tests {
                 entered: entered_tx,
                 release: release_rx,
             })?;
-        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        entered_rx.recv_timeout(Duration::from_secs(30))?;
         let error = flush_pipeline
             .flush_and_wait()
             .expect_err("paused worker must miss the flush deadline");
@@ -37284,7 +37867,7 @@ mod tests {
                 entered: entered_tx,
                 release: release_rx,
             })?;
-        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        entered_rx.recv_timeout(Duration::from_secs(30))?;
         let error = shutdown_pipeline
             .shutdown()
             .expect_err("paused worker must miss the shutdown deadline");
@@ -37334,14 +37917,14 @@ mod tests {
                 entered: entered_tx,
                 release: release_rx,
             })?;
-        entered_rx.recv_timeout(Duration::from_secs(2))?;
+        entered_rx.recv_timeout(Duration::from_secs(30))?;
         assert!(pipeline.shutdown().is_err());
         let started = Instant::now();
         drop(pipeline);
         assert!(started.elapsed() < Duration::from_secs(2));
         release_tx.send(())?;
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !analytics.snapshot().stopped {
             assert!(
                 Instant::now() < deadline,

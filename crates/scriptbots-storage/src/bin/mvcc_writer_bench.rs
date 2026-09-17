@@ -17,7 +17,8 @@
 //! application write path. Run it through the pinned DSR profile; results feed the
 //! archipelago persistence decision memo in bd-2z0.8.9.13.
 
-use fsqlite::{Connection, FrankenError, compat::RowExt};
+use fsqlite::{FrankenError, compat::RowExt};
+use scriptbots_storage::Connection;
 use std::{
     env, fs,
     path::{Path, PathBuf},

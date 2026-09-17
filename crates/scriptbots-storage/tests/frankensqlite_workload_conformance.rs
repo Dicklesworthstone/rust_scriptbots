@@ -3,8 +3,7 @@
 //! This test deliberately bypasses `StoragePipeline` to qualify the database engine itself. Its
 //! insert SQL remains private to this test target and is not a supported application write path.
 
-use fsqlite::{Connection, SqliteValue, compat::RowExt};
-use scriptbots_storage::SCRIPTBOTS_SCHEMA_V6;
+use scriptbots_storage::{Connection, FrankenError, RowExt, SCRIPTBOTS_SCHEMA_V6, SqliteValue};
 use std::{
     fs,
     path::PathBuf,
@@ -800,9 +799,9 @@ fn frankensqlite_restricted_native_operation_preserves_sql_and_cancellation() {
             caller.spawn(|_| async {}),
             Err(SpawnError::RuntimeUnavailable)
         ));
-        let operation = connection.root_cx().create_child();
+        let operation = connection.inner().root_cx().create_child();
         operation.set_native_cx(caller.clone());
-        let _operation_guard = connection.bind_operation_cx(&operation);
+        let _operation_guard = connection.inner().bind_operation_cx(&operation);
         connection
             .execute("INSERT INTO migration_probe VALUES (42)")
             .expect("restricted operation uses the already-owned connection");
@@ -810,11 +809,11 @@ fn frankensqlite_restricted_native_operation_preserves_sql_and_cancellation() {
             .query("SELECT value FROM migration_probe")
             .expect("restricted operation reads its inserted row");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<i64>(0).expect("integer result"), 42);
+        assert_eq!(rows[0].get_typed::<i64>(0).expect("integer result"), 42);
         caller.cancel_with(CancelKind::User, Some("cancel SQL operation"));
         assert!(matches!(
             connection.execute("INSERT INTO migration_probe VALUES (99)"),
-            Err(fsqlite::FrankenError::Abort)
+            Err(FrankenError::Abort)
         ));
         assert_eq!(
             Cx::current().expect("caller retained").capabilities(),
@@ -826,7 +825,7 @@ fn frankensqlite_restricted_native_operation_preserves_sql_and_cancellation() {
         .query("SELECT value FROM migration_probe")
         .expect("dropping operation binding restores the uncancelled connection root");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get::<i64>(0).expect("committed integer"), 42);
+    assert_eq!(rows[0].get_typed::<i64>(0).expect("committed integer"), 42);
     assert_eq!(
         Cx::current().expect("owner restored").capabilities(),
         owner.capabilities()

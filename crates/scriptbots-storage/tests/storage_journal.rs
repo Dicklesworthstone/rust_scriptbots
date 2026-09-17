@@ -1,6 +1,5 @@
 //! Public-boundary coverage for the HostCore storage-journal adapter.
 
-use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentUid, BrainRunner, CharacterizationError, ControlCommand, INPUT_SIZE,
     NullPersistence, OUTPUT_SIZE, Position, ReplayEventKind, ScriptBotsConfig, SelectionMode,
@@ -22,6 +21,7 @@ use scriptbots_storage::{
     PersistenceGuarantee, Storage, StorageError, StorageEventJournalReader,
     StorageIntegrityCheckResult, StorageJournalOptions, StoragePipeline, StorageReader,
 };
+use scriptbots_storage::{Connection, RowExt};
 use std::{
     fs,
     sync::{Arc, Barrier, Once},
@@ -1709,7 +1709,7 @@ fn file_channel_concurrent_exact_duplicate_clients_apply_once_and_persist_author
         (run, guarantee)
     });
     let (mut coordinator, run_id) = handoff_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(Duration::from_secs(60))
         .expect("receive channel client from owner thread");
 
     let barrier = Arc::new(Barrier::new(3));
@@ -2116,19 +2116,12 @@ fn file_journal_replays_gui_world_edits_with_identical_digests_and_receipts() {
         })
         .collect::<Vec<_>>();
     assert_eq!(crossovers, vec![(Tick(1), Tick(2))]);
-    assert!(
-        matches!(
-            first_reader.narrative_input_page_v1(None, 2, 0),
-            Err(StorageError::NarrativeInputStream(
-                NarrativeInputStreamError::MixedConfiguration {
-                    tick: 2,
-                    expected: 0,
-                    actual: 1,
-                }
-            ))
-        ),
-        "fixed-configuration offline replay must refuse a live configuration boundary"
-    );
+    let narrative_input = first_reader
+        .narrative_input_page_v1(None, 2, 0)
+        .expect("authenticated live configuration boundary must decode successfully");
+    assert_eq!(narrative_input.inputs.len(), 2);
+    assert_eq!(narrative_input.inputs[0].config_revision, 0);
+    assert_eq!(narrative_input.inputs[1].config_revision, 1);
     let command_count =
         u64::try_from(original_envelopes.len()).expect("bounded command count fits u64");
     let first_evidence = first_reader

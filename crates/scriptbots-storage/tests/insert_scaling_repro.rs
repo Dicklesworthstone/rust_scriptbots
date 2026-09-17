@@ -19,12 +19,13 @@
 //! 2026-09-04 historical baseline (RCH worker, release): see bd-w1oi for the recorded
 //! curves. Kept `#[ignore]` because it is a timing diagnostic, not a gate.
 
+use scriptbots_storage::Connection;
 use std::time::Instant;
 
 const N: usize = 4000;
 const WINDOW: usize = 500;
 
-fn measure_mode(conn: &fsqlite::Connection, mode: &str) {
+fn measure_mode(conn: &Connection, mode: &str) {
     conn.execute("DELETE FROM t").expect("delete");
     let mut times: Vec<u128> = Vec::with_capacity(N);
     let transaction = mode.starts_with("bigtx");
@@ -58,7 +59,7 @@ fn measure_mode(conn: &fsqlite::Connection, mode: &str) {
 #[test]
 #[ignore = "timing diagnostic for bd-w1oi; run explicitly with --ignored --nocapture"]
 fn insert_latency_scaling_repro() {
-    let conn = fsqlite::Connection::open(":memory:").expect("open");
+    let conn = Connection::open(":memory:").expect("open");
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b TEXT NOT NULL)")
         .expect("create");
     conn.execute("CREATE INDEX t_a ON t(a)").expect("index");

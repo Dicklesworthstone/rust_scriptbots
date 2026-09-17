@@ -12,16 +12,14 @@
 //! 6. Mock-free E2E timeout handoff, held worker, and eventual recovery with structured logs.
 
 use scriptbots_storage::{
-    DEFAULT_HUNG_REAPER_TIMEOUT, MAX_CONCURRENT_REAPERS, ReaperAccountingError,
-    ReaperFallbackReason, ReaperFaultPoint, ReaperJoinOutcome, ReaperReceiptState, ReaperStats,
-    StorageDeadlines, StoragePipeline, arm_reaper_fault, clear_all_reaper_faults,
-    clear_reaper_fault, handoff_join_only_for_test, next_reap_request_id,
+    MAX_CONCURRENT_REAPERS, ReaperAccountingError, ReaperFallbackReason, ReaperFaultPoint,
+    ReaperJoinOutcome, ReaperReceiptState, ReaperStats, StorageDeadlines, StoragePipeline,
+    arm_reaper_fault, clear_all_reaper_faults, clear_reaper_fault, handoff_join_only_for_test,
     poison_reaper_registry_for_test, reaper_accounting_receipts, reset_reaper_registry_for_test,
     set_reaper_hung_threshold_for_test, simulate_negative_double_consumption_for_test,
     simulate_negative_skipped_drain_for_test, storage_reaper_stats, verify_reaper_accounting,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,8 +44,17 @@ fn cleanup_temp_db(path: &str) {
     }
 }
 
+static REAPER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_reaper_test() -> std::sync::MutexGuard<'static, ()> {
+    let guard = REAPER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    clear_all_reaper_faults();
+    guard
+}
+
 #[test]
 fn the_reaper_registry_reports_its_own_state() {
+    let _lock = lock_reaper_test();
     let stats = storage_reaper_stats();
     stats.check_invariants().expect("invariants must hold");
     if stats.queued > 0 {
@@ -62,6 +69,7 @@ fn the_reaper_registry_reports_its_own_state() {
 
 #[test]
 fn zero_paths_invariants_and_error_detection() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     let stats = storage_reaper_stats();
     assert_eq!(stats.active, 0);
@@ -108,6 +116,7 @@ fn zero_paths_invariants_and_error_detection() {
 
 #[test]
 fn many_pipelines_shut_down_cleanly_without_a_thread_explosion() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     let before = storage_reaper_stats();
 
@@ -118,7 +127,13 @@ fn many_pipelines_shut_down_cleanly_without_a_thread_explosion() {
             StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
                 .expect("pipeline");
         pipeline.shutdown().expect("shutdown");
+        cleanup_temp_db(&path);
         paths.push(path);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while storage_reaper_stats().active > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
     }
 
     let after = storage_reaper_stats();
@@ -147,6 +162,7 @@ fn many_pipelines_shut_down_cleanly_without_a_thread_explosion() {
 
 #[test]
 fn held_worker_and_hung_observability() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     set_reaper_hung_threshold_for_test(Duration::from_millis(30));
 
@@ -202,6 +218,7 @@ fn held_worker_and_hung_observability() {
 
 #[test]
 fn duplicate_same_path_timeouts_coalesce_and_drain_fifo() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     let path = temp_db("coalesce", 0);
     let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
@@ -217,14 +234,14 @@ fn duplicate_same_path_timeouts_coalesce_and_drain_fifo() {
     let req_id_2 = handoff_join_only_for_test(
         dummy_worker_2,
         Arc::clone(&path_arc),
-        scriptbots_storage::AnalyticsSnapshotProvider::default(),
+        scriptbots_storage::AnalyticsSnapshotProvider::empty(),
     );
 
     let dummy_worker_3 = thread::spawn(|| None);
     let req_id_3 = handoff_join_only_for_test(
         dummy_worker_3,
         Arc::clone(&path_arc),
-        scriptbots_storage::AnalyticsSnapshotProvider::default(),
+        scriptbots_storage::AnalyticsSnapshotProvider::empty(),
     );
 
     let stats = storage_reaper_stats();
@@ -268,6 +285,7 @@ fn duplicate_same_path_timeouts_coalesce_and_drain_fifo() {
 
 #[test]
 fn reaping_one_path_does_not_block_another() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     let path_a = temp_db("cross_a", 0);
     let path_b = temp_db("cross_b", 1);
@@ -314,6 +332,7 @@ fn reaping_one_path_does_not_block_another() {
 
 #[test]
 fn registry_saturation_and_cap_plus_one_fallback() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
 
     let mut pipelines = Vec::new();
@@ -378,6 +397,7 @@ fn registry_saturation_and_cap_plus_one_fallback() {
 
 #[test]
 fn spawn_failure_seam_falls_back_synchronously_without_leaking_handle() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     arm_reaper_fault(ReaperFaultPoint::ForceSpawnFailure);
 
@@ -421,6 +441,7 @@ fn spawn_failure_seam_falls_back_synchronously_without_leaking_handle() {
 
 #[test]
 fn registry_admission_fallback_seam() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     arm_reaper_fault(ReaperFaultPoint::ForceRegistryAdmissionFallback);
 
@@ -452,6 +473,7 @@ fn registry_admission_fallback_seam() {
 
 #[test]
 fn poisoned_registry_mutex_recovery() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     poison_reaper_registry_for_test();
 
@@ -476,6 +498,7 @@ fn poisoned_registry_mutex_recovery() {
 
 #[test]
 fn worker_panic_is_caught_and_accounted() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     let path: Arc<str> = "panic_path.sqlite".into();
 
@@ -486,7 +509,7 @@ fn worker_panic_is_caught_and_accounted() {
     let req_id = handoff_join_only_for_test(
         panic_handle,
         Arc::clone(&path),
-        scriptbots_storage::AnalyticsSnapshotProvider::default(),
+        scriptbots_storage::AnalyticsSnapshotProvider::empty(),
     );
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -512,6 +535,7 @@ fn worker_panic_is_caught_and_accounted() {
 
 #[test]
 fn negative_control_skipped_drain_detected() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     simulate_negative_skipped_drain_for_test(8888, "stranded_db.sqlite");
 
@@ -533,6 +557,7 @@ fn negative_control_skipped_drain_detected() {
 
 #[test]
 fn negative_control_double_consumption_detected() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     let path = temp_db("dbl_cons", 0);
     let mut pipeline = StoragePipeline::create_unattributed_file_with_thresholds(&path, 1, 1, 1, 1)
@@ -559,6 +584,7 @@ fn negative_control_double_consumption_detected() {
 
 #[test]
 fn reaper_bounds_mock_free_timeout_handoff_and_eventual_recovery_e2e() {
+    let _lock = lock_reaper_test();
     reset_reaper_registry_for_test();
     set_reaper_hung_threshold_for_test(Duration::from_millis(40));
 
@@ -571,8 +597,10 @@ fn reaper_bounds_mock_free_timeout_handoff_and_eventual_recovery_e2e() {
     );
 
     // 1. Open Pipeline A with short shutdown deadline
-    let mut deadlines_a = StorageDeadlines::default();
-    deadlines_a.shutdown_ack = Duration::from_millis(50);
+    let deadlines_a = StorageDeadlines {
+        shutdown_ack: Duration::from_millis(50),
+        ..StorageDeadlines::default()
+    };
     let mut pipeline_a = StoragePipeline::create_unattributed_file_with_thresholds_and_deadlines(
         &path_a,
         1,
@@ -616,7 +644,7 @@ fn reaper_bounds_mock_free_timeout_handoff_and_eventual_recovery_e2e() {
     let req_id_a2 = handoff_join_only_for_test(
         worker_a2,
         Arc::clone(&path_a_arc),
-        scriptbots_storage::AnalyticsSnapshotProvider::default(),
+        scriptbots_storage::AnalyticsSnapshotProvider::empty(),
     );
 
     let stats_dup = storage_reaper_stats();

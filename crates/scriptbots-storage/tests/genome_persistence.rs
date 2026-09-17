@@ -9,7 +9,6 @@
 //! - Ordered lineage batch readback and bounded pagination.
 //! - Fixed-seed multi-generation E2E comparing live envelopes with reopened DB readback.
 
-use fsqlite::compat::{OpenFlags, RowExt, open_with_flags};
 use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BirthOrigin, BirthRecord, BrainFamilyCodec, BrainFamilyId,
@@ -22,6 +21,7 @@ use scriptbots_storage::{
     GenomeStorageError, Locus, RunManifestRecord, StorageError, StoragePipeline, StorageReader,
     export_locus_trace_csv, export_locus_trace_png,
 };
+use scriptbots_storage::{OpenFlags, RowExt, open_with_flags};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 

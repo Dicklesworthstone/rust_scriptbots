@@ -1,7 +1,3 @@
-use fsqlite::{
-    Connection,
-    compat::{OpenFlags, RowExt, open_with_flags},
-};
 use scriptbots_core::{
     AgentData, AgentUid, BrainRunner, INPUT_SIZE, OUTPUT_SIZE, PersistenceBatch, Position,
     ReplayEvent, ReplayEventKind, ReplayInteractionKind, ScriptBotsConfig, Tick, TickSummary,
@@ -11,9 +7,10 @@ use scriptbots_core::{
 };
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    ExportFormat, ExportTable, NarrativeQueryError, RunEventDecodeError, RunEventField,
-    RunEventIdentity, RunManifestRecord, Storage, StorageDeadlines, StorageError, StoragePipeline,
-    StorageReader, export_storage_table, verify_export_receipt,
+    Connection, ExportFormat, ExportTable, NarrativeQueryError, OpenFlags, RowExt,
+    RunEventDecodeError, RunEventField, RunEventIdentity, RunManifestRecord, Storage,
+    StorageDeadlines, StorageError, StoragePipeline, StorageReader, export_storage_table,
+    open_with_flags, verify_export_receipt,
 };
 use std::{
     fs,

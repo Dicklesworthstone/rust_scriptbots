@@ -1,6 +1,5 @@
 //! End-to-end proof that one FrankenSQLite file can hold independent runs with overlapping keys.
 
-use fsqlite::{Connection, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
     Generation, MetricSample, PersistenceBatch, Position, ScriptBotsConfig, Tick, TickSummary,
@@ -11,6 +10,7 @@ use scriptbots_storage::{
     BatchPersistenceState, FailureCommitState, RunManifestRecord, StorageError, StorageOperation,
     StoragePipeline, StorageReader, StorageWorkerError,
 };
+use scriptbots_storage::{Connection, RowExt};
 use std::{
     fs,
     time::{SystemTime, UNIX_EPOCH},

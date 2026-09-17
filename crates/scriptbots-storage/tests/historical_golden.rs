@@ -1,10 +1,10 @@
-use fsqlite::{Connection, FrankenError, compat::RowExt};
 use scriptbots_core::{
     AgentData, AgentIdentity, AgentRuntime, AgentState, AgentUid, BirthOrigin, BirthRecord,
     CombatEventFlags, DeathCause, DeathRecord, Generation, MetricSample, PersistenceBatch,
     PersistenceEvent, PersistenceEventKind, Position, Tick, TickSummary,
 };
 use scriptbots_storage::Storage;
+use scriptbots_storage::{Connection, FrankenError, RowExt};
 use std::{
     fs,
     path::PathBuf,

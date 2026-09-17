@@ -24,13 +24,12 @@
 //! payload is proven to leave no open write transaction behind; and repeated recovery of the
 //! same database is proven to be a fixed point that never duplicates scientific rows.
 
-use fsqlite::{
-    Connection, FrankenError, SqliteValue,
-    compat::{OpenFlags, RowExt, open_with_flags},
-};
 use scriptbots_core::{
     MetricSample, PersistenceBatch, Tick, TickSummary,
     narrative::{EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord},
+};
+use scriptbots_storage::{
+    Connection, FrankenError, OpenFlags, RowExt, SqliteValue, open_with_flags,
 };
 use scriptbots_storage::{
     FailureCommitState, PersistenceBatchId, PersistenceWatermarks, Storage, StorageError,
