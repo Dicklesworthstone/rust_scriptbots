@@ -738,6 +738,7 @@ JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. 
 - **Formatting**: `cargo fmt --all`
 - **Tests**: `cargo test --workspace` (simulation and GPUI tests will be added as systems land)
 - **Profiles**: Release uses LTO, single codegen unit, and abort-on-panic for optimal binaries.
+- **rust-analyzer artifacts**: The repository `lsp.json` configures Oh My Pi with `cargo.targetDir = true` at initialization and configuration updates. Analyzer checks and build-script/proc-macro builds use `<Cargo target directory>/rust-analyzer`, leaving ordinary CLI/RCH target selection unchanged. Other editors must set their equivalent `rust-analyzer.cargo.targetDir` option; they do not consume this file. Reload the affected language server after changing settings. This separates analyzer artifacts from agent builds, not different analyzer sessions from each other, and does not resolve package-cache locks or filesystem hangs.
 
 ### Authoritative tracker triage
 

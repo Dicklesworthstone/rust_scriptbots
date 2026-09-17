@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "rust-analyzer": {
+      "initOptions": {
+        "cargo": {
+          "targetDir": true
+        }
+      },
+      "settings": {
+        "rust-analyzer": {
+          "cargo": {
+            "targetDir": true
+          }
+        }
+      }
+    }
+  }
+}
