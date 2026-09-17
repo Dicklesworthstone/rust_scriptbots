@@ -351,13 +351,13 @@ budget, the writer lease + `filesystem_has_stable_file_identity`).
 Frontends are simulation consumers, never authors of core science state. They read immutable
 `RenderSnapshot`s (§3) and submit `HostCommand`s (§2).
 
-### Current vs Target State
+### Current & Transitional State vs Target State
 
-- **[Current native state, 2026-09-11]**: terminal, GPUI, Bevy and HTTP/MCP receive the
+- **[Current State, 2026-09-11]**: terminal, GPUI, Bevy and HTTP/MCP receive the
   production host port and immutable publications. Their ordinary render loops do not own
   the science clock. Bevy's legacy command callback still returns an admitted identity;
   complete applied/durable interaction feedback remains part of the open migration work.
-- **[Remaining target]**: finish all native input, receipt and lifecycle contracts and their
+- **[Target State: Dedicated HostCore Ownership (`bd-k7nq`)]**: finish all native input, receipt and lifecycle contracts and their
   real-window/PTY tests. Migrate the experimental browser's `requestAnimationFrame` loop,
   which currently calls `simHandle.tick(1)`, to a scheduler whose science is independent of
   repaint cadence. Keep library construction and capture fixtures separate from live ownership.
