@@ -1164,6 +1164,7 @@ fn join_url(base: &str, path: &str) -> String {
 
 fn parse_value(raw: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Number(ref num)) if num.as_f64().is_none() => Ok(Value::String(raw.to_string())),
         Ok(value) => Ok(value),
         Err(_) => Ok(Value::String(raw.to_string())),
     }
