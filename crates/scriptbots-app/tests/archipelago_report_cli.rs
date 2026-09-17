@@ -15,7 +15,9 @@ use scriptbots_runtime::{
     Archipelago, ArchipelagoConfig, ArchipelagoMigration, HostCoreOptions, IslandId, IslandSpec,
     Topology,
 };
-use scriptbots_storage::{ArchipelagoBarrierSink, ArchipelagoReport, Storage, StorageReader};
+use scriptbots_storage::{
+    ArchipelagoBarrierSink, ArchipelagoReport, Connection, Storage, StorageReader,
+};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -178,7 +180,7 @@ fn recorded_archipelago_cli_persists_every_island_and_tick()
     }
     reader.close()?;
 
-    let connection = fsqlite::Connection::open(database.to_str().unwrap())?;
+    let connection = Connection::open(database.to_str().unwrap())?;
     let mut observations = Vec::new();
     for table in ["tick_summaries", "agents", "metrics", "replay_events"] {
         let rows = connection.query(&format!("SELECT tick, COUNT(DISTINCT island_id), COUNT(*) FROM {table} GROUP BY tick ORDER BY tick"))?;
@@ -533,7 +535,7 @@ fn test_archipelago_report_reconstructs_and_verifies_conservation_e2e()
         let run_id_str = reader.run_id().to_string();
         reader.close()?;
 
-        let conn = fsqlite::Connection::open(&path_str)?;
+        let conn = Connection::open(&path_str)?;
         conn.execute_with_params(
             "INSERT INTO deaths (run_id, tick, agent_uid, age, generation, herbivore_tendency, brain_kind, brain_key, energy, food_balance_total, cause, was_hybrid, spike_attacker, spike_victim, hit_carnivore, hit_herbivore, hit_by_carnivore, hit_by_herbivore, island_id)
              VALUES (?1, 2, 999999, 10, 1, 0.5, NULL, NULL, 1.0, 0.0, 'phantom_fault', 0, 0, 0, 0, 0, 0, 0, 0)",

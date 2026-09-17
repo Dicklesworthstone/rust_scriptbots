@@ -5,9 +5,9 @@
 //! qualifier that can never be lost, and the null-tournament bias probe.
 
 use scriptbots_app::tournament::{
-    EloRating, FamilyScore, MatchOutcome, MatchResult, OrderPolicy, TournamentError,
-    TournamentHarness, TournamentSpec, enforce_no_config_drift, plan, run_match, run_tournament,
-    run_tournament_with_jobs,
+    EloRating, FamilyScore, MatchOutcome, MatchResult, OrderPolicy, RatingAxis, RatingError,
+    RatingOptions, TournamentError, TournamentHarness, TournamentSpec, enforce_no_config_drift,
+    plan, rate_reports, run_match, run_tournament, run_tournament_with_jobs,
 };
 use scriptbots_brain::BrainKind;
 use scriptbots_core::ScriptBotsConfig;
@@ -251,4 +251,107 @@ fn test_elo_update_symmetry() {
 
     assert!((winner.rating - 1_516.0).abs() < 1e-4);
     assert!((loser.rating - 1_484.0).abs() < 1e-4);
+}
+
+#[test]
+fn test_rating_multi_axis_clustered_bootstrap_and_markdown() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_test_writer()
+        .try_init();
+
+    let spec = TournamentSpec {
+        families: vec![MLP_A, DWRAON],
+        seeds: vec![101, 102, 103, 104, 105, 106, 107, 108],
+        ticks: 200,
+        cohort_size: 16,
+        order_policy: OrderPolicy::BothAssignments,
+        closed: true,
+        config_layers: Vec::new(),
+    };
+    let reports = run_tournament(&spec, &small_world()).expect("run tournament");
+    assert_eq!(reports.len(), 16); // 8 seeds * 2 assignments
+
+    let options = RatingOptions {
+        bootstrap_replicates: 50, // fast for integration test
+        ..RatingOptions::default()
+    };
+    let rating_table = rate_reports(&reports, &options).expect("rate reports");
+
+    // Verify rating axes
+    let survival = rating_table
+        .axis(RatingAxis::SurvivalShare)
+        .or_else(|| {
+            panic!(
+                "survival share ratings not Rated; outcome: {:?}",
+                rating_table.axes.get(&RatingAxis::SurvivalShare)
+            )
+        })
+        .unwrap();
+    assert_eq!(survival.n_matches, 16);
+    assert_eq!(survival.n_seeds, 8);
+    assert!(survival.converged);
+    assert_eq!(survival.ratings.len(), 2);
+
+    let mlp_rating = survival.ratings.get(&MLP_A).expect("mlp rating");
+    let dwraon_rating = survival.ratings.get(&DWRAON).expect("dwraon rating");
+
+    // Bradley-Terry theta zero-mean anchor check
+    let mean_theta = (mlp_rating.theta + dwraon_rating.theta) / 2.0;
+    assert!(
+        mean_theta.abs() < 1e-6,
+        "mean theta should be 0: {mean_theta}"
+    );
+
+    // Elo transform check: elo = 400 * theta / ln(10) + 1500
+    let expected_mlp_elo = 400.0 * mlp_rating.theta / std::f64::consts::LN_10 + 1500.0;
+    assert!((mlp_rating.elo - expected_mlp_elo).abs() < 1e-4);
+
+    // Markdown leaderboard generation
+    let md = rating_table.generate_markdown();
+    assert!(md.contains("# ScriptBots Multi-Axis Brain Family Tournament Leaderboard"));
+    assert!(md.contains("## Axis: survival_share (`survival_share`)"));
+    assert!(md.contains("## Axis: biomass_share (`biomass_share`)"));
+    assert!(md.contains("## Axis: mean_lineage_depth (`mean_lineage_depth`)"));
+    assert!(md.contains("## Axis: time_to_extinction (`time_to_extinction`)"));
+    assert!(md.contains("## Axis: aggregate_score (`aggregate_score`)"));
+    assert!(md.contains("novelty_coverage data is absent or incomplete"));
+}
+
+#[test]
+fn test_rate_outcomes_degenerate_inputs() {
+    let options = RatingOptions::default();
+
+    // 1. Empty matches -> error
+    let empty_res = TournamentHarness::rate_outcomes(&[], &options);
+    assert_eq!(empty_res, Err(RatingError::EmptyMatches));
+
+    // 2. Single family -> error
+    let mut outcome = MatchOutcome {
+        match_id: scriptbots_app::tournament::MatchId(1),
+        seed: 42,
+        ticks_run: 100,
+        spawn_order_index: 0,
+        spawn_order: vec![MLP_A],
+        per_family: std::collections::BTreeMap::new(),
+        warnings: Vec::new(),
+    };
+    outcome.set_family(
+        MLP_A,
+        scriptbots_app::tournament::FamilyOutcome {
+            survival_share: 1.0,
+            biomass_share: 1.0,
+            mean_lineage_depth: 1.0,
+            max_lineage_depth: 1,
+            extinct_at: None,
+            novelty_coverage: None,
+        },
+    );
+    let single_fam_res = TournamentHarness::rate_outcomes(&[outcome], &options);
+    assert_eq!(
+        single_fam_res,
+        Err(RatingError::TooFewFamilies { families: 1 })
+    );
 }
