@@ -19,7 +19,9 @@ food_respawn_interval = 25
 food_respawn_amount = 0.5
 
 [envelope]
-ticks = 300
+# Observe established mortality as well as reproduction without changing dynamics.
+# The declared cohort includes a trajectory whose first death occurs after tick 300.
+ticks = 360
 population_min = 10
 population_max = 250
 births_min = 5

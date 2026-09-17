@@ -4,7 +4,7 @@
 //!
 //! Completion-proof debt from bd-2z0.10.2:
 //! 1. The checked-in meadow scenario (`scenarios/meadow.scenario.toml`) executes its full declared
-//!    cohort schedule (`seeds = [42, 137, 20260717]`, 300 ticks).
+//!    cohort schedule and observation horizon from its envelope.
 //! 2. Satisfies all declared envelope criteria on every seed (population in [10, 250], births >= 5, deaths >= 1).
 //! 3. Scientific parity between these two named helper paths (bit-exact WorldDigestV1 match).
 //! 4. Balanced ledger: Resource ledger enabled, reconciles at every tick, and evaluates to zero breaches
