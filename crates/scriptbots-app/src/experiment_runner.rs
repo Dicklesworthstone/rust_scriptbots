@@ -1737,7 +1737,7 @@ fn config_for_run(
     Ok(config)
 }
 
-fn insert_dotted_value(
+pub(crate) fn insert_dotted_value(
     root: &mut serde_json::Map<String, serde_json::Value>,
     path: &str,
     value: serde_json::Value,

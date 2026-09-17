@@ -36,6 +36,13 @@ pub struct RunSummary {
     pub variant_id: String,
     /// The arm's exact config overrides, so the run can be rebuilt rather than recognized.
     pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// Canonical brain family that produced the run (e.g. `mlp.baseline`).
+    ///
+    /// REQUIRED FOR REPRODUCTION (bd-16g.1.7). The child runner composes its founding
+    /// population from `--brain`/`SCRIPTBOTS_BRAIN` (default `mixed`), so a reproduce
+    /// script that omits it re-executes a structurally different world even with the
+    /// exact config layer: mixed registers four families while the parent ran one.
+    pub brain_family: String,
     /// Provenance schema version this row was WRITTEN at.
     ///
     /// Stored rather than assumed, because per bd-2z0.5.6's policy a digest is only
@@ -53,20 +60,24 @@ pub(crate) struct RunSummaryParts {
     pub(crate) seed: u64,
     pub(crate) config_digest: String,
     pub(crate) digest: String,
+    pub(crate) config_overrides: BTreeMap<String, serde_json::Value>,
     pub(crate) ticks: u64,
     pub(crate) metrics: BTreeMap<String, f64>,
     pub(crate) summary_artifact_digest: String,
     pub(crate) summary_path: Option<String>,
     pub(crate) variant_id: String,
-    pub(crate) config_overrides: BTreeMap<String, serde_json::Value>,
+    pub(crate) brain_family: String,
 }
 
 /// Current lab run-summary provenance version (bd-2z0.5.6 policy, per-table versioning).
 ///
 /// Bumped 1 -> 2 when `variant_id` and `config_overrides` were folded INTO the digest.
-/// Per the policy this does not invalidate retained v1 artifacts; it makes them
+/// Bumped 2 -> 3 when `brain_family` joined (bd-16g.1.7): the child runner composes its
+/// founding population from the brain preset, so a reproduce script without it executes
+/// a structurally different world.
+/// Per the policy this does not invalidate retained older artifacts; it makes them
 /// NotComparable, which [`RunSummary::verify_analysis_input`] reports as its own outcome.
-pub const LAB_RUN_SUMMARY_VERSION: u32 = 2;
+pub const LAB_RUN_SUMMARY_VERSION: u32 = 3;
 
 /// Whether a row's analysis-input digest can be checked, and if so whether it held.
 ///
@@ -113,6 +124,7 @@ impl RunSummary {
             summary_path: parts.summary_path,
             variant_id: parts.variant_id,
             config_overrides: parts.config_overrides,
+            brain_family: parts.brain_family,
             provenance_version: LAB_RUN_SUMMARY_VERSION,
             analysis_input_digest: String::new(),
         };
@@ -170,11 +182,11 @@ fn analysis_input_digest(summary: &RunSummary) -> String {
         ..
     } = summary;
     let mut hasher = blake3::Hasher::new();
-    // v2 (bd-16g.1.7): variant_id and config_overrides joined the digest. Per bd-2z0.5.6
-    // the new reproduction inputs go INSIDE the digest -- provenance the integrity digest
-    // does not cover is not provenance -- and the version tag is what keeps v1 artifacts
-    // reported as NotComparable rather than corrupt.
-    hasher.update(b"scriptbots.lab-run-summary.v2\0");
+    // v3 (bd-16g.1.7): brain_family joined the digest after variant_id/config_overrides
+    // (v2). Per bd-2z0.5.6 the new reproduction inputs go INSIDE the digest -- provenance
+    // the integrity digest does not cover is not provenance -- and the version tag is
+    // what keeps older artifacts reported as NotComparable rather than corrupt.
+    hasher.update(b"scriptbots.lab-run-summary.v3\0");
     hash_len_prefixed(&mut hasher, run_id.as_bytes());
     hasher.update(&arm_id.to_le_bytes());
     hasher.update(&seed.to_le_bytes());
@@ -190,6 +202,7 @@ fn analysis_input_digest(summary: &RunSummary) -> String {
     }
     hash_len_prefixed(&mut hasher, summary_artifact_digest.as_bytes());
     hash_len_prefixed(&mut hasher, variant_id.as_bytes());
+    hash_len_prefixed(&mut hasher, summary.brain_family.as_bytes());
     let override_count =
         u64::try_from(config_overrides.len()).expect("map length fits u64 on supported targets");
     hasher.update(&override_count.to_le_bytes());
@@ -1273,6 +1286,7 @@ mod tests {
                 "food_regrowth_rate".to_owned(),
                 serde_json::json!(0.1 * f64::from(arm_id + 1)),
             )]),
+            brain_family: "mlp.baseline".to_owned(),
         })
     }
 
@@ -2226,6 +2240,7 @@ mod tests {
                 summary_path: None,
                 variant_id: "arm-000".to_owned(),
                 config_overrides: BTreeMap::from([("nested".to_owned(), nested)]),
+                brain_family: "mlp.baseline".to_owned(),
             })
         };
         assert_eq!(

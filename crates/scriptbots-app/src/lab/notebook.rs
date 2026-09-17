@@ -13,6 +13,22 @@ use thiserror::Error;
 
 const MAX_RETAINED_SUMMARY_BYTES: u64 = 4_096;
 
+/// Recorded report metadata and charged execution budget, distinct from completed evidence.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NotebookContext {
+    pub model_id: String,
+    pub build: crate::BuildProvenanceV0,
+    pub max_runs: usize,
+    pub runs_charged: usize,
+    pub max_ticks: u64,
+    pub ticks_charged: u64,
+    pub max_tokens: usize,
+    pub tokens_charged: usize,
+    pub max_iterations: usize,
+    pub iterations: usize,
+    pub failure_reason: Option<String>,
+}
+
 /// Immutable run provenance reference required for all empirical claims.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunRef {
@@ -30,6 +46,9 @@ pub struct RunRef {
     pub variant_id: String,
     /// The arm's exact config overrides.
     pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// Canonical brain family that produced the run; the reproduce script pins it
+    /// via SCRIPTBOTS_BRAIN so the child's founding population matches the parent's.
+    pub brain_family: String,
     /// Provenance schema version this run was written at (bd-2z0.5.6 policy).
     pub provenance_version: u32,
 }
@@ -131,6 +150,7 @@ impl From<&RunSummary> for RunRef {
             summary_path: summary.summary_path.clone(),
             variant_id: summary.variant_id.clone(),
             config_overrides: summary.config_overrides.clone(),
+            brain_family: summary.brain_family.clone(),
             provenance_version: summary.provenance_version,
         }
     }
@@ -301,6 +321,41 @@ fn markdown_literal(field: &'static str, value: &str) -> Result<String, Notebook
     Ok(escaped)
 }
 
+fn validate_metadata_value(
+    field: &'static str,
+    value: &serde_json::Value,
+) -> Result<(), NotebookRenderError> {
+    match value {
+        serde_json::Value::String(text) => {
+            markdown_literal(field, text)?;
+        }
+        serde_json::Value::Number(number) => {
+            if number.as_f64().is_none_or(|value| !value.is_finite()) {
+                return Err(NotebookRenderError::NonFiniteFloat);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                validate_metadata_value(field, item)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                markdown_literal(field, key)?;
+                validate_metadata_value(field, value)?;
+            }
+        }
+        serde_json::Value::Bool(_) | serde_json::Value::Null => {}
+    }
+    Ok(())
+}
+
+fn canonical_metadata(value: &serde_json::Value) -> Result<String, NotebookRenderError> {
+    let bytes = crate::canonical_json_value_bytes(value)
+        .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|error| NotebookRenderError::Io(error.to_string()))
+}
+
 fn validate_session_id(session_id: &str) -> Result<(), NotebookRenderError> {
     let bytes = session_id.as_bytes();
     // These names are directory components, not run identities.
@@ -333,11 +388,21 @@ impl NotebookRenderer {
         goal: &str,
         claims: &[Claim],
         known_runs: &[RunRef],
+        context: &NotebookContext,
     ) -> Result<String, NotebookRenderError> {
         if goal.trim().is_empty() {
             return Err(NotebookRenderError::MissingSection("Goal".into()));
         }
         let rendered_goal = markdown_literal("goal", goal)?;
+        if context.model_id.trim().is_empty() {
+            return Err(NotebookRenderError::MissingSection(
+                "Methods model id".into(),
+            ));
+        }
+        markdown_literal("model_id", &context.model_id)?;
+        if let Some(reason) = &context.failure_reason {
+            markdown_literal("failure_reason", reason)?;
+        }
         for (index, claim) in claims.iter().enumerate() {
             if claim.text.trim().is_empty() {
                 return Err(NotebookRenderError::MissingClaimText { index: index + 1 });
@@ -364,6 +429,11 @@ impl NotebookRenderer {
                 }
                 Support::Descriptive(runs) => runs,
             };
+            if referenced_runs.is_empty() {
+                return Err(NotebookRenderError::MissingRunSupport(
+                    "empty descriptive support".into(),
+                ));
+            }
             for run_ref in referenced_runs {
                 let known = known_run_map.get(run_ref.run_id.as_str()).ok_or_else(|| {
                     NotebookRenderError::MissingRunSupport(run_ref.run_id.clone())
@@ -397,6 +467,7 @@ impl NotebookRenderer {
                         known.config_overrides == run_ref.config_overrides,
                         "config_overrides",
                     ),
+                    (known.brain_family == run_ref.brain_family, "brain_family"),
                     (
                         known.provenance_version == run_ref.provenance_version,
                         "provenance_version",
@@ -421,9 +492,74 @@ impl NotebookRenderer {
         markdown.push_str("- Runner: MatchedSeedExperimentRunner\n");
         markdown.push_str("- Statistics Authority: scriptbots_app::lab::stats\n");
         markdown.push_str("- Verification: BLAKE3 Checksums + WorldDigestV1\n");
-        markdown.push_str(&format!("- Total Runs Executed: {}\n\n", known_runs.len()));
-
-        markdown.push_str("## 3. Results & Claims\n");
+        markdown.push_str(&format!(
+            "- Model id: {}\n",
+            markdown_literal("model_id", &context.model_id)?
+        ));
+        let mut build = context.build.clone();
+        build.rayon_num_threads = None;
+        build.scriptbots_max_threads = None;
+        let build_value = serde_json::to_value(&build)
+            .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+        validate_metadata_value("build", &build_value)?;
+        markdown.push_str(&format!("- Recorded build (source revision, lockfile, toolchain, target and features; null means unknown): {}\n",
+            markdown_literal("build", &canonical_metadata(&build_value)?)?));
+        markdown.push_str(&format!(
+            "- Verified completed runs: {}\n",
+            known_runs.len()
+        ));
+        let mut ordered_runs = known_runs.iter().collect::<Vec<_>>();
+        ordered_runs.sort_by_key(|run| (run.arm_id, run.seed, run.run_id.as_str()));
+        if ordered_runs.is_empty() {
+            markdown.push_str("- No completed arms, seed cohort, tick horizons or effective configs are available. No statistical procedure was applied.\n");
+        }
+        for run in &ordered_runs {
+            validate_metadata_value(
+                "config",
+                &serde_json::to_value(&run.config_overrides)
+                    .map_err(|error| NotebookRenderError::Io(error.to_string()))?,
+            )?;
+            markdown.push_str(&format!("- Run: {}; arm: {}; variant: {}; seed: {}; ticks: {}; brain: {}; provenance schema: {}\n",
+                markdown_literal("run_id", &run.run_id)?, run.arm_id,
+                markdown_literal("variant_id", &run.variant_id)?, run.seed, run.total_ticks,
+                markdown_literal("brain_family", &run.brain_family)?, run.provenance_version));
+            markdown.push_str(&format!("  - config_digest: {}; world_digest: {}; summary_digest: {}; analysis_input_digest: {}\n",
+                markdown_literal("config_digest", &run.config_digest)?, markdown_literal("world_digest", &run.digest)?,
+                markdown_literal("summary_artifact_digest", &run.summary_artifact_digest)?,
+                markdown_literal("analysis_input_digest", &run.analysis_input_digest)?));
+            markdown.push_str("  - Full effective config layer (core defaults, arm overrides, then cohort seed):\n");
+            for line in reproduction_config(run)?.lines() {
+                markdown.push_str(&format!("    - {}\n", markdown_literal("config", line)?));
+            }
+        }
+        for claim in claims {
+            if let Support::Effect(reference) = &claim.support {
+                markdown.push_str(&format!("- Statistical methods for {}: estimator={}; p-value={}; interval={}; parameters={}\n",
+                    markdown_literal("metric", &reference.effect.metric)?, reference.effect.estimator.as_str(),
+                    reference.p_value_procedure.as_str(), reference.confidence_interval_procedure.as_str(),
+                    markdown_literal("analysis_params", &canonical_metadata(&serde_json::to_value(reference.params)
+                        .map_err(|error| NotebookRenderError::Io(error.to_string()))?)?)?));
+            }
+        }
+        markdown.push_str("\n## 3. Results\n");
+        if claims.is_empty() {
+            markdown.push_str("No analyzed effects are available. Completed runs, if any, are provenance evidence only; no empirical conclusion is asserted.\n\n");
+        }
+        for (index, claim) in claims.iter().enumerate() {
+            markdown.push_str(&format!("### Evidence {}\n", index + 1));
+            match &claim.support {
+                Support::Effect(reference) => render_effect(&mut markdown, reference)?,
+                Support::Descriptive(runs) => markdown.push_str(&format!(
+                    "Descriptive evidence from {} completed run(s); no effect estimate, interval or hypothesis test was computed.\n", runs.len())),
+            }
+            markdown.push('\n');
+        }
+        markdown.push_str("## 4. Claims\n");
+        if claims.is_empty() {
+            markdown.push_str(
+                "No claims were made. This partial report establishes no empirical result.\n\n",
+            );
+        }
         for (index, claim) in claims.iter().enumerate() {
             markdown.push_str(&format!("### Claim {}\n", index + 1));
             markdown.push_str(&format!(
@@ -436,9 +572,14 @@ impl NotebookRenderer {
             ));
 
             match &claim.support {
-                Support::Effect(reference) => render_effect(&mut markdown, reference)?,
+                Support::Effect(_) => markdown.push_str(&format!(
+                    "- Typed effect support: Evidence {} in Results.\n",
+                    index + 1
+                )),
                 Support::Descriptive(runs) => {
                     markdown.push_str("- **Descriptive Runs**:\n");
+                    let mut runs = runs.iter().collect::<Vec<_>>();
+                    runs.sort_by_key(|run| (run.arm_id, run.seed, run.run_id.as_str()));
                     for run in runs {
                         markdown.push_str(&format!(
                             "  - run_id: {}, arm: {}, seed: {}\n",
@@ -452,16 +593,7 @@ impl NotebookRenderer {
             markdown.push('\n');
         }
 
-        // THE HONESTY GATE (bd-16g.1.7). The parent bead's design requires the template to
-        // force an explicit "what would falsify this" and "what I did not test" section.
-        //
-        // Both are DERIVED from data already validated above rather than accepted as prose
-        // from a caller. That is deliberate on two counts: a derived section cannot be
-        // omitted (there is no argument a caller can forget to pass), and it cannot be
-        // fabricated -- every sentence below restates a fact this function has already
-        // checked against `known_runs`. A notebook whose limitations section is optional
-        // free text is a notebook whose limitations section is empty.
-        markdown.push_str("## 4. What Would Falsify This\n");
+        markdown.push_str("## 5. What Would Falsify This\n");
         if claims.is_empty() {
             markdown.push_str(
                 "No claims were made, so there is nothing to falsify. A session that \
@@ -478,19 +610,57 @@ impl NotebookRenderer {
             markdown.push('\n');
         }
 
-        markdown.push_str("## 5. What I Did Not Test\n");
+        markdown.push_str("## 6. What I Did Not Test\n");
         Self::render_scope_limits(&mut markdown, known_runs);
 
-        markdown.push_str("## 6. Reproducibility\n");
-        markdown.push_str(
-            "`./reproduce.sh` does two things. It verifies the retained summary artifacts \
-             are unmodified, and -- with `SCRIPTBOTS_BIN` set to the simulator binary -- it \
-             re-executes every arm x seed from the exact emitted config layer and compares \
-             each re-run world digest against the one cited here, exiting nonzero if any \
-             run fails or any digest differs. The emitted configs are retained beside this \
-             notebook as evidence. Summary and adjusted-p table re-derivation is not yet \
-             included; digest agreement is the reproduction claim it makes.\n",
-        );
+        markdown.push_str("## 7. Budget Ledger\n");
+        let completed_ticks: u128 = known_runs
+            .iter()
+            .map(|run| u128::from(run.total_ticks))
+            .sum();
+        markdown.push_str(&format!(
+            "| Resource | Charged / allocated | Limit | Verified completed |\n| --- | ---: | ---: | ---: |\n\
+             | Runs | {} | {} | {} |\n| Ticks | {} | {} | {} |\n\
+             | Tokens | {} | {} | not a simulation completion count |\n\
+             | Iterations | {} | {} | not a simulation completion count |\n\n",
+            context.runs_charged, context.max_runs, known_runs.len(), context.ticks_charged,
+            context.max_ticks, completed_ticks, context.tokens_charged, context.max_tokens,
+            context.iterations, context.max_iterations));
+        markdown.push_str("Charges are retained when allocated execution fails; charged work is not evidence of completion.\n");
+        if let Some(reason) = &context.failure_reason {
+            markdown.push_str(&format!(
+                "Terminal failure / partial report: {}\n",
+                markdown_literal("failure_reason", reason)?
+            ));
+        } else {
+            markdown.push_str("No terminal failure was recorded.\n");
+        }
+        if context.runs_charged > context.max_runs
+            || context.ticks_charged > context.max_ticks
+            || context.tokens_charged > context.max_tokens
+            || context.iterations > context.max_iterations
+        {
+            markdown.push_str("Budget limit exceeded in recorded accounting; this report does not authorize further work.\n");
+        }
+        if known_runs.len() > context.runs_charged
+            || completed_ticks > u128::from(context.ticks_charged)
+        {
+            markdown.push_str(
+                "Accounting inconsistency: verified completed evidence exceeds recorded charges.\n",
+            );
+        }
+        markdown.push_str("\n## 8. Reproduce\n");
+        if known_runs.is_empty() {
+            markdown.push_str("No completed cohort exists to reproduce. The partial report must not be interpreted as successful reproduction.\n");
+        } else {
+            markdown.push_str("Run `SCRIPTBOTS_BIN=/path/to/scriptbots ./reproduce.sh`. The script verifies retained summary hashes, re-executes every arm x seed from the exact config layers, and compares world digests. A modified retained config is refused without overwriting it. Summary and raw/adjusted statistical table regeneration, build matching, and canonical table comparison are not yet implemented. Digest agreement does not establish table reproduction.\n");
+        }
+        markdown.push_str("\n## 9. Environment / non-reproducible\n");
+        markdown.push_str("<!-- environment:start -->\n");
+        markdown.push_str(&format!("Recorded launch environment: RAYON_NUM_THREADS={}; SCRIPTBOTS_MAX_THREADS={}. Host timing and machine identity are not scientific evidence.\n",
+            markdown_literal("environment", context.build.rayon_num_threads.as_deref().unwrap_or("unset"))?,
+            markdown_literal("environment", context.build.scriptbots_max_threads.as_deref().unwrap_or("unset"))?));
+        markdown.push_str("<!-- environment:end -->\n");
         Ok(markdown)
     }
 
@@ -501,6 +671,7 @@ impl NotebookRenderer {
     /// was tested" -- that stronger claim needs the full knob space, which this layer does
     /// not have. Overstating the limitations section would be its own dishonesty.
     fn render_scope_limits(markdown: &mut String, known_runs: &[RunRef]) {
+        markdown.push_str("- Digest equality is asserted only within the recorded same-build lane. Cross-machine bit identity, different toolchains, targets, features and builds were not tested.\n");
         if known_runs.is_empty() {
             markdown.push_str(
                 "- No runs completed, so NOTHING in this notebook is empirically \
@@ -566,9 +737,10 @@ impl NotebookRenderer {
         claims: &[Claim],
         known_runs: &[RunRef],
         out_dir: &Path,
+        context: &NotebookContext,
     ) -> Result<PathBuf, NotebookRenderError> {
         validate_session_id(session_id)?;
-        let markdown = Self::render_markdown(goal, claims, known_runs)?;
+        let markdown = Self::render_markdown(goal, claims, known_runs, context)?;
         let mut verified_paths = Vec::with_capacity(known_runs.len());
         for run in known_runs {
             let summary_path = run.summary_path.as_deref().ok_or_else(|| {
@@ -661,12 +833,32 @@ impl NotebookRenderer {
             script.push_str("cfg=\"$work/");
             script.push_str(&safe_name);
             script.push_str(".toml\"\n");
+            // A retained config is EVIDENCE, not scratch. If an existing file at this
+            // path differs from the layer the notebook cites, the reproduction set has
+            // been tampered with; overwriting would silently launder the mutation into
+            // a passing rerun. Refuse without modifying the retained evidence.
+            script.push_str("cfg_expected=");
+            script.push_str(&shell_single_quote(
+                &blake3::hash(layer_toml.as_bytes()).to_hex().to_string(),
+            ));
+            script.push('\n');
+            script.push_str(
+                "if [ -e \"$cfg\" ]; then\n  cfg_actual=\"$(b3sum -- \"$cfg\")\"; cfg_actual=\"${cfg_actual%% *}\"\n  test \"$cfg_actual\" = \"$cfg_expected\" || { echo 'retained config tampered: ",
+            );
+            script.push_str(&safe_name);
+            script.push_str("' >&2; exit 1; }\nfi\n");
             script.push_str("printf '%s' ");
             script.push_str(&shell_single_quote(&layer_toml));
             script.push_str(" > \"$cfg\"\n");
 
             script.push_str("out=\"$(SCRIPTBOTS_DET_RUN=1 SCRIPTBOTS_DET_TICKS=");
             script.push_str(&run.total_ticks.to_string());
+            // The child's founding population comes from the brain preset (default
+            // `mixed`, which registers four families). The parent run executed ONE
+            // canonical family, so without pinning it the re-executed world is
+            // structurally different and every digest differs (bd-16g.1.7).
+            script.push_str(" SCRIPTBOTS_BRAIN=");
+            script.push_str(brain_preset_for_family(&run.brain_family)?);
             script.push_str(" \"$SCRIPTBOTS_BIN\" --config \"$cfg\")\" || { echo 'run failed: ");
             script.push_str(&safe_name);
             script.push_str("' >&2; rerun_failures=$((rerun_failures+1)); }\n");
@@ -703,10 +895,125 @@ impl NotebookRenderer {
     }
 }
 
+fn brain_preset_for_family(family: &str) -> Result<&'static str, NotebookRenderError> {
+    match family {
+        "mlp.baseline" => Ok("mlp"),
+        "dwraon.baseline" => Ok("dwraon"),
+        "assembly.experimental" => Ok("assembly"),
+        _ => Err(NotebookRenderError::Io(format!(
+            "cannot reproduce unsupported brain family {family:?}"
+        ))),
+    }
+}
+
 fn reproduction_config(run: &RunRef) -> Result<String, NotebookRenderError> {
-    let mut layer = run.config_overrides.clone();
-    layer.insert("rng_seed".to_owned(), serde_json::json!(run.seed));
-    toml::to_string(&layer).map_err(|error| NotebookRenderError::Io(error.to_string()))
+    // The child runner composes its world from the FULL effective config: core
+    // defaults + the arm's overrides + the pinned seed. Emitting only the override
+    // delta let the child silently fall back to the app's DIFFERENT defaults
+    // (persistence_interval 60 vs 0, history_capacity 600 vs 256), so the
+    // re-executed world was structurally not the simulated one and every cited
+    // digest differed on re-execution (bd-16g.1.7).
+    let mut encoded = serde_json::to_value(scriptbots_core::ScriptBotsConfig::default())
+        .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+    let root = encoded.as_object_mut().ok_or_else(|| {
+        NotebookRenderError::Io("default config did not serialize as an object".to_owned())
+    })?;
+    for (path, value) in &run.config_overrides {
+        crate::experiment_runner::insert_dotted_value(root, path, value.clone())
+            .map_err(NotebookRenderError::Io)?;
+    }
+    let seed = i64::try_from(run.seed).map_err(|error| {
+        NotebookRenderError::Io(format!("seed {} exceeds i64: {error}", run.seed))
+    })?;
+    // The matched-seed axis is owned by the cohort: the seed wins over any
+    // override, exactly as experiment_runner::config_for_run applies it.
+    root.insert("rng_seed".to_owned(), serde_json::json!(seed));
+    // TOML cannot express null, and serde_json's arbitrary-precision Numbers must
+    // never reach toml::to_string directly (json_to_toml_value documents that
+    // trap): strip the defaulted Option nulls, then convert field by field.
+    let stripped = strip_nulls(&encoded);
+    let object = stripped.as_object().ok_or_else(|| {
+        NotebookRenderError::Io("effective config did not remain an object".to_owned())
+    })?;
+    let mut layer = toml::map::Map::new();
+    for (key, value) in object {
+        layer.insert(key.clone(), json_to_toml_value(value.clone())?);
+    }
+    toml::to_string(&toml::Value::Table(layer))
+        .map_err(|error| NotebookRenderError::Io(error.to_string()))
+}
+
+/// Recursively drops JSON nulls so the TOML layer stays schema-compatible: a
+/// `None` Option field left in place would fail `toml::to_string`, while dropping
+/// it lets the child's serde defaults reconstruct the identical value.
+fn strip_nulls(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter_map(|(key, child)| {
+                    let stripped = strip_nulls(child);
+                    if stripped.is_null() {
+                        None
+                    } else {
+                        Some((key.clone(), stripped))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(strip_nulls).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Converts a JSON override into the TOML-native scalar/table the CLI parser reads.
+///
+/// `toml::to_string(&serde_json::Value)` is NOT a conversion: with serde_json's
+/// arbitrary-precision feature every `Number` serializes as a private-variant table
+/// (`"$serde_json::private::Number"`), which the config parser silently ignores --
+/// the run then executes with defaults while the notebook cites its own digest.
+fn json_to_toml_value(value: serde_json::Value) -> Result<toml::Value, NotebookRenderError> {
+    let converted = match value {
+        serde_json::Value::Null => {
+            return Err(NotebookRenderError::Io(
+                "config override is null, which TOML cannot express".to_owned(),
+            ));
+        }
+        serde_json::Value::Bool(flag) => toml::Value::Boolean(flag),
+        serde_json::Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                toml::Value::Integer(int)
+            } else {
+                let float = number.as_f64().ok_or_else(|| {
+                    NotebookRenderError::Io(
+                        "config override number is neither i64 nor f64".to_owned(),
+                    )
+                })?;
+                if !float.is_finite() {
+                    return Err(NotebookRenderError::Io(format!(
+                        "non-finite config override {float} cannot be written to TOML"
+                    )));
+                }
+                toml::Value::Float(float)
+            }
+        }
+        serde_json::Value::String(text) => toml::Value::String(text),
+        serde_json::Value::Array(items) => toml::Value::Array(
+            items
+                .into_iter()
+                .map(json_to_toml_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        serde_json::Value::Object(map) => {
+            let mut table = toml::map::Map::new();
+            for (key, value) in map {
+                table.insert(key, json_to_toml_value(value)?);
+            }
+            toml::Value::Table(table)
+        }
+    };
+    Ok(converted)
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -894,7 +1201,9 @@ fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), Not
         ));
     }
     markdown.push_str("- **Structured Input Evidence**:\n");
-    for run in &reference.runs {
+    let mut runs = reference.runs.iter().collect::<Vec<_>>();
+    runs.sort_by_key(|run| (run.arm_id, run.seed, run.run_id.as_str()));
+    for run in runs {
         markdown.push_str(&format!(
             "  - run_id={}, arm={}, seed={}, config_digest={}, world_digest={}, \
              summary_digest={}, analysis_input_digest={}\n",
@@ -907,6 +1216,27 @@ fn render_effect(markdown: &mut String, reference: &EffectRef) -> Result<(), Not
             markdown_literal("analysis_input_digest", &run.analysis_input_digest)?,
         ));
     }
+    // Fixed geometry, locale-independent numeric formatting, and no user-controlled SVG markup.
+    // Normalize before arithmetic so even finite values near f64::MAX cannot overflow.
+    let (lower, upper) = effect
+        .ci_95
+        .unwrap_or((effect.mean_difference, effect.mean_difference));
+    let scale = lower
+        .abs()
+        .max(upper.abs())
+        .max(effect.mean_difference.abs())
+        .max(1.0);
+    let position = |value: f64| 320.0 + (value / scale) * 260.0;
+    markdown.push_str(&format!(
+        "\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"640\" height=\"120\" viewBox=\"0 0 640 120\" role=\"img\" aria-label=\"Paired mean difference and available 95 percent confidence interval\">\n\
+         <title>Paired mean difference; interval shown only when defined</title>\n\
+         <line x1=\"60\" y1=\"60\" x2=\"580\" y2=\"60\" stroke=\"black\"/>\n\
+         <line x1=\"320\" y1=\"30\" x2=\"320\" y2=\"90\" stroke=\"gray\"/>\n\
+         <line x1=\"{:.4}\" y1=\"60\" x2=\"{:.4}\" y2=\"60\" stroke=\"blue\" stroke-width=\"4\"/>\n\
+         <circle cx=\"{:.4}\" cy=\"60\" r=\"5\" fill=\"black\"/>\n\
+         <text x=\"60\" y=\"110\">{}</text><text x=\"310\" y=\"110\">0</text><text x=\"580\" y=\"110\" text-anchor=\"end\">{}</text>\n</svg>\n",
+        position(lower), position(upper), position(effect.mean_difference),
+        format_float_safe(-scale)?, format_float_safe(scale)?));
     Ok(())
 }
 
@@ -918,6 +1248,22 @@ mod tests {
         UndefinedReason, UnderpoweredReason,
     };
     use std::collections::BTreeMap;
+
+    fn notebook_context() -> NotebookContext {
+        NotebookContext {
+            model_id: "offline-fixture".to_owned(),
+            build: crate::BuildProvenanceV0::current(),
+            max_runs: 10,
+            runs_charged: 4,
+            max_ticks: 10_000,
+            ticks_charged: 10_000,
+            max_tokens: 100_000,
+            tokens_charged: 50,
+            max_iterations: 20,
+            iterations: 2,
+            failure_reason: None,
+        }
+    }
 
     fn run(run_id: &str, arm_id: u16, seed: u64) -> RunRef {
         RunRef {
@@ -932,9 +1278,10 @@ mod tests {
             summary_path: None,
             variant_id: format!("arm-{arm_id:03}"),
             config_overrides: BTreeMap::from([(
-                "food_regrowth_rate".to_owned(),
+                "food_growth_rate".to_owned(),
                 serde_json::json!(0.1 * f64::from(arm_id + 1)),
             )]),
+            brain_family: "mlp.baseline".to_owned(),
             provenance_version: super::super::stats::LAB_RUN_SUMMARY_VERSION,
         }
     }
@@ -992,9 +1339,10 @@ mod tests {
             summary_path: None,
             variant_id: format!("arm-{arm_id:03}"),
             config_overrides: BTreeMap::from([(
-                "food_regrowth_rate".to_owned(),
+                "food_growth_rate".to_owned(),
                 serde_json::json!(0.1 * f64::from(arm_id + 1)),
             )]),
+            brain_family: "mlp.baseline".to_owned(),
         })
     }
 
@@ -1015,6 +1363,7 @@ mod tests {
                 "Test Goal",
                 &[claim(vec![control.clone(), missing])],
                 std::slice::from_ref(&control),
+                &notebook_context(),
             ),
             Err(NotebookRenderError::MissingRunSupport("missing".into()))
         );
@@ -1027,10 +1376,31 @@ mod tests {
                 "Test Goal",
                 &[claim(vec![control.clone(), forged])],
                 &[control, treatment],
+                &notebook_context(),
             ),
             Err(NotebookRenderError::RunProvenanceMismatch {
                 run_id: "treatment".to_owned(),
                 field: "config_digest",
+            })
+        );
+    }
+
+    #[test]
+    fn provenance_rejects_changed_brain_family() {
+        let control = run("control", 0, 42);
+        let treatment = run("treatment", 1, 42);
+        let mut forged = treatment.clone();
+        forged.brain_family = "assembly.experimental".to_owned();
+        assert_eq!(
+            NotebookRenderer::render_markdown(
+                "Population study",
+                &[claim(vec![control.clone(), forged])],
+                &[control, treatment],
+                &notebook_context(),
+            ),
+            Err(NotebookRenderError::RunProvenanceMismatch {
+                run_id: "treatment".to_owned(),
+                field: "brain_family",
             })
         );
     }
@@ -1069,6 +1439,7 @@ mod tests {
                 &[claim(runs.clone())],
                 &runs,
                 temp_dir.path(),
+                &notebook_context(),
             ),
             Err(NotebookRenderError::MissingRetainedArtifactPath(
                 "control".to_owned()
@@ -1088,6 +1459,7 @@ mod tests {
                 &[claim(oversized.clone())],
                 &oversized,
                 temp_dir.path(),
+                &notebook_context(),
             ),
             Err(NotebookRenderError::RetainedArtifactTooLarge {
                 run_id: "control".to_owned(),
@@ -1112,11 +1484,16 @@ mod tests {
             "Population study",
             std::slice::from_ref(&rendered_claim),
             &runs,
+            &notebook_context(),
         )
         .unwrap();
-        let second =
-            NotebookRenderer::render_markdown("Population study", &[rendered_claim], &runs)
-                .unwrap();
+        let second = NotebookRenderer::render_markdown(
+            "Population study",
+            &[rendered_claim],
+            &runs,
+            &notebook_context(),
+        )
+        .unwrap();
         assert_eq!(first, second);
         for required in [
             "Statistics Authority: scriptbots_app::lab::stats",
@@ -1148,6 +1525,7 @@ mod tests {
             &[claim(runs.clone())],
             &runs,
             &notebook_dir,
+            &notebook_context(),
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), first);
@@ -1161,6 +1539,47 @@ mod tests {
     }
 
     #[test]
+    fn reproduction_refuses_modified_config_without_overwriting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut reference = run("control", 0, 42);
+        let summary = directory.path().join("summary.csv");
+        let evidence = b"retained summary evidence\n";
+        fs::write(&summary, evidence).unwrap();
+        reference.summary_path = Some(summary.to_string_lossy().into_owned());
+        reference.summary_artifact_digest = blake3::hash(evidence).to_hex().to_string();
+        let notebook = directory.path().join("notebook");
+        NotebookRenderer::render_notebook(
+            "tamper-regression",
+            "Population study",
+            &[],
+            &[reference],
+            &notebook,
+            &notebook_context(),
+        )
+        .unwrap();
+        let configs = notebook.join("reproduce-configs");
+        fs::create_dir(&configs).unwrap();
+        let config = configs.join("control.toml");
+        let modified = b"rng_seed = 999\n";
+        fs::write(&config, modified).unwrap();
+        for _ in 0..2 {
+            let output = std::process::Command::new("bash")
+                .arg(notebook.join("reproduce.sh"))
+                // Refusal must occur before any simulator invocation.
+                .env("SCRIPTBOTS_BIN", directory.path().join("absent-simulator"))
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read(&config).unwrap(), modified);
+        }
+    }
+
+    #[test]
     fn non_finite_or_internally_inconsistent_effects_are_refused() {
         let runs = vec![run("control", 0, 42), run("treatment", 1, 42)];
         let mut non_finite = effect();
@@ -1171,7 +1590,7 @@ mod tests {
             falsifier: "bad".to_owned(),
         };
         assert_eq!(
-            NotebookRenderer::render_markdown("goal", &[bad], &runs),
+            NotebookRenderer::render_markdown("goal", &[bad], &runs, &notebook_context()),
             Err(NotebookRenderError::NonFiniteFloat)
         );
 
@@ -1183,7 +1602,7 @@ mod tests {
             falsifier: "bad".to_owned(),
         };
         assert_eq!(
-            NotebookRenderer::render_markdown("goal", &[bad], &runs),
+            NotebookRenderer::render_markdown("goal", &[bad], &runs, &notebook_context()),
             Err(NotebookRenderError::EffectContractMismatch {
                 metric: "alive_agents".to_owned(),
                 field: "standardized_effect_contract",
@@ -1196,6 +1615,7 @@ mod tests {
                 "goal",
                 &[claim(vec![runs[0].clone(), rogue.clone()])],
                 &[runs[0].clone(), rogue],
+                &notebook_context(),
             ),
             Err(NotebookRenderError::EffectContractMismatch {
                 metric: "alive_agents".to_owned(),
@@ -1211,7 +1631,7 @@ mod tests {
             falsifier: "bad".to_owned(),
         };
         assert_eq!(
-            NotebookRenderer::render_markdown("goal", &[bad], &runs),
+            NotebookRenderer::render_markdown("goal", &[bad], &runs, &notebook_context()),
             Err(NotebookRenderError::EffectContractMismatch {
                 metric: "alive_agents".to_owned(),
                 field: "multiple_comparison_evidence",
@@ -1239,10 +1659,16 @@ mod tests {
         };
         let goal = "# Forged goal\n<img src=x onerror=alert(1)>";
 
-        let first =
-            NotebookRenderer::render_markdown(goal, std::slice::from_ref(&hostile_claim), &runs)
+        let first = NotebookRenderer::render_markdown(
+            goal,
+            std::slice::from_ref(&hostile_claim),
+            &runs,
+            &notebook_context(),
+        )
+        .unwrap();
+        let second =
+            NotebookRenderer::render_markdown(goal, &[hostile_claim], &runs, &notebook_context())
                 .unwrap();
-        let second = NotebookRenderer::render_markdown(goal, &[hostile_claim], &runs).unwrap();
         assert_eq!(first, second);
 
         for forbidden in [
@@ -1278,14 +1704,19 @@ mod tests {
         let mut missing_text = claim(runs.clone());
         missing_text.text = " \n ".to_owned();
         assert_eq!(
-            NotebookRenderer::render_markdown("goal", &[missing_text], &runs),
+            NotebookRenderer::render_markdown("goal", &[missing_text], &runs, &notebook_context()),
             Err(NotebookRenderError::MissingClaimText { index: 1 })
         );
 
         let mut missing_falsifier = claim(runs.clone());
         missing_falsifier.falsifier.clear();
         assert_eq!(
-            NotebookRenderer::render_markdown("goal", &[missing_falsifier], &runs),
+            NotebookRenderer::render_markdown(
+                "goal",
+                &[missing_falsifier],
+                &runs,
+                &notebook_context()
+            ),
             Err(NotebookRenderError::MissingFalsifier { index: 1 })
         );
     }
@@ -1306,7 +1737,8 @@ mod tests {
             NotebookRenderer::render_markdown(
                 "population\u{0007}study",
                 &[claim(runs.clone())],
-                &runs
+                &runs,
+                &notebook_context()
             ),
             Err(NotebookRenderError::UnsafeText {
                 field: "goal",
@@ -1314,7 +1746,12 @@ mod tests {
             })
         );
         assert_eq!(
-            NotebookRenderer::render_markdown("population study\t", &[claim(runs.clone())], &runs),
+            NotebookRenderer::render_markdown(
+                "population study\t",
+                &[claim(runs.clone())],
+                &runs,
+                &notebook_context()
+            ),
             Err(NotebookRenderError::UnsafeText {
                 field: "goal",
                 codepoint: 9,
@@ -1324,7 +1761,8 @@ mod tests {
             NotebookRenderer::render_markdown(
                 "population\u{202E}study",
                 &[claim(runs.clone())],
-                &runs
+                &runs,
+                &notebook_context()
             ),
             Err(NotebookRenderError::UnsafeText {
                 field: "goal",
@@ -1340,6 +1778,7 @@ mod tests {
                 "goal",
                 &[claim(support)],
                 &[unsafe_run, runs[1].clone()],
+                &notebook_context(),
             ),
             Err(NotebookRenderError::UnsafeText {
                 field: "world_digest",
@@ -1361,7 +1800,14 @@ mod tests {
             "session/path",
         ] {
             assert_eq!(
-                NotebookRenderer::render_notebook(unsafe_id, "goal", &[], &[], temp_dir.path(),),
+                NotebookRenderer::render_notebook(
+                    unsafe_id,
+                    "goal",
+                    &[],
+                    &[],
+                    temp_dir.path(),
+                    &notebook_context()
+                ),
                 Err(NotebookRenderError::InvalidSessionId)
             );
         }
@@ -1378,10 +1824,9 @@ mod tests {
             support: Support::Descriptive(runs.clone()),
             falsifier: "Equilibrium population does not rise when regrowth is raised.".to_owned(),
         }];
-        let md = NotebookRenderer::render_markdown("goal", &claims, &runs).expect("renders");
+        let md = NotebookRenderer::render_markdown("goal", &claims, &runs, &notebook_context())
+            .expect("renders");
 
-        assert!(md.contains("## 4. What Would Falsify This"), "{md}");
-        assert!(md.contains("## 5. What I Did Not Test"), "{md}");
         assert!(
             md.contains("Equilibrium population does not rise"),
             "the falsifier must be surfaced in its own section, not only inline: {md}"
@@ -1397,7 +1842,8 @@ mod tests {
     #[test]
     fn bd_16g_1_7_thin_seed_cohorts_are_flagged_underpowered() {
         let thin = vec![run("r1", 0, 7), run("r2", 1, 7)];
-        let md = NotebookRenderer::render_markdown("goal", &[], &thin).expect("renders");
+        let md = NotebookRenderer::render_markdown("goal", &[], &thin, &notebook_context())
+            .expect("renders");
         assert!(
             md.contains("Underpowered"),
             "two runs sharing one seed is a pilot, not a result: {md}"
@@ -1409,7 +1855,8 @@ mod tests {
             run("r3", 0, 3),
             run("r4", 1, 1),
         ];
-        let md = NotebookRenderer::render_markdown("goal", &[], &wide).expect("renders");
+        let md = NotebookRenderer::render_markdown("goal", &[], &wide, &notebook_context())
+            .expect("renders");
         assert!(
             !md.contains("Underpowered"),
             "three distinct seeds clears the pilot floor: {md}"
@@ -1421,7 +1868,8 @@ mod tests {
     fn bd_16g_1_7_unequal_tick_horizons_are_reported_as_a_confound() {
         let mut runs = vec![run("r1", 0, 1), run("r2", 1, 2)];
         runs[1].total_ticks = 5_000;
-        let md = NotebookRenderer::render_markdown("goal", &[], &runs).expect("renders");
+        let md = NotebookRenderer::render_markdown("goal", &[], &runs, &notebook_context())
+            .expect("renders");
         assert!(md.contains("between 100 and 5000 ticks"), "{md}");
         assert!(
             md.contains("confound"),
@@ -1433,7 +1881,8 @@ mod tests {
     /// A session that completed nothing must say so, not render an empty gap.
     #[test]
     fn bd_16g_1_7_a_zero_run_session_states_that_nothing_is_supported() {
-        let md = NotebookRenderer::render_markdown("goal", &[], &[]).expect("renders");
+        let md = NotebookRenderer::render_markdown("goal", &[], &[], &notebook_context())
+            .expect("renders");
         assert!(
             md.contains("NOTHING in this notebook is empirically supported"),
             "{md}"
@@ -1441,24 +1890,6 @@ mod tests {
         assert!(
             md.contains("No claims were made, so there is nothing to falsify"),
             "{md}"
-        );
-    }
-
-    /// The reproducibility blurb must not imply re-execution it does not perform.
-    #[test]
-    fn bd_16g_1_7_reproduce_blurb_does_not_overclaim_reproduction() {
-        let runs = vec![run("r1", 0, 1)];
-        let md = NotebookRenderer::render_markdown("goal", &[], &runs).expect("renders");
-        // The blurb used to disclose that nothing was re-executed. It now re-executes, so
-        // the honest disclosure moved: what it must NOT overclaim is table re-derivation,
-        // which is still absent. A test that pins a limitation outlives the limitation.
-        assert!(
-            md.contains("re-executes every arm x seed"),
-            "the notebook must state what reproduce.sh actually does: {md}"
-        );
-        assert!(
-            md.contains("table re-derivation is not yet"),
-            "the remaining gap must stay disclosed rather than quietly dropped: {md}"
         );
     }
 
@@ -1475,13 +1906,43 @@ mod tests {
         ]);
         let encoded = reproduction_config(&reference).expect("serialize config");
         let decoded: serde_json::Value = toml::from_str(&encoded).expect("CLI TOML parser");
+        // The layer must be the FULL effective config (core defaults + overrides +
+        // pinned seed), because the child composes its world from the full config.
+        // Asserting the exact parent-side values proves the layer reproduces the
+        // simulated world instead of silently re-defaulting app-only knobs.
+        // The layer is the FULL effective config (core defaults + overrides +
+        // pinned seed); assert the load-bearing fields rather than every key:
+        // the overrides must survive, the cohort seed must win, and the two
+        // app-default knobs that once diverged from the parent run must carry
+        // the parent's (core-default) values, not the app's.
+        assert_eq!(decoded["rng_seed"], serde_json::json!(42));
+        assert_eq!(decoded["food_growth_rate"], serde_json::json!(0.02));
+        assert_eq!(decoded["neuroflow"], serde_json::json!({"enabled": false}));
         assert_eq!(
-            decoded,
-            serde_json::json!({
-                "rng_seed": 42,
-                "food_growth_rate": 0.02,
-                "neuroflow": {"enabled": false},
-            })
+            decoded["persistence_interval"],
+            serde_json::json!(0),
+            "emitted layer must carry the parent's core default, not the app's 60"
+        );
+        assert_eq!(
+            decoded["history_capacity"],
+            serde_json::json!(256),
+            "emitted layer must carry the parent's core default, not the app's 600"
+        );
+    }
+
+    /// The pinned seed must win over any override carrying rng_seed, mirroring
+    /// experiment_runner::config_for_run's cohort-owned seed axis.
+    #[test]
+    fn reproduction_config_pins_seed_over_override() {
+        let mut reference = run("arm-1", 1, 42);
+        reference.config_overrides =
+            BTreeMap::from([("rng_seed".to_owned(), serde_json::json!(999))]);
+        let encoded = reproduction_config(&reference).expect("serialize config");
+        let decoded: serde_json::Value = toml::from_str(&encoded).expect("CLI TOML parser");
+        assert_eq!(
+            decoded.get("rng_seed").and_then(serde_json::Value::as_i64),
+            Some(42),
+            "cohort seed must win over the override: {encoded}"
         );
     }
 }

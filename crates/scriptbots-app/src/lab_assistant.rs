@@ -123,7 +123,7 @@ impl ExperimentExecutor for MatchedSeedExecutor {
         let status = runner
             .execute_batch(&output_dir.join("status.json"))
             .map_err(|error| error.to_string())?;
-        let summaries = completed_run_summaries(spec, &status)?;
+        let summaries = completed_run_summaries(&spec.arms, &status)?;
         execution_receipt(spec, &status, summaries)
     }
 }
@@ -187,8 +187,8 @@ fn read_bounded_analysis_file(path: &std::path::Path, limit: usize) -> Result<Ve
     Ok(bytes)
 }
 
-fn completed_run_summaries(
-    spec: &ValidatedSpec,
+pub(crate) fn completed_run_summaries(
+    arms: &[crate::lab::spec::Arm],
     status: &ExperimentBatchStatus,
 ) -> Result<Vec<RunSummary>, String> {
     let mut summaries = Vec::with_capacity(status.runs.len());
@@ -209,12 +209,12 @@ fn completed_run_summaries(
                     record.run_id, record.variant_id
                 )
             })?;
-        if spec.arms.get(usize::from(arm_id)).is_none() {
+        if arms.get(usize::from(arm_id)).is_none() {
             return Err(format!(
                 "run {} references arm {} outside validated arm count {}",
                 record.run_id,
                 arm_id,
-                spec.arms.len()
+                arms.len()
             ));
         }
         let bundle_path = record.bundle_path.as_ref().ok_or_else(|| {
@@ -335,14 +335,13 @@ fn completed_run_summaries(
         // The arm's actual overrides, not just its ordinal. An out-of-range arm is a hard
         // error rather than an empty map: empty overrides are a VALID config (the defaults),
         // so defaulting here would digest a broken run as a clean default-config run.
-        let config_overrides = spec
-            .arms
+        let config_overrides = arms
             .get(usize::from(arm_id))
             .ok_or_else(|| {
                 format!(
                     "run {} names arm {arm_id} but the spec declares only {} arm(s)",
                     record.run_id,
-                    spec.arms.len()
+                    arms.len()
                 )
             })?
             .clone();
@@ -358,6 +357,7 @@ fn completed_run_summaries(
             summary_path: Some(summary_path.to_string_lossy().into_owned()),
             variant_id: record.variant_id.clone(),
             config_overrides,
+            brain_family: row.brain_family,
         }));
     }
     Ok(summaries)
@@ -769,6 +769,23 @@ impl LabStateMachine {
         Ok(())
     }
 
+    /// Report metadata and charged budget for the notebook contract.
+    fn notebook_context(&self) -> crate::lab::notebook::NotebookContext {
+        crate::lab::notebook::NotebookContext {
+            model_id: self.client.model_id().to_owned(),
+            build: crate::BuildProvenanceV0::current(),
+            max_runs: self.budget.max_runs,
+            runs_charged: self.runs_spent,
+            max_ticks: self.budget.max_ticks,
+            ticks_charged: self.ticks_spent,
+            max_tokens: self.budget.max_tokens,
+            tokens_charged: self.tokens_spent,
+            max_iterations: self.budget.max_iterations,
+            iterations: self.iterations,
+            failure_reason: self.failure_reason.clone(),
+        }
+    }
+
     fn report(&mut self) -> Result<(), LabError> {
         let (Some(validated), Some(analysis)) =
             (self.validated_spec.as_ref(), self.analysis.as_ref())
@@ -804,6 +821,10 @@ impl LabStateMachine {
             return Ok(());
         };
         let known_runs = run_refs(&self.run_summaries);
+        let goal = format!(
+            "{}\n\n- Validated Spec ID: {}",
+            validated.spec.hypothesis, validated.spec_id
+        );
         let claims = match claims_from_analysis(
             analysis,
             &self.run_summaries,
@@ -816,17 +837,15 @@ impl LabStateMachine {
                 return Err(LabError::Notebook(error));
             }
         };
-        let goal = format!(
-            "{}\n\n- Validated Spec ID: {}",
-            validated.spec.hypothesis, validated.spec_id
-        );
-        let rendered = match NotebookRenderer::render_markdown(&goal, &claims, &known_runs) {
-            Ok(rendered) => rendered,
-            Err(error) => {
-                self.phase = LabPhase::Finished;
-                return Err(LabError::Notebook(error));
-            }
-        };
+        let context = self.notebook_context();
+        let rendered =
+            match NotebookRenderer::render_markdown(&goal, &claims, &known_runs, &context) {
+                Ok(rendered) => rendered,
+                Err(error) => {
+                    self.phase = LabPhase::Finished;
+                    return Err(LabError::Notebook(error));
+                }
+            };
         if let Some(root) = &self.notebook_root {
             let directory = root.join(&validated.spec_id).join("notebook");
             let path = NotebookRenderer::render_notebook(
@@ -835,6 +854,7 @@ impl LabStateMachine {
                 &claims,
                 &known_runs,
                 &directory,
+                &context,
             )
             .map_err(LabError::Notebook)?;
             self.notebook_path = Some(path);
@@ -975,6 +995,7 @@ mod tests {
                         summary_path: None,
                         variant_id: format!("arm-{arm_id:03}"),
                         config_overrides: arm.clone(),
+                        brain_family: "mlp.baseline".to_owned(),
                     }));
                 }
             }
@@ -1222,8 +1243,13 @@ mod tests {
                 "{}\n\n- Validated Spec ID: {}",
                 validated.spec.hypothesis, validated.spec_id
             );
-            NotebookRenderer::render_markdown(&goal, &claims, &run_refs(summaries))
-                .expect("verified analysis renders")
+            NotebookRenderer::render_markdown(
+                &goal,
+                &claims,
+                &run_refs(summaries),
+                &first_lab.notebook_context(),
+            )
+            .expect("verified analysis renders")
         };
         let mut reordered = first_lab.run_summaries.clone();
         reordered.reverse();
@@ -1261,6 +1287,7 @@ mod tests {
             summary_path: None,
             variant_id: treatment.variant_id.clone(),
             config_overrides: treatment.config_overrides.clone(),
+            brain_family: treatment.brain_family.clone(),
         });
         assert_ne!(
             render(&changed),
@@ -1301,7 +1328,7 @@ mod tests {
         fs::write(&summary_path, format!("{header}\n{}\n", cells.join(",")))
             .expect("deliberate post-verification mutation");
 
-        let error = completed_run_summaries(&validated, &status)
+        let error = completed_run_summaries(&validated.arms, &status)
             .expect_err("artifact mutation must fail closed");
         assert!(
             error.contains("no longer matches its verified bundle artifact entry"),
