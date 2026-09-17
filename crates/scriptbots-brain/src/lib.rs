@@ -23,8 +23,27 @@ pub mod assembly;
 pub use assembly::AssemblyBrain;
 
 /// Small newtype wrapper identifying brain families.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct BrainKind(&'static str);
+
+impl<'de> serde::Deserialize<'de> for BrainKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let static_str: &'static str = match s.as_str() {
+            "mlp.baseline" => "mlp.baseline",
+            "dwraon.baseline" => "dwraon.baseline",
+            "assembly.experimental" => "assembly.experimental",
+            "ml.neuroflow" => "ml.neuroflow",
+            "ml.placeholder" => "ml.placeholder",
+            "echo" => "echo",
+            _ => Box::leak(s.into_boxed_str()),
+        };
+        Ok(BrainKind::new(static_str))
+    }
+}
 
 impl BrainKind {
     #[must_use]
