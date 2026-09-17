@@ -649,10 +649,10 @@ impl Default for BimodalityParams {
 ///
 /// # Complexity (bd-16g.2.11)
 ///
-/// **O(n) time, O(1) working memory.** Two passes over the input plus one pass
-/// over [`BIMODALITY_BINS`] bins, which is independent of `n`. This previously
-/// sorted a full copy of the sample — O(n log n) time and O(n) memory — which
-/// contradicted the leaf contract this primitive advertises.
+/// **O(n) time, O(1) working memory.** Three passes over a nonconstant input
+/// (validation/extent, histogram, dispersion), followed by fixed-size bin scans.
+/// Empty, singleton and constant inputs return after the extent pass. No input
+/// copy or full-sample sort is allocated.
 ///
 /// # Exactness and the approximation envelope
 ///
@@ -706,9 +706,8 @@ pub fn bimodality(
 pub struct DetectorWork {
     /// Times an input value was read. Linear in the sample count by construction.
     pub value_visits: u64,
-    /// Times a histogram bin was read or folded. Bounded by [`BIMODALITY_BINS`],
-    /// independent of the sample count — this is the bounded-memory claim made
-    /// countable.
+    /// Histogram touches: two per input value plus fixed-size bin scans on the
+    /// nonconstant path. The scans, not the total, are independent of sample count.
     pub bin_visits: u64,
     /// Heap allocations performed. Zero for this path: the histogram lives in fixed
     /// stack arrays. The previous implementation allocated a full copy of the sample.
@@ -743,36 +742,36 @@ fn bimodality_inner(
     params: BimodalityParams,
     work: &mut DetectorWork,
 ) -> Result<BimodalityScore, DetectError> {
-    for (index, value) in values.iter().enumerate() {
-        if !value.is_finite() {
-            return Err(DetectError::NonFinite { index });
-        }
-    }
-    if values.len() < 2 {
-        return Ok(BimodalityScore {
-            score: 0.0,
-            separation: 0.0,
-            split: values.first().copied().unwrap_or_default(),
-            lower_mean: values.first().copied().unwrap_or_default(),
-            upper_mean: values.first().copied().unwrap_or_default(),
-            lower_count: values.len(),
-            upper_count: 0,
-            is_bimodal: false,
-        });
-    }
-
-    // PASS 1: extent only. `min`/`max` are order-independent by construction.
+    // PASS 1: validate and compute the extent. Count validation reads even when
+    // a non-finite value terminates this pass early.
     let n = values.len() as f64;
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
-    for value in values {
+    for (index, value) in values.iter().enumerate() {
         work.value_visits += 1;
+        if !value.is_finite() {
+            return Err(DetectError::NonFinite { index });
+        }
         if *value < min {
             min = *value;
         }
         if *value > max {
             max = *value;
         }
+    }
+
+    if values.len() < 2 {
+        let value = if values.is_empty() { 0.0 } else { min };
+        return Ok(BimodalityScore {
+            score: 0.0,
+            separation: 0.0,
+            split: value,
+            lower_mean: value,
+            upper_mean: value,
+            lower_count: values.len(),
+            upper_count: 0,
+            is_bimodal: false,
+        });
     }
 
     // Exact equality is the correct test here, not a tolerance: `min == max` holds
@@ -2641,6 +2640,32 @@ mod tests {
                     "{name} n={n}: the histogram path must not allocate"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bd_16g_2_11_work_counter_counts_the_finite_validation_pass() {
+        let params = BimodalityParams::default();
+        let mut poisoned = [1.0; 512];
+        for index in [0, 256, 511] {
+            poisoned[index] = f64::NAN;
+            let mut work = DetectorWork::default();
+            assert_eq!(
+                bimodality_inner(&poisoned, params, &mut work),
+                Err(DetectError::NonFinite { index })
+            );
+            assert_eq!(work.value_visits, index as u64 + 1);
+            poisoned[index] = 1.0;
+        }
+        for values in [&[][..], &[1.0][..], &poisoned[..]] {
+            let (_, work) = bimodality_with_work(values, params).expect("finite extent");
+            assert_eq!(work.value_visits, values.len() as u64);
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                bimodality(&[value], params),
+                Err(DetectError::NonFinite { index: 0 })
+            );
         }
     }
 
