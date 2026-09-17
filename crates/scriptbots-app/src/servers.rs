@@ -18,8 +18,9 @@ use axum::{
 };
 use fastmcp_rust::{
     Content, Cx, JsonRpcRequest, McpError, McpErrorCode, McpResult, NotificationSender,
-    PendingRequests, RequestSender, Server, Session, ToolHandler,
+    PendingRequests, RequestSender, Session, ToolHandler,
 };
+use fastmcp_server::{Server, ServerBuilder};
 use futures_util::stream::{Stream, StreamExt};
 use scriptbots_core::PresetKind;
 use serde::{Deserialize, Serialize};
@@ -2102,7 +2103,7 @@ async fn prepare_mcp_server(
 ) -> Result<PreparedMcpServer> {
     info!(address = %reserved.address, "Preparing MCP HTTP server");
     let builder = register_control_tools(
-        fastmcp_rust::ServerBuilder::new("scriptbots-control", env!("CARGO_PKG_VERSION")),
+        ServerBuilder::new("scriptbots-control", env!("CARGO_PKG_VERSION")),
         handle,
     );
 
@@ -2162,10 +2163,7 @@ async fn prepare_mcp_server(
 /// variant that dispatches but is never registered here is simply an MCP tool that
 /// does not exist. That is the same silent drift that removed eight routes from the
 /// published OpenAPI document (bd-01dg), so `mcp_tool_roster_is_complete` pins it.
-fn register_control_tools(
-    builder: fastmcp_rust::ServerBuilder,
-    handle: ControlHandle,
-) -> fastmcp_rust::ServerBuilder {
+fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> ServerBuilder {
     let mut builder = builder;
 
     builder = register_tool(
@@ -2339,13 +2337,13 @@ fn register_control_tools(
 }
 
 fn register_tool(
-    builder: fastmcp_rust::ServerBuilder,
+    builder: ServerBuilder,
     name: &str,
     description: &str,
     schema: Value,
     kind: ControlToolKind,
     handle: ControlHandle,
-) -> fastmcp_rust::ServerBuilder {
+) -> ServerBuilder {
     builder.tool(ControlTool {
         handle,
         kind,
@@ -3163,11 +3161,7 @@ mod tests {
         let runtime = mcp_context_test_runtime();
         let (handle, _receiver) = handle();
         let server = Arc::new(
-            register_control_tools(
-                fastmcp_rust::ServerBuilder::new("context-test", "0"),
-                handle,
-            )
-            .build(),
+            register_control_tools(ServerBuilder::new("context-test", "0"), handle).build(),
         );
         let state = McpHttpState {
             session: Arc::new(Mutex::new(Session::new(
@@ -3636,7 +3630,9 @@ mod tests {
             description: "Merge a JSON object patch".to_string(),
             schema: json!({"type": "object"}),
         };
-        let ctx = fastmcp_rust::McpContext::new(asupersync::Cx::for_testing(), 1);
+        let runtime = mcp_context_test_runtime();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let ctx = fastmcp_rust::McpContext::new(cx, 1);
         let arguments = json!({"patch": {"food_growth_rate": "Infinity"}});
         let error = tool
             .call(&ctx, arguments)
@@ -3763,7 +3759,7 @@ mod tests {
     fn mcp_tool_roster_is_complete() {
         let (control, _receiver) = handle();
         let server = register_control_tools(
-            fastmcp_rust::ServerBuilder::new("scriptbots-control-test", "0.0.0"),
+            ServerBuilder::new("scriptbots-control-test", "0.0.0"),
             control,
         )
         .build();

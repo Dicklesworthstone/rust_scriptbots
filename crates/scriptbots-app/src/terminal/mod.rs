@@ -15224,6 +15224,7 @@ mod tests {
     ///   - clamped == world.runtime[agent].sensors
     ///   - outputs == runtime.outputs
     ///   - boost == (outputs[6] > 0.5).
+    ///
     /// This log IS the debugging artifact when a brain misbehaves.
     #[test]
     fn headless_inspector_100_ticks_jsonl_artifact() {

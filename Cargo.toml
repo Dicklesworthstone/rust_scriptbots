@@ -54,6 +54,7 @@ rand08 = { package = "rand", version = "0.8.5" }
 miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
 
 fastmcp-rust = { version = "=0.10.0" }
+fastmcp-server = { version = "=0.10.0" }
 # These extensions were implicit in the previous native feature. Keep the same
 # SQL surface now that FrankenSQLite makes their registration explicit.
 fsqlite = { version = "=0.4.0", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "a855a15399a1994943c81e15f284bed780b4f86b", default-features = false, features = ["native", "json", "fts5", "icu", "misc", "rtree"] }
