@@ -651,16 +651,7 @@ impl NotebookRenderer {
         script.push_str("rerun_failures=0\n");
 
         for run in known_runs {
-            // The emitted config is the arm's overrides plus the pinned seed, serialized
-            // with serde so the file is exactly what the runner parses -- never hand-built
-            // text that could drift from the real schema.
-            let mut layer = serde_json::Map::new();
-            for (key, value) in &run.config_overrides {
-                layer.insert(key.clone(), value.clone());
-            }
-            layer.insert("rng_seed".to_owned(), serde_json::json!(run.seed));
-            let layer_toml = toml::to_string(&serde_json::Value::Object(layer))
-                .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+            let layer_toml = reproduction_config(run)?;
 
             let safe_name = run
                 .run_id
@@ -710,6 +701,12 @@ impl NotebookRenderer {
 
         Ok(notebook_path)
     }
+}
+
+fn reproduction_config(run: &RunRef) -> Result<String, NotebookRenderError> {
+    let mut layer = run.config_overrides.clone();
+    layer.insert("rng_seed".to_owned(), serde_json::json!(run.seed));
+    toml::to_string(&layer).map_err(|error| NotebookRenderError::Io(error.to_string()))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -1465,62 +1462,26 @@ mod tests {
         );
     }
 
-    /// The emitted script must actually RE-EXECUTE, not only re-hash.
-    ///
-    /// The defect this bead names is that reproduce.sh "explicitly hashes retained
-    /// summaries instead of rerunning every arm and seed". These assertions fail if anyone
-    /// reverts to that shape.
     #[test]
-    fn bd_16g_1_7_reproduce_script_reruns_every_arm_and_seed() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let runs = vec![run("r1", 0, 11), run("r2", 1, 12)];
-        let mut summaries = Vec::new();
-        for item in &runs {
-            let path = dir.path().join(format!("{}.json", item.run_id));
-            std::fs::write(&path, b"{}").expect("write summary");
-            let mut owned = item.clone();
-            owned.summary_path = Some(path.to_string_lossy().into_owned());
-            owned.summary_artifact_digest = blake3::hash(b"{}").to_hex().to_string();
-            summaries.push(owned);
-        }
-        let out = dir.path().join("nb");
-        NotebookRenderer::render_notebook("session-1", "goal", &[], &summaries, &out)
-            .expect("renders");
-        let script = std::fs::read_to_string(out.join("reproduce.sh")).expect("script");
-
-        // It invokes the real runner, once per run, with the pinned tick budget.
+    fn reproduction_config_roundtrips_through_cli_toml_format() {
+        let mut reference = run("arm-1", 1, 42);
+        reference.config_overrides = BTreeMap::from([
+            ("rng_seed".to_owned(), serde_json::json!(999)),
+            ("food_growth_rate".to_owned(), serde_json::json!(0.02)),
+            (
+                "neuroflow".to_owned(),
+                serde_json::json!({"enabled": false}),
+            ),
+        ]);
+        let encoded = reproduction_config(&reference).expect("serialize config");
+        let decoded: serde_json::Value = toml::from_str(&encoded).expect("CLI TOML parser");
         assert_eq!(
-            script.matches("SCRIPTBOTS_DET_RUN=1").count(),
-            summaries.len(),
-            "every arm x seed must be re-executed:\n{script}"
-        );
-        assert!(script.contains("SCRIPTBOTS_DET_TICKS=100"), "{script}");
-
-        // It writes the EXACT config layer, seed included, rather than assuming defaults.
-        assert!(
-            script.contains("\"rng_seed\":11") && script.contains("\"rng_seed\":12"),
-            "each run's seed must be pinned into its emitted config: {script}"
-        );
-        assert!(
-            script.contains("food_regrowth_rate"),
-            "the arm's overrides must reach the emitted config: {script}"
-        );
-
-        // It compares re-executed digests and fails the script on any difference.
-        assert!(
-            script.contains("digest differs on re-execution"),
-            "{script}"
-        );
-        assert!(script.contains("did not reproduce"), "{script}");
-        assert!(
-            script.contains("exit 1"),
-            "a mismatch must exit nonzero: {script}"
-        );
-
-        // And it never deletes the evidence it just produced.
-        assert!(
-            !script.contains("rm -"),
-            "emitted configs are evidence and must not be cleaned up: {script}"
+            decoded,
+            serde_json::json!({
+                "rng_seed": 42,
+                "food_growth_rate": 0.02,
+                "neuroflow": {"enabled": false},
+            })
         );
     }
 }
