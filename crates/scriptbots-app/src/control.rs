@@ -1894,7 +1894,7 @@ pub(crate) mod tests {
             .and_then(Value::as_f64)
             .expect("food_growth_rate");
         assert!(
-            (value - f64::from(ScriptBotsConfig::default().food_growth_rate)).abs() < f64::EPSILON,
+            (value as f32 - ScriptBotsConfig::default().food_growth_rate).abs() < f32::EPSILON,
             "rejected update changed food_growth_rate to {value}"
         );
     }

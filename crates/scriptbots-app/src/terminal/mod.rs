@@ -15277,6 +15277,11 @@ mod tests {
             movement_drain: 0.0,
             temperature_discomfort_rate: 0.0,
             aging_health_decay_rate: 0.0,
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_respawn_interval: 0,
+            initial_food: 0.0,
             closed: true,
             rng_seed: Some(0x1604_4E42),
             ..ScriptBotsConfig::default()
@@ -15308,6 +15313,15 @@ mod tests {
         let mut jsonl_lines = Vec::with_capacity(100);
 
         for _ in 1..=100 {
+            // 2. The raw/clamped/saturated attribution summary (bd-16g.4.2)
+            // Captured over the completed boundary immediately preceding step so that
+            // clamped matches the exact brain-facing sensor vector realized by stage_sense.
+            let probe_snap = app
+                .snapshot
+                .probe
+                .clone()
+                .expect("probe snapshot must be active");
+
             app.submit_and_wait(ControlCommand::Step).expect("step");
             app.refresh_snapshot();
 
@@ -15328,12 +15342,6 @@ mod tests {
             }
             assert_eq!(named_sensors.len(), 25, "must name all 25 sensors");
 
-            // 2. The raw/clamped/saturated attribution summary (bd-16g.4.2)
-            let probe_snap = app
-                .snapshot
-                .probe
-                .as_ref()
-                .expect("probe snapshot must be active");
             let attr = &probe_snap.attribution;
             let attribution_summary = AttributionSummaryRecord {
                 raw: attr.raw.to_vec(),
