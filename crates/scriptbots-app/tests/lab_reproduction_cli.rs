@@ -32,6 +32,13 @@ fn spec_input() -> serde_json::Value {
 /// Runs the REAL pipeline end-to-end: validated spec -> real worlds -> real
 /// analysis -> materialized notebook. No provider and no mocks anywhere.
 fn real_notebook(root: &std::path::Path) -> std::path::PathBuf {
+    materialize_real_notebook(root, false)
+}
+
+fn materialize_real_notebook(
+    root: &std::path::Path,
+    shuffled_rerender: bool,
+) -> std::path::PathBuf {
     let turn = ScriptedTurn {
         body: serde_json::json!({
             "stop_reason": "tool_use",
@@ -89,6 +96,27 @@ fn real_notebook(root: &std::path::Path) -> std::path::PathBuf {
         &context,
     )
     .expect("materialized notebook");
+    if shuffled_rerender {
+        let retained = retained_files(&out);
+        let mut shuffled_runs = run_refs(&summaries);
+        shuffled_runs.reverse();
+        let mut shuffled_claims = claims.clone();
+        shuffled_claims.reverse();
+        NotebookRenderer::render_notebook(
+            "e2e-reproduction",
+            "faster food growth raises the final population",
+            &shuffled_claims,
+            &shuffled_runs,
+            &out,
+            &context,
+        )
+        .expect("shuffled identical cohort rerenders at the same immutable destination");
+        assert_eq!(
+            retained_files(&out),
+            retained,
+            "rerender changed retained evidence"
+        );
+    }
     out
 }
 
@@ -110,6 +138,157 @@ fn log(output: &std::process::Output) -> String {
     )
 }
 
+fn retained_files(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(root).expect("read evidence directory") {
+        let entry = entry.expect("evidence entry");
+        let path = entry.path();
+        if entry.file_type().expect("evidence type").is_dir() {
+            files.extend(retained_files(&path));
+        } else {
+            files.insert(
+                path.clone(),
+                std::fs::read(path).expect("retained evidence bytes"),
+            );
+        }
+    }
+    files
+}
+
+fn read_json(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(path).expect("read JSON artifact"))
+        .expect("valid JSON artifact")
+}
+
+// Preserve valid JSON and align the retained tables and emitted script's input
+// pin, so these tests reach semantic verification rather than the outer hash.
+fn repin_input(notebook: &std::path::Path, input: &serde_json::Value) {
+    let path = notebook.join("reproduction.json");
+    let old_digest = blake3::hash(&std::fs::read(&path).expect("original input"))
+        .to_hex()
+        .to_string();
+    let bytes = serde_json::to_vec_pretty(input).expect("serialize tampered input");
+    let new_digest = blake3::hash(&bytes).to_hex().to_string();
+    std::fs::write(path, bytes).expect("retain tampered input");
+    for (name, value) in [
+        ("summaries.json", &input["runs"]),
+        ("analysis.json", &input["analysis"]),
+    ] {
+        std::fs::write(
+            notebook.join(name),
+            serde_json::to_vec_pretty(value).unwrap(),
+        )
+        .expect("align retained table");
+    }
+    let script = notebook.join("reproduce.sh");
+    let emitted = std::fs::read_to_string(&script).expect("emitted script");
+    std::fs::write(script, emitted.replace(&old_digest, &new_digest))
+        .expect("repin real emitted script");
+}
+
+fn assert_semantic_refusal(mutate: impl FnOnce(&mut serde_json::Value), diagnostic: &str) {
+    let temp = tempfile::tempdir().expect("temp root");
+    let notebook = real_notebook(temp.path());
+    let mut input = read_json(&notebook.join("reproduction.json"));
+    mutate(&mut input);
+    repin_input(&notebook, &input);
+    // Snapshot the entire cohort, including bundle manifests, CSV exports and
+    // run evidence, not just the particular JSON field under attack.
+    let retained = retained_files(temp.path());
+    let output = run_script(&notebook);
+    assert_ne!(output.status.code(), Some(0), "{}", log(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(diagnostic),
+        "expected {diagnostic}: {}",
+        log(&output)
+    );
+    assert!(
+        !stderr.contains("reproduction input BLAKE3 mismatch"),
+        "{}",
+        log(&output)
+    );
+    assert_eq!(
+        retained_files(temp.path()),
+        retained,
+        "refusal rewrote evidence or began a rerun"
+    );
+}
+
+#[test]
+fn tampered_seed_is_refused_by_normalized_config_verification() {
+    assert_semantic_refusal(
+        |input| {
+            let seed = input["runs"][0]["reference"]["seed"].as_u64().unwrap();
+            input["runs"][0]["reference"]["seed"] = (seed + 100).into();
+        },
+        "normalized config mismatch",
+    );
+}
+
+#[test]
+fn tampered_world_digest_is_refused_by_run_evidence_verification() {
+    assert_semantic_refusal(
+        |input| {
+            let digest = input["runs"][0]["reference"]["digest"].as_str().unwrap();
+            let mut tampered = digest.to_owned();
+            tampered.replace_range(..1, if digest.starts_with('0') { "1" } else { "0" });
+            input["runs"][0]["reference"]["digest"] = tampered.into();
+        },
+        "evidence mismatch run=",
+    );
+}
+
+#[test]
+fn tampered_summary_artifact_hash_is_refused_by_scientific_summary_verification() {
+    assert_semantic_refusal(
+        |input| {
+            let digest = input["runs"][0]["reference"]["summary_artifact_digest"]
+                .as_str()
+                .unwrap();
+            let mut tampered = digest.to_owned();
+            tampered.replace_range(..1, if digest.starts_with('0') { "1" } else { "0" });
+            input["runs"][0]["reference"]["summary_artifact_digest"] = tampered.into();
+        },
+        "scientific summary mismatch run=",
+    );
+}
+
+#[test]
+fn tampered_adjusted_p_value_is_refused_by_canonical_analysis_verification() {
+    assert_semantic_refusal(
+        |input| {
+            let adjusted = &mut input["analysis"]["effects"][0]["adjusted"]["adjusted_p_value"];
+            let original = adjusted.as_f64().expect("real adjusted p value");
+            *adjusted = if original == 0.0 { 0.5 } else { 0.0 }.into();
+        },
+        "retained canonical analysis differs",
+    );
+}
+
+#[test]
+fn tampered_build_identity_is_refused_before_execution() {
+    assert_semantic_refusal(
+        |input| {
+            let version = input["context"]["build"]["package_version"]
+                .as_str()
+                .unwrap();
+            input["context"]["build"]["package_version"] = format!("{version}-tampered").into();
+        },
+        "expected source/build provenance mismatch",
+    );
+}
+
+#[test]
+fn shuffled_cohort_rerender_preserves_retained_artifacts() {
+    let temp = tempfile::tempdir().expect("temp root");
+    let notebook = materialize_real_notebook(temp.path(), true);
+    let output = run_script(&notebook);
+    assert_eq!(output.status.code(), Some(0), "{}", log(&output));
+}
+
 #[test]
 fn clean_cohort_reproduces_every_arm_and_seed() {
     let temp = tempfile::tempdir().expect("temp root");
@@ -126,13 +305,45 @@ fn clean_cohort_reproduces_every_arm_and_seed() {
     for token in ["[REPRODUCE]", "[CHILD]", "[VERIFY]", "e2e-reproduction"] {
         assert!(stderr.contains(token), "missing {token} in:\n{stderr}");
     }
-    // The rerun landed in a unique confined child directory with regenerated tables.
-    assert!(
-        notebook.join("rerun-000000").is_dir(),
-        "rerun output retained"
+    let regenerated = notebook.join("rerun-000000");
+    assert_eq!(
+        read_json(&regenerated.join("analysis.json")),
+        read_json(&notebook.join("analysis.json")),
+        "complete canonical raw/adjusted analysis must reproduce"
     );
-    assert!(notebook.join("rerun-000000/summaries.json").is_file());
-    assert!(notebook.join("rerun-000000/analysis.json").is_file());
+    let mut expected = read_json(&notebook.join("summaries.json"));
+    let mut actual = read_json(&regenerated.join("summaries.json"));
+    let expected_rows = expected.as_array_mut().expect("retained summary rows");
+    let actual_rows = actual.as_array_mut().expect("regenerated summary rows");
+    let expected_keys = [(0, 41), (0, 42), (1, 41), (1, 42)];
+    assert_eq!(actual_rows.len(), expected_keys.len());
+    for (index, (arm, seed)) in expected_keys.into_iter().enumerate() {
+        let row = &actual_rows[index]["reference"];
+        assert_eq!(row["arm_id"], arm);
+        assert_eq!(row["seed"], seed);
+        let record = read_json(&regenerated.join(format!("record-{index:04}.json")));
+        assert_eq!(record["state"], "Completed");
+        assert_eq!(record["run_id"], row["run_id"]);
+        assert_eq!(record["variant_id"], format!("arm-{arm:03}"));
+        assert_eq!(record["seed"], seed);
+        assert_eq!(record["total_ticks"], 2);
+        assert_eq!(record["final_digest"], row["digest"]);
+    }
+    // Only the retained CSV's location changes; hashes, metrics, seeds, configs
+    // and all other scientific provenance must remain byte-for-byte equivalent.
+    for rows in [expected_rows, actual_rows] {
+        for row in rows {
+            let path = row["reference"]["summary_path"]
+                .as_str()
+                .expect("summary path");
+            assert!(std::path::Path::new(path).is_file());
+            row["reference"]["summary_path"] = serde_json::Value::Null;
+        }
+    }
+    assert_eq!(
+        actual, expected,
+        "canonical regenerated scientific summaries differ"
+    );
 }
 
 #[test]

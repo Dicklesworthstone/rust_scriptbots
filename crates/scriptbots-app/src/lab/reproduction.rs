@@ -310,13 +310,26 @@ pub(crate) fn emit(
         configs,
     };
     if let Some(first) = runs.first() {
+        ensure!(
+            input.configs.len() == runs.len(),
+            "config/run count mismatch"
+        );
+        let mut config_order: Vec<_> = runs
+            .iter()
+            .zip(std::mem::take(&mut input.configs))
+            .collect();
+        config_order.sort_by_key(|(run, _)| (run.arm_id, run.seed));
+        input.configs = config_order.into_iter().map(|(_, config)| config).collect();
         let suffix = format!("-{}-seed{}", first.variant_id, first.seed);
         input.experiment_id = first
             .run_id
             .strip_suffix(&suffix)
             .context("run identity is not canonical")?
             .to_owned();
-        let recs = records(runs)?;
+        let mut recs = records(runs)?;
+        recs.sort_by(|left, right| {
+            (&left.variant_id, left.seed).cmp(&(&right.variant_id, right.seed))
+        });
         let bundle = Path::new(recs[0].bundle_path.as_deref().context("missing bundle")?);
         let evidence: serde_json::Value =
             serde_json::from_slice(&checked_file(&bundle.join("evidence/run.json"))?)?;
