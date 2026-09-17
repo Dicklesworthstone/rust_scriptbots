@@ -1350,13 +1350,12 @@ pub(crate) mod tests {
         owner: MutexGuard<'_, ()>,
     ) -> Result<SimulationStatusDto, ControlError> {
         let (reply, receipt) = std::sync::mpsc::channel();
-        let reader = std::thread::spawn(move || reply.send(handle.status()));
+        let reader = std::thread::spawn(move || {
+            reply.send(handle.status()).expect("reply retained");
+        });
         let result = receipt.recv_timeout(std::time::Duration::from_secs(2));
         drop(owner);
-        reader
-            .join()
-            .expect("status reader joins")
-            .expect("reply retained");
+        reader.join().expect("status reader joins");
         result.expect("status must return while the owner still holds its lock")
     }
 
