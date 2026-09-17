@@ -169,6 +169,10 @@ fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
 
+    if let Some(AppSubcommand::LabReproduce(args)) = &cli.subcommand {
+        return scriptbots_app::lab::reproduction::run(args);
+    }
+
     if let Some(AppSubcommand::EconomyAudit(ref audit_args)) = cli.subcommand {
         let pass = economy_audit::run_economy_audit(audit_args)?;
         if pass {
@@ -2677,6 +2681,8 @@ enum AppSubcommand {
     EconomyAudit(EconomyAuditArgs),
     /// Offline archipelago reconstruction report and population conservation audit (bd-16g.5.5.5)
     ReportArchipelago(ReportArchipelagoArgs),
+    /// Re-execute and compare a retained same-build matched-seed notebook.
+    LabReproduce(scriptbots_app::lab::reproduction::ReproduceArgs),
 }
 
 #[derive(Parser, Debug)]

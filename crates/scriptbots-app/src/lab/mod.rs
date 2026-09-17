@@ -14,5 +14,6 @@
 
 pub mod llm;
 pub mod notebook;
+pub mod reproduction;
 pub mod spec;
 pub mod stats;

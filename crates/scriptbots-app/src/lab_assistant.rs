@@ -21,7 +21,7 @@ use scriptbots_storage::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -790,30 +790,33 @@ impl LabStateMachine {
         let (Some(validated), Some(analysis)) =
             (self.validated_spec.as_ref(), self.analysis.as_ref())
         else {
-            let reason = self
+            let mut context = self.notebook_context();
+            context
                 .failure_reason
-                .as_deref()
-                .unwrap_or("no validated statistical analysis was produced");
-            let rendered = format!(
-                "# ScriptBots Autonomous Science Lab Notebook\n\n\
-                 ## Outcome\n\
-                 No scientific result is available.\n\n\
-                 ## Typed Refusal\n\
-                 {reason}\n"
-            );
+                .get_or_insert_with(|| "no validated statistical analysis was produced".to_owned());
+            let goal = self
+                .spec
+                .as_ref()
+                .map_or("No validated experiment hypothesis is available.", |spec| {
+                    spec.hypothesis.as_str()
+                });
+            let rendered = NotebookRenderer::render_markdown(goal, &[], &[], &context)
+                .map_err(LabError::Notebook)?;
             if let Some(root) = &self.notebook_root {
                 let report_id = self
                     .proposal_id
                     .as_deref()
                     .unwrap_or("unvalidated-proposal");
                 let directory = root.join(report_id).join("notebook");
-                fs::create_dir_all(&directory).map_err(|error| {
-                    LabError::Notebook(NotebookRenderError::Io(error.to_string()))
-                })?;
-                let path = directory.join("notebook.md");
-                fs::write(&path, &rendered).map_err(|error| {
-                    LabError::Notebook(NotebookRenderError::Io(error.to_string()))
-                })?;
+                let path = NotebookRenderer::render_notebook(
+                    report_id,
+                    goal,
+                    &[],
+                    &[],
+                    &directory,
+                    &context,
+                )
+                .map_err(LabError::Notebook)?;
                 self.notebook_path = Some(path);
             }
             self.rendered_notebook = Some(rendered);
@@ -926,7 +929,15 @@ impl LabStateMachine {
     /// Advance the state machine repeatedly until reaching Finished or an unrecoverable error.
     pub fn run_to_completion(&mut self) -> Result<LabPhase, LabError> {
         while self.phase != LabPhase::Finished {
-            let phase = self.step()?;
+            let phase = match self.step() {
+                Ok(phase) => phase,
+                Err(error) => {
+                    if self.phase == LabPhase::Report {
+                        self.report()?;
+                    }
+                    return Err(error);
+                }
+            };
             if phase == LabPhase::Finished {
                 break;
             }
@@ -949,6 +960,7 @@ fn stable_value_id(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::lab::llm::{ScriptedClient, ScriptedTurn};
+    use std::fs;
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
@@ -1071,6 +1083,74 @@ mod tests {
     }
 
     #[test]
+    fn zero_completed_runs_preserve_partial_budget_and_escape_failure() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = state_machine(valid_input(), temp.path().join("unused"), calls);
+        runner.runs_spent = 4;
+        runner.ticks_spent = 8;
+        runner.failure_reason = Some("<script>alert(1)</script>".to_owned());
+        runner.notebook_root = Some(temp.path().to_path_buf());
+        runner.phase = LabPhase::Report;
+        assert_eq!(runner.step().expect("partial report"), LabPhase::Finished);
+        let report = runner.generate_notebook();
+        for section in [
+            "Goal",
+            "Methods",
+            "Results",
+            "Claims",
+            "What Would Falsify This",
+            "What I Did Not Test",
+            "Budget Ledger",
+            "Reproduce",
+            "Environment / non-reproducible",
+        ] {
+            let heading = report
+                .lines()
+                .find(|line| line.starts_with("## ") && line.ends_with(section))
+                .expect("required partial report section");
+            let content = report.split_once(heading).expect("section").1;
+            assert!(
+                !content
+                    .split("\n## ")
+                    .next()
+                    .expect("section body")
+                    .trim()
+                    .is_empty()
+            );
+        }
+        assert!(!report.contains("<script>"));
+        assert!(report.contains("&lt;script&gt;"));
+        assert!(report.contains("| Runs | 4 | 64 | 0 |"));
+        assert!(report.contains("| Ticks | 8 | 10000 | 0 |"));
+        assert!(report.contains("No completed cohort exists to reproduce"));
+        assert_eq!(
+            fs::read_to_string(runner.notebook_path.as_ref().expect("partial artifact")).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn rejected_proposal_retains_partial_report_before_returning_error() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("executor-called");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = state_machine(valid_input(), marker.clone(), Arc::clone(&calls));
+        runner.budget.max_runs = 1;
+        runner.notebook_root = Some(temp.path().to_path_buf());
+        assert!(matches!(
+            runner.run_to_completion(),
+            Err(LabError::Validation { .. })
+        ));
+        assert_eq!(runner.phase, LabPhase::Finished);
+        assert!(!marker.exists());
+        let report =
+            fs::read_to_string(runner.notebook_path.as_ref().expect("failure notebook")).unwrap();
+        assert!(report.contains("| Runs | 0 | 1 | 0 |"));
+        assert!(report.contains("No completed cohort exists to reproduce"));
+    }
+
+    #[test]
     fn valid_tool_proposal_reaches_the_executor_as_the_canonical_plan() {
         let temp = tempfile::tempdir().expect("temp dir");
         let marker = temp.path().join("executor-called");
@@ -1178,39 +1258,6 @@ mod tests {
         assert_eq!(
             fs::read_to_string(notebook_path).expect("materialized notebook readable"),
             first.as_str()
-        );
-        let verifier = fs::read_to_string(
-            notebook_path
-                .parent()
-                .expect("notebook parent")
-                .join("reproduce.sh"),
-        )
-        .expect("retained evidence verifier");
-        assert!(verifier.contains("b3sum"));
-        // The verifier's SCOPE changed, and this assertion was pinning the old
-        // limit. Until 5b64955ad7 ("reproduce.sh actually re-executes every arm x
-        // seed") the script only checked retained artifact hashes, so it
-        // truthfully said it did not re-run the simulation. It now re-executes
-        // every arm x seed from the emitted config and compares each re-run world
-        // digest against the cited one, exiting nonzero on any mismatch.
-        //
-        // Re-adding the old sentence to make this pass would have asserted a
-        // limitation the product no longer has, and would have quietly weakened
-        // the guarantee this test exists to defend. So it asserts the STRONGER
-        // property instead: that the verifier really does re-execute and compare.
-        assert!(
-            verifier.contains("SCRIPTBOTS_DET_RUN=1"),
-            "the verifier must actually re-execute each arm x seed, not only hash \
-             retained artifacts"
-        );
-        assert!(
-            verifier.contains("digest differs on re-execution"),
-            "the verifier must compare each re-run digest against the cited one and \
-             fail when they differ; hashing artifacts alone does not reproduce a run"
-        );
-        assert!(
-            verifier.contains("did not reproduce"),
-            "the verifier must exit nonzero when any arm fails to reproduce"
         );
 
         let repeated_lab = run_lab(temp.path().join("repeated"));
@@ -1387,7 +1434,6 @@ mod tests {
             .rendered_notebook
             .as_deref()
             .expect("typed refusal report retained");
-        assert!(report.contains("No scientific result is available"));
         assert!(report.contains("experiment proposal failed validation"));
     }
 

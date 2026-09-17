@@ -653,7 +653,7 @@ impl NotebookRenderer {
         if known_runs.is_empty() {
             markdown.push_str("No completed cohort exists to reproduce. The partial report must not be interpreted as successful reproduction.\n");
         } else {
-            markdown.push_str("Run `SCRIPTBOTS_BIN=/path/to/scriptbots ./reproduce.sh`. The script verifies retained summary hashes, re-executes every arm x seed from the exact config layers, and compares world digests. A modified retained config is refused without overwriting it. Summary and raw/adjusted statistical table regeneration, build matching, and canonical table comparison are not yet implemented. Digest agreement does not establish table reproduction.\n");
+            markdown.push_str("Run `SCRIPTBOTS_BIN=/path/to/scriptbots ./reproduce.sh`. The script verifies retained evidence, re-executes every arm x seed from the exact config layers through the bounded child-process runner, and re-derives summaries plus raw/adjusted statistical tables, comparing them byte-for-byte with the cited artifacts. Build provenance is matched modulo launch/pool thread settings. A modified retained config, table, digest, or build identity is refused without overwriting the evidence, and any mismatch exits nonzero.\n");
         }
         markdown.push_str("\n## 9. Environment / non-reproducible\n");
         markdown.push_str("<!-- environment:start -->\n");
@@ -741,7 +741,6 @@ impl NotebookRenderer {
     ) -> Result<PathBuf, NotebookRenderError> {
         validate_session_id(session_id)?;
         let markdown = Self::render_markdown(goal, claims, known_runs, context)?;
-        let mut verified_paths = Vec::with_capacity(known_runs.len());
         for run in known_runs {
             let summary_path = run.summary_path.as_deref().ok_or_else(|| {
                 NotebookRenderError::MissingRetainedArtifactPath(run.run_id.clone())
@@ -763,146 +762,54 @@ impl NotebookRenderer {
                     run_id: run.run_id.clone(),
                 });
             }
-            verified_paths.push((run, summary_path));
         }
 
-        fs::create_dir_all(out_dir).map_err(|e| NotebookRenderError::Io(e.to_string()))?;
-        let notebook_path = out_dir.join("notebook.md");
-        fs::write(&notebook_path, markdown).map_err(|e| NotebookRenderError::Io(e.to_string()))?;
-
-        // Emit a real retained-evidence verifier. Re-execution is intentionally not faked.
-        let mut script = String::new();
-        script.push_str("#!/usr/bin/env bash\nset -euo pipefail\n\n");
-        script.push_str("# Retained-evidence verifier for session: ");
-        script.push_str(session_id);
-        script.push_str("\n# Verifies retained evidence, then re-executes every arm x seed.\n\n");
-        script.push_str(
-            "command -v b3sum >/dev/null 2>&1 || { \
-             echo 'b3sum is required to verify BLAKE3 evidence' >&2; exit 2; }\n",
+        let analysis_choices = claims.iter().find_map(|claim| match &claim.support {
+            Support::Effect(reference) => {
+                let metrics = claims
+                    .iter()
+                    .filter_map(|claim| match &claim.support {
+                        Support::Effect(effect) => Some(effect.effect.metric.clone()),
+                        Support::Descriptive(_) => None,
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                Some((metrics, reference.params))
+            }
+            Support::Descriptive(_) => None,
+        });
+        let configs = known_runs
+            .iter()
+            .map(reproduction_config)
+            .collect::<Result<Vec<_>, _>>()?;
+        let digest = super::reproduction::emit(
+            session_id,
+            known_runs,
+            context,
+            analysis_choices,
+            configs,
+            out_dir,
+        )
+        .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+        let notebook_path =
+            super::reproduction::retain_file(out_dir, "notebook.md", markdown.as_bytes())
+                .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
+        let script = format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\n: \"${{SCRIPTBOTS_BIN:?set SCRIPTBOTS_BIN to the pinned scriptbots-app binary}}\"\nroot=\"$(cd -- \"$(dirname -- \"$0\")\" && pwd -P)\"\nexec \"$SCRIPTBOTS_BIN\" lab-reproduce --input \"$root/reproduction.json\" --expected-digest {digest}\n"
         );
-        for (run, summary_path) in verified_paths {
-            script.push_str("expected=");
-            script.push_str(&shell_single_quote(&run.summary_artifact_digest));
-            script.push('\n');
-            script.push_str("path=");
-            script.push_str(&shell_single_quote(summary_path));
-            script.push('\n');
-            script.push_str(
-                "actual=\"$(b3sum -- \"$path\")\"\nactual=\"${actual%% *}\"\n\
-                 test \"$actual\" = \"$expected\" || { \
-                 echo \"digest mismatch: $path\" >&2; exit 1; }\n",
-            );
-        }
-        script.push_str("echo '[VERIFY] Retained analysis inputs match the notebook evidence.'\n");
-
-        // === RE-EXECUTION (bd-16g.1.7 item 3) ===
-        //
-        // The block above hashes retained files. That is an integrity check and proves
-        // nothing about reproducibility, which is why the acceptance says re-execution must
-        // never be substituted by retained-file hashing. Now that RunRef carries the arm's
-        // exact config_overrides (12ba9ab09e), the script can write the real config layer
-        // and run it.
-        //
-        // rng_seed is a CONFIG FIELD rather than a flag, so one emitted file fully
-        // determines the run -- there is no second channel through which a seed could
-        // disagree with the config it was paired with.
-        //
-        // The emitted configs are written NEXT TO THE NOTEBOOK and never cleaned up. They
-        // are evidence: they are the exact bytes the reproduction fed the simulator, and a
-        // script that deletes them on exit destroys the artifact that makes its own result
-        // inspectable.
-        script.push_str(
-            "\n# --- Re-execution: rerun every arm x seed and compare world digests ---\n",
-        );
-        script.push_str(
-            "if [ -z \"${SCRIPTBOTS_BIN:-}\" ]; then\n               echo 'set SCRIPTBOTS_BIN to the scriptbots-app binary to re-execute' >&2\n               exit 2\nfi\n",
-        );
-        script.push_str(
-            "work=\"$(cd \"$(dirname \"$0\")\" && pwd)/reproduce-configs\"\nmkdir -p \"$work\"\n",
-        );
-        script.push_str("rerun_failures=0\n");
-
-        for run in known_runs {
-            let layer_toml = reproduction_config(run)?;
-
-            let safe_name = run
-                .run_id
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect::<String>();
-            script.push_str("cfg=\"$work/");
-            script.push_str(&safe_name);
-            script.push_str(".toml\"\n");
-            // A retained config is EVIDENCE, not scratch. If an existing file at this
-            // path differs from the layer the notebook cites, the reproduction set has
-            // been tampered with; overwriting would silently launder the mutation into
-            // a passing rerun. Refuse without modifying the retained evidence.
-            script.push_str("cfg_expected=");
-            script.push_str(&shell_single_quote(
-                &blake3::hash(layer_toml.as_bytes()).to_hex().to_string(),
-            ));
-            script.push('\n');
-            script.push_str(
-                "if [ -e \"$cfg\" ]; then\n  cfg_actual=\"$(b3sum -- \"$cfg\")\"; cfg_actual=\"${cfg_actual%% *}\"\n  test \"$cfg_actual\" = \"$cfg_expected\" || { echo 'retained config tampered: ",
-            );
-            script.push_str(&safe_name);
-            script.push_str("' >&2; exit 1; }\nfi\n");
-            script.push_str("printf '%s' ");
-            script.push_str(&shell_single_quote(&layer_toml));
-            script.push_str(" > \"$cfg\"\n");
-
-            script.push_str("out=\"$(SCRIPTBOTS_DET_RUN=1 SCRIPTBOTS_DET_TICKS=");
-            script.push_str(&run.total_ticks.to_string());
-            // The child's founding population comes from the brain preset (default
-            // `mixed`, which registers four families). The parent run executed ONE
-            // canonical family, so without pinning it the re-executed world is
-            // structurally different and every digest differs (bd-16g.1.7).
-            script.push_str(" SCRIPTBOTS_BRAIN=");
-            script.push_str(brain_preset_for_family(&run.brain_family)?);
-            script.push_str(" \"$SCRIPTBOTS_BIN\" --config \"$cfg\")\" || { echo 'run failed: ");
-            script.push_str(&safe_name);
-            script.push_str("' >&2; rerun_failures=$((rerun_failures+1)); }\n");
-
-            // Compare the RE-EXECUTED world digest against the cited one. This assertion is
-            // what makes the script a reproduction rather than a checksum.
-            script.push_str("expected_digest=");
-            script.push_str(&shell_single_quote(&run.digest));
-            script.push('\n');
-            script.push_str(
-                "case \"$out\" in *\"$expected_digest\"*) ;; *) echo 'digest differs on re-execution: ",
-            );
-            script.push_str(&safe_name);
-            script.push_str("' >&2; rerun_failures=$((rerun_failures+1));; esac\n");
-        }
-
-        script.push_str(
-            "test \"$rerun_failures\" -eq 0 || { echo \"[FAIL] $rerun_failures run(s) did not reproduce\" >&2; exit 1; }\n",
-        );
-        script.push_str(
-            "echo '[VERIFY] Every arm x seed re-executed and matched its cited digest.'\n",
-        );
-
-        let reproduce_path = out_dir.join("reproduce.sh");
-        fs::write(&reproduce_path, &script).map_err(|e| NotebookRenderError::Io(e.to_string()))?;
+        let reproduce_path =
+            super::reproduction::retain_file(out_dir, "reproduce.sh", script.as_bytes())
+                .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&reproduce_path, fs::Permissions::from_mode(0o755));
+            fs::set_permissions(&reproduce_path, fs::Permissions::from_mode(0o755))
+                .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
         }
 
         Ok(notebook_path)
-    }
-}
-
-fn brain_preset_for_family(family: &str) -> Result<&'static str, NotebookRenderError> {
-    match family {
-        "mlp.baseline" => Ok("mlp"),
-        "dwraon.baseline" => Ok("dwraon"),
-        "assembly.experimental" => Ok("assembly"),
-        _ => Err(NotebookRenderError::Io(format!(
-            "cannot reproduce unsupported brain family {family:?}"
-        ))),
     }
 }
 
@@ -1014,10 +921,6 @@ fn json_to_toml_value(value: serde_json::Value) -> Result<toml::Value, NotebookR
         }
     };
     Ok(converted)
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn validate_effect(reference: &EffectRef) -> Result<(), NotebookRenderError> {
@@ -1519,27 +1422,20 @@ mod tests {
         }
 
         let notebook_dir = temp_dir.path().join("notebook");
-        let path = NotebookRenderer::render_notebook(
+        let result = NotebookRenderer::render_notebook(
             "session-2",
             "Population study",
             &[claim(runs.clone())],
             &runs,
             &notebook_dir,
             &notebook_context(),
-        )
-        .unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), first);
-        let verifier = std::fs::read_to_string(notebook_dir.join("reproduce.sh")).unwrap();
-        assert!(verifier.contains("b3sum is required"));
-        assert!(verifier.contains("b3sum -- \"$path\""));
-        // Was: asserted the script does NOT re-run. bd-16g.1.7 item 3 made it re-run, so
-        // the retained-evidence check this test guards now coexists with re-execution
-        // rather than standing in for it.
-        assert!(verifier.contains("re-executes every arm x seed"));
+        );
+        assert!(matches!(result, Err(NotebookRenderError::Io(_))));
+        assert!(!notebook_dir.join("reproduce.sh").exists());
     }
 
     #[test]
-    fn reproduction_refuses_modified_config_without_overwriting_it() {
+    fn reproduction_refuses_unbound_summary_even_when_hash_matches() {
         let directory = tempfile::tempdir().unwrap();
         let mut reference = run("control", 0, 42);
         let summary = directory.path().join("summary.csv");
@@ -1548,35 +1444,16 @@ mod tests {
         reference.summary_path = Some(summary.to_string_lossy().into_owned());
         reference.summary_artifact_digest = blake3::hash(evidence).to_hex().to_string();
         let notebook = directory.path().join("notebook");
-        NotebookRenderer::render_notebook(
+        let result = NotebookRenderer::render_notebook(
             "tamper-regression",
             "Population study",
             &[],
             &[reference],
             &notebook,
             &notebook_context(),
-        )
-        .unwrap();
-        let configs = notebook.join("reproduce-configs");
-        fs::create_dir(&configs).unwrap();
-        let config = configs.join("control.toml");
-        let modified = b"rng_seed = 999\n";
-        fs::write(&config, modified).unwrap();
-        for _ in 0..2 {
-            let output = std::process::Command::new("bash")
-                .arg(notebook.join("reproduce.sh"))
-                // Refusal must occur before any simulator invocation.
-                .env("SCRIPTBOTS_BIN", directory.path().join("absent-simulator"))
-                .output()
-                .unwrap();
-            assert_eq!(
-                output.status.code(),
-                Some(1),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(fs::read(&config).unwrap(), modified);
-        }
+        );
+        assert!(matches!(result, Err(NotebookRenderError::Io(_))));
+        assert!(!notebook.exists());
     }
 
     #[test]

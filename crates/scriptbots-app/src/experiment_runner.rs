@@ -391,6 +391,48 @@ impl MatchedSeedExperimentRunner {
         }
     }
 
+    /// Run a canonical CLI worker with a wall-clock bound and reap every exit path.
+    /// Output is inherited, never buffered without a size bound.
+    ///
+    /// # Errors
+    /// Returns spawn, wait, timeout, or unsuccessful-exit errors.
+    pub fn run_bounded_child(
+        command: &mut std::process::Command,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        command.stdin(std::process::Stdio::null());
+        let mut child = command.spawn()?;
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(Error::other(format!(
+                            "canonical child exit={status} timeout=false"
+                        )))
+                    };
+                }
+                Ok(None) if started.elapsed() < timeout => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(match result {
+                        Err(error) => error,
+                        _ => Error::new(
+                            ErrorKind::TimedOut,
+                            "canonical child timeout=true; killed and reaped",
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     /// Generates initial pending run records for every variant and seed combination.
     ///
     /// # Errors
@@ -1707,7 +1749,7 @@ pub fn validate_scenario_arm(
     config_for_run(overrides, 0).map(|_| ())
 }
 
-fn config_for_run(
+pub(crate) fn config_for_run(
     overrides: &BTreeMap<String, serde_json::Value>,
     seed: u64,
 ) -> Result<ScriptBotsConfig, String> {
