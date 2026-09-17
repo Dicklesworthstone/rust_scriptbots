@@ -3765,6 +3765,13 @@ impl HostCore {
                 next_control,
                 true,
             ),
+            HostCommand::ApplyMap(artifact) => self.apply_world_control_command(
+                admission,
+                &retry_envelope,
+                ControlCommand::ApplyMap(artifact),
+                next_control,
+                true,
+            ),
             HostCommand::Emigrate { agent_uid } => {
                 self.apply_emigrate_command(admission, &retry_envelope, agent_uid, next_control)
             }
@@ -3870,6 +3877,7 @@ impl HostCore {
                     | HostCommand::SpawnCrossover { .. }
                     | HostCommand::Emigrate { .. }
                     | HostCommand::Immigrate { .. }
+                    | HostCommand::ApplyMap(_)
             )
         {
             return Ok(None);
@@ -3935,8 +3943,13 @@ impl HostCore {
                     .ok_or_else(|| protocol_violation("scientific revision exhausted"))
             })
             .transpose()?;
+        let is_apply_map = matches!(command, ControlCommand::ApplyMap(_));
         match apply_control_command(&mut self.world, command) {
-            Ok(ControlDisposition::WorldApplied) => {}
+            Ok(ControlDisposition::WorldApplied) => {
+                if is_apply_map {
+                    self.snapshot_layers.refresh(&self.world)?;
+                }
+            }
             Ok(ControlDisposition::Playback(_)) => {
                 return Err(protocol_violation(
                     "world HostCommand mapped to a playback-only core command",
@@ -4887,7 +4900,7 @@ mod tests {
         BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner, BrainSpawnError, Generation,
         HydrologyField, HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer, INPUT_SIZE,
         MapArtifact, MapArtifactMetadata, MapGeneratorKind, OUTPUT_SIZE, Position,
-        ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainLayer, Velocity,
+        ScalarField, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainLayer, Velocity,
         bound_brain_inspection,
     };
     use std::{hint::black_box, sync::Mutex, time::Instant};
@@ -10887,6 +10900,53 @@ mod tests {
             .expect("volatile step receipt");
         assert_eq!(core.drive_interest(), HostDriveInterest::WakeOnly);
         assert!(core.scientific_digest_v1().is_ok());
+    }
+
+    #[test]
+    fn host_command_apply_map_updates_science_layers_and_temperature() {
+        let (mut core, mut port) = host(true);
+        let initial_snapshot = core.latest_snapshot();
+        assert_eq!(initial_snapshot.revisions.control, ControlRevision::new(0));
+        assert_eq!(initial_snapshot.revisions.scientific, ScientificRevision::new(0));
+        assert!(core.world().temperature().is_none());
+
+        let (_base_map, original_map, _) = snapshot_map_artifacts(core.world());
+        let width = original_map.terrain().width();
+        let height = original_map.terrain().height();
+        let temp_field = ScalarField::new(width, height, vec![0.75; (width * height) as usize])
+            .expect("valid temperature field");
+        let changed_map = MapArtifact::new(
+            original_map.terrain().clone(),
+            original_map.fertility().cloned(),
+            Some(temp_field),
+            original_map.hydrology_tiles().cloned(),
+            original_map.hydrology_field().cloned(),
+            original_map.metadata().clone(),
+        )
+        .expect("valid artifact with temperature");
+
+        let initial_terrain_rev = initial_snapshot.layers.revisions.terrain;
+
+        let status = submit(&mut port, 1, HostCommand::ApplyMap(Box::new(changed_map)));
+        assert_eq!(status.application(), &ApplicationState::Admitted);
+
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("apply map drive");
+
+        let updated_status = port
+            .command_status(CommandId::new(1))
+            .expect("status query")
+            .expect("status exists");
+        assert!(matches!(updated_status.application(), ApplicationState::Applied(_)));
+
+        let latest = core.latest_snapshot();
+        assert_eq!(latest.revisions.control, ControlRevision::new(1));
+        assert_eq!(latest.revisions.scientific, ScientificRevision::new(1));
+        assert!(latest.layers.revisions.terrain > initial_terrain_rev);
+
+        assert!(core.world().temperature().is_some());
+        let sampled = core.world().sample_temperature_at(Position { x: 5.0, y: 5.0 });
+        assert!((sampled - 0.75).abs() < 1e-5);
     }
 
     #[test]

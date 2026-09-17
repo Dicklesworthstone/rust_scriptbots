@@ -35,9 +35,10 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::ScenarioIdentityV0;
 use crate::command::CommandSubmit;
 use crate::control::{
-    AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, DietClassDto,
-    EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, Scoreboard, SelectionModeDto,
-    SelectionStateDto, SimulationStatusDto, SpeedRequest,
+    parse_map_artifact, AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError,
+    ControlHandle, DietClassDto, EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate,
+    MapApplyRequestBody, MapGenerateRequestBody, Scoreboard, SelectionModeDto, SelectionStateDto,
+    SimulationStatusDto, SpeedRequest,
 };
 use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
 use scriptbots_runtime::channel::ChannelHostPort;
@@ -1114,7 +1115,9 @@ pub struct SpeedRequestBody {
         post_control_speed,
         post_control_shutdown,
         get_control_status,
-        get_status
+        get_status,
+        post_map_generate,
+        post_map_apply
     ),
     components(
         schemas(
@@ -1144,11 +1147,16 @@ pub struct SpeedRequestBody {
             CommandStatusDto,
             StepRequestBody,
             SpeedRequestBody,
-            SimulationStatusDto
+            SimulationStatusDto,
+            MapGenerateRequestBody,
+            MapApplyRequestBody
         )
     ),
     info(title = "ScriptBots Control API", version = "0.0.0"),
-    tags((name = "control", description = "Runtime configuration controls"))
+    tags(
+        (name = "control", description = "Runtime configuration controls"),
+        (name = "map", description = "Procedural map generation and application controls")
+    )
 )]
 struct ApiDoc;
 
@@ -1922,6 +1930,80 @@ async fn post_pause(
     Ok(Json(status))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/map/generate",
+    tag = "map",
+    request_body(content = Option<MapGenerateRequestBody>, description = "Optional map generator configuration"),
+    responses((status = 200, description = "Generated MapArtifact"))
+)]
+async fn post_map_generate(
+    State(state): State<ApiState>,
+    bytes: axum::body::Bytes,
+) -> Result<Json<Value>, AppError> {
+    let req: MapGenerateRequestBody = if bytes.iter().all(u8::is_ascii_whitespace) {
+        MapGenerateRequestBody {
+            width: None,
+            height: None,
+            cell_size: None,
+            seed: None,
+            tileset: None,
+        }
+    } else {
+        serde_json::from_slice(&bytes).map_err(|error| {
+            AppError::bad_request(format!("invalid map generate request payload: {error}"))
+        })?
+    };
+
+    let tileset: Option<scriptbots_core::TilesetSpec> = if let Some(v) = req.tileset {
+        Some(serde_json::from_value(v).map_err(|e| {
+            AppError::bad_request(format!("invalid tileset specification: {e}"))
+        })?)
+    } else {
+        None
+    };
+
+    let artifact = run_control(move || {
+        let (def_w, def_h, def_cell) = state
+            .handle
+            .read_snapshot()
+            .map(|s| (s.layers.terrain.width, s.layers.terrain.height, s.layers.terrain.cell_size))
+            .unwrap_or((100, 100, 50));
+        let width = req.width.unwrap_or(def_w);
+        let height = req.height.unwrap_or(def_h);
+        let cell_size = req.cell_size.or(Some(def_cell));
+        let seed = req.seed.unwrap_or(0x5a4f_4d41);
+        state.handle.generate_map(width, height, cell_size, seed, tileset)
+    })
+    .await?;
+
+    let val = serde_json::to_value(&artifact).map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(val))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/map/apply",
+    tag = "map",
+    request_body = MapApplyRequestBody,
+    responses((status = 200, body = CommandStatusDto))
+)]
+async fn post_map_apply(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<MapApplyRequestBody>,
+) -> Result<Json<CommandStatusDto>, AppError> {
+    let key = idempotency_key(&headers).or(payload.idempotency_key);
+    let artifact = parse_map_artifact(&payload.artifact)?;
+
+    let status = run_control(move || {
+        state.handle.apply_map(artifact, key.as_deref())
+    })
+    .await?;
+
+    Ok(Json(status))
+}
+
 /// The client-supplied idempotency key from an MCP tool call, if any.
 ///
 /// Same absent-is-absent rule as the HTTP header: a blank string is not a key.
@@ -2065,6 +2147,9 @@ fn prepare_rest_server(
         .route("/api/control/speed", post(post_control_speed))
         .route("/api/control/shutdown", post(post_control_shutdown))
         .route("/api/control/status/{command_id}", get(get_control_status))
+        // Procedural map generation and application controls
+        .route("/api/v1/map/generate", post(post_map_generate))
+        .route("/api/v1/map/apply", post(post_map_apply))
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
@@ -2330,6 +2415,42 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
             "additionalProperties": false
         }),
         ControlToolKind::GetCommandStatus,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "map_generate",
+        "Generate a procedural map artifact deterministically",
+        json!({
+            "type": "object",
+            "properties": {
+                "width": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 1},
+                "cell_size": {"type": "integer", "minimum": 1},
+                "seed": {"type": "integer"},
+                "tileset": {"type": "object"}
+            },
+            "additionalProperties": false
+        }),
+        ControlToolKind::MapGenerate,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "map_apply",
+        "Apply a procedural map artifact to the running simulation",
+        json!({
+            "type": "object",
+            "properties": {
+                "artifact": {"type": "object"},
+                "idempotency_key": {"type": "string"}
+            },
+            "required": ["artifact"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::MapApply,
         handle,
     );
 
@@ -2485,6 +2606,8 @@ enum ControlToolKind {
     GetStatus,
     Shutdown,
     GetCommandStatus,
+    MapGenerate,
+    MapApply,
 }
 
 impl ToolHandler for ControlTool {
@@ -2633,6 +2756,39 @@ impl ToolHandler for ControlTool {
                     .to_string();
                 let handle = self.handle.clone();
                 let status = run_control_mcp_sync(move || handle.command_status(&command_id))?;
+                make_tool_result(status)
+            }
+            ControlToolKind::MapGenerate => {
+                let width = arguments.get("width").and_then(Value::as_u64).map(|v| v as u32);
+                let height = arguments.get("height").and_then(Value::as_u64).map(|v| v as u32);
+                let cell_size = arguments.get("cell_size").and_then(Value::as_u64).map(|v| v as u32);
+                let seed = arguments.get("seed").and_then(Value::as_u64).unwrap_or(0x5a4f_4d41);
+                let tileset = arguments
+                    .get("tileset")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok());
+                let handle = self.handle.clone();
+                let artifact = run_control_mcp_sync(move || {
+                    let (def_w, def_h, def_cell) = handle
+                        .read_snapshot()
+                        .map(|s| (s.layers.terrain.width, s.layers.terrain.height, s.layers.terrain.cell_size))
+                        .unwrap_or((100, 100, 50));
+                    let width = width.unwrap_or(def_w);
+                    let height = height.unwrap_or(def_h);
+                    handle.generate_map(width, height, cell_size.or(Some(def_cell)), seed, tileset)
+                })?;
+                make_tool_result(artifact)
+            }
+            ControlToolKind::MapApply => {
+                let artifact_val = arguments
+                    .get("artifact")
+                    .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "missing 'artifact' parameter"))?;
+                let artifact = parse_map_artifact(artifact_val).map_err(|e| {
+                    McpError::new(McpErrorCode::InvalidParams, format!("invalid map artifact: {e}"))
+                })?;
+                let key = mcp_idempotency_key(&arguments);
+                let handle = self.handle.clone();
+                let status = run_control_mcp_sync(move || handle.apply_map(artifact, key.as_deref()))?;
                 make_tool_result(status)
             }
         }
@@ -3780,6 +3936,8 @@ mod tests {
             "get_status",
             "shutdown",
             "get_command_status",
+            "map_generate",
+            "map_apply",
         ]
         .into_iter()
         .map(str::to_owned)

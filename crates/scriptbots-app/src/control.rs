@@ -7,10 +7,13 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 // removed duplicate import
 
+use std::fs;
+use std::path::Path;
+
 use scriptbots_core::{
-    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
-    ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind, Tick,
-    WorldState,
+    default_tileset_spec, AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass,
+    HydrologyFlowDirection, MapArtifact, RuleBasedMapGenerator, ScriptBotsConfig, SelectionMode,
+    SelectionState, SelectionUpdate, TerrainKind, Tick, TilesetSpec, WorldState,
 };
 
 use scriptbots_core::ConfigAuditEntry;
@@ -257,6 +260,84 @@ pub struct CommandStatusDto {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SpeedRequest {
     pub speed: f32,
+}
+
+/// Request payload for generating a procedural map sandbox artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MapGenerateRequestBody {
+    /// Width of the map grid in cells. Defaults to 100.
+    #[schema(default = 100)]
+    pub width: Option<u32>,
+    /// Height of the map grid in cells. Defaults to 100.
+    #[schema(default = 100)]
+    pub height: Option<u32>,
+    /// Cell size in world units. Defaults to 50.
+    #[schema(default = 50)]
+    pub cell_size: Option<u32>,
+    /// Random seed for deterministic generation. Defaults to a constant seed if omitted.
+    pub seed: Option<u64>,
+    /// Optional declarative tileset specification (as JSON object). If omitted, default biome tileset is used.
+    #[schema(value_type = Option<Object>)]
+    pub tileset: Option<Value>,
+}
+
+/// Request payload for applying a map artifact to the simulation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MapApplyRequestBody {
+    /// Map artifact payload: either a JSON representation of MapArtifact or a base64/hex postcard string, or file path.
+    #[schema(value_type = Object)]
+    pub artifact: Value,
+    /// Optional idempotency key to prevent double application on retry.
+    pub idempotency_key: Option<String>,
+}
+
+fn hex_to_bytes(s: &str) -> Result<Vec<u8>, ()> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err(());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+        .collect()
+}
+
+/// Parse a `MapArtifact` from either a JSON object or string (file path, raw JSON, or hex-encoded postcard).
+pub fn parse_map_artifact(value: &Value) -> Result<MapArtifact, ControlError> {
+    match value {
+        Value::Object(_) => serde_json::from_value(value.clone())
+            .map_err(|e| ControlError::InvalidPatch(format!("invalid map artifact JSON: {e}"))),
+        Value::String(s) => {
+            let path = Path::new(s);
+            if path.exists() {
+                let bytes = fs::read(path)
+                    .map_err(|e| ControlError::InvalidPatch(format!("failed to read map file: {e}")))?;
+                if let Ok(artifact) = postcard::from_bytes::<MapArtifact>(&bytes) {
+                    return Ok(artifact);
+                }
+                if let Ok(artifact) = serde_json::from_slice::<MapArtifact>(&bytes) {
+                    return Ok(artifact);
+                }
+                return Err(ControlError::InvalidPatch(
+                    "file is neither a valid postcard nor JSON MapArtifact".into(),
+                ));
+            }
+            if let Ok(artifact) = serde_json::from_str::<MapArtifact>(s) {
+                return Ok(artifact);
+            }
+            if let Ok(bytes) = hex_to_bytes(s) {
+                if let Ok(artifact) = postcard::from_bytes::<MapArtifact>(&bytes) {
+                    return Ok(artifact);
+                }
+            }
+            Err(ControlError::InvalidPatch(
+                "invalid map artifact string: not a valid file path, JSON string, or hex postcard".into(),
+            ))
+        }
+        _ => Err(ControlError::InvalidPatch(
+            "map artifact must be a JSON object or string".into(),
+        )),
+    }
 }
 
 /// Shared handle used by REST, CLI, and MCP surfaces to access the running world.
@@ -740,6 +821,36 @@ impl ControlHandle {
             .command_status(id)?
             .map(|status| self.status_dto(status))
             .transpose()
+    }
+
+    /// Submit an ApplyMap command.
+    pub fn apply_map(
+        &self,
+        artifact: MapArtifact,
+        idempotency_key: Option<&str>,
+    ) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command_with_key(
+            ControlCommand::ApplyMap(Box::new(artifact)),
+            idempotency_key,
+        )
+    }
+
+    /// Generate a procedural map artifact deterministically using a rule-based generator.
+    pub fn generate_map(
+        &self,
+        width: u32,
+        height: u32,
+        cell_size: Option<u32>,
+        seed: u64,
+        tileset: Option<TilesetSpec>,
+    ) -> Result<MapArtifact, ControlError> {
+        let spec = tileset.unwrap_or_else(default_tileset_spec);
+        let generator = RuleBasedMapGenerator::new(spec)
+            .map_err(|e| ControlError::InvalidPatch(format!("tileset compile error: {e}")))?;
+        let cell_size = cell_size.unwrap_or(50);
+        generator
+            .generate(width, height, cell_size, seed)
+            .map_err(|e| ControlError::InvalidPatch(format!("map generation error: {e}")))
     }
 
     /// Submit a command, honouring an idempotency key when one is supplied.

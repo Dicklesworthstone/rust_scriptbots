@@ -155,8 +155,8 @@ check "MCP unsupported protocol version returns -32602" \
 
 TOOLS="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
     | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
-EXPECTED_TOOLS="apply_patch apply_updates apply_preset get_command_status get_config get_status list_knobs list_presets pause resume set_speed shutdown step "
-check "MCP tools/list returns the full 13-tool roster" "$TOOLS" "$EXPECTED_TOOLS"
+EXPECTED_TOOLS="apply_patch apply_preset apply_updates get_command_status get_config get_status list_knobs list_presets map_apply map_generate pause resume set_speed shutdown step "
+check "MCP tools/list returns the full 15-tool roster" "$TOOLS" "$EXPECTED_TOOLS"
 
 STATUS_CALL="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' \
     -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}' \

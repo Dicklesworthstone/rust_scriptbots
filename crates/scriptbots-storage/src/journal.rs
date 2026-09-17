@@ -9,7 +9,8 @@ use super::{
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use scriptbots_core::{
-    AgentUid, BirthRecord, DeathRecord, ScriptBotsConfig, SelectionUpdate, Tick, TickCombatSummary,
+    AgentUid, BirthRecord, DeathRecord, MapArtifact, ScriptBotsConfig, SelectionUpdate, Tick,
+    TickCombatSummary,
 };
 use scriptbots_runtime::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand,
@@ -735,6 +736,7 @@ enum HostCommandPostcardV1 {
         speed_bits: Option<u32>,
         step_once: bool,
     },
+    ApplyMap(Box<MapArtifact>),
 }
 
 impl HostCommandPostcardV1 {
@@ -778,6 +780,7 @@ impl HostCommandPostcardV1 {
                 origin_island: origin_island.0,
                 origin_uid: origin_uid.get(),
             },
+            HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.clone()),
         }
     }
 
@@ -827,6 +830,7 @@ impl HostCommandPostcardV1 {
                 origin_island: IslandId(origin_island),
                 origin_uid: AgentUid(origin_uid),
             },
+            Self::ApplyMap(artifact) => HostCommand::ApplyMap(artifact),
         }
     }
 }
@@ -866,6 +870,7 @@ enum HostCommandPostcardRefV1<'a> {
         speed_bits: Option<u32>,
         step_once: bool,
     },
+    ApplyMap(&'a MapArtifact),
 }
 
 impl<'a> HostCommandPostcardRefV1<'a> {
@@ -909,6 +914,7 @@ impl<'a> HostCommandPostcardRefV1<'a> {
                 origin_island: origin_island.0,
                 origin_uid: origin_uid.get(),
             },
+            HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.as_ref()),
         }
     }
 }
@@ -5951,6 +5957,61 @@ mod tests {
                 assert_eq!(update.step_once, step_once);
             }
         }
+    }
+
+    #[test]
+    fn apply_map_command_round_trips_losslessly_through_wire_and_archive() {
+        let tile = scriptbots_core::TerrainTile {
+            kind: scriptbots_core::TerrainKind::Grass,
+            elevation: 0.5,
+            moisture: 0.5,
+            accent: 0.0,
+            fertility_bias: 0.0,
+            temperature_bias: 0.0,
+            palette_index: 0,
+        };
+        let terrain = scriptbots_core::TerrainLayer::from_tiles(10, 10, 1, vec![tile; 100])
+            .expect("valid terrain layer");
+        let fertility = scriptbots_core::ScalarField::new(10, 10, vec![0.5; 100]).unwrap();
+        let temperature = scriptbots_core::ScalarField::new(10, 10, vec![0.8; 100]).unwrap();
+        let metadata = scriptbots_core::MapArtifactMetadata {
+            generator: scriptbots_core::MapGeneratorKind::RuleBased,
+            tileset_id: "test_tileset".to_string(),
+            tileset_hash: 0x1234,
+            seed: 42,
+            width: 10,
+            height: 10,
+            attempt_count: 1,
+            succeeded_on: 1,
+            generated_at_epoch_ms: 1000,
+        };
+        let artifact = MapArtifact::new(
+            terrain,
+            Some(fertility),
+            Some(temperature),
+            None,
+            None,
+            metadata,
+        )
+        .expect("valid test artifact");
+        let command = HostCommand::ApplyMap(Box::new(artifact.clone()));
+        let owned = HostCommandPostcardV1::from_runtime(&command);
+        let borrowed = HostCommandPostcardRefV1::from_runtime(&command);
+        let bytes = postcard::to_allocvec(&owned).expect("owned command bytes");
+        assert_eq!(
+            bytes,
+            postcard::to_allocvec(&borrowed).expect("borrowed command bytes")
+        );
+        let decoded: HostCommandPostcardV1 =
+            postcard::from_bytes(&bytes).expect("durable command readback");
+        let HostCommand::ApplyMap(decoded_artifact) = decoded.into_runtime() else {
+            panic!("apply map command discriminant changed");
+        };
+        assert_eq!(decoded_artifact.as_ref(), &artifact);
+        assert_eq!(
+            decoded_artifact.scientific_content_hash(),
+            artifact.scientific_content_hash()
+        );
     }
 
     #[test]

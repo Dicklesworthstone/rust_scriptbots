@@ -1495,6 +1495,8 @@ pub enum ControlCommand {
     SetSpeed(f32),
     /// Request simulation shutdown.
     Shutdown,
+    /// Replace the world environment with a validated procedural map artifact.
+    ApplyMap(Box<map_sandbox::MapArtifact>),
 }
 
 /// Playback command carried to the external simulation driver.
@@ -1589,6 +1591,9 @@ impl ControlCommand {
                     Ok(())
                 }
             }
+            Self::ApplyMap(artifact) => artifact
+                .validate()
+                .map_err(|_| WorldStateError::InvalidConfig("invalid map artifact")),
         }
     }
 }
@@ -1661,6 +1666,10 @@ pub fn apply_control_command(
             step_once: false,
         })),
         ControlCommand::Shutdown => Ok(ControlDisposition::WorldApplied),
+        ControlCommand::ApplyMap(artifact) => {
+            world.apply_map_artifact(&artifact)?;
+            Ok(ControlDisposition::WorldApplied)
+        }
     }
 }
 
@@ -1761,6 +1770,28 @@ fn sample_temperature(config: &ScriptBotsConfig, x: f32) -> f32 {
     let distance = ((normalized - 0.5).abs() * 2.0).clamp(0.0, 1.0);
     let exponent = config.temperature_gradient_exponent.max(f32::EPSILON);
     distance.powf(exponent).clamp(0.0, 1.0)
+}
+
+fn sample_temperature_with_field(
+    config: &ScriptBotsConfig,
+    field: Option<&map_sandbox::ScalarField>,
+    position: Position,
+) -> f32 {
+    if let Some(field) = field {
+        let cell_size = validated_world_unit_f32(config.food_cell_size);
+        let width = field.width();
+        let height = field.height();
+        if width > 0 && height > 0 && cell_size > 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let cell_x = ((position.x / cell_size).floor() as i32).rem_euclid(width as i32) as u32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let cell_y = ((position.y / cell_size).floor() as i32).rem_euclid(height as i32) as u32;
+            if let Some(val) = field.get(cell_x, cell_y) {
+                return val.clamp(0.0, 1.0);
+            }
+        }
+    }
+    sample_temperature(config, position.x)
 }
 
 fn temperature_discomfort(env_temperature: f32, preference: f32) -> f32 {
@@ -14029,7 +14060,7 @@ impl FoodGrid {
 }
 
 /// Tile-based terrain layer used for rendering biomes and overlays.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerrainLayer {
     width: u32,
     height: u32,
@@ -14318,7 +14349,7 @@ pub enum TerrainKind {
 }
 
 /// Metadata captured for every terrain tile.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TerrainTile {
     /// Terrain class.
     pub kind: TerrainKind,
@@ -16061,7 +16092,7 @@ mod map_sandbox {
     }
 
     /// Provenance record for a generated map: what was generated, from what, and how.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct MapArtifactMetadata {
         /// Which generator produced the artifact.
         pub generator: MapGeneratorKind,
@@ -16086,7 +16117,7 @@ mod map_sandbox {
 
     /// A validated `width` x `height` grid of finite `f32` values (e.g. fertility
     /// or temperature), stored row-major.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct ScalarField {
         width: u32,
         height: u32,
@@ -16128,6 +16159,17 @@ mod map_sandbox {
             &self.values
         }
 
+        /// Immutable access to a specific cell value.
+        #[must_use]
+        pub fn get(&self, x: u32, y: u32) -> Option<f32> {
+            if x < self.width && y < self.height {
+                let idx = (y as usize) * (self.width as usize) + (x as usize);
+                self.values.get(idx).copied()
+            } else {
+                None
+            }
+        }
+
         /// Re-check the length and finiteness invariants (already enforced by
         /// [`ScalarField::new`]).
         pub fn validate(&self) -> Result<(), ScientificStateError> {
@@ -16148,7 +16190,7 @@ mod map_sandbox {
     }
 
     /// Per-cell hydrology parameters stamped by a placed tile.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HydrologyTile {
         /// How readily water passes through the cell.
         pub permeability: f32,
@@ -16179,7 +16221,7 @@ mod map_sandbox {
 
     /// A validated `width` x `height` grid of per-cell hydrology parameters,
     /// stored row-major.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HydrologyTileLayer {
         width: u32,
         height: u32,
@@ -16272,7 +16314,7 @@ mod map_sandbox {
     /// A validated `width` x `height` hydrology solution: per-cell flow directions,
     /// accumulation, spill elevations, basin assignment, and starting water depth,
     /// all stored row-major.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HydrologyField {
         width: u32,
         height: u32,
@@ -16389,7 +16431,7 @@ mod map_sandbox {
 
     /// A fully generated, validated map: terrain plus optional environmental
     /// fields, optional hydrology, and provenance metadata.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct MapArtifact {
         terrain: TerrainLayer,
         fertility: Option<ScalarField>,
@@ -16510,6 +16552,128 @@ mod map_sandbox {
                 }
             }
             Ok(())
+        }
+
+        /// Compute a deterministic 64-bit hash of the scientific content of this artifact.
+        ///
+        /// This explicitly hashes terrain, fertility, temperature, hydrology, seed,
+        /// tileset hash, and generator identity, while explicitly excluding
+        /// `generated_at_epoch_ms` so identical inputs reproduce the exact same hash.
+        #[must_use]
+        pub fn scientific_content_hash(&self) -> u64 {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"map-artifact-scientific-v1");
+
+            // Terrain
+            let terrain = self.terrain();
+            bytes.extend_from_slice(&(u64::from(terrain.width())).to_le_bytes());
+            bytes.extend_from_slice(&(u64::from(terrain.height())).to_le_bytes());
+            bytes.extend_from_slice(&(u64::from(terrain.cell_size())).to_le_bytes());
+            bytes.extend_from_slice(&(terrain.tiles().len() as u64).to_le_bytes());
+            for tile in terrain.tiles() {
+                bytes.push(terrain_kind_tag_v0(tile.kind));
+                bytes.extend_from_slice(&tile.elevation.to_bits().to_le_bytes());
+                bytes.extend_from_slice(&tile.moisture.to_bits().to_le_bytes());
+                bytes.extend_from_slice(&tile.accent.to_bits().to_le_bytes());
+                bytes.extend_from_slice(&tile.fertility_bias.to_bits().to_le_bytes());
+                bytes.extend_from_slice(&tile.temperature_bias.to_bits().to_le_bytes());
+                bytes.extend_from_slice(&tile.palette_index.to_le_bytes());
+            }
+
+            // Fertility field
+            match self.fertility() {
+                Some(field) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(u64::from(field.width())).to_le_bytes());
+                    bytes.extend_from_slice(&(u64::from(field.height())).to_le_bytes());
+                    bytes.extend_from_slice(&(field.values().len() as u64).to_le_bytes());
+                    for &val in field.values() {
+                        bytes.extend_from_slice(&val.to_bits().to_le_bytes());
+                    }
+                }
+                None => bytes.push(0),
+            }
+
+            // Temperature field
+            match self.temperature() {
+                Some(field) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(u64::from(field.width())).to_le_bytes());
+                    bytes.extend_from_slice(&(u64::from(field.height())).to_le_bytes());
+                    bytes.extend_from_slice(&(field.values().len() as u64).to_le_bytes());
+                    for &val in field.values() {
+                        bytes.extend_from_slice(&val.to_bits().to_le_bytes());
+                    }
+                }
+                None => bytes.push(0),
+            }
+
+            // Hydrology tiles
+            match self.hydrology_tiles() {
+                Some(tiles) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(u64::from(tiles.width())).to_le_bytes());
+                    bytes.extend_from_slice(&(u64::from(tiles.height())).to_le_bytes());
+                    bytes.extend_from_slice(&(tiles.tiles().len() as u64).to_le_bytes());
+                    for tile in tiles.tiles() {
+                        bytes.extend_from_slice(&tile.permeability.to_bits().to_le_bytes());
+                        bytes.extend_from_slice(&tile.runoff_bias.to_bits().to_le_bytes());
+                        bytes.extend_from_slice(&tile.basin_rank.to_bits().to_le_bytes());
+                        bytes.extend_from_slice(&tile.channel_priority.to_bits().to_le_bytes());
+                        bytes.extend_from_slice(&tile.swim_cost.to_bits().to_le_bytes());
+                    }
+                }
+                None => bytes.push(0),
+            }
+
+            // Hydrology field
+            match self.hydrology_field() {
+                Some(field) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(u64::from(field.width())).to_le_bytes());
+                    bytes.extend_from_slice(&(u64::from(field.height())).to_le_bytes());
+                    for dir in field.flow_directions() {
+                        let tag = match dir {
+                            HydrologyFlowDirection::None => 0_u8,
+                            HydrologyFlowDirection::North => 1,
+                            HydrologyFlowDirection::South => 2,
+                            HydrologyFlowDirection::East => 3,
+                            HydrologyFlowDirection::West => 4,
+                        };
+                        bytes.push(tag);
+                    }
+                    for &acc in field.accumulation() {
+                        bytes.extend_from_slice(&acc.to_bits().to_le_bytes());
+                    }
+                    for &spill in field.spill_elevation() {
+                        bytes.extend_from_slice(&spill.to_bits().to_le_bytes());
+                    }
+                    for &basin in field.basin_ids() {
+                        bytes.extend_from_slice(&basin.to_le_bytes());
+                    }
+                    for &depth in field.initial_water_depth() {
+                        bytes.extend_from_slice(&depth.to_bits().to_le_bytes());
+                    }
+                }
+                None => bytes.push(0),
+            }
+
+            // Scientific metadata (EXCLUDES generated_at_epoch_ms!)
+            let meta = self.metadata();
+            let gen_tag = match meta.generator {
+                MapGeneratorKind::RuleBased => 0_u8,
+            };
+            bytes.push(gen_tag);
+            bytes.extend_from_slice(&(meta.tileset_id.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(meta.tileset_id.as_bytes());
+            bytes.extend_from_slice(&meta.tileset_hash.to_le_bytes());
+            bytes.extend_from_slice(&meta.seed.to_le_bytes());
+            bytes.extend_from_slice(&(u64::from(meta.width)).to_le_bytes());
+            bytes.extend_from_slice(&(u64::from(meta.height)).to_le_bytes());
+            bytes.extend_from_slice(&(meta.attempt_count as u64).to_le_bytes());
+            bytes.extend_from_slice(&(meta.succeeded_on as u64).to_le_bytes());
+
+            characterization_fnv1a64(&bytes)
         }
     }
 
@@ -17321,6 +17485,123 @@ mod map_sandbox {
             .map_or(0, |dur| dur.as_millis())
     }
 
+    /// Standard default 6-biome tileset suitable for procedural generation.
+    #[must_use]
+    pub fn default_tileset_spec() -> TilesetSpec {
+        TilesetSpec {
+            id: "default-v1".to_owned(),
+            label: Some("Default Procedural Biomes".to_owned()),
+            description: Some(
+                "Standard 6-biome procedural tileset with natural environmental biases".to_owned(),
+            ),
+            tiles: vec![
+                TileSpec {
+                    id: "deep_water".to_owned(),
+                    label: Some("Deep Water".to_owned()),
+                    weight: 2,
+                    terrain_kind: TerrainKind::DeepWater,
+                    fertility_bias: Some(0.1),
+                    temperature_bias: Some(-0.2),
+                    elevation: Some(0.0),
+                    moisture: Some(1.0),
+                    accent: Some(0.1),
+                    palette_index: Some(0),
+                    permeability: Some(0.95),
+                    runoff_bias: Some(0.05),
+                    basin_rank: Some(3.0),
+                    channel_priority: Some(0.9),
+                    swim_cost: Some(0.1),
+                },
+                TileSpec {
+                    id: "shallow_water".to_owned(),
+                    label: Some("Shallow Water".to_owned()),
+                    weight: 2,
+                    terrain_kind: TerrainKind::ShallowWater,
+                    fertility_bias: Some(0.3),
+                    temperature_bias: Some(-0.1),
+                    elevation: Some(0.15),
+                    moisture: Some(0.85),
+                    accent: Some(0.2),
+                    palette_index: Some(1),
+                    permeability: Some(0.8),
+                    runoff_bias: Some(0.15),
+                    basin_rank: Some(2.0),
+                    channel_priority: Some(0.7),
+                    swim_cost: Some(0.3),
+                },
+                TileSpec {
+                    id: "sand".to_owned(),
+                    label: Some("Sand".to_owned()),
+                    weight: 3,
+                    terrain_kind: TerrainKind::Sand,
+                    fertility_bias: Some(0.15),
+                    temperature_bias: Some(0.2),
+                    elevation: Some(0.3),
+                    moisture: Some(0.2),
+                    accent: Some(0.1),
+                    palette_index: Some(2),
+                    permeability: Some(0.6),
+                    runoff_bias: Some(0.3),
+                    basin_rank: Some(1.0),
+                    channel_priority: Some(0.3),
+                    swim_cost: Some(0.7),
+                },
+                TileSpec {
+                    id: "grass".to_owned(),
+                    label: Some("Grassland".to_owned()),
+                    weight: 5,
+                    terrain_kind: TerrainKind::Grass,
+                    fertility_bias: Some(0.7),
+                    temperature_bias: Some(0.0),
+                    elevation: Some(0.5),
+                    moisture: Some(0.6),
+                    accent: Some(0.3),
+                    palette_index: Some(3),
+                    permeability: Some(0.4),
+                    runoff_bias: Some(0.5),
+                    basin_rank: Some(0.5),
+                    channel_priority: Some(0.4),
+                    swim_cost: Some(1.0),
+                },
+                TileSpec {
+                    id: "bloom".to_owned(),
+                    label: Some("Nutrient Bloom".to_owned()),
+                    weight: 1,
+                    terrain_kind: TerrainKind::Bloom,
+                    fertility_bias: Some(1.0),
+                    temperature_bias: Some(0.1),
+                    elevation: Some(0.45),
+                    moisture: Some(0.75),
+                    accent: Some(0.8),
+                    palette_index: Some(4),
+                    permeability: Some(0.5),
+                    runoff_bias: Some(0.4),
+                    basin_rank: Some(0.8),
+                    channel_priority: Some(0.5),
+                    swim_cost: Some(0.9),
+                },
+                TileSpec {
+                    id: "rock".to_owned(),
+                    label: Some("Rock".to_owned()),
+                    weight: 2,
+                    terrain_kind: TerrainKind::Rock,
+                    fertility_bias: Some(0.05),
+                    temperature_bias: Some(0.3),
+                    elevation: Some(0.85),
+                    moisture: Some(0.1),
+                    accent: Some(0.4),
+                    palette_index: Some(5),
+                    permeability: Some(0.1),
+                    runoff_bias: Some(0.9),
+                    basin_rank: Some(0.1),
+                    channel_priority: Some(0.1),
+                    swim_cost: Some(1.5),
+                },
+            ],
+            adjacency: Vec::new(),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -18013,13 +18294,112 @@ mod map_sandbox {
                 ScientificStateError::DimensionOverflow { .. }
             ));
         }
+
+        #[test]
+        fn scientific_content_hash_invariance_and_sensitivity() {
+            let spec = default_tileset_spec();
+            let generator = RuleBasedMapGenerator::new(spec).expect("compile default tileset");
+            let mut artifact1 = generator.generate(16, 16, 16, 12345).expect("generate 1");
+            let hash1 = artifact1.scientific_content_hash();
+
+            // Wall-clock timestamp invariance: altering generated_at_epoch_ms must NOT change the scientific hash
+            artifact1.metadata.generated_at_epoch_ms = artifact1
+                .metadata
+                .generated_at_epoch_ms
+                .wrapping_add(987_654_321);
+            let hash1_shifted_time = artifact1.scientific_content_hash();
+            assert_eq!(
+                hash1, hash1_shifted_time,
+                "scientific_content_hash must be strictly invariant to wall-clock generated_at_epoch_ms"
+            );
+
+            // Sensitivity: different seed must yield different hash
+            let artifact2 = generator.generate(16, 16, 16, 54321).expect("generate 2");
+            let hash2 = artifact2.scientific_content_hash();
+            assert_ne!(
+                hash1, hash2,
+                "different seeds must produce different scientific content hashes"
+            );
+        }
+
+        #[test]
+        fn map_temperature_field_application_and_sensor_evaluation() {
+            let spec = default_tileset_spec();
+            let generator = RuleBasedMapGenerator::new(spec).expect("compile generator");
+            let artifact = generator.generate(8, 8, 16, 42).expect("generate map artifact");
+
+            let mut world = super::super::WorldState::new(super::super::ScriptBotsConfig {
+                world_width: 128,
+                world_height: 128,
+                food_cell_size: 16,
+                rng_seed: Some(42),
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..super::super::ScriptBotsConfig::default()
+            })
+            .expect("world");
+
+            assert!(
+                world.temperature().is_none(),
+                "world initially has no scalar temperature field"
+            );
+
+            let pos = super::super::Position { x: 24.0, y: 24.0 };
+            let fallback_temp = world.sample_temperature_at(pos);
+
+            // Apply valid artifact
+            world
+                .apply_map_artifact(&artifact)
+                .expect("apply map artifact succeeds");
+
+            assert!(
+                world.temperature().is_some(),
+                "world now has scalar temperature field from map"
+            );
+            let temp_field = world.temperature().unwrap();
+            assert_eq!(temp_field.width(), 8);
+            assert_eq!(temp_field.height(), 8);
+
+            // At cell (1, 1) corresponding to x=24, y=24 with cell_size=16
+            let expected_temp = temp_field.get(1, 1).expect("cell 1,1 value");
+            let sampled_temp = world.sample_temperature_at(pos);
+            assert_eq!(sampled_temp, expected_temp);
+            // The map's scalar field differs from the 1D default fallback
+            assert!(
+                (sampled_temp - fallback_temp).abs() > 1e-4
+                    || expected_temp == fallback_temp,
+                "sampled temperature should come from scalar field"
+            );
+
+            // Dimension mismatch rejection
+            let bad_artifact = generator
+                .generate(16, 16, 16, 42)
+                .expect("16x16 artifact");
+            let baseline_digest = world
+                .characterization_digest_v0()
+                .expect("baseline digest");
+            let err = world
+                .apply_map_artifact(&bad_artifact)
+                .expect_err("dimension mismatch must fail");
+            assert!(
+                matches!(err, super::super::WorldStateError::InvalidConfig(_)),
+                "must fail with InvalidConfig"
+            );
+            assert_eq!(
+                world
+                    .characterization_digest_v0()
+                    .expect("post-rejection digest"),
+                baseline_digest,
+                "world state must remain unmutated on rejection"
+            );
+        }
     }
 }
 
 pub use map_sandbox::{
-    AdjacencySpec, HydrologyField, HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer,
-    MapArtifact, MapArtifactMetadata, MapGenerationError, MapGeneratorKind, RuleBasedMapGenerator,
-    ScalarField, TileSpec, TilesetSpec,
+    default_tileset_spec, AdjacencySpec, HydrologyField, HydrologyFlowDirection, HydrologyTile,
+    HydrologyTileLayer, MapArtifact, MapArtifactMetadata, MapGenerationError, MapGeneratorKind,
+    RuleBasedMapGenerator, ScalarField, TileSpec, TilesetSpec,
 };
 
 /// Runtime hydrology state tracked by the world.
@@ -18331,6 +18711,7 @@ pub struct WorldState {
     terrain: TerrainLayer,
     map_metadata: Option<MapArtifactMetadata>,
     hydrology: Option<HydrologyState>,
+    temperature: Option<ScalarField>,
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
@@ -19238,6 +19619,7 @@ impl WorldState {
             terrain,
             map_metadata: None,
             hydrology: None,
+            temperature: None,
             config,
             tick: Tick::zero(),
             epoch: 0,
@@ -20141,6 +20523,7 @@ impl WorldState {
         let food_max = self.config.food_max;
         let tick_value = legacy_clock_counter_f32(self.tick.0.saturating_add(1));
         let index = &self.index;
+        let temperature_field = self.temperature.as_ref();
 
         let sensor_results: Vec<([f32; INPUT_SIZE], u32)> =
             collect_handles!(handles, |idx, _handle| {
@@ -20233,7 +20616,8 @@ impl WorldState {
                 sensors[17] = (tick_value / clocks[idx][1].max(1.0)).sin().abs();
                 sensors[18] = clamp01(hearing_channel);
                 sensors[19] = clamp01(blood);
-                let env_temperature = sample_temperature(&self.config, position.x);
+                let env_temperature =
+                    sample_temperature_with_field(&self.config, temperature_field, position);
                 let discomfort =
                     temperature_discomfort(env_temperature, temperature_preferences[idx]);
                 sensors[20] = clamp01(discomfort);
@@ -20437,7 +20821,8 @@ impl WorldState {
 
         let tick_value = legacy_clock_counter_f32(self.tick.0.saturating_add(1));
         let clocks = observer.clocks;
-        let env_temperature = sample_temperature(&self.config, position.x);
+        let env_temperature =
+            sample_temperature_with_field(&self.config, self.temperature.as_ref(), position);
         let discomfort = temperature_discomfort(env_temperature, observer.temperature_preference);
 
         let mut raw = [0.0f32; INPUT_SIZE];
@@ -21575,6 +21960,7 @@ impl WorldState {
         self.work_penalties.clear();
         self.work_penalties.resize(handles.len(), 0.0);
         let penalties = &mut self.work_penalties;
+        let temperature_field = self.temperature.as_ref();
 
         #[cfg(feature = "simd_wide")]
         {
@@ -21585,10 +21971,26 @@ impl WorldState {
                 let i0 = base * 4;
                 let idxs = [chunk[0], chunk[1], chunk[2], chunk[3]];
                 // Gather env temps and preferences per lane
-                let t0 = sample_temperature(&self.config, positions_snapshot[i0].x);
-                let t1 = sample_temperature(&self.config, positions_snapshot[i0 + 1].x);
-                let t2 = sample_temperature(&self.config, positions_snapshot[i0 + 2].x);
-                let t3 = sample_temperature(&self.config, positions_snapshot[i0 + 3].x);
+                let t0 = sample_temperature_with_field(
+                    &self.config,
+                    temperature_field,
+                    positions_snapshot[i0],
+                );
+                let t1 = sample_temperature_with_field(
+                    &self.config,
+                    temperature_field,
+                    positions_snapshot[i0 + 1],
+                );
+                let t2 = sample_temperature_with_field(
+                    &self.config,
+                    temperature_field,
+                    positions_snapshot[i0 + 2],
+                );
+                let t3 = sample_temperature_with_field(
+                    &self.config,
+                    temperature_field,
+                    positions_snapshot[i0 + 3],
+                );
 
                 let p0 = self
                     .runtime
@@ -21639,7 +22041,11 @@ impl WorldState {
             let base = handles.len() - remainder.len();
             for (o, agent_id) in remainder.iter().enumerate() {
                 let idx = base + o;
-                let env_temperature = sample_temperature(&self.config, positions_snapshot[idx].x);
+                let env_temperature = sample_temperature_with_field(
+                    &self.config,
+                    temperature_field,
+                    positions_snapshot[idx],
+                );
                 let Some(runtime) = self.runtime.get(*agent_id) else {
                     continue;
                 };
@@ -21658,7 +22064,11 @@ impl WorldState {
 
         #[cfg(not(feature = "simd_wide"))]
         for (idx, agent_id) in handles.iter().enumerate() {
-            let env_temperature = sample_temperature(&self.config, positions_snapshot[idx].x);
+            let env_temperature = sample_temperature_with_field(
+                &self.config,
+                temperature_field,
+                positions_snapshot[idx],
+            );
             let Some(runtime) = self.runtime.get(*agent_id) else {
                 continue;
             };
@@ -25916,7 +26326,11 @@ impl WorldState {
                 }
 
                 if let Some(position) = positions.get(idx).filter(|_| macro_enabled) {
-                    let env_temperature = sample_temperature(&self.config, position.x);
+                    let env_temperature = sample_temperature_with_field(
+                        &self.config,
+                        self.temperature.as_ref(),
+                        *position,
+                    );
                     let discomfort = f64::from(temperature_discomfort(
                         env_temperature,
                         runtime.temperature_preference,
@@ -28609,6 +29023,7 @@ impl WorldState {
         self.food_profiles = candidate_food_profiles;
         self.food = candidate_food;
         self.hydrology = candidate_hydrology;
+        self.temperature = artifact.temperature().cloned();
         self.map_metadata = Some(artifact.metadata().clone());
         Ok(())
     }
@@ -28623,6 +29038,18 @@ impl WorldState {
     #[must_use]
     pub const fn hydrology(&self) -> Option<&HydrologyState> {
         self.hydrology.as_ref()
+    }
+
+    /// Immutable access to the applied map's temperature scalar field when available.
+    #[must_use]
+    pub const fn temperature(&self) -> Option<&ScalarField> {
+        self.temperature.as_ref()
+    }
+
+    /// Sample the ambient environmental temperature at the given position.
+    #[must_use]
+    pub fn sample_temperature_at(&self, position: Position) -> f32 {
+        sample_temperature_with_field(&self.config, self.temperature.as_ref(), position)
     }
 
     /// Immutable access to the brain registry.

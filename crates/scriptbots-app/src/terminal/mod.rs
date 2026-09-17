@@ -756,6 +756,28 @@ impl<'a> TerminalApp<'a> {
         }
     }
 
+    fn toggle_pause(&mut self) {
+        let paused = !self.paused;
+        let action = if paused { "Pause" } else { "Resume" };
+        let command = ControlCommand::UpdateSimulation(SimulationCommand {
+            paused: Some(paused),
+            speed_multiplier: Some(if paused {
+                0.0
+            } else {
+                self.speed_multiplier.max(1.0)
+            }),
+            step_once: false,
+        });
+        // Admission does not change observed playback. refresh_snapshot owns
+        // that transition, including commands rejected after admission.
+        if let Some(receipt) = (self.command_submit.as_ref())(command) {
+            debug!(%receipt, "playback request enqueued");
+            self.push_toast(format!("{action} request submitted"));
+        } else {
+            self.push_toast(format!("{action} request not submitted"));
+        }
+    }
+
     /// Explicit batch-mode command barrier. Repainting never invokes this;
     /// only a requested headless science step waits for its own receipt.
     fn submit_and_wait(&mut self, command: ControlCommand) -> Result<()> {
@@ -2942,19 +2964,7 @@ impl<'a> TerminalApp<'a> {
     pub fn execute_palette_action(&mut self, action: CommandPaletteAction) {
         match action {
             CommandPaletteAction::TogglePause => {
-                self.paused = !self.paused;
-                self.submit_simulation_command(ControlCommand::UpdateSimulation(
-                    SimulationCommand {
-                        paused: Some(self.paused),
-                        speed_multiplier: Some(if self.paused {
-                            0.0
-                        } else {
-                            self.speed_multiplier.max(1.0)
-                        }),
-                        step_once: false,
-                    },
-                ));
-                self.push_toast(if self.paused { "Paused" } else { "Resumed" });
+                self.toggle_pause();
             }
             CommandPaletteAction::StepOnce => {
                 self.step_once();
@@ -3184,20 +3194,7 @@ impl<'a> TerminalApp<'a> {
                 return Ok(false);
             }
             (KeyCode::Char(' '), _) => {
-                self.paused = !self.paused;
-                if self.paused {
-                    self.speed_multiplier = 0.0;
-                } else if self.speed_multiplier <= 0.0 {
-                    self.speed_multiplier = 1.0;
-                }
-                self.push_toast(if self.paused { "Paused" } else { "Resumed" });
-                self.submit_simulation_command(ControlCommand::UpdateSimulation(
-                    SimulationCommand {
-                        paused: Some(self.paused),
-                        speed_multiplier: Some(self.speed_multiplier),
-                        step_once: false,
-                    },
-                ));
+                self.toggle_pause();
             }
             (KeyCode::Char('+') | KeyCode::Char('='), _) => {
                 self.speed_multiplier = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
@@ -15926,12 +15923,39 @@ mod tests {
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
 
+        // Receipt admission without owner application must not change the
+        // playback state displayed by either pause entry point.
+        assert!(app.paused);
+        app.command_submit = Arc::new(|_| Some("pending-playback".to_owned()));
+        app.execute_palette_action(CommandPaletteAction::TogglePause);
+        assert!(app.paused, "admission is not observed resumption");
+        assert!(app.host.snapshot_hub().latest().playback.paused);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("space is handled");
+        assert!(app.paused, "keyboard admission is not observed resumption");
+
+        app.command_submit = Arc::new(|_| None);
+        app.execute_palette_action(CommandPaletteAction::TogglePause);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("space is handled");
+        assert!(app.paused, "rejected requests preserve observed playback");
+
+        // A successful owner application, unlike admission, changes the display
+        // when its publication is consumed. Exercise both playback directions.
         app.submit_and_wait(ControlCommand::Resume)
             .expect("resume real host");
         app.refresh_snapshot();
         assert!(!app.paused);
+        app.command_submit = Arc::new(|_| Some("pending-pause".to_owned()));
         app.execute_palette_action(CommandPaletteAction::TogglePause);
-        assert!(app.paused, "TogglePause action must set app.paused to true");
+        assert!(!app.paused, "admission is not observed pausing");
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("space is handled");
+        assert!(!app.paused, "keyboard admission is not observed pausing");
+        app.submit_and_wait(ControlCommand::Pause)
+            .expect("pause real host");
+        app.refresh_snapshot();
+        assert!(app.paused);
 
         assert_eq!(app.map_zoom_level, 1.0);
         app.zoom_in();

@@ -1859,6 +1859,8 @@ pub enum HostCommand {
     Shutdown,
     /// Apply pause, speed, and an optional single step as one ordered command.
     UpdateSimulation(SimulationCommand),
+    /// Replace the active world map with a pre-generated map artifact.
+    ApplyMap(Box<scriptbots_core::MapArtifact>),
 }
 
 impl HostCommand {
@@ -1909,6 +1911,11 @@ impl HostCommand {
                     message: "crossover parents must be distinct".to_owned(),
                 })
             }
+            Self::ApplyMap(artifact) => artifact
+                .validate()
+                .map_err(|error| CommandValidationError::InvalidWorldCommand {
+                    message: error.to_string(),
+                }),
             _ => Ok(()),
         }
     }
@@ -1932,6 +1939,7 @@ impl HostCommand {
             | Self::Emigrate { .. }
             | Self::Immigrate { .. }
             | Self::UpdateSimulation(_)
+            | Self::ApplyMap(_)
             | Self::Shutdown => true,
         }
     }
@@ -1999,6 +2007,7 @@ impl TryFrom<ControlCommand> for HostCommand {
                 Ok(Self::SetSpeed(speed.clamp(0.0, 32.0)))
             }
             ControlCommand::Shutdown => Ok(Self::Shutdown),
+            ControlCommand::ApplyMap(artifact) => Ok(Self::ApplyMap(artifact)),
         }
     }
 }
@@ -7425,7 +7434,8 @@ mod tests {
                     | HostCommand::SpawnAgent { .. }
                     | HostCommand::SpawnCrossover { .. }
                     | HostCommand::Emigrate { .. }
-                    | HostCommand::Immigrate { .. } => {
+                    | HostCommand::Immigrate { .. }
+                    | HostCommand::ApplyMap(_) => {
                         self.revisions.scientific =
                             self.revisions.scientific.checked_next().ok_or_else(|| {
                                 protocol_violation("scientific revision exhausted")

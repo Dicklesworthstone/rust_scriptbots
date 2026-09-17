@@ -948,12 +948,13 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 500
 - Default: `127.0.0.1:8090` over HTTP; disable with `SCRIPTBOTS_CONTROL_MCP=disabled`.
 - Override bind address: `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR=127.0.0.1:9090`.
 - Implemented with `fastmcp-rust`; the server shares the same `ControlHandle` as REST.
-- Tools exposed (13):
+- Tools exposed (15):
   - Configuration: `list_knobs` → array of knob entries; `get_config` → full config snapshot;
     `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`; `apply_patch` → accepts `{ patch: { ... } }`
   - Scenarios: `list_presets` → available scenario presets; `apply_preset` → accepts `{ name }`
   - Playback: `pause`, `resume`, `step` (accepts `{ count }`), `set_speed`, `shutdown`
   - Observation: `get_status` → current simulation status; `get_command_status` → two-axis status by command ID
+  - Maps: `map_generate` → procedural sandbox map generation; `map_apply` → apply map artifact to running simulation
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
 
 MCP quickstart:

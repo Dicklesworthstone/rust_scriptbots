@@ -146,6 +146,33 @@ enum Command {
         /// Command ID to look up (e.g. cmd-1).
         id: String,
     },
+    /// Generate a procedural map artifact via the REST API.
+    MapGenerate {
+        /// Map grid width in cells.
+        #[arg(long)]
+        width: Option<u32>,
+        /// Map grid height in cells.
+        #[arg(long)]
+        height: Option<u32>,
+        /// Cell size in world units.
+        #[arg(long)]
+        cell_size: Option<u32>,
+        /// Random seed for generation.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Optional tileset specification JSON file.
+        #[arg(long)]
+        tileset: Option<PathBuf>,
+        /// Output file path to save the generated map artifact (Postcard or JSON depending on extension).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Apply a map artifact to the running simulation via REST.
+    MapApply {
+        /// Path to map artifact file (postcard binary or JSON).
+        #[arg(long, short)]
+        file: PathBuf,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -205,6 +232,29 @@ async fn main() -> Result<()> {
                 Command::Shutdown => shutdown_command(&client, &cli.base_url).await?,
                 Command::LookupStatus { id } => {
                     lookup_status_command(&client, &cli.base_url, &id).await?
+                }
+                Command::MapGenerate {
+                    width,
+                    height,
+                    cell_size,
+                    seed,
+                    tileset,
+                    out,
+                } => {
+                    map_generate_command(
+                        &client,
+                        &cli.base_url,
+                        width,
+                        height,
+                        cell_size,
+                        seed,
+                        tileset,
+                        out,
+                    )
+                    .await?
+                }
+                Command::MapApply { file } => {
+                    map_apply_command(&client, &cli.base_url, file, key).await?
                 }
             }
         }
@@ -1041,6 +1091,152 @@ async fn lookup_status_command(client: &Client, base_url: &str, id: &str) -> Res
     } else {
         bail!("status lookup failed ({status}): {body}");
     }
+    Ok(())
+}
+
+async fn map_generate_command(
+    client: &Client,
+    base_url: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+    cell_size: Option<u32>,
+    seed: Option<u64>,
+    tileset_path: Option<PathBuf>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let tileset: Option<Value> = if let Some(path) = tileset_path {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read tileset file {}", path.display()))?;
+        Some(serde_json::from_str(&content).context("failed to parse tileset JSON")?)
+    } else {
+        None
+    };
+
+    let body = serde_json::json!({
+        "width": width,
+        "height": height,
+        "cell_size": cell_size,
+        "seed": seed,
+        "tileset": tileset,
+    });
+
+    let url = join_url(base_url, "/api/v1/map/generate");
+    let response = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .context("failed to send map generate request")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        bail!("map generate failed ({status}): {text}");
+    }
+
+    let artifact_json: Value = response
+        .json()
+        .await
+        .context("failed to deserialize map generate response")?;
+
+    let artifact: scriptbots_core::MapArtifact = serde_json::from_value(artifact_json.clone())
+        .context("failed to parse returned MapArtifact")?;
+
+    let hash = artifact.scientific_content_hash();
+    let w = artifact.terrain().width();
+    let h = artifact.terrain().height();
+    let cs = artifact.terrain().cell_size();
+
+    if let Some(out_path) = out {
+        if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create directory {}", parent.display())
+            })?;
+        }
+        let is_json = out_path.extension().and_then(|ext| ext.to_str()) == Some("json");
+        if is_json {
+            let json_str = serde_json::to_string_pretty(&artifact_json)
+                .context("failed to format JSON")?;
+            fs::write(&out_path, json_str)
+                .with_context(|| format!("failed to write map artifact to {}", out_path.display()))?;
+        } else {
+            let bytes = postcard::to_allocvec(&artifact)
+                .map_err(|e| anyhow::anyhow!("failed to encode postcard artifact: {e}"))?;
+            fs::write(&out_path, bytes)
+                .with_context(|| format!("failed to write map artifact to {}", out_path.display()))?;
+        }
+        println!(
+            "{} {}x{} (cell_size={}), hash=0x{:016x}, saved to {}",
+            "✔ Map generated successfully:".green().bold(),
+            w, h, cs, hash, out_path.display()
+        );
+    } else {
+        println!(
+            "{} {}x{} (cell_size={}), hash=0x{:016x}",
+            "✔ Map generated successfully:".green().bold(),
+            w, h, cs, hash
+        );
+    }
+
+    Ok(())
+}
+
+async fn map_apply_command(
+    client: &Client,
+    base_url: &str,
+    file: PathBuf,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
+    let bytes = fs::read(&file)
+        .with_context(|| format!("failed to read map file {}", file.display()))?;
+    let artifact: scriptbots_core::MapArtifact = if let Ok(art) = postcard::from_bytes(&bytes) {
+        art
+    } else if let Ok(art) = serde_json::from_slice(&bytes) {
+        art
+    } else {
+        bail!("file {} is neither a valid postcard nor JSON MapArtifact", file.display());
+    };
+
+    let artifact_val = serde_json::to_value(&artifact)
+        .context("failed to serialize MapArtifact to JSON value")?;
+
+    let body = serde_json::json!({
+        "artifact": artifact_val,
+        "idempotency_key": idempotency_key,
+    });
+
+    let url = join_url(base_url, "/api/v1/map/apply");
+    let mut req = client.post(url).json(&body);
+    if let Some(key) = idempotency_key {
+        req = req.header("Idempotency-Key", key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .context("failed to send map apply request")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        bail!("map apply failed ({status}): {text}");
+    }
+
+    let resp_status: scriptbots_app::CommandStatusDto = response
+        .json()
+        .await
+        .context("failed to parse command status response")?;
+
+    println!(
+        "{} id={}, app_state={}, journal_state={}, control_rev={}, scientific_rev={}",
+        "✔ Map apply command submitted:".green().bold(),
+        resp_status.command_id,
+        resp_status.application_state,
+        resp_status.journal_state,
+        resp_status.control_revision,
+        resp_status.scientific_revision
+    );
+
     Ok(())
 }
 

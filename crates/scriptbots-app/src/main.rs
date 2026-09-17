@@ -29,8 +29,9 @@ use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_p
 #[cfg(test)]
 use scriptbots_brain::{AssemblyBrain, DwraonBrain, MlpBrain};
 use scriptbots_core::{
-    LEGACY_RENDER_ENV_NAMES, NeuroflowActivationKind, NullPersistence, PersistenceAdmissionSession,
-    RenderQuality, RenderTonemapMode, ReplayEventKind, ReplayInteractionKind, ScriptBotsConfig,
+    default_tileset_spec, LEGACY_RENDER_ENV_NAMES, MapArtifact, NeuroflowActivationKind,
+    NullPersistence, PersistenceAdmissionSession, RenderQuality, RenderTonemapMode,
+    ReplayEventKind, ReplayInteractionKind, RuleBasedMapGenerator, ScriptBotsConfig,
     TickSummary, WorldDigestV1, WorldPersistence, WorldState, map_legacy_render_env,
     parse_render_quality,
 };
@@ -189,6 +190,16 @@ fn main() -> Result<()> {
         } else {
             std::process::exit(1);
         }
+    }
+
+    if let Some(AppSubcommand::MapGenerate(ref gen_args)) = cli.subcommand {
+        run_map_generate(gen_args)?;
+        return Ok(());
+    }
+
+    if let Some(AppSubcommand::MapApply(ref apply_args)) = cli.subcommand {
+        run_map_apply(apply_args)?;
+        return Ok(());
     }
 
     if let Some(ref db_path) = cli.report_archipelago {
@@ -2683,6 +2694,100 @@ enum AppSubcommand {
     ReportArchipelago(ReportArchipelagoArgs),
     /// Re-execute and compare a retained same-build matched-seed notebook.
     LabReproduce(scriptbots_app::lab::reproduction::ReproduceArgs),
+    /// Generate a procedural map sandbox artifact offline.
+    MapGenerate(MapGenerateArgs),
+    /// Inspect and validate a procedural map artifact file.
+    MapApply(MapApplyArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+pub struct MapGenerateArgs {
+    /// Grid width in cells.
+    #[arg(long, default_value_t = 100)]
+    pub width: u32,
+    /// Grid height in cells.
+    #[arg(long, default_value_t = 100)]
+    pub height: u32,
+    /// Cell size in world units.
+    #[arg(long, default_value_t = 50)]
+    pub cell_size: u32,
+    /// Random seed for deterministic generation.
+    #[arg(long)]
+    pub seed: Option<u64>,
+    /// Optional declarative tileset specification JSON file.
+    #[arg(long)]
+    pub tileset: Option<PathBuf>,
+    /// Output file path to save the generated map artifact.
+    #[arg(long, short)]
+    pub out: PathBuf,
+}
+
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+pub struct MapApplyArgs {
+    /// Path to map artifact file to inspect and validate.
+    #[arg(long, short)]
+    pub file: PathBuf,
+}
+
+fn run_map_generate(args: &MapGenerateArgs) -> Result<()> {
+    let spec = if let Some(ref path) = args.tileset {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read tileset file {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| "failed to parse tileset JSON")?
+    } else {
+        default_tileset_spec()
+    };
+    let generator = RuleBasedMapGenerator::new(spec)
+        .map_err(|e| anyhow!("failed to compile tileset: {e}"))?;
+    let seed = args.seed.unwrap_or(0x5a4f_4d41);
+    let artifact = generator
+        .generate(args.width, args.height, args.cell_size, seed)
+        .map_err(|e| anyhow!("failed to generate map: {e}"))?;
+
+    let is_json = args.out.extension().and_then(|ext| ext.to_str()) == Some("json");
+    if is_json {
+        let json_str = serde_json::to_string_pretty(&artifact)
+            .context("failed to serialize MapArtifact to JSON")?;
+        fs::write(&args.out, json_str)
+            .with_context(|| format!("failed to write map artifact to {}", args.out.display()))?;
+    } else {
+        let bytes = postcard::to_allocvec(&artifact)
+            .map_err(|e| anyhow!("failed to serialize MapArtifact to postcard: {e}"))?;
+        fs::write(&args.out, bytes)
+            .with_context(|| format!("failed to write map artifact to {}", args.out.display()))?;
+    }
+    println!(
+        "Map generated successfully: {}x{} (cell_size={}), hash=0x{:016x}, saved to {}",
+        args.width,
+        args.height,
+        args.cell_size,
+        artifact.scientific_content_hash(),
+        args.out.display()
+    );
+    Ok(())
+}
+
+fn run_map_apply(args: &MapApplyArgs) -> Result<()> {
+    let bytes = fs::read(&args.file)
+        .with_context(|| format!("failed to read map artifact file {}", args.file.display()))?;
+    let artifact: MapArtifact = if let Ok(art) = postcard::from_bytes(&bytes) {
+        art
+    } else if let Ok(art) = serde_json::from_slice(&bytes) {
+        art
+    } else {
+        bail!("file {} is neither a valid postcard nor JSON MapArtifact", args.file.display());
+    };
+    artifact.validate().map_err(|e| anyhow!("invalid map artifact: {e}"))?;
+    println!(
+        "Map artifact verified: {}x{} (cell_size={}), tileset='{}', hash=0x{:016x}",
+        artifact.terrain().width(),
+        artifact.terrain().height(),
+        artifact.terrain().cell_size(),
+        artifact.metadata().tileset_id,
+        artifact.scientific_content_hash()
+    );
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
