@@ -835,6 +835,14 @@ For an interactive run, ScriptBots parses the control environment and transactio
     `POST /api/control/step`, `POST /api/control/speed`, `POST /api/control/shutdown`,
     and `GET /api/control/status/{command_id}`
 
+`GET /api/status` and MCP `get_status` report one immutable owner publication:
+`paused`, `lifecycle`, tagged `health` (including blocker/fault detail),
+`last_applied_command`, `command_queue_depth`, and `snapshot_revision`, alongside
+tick, population, closed-world mode, and configuration revision. These are observed
+states, not queued intentions. A busy owner may leave the last publication unchanged;
+an applied command identity does not establish journal durability. Use the two-axis
+command status endpoint for that command's independent journal outcome.
+
 Every route above is registered in the published OpenAPI document, so `/docs` and
 `/api-docs/openapi.json` are the authoritative, machine-readable version of this list.
 

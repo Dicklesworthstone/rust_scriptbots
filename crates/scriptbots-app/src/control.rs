@@ -47,18 +47,20 @@ pub struct SimulationStatusDto {
     pub agent_count: usize,
     pub is_closed: bool,
     pub config_revision: u64,
-}
-
-impl SimulationStatusDto {
-    #[cfg(test)]
-    fn from_world(world: &WorldState) -> Self {
-        Self {
-            tick: world.tick().0,
-            agent_count: world.agent_count(),
-            is_closed: world.is_closed(),
-            config_revision: world.config_revision(),
-        }
-    }
+    /// Automatic ticking state observed at this publication, not a queued request.
+    pub paused: bool,
+    /// Owner lifecycle; stopping does not establish completed shutdown.
+    #[schema(value_type = String)]
+    pub lifecycle: scriptbots_runtime::HostLifecycle,
+    /// Exact owner blocker or fault, independent of storage durability.
+    #[schema(value_type = Object)]
+    pub health: scriptbots_runtime::HostHealth,
+    /// Most recently applied command; application does not prove journal durability.
+    pub last_applied_command: Option<String>,
+    /// Admitted commands still waiting at the observed owner boundary.
+    pub command_queue_depth: usize,
+    /// Publication identity for detecting stale observations while science is paused.
+    pub snapshot_revision: u64,
 }
 
 /// Snapshot describing the current hydrology state.
@@ -392,6 +394,12 @@ impl ControlHandle {
             agent_count: snapshot.world.agents.len(),
             is_closed: snapshot.config.closed,
             config_revision: snapshot.revisions.config.get(),
+            paused: snapshot.playback.paused,
+            lifecycle: snapshot.lifecycle,
+            health: snapshot.health.clone(),
+            last_applied_command: snapshot.last_applied_command.map(|id| id.to_string()),
+            command_queue_depth: snapshot.command_queue_depth,
+            snapshot_revision: snapshot.revision.get(),
         })
     }
 
@@ -1370,15 +1378,14 @@ pub(crate) mod tests {
         let mut config = world.config().clone();
         config.closed = false;
         world.apply_config_update(config).expect("first revision");
-        let expected = SimulationStatusDto {
-            tick: 1,
-            agent_count: 1,
-            is_closed: false,
-            config_revision: 1,
-        };
-        assert_eq!(SimulationStatusDto::from_world(&world), expected);
         let host = TestHost::spawn(world);
         let handle = host.handle();
+        let expected = handle.status().expect("initial observed status");
+        assert_eq!(expected.tick, 1);
+        assert_eq!(expected.agent_count, 1);
+        assert!(!expected.is_closed);
+        assert_eq!(expected.config_revision, 1);
+        assert!(expected.paused);
         let owner = host.clock_gate.lock().expect("hold owner clock");
         let submitting_handle = handle.clone();
         let update = std::thread::spawn(move || {
@@ -1404,6 +1411,42 @@ pub(crate) mod tests {
             current, expected,
             "the projection must refresh after the queued change applies"
         );
+    }
+
+    #[test]
+    fn status_reports_observed_playback_and_shutdown() {
+        let (handle, mut host) = handle();
+        let status = serde_json::to_value(handle.status().expect("paused status")).unwrap();
+        assert_eq!(status["paused"], true);
+        assert_eq!(status["lifecycle"], "running");
+        let resumed = handle
+            .submit_control_command(ControlCommand::Resume)
+            .unwrap();
+        host.wait_applied(&resumed);
+        let status = serde_json::to_value(handle.status().expect("running status")).unwrap();
+        assert_eq!(status["paused"], false);
+        assert_eq!(status["health"]["state"], "healthy");
+        let paused = handle
+            .submit_control_command(ControlCommand::Pause)
+            .unwrap();
+        host.wait_applied(&paused);
+        assert_eq!(
+            serde_json::to_value(handle.status().unwrap()).unwrap()["paused"],
+            true
+        );
+        host.port
+            .submit(CommandEnvelope::new(
+                CommandId::new(u128::MAX - 2),
+                HostCommand::Shutdown,
+            ))
+            .expect("shutdown admitted");
+        host.worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("shutdown completed");
+        let status = serde_json::to_value(handle.status().expect("terminal status")).unwrap();
+        assert_eq!(status["lifecycle"], "stopped");
     }
 
     #[test]
