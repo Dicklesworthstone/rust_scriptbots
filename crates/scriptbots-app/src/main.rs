@@ -29,10 +29,10 @@ use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_p
 #[cfg(test)]
 use scriptbots_brain::{AssemblyBrain, DwraonBrain, MlpBrain};
 use scriptbots_core::{
-    default_tileset_spec, LEGACY_RENDER_ENV_NAMES, MapArtifact, NeuroflowActivationKind,
-    NullPersistence, PersistenceAdmissionSession, RenderQuality, RenderTonemapMode,
-    ReplayEventKind, ReplayInteractionKind, RuleBasedMapGenerator, ScriptBotsConfig,
-    TickSummary, WorldDigestV1, WorldPersistence, WorldState, map_legacy_render_env,
+    LEGACY_RENDER_ENV_NAMES, MapArtifact, NeuroflowActivationKind, NullPersistence,
+    PersistenceAdmissionSession, RenderQuality, RenderTonemapMode, ReplayEventKind,
+    ReplayInteractionKind, RuleBasedMapGenerator, ScriptBotsConfig, TickSummary, WorldDigestV1,
+    WorldPersistence, WorldState, default_tileset_spec, map_legacy_render_env,
     parse_render_quality,
 };
 #[cfg(feature = "gui")]
@@ -2733,13 +2733,12 @@ fn run_map_generate(args: &MapGenerateArgs) -> Result<()> {
     let spec = if let Some(ref path) = args.tileset {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read tileset file {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| "failed to parse tileset JSON")?
+        serde_json::from_str(&content).with_context(|| "failed to parse tileset JSON")?
     } else {
         default_tileset_spec()
     };
-    let generator = RuleBasedMapGenerator::new(spec)
-        .map_err(|e| anyhow!("failed to compile tileset: {e}"))?;
+    let generator =
+        RuleBasedMapGenerator::new(spec).map_err(|e| anyhow!("failed to compile tileset: {e}"))?;
     let seed = args.seed.unwrap_or(0x5a4f_4d41);
     let artifact = generator
         .generate(args.width, args.height, args.cell_size, seed)
@@ -2776,9 +2775,14 @@ fn run_map_apply(args: &MapApplyArgs) -> Result<()> {
     } else if let Ok(art) = serde_json::from_slice(&bytes) {
         art
     } else {
-        bail!("file {} is neither a valid postcard nor JSON MapArtifact", args.file.display());
+        bail!(
+            "file {} is neither a valid postcard nor JSON MapArtifact",
+            args.file.display()
+        );
     };
-    artifact.validate().map_err(|e| anyhow!("invalid map artifact: {e}"))?;
+    artifact
+        .validate()
+        .map_err(|e| anyhow!("invalid map artifact: {e}"))?;
     println!(
         "Map artifact verified: {}x{} (cell_size={}), tileset='{}', hash=0x{:016x}",
         artifact.terrain().width(),

@@ -18326,7 +18326,9 @@ mod map_sandbox {
         fn map_temperature_field_application_and_sensor_evaluation() {
             let spec = default_tileset_spec();
             let generator = RuleBasedMapGenerator::new(spec).expect("compile generator");
-            let artifact = generator.generate(8, 8, 16, 42).expect("generate map artifact");
+            let artifact = generator
+                .generate(8, 8, 16, 42)
+                .expect("generate map artifact");
 
             let mut world = super::super::WorldState::new(super::super::ScriptBotsConfig {
                 world_width: 128,
@@ -18366,18 +18368,13 @@ mod map_sandbox {
             assert_eq!(sampled_temp, expected_temp);
             // The map's scalar field differs from the 1D default fallback
             assert!(
-                (sampled_temp - fallback_temp).abs() > 1e-4
-                    || expected_temp == fallback_temp,
+                (sampled_temp - fallback_temp).abs() > 1e-4 || expected_temp == fallback_temp,
                 "sampled temperature should come from scalar field"
             );
 
             // Dimension mismatch rejection
-            let bad_artifact = generator
-                .generate(16, 16, 16, 42)
-                .expect("16x16 artifact");
-            let baseline_digest = world
-                .characterization_digest_v0()
-                .expect("baseline digest");
+            let bad_artifact = generator.generate(16, 16, 16, 42).expect("16x16 artifact");
+            let baseline_digest = world.characterization_digest_v0().expect("baseline digest");
             let err = world
                 .apply_map_artifact(&bad_artifact)
                 .expect_err("dimension mismatch must fail");
@@ -18397,9 +18394,9 @@ mod map_sandbox {
 }
 
 pub use map_sandbox::{
-    default_tileset_spec, AdjacencySpec, HydrologyField, HydrologyFlowDirection, HydrologyTile,
-    HydrologyTileLayer, MapArtifact, MapArtifactMetadata, MapGenerationError, MapGeneratorKind,
-    RuleBasedMapGenerator, ScalarField, TileSpec, TilesetSpec,
+    AdjacencySpec, HydrologyField, HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer,
+    MapArtifact, MapArtifactMetadata, MapGenerationError, MapGeneratorKind, RuleBasedMapGenerator,
+    ScalarField, TileSpec, TilesetSpec, default_tileset_spec,
 };
 
 /// Runtime hydrology state tracked by the world.

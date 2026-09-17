@@ -35,10 +35,10 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::ScenarioIdentityV0;
 use crate::command::CommandSubmit;
 use crate::control::{
-    parse_map_artifact, AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError,
-    ControlHandle, DietClassDto, EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate,
-    MapApplyRequestBody, MapGenerateRequestBody, Scoreboard, SelectionModeDto, SelectionStateDto,
-    SimulationStatusDto, SpeedRequest,
+    AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, DietClassDto,
+    EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, MapApplyRequestBody,
+    MapGenerateRequestBody, Scoreboard, SelectionModeDto, SelectionStateDto, SimulationStatusDto,
+    SpeedRequest, parse_map_artifact,
 };
 use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
 use scriptbots_runtime::channel::ChannelHostPort;
@@ -1955,25 +1955,34 @@ async fn post_map_generate(
         })?
     };
 
-    let tileset: Option<scriptbots_core::TilesetSpec> = if let Some(v) = req.tileset {
-        Some(serde_json::from_value(v).map_err(|e| {
-            AppError::bad_request(format!("invalid tileset specification: {e}"))
-        })?)
-    } else {
-        None
-    };
+    let tileset: Option<scriptbots_core::TilesetSpec> =
+        if let Some(v) = req.tileset {
+            Some(serde_json::from_value(v).map_err(|e| {
+                AppError::bad_request(format!("invalid tileset specification: {e}"))
+            })?)
+        } else {
+            None
+        };
 
     let artifact = run_control(move || {
         let (def_w, def_h, def_cell) = state
             .handle
             .read_snapshot()
-            .map(|s| (s.layers.terrain.width, s.layers.terrain.height, s.layers.terrain.cell_size))
+            .map(|s| {
+                (
+                    s.layers.terrain.width,
+                    s.layers.terrain.height,
+                    s.layers.terrain.cell_size,
+                )
+            })
             .unwrap_or((100, 100, 50));
         let width = req.width.unwrap_or(def_w);
         let height = req.height.unwrap_or(def_h);
         let cell_size = req.cell_size.or(Some(def_cell));
         let seed = req.seed.unwrap_or(0x5a4f_4d41);
-        state.handle.generate_map(width, height, cell_size, seed, tileset)
+        state
+            .handle
+            .generate_map(width, height, cell_size, seed, tileset)
     })
     .await?;
 
@@ -1996,10 +2005,7 @@ async fn post_map_apply(
     let key = idempotency_key(&headers).or(payload.idempotency_key);
     let artifact = parse_map_artifact(&payload.artifact)?;
 
-    let status = run_control(move || {
-        state.handle.apply_map(artifact, key.as_deref())
-    })
-    .await?;
+    let status = run_control(move || state.handle.apply_map(artifact, key.as_deref())).await?;
 
     Ok(Json(status))
 }
@@ -2759,10 +2765,22 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::MapGenerate => {
-                let width = arguments.get("width").and_then(Value::as_u64).map(|v| v as u32);
-                let height = arguments.get("height").and_then(Value::as_u64).map(|v| v as u32);
-                let cell_size = arguments.get("cell_size").and_then(Value::as_u64).map(|v| v as u32);
-                let seed = arguments.get("seed").and_then(Value::as_u64).unwrap_or(0x5a4f_4d41);
+                let width = arguments
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32);
+                let height = arguments
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32);
+                let cell_size = arguments
+                    .get("cell_size")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32);
+                let seed = arguments
+                    .get("seed")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0x5a4f_4d41);
                 let tileset = arguments
                     .get("tileset")
                     .cloned()
@@ -2771,7 +2789,13 @@ impl ToolHandler for ControlTool {
                 let artifact = run_control_mcp_sync(move || {
                     let (def_w, def_h, def_cell) = handle
                         .read_snapshot()
-                        .map(|s| (s.layers.terrain.width, s.layers.terrain.height, s.layers.terrain.cell_size))
+                        .map(|s| {
+                            (
+                                s.layers.terrain.width,
+                                s.layers.terrain.height,
+                                s.layers.terrain.cell_size,
+                            )
+                        })
                         .unwrap_or((100, 100, 50));
                     let width = width.unwrap_or(def_w);
                     let height = height.unwrap_or(def_h);
@@ -2780,15 +2804,19 @@ impl ToolHandler for ControlTool {
                 make_tool_result(artifact)
             }
             ControlToolKind::MapApply => {
-                let artifact_val = arguments
-                    .get("artifact")
-                    .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "missing 'artifact' parameter"))?;
+                let artifact_val = arguments.get("artifact").ok_or_else(|| {
+                    McpError::new(McpErrorCode::InvalidParams, "missing 'artifact' parameter")
+                })?;
                 let artifact = parse_map_artifact(artifact_val).map_err(|e| {
-                    McpError::new(McpErrorCode::InvalidParams, format!("invalid map artifact: {e}"))
+                    McpError::new(
+                        McpErrorCode::InvalidParams,
+                        format!("invalid map artifact: {e}"),
+                    )
                 })?;
                 let key = mcp_idempotency_key(&arguments);
                 let handle = self.handle.clone();
-                let status = run_control_mcp_sync(move || handle.apply_map(artifact, key.as_deref()))?;
+                let status =
+                    run_control_mcp_sync(move || handle.apply_map(artifact, key.as_deref()))?;
                 make_tool_result(status)
             }
         }

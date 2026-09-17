@@ -1911,11 +1911,13 @@ impl HostCommand {
                     message: "crossover parents must be distinct".to_owned(),
                 })
             }
-            Self::ApplyMap(artifact) => artifact
-                .validate()
-                .map_err(|error| CommandValidationError::InvalidWorldCommand {
-                    message: error.to_string(),
-                }),
+            Self::ApplyMap(artifact) => {
+                artifact
+                    .validate()
+                    .map_err(|error| CommandValidationError::InvalidWorldCommand {
+                        message: error.to_string(),
+                    })
+            }
             _ => Ok(()),
         }
     }

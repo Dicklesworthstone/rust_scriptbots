@@ -11,9 +11,9 @@ use std::fs;
 use std::path::Path;
 
 use scriptbots_core::{
-    default_tileset_spec, AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass,
-    HydrologyFlowDirection, MapArtifact, RuleBasedMapGenerator, ScriptBotsConfig, SelectionMode,
-    SelectionState, SelectionUpdate, TerrainKind, Tick, TilesetSpec, WorldState,
+    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
+    MapArtifact, RuleBasedMapGenerator, ScriptBotsConfig, SelectionMode, SelectionState,
+    SelectionUpdate, TerrainKind, Tick, TilesetSpec, WorldState, default_tileset_spec,
 };
 
 use scriptbots_core::ConfigAuditEntry;
@@ -310,8 +310,9 @@ pub fn parse_map_artifact(value: &Value) -> Result<MapArtifact, ControlError> {
         Value::String(s) => {
             let path = Path::new(s);
             if path.exists() {
-                let bytes = fs::read(path)
-                    .map_err(|e| ControlError::InvalidPatch(format!("failed to read map file: {e}")))?;
+                let bytes = fs::read(path).map_err(|e| {
+                    ControlError::InvalidPatch(format!("failed to read map file: {e}"))
+                })?;
                 if let Ok(artifact) = postcard::from_bytes::<MapArtifact>(&bytes) {
                     return Ok(artifact);
                 }
@@ -331,7 +332,8 @@ pub fn parse_map_artifact(value: &Value) -> Result<MapArtifact, ControlError> {
                 }
             }
             Err(ControlError::InvalidPatch(
-                "invalid map artifact string: not a valid file path, JSON string, or hex postcard".into(),
+                "invalid map artifact string: not a valid file path, JSON string, or hex postcard"
+                    .into(),
             ))
         }
         _ => Err(ControlError::InvalidPatch(

@@ -395,10 +395,16 @@ fn persisted_inputs_reproduce_all_detector_evidence_and_bridge() {
     let path = test_path("detector_inputs");
     let path_str = path.to_str().expect("utf8 path");
     let manifest = RunManifestRecord::unattributed(RunId::new(0x0BD1_0211));
+    let started = std::time::Instant::now();
+    eprintln!("[storage-diagnostic] phase=open event=start path={path_str}");
     let mut pipeline = StoragePipeline::create_new_file_for_run_with_thresholds(
         path_str, manifest, 64, 64, 64, 64,
     )
     .expect("metric pipeline opens");
+    eprintln!(
+        "[storage-diagnostic] phase=open event=complete elapsed={:?}",
+        started.elapsed()
+    );
     for sample in &original {
         let payload = PersistenceBatch {
             summary: TickSummary {
@@ -423,11 +429,33 @@ fn persisted_inputs_reproduce_all_detector_evidence_and_bridge() {
             narrative_events: Vec::new(),
             genomes: Vec::new(),
         };
+        eprintln!(
+            "[storage-diagnostic] phase=admit event=start tick={} elapsed={:?}",
+            sample.tick,
+            started.elapsed()
+        );
         pipeline.submit(&payload).expect("metric input admitted");
+        eprintln!(
+            "[storage-diagnostic] phase=admit event=complete tick={} elapsed={:?}",
+            sample.tick,
+            started.elapsed()
+        );
     }
+    eprintln!(
+        "[storage-diagnostic] phase=shutdown event=start elapsed={:?}",
+        started.elapsed()
+    );
     pipeline
         .shutdown()
         .expect("all metric inputs durable and writer closed");
+    eprintln!(
+        "[storage-diagnostic] phase=shutdown event=complete elapsed={:?}",
+        started.elapsed()
+    );
+    eprintln!(
+        "[storage-diagnostic] phase=readback event=start elapsed={:?}",
+        started.elapsed()
+    );
     let reader = StorageReader::open(path_str).expect("independent metric reader opens");
     let rows = reader
         .recent_metrics(original.len() + 1)
@@ -446,6 +474,11 @@ fn persisted_inputs_reproduce_all_detector_evidence_and_bridge() {
             "first differing persisted input at row {index}"
         );
     }
+    eprintln!(
+        "[storage-diagnostic] phase=readback event=verified rows={} elapsed={:?}",
+        rows.len(),
+        started.elapsed()
+    );
     let recovered: Vec<_> = rows
         .into_iter()
         .map(|row| Sample::new(row.tick, row.value))
@@ -454,6 +487,10 @@ fn persisted_inputs_reproduce_all_detector_evidence_and_bridge() {
     // Fixed complete windows: chunking changes assembly, never the detector's input window.
     // In particular, a partial bimodality assessment is not compared to the full-set verdict.
     for end in [200, 300] {
+        eprintln!(
+            "[storage-diagnostic] phase=evidence event=start window={end} elapsed={:?}",
+            started.elapsed()
+        );
         let (memory_evidence, expected) = detector_window("in_memory", &original[..end]);
         let (recovered_evidence, actual) = detector_window("recovered", &recovered[..end]);
         for kind in [
@@ -557,5 +594,9 @@ fn persisted_inputs_reproduce_all_detector_evidence_and_bridge() {
         let mut truncated = expected.clone();
         truncated.pop();
         compare_evidence("negative_truncated_evidence", &expected, &truncated, false);
+        eprintln!(
+            "[storage-diagnostic] phase=evidence event=verified window={end} elapsed={:?}",
+            started.elapsed()
+        );
     }
 }

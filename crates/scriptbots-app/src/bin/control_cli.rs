@@ -1149,32 +1149,40 @@ async fn map_generate_command(
 
     if let Some(out_path) = out {
         if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create directory {}", parent.display())
-            })?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
         let is_json = out_path.extension().and_then(|ext| ext.to_str()) == Some("json");
         if is_json {
-            let json_str = serde_json::to_string_pretty(&artifact_json)
-                .context("failed to format JSON")?;
-            fs::write(&out_path, json_str)
-                .with_context(|| format!("failed to write map artifact to {}", out_path.display()))?;
+            let json_str =
+                serde_json::to_string_pretty(&artifact_json).context("failed to format JSON")?;
+            fs::write(&out_path, json_str).with_context(|| {
+                format!("failed to write map artifact to {}", out_path.display())
+            })?;
         } else {
             let bytes = postcard::to_allocvec(&artifact)
                 .map_err(|e| anyhow::anyhow!("failed to encode postcard artifact: {e}"))?;
-            fs::write(&out_path, bytes)
-                .with_context(|| format!("failed to write map artifact to {}", out_path.display()))?;
+            fs::write(&out_path, bytes).with_context(|| {
+                format!("failed to write map artifact to {}", out_path.display())
+            })?;
         }
         println!(
             "{} {}x{} (cell_size={}), hash=0x{:016x}, saved to {}",
             "✔ Map generated successfully:".green().bold(),
-            w, h, cs, hash, out_path.display()
+            w,
+            h,
+            cs,
+            hash,
+            out_path.display()
         );
     } else {
         println!(
             "{} {}x{} (cell_size={}), hash=0x{:016x}",
             "✔ Map generated successfully:".green().bold(),
-            w, h, cs, hash
+            w,
+            h,
+            cs,
+            hash
         );
     }
 
@@ -1187,18 +1195,21 @@ async fn map_apply_command(
     file: PathBuf,
     idempotency_key: Option<&str>,
 ) -> Result<()> {
-    let bytes = fs::read(&file)
-        .with_context(|| format!("failed to read map file {}", file.display()))?;
+    let bytes =
+        fs::read(&file).with_context(|| format!("failed to read map file {}", file.display()))?;
     let artifact: scriptbots_core::MapArtifact = if let Ok(art) = postcard::from_bytes(&bytes) {
         art
     } else if let Ok(art) = serde_json::from_slice(&bytes) {
         art
     } else {
-        bail!("file {} is neither a valid postcard nor JSON MapArtifact", file.display());
+        bail!(
+            "file {} is neither a valid postcard nor JSON MapArtifact",
+            file.display()
+        );
     };
 
-    let artifact_val = serde_json::to_value(&artifact)
-        .context("failed to serialize MapArtifact to JSON value")?;
+    let artifact_val =
+        serde_json::to_value(&artifact).context("failed to serialize MapArtifact to JSON value")?;
 
     let body = serde_json::json!({
         "artifact": artifact_val,

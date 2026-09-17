@@ -4899,8 +4899,8 @@ mod tests {
         ActivationLayer, AgentData, AgentUid, BrainActivations, BrainInspection,
         BrainInspectionLimits, BrainInspectionSnapshot, BrainRunner, BrainSpawnError, Generation,
         HydrologyField, HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer, INPUT_SIZE,
-        MapArtifact, MapArtifactMetadata, MapGeneratorKind, OUTPUT_SIZE, Position,
-        ScalarField, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainLayer, Velocity,
+        MapArtifact, MapArtifactMetadata, MapGeneratorKind, OUTPUT_SIZE, Position, ScalarField,
+        ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainLayer, Velocity,
         bound_brain_inspection,
     };
     use std::{hint::black_box, sync::Mutex, time::Instant};
@@ -10907,7 +10907,10 @@ mod tests {
         let (mut core, mut port) = host(true);
         let initial_snapshot = core.latest_snapshot();
         assert_eq!(initial_snapshot.revisions.control, ControlRevision::new(0));
-        assert_eq!(initial_snapshot.revisions.scientific, ScientificRevision::new(0));
+        assert_eq!(
+            initial_snapshot.revisions.scientific,
+            ScientificRevision::new(0)
+        );
         assert!(core.world().temperature().is_none());
 
         let (_base_map, original_map, _) = snapshot_map_artifacts(core.world());
@@ -10937,7 +10940,10 @@ mod tests {
             .command_status(CommandId::new(1))
             .expect("status query")
             .expect("status exists");
-        assert!(matches!(updated_status.application(), ApplicationState::Applied(_)));
+        assert!(matches!(
+            updated_status.application(),
+            ApplicationState::Applied(_)
+        ));
 
         let latest = core.latest_snapshot();
         assert_eq!(latest.revisions.control, ControlRevision::new(1));
@@ -10945,7 +10951,9 @@ mod tests {
         assert!(latest.layers.revisions.terrain > initial_terrain_rev);
 
         assert!(core.world().temperature().is_some());
-        let sampled = core.world().sample_temperature_at(Position { x: 5.0, y: 5.0 });
+        let sampled = core
+            .world()
+            .sample_temperature_at(Position { x: 5.0, y: 5.0 });
         assert!((sampled - 0.75).abs() < 1e-5);
     }
 
