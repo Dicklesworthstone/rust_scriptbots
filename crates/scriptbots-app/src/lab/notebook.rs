@@ -303,6 +303,10 @@ fn markdown_literal(field: &'static str, value: &str) -> Result<String, Notebook
 
 fn validate_session_id(session_id: &str) -> Result<(), NotebookRenderError> {
     let bytes = session_id.as_bytes();
+    // These names are directory components, not run identities.
+    if matches!(session_id, "." | "..") {
+        return Err(NotebookRenderError::InvalidSessionId);
+    }
     if bytes.is_empty()
         || bytes.len() > 128
         || !bytes
@@ -655,7 +659,7 @@ impl NotebookRenderer {
                 layer.insert(key.clone(), value.clone());
             }
             layer.insert("rng_seed".to_owned(), serde_json::json!(run.seed));
-            let layer_json = serde_json::to_string(&serde_json::Value::Object(layer))
+            let layer_toml = toml::to_string(&serde_json::Value::Object(layer))
                 .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
 
             let safe_name = run
@@ -665,9 +669,9 @@ impl NotebookRenderer {
                 .collect::<String>();
             script.push_str("cfg=\"$work/");
             script.push_str(&safe_name);
-            script.push_str(".json\"\n");
+            script.push_str(".toml\"\n");
             script.push_str("printf '%s' ");
-            script.push_str(&shell_single_quote(&layer_json));
+            script.push_str(&shell_single_quote(&layer_toml));
             script.push_str(" > \"$cfg\"\n");
 
             script.push_str("out=\"$(SCRIPTBOTS_DET_RUN=1 SCRIPTBOTS_DET_TICKS=");
@@ -1352,6 +1356,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         for unsafe_id in [
             "",
+            ".",
+            "..",
+            "../escape",
             "session\nprintf PWNED",
             "session;printf-PWNED",
             "session/path",
