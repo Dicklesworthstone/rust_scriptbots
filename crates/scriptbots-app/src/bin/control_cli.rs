@@ -1094,6 +1094,7 @@ async fn lookup_status_command(client: &Client, base_url: &str, id: &str) -> Res
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn map_generate_command(
     client: &Client,
     base_url: &str,

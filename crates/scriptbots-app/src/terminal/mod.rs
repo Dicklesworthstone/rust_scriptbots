@@ -8584,8 +8584,10 @@ mod tests {
     #[test]
     fn event_pulse_ring_renders_on_canvas_and_stills_under_reduced_motion() {
         let land = canvas_test_terrain();
-        let mut empty_snapshot = Snapshot::default();
-        empty_snapshot.tick = 10;
+        let empty_snapshot = Snapshot {
+            tick: 10,
+            ..Default::default()
+        };
         let empty_frame = render_canvas_frame_motion(
             &empty_snapshot,
             &land,
@@ -8594,14 +8596,16 @@ mod tests {
             MotionPolicy::Full,
         );
 
-        let mut ring_snapshot = Snapshot::default();
-        ring_snapshot.tick = 10;
-        ring_snapshot.event_rings = vec![EventPulseRing {
-            x: 0.5,
-            y: 0.5,
-            radius: 2.0,
-            intensity: 1.0,
-        }];
+        let ring_snapshot = Snapshot {
+            tick: 10,
+            event_rings: vec![EventPulseRing {
+                x: 0.5,
+                y: 0.5,
+                radius: 2.0,
+                intensity: 1.0,
+            }],
+            ..Default::default()
+        };
 
         let active_frame =
             render_canvas_frame_motion(&ring_snapshot, &land, (8, 4), (0, 0.0), MotionPolicy::Full);
