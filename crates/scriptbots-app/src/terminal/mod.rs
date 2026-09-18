@@ -2821,11 +2821,7 @@ impl<'a> TerminalApp<'a> {
             Block::default()
                 .title(self.palette.title("Help — controls & legend"))
                 .borders(Borders::ALL)
-                .style(if self.palette.has_color() {
-                    Style::default().bg(Color::Black).fg(Color::White)
-                } else {
-                    Style::default()
-                }),
+                .style(self.palette.help_style()),
         );
         frame.render_widget(paragraph, area);
     }
@@ -6062,6 +6058,8 @@ struct TerminalTheme {
     paused_bg: Color,
     running_fg: Color,
     running_bg: Color,
+    surface: Color,
+    text: Color,
     diet: [Color; 3],
     event: [Color; 4],
     population_spark: Color,
@@ -6205,6 +6203,8 @@ impl Palette {
                 paused_bg: srgb_color(carn),
                 running_fg: srgb_color(visual::BIOLUMINESCENT_DARK_FIELD_V1.substrate.abyss_srgb),
                 running_bg: srgb_color(food),
+                surface: srgb_color(visual::BIOLUMINESCENT_DARK_FIELD_V1.substrate.abyss_srgb),
+                text: rgb(0xf8fafc),
                 diet: [srgb_color(herb), srgb_color(omni), srgb_color(carn)],
                 event: [
                     srgb_color(food),
@@ -6243,6 +6243,8 @@ impl Palette {
                 paused_bg: rgb(0xf97316),
                 running_fg: rgb(0x0f172a),
                 running_bg: rgb(0x22c55e),
+                surface: rgb(0x0f172a),
+                text: rgb(0xf8fafc),
                 diet: [rgb(0x22c55e), rgb(0xfacc15), rgb(0xcb2a3b)],
                 event: [rgb(0x22c55e), rgb(0xf97316), rgb(0xfacc15), rgb(0x60a5fa)],
                 population_spark: rgb(0x22c55e),
@@ -6271,6 +6273,8 @@ impl Palette {
                 paused_bg: rgb(0xfbbf24),
                 running_fg: rgb(0x082f49),
                 running_bg: rgb(0x2dd4bf),
+                surface: rgb(0x082f49),
+                text: rgb(0xf8fafc),
                 diet: [rgb(0x2dd4bf), rgb(0xfbbf24), rgb(0xf87171)],
                 event: [rgb(0x2dd4bf), rgb(0xf87171), rgb(0xfbbf24), rgb(0x60a5fa)],
                 population_spark: rgb(0x2dd4bf),
@@ -6299,6 +6303,8 @@ impl Palette {
                 paused_bg: rgb(0xfbbf24),
                 running_fg: rgb(0x082f49),
                 running_bg: rgb(0x38bdf8),
+                surface: rgb(0x082f49),
+                text: rgb(0xf8fafc),
                 diet: [rgb(0x38bdf8), rgb(0xfbbf24), rgb(0xf472b6)],
                 event: [rgb(0x38bdf8), rgb(0xf472b6), rgb(0xfbbf24), rgb(0x7dd3fc)],
                 population_spark: rgb(0x38bdf8),
@@ -6327,6 +6333,8 @@ impl Palette {
                 paused_bg: rgb(0x22c55e),
                 running_fg: rgb(0x0b1120),
                 running_bg: rgb(0xf97316),
+                surface: rgb(0x0b1120),
+                text: rgb(0xf8fafc),
                 diet: [rgb(0xfb7185), rgb(0xfacc15), rgb(0x6366f1)],
                 event: [rgb(0xfb7185), rgb(0x6366f1), rgb(0xfacc15), rgb(0xf97316)],
                 population_spark: rgb(0xfb7185),
@@ -6355,6 +6363,8 @@ impl Palette {
                 paused_bg: rgb(0xfacc15),
                 running_fg: rgb(0x000000),
                 running_bg: rgb(0xf97316),
+                surface: rgb(0x000000),
+                text: rgb(0xffffff),
                 diet: [rgb(0xffffff), rgb(0xfacc15), rgb(0xff5555)],
                 event: [rgb(0xffffff), rgb(0xff5555), rgb(0xfacc15), rgb(0x38bdf8)],
                 population_spark: rgb(0xffffff),
@@ -6522,6 +6532,15 @@ impl Palette {
             .fg(theme.running_fg)
             .bg(theme.running_bg)
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// Help panel surface and text style (bd-f4x0).
+    ///
+    /// The help panel overlays the simulation view, so its surface must clear the underlying
+    /// cells with the theme's deliberate background and its text must meet WCAG AA contrast.
+    fn help_style(&self) -> Style {
+        let theme = self.theme();
+        Style::default().bg(theme.surface).fg(theme.text)
     }
 
     fn speed_style(&self, speed: f32) -> Style {
@@ -15903,6 +15922,7 @@ mod tests {
                 for (label, fg, bg) in [
                     ("paused status", t.paused_fg, t.paused_bg),
                     ("running status", t.running_fg, t.running_bg),
+                    ("help panel", t.text, t.surface),
                 ] {
                     let ratio = contrast_ratio(fg, bg);
                     if ratio < WCAG_AA_NORMAL_TEXT {
@@ -15979,6 +15999,43 @@ mod tests {
             "black on white must pass the gate, or the threshold rejects everything \
              and the sweep is green for the wrong reason"
         );
+    }
+
+    /// Help panel surface and text must route through theme authority and meet WCAG AA contrast (bd-f4x0).
+    #[test]
+    fn the_help_panel_style_is_derived_from_theme_and_meets_contrast() {
+        for theme_id in [
+            CuratedThemeId::BioluminescentDarkField,
+            CuratedThemeId::CyberpunkAurora,
+            CuratedThemeId::Darcula,
+            CuratedThemeId::LumenLight,
+            CuratedThemeId::NordicFrost,
+            CuratedThemeId::HighContrast,
+        ] {
+            for mode in [
+                TerminalPaletteMode::Natural,
+                TerminalPaletteMode::Deuteranopia,
+                TerminalPaletteMode::Protanopia,
+                TerminalPaletteMode::Tritanopia,
+                TerminalPaletteMode::HighContrast,
+            ] {
+                let mut palette = Palette::test_backend_evidence();
+                palette.theme_id = theme_id;
+                palette.mode = mode;
+
+                let style = palette.help_style();
+                let theme = palette.theme();
+
+                assert_eq!(style.bg, Some(theme.surface));
+                assert_eq!(style.fg, Some(theme.text));
+
+                let ratio = contrast_ratio(theme.text, theme.surface);
+                assert!(
+                    ratio >= WCAG_AA_NORMAL_TEXT,
+                    "theme {theme_id:?}/{mode:?} help panel contrast {ratio:.2}:1 must meet {WCAG_AA_NORMAL_TEXT}:1"
+                );
+            }
+        }
     }
 
     #[test]
