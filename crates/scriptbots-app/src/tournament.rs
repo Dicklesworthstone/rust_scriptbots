@@ -15,6 +15,13 @@ use std::{
 pub use execution::{
     MatchRunReport, enforce_no_config_drift, run_match, run_tournament, run_tournament_with_jobs,
 };
+pub use leaderboard::{
+    ExcludedRunRecord, ExclusionReason, LeaderboardCheckError, LeaderboardPipelineOutcome,
+    TournamentArgs, TournamentResultRow, TournamentSpecFile, check_leaderboard_drift,
+    compute_unified_diff, execute_leaderboard_tournament, filter_eligible_rows,
+    generate_leaderboard_document, reports_to_result_rows, run_tournament_command,
+    save_tournament_artifacts, to_brain_kind,
+};
 pub use rating::{
     AxisRatingOutcome, AxisRatings, BtPrior, FamilyRating, OrderEffectReport, PairwiseComparison,
     PairwiseResult, PairwiseVerdict, RatingAxis, RatingError, RatingOptions, RatingTable,
@@ -158,6 +165,15 @@ pub enum TournamentError {
     DuplicateMatchId { match_id: u64 },
     #[error("configuration layer {path} failed: {reason}")]
     ConfigLayer { path: PathBuf, reason: String },
+    #[error("leaderboard check failed: {0}")]
+    LeaderboardCheck(#[from] leaderboard::LeaderboardCheckError),
+    #[error(
+        "leaderboard reproducibility check failed: rerun results digest {rerun_digest} != {results_digest}"
+    )]
+    LeaderboardReproducibility {
+        rerun_digest: String,
+        results_digest: String,
+    },
     #[error("{reason}")]
     UnbalancedOrders { reason: String },
 }
@@ -709,6 +725,8 @@ pub mod execution {
     pub struct MatchRunReport {
         pub outcome: MatchOutcome,
         pub config_digest: String,
+        pub plan: super::MatchPlan,
+        pub agents_final: BTreeMap<BrainKind, usize>,
     }
 
     fn config_layer_error(path: &Path, reason: impl std::fmt::Display) -> TournamentError {
@@ -1186,6 +1204,8 @@ pub mod execution {
         Ok(MatchRunReport {
             outcome,
             config_digest,
+            plan: plan.clone(),
+            agents_final: family_live,
         })
     }
 
@@ -2672,6 +2692,1375 @@ pub mod rating {
     }
 }
 
+/// CI-regenerated leaderboard, provenance tracking, and drift detection (bd-16g.12.3).
+pub mod leaderboard {
+    use super::{
+        FamilyOutcome, MatchId, MatchOutcome, MatchRunReport, OrderPolicy, RatingAxis,
+        RatingOptions, RatingTable, TournamentError, TournamentSpec,
+        execution::run_tournament_with_jobs, rating::rate_tournament,
+    };
+    use crate::BuildProvenanceV0;
+    use scriptbots_brain::BrainKind;
+    use scriptbots_core::ScriptBotsConfig;
+    use serde::{Deserialize, Serialize};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    fn default_title() -> String {
+        "ScriptBots Canonical Brain-Family Tournament".to_owned()
+    }
+
+    fn default_version() -> String {
+        "1.0.0".to_owned()
+    }
+
+    fn default_order_policy_str() -> String {
+        "balanced_latin_square".to_owned()
+    }
+
+    fn default_sense_backend() -> String {
+        "cpu_simd".to_owned()
+    }
+
+    fn default_sense_determinism() -> String {
+        "exact".to_owned()
+    }
+
+    fn default_true() -> bool {
+        true
+    }
+
+    /// Pinned tournament specification file (`tournament/spec.toml`).
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct TournamentSpecFile {
+        pub tournament: TournamentSpecHeader,
+        #[serde(default)]
+        pub parameters: Option<SpecParameters>,
+        #[serde(default)]
+        pub reproducibility: Option<SpecReproducibility>,
+        #[serde(default)]
+        pub smoke: Option<SmokeSpecConfig>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct TournamentSpecHeader {
+        #[serde(default = "default_title")]
+        pub title: String,
+        #[serde(default = "default_version")]
+        pub version: String,
+        pub families: Vec<String>,
+        pub seeds: Vec<u64>,
+        pub ticks: u64,
+        pub cohort_size: usize,
+        #[serde(default = "default_order_policy_str")]
+        pub order_policy: String,
+        #[serde(default = "default_true")]
+        pub closed: bool,
+        #[serde(default = "default_sense_backend")]
+        pub sense_backend: String,
+        #[serde(default = "default_sense_determinism")]
+        pub sense_determinism: String,
+        #[serde(default = "default_true")]
+        pub reproducible: bool,
+        #[serde(default)]
+        pub config_layers: Vec<PathBuf>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    pub struct SpecParameters {
+        #[serde(default = "default_nodes")]
+        pub nodes_per_family: usize,
+        #[serde(default = "default_true")]
+        pub same_kind_mating_barrier: bool,
+        #[serde(default)]
+        pub interbreeding: bool,
+    }
+
+    fn default_nodes() -> usize {
+        200
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    pub struct SpecReproducibility {
+        #[serde(default = "default_true")]
+        pub require_identical_rerun: bool,
+        #[serde(default = "default_retries")]
+        pub max_retries: usize,
+    }
+
+    fn default_retries() -> usize {
+        1
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    pub struct SmokeSpecConfig {
+        pub families: Vec<String>,
+        pub seeds: Vec<u64>,
+        pub ticks: u64,
+        pub cohort_size: usize,
+        #[serde(default = "default_both_assignments")]
+        pub order_policy: String,
+        #[serde(default = "default_true")]
+        pub closed: bool,
+    }
+
+    fn default_both_assignments() -> String {
+        "both_assignments".to_owned()
+    }
+
+    impl TournamentSpecFile {
+        /// Load spec from a TOML file path.
+        pub fn from_file(path: &Path) -> Result<Self, TournamentError> {
+            let content = fs::read_to_string(path).map_err(|e| TournamentError::ConfigLayer {
+                path: path.to_path_buf(),
+                reason: format!("failed to read spec file: {e}"),
+            })?;
+            Self::from_toml_str(&content)
+        }
+
+        /// Parse spec from TOML string.
+        pub fn from_toml_str(s: &str) -> Result<Self, TournamentError> {
+            toml::from_str(s).map_err(|e| TournamentError::UnbalancedOrders {
+                reason: format!("failed to parse tournament spec TOML: {e}"),
+            })
+        }
+
+        /// Compute canonical Blake3 digest of the spec.
+        #[must_use]
+        pub fn spec_digest(&self) -> String {
+            let canonical = serde_json::to_string(self).unwrap_or_default();
+            blake3::hash(canonical.as_bytes()).to_hex().to_string()
+        }
+
+        /// Parse the order policy string.
+        pub fn parse_order_policy(s: &str) -> Result<OrderPolicy, TournamentError> {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "both_assignments" | "bothassignments" => Ok(OrderPolicy::BothAssignments),
+                "balanced_latin_square" | "balancedlatinsquare" | "latin_square" => {
+                    Ok(OrderPolicy::BalancedLatinSquare)
+                }
+                "all_permutations" | "allpermutations" | "factorial" => {
+                    Ok(OrderPolicy::AllPermutations)
+                }
+                other => Err(TournamentError::UnbalancedOrders {
+                    reason: format!(
+                        "unknown order policy '{other}'; valid: both_assignments, balanced_latin_square, all_permutations"
+                    ),
+                }),
+            }
+        }
+
+        /// Apply command-line overrides (families, seeds, ticks, cohort_size).
+        pub fn apply_cli_overrides(
+            &mut self,
+            families: Option<&str>,
+            seeds: Option<&str>,
+            ticks: Option<u64>,
+            cohort_size: Option<usize>,
+        ) -> Result<(), TournamentError> {
+            if let Some(fams) = families {
+                let fams = fams.trim();
+                if !fams.is_empty() && !fams.eq_ignore_ascii_case("all") {
+                    let parsed: Vec<String> = fams
+                        .split([',', ' ', '\t'])
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect();
+                    if parsed.is_empty() {
+                        return Err(TournamentError::UnbalancedOrders {
+                            reason: "empty families override specified".to_owned(),
+                        });
+                    }
+                    self.tournament.families = parsed.clone();
+                    if let Some(ref mut sm) = self.smoke {
+                        sm.families = parsed;
+                    }
+                }
+            }
+
+            if let Some(seeds_str) = seeds {
+                let seeds_str = seeds_str.trim();
+                if !seeds_str.is_empty() {
+                    let parsed_seeds = if let Ok(count) = seeds_str.parse::<usize>() {
+                        if count == 0 {
+                            return Err(TournamentError::UnbalancedOrders {
+                                reason: "seeds count override must be >= 1".to_owned(),
+                            });
+                        }
+                        if count <= self.tournament.seeds.len() {
+                            self.tournament.seeds[..count].to_vec()
+                        } else {
+                            let start = self.tournament.seeds.first().copied().unwrap_or(101);
+                            (start..start + count as u64).collect()
+                        }
+                    } else {
+                        let parsed: Result<Vec<u64>, _> = seeds_str
+                            .split([',', ' ', '\t'])
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.parse::<u64>())
+                            .collect();
+                        let parsed = parsed.map_err(|e| TournamentError::UnbalancedOrders {
+                            reason: format!("invalid seeds list override: {e}"),
+                        })?;
+                        if parsed.is_empty() {
+                            return Err(TournamentError::UnbalancedOrders {
+                                reason: "empty seeds override specified".to_owned(),
+                            });
+                        }
+                        parsed
+                    };
+                    self.tournament.seeds = parsed_seeds.clone();
+                    if let Some(ref mut sm) = self.smoke {
+                        sm.seeds = parsed_seeds;
+                    }
+                }
+            }
+
+            if let Some(t) = ticks {
+                if t == 0 {
+                    return Err(TournamentError::UnbalancedOrders {
+                        reason: "ticks override must be >= 1".to_owned(),
+                    });
+                }
+                self.tournament.ticks = t;
+                if let Some(ref mut sm) = self.smoke {
+                    sm.ticks = t;
+                }
+            }
+
+            if let Some(c) = cohort_size {
+                if c == 0 {
+                    return Err(TournamentError::UnbalancedOrders {
+                        reason: "cohort-size override must be >= 1".to_owned(),
+                    });
+                }
+                self.tournament.cohort_size = c;
+                if let Some(ref mut sm) = self.smoke {
+                    sm.cohort_size = c;
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Convert full canonical spec to runtime [`TournamentSpec`].
+        pub fn to_spec(&self) -> Result<TournamentSpec, TournamentError> {
+            let families: Vec<BrainKind> = self
+                .tournament
+                .families
+                .iter()
+                .map(|f| to_brain_kind(f))
+                .collect();
+            let order_policy = Self::parse_order_policy(&self.tournament.order_policy)?;
+
+            Ok(TournamentSpec {
+                families,
+                seeds: self.tournament.seeds.clone(),
+                ticks: self.tournament.ticks,
+                cohort_size: self.tournament.cohort_size,
+                order_policy,
+                closed: self.tournament.closed,
+                config_layers: self.tournament.config_layers.clone(),
+            })
+        }
+
+        /// Convert smoke spec configuration to runtime [`TournamentSpec`].
+        pub fn to_smoke_spec(&self) -> Result<TournamentSpec, TournamentError> {
+            if let Some(ref smoke) = self.smoke {
+                let families: Vec<BrainKind> =
+                    smoke.families.iter().map(|f| to_brain_kind(f)).collect();
+                let order_policy = Self::parse_order_policy(&smoke.order_policy)?;
+                Ok(TournamentSpec {
+                    families,
+                    seeds: smoke.seeds.clone(),
+                    ticks: smoke.ticks,
+                    cohort_size: smoke.cohort_size,
+                    order_policy,
+                    closed: smoke.closed,
+                    config_layers: self.tournament.config_layers.clone(),
+                })
+            } else {
+                let families: Vec<BrainKind> = self
+                    .tournament
+                    .families
+                    .iter()
+                    .take(2)
+                    .map(|f| to_brain_kind(f))
+                    .collect();
+                let seeds = if self.tournament.seeds.len() >= 4 {
+                    self.tournament.seeds[..4].to_vec()
+                } else {
+                    self.tournament.seeds.clone()
+                };
+                Ok(TournamentSpec {
+                    families,
+                    seeds,
+                    ticks: 200,
+                    cohort_size: 16,
+                    order_policy: OrderPolicy::BothAssignments,
+                    closed: true,
+                    config_layers: Vec::new(),
+                })
+            }
+        }
+    }
+
+    /// Convert an owned or borrowed family name string to canonical [`BrainKind`].
+    #[must_use]
+    pub fn to_brain_kind(s: &str) -> BrainKind {
+        match s.trim() {
+            "mlp" | "mlp.baseline" => BrainKind::new("mlp"),
+            "dwraon" | "dwraon.baseline" => BrainKind::new("dwraon"),
+            "assembly" | "assembly.experimental" => BrainKind::new("assembly"),
+            "neuro" | "ml.neuroflow" => BrainKind::new("neuro"),
+            other => BrainKind::new(other.to_string().leak()),
+        }
+    }
+
+    /// Machine-readable row in `tournament_results.jsonl`.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct TournamentResultRow {
+        pub run_id: String,
+        pub match_id: u64,
+        pub seed: u64,
+        pub world_seed: u64,
+        pub brain_seed: u64,
+        pub family: String,
+        pub spawn_order_index: u32,
+        pub survival_share: f64,
+        pub biomass_share: f64,
+        pub mean_lineage_depth: f64,
+        pub max_lineage_depth: u32,
+        pub extinct_at: Option<u64>,
+        pub novelty_coverage: Option<f64>,
+        pub agents_final: usize,
+        pub config_digest: String,
+        pub manifest_digest: String,
+        pub reproducible: bool,
+        pub sense_backend: String,
+        pub sense_determinism: String,
+        pub warnings: Vec<String>,
+    }
+
+    impl TournamentResultRow {
+        /// Serialize a slice of rows to JSON Lines format.
+        pub fn serialize_jsonl(rows: &[Self]) -> Result<String, serde_json::Error> {
+            let mut out = String::new();
+            for row in rows {
+                let line = serde_json::to_string(row)?;
+                out.push_str(&line);
+                out.push('\n');
+            }
+            Ok(out)
+        }
+
+        /// Parse rows from JSON Lines format.
+        pub fn deserialize_jsonl(s: &str) -> Result<Vec<Self>, serde_json::Error> {
+            let mut rows = Vec::new();
+            for line in s.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let row: Self = serde_json::from_str(trimmed)?;
+                rows.push(row);
+            }
+            Ok(rows)
+        }
+    }
+
+    /// Reason why a match outcome row was excluded from the rating leaderboard.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub enum ExclusionReason {
+        NotReproducible,
+        ApproximateSense(String),
+        ConfigDigestMismatch { expected: String, found: String },
+    }
+
+    /// Audit record for an excluded tournament run.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ExcludedRunRecord {
+        pub run_id: String,
+        pub match_id: u64,
+        pub family: String,
+        pub seed: u64,
+        pub reason: ExclusionReason,
+    }
+
+    /// Convert execution reports to structured result rows.
+    #[must_use]
+    pub fn reports_to_result_rows(
+        reports: &[MatchRunReport],
+        sense_backend: &str,
+        sense_determinism: &str,
+        reproducible: bool,
+    ) -> Vec<TournamentResultRow> {
+        let mut rows = Vec::new();
+        for report in reports {
+            let match_id = report.outcome.match_id.0;
+            let seed = report.outcome.seed;
+            let world_seed = report.plan.world_seed;
+            let brain_seed = report.plan.brain_seed;
+            let spawn_order_index = report.outcome.spawn_order_index;
+            let config_digest = report.config_digest.clone();
+
+            for (family_name, outcome) in &report.outcome.per_family {
+                let run_id = format!("run-{match_id:016x}-{family_name}");
+                let manifest_raw = format!(
+                    "{run_id}:{config_digest}:{seed}:{world_seed}:{brain_seed}:{reproducible}:{sense_backend}:{sense_determinism}"
+                );
+                let manifest_digest = blake3::hash(manifest_raw.as_bytes()).to_hex().to_string();
+
+                let agents_final = report
+                    .agents_final
+                    .get(&to_brain_kind(family_name))
+                    .copied()
+                    .unwrap_or(0);
+
+                rows.push(TournamentResultRow {
+                    run_id,
+                    match_id,
+                    seed,
+                    world_seed,
+                    brain_seed,
+                    family: family_name.clone(),
+                    spawn_order_index,
+                    survival_share: outcome.survival_share,
+                    biomass_share: outcome.biomass_share,
+                    mean_lineage_depth: outcome.mean_lineage_depth,
+                    max_lineage_depth: outcome.max_lineage_depth,
+                    extinct_at: outcome.extinct_at,
+                    novelty_coverage: outcome.novelty_coverage,
+                    agents_final,
+                    config_digest: config_digest.clone(),
+                    manifest_digest,
+                    reproducible,
+                    sense_backend: sense_backend.to_owned(),
+                    sense_determinism: sense_determinism.to_owned(),
+                    warnings: report.outcome.warnings.clone(),
+                });
+            }
+        }
+        rows
+    }
+
+    /// Filter eligible result rows for rating computation, discarding and reporting invalid runs.
+    #[must_use]
+    pub fn filter_eligible_rows(
+        rows: &[TournamentResultRow],
+        expected_config_digest: &str,
+    ) -> (Vec<TournamentResultRow>, Vec<ExcludedRunRecord>) {
+        let mut eligible = Vec::with_capacity(rows.len());
+        let mut excluded = Vec::new();
+
+        for row in rows {
+            if !row.reproducible {
+                let record = ExcludedRunRecord {
+                    run_id: row.run_id.clone(),
+                    match_id: row.match_id,
+                    family: row.family.clone(),
+                    seed: row.seed,
+                    reason: ExclusionReason::NotReproducible,
+                };
+                tracing::warn!(
+                    target: "scriptbots::tournament::leaderboard",
+                    run_id = %record.run_id,
+                    match_id = record.match_id,
+                    family = %record.family,
+                    seed = record.seed,
+                    reason = "reproducible=false",
+                    "run excluded from tournament leaderboard"
+                );
+                excluded.push(record);
+            } else if row.sense_determinism.eq_ignore_ascii_case("approximate") {
+                let record = ExcludedRunRecord {
+                    run_id: row.run_id.clone(),
+                    match_id: row.match_id,
+                    family: row.family.clone(),
+                    seed: row.seed,
+                    reason: ExclusionReason::ApproximateSense(row.sense_determinism.clone()),
+                };
+                tracing::warn!(
+                    target: "scriptbots::tournament::leaderboard",
+                    run_id = %record.run_id,
+                    match_id = record.match_id,
+                    family = %record.family,
+                    seed = record.seed,
+                    reason = "sense_determinism=approximate",
+                    "run excluded from tournament leaderboard"
+                );
+                excluded.push(record);
+            } else if !expected_config_digest.is_empty()
+                && row.config_digest != expected_config_digest
+            {
+                let record = ExcludedRunRecord {
+                    run_id: row.run_id.clone(),
+                    match_id: row.match_id,
+                    family: row.family.clone(),
+                    seed: row.seed,
+                    reason: ExclusionReason::ConfigDigestMismatch {
+                        expected: expected_config_digest.to_owned(),
+                        found: row.config_digest.clone(),
+                    },
+                };
+                tracing::warn!(
+                    target: "scriptbots::tournament::leaderboard",
+                    run_id = %record.run_id,
+                    match_id = record.match_id,
+                    family = %record.family,
+                    seed = record.seed,
+                    expected = %expected_config_digest,
+                    found = %row.config_digest,
+                    reason = "config_digest_mismatch",
+                    "run excluded from tournament leaderboard"
+                );
+                excluded.push(record);
+            } else {
+                eligible.push(row.clone());
+            }
+        }
+
+        if !excluded.is_empty() {
+            tracing::warn!(
+                target: "scriptbots::tournament::leaderboard",
+                excluded = excluded.len(),
+                "runs excluded from tournament leaderboard"
+            );
+        }
+
+        (eligible, excluded)
+    }
+
+    /// Reconstruct [`MatchOutcome`]s from eligible rows for rating calculation.
+    #[must_use]
+    #[derive(Default)]
+    struct RowMatchAccumulator {
+        seed: u64,
+        spawn_order_index: u32,
+        spawn_order: Vec<String>,
+        per_family: BTreeMap<String, FamilyOutcome>,
+        warnings: Vec<String>,
+    }
+
+    /// Reconstruct [`MatchOutcome`]s from eligible rows for rating calculation.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn rows_to_match_outcomes(rows: &[TournamentResultRow]) -> Vec<MatchOutcome> {
+        let mut by_match: BTreeMap<u64, RowMatchAccumulator> = BTreeMap::new();
+        for r in rows {
+            let entry = by_match
+                .entry(r.match_id)
+                .or_insert_with(|| RowMatchAccumulator {
+                    seed: r.seed,
+                    spawn_order_index: r.spawn_order_index,
+                    spawn_order: Vec::new(),
+                    per_family: BTreeMap::new(),
+                    warnings: r.warnings.clone(),
+                });
+            if !entry.spawn_order.contains(&r.family) {
+                entry.spawn_order.push(r.family.clone());
+            }
+            entry.per_family.insert(
+                r.family.clone(),
+                FamilyOutcome {
+                    survival_share: r.survival_share,
+                    biomass_share: r.biomass_share,
+                    mean_lineage_depth: r.mean_lineage_depth,
+                    max_lineage_depth: r.max_lineage_depth,
+                    extinct_at: r.extinct_at,
+                    novelty_coverage: r.novelty_coverage,
+                },
+            );
+        }
+
+        by_match
+            .into_iter()
+            .map(|(match_id, acc)| MatchOutcome {
+                match_id: MatchId(match_id),
+                seed: acc.seed,
+                ticks_run: 0,
+                spawn_order_index: acc.spawn_order_index,
+                spawn_order: acc.spawn_order.iter().map(|s| to_brain_kind(s)).collect(),
+                per_family: acc.per_family,
+                warnings: acc.warnings,
+            })
+            .collect()
+    }
+
+    /// Generate the complete `docs/leaderboard.md` markdown content.
+    #[must_use]
+    pub fn generate_leaderboard_document(
+        spec: &TournamentSpecFile,
+        rating_table: &RatingTable,
+        rows: &[TournamentResultRow],
+        excluded: &[ExcludedRunRecord],
+        config_digest: &str,
+        build: &crate::BuildProvenanceV0,
+    ) -> String {
+        let mut out = String::new();
+
+        out.push_str("<!-- DO NOT EDIT: Automatically generated by scriptbots-app tournament. Regenerate with: scriptbots-app tournament --spec tournament/spec.toml -->\n\n");
+        out.push_str("# ScriptBots Canonical Brain-Family Tournament Leaderboard\n\n");
+        out.push_str("Empirical multi-axis comparative evaluation of autonomous neural agent architectures under identical ecological pressure with regularized Bradley-Terry / Zermelo ratings and clustered bootstrap confidence intervals.\n\n");
+
+        out.push_str("## Protocol & Scientific Boundary Conditions\n\n");
+        out.push_str("| Property | Value |\n| :--- | :--- |\n");
+        out.push_str(&format!(
+            "| Specification Title | {} (v{}) |\n",
+            spec.tournament.title, spec.tournament.version
+        ));
+        out.push_str(&format!(
+            "| Spec Blake3 Digest | `{}` |\n",
+            spec.spec_digest()
+        ));
+        out.push_str(&format!(
+            "| Effective Config Digest | `{config_digest}` |\n"
+        ));
+        out.push_str(&format!(
+            "| Entered Families | {} |\n",
+            spec.tournament.families.join(", ")
+        ));
+        let seeds_summary = if spec.tournament.seeds.len() <= 8 {
+            format!("{:?}", spec.tournament.seeds)
+        } else {
+            format!(
+                "[{}, {}, ..., {}] ({} total)",
+                spec.tournament.seeds[0],
+                spec.tournament.seeds[1],
+                spec.tournament.seeds.last().unwrap_or(&0),
+                spec.tournament.seeds.len()
+            )
+        };
+        out.push_str(&format!("| Evaluated Seeds | {seeds_summary} |\n"));
+        out.push_str(&format!(
+            "| Tick Budget | {} ticks per match |\n",
+            spec.tournament.ticks
+        ));
+        let agents_per_fam = if spec.tournament.families.is_empty() {
+            0
+        } else {
+            spec.tournament.cohort_size / spec.tournament.families.len()
+        };
+        out.push_str(&format!(
+            "| Cohort Size | {} total agents ({} per family) |\n",
+            spec.tournament.cohort_size, agents_per_fam
+        ));
+        out.push_str(&format!(
+            "| Order Policy | `{}` |\n",
+            spec.tournament.order_policy
+        ));
+        out.push_str(&format!(
+            "| Closed World | `{}` (extinction is terminal, zero respawn) |\n",
+            spec.tournament.closed
+        ));
+        out.push_str("| Reproductive Isolation | Same-kind mating barrier enforced (zero cross-family mating) |\n");
+        let nodes = spec.parameters.as_ref().map_or(200, |p| p.nodes_per_family);
+        out.push_str(&format!(
+            "| Parameter Complexity | {nodes} nodes per family across all architectures |\n"
+        ));
+        out.push_str(&format!(
+            "| Sensory Lane | `{}` (Determinism: `{}`) |\n",
+            spec.tournament.sense_backend, spec.tournament.sense_determinism
+        ));
+        let source_rev = build.source_revision.as_deref().unwrap_or("unknown");
+        let toolchain = build
+            .compiler_toolchain
+            .as_deref()
+            .unwrap_or(&build.declared_toolchain);
+        let target = format!("{}-{}", build.core.target_arch, build.core.target_os);
+        out.push_str(&format!(
+            "| Build Source Revision | `{source_rev}` |\n\
+             | Build Toolchain | `{toolchain}` |\n\
+             | Build Target | `{target}` (parallel: {}, simd: {}) |\n\
+             | Cargo Lockfile Digest | `{}` |\n\n",
+            build.core.parallel, build.core.simd_wide, build.lockfile_digest
+        ));
+
+        if !rating_table.warnings.is_empty() {
+            out.push_str("### Tournament Warnings & Qualifiers\n\n");
+            for w in &rating_table.warnings {
+                out.push_str(&format!("- ⚠️ {w}\n"));
+            }
+            out.push('\n');
+        }
+
+        out.push_str("## Multi-Axis Ratings & Confidence Intervals\n\n");
+
+        for axis in RatingAxis::ALL {
+            out.push_str(&format!("### Axis: {} (`{}`)\n\n", axis, axis.as_str()));
+            match rating_table.axes.get(axis) {
+                Some(super::AxisRatingOutcome::Rated(ratings)) => {
+                    out.push_str(&format!(
+                        "*Matches: {}, Seeds: {}, Iterations: {} ({}), Bootstrap Replicates: {}*\n\n",
+                        ratings.n_matches,
+                        ratings.n_seeds,
+                        ratings.iterations,
+                        if ratings.converged {
+                            "converged"
+                        } else {
+                            "unconverged"
+                        },
+                        ratings.bootstrap_replicates
+                    ));
+
+                    out.push_str(
+                        "| Rank | Family | Elo Rating (95% CI) | Theta (95% CI) | SE | Matches | W / L / D | Evidence Provenance |\n\
+                         | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n",
+                    );
+
+                    let mut sorted: Vec<_> = ratings.ratings.values().collect();
+                    sorted.sort_by(|a, b| {
+                        b.elo
+                            .total_cmp(&a.elo)
+                            .then_with(|| a.family.as_str().cmp(b.family.as_str()))
+                    });
+
+                    for (rank, r) in sorted.iter().enumerate() {
+                        let sign = if r.theta >= 0.0 { "+" } else { "" };
+                        let prov_tag = format!("[^{}-{}]", r.family.as_str(), axis.as_str());
+                        out.push_str(&format!(
+                            "| {} | {} | {:.1} [{:.1}, {:.1}] | {}{:.3} [{:.3}, {:.3}] | {:.3} | {} | {} / {} / {} | {} |\n",
+                            rank + 1,
+                            r.family.as_str(),
+                            r.elo,
+                            r.elo_ci95.0,
+                            r.elo_ci95.1,
+                            sign,
+                            r.theta,
+                            r.ci95.0,
+                            r.ci95.1,
+                            r.se,
+                            r.n_matches,
+                            r.wins,
+                            r.losses,
+                            r.draws,
+                            prov_tag
+                        ));
+                    }
+                    out.push('\n');
+
+                    if !ratings.pairwise.is_empty() {
+                        out.push_str(
+                            "#### Pairwise Head-to-Head Comparisons\n\n\
+                             | Family A | Family B | Verdict | Theta Diff (95% CI) | Win Rate Diff | Cliff's Delta | W / L / D |\n\
+                             | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n",
+                        );
+                        for pair in &ratings.pairwise {
+                            let sign = if pair.theta_diff >= 0.0 { "+" } else { "" };
+                            out.push_str(&format!(
+                                "| {} | {} | `{}` | {}{:.3} [{:.3}, {:.3}] | {:+.3} | {:+.3} | {} / {} / {} |\n",
+                                pair.a.as_str(),
+                                pair.b.as_str(),
+                                pair.verdict.as_str(),
+                                sign,
+                                pair.theta_diff,
+                                pair.ci95.0,
+                                pair.ci95.1,
+                                pair.effect_size_win_rate_diff,
+                                pair.cliffs_delta,
+                                pair.wins_a,
+                                pair.wins_b,
+                                pair.draws,
+                            ));
+                        }
+                        out.push('\n');
+                    }
+
+                    if let Some(order_effect) = rating_table.order_effects.get(axis) {
+                        if order_effect.detected {
+                            out.push_str("> ⚠️ **Spawn-Order Effect Detected**: Spawn order significantly affected performance on this axis.\n\n");
+                        }
+                        out.push_str("#### Spawn-Order Position Performance\n");
+                        for (pos, mean) in &order_effect.position_means {
+                            if let Some(ci) = order_effect.position_ci95.get(pos) {
+                                out.push_str(&format!(
+                                    "- Position {}: mean = {:.3} (95% CI [{:.3}, {:.3}])\n",
+                                    pos, mean, ci.0, ci.1
+                                ));
+                            } else {
+                                out.push_str(&format!("- Position {}: mean = {:.3}\n", pos, mean));
+                            }
+                        }
+                        out.push('\n');
+                    }
+                }
+                Some(super::AxisRatingOutcome::Undetermined { reason }) => {
+                    out.push_str(&format!("*Undetermined: {reason}*\n\n"));
+                }
+                None => {
+                    out.push_str("*Not evaluated on this axis.*\n\n");
+                }
+            }
+        }
+
+        out.push_str("## Exclusion Audit\n\n");
+        out.push_str(&format!("- Total Excluded Runs: {}\n", excluded.len()));
+        if excluded.is_empty() {
+            out.push_str("*Zero exclusions: all match rows verified reproducible (`reproducible = true`), exact-sense (`sense_determinism = exact`), and matching canonical config digest.*\n\n");
+        } else {
+            out.push_str("### Discarded Observations\n\n");
+            for rec in excluded {
+                let reason_str = match &rec.reason {
+                    ExclusionReason::NotReproducible => "reproducible: false".to_owned(),
+                    ExclusionReason::ApproximateSense(det) => {
+                        format!("sense_determinism: approximate ({det})")
+                    }
+                    ExclusionReason::ConfigDigestMismatch { expected, found } => {
+                        format!("config_digest_mismatch: expected {expected}, found {found}")
+                    }
+                };
+                out.push_str(&format!(
+                    "- Run `{}` (Family: `{}`, Match: `{}`, Seed: `{}`): {}\n",
+                    rec.run_id, rec.family, rec.match_id, rec.seed, reason_str
+                ));
+            }
+            out.push('\n');
+        }
+
+        out.push_str("## Run & Match Provenance Footnotes\n\n");
+        let mut matches_by_family: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
+        for r in rows {
+            matches_by_family
+                .entry(&r.family)
+                .or_default()
+                .insert(r.match_id);
+        }
+
+        for (family, match_ids) in matches_by_family {
+            for axis in RatingAxis::ALL {
+                let tag = format!("{family}-{}", axis.as_str());
+                let sample_matches = match_ids
+                    .iter()
+                    .take(8)
+                    .map(|id| format!("{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if match_ids.len() > 8 {
+                    format!(" and {} more", match_ids.len() - 8)
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "[^{tag}]: Derived from {} matches across entered seeds (Match IDs: {sample_matches}{more}).\n",
+                    match_ids.len()
+                ));
+            }
+        }
+
+        out
+    }
+
+    /// Compute line-by-line unified diff between two text buffers.
+    #[must_use]
+    pub fn compute_unified_diff(
+        expected: &str,
+        actual: &str,
+        expected_label: &str,
+        actual_label: &str,
+    ) -> String {
+        let expected_lines: Vec<&str> = expected.lines().collect();
+        let actual_lines: Vec<&str> = actual.lines().collect();
+
+        let mut out = String::new();
+        out.push_str(&format!("--- {expected_label}\n+++ {actual_label}\n"));
+
+        let max_len = expected_lines.len().max(actual_lines.len());
+        let mut diff_count = 0;
+        for i in 0..max_len {
+            let e = expected_lines.get(i);
+            let a = actual_lines.get(i);
+            if e != a {
+                diff_count += 1;
+                out.push_str(&format!("@@ line {} @@\n", i + 1));
+                if let Some(exp) = e {
+                    out.push_str(&format!("-{exp}\n"));
+                }
+                if let Some(act) = a {
+                    out.push_str(&format!("+{act}\n"));
+                }
+                if diff_count > 50 {
+                    out.push_str("... (truncated additional diff lines)\n");
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Error returned when `--check` encounters document or config drift.
+    #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+    pub enum LeaderboardCheckError {
+        #[error("committed leaderboard file not found at {path}: {reason}")]
+        FileNotFound { path: PathBuf, reason: String },
+        #[error(
+            "config digest drift detected: committed records {committed}, freshly generated records {generated}"
+        )]
+        ConfigDrift {
+            committed: String,
+            generated: String,
+        },
+        #[error(
+            "leaderboard document drift detected across {mismatched_lines} lines at {path}:\n{diff}"
+        )]
+        DocumentDrift {
+            mismatched_lines: usize,
+            diff: String,
+            path: PathBuf,
+        },
+    }
+
+    /// Check if a committed leaderboard matches newly generated content, verifying config digest and text equality.
+    pub fn check_leaderboard_drift(
+        committed_text: &str,
+        generated_text: &str,
+        path: &Path,
+    ) -> Result<(), LeaderboardCheckError> {
+        // 1. Config drift check
+        fn extract_config_digest(text: &str) -> Option<String> {
+            for line in text.lines() {
+                if !line.contains("Effective Config Digest") {
+                    continue;
+                }
+                let start = line.find('`')?;
+                let end = line[start + 1..].find('`')?;
+                return Some(line[start + 1..start + 1 + end].to_owned());
+            }
+            None
+        }
+
+        let comm_digest = extract_config_digest(committed_text);
+        let gen_digest = extract_config_digest(generated_text);
+        if let (Some(comm), Some(generated)) = (comm_digest, gen_digest)
+            && comm != generated
+        {
+            tracing::error!(
+                target: "scriptbots::tournament::leaderboard",
+                path = %path.display(),
+                committed = %comm,
+                generated = %generated,
+                "leaderboard check failed: configuration drift"
+            );
+            return Err(LeaderboardCheckError::ConfigDrift {
+                committed: comm,
+                generated,
+            });
+        }
+
+        // 2. Full document byte/line equality check
+        if committed_text.trim() == generated_text.trim() {
+            return Ok(());
+        }
+
+        let diff = compute_unified_diff(
+            committed_text,
+            generated_text,
+            &format!("committed: {}", path.display()),
+            "generated",
+        );
+        let mismatched_lines = diff.lines().filter(|l| l.starts_with("@@")).count();
+
+        tracing::error!(
+            target: "scriptbots::tournament::leaderboard",
+            path = %path.display(),
+            diff = %diff,
+            "leaderboard check failed with document drift"
+        );
+
+        Err(LeaderboardCheckError::DocumentDrift {
+            mismatched_lines,
+            diff,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Summary outcome of a tournament leaderboard run.
+    #[derive(Debug, Clone)]
+    pub struct LeaderboardPipelineOutcome {
+        pub spec: TournamentSpecFile,
+        pub config_digest: String,
+        pub spec_digest: String,
+        pub total_matches: usize,
+        pub total_rows: usize,
+        pub eligible_rows: usize,
+        pub excluded_rows: usize,
+        pub results_jsonl: String,
+        pub ratings_json: String,
+        pub leaderboard_md: String,
+        pub results_digest: String,
+        pub ratings_digest: String,
+    }
+
+    /// Save tournament artifacts (`tournament_results.jsonl`, `ratings.json`, `leaderboard.md`).
+    pub fn save_tournament_artifacts(
+        outcome: &LeaderboardPipelineOutcome,
+        out_path: &Path,
+        leaderboard_path: Option<&Path>,
+    ) -> Result<(), std::io::Error> {
+        let (out_dir, lb_file) = if out_path.extension().and_then(|s| s.to_str()) == Some("md") {
+            (
+                out_path.parent().unwrap_or_else(|| Path::new(".")),
+                out_path.to_path_buf(),
+            )
+        } else {
+            (out_path, out_path.join("leaderboard.md"))
+        };
+
+        fs::create_dir_all(out_dir)?;
+        fs::write(
+            out_dir.join("tournament_results.jsonl"),
+            &outcome.results_jsonl,
+        )?;
+        fs::write(out_dir.join("ratings.json"), &outcome.ratings_json)?;
+        fs::write(&lb_file, &outcome.leaderboard_md)?;
+
+        if let Some(target_lb) = leaderboard_path
+            && target_lb != lb_file
+        {
+            if let Some(parent) = target_lb.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(target_lb, &outcome.leaderboard_md)?;
+        }
+
+        Ok(())
+    }
+
+    /// Execute the complete tournament leaderboard pipeline: plan -> run -> rate -> render -> check -> emit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_leaderboard_tournament(
+        spec_file: &TournamentSpecFile,
+        spec_path: Option<&Path>,
+        is_smoke: bool,
+        base_config: &ScriptBotsConfig,
+        build_provenance: &BuildProvenanceV0,
+        out_dir: Option<&Path>,
+        check_target: Option<&Path>,
+        check_reproducibility: bool,
+        jobs: usize,
+    ) -> Result<LeaderboardPipelineOutcome, TournamentError> {
+        let runtime_spec = if is_smoke {
+            spec_file.to_smoke_spec()?
+        } else {
+            spec_file.to_spec()?
+        };
+
+        let planned_matches = super::plan(&runtime_spec)?.len();
+        let spec_path_str = spec_path
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "tournament/spec.toml".to_string());
+        let build_rev = build_provenance
+            .source_revision
+            .as_deref()
+            .unwrap_or("unknown");
+
+        let mut effective_base_config = base_config.clone();
+        let prevent_cross_mating = spec_file
+            .parameters
+            .as_ref()
+            .is_none_or(|p| p.same_kind_mating_barrier || !p.interbreeding);
+        if prevent_cross_mating {
+            effective_base_config.reproduction_partner_chance = 0.0;
+        }
+
+        let mut digest_config = effective_base_config.clone();
+        digest_config.rng_seed = None;
+        digest_config.closed = runtime_spec.closed;
+        let expected_config_digest = blake3::hash(
+            serde_json::to_string(&(digest_config, runtime_spec.ticks))
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+
+        tracing::info!(
+            target: "scriptbots::tournament::leaderboard",
+            spec_path = %spec_path_str,
+            spec_digest = %spec_file.spec_digest(),
+            families = ?runtime_spec.families,
+            seeds = ?runtime_spec.seeds,
+            ticks = runtime_spec.ticks,
+            matches = planned_matches,
+            config_digest = %expected_config_digest,
+            build_digest = %build_rev,
+            sense_backend = %spec_file.tournament.sense_backend,
+            sense_determinism = %spec_file.tournament.sense_determinism,
+            "starting tournament leaderboard execution"
+        );
+
+        let reports = run_tournament_with_jobs(&runtime_spec, &effective_base_config, jobs)?;
+        super::enforce_no_config_drift(&reports)?;
+
+        let config_digest = reports
+            .first()
+            .map(|r| r.config_digest.clone())
+            .unwrap_or_default();
+
+        for report in &reports {
+            for (family, outcome) in &report.outcome.per_family {
+                tracing::info!(
+                    target: "scriptbots::tournament::leaderboard",
+                    match_id = report.outcome.match_id.0,
+                    run_id = format!("run-{:016x}-{family}", report.outcome.match_id.0),
+                    seed = report.outcome.seed,
+                    family = %family,
+                    spawn_order_index = report.outcome.spawn_order_index,
+                    survival_share = outcome.survival_share,
+                    biomass_share = outcome.biomass_share,
+                    lineage_depth = outcome.mean_lineage_depth,
+                    "match outcome row"
+                );
+            }
+        }
+
+        let rows = reports_to_result_rows(
+            &reports,
+            &spec_file.tournament.sense_backend,
+            &spec_file.tournament.sense_determinism,
+            spec_file.tournament.reproducible,
+        );
+
+        let (eligible_rows, excluded_runs) = filter_eligible_rows(&rows, &config_digest);
+        let eligible_outcomes = rows_to_match_outcomes(&eligible_rows);
+
+        let rating_options = RatingOptions {
+            bootstrap_replicates: if is_smoke { 50 } else { 2000 },
+            ..RatingOptions::default()
+        };
+        let rating_table = rate_tournament(&eligible_outcomes, &rating_options).map_err(|e| {
+            TournamentError::UnbalancedOrders {
+                reason: e.to_string(),
+            }
+        })?;
+
+        let leaderboard_md = generate_leaderboard_document(
+            spec_file,
+            &rating_table,
+            &eligible_rows,
+            &excluded_runs,
+            &config_digest,
+            build_provenance,
+        );
+
+        let results_jsonl = TournamentResultRow::serialize_jsonl(&rows).map_err(|e| {
+            TournamentError::UnbalancedOrders {
+                reason: e.to_string(),
+            }
+        })?;
+        let ratings_json = serde_json::to_string_pretty(&rating_table).map_err(|e| {
+            TournamentError::UnbalancedOrders {
+                reason: e.to_string(),
+            }
+        })?;
+
+        let results_digest = blake3::hash(results_jsonl.as_bytes()).to_hex().to_string();
+        let ratings_digest = blake3::hash(ratings_json.as_bytes()).to_hex().to_string();
+
+        if check_reproducibility {
+            tracing::info!(
+                target: "scriptbots::tournament::leaderboard",
+                "running second pass to verify byte-level reproducibility gate"
+            );
+            let reports_rerun =
+                run_tournament_with_jobs(&runtime_spec, &effective_base_config, jobs)?;
+            let rows_rerun = reports_to_result_rows(
+                &reports_rerun,
+                &spec_file.tournament.sense_backend,
+                &spec_file.tournament.sense_determinism,
+                spec_file.tournament.reproducible,
+            );
+            let results_rerun_jsonl =
+                TournamentResultRow::serialize_jsonl(&rows_rerun).map_err(|e| {
+                    TournamentError::UnbalancedOrders {
+                        reason: e.to_string(),
+                    }
+                })?;
+            let rerun_digest = blake3::hash(results_rerun_jsonl.as_bytes())
+                .to_hex()
+                .to_string();
+
+            if results_digest != rerun_digest {
+                return Err(TournamentError::LeaderboardReproducibility {
+                    rerun_digest,
+                    results_digest,
+                });
+            }
+            tracing::info!(
+                target: "scriptbots::tournament::leaderboard",
+                digest = %results_digest,
+                "reproducibility gate passed: bit-identical results across invocations"
+            );
+        }
+
+        let mut verdict = "ok";
+        if let Some(check_path) = check_target {
+            let committed =
+                fs::read_to_string(check_path).map_err(|e| TournamentError::ConfigLayer {
+                    path: check_path.to_path_buf(),
+                    reason: format!("failed to read committed leaderboard for check: {e}"),
+                })?;
+            check_leaderboard_drift(&committed, &leaderboard_md, check_path).map_err(|e| {
+                verdict = "drift";
+                TournamentError::LeaderboardCheck(e)
+            })?;
+        }
+
+        let outcome = LeaderboardPipelineOutcome {
+            spec: spec_file.clone(),
+            config_digest,
+            spec_digest: spec_file.spec_digest(),
+            total_matches: reports.len(),
+            total_rows: rows.len(),
+            eligible_rows: eligible_rows.len(),
+            excluded_rows: excluded_runs.len(),
+            results_jsonl,
+            ratings_json,
+            leaderboard_md,
+            results_digest: results_digest.clone(),
+            ratings_digest: ratings_digest.clone(),
+        };
+
+        if let Some(dir) = out_dir {
+            save_tournament_artifacts(&outcome, dir, None).map_err(|e| {
+                TournamentError::UnbalancedOrders {
+                    reason: format!("failed to save tournament artifacts: {e}"),
+                }
+            })?;
+        }
+
+        tracing::info!(
+            target: "scriptbots::tournament::leaderboard",
+            verdict = verdict,
+            matches = outcome.total_matches,
+            excluded = outcome.excluded_rows,
+            ratings_digest = %ratings_digest,
+            results_digest = %results_digest,
+            "leaderboard execution complete"
+        );
+
+        Ok(outcome)
+    }
+
+    /// CLI arguments for the `tournament` subcommand.
+    #[derive(clap::Args, Debug, Clone, PartialEq)]
+    pub struct TournamentArgs {
+        /// Path to tournament specification TOML file.
+        #[arg(long = "spec", default_value = "tournament/spec.toml")]
+        pub spec: PathBuf,
+
+        /// Brain families to enter, or "all" (e.g. "mlp,dwraon,assembly").
+        #[arg(long = "families")]
+        pub families: Option<String>,
+
+        /// Number of seeds or comma-separated list of explicit seeds.
+        #[arg(long = "seeds")]
+        pub seeds: Option<String>,
+
+        /// Simulation ticks per match.
+        #[arg(long = "ticks")]
+        pub ticks: Option<u64>,
+
+        /// Total cohort size per match (split equally across families).
+        #[arg(long = "cohort-size")]
+        pub cohort_size: Option<usize>,
+
+        /// Output directory for artifacts (tournament_results.jsonl, ratings.json, leaderboard.md).
+        #[arg(long = "out")]
+        pub out: Option<PathBuf>,
+
+        /// Check target markdown file (e.g. docs/leaderboard.md) to detect drift against committed table.
+        #[arg(long = "check")]
+        pub check: Option<PathBuf>,
+
+        /// Run bounded smoke tournament configuration instead of full tournament.
+        #[arg(long = "smoke")]
+        pub smoke: bool,
+
+        /// Verify byte-level reproducibility by running twice and comparing output hashes.
+        #[arg(long = "check-reproducibility")]
+        pub check_reproducibility: bool,
+
+        /// Worker parallelism (0 = Rayon default).
+        #[arg(long = "jobs", default_value_t = 0)]
+        pub jobs: usize,
+    }
+
+    /// Dispatch tournament execution from parsed CLI arguments.
+    pub fn run_tournament_command(
+        args: &TournamentArgs,
+    ) -> anyhow::Result<LeaderboardPipelineOutcome> {
+        let mut spec_file = if args.spec.exists() {
+            TournamentSpecFile::from_file(&args.spec).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read tournament spec {}: {e}",
+                    args.spec.display()
+                )
+            })?
+        } else {
+            let candidates = [
+                args.spec.as_path(),
+                Path::new("tournament/spec.toml"),
+                Path::new("../../tournament/spec.toml"),
+            ];
+            let found = candidates.iter().find(|p| p.exists());
+            if let Some(p) = found {
+                TournamentSpecFile::from_file(p).map_err(|e| {
+                    anyhow::anyhow!("failed to read tournament spec {}: {e}", p.display())
+                })?
+            } else {
+                anyhow::bail!(
+                    "tournament specification file not found at {} (or fallback locations)",
+                    args.spec.display()
+                );
+            }
+        };
+
+        spec_file
+            .apply_cli_overrides(
+                args.families.as_deref(),
+                args.seeds.as_deref(),
+                args.ticks,
+                args.cohort_size,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to apply CLI overrides: {e}"))?;
+
+        let base_config = ScriptBotsConfig::default();
+        let build_provenance = BuildProvenanceV0::current();
+
+        let outcome = execute_leaderboard_tournament(
+            &spec_file,
+            Some(&args.spec),
+            args.smoke,
+            &base_config,
+            &build_provenance,
+            args.out.as_deref(),
+            args.check.as_deref(),
+            args.check_reproducibility,
+            args.jobs,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        println!("Tournament Leaderboard Pipeline Complete:");
+        println!("  Spec Digest:    {}", outcome.spec_digest);
+        println!("  Config Digest:  {}", outcome.config_digest);
+        println!("  Total Matches:  {}", outcome.total_matches);
+        println!(
+            "  Rows Recorded:  {} (Eligible: {}, Excluded: {})",
+            outcome.total_rows, outcome.eligible_rows, outcome.excluded_rows
+        );
+        println!("  Results Digest: {}", outcome.results_digest);
+        println!("  Ratings Digest: {}", outcome.ratings_digest);
+        println!("  Verdict:        OK");
+
+        Ok(outcome)
+    }
+}
+
 /// Result record for a match between two or more brain families.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchResult {
@@ -3674,5 +5063,334 @@ mod tests {
         assert!(md.contains("mlp"));
         assert!(md.contains("dwraon"));
         assert!(md.contains("Pairwise Head-to-Head Comparisons"));
+    }
+
+    #[test]
+    fn test_leaderboard_row_exclusion_filter() {
+        use leaderboard::{ExclusionReason, TournamentResultRow, filter_eligible_rows};
+
+        let valid_row = TournamentResultRow {
+            run_id: "run-valid".to_string(),
+            match_id: 1,
+            seed: 101,
+            world_seed: 101,
+            brain_seed: 101,
+            family: "mlp".to_string(),
+            spawn_order_index: 0,
+            survival_share: 0.6,
+            biomass_share: 0.5,
+            mean_lineage_depth: 4.0,
+            max_lineage_depth: 5,
+            extinct_at: None,
+            novelty_coverage: None,
+            agents_final: 10,
+            config_digest: "cfg-123".to_string(),
+            manifest_digest: "mnf-123".to_string(),
+            sense_backend: "cpu_simd".to_string(),
+            sense_determinism: "exact".to_string(),
+            reproducible: true,
+            warnings: Vec::new(),
+        };
+
+        let mut irreproducible_row = valid_row.clone();
+        irreproducible_row.run_id = "run-not-reproducible".to_string();
+        irreproducible_row.reproducible = false;
+
+        let mut approx_row = valid_row.clone();
+        approx_row.run_id = "run-approx".to_string();
+        approx_row.sense_determinism = "approximate".to_string();
+
+        let mut stale_cfg_row = valid_row.clone();
+        stale_cfg_row.run_id = "run-stale".to_string();
+        stale_cfg_row.config_digest = "cfg-old".to_string();
+
+        let rows = vec![valid_row, irreproducible_row, approx_row, stale_cfg_row];
+        let (eligible, excluded) = filter_eligible_rows(&rows, "cfg-123");
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].run_id, "run-valid");
+        assert_eq!(excluded.len(), 3);
+        assert!(matches!(
+            excluded[0].reason,
+            ExclusionReason::NotReproducible
+        ));
+        assert!(matches!(
+            excluded[1].reason,
+            ExclusionReason::ApproximateSense(_)
+        ));
+        assert!(matches!(
+            excluded[2].reason,
+            ExclusionReason::ConfigDigestMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_leaderboard_drift_check() {
+        use leaderboard::{LeaderboardCheckError, check_leaderboard_drift};
+        use std::path::Path;
+
+        let doc1 = "# Leaderboard\n- Effective Config Digest: `cfg-abc`\n\nSome results\n";
+        let doc2 = "# Leaderboard\n- Effective Config Digest: `cfg-abc`\n\nSome results\n";
+        let doc_drift = "# Leaderboard\n- Effective Config Digest: `cfg-abc`\n\nAltered results\n";
+        let doc_cfg_drift = "# Leaderboard\n- Effective Config Digest: `cfg-xyz`\n\nSome results\n";
+
+        let dummy_path = Path::new("docs/leaderboard.md");
+
+        // Identical documents pass
+        assert!(check_leaderboard_drift(doc1, doc2, dummy_path).is_ok());
+
+        // Text change triggers DocumentDrift
+        let err_drift = check_leaderboard_drift(doc1, doc_drift, dummy_path).unwrap_err();
+        assert!(matches!(
+            err_drift,
+            LeaderboardCheckError::DocumentDrift { .. }
+        ));
+
+        // Config change triggers ConfigDrift
+        let err_cfg = check_leaderboard_drift(doc1, doc_cfg_drift, dummy_path).unwrap_err();
+        assert!(matches!(err_cfg, LeaderboardCheckError::ConfigDrift { .. }));
+    }
+
+    #[test]
+    fn test_spec_file_parsing_and_smoke_conversion() {
+        use leaderboard::TournamentSpecFile;
+
+        let spec_toml = include_str!("../../../tournament/spec.toml");
+        let spec_file = TournamentSpecFile::from_toml_str(spec_toml).expect("parse spec.toml");
+
+        assert_eq!(
+            spec_file.tournament.title,
+            "ScriptBots Canonical Brain-Family Tournament"
+        );
+        assert_eq!(
+            spec_file.tournament.families,
+            vec!["mlp", "dwraon", "assembly"]
+        );
+        assert_eq!(spec_file.tournament.seeds.len(), 32);
+
+        let smoke_spec = spec_file.to_smoke_spec().expect("smoke spec");
+        assert_eq!(smoke_spec.families.len(), 2);
+        assert_eq!(smoke_spec.seeds.len(), 4);
+        assert_eq!(smoke_spec.ticks, 200);
+    }
+
+    #[test]
+    fn test_spec_cli_overrides() {
+        use leaderboard::TournamentSpecFile;
+
+        let spec_toml = include_str!("../../../tournament/spec.toml");
+        let mut spec_file = TournamentSpecFile::from_toml_str(spec_toml).expect("parse spec.toml");
+
+        // 1. Valid overrides
+        spec_file
+            .apply_cli_overrides(Some("mlp, assembly"), Some("4"), Some(500), Some(32))
+            .expect("apply overrides");
+
+        assert_eq!(spec_file.tournament.families, vec!["mlp", "assembly"]);
+        assert_eq!(spec_file.tournament.seeds.len(), 4);
+        assert_eq!(spec_file.tournament.ticks, 500);
+        assert_eq!(spec_file.tournament.cohort_size, 32);
+
+        // Explicit seeds list
+        spec_file
+            .apply_cli_overrides(None, Some("201, 202, 203"), None, None)
+            .expect("apply seeds list override");
+        assert_eq!(spec_file.tournament.seeds, vec![201, 202, 203]);
+
+        // 2. Invalid overrides fail with typed error
+        assert!(
+            spec_file
+                .apply_cli_overrides(None, Some("0"), None, None)
+                .is_err()
+        );
+        assert!(
+            spec_file
+                .apply_cli_overrides(None, None, Some(0), None)
+                .is_err()
+        );
+        assert!(
+            spec_file
+                .apply_cli_overrides(None, None, None, Some(0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_save_tournament_artifacts() {
+        use leaderboard::{
+            LeaderboardPipelineOutcome, TournamentSpecFile, save_tournament_artifacts,
+        };
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("scriptbots-test-artifacts-{}", std::process::id()));
+
+        let spec_toml = include_str!("../../../tournament/spec.toml");
+        let spec_file = TournamentSpecFile::from_toml_str(spec_toml).expect("parse spec.toml");
+
+        let outcome = LeaderboardPipelineOutcome {
+            spec: spec_file,
+            config_digest: "cfg-test".to_string(),
+            spec_digest: "spec-test".to_string(),
+            total_matches: 4,
+            total_rows: 8,
+            eligible_rows: 8,
+            excluded_rows: 0,
+            results_jsonl: "{\"match_id\":1}\n".to_string(),
+            ratings_json: "{\"axes\":{}}\n".to_string(),
+            leaderboard_md: "# Test Leaderboard\n".to_string(),
+            results_digest: "digest-results".to_string(),
+            ratings_digest: "digest-ratings".to_string(),
+        };
+
+        // Directory target
+        save_tournament_artifacts(&outcome, &temp_dir, None).expect("save to directory");
+        assert!(temp_dir.join("tournament_results.jsonl").exists());
+        assert!(temp_dir.join("ratings.json").exists());
+        assert!(temp_dir.join("leaderboard.md").exists());
+
+        // File target
+        let file_target = temp_dir.join("custom").join("my_leaderboard.md");
+        save_tournament_artifacts(&outcome, &file_target, None).expect("save to md file");
+        assert!(file_target.exists());
+        assert!(
+            temp_dir
+                .join("custom")
+                .join("tournament_results.jsonl")
+                .exists()
+        );
+        assert!(temp_dir.join("custom").join("ratings.json").exists());
+    }
+
+    #[test]
+    fn test_execute_leaderboard_tournament_smoke() {
+        use crate::BuildProvenanceV0;
+        use leaderboard::{
+            LeaderboardCheckError, TournamentSpecFile, check_leaderboard_drift,
+            execute_leaderboard_tournament,
+        };
+        use scriptbots_core::ScriptBotsConfig;
+
+        let spec_toml = include_str!("../../../tournament/spec.toml");
+        let mut spec_file = TournamentSpecFile::from_toml_str(spec_toml).expect("parse spec.toml");
+
+        // Use a 2-seed x 50-tick smoke configuration for rapid unit test
+        if let Some(ref mut sm) = spec_file.smoke {
+            sm.seeds = vec![101, 102];
+            sm.ticks = 50;
+            sm.cohort_size = 8;
+        }
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let base_config = ScriptBotsConfig::default();
+        let build = BuildProvenanceV0::current();
+
+        let outcome = execute_leaderboard_tournament(
+            &spec_file,
+            None,
+            true, // is_smoke
+            &base_config,
+            &build,
+            None, // out_dir
+            None, // check_target
+            true, // check_reproducibility
+            2,    // jobs
+        )
+        .expect("smoke leaderboard execution");
+
+        assert_eq!(outcome.total_matches, 4); // 2 seeds x 2 orders
+        assert_eq!(outcome.eligible_rows, 8); // 4 matches x 2 families
+        assert_eq!(outcome.excluded_rows, 0);
+        assert!(!outcome.results_digest.is_empty());
+        assert!(!outcome.ratings_digest.is_empty());
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("# ScriptBots Canonical Brain-Family Tournament")
+        );
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("## Multi-Axis Ratings & Confidence Intervals")
+        );
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("Pairwise Head-to-Head Comparisons")
+        );
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("Spawn-Order Position Performance")
+        );
+        assert!(outcome.leaderboard_md.contains("## Exclusion Audit"));
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("## Run & Match Provenance Footnotes")
+        );
+
+        // Check self-consistency (--check against generated document passes)
+        let dummy_path = std::path::Path::new("docs/leaderboard.md");
+        assert!(
+            check_leaderboard_drift(&outcome.leaderboard_md, &outcome.leaderboard_md, dummy_path)
+                .is_ok()
+        );
+
+        // Negative check 1: mutated row in document fails with DocumentDrift
+        let mutated_doc = outcome.leaderboard_md.replace("1500.00", "1599.99");
+        if mutated_doc != outcome.leaderboard_md {
+            let drift_err =
+                check_leaderboard_drift(&outcome.leaderboard_md, &mutated_doc, dummy_path)
+                    .unwrap_err();
+            assert!(matches!(
+                drift_err,
+                LeaderboardCheckError::DocumentDrift { .. }
+            ));
+        }
+
+        // Negative check 2: stale config digest fails with ConfigDrift
+        let stale_cfg_doc = outcome
+            .leaderboard_md
+            .replace(&outcome.config_digest, "stale_config_digest_12345");
+        let cfg_err = check_leaderboard_drift(&stale_cfg_doc, &outcome.leaderboard_md, dummy_path)
+            .unwrap_err();
+        assert!(matches!(cfg_err, LeaderboardCheckError::ConfigDrift { .. }));
+    }
+
+    #[test]
+    fn test_execute_leaderboard_tournament_three_families_barrier() {
+        use crate::BuildProvenanceV0;
+        use leaderboard::{TournamentSpecFile, execute_leaderboard_tournament};
+        use scriptbots_core::ScriptBotsConfig;
+
+        let spec_toml = include_str!("../../../tournament/spec.toml");
+        let mut spec_file = TournamentSpecFile::from_toml_str(spec_toml).expect("parse spec.toml");
+
+        // 3 families with Latin square and 300 ticks to verify cross-kind barrier
+        spec_file.tournament.families = vec!["mlp".into(), "dwraon".into(), "assembly".into()];
+        spec_file.tournament.seeds = vec![101];
+        spec_file.tournament.ticks = 300;
+        spec_file.tournament.cohort_size = 12;
+        spec_file.tournament.order_policy = "balanced_latin_square".into();
+
+        let base_config = ScriptBotsConfig::default();
+        let build = BuildProvenanceV0::current();
+
+        let outcome = execute_leaderboard_tournament(
+            &spec_file,
+            None,
+            false,
+            &base_config,
+            &build,
+            None,
+            None,
+            true,
+            1,
+        )
+        .expect("3-family tournament with reproduction barrier must succeed");
+
+        assert_eq!(outcome.total_matches, 3);
+        assert_eq!(outcome.eligible_rows, 9);
+        assert_eq!(outcome.excluded_rows, 0);
     }
 }

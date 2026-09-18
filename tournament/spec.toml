@@ -1,0 +1,39 @@
+# ScriptBots Canonical Brain-Family Tournament Specification (bd-16g.12.3)
+#
+# Pinned tournament configuration for multi-axis brain family ranking,
+# clustered bootstrap confidence intervals, and CI-regenerated leaderboard.
+
+[tournament]
+title = "ScriptBots Canonical Brain-Family Tournament"
+version = "1.0.0"
+families = ["mlp", "dwraon", "assembly"]
+seeds = [
+    101, 102, 103, 104, 105, 106, 107, 108,
+    109, 110, 111, 112, 113, 114, 115, 116,
+    117, 118, 119, 120, 121, 122, 123, 124,
+    125, 126, 127, 128, 129, 130, 131, 132,
+]
+ticks = 20000
+cohort_size = 24
+order_policy = "balanced_latin_square"
+closed = true
+sense_backend = "cpu_simd"
+sense_determinism = "exact"
+reproducible = true
+
+[parameters]
+nodes_per_family = 200
+same_kind_mating_barrier = true
+interbreeding = false
+
+[reproducibility]
+require_identical_rerun = true
+max_retries = 1
+
+[smoke]
+families = ["mlp", "dwraon"]
+seeds = [101, 102, 103, 104]
+ticks = 200
+cohort_size = 16
+order_policy = "both_assignments"
+closed = true
