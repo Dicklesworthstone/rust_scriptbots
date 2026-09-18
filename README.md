@@ -643,6 +643,8 @@ Simulation controls and retained-history playback are separate. The unmodified `
 | Toggle stats panel | `1` |
 | Toggle history panel | `2` |
 | Toggle performance panel | `3` |
+| Cycle sense probe eye forward | `.` |
+| Cycle sense probe eye backward | `Ctrl + .` |
 
 <!-- END GENERATED GPUI DEFAULT SHORTCUTS -->
 

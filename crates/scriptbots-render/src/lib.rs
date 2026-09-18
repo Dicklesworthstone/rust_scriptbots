@@ -5203,6 +5203,28 @@ impl SimulationView {
         }
     }
 
+    fn cycle_eye_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector.cycle_eye_selection(forward);
+            cx.notify();
+        }
+    }
+
+    fn toggle_eye_selection(&mut self, eye: usize, cx: &mut Context<Self>) {
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector.toggle_eye_selection(eye);
+            cx.notify();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn select_eye(&mut self, eye: Option<usize>, cx: &mut Context<Self>) {
+        if let Ok(mut inspector) = self.inspector.lock() {
+            inspector.select_eye(eye);
+            cx.notify();
+        }
+    }
+
     fn set_persistence_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if enabled {
             let interval = self
@@ -5368,7 +5390,9 @@ impl SimulationView {
             | CommandAction::ToggleClosedEnvironment
             | CommandAction::ClearSelection
             | CommandAction::SelectAll
-            | CommandAction::FocusFirstSelected => true,
+            | CommandAction::FocusFirstSelected
+            | CommandAction::CycleEyeForward
+            | CommandAction::CycleEyeBackward => true,
         }
     }
 
@@ -5378,6 +5402,8 @@ impl SimulationView {
             CommandAction::GoLive => self.playback_go_live(cx),
             CommandAction::ToggleNarration => self.toggle_narration(cx),
             CommandAction::CyclePalette => self.cycle_palette(cx),
+            CommandAction::CycleEyeForward => self.cycle_eye_selection(true, cx),
+            CommandAction::CycleEyeBackward => self.cycle_eye_selection(false, cx),
             CommandAction::ToggleSimulationPause => {
                 let paused = !self.simulation_drive_snapshot().paused;
                 self.set_simulation_paused(paused, cx);
@@ -7387,6 +7413,23 @@ impl SimulationView {
             .child(div().text_xs().text_color(rgb(0xcbd5f5)).child("Narration"))
             .child(narration_button)
     }
+
+    fn render_inspector_sense_attribution(
+        &self,
+        detail: &AgentInspectorDetails,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut listeners: [Option<Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>;
+            NUM_EYES] = [None, None, None, None];
+        for eye in 0..NUM_EYES {
+            let listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
+                this.toggle_eye_selection(eye, cx);
+            });
+            listeners[eye] = Some(Arc::new(listener));
+        }
+        render_sense_attribution_with_listeners(detail, Some(&listeners))
+    }
+
     fn render_inspector_detail(
         &self,
         detail: &AgentInspectorDetails,
@@ -7460,7 +7503,7 @@ impl SimulationView {
             )))
             .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Sensors"))
             .child(sensor_bars)
-            .child(render_sense_attribution(detail))
+            .child(self.render_inspector_sense_attribution(detail, cx))
             .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Outputs"))
             .child(output_bars)
             .child({
@@ -9405,14 +9448,55 @@ const fn sensor_source_tag(kind: SensorKind) -> &'static str {
     }
 }
 
-/// Egocentric sense attribution for the focused agent (bd-16g.4.2).
+/// Hit-test an angular point on the true-angle cone strip (bd-2z0.7.15).
 ///
-/// Renders `SensorAttribution` verbatim: clamped values, an explicit `⚠raw`
-/// marker on saturated channels (contributions legitimately sum above 1.0 —
-/// normalising them would destroy the information), eye rows labeled with
-/// their true relative angle and FOV, `SENSOR_LAYOUT`-derived source tags,
-/// and the strongest contributors with their perceived colours.
-fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
+/// Maps `click_x` in `0.0..=strip_width` to the egocentric heading angle
+/// `[-180°, +180°]` and tests which eye cone contains it.
+/// If multiple cones overlap at `click_x`, the cone whose optical center is closest
+/// to the click angle is selected deterministically (ties broken by lower eye index).
+pub fn hit_test_eye_cone(
+    strip_width: f32,
+    eye_directions: &[f32; NUM_EYES],
+    eye_fovs: &[f32; NUM_EYES],
+    click_x: f32,
+) -> Option<usize> {
+    if strip_width <= 0.0 || !click_x.is_finite() || click_x < 0.0 || click_x > strip_width {
+        return None;
+    }
+
+    // Map [0, strip_width] linearly to [-180°, +180°]
+    let click_angle = (click_x / strip_width) * 360.0 - 180.0;
+
+    let mut best_match: Option<(usize, f32)> = None;
+
+    for eye in 0..NUM_EYES {
+        let dir = eye_directions[eye].to_degrees();
+        let fov = eye_fovs[eye].to_degrees().max(1.0);
+        let half_fov = fov / 2.0;
+
+        // Shortest angular difference in [0, 180] wrapped modulo 360
+        let diff = (click_angle - dir).rem_euclid(360.0);
+        let ang_dist = if diff > 180.0 { 360.0 - diff } else { diff };
+
+        if ang_dist <= half_fov {
+            match best_match {
+                None => best_match = Some((eye, ang_dist)),
+                Some((_, best_dist)) if ang_dist < best_dist => {
+                    best_match = Some((eye, ang_dist));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    best_match.map(|(eye, _)| eye)
+}
+
+/// Render the egocentric sense attribution panel with optional interactive click listeners (bd-2z0.7.15).
+fn render_sense_attribution_with_listeners(
+    detail: &AgentInspectorDetails,
+    eye_listeners: Option<&[Option<Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>]>,
+) -> Div {
     let container = div()
         .flex()
         .flex_col()
@@ -9438,11 +9522,20 @@ fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
     } else {
         String::new()
     };
-    let mut panel = container.child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
-        "Sense attribution · t{} · {} contributors{truncation}",
-        attribution.tick.0,
-        attribution.contributions.len(),
-    )));
+    let title = if let Some(selected) = detail.selected_eye {
+        format!(
+            "Sense attribution · Eye {selected} selected · t{} · {} contributors{truncation}",
+            attribution.tick.0,
+            attribution.contributions.len(),
+        )
+    } else {
+        format!(
+            "Sense attribution · t{} · {} contributors{truncation}",
+            attribution.tick.0,
+            attribution.contributions.len(),
+        )
+    };
+    let mut panel = container.child(div().text_xs().text_color(rgb(0x94a3b8)).child(title));
 
     // True-angle strip: the agent's full [-180°, +180°] egocentric field
     // unrolled at 1px/degree. Each eye covers its real angular span at its
@@ -9458,6 +9551,7 @@ fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
             .rounded_sm()
             .bg(rgb(0x0a1420));
         for eye in 0..NUM_EYES {
+            let is_selected = detail.selected_eye == Some(eye);
             let mut seen = [0.0_f32; 3];
             let mut density = 0.0_f32;
             for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye == Some(eye)) {
@@ -9475,35 +9569,56 @@ fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
             let left = clamp_x(strip_width / 2.0 + direction - fov / 2.0);
             let width = fov.min(strip_width - left).max(1.0);
             // Density scales brightness; an empty cone stays faintly visible
-            // so its coverage is still readable.
-            let brightness = density.mul_add(0.75, 0.25);
+            // so its coverage is still readable. When another cone is selected, dim unselected.
+            let mut brightness = density.mul_add(0.75, 0.25);
+            if detail.selected_eye.is_some() && !is_selected {
+                brightness *= 0.45;
+            }
             let tint = [
                 seen[0] * brightness,
                 seen[1] * brightness,
                 seen[2] * brightness,
             ];
-            strip = strip.child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(3.0))
-                    .w(px(width))
-                    .h(px(10.0))
-                    .rounded_sm()
-                    .bg(rgb_from_triplet(tint)),
-            );
+            let mut cone_div = div()
+                .absolute()
+                .left(px(left))
+                .top(px(if is_selected { 2.0 } else { 3.0 }))
+                .w(px(width))
+                .h(px(if is_selected { 12.0 } else { 10.0 }))
+                .rounded_sm()
+                .bg(rgb_from_triplet(tint));
+            if is_selected {
+                cone_div = cone_div.border_1().border_color(rgb(0x38bdf8));
+            }
+            if let Some(listener) = eye_listeners.and_then(|l| l.get(eye).cloned().flatten()) {
+                cone_div =
+                    cone_div.on_mouse_down(MouseButton::Left, move |e, w, a| listener(e, w, a));
+            }
+            strip = strip.child(cone_div);
         }
-        // Contributor bearings as full-height ticks in their perceived colour.
+        // Contributor bearings as ticks in their perceived colour; dimmed when outside selected cone.
         for contribution in &attribution.contributions {
             let x = clamp_x(strip_width / 2.0 + contribution.bearing.to_degrees());
+            let (tick_h, tick_top, tick_color) =
+                if let Some(selected) = detail.selected_eye.filter(|&e| e < NUM_EYES) {
+                    let in_cone = contribution.eye_density[selected] > 0.0
+                        || contribution.eye_rgb[selected] != [0.0, 0.0, 0.0];
+                    if in_cone {
+                        (16.0_f32, 0.0_f32, rgb_from_triplet(contribution.color))
+                    } else {
+                        (8.0_f32, 4.0_f32, rgb(0x334155))
+                    }
+                } else {
+                    (16.0_f32, 0.0_f32, rgb_from_triplet(contribution.color))
+                };
             strip = strip.child(
                 div()
                     .absolute()
                     .left(px(x))
-                    .top(px(0.0))
+                    .top(px(tick_top))
                     .w(px(2.0))
-                    .h(px(16.0))
-                    .bg(rgb_from_triplet(contribution.color)),
+                    .h(px(tick_h))
+                    .bg(tick_color),
             );
         }
         // Heading line at 0°.
@@ -9516,14 +9631,18 @@ fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
                 .h(px(16.0))
                 .bg(rgb(0x64748b)),
         );
+        let legend = if detail.selected_eye.is_some() {
+            "-180°       eye cones at true angles · highlighted cone active · click to toggle       +180°"
+        } else {
+            "-180°       eye cones at true angles · ticks = contributors · click cone/row to filter +180°"
+        };
         panel = panel
             .child(strip)
-            .child(div().text_xs().text_color(rgb(0x475569)).child(
-                "-180°            eye cones at true angles · ticks = contributors            +180°",
-            ));
+            .child(div().text_xs().text_color(rgb(0x475569)).child(legend));
     }
 
     for eye in 0..NUM_EYES {
+        let is_selected = detail.selected_eye == Some(eye);
         let mut rgb_seen = [0.0_f32; 3];
         let mut density = 0.0_f32;
         let mut saturated = false;
@@ -9546,89 +9665,202 @@ fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
         let direction = detail.eye_directions[eye].to_degrees();
         let fov = detail.eye_fovs[eye].to_degrees();
         let marker = if saturated { cells.as_str() } else { "" };
-        panel = panel.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(color_swatch(rgb_seen))
-                .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
-                    "eye{eye} ∠{direction:+.0}° fov {fov:.0}° · ρ{density:.2}{marker}"
-                ))),
-        );
-    }
-
-    let mut scalar_line = String::new();
-    for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye.is_none()) {
-        let index = channel.index;
-        scalar_line.push_str(&format!(
-            "{} {:.2}[{}]",
-            channel.name,
-            attribution.clamped[index],
-            sensor_source_tag(channel.kind)
-        ));
-        if attribution.saturated[index] {
-            scalar_line.push_str(&format!("⚠{:.1}", attribution.raw[index]));
+        let selected_suffix = if is_selected { " [active]" } else { "" };
+        let mut row_div = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_sm()
+            .px_1()
+            .child(color_swatch(rgb_seen))
+            .child(div().text_xs().text_color(if is_selected { rgb(0x38bdf8) } else { rgb(0xcbd5f5) }).child(format!(
+                "eye{eye} ∠{direction:+.0}° fov {fov:.0}° · ρ{density:.2}{marker}{selected_suffix}"
+            )));
+        if is_selected {
+            row_div = row_div
+                .border_1()
+                .border_color(rgb(0x38bdf8))
+                .bg(rgb(0x162a45));
         }
-        scalar_line.push_str("  ");
+        if let Some(listener) = eye_listeners.and_then(|l| l.get(eye).cloned().flatten()) {
+            row_div = row_div.on_mouse_down(MouseButton::Left, move |e, w, a| listener(e, w, a));
+        }
+        panel = panel.child(row_div);
     }
-    panel = panel.child(
-        div()
-            .text_xs()
-            .text_color(rgb(0x94a3b8))
-            .child(scalar_line.trim_end().to_owned()),
-    );
 
-    if attribution.contributions.is_empty() {
+    if let Some(selected_eye) = detail.selected_eye {
+        // Single cone projection via SensorAttribution::for_eye
+        if let Some(cone) = attribution.for_eye(selected_eye) {
+            let truncation_note = if cone.parent_truncated > 0 {
+                format!(" (+{} truncated upstream)", cone.parent_truncated)
+            } else {
+                String::new()
+            };
+            panel = panel.child(div().text_xs().text_color(rgb(0x38bdf8)).child(format!(
+                "Eye {selected_eye} Cone Projection · {} in cone{truncation_note}",
+                cone.contributions.len()
+            )));
+            if cone.filtered_out > 0 {
+                panel = panel.child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+                    "{} neighbours outside this cone",
+                    cone.filtered_out
+                )));
+            }
+
+            let mut channel_spans = String::new();
+            for (slot, letter) in ["d", "R", "G", "B"].iter().enumerate() {
+                channel_spans.push_str(&format!("{letter}{:.2}", cone.clamped[slot]));
+                if cone.saturated[slot] {
+                    channel_spans.push_str(&format!("⚠{:.1}", cone.raw[slot]));
+                }
+                channel_spans.push(' ');
+            }
+            let eye_swatch = color_swatch([cone.clamped[1], cone.clamped[2], cone.clamped[3]]);
+            panel = panel.child(
+                div().flex().items_center().gap_2().child(eye_swatch).child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child(channel_spans.trim_end().to_owned()),
+                ),
+            );
+
+            if cone.contributions.is_empty() {
+                panel = panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x64748b))
+                        .child("nobody in this cone"),
+                );
+            } else {
+                for contribution in cone
+                    .contributions
+                    .iter()
+                    .take(SENSE_PROBE_VISIBLE_CONTRIBUTORS)
+                {
+                    panel = panel.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(color_swatch(contribution.color))
+                            .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                                "#{} ∠{:+.0}° d{:.0} ρ{:.2} Σ{:.2}",
+                                contribution.source_uid.0,
+                                contribution.bearing.to_degrees(),
+                                contribution.distance,
+                                contribution.density,
+                                contribution.total,
+                            ))),
+                    );
+                }
+                let hidden = cone
+                    .contributions
+                    .len()
+                    .saturating_sub(SENSE_PROBE_VISIBLE_CONTRIBUTORS);
+                if hidden > 0 {
+                    panel = panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x64748b))
+                            .child(format!("… +{hidden} weaker contributors in cone")),
+                    );
+                }
+            }
+        } else {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xef4444))
+                    .child(format!("eye {selected_eye} is out of range")),
+            );
+        }
+    } else {
+        // Multi-cone overview: scalar line + top contributors across all eyes
+        let mut scalar_line = String::new();
+        for channel in SENSOR_LAYOUT.iter().filter(|c| c.eye.is_none()) {
+            let index = channel.index;
+            scalar_line.push_str(&format!(
+                "{} {:.2}[{}]",
+                channel.name,
+                attribution.clamped[index],
+                sensor_source_tag(channel.kind)
+            ));
+            if attribution.saturated[index] {
+                scalar_line.push_str(&format!("⚠{:.1}", attribution.raw[index]));
+            }
+            scalar_line.push_str("  ");
+        }
         panel = panel.child(
             div()
                 .text_xs()
-                .text_color(rgb(0x64748b))
-                .child("no neighbours within sense radius (self/grid channels stay live)"),
+                .text_color(rgb(0x94a3b8))
+                .child(scalar_line.trim_end().to_owned()),
         );
-    } else {
-        for contribution in attribution
-            .contributions
-            .iter()
-            .take(SENSE_PROBE_VISIBLE_CONTRIBUTORS)
-        {
-            let dominant_eye = contribution
-                .eye_density
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map_or(0, |(eye, _)| eye);
-            panel = panel.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(color_swatch(contribution.color))
-                    .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
-                        "#{} ∠{:+.0}° d{:.0} eye{} Σ{:.2}",
-                        contribution.source_uid.0,
-                        contribution.bearing.to_degrees(),
-                        contribution.distance,
-                        dominant_eye,
-                        contribution.total,
-                    ))),
-            );
-        }
-        let hidden = attribution
-            .contributions
-            .len()
-            .saturating_sub(SENSE_PROBE_VISIBLE_CONTRIBUTORS);
-        if hidden > 0 {
+
+        if attribution.contributions.is_empty() {
             panel = panel.child(
                 div()
                     .text_xs()
                     .text_color(rgb(0x64748b))
-                    .child(format!("… +{hidden} weaker contributors")),
+                    .child("no neighbours within sense radius (self/grid channels stay live)"),
             );
+        } else {
+            for contribution in attribution
+                .contributions
+                .iter()
+                .take(SENSE_PROBE_VISIBLE_CONTRIBUTORS)
+            {
+                let dominant_eye = contribution
+                    .eye_density
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map_or(0, |(eye, _)| eye);
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(color_swatch(contribution.color))
+                        .child(div().text_xs().text_color(rgb(0xcbd5f5)).child(format!(
+                            "#{} ∠{:+.0}° d{:.0} eye{} Σ{:.2}",
+                            contribution.source_uid.0,
+                            contribution.bearing.to_degrees(),
+                            contribution.distance,
+                            dominant_eye,
+                            contribution.total,
+                        ))),
+                );
+            }
+            let hidden = attribution
+                .contributions
+                .len()
+                .saturating_sub(SENSE_PROBE_VISIBLE_CONTRIBUTORS);
+            if hidden > 0 {
+                panel = panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x64748b))
+                        .child(format!("… +{hidden} weaker contributors")),
+                );
+            }
         }
     }
 
     panel
+}
+
+/// Renders `SensorAttribution` verbatim: clamped values, an explicit `⚠raw`
+/// marker on saturated channels (contributions legitimately sum above 1.0 —
+/// normalising them would destroy the information), eye rows labeled with
+/// their true relative angle and FOV, `SENSOR_LAYOUT`-derived source tags,
+/// and the strongest contributors with their perceived colours (bd-2z0.7.15).
+pub fn render_sense_attribution(detail: &AgentInspectorDetails) -> Div {
+    render_sense_attribution_with_listeners(
+        detail,
+        None::<&[Option<Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>]>,
+    )
 }
 
 fn render_brain_bars(values: &[f32], is_sensor: bool) -> Div {
@@ -11324,6 +11556,7 @@ struct InspectorState {
     focused_agent: Option<AgentId>,
     hovered_agent: Option<AgentId>,
     persistence_last_enabled: u32,
+    selected_eye: Option<usize>,
 }
 
 impl Default for InspectorState {
@@ -11332,6 +11565,41 @@ impl Default for InspectorState {
             focused_agent: None,
             hovered_agent: None,
             persistence_last_enabled: 60,
+            selected_eye: None,
+        }
+    }
+}
+
+impl InspectorState {
+    /// Step the sense-probe cone selection (bd-2z0.7.15).
+    ///
+    /// The states are `All` (`None`) followed by each eye (`Some(0)` to `Some(NUM_EYES - 1)`),
+    /// so `NUM_EYES + 1` in total, and stepping wraps in both directions.
+    pub fn cycle_eye_selection(&mut self, forward: bool) {
+        let states = NUM_EYES + 1;
+        let current = self.selected_eye.map_or(0, |eye| eye + 1);
+        let next = if forward {
+            (current + 1) % states
+        } else {
+            (current + states - 1) % states
+        };
+        self.selected_eye = (next > 0).then(|| next - 1);
+    }
+
+    /// Select or deselect a specific eye cone.
+    #[allow(dead_code)]
+    pub fn select_eye(&mut self, eye: Option<usize>) {
+        self.selected_eye = eye.filter(|&e| e < NUM_EYES);
+    }
+
+    /// Toggle selection of a specific eye cone.
+    pub fn toggle_eye_selection(&mut self, eye: usize) {
+        if eye < NUM_EYES {
+            if self.selected_eye == Some(eye) {
+                self.selected_eye = None;
+            } else {
+                self.selected_eye = Some(eye);
+            }
         }
     }
 }
@@ -11346,6 +11614,7 @@ struct InspectorSnapshot {
     persistence_enabled: bool,
     persistence_interval: u32,
     persistence_cached_interval: u32,
+    selected_eye: Option<usize>,
 }
 
 /// HUD chrome system (bd-f4x0), derived from the bd-9pqz art direction.
@@ -12164,6 +12433,11 @@ impl SelectionEventKind {
     }
 }
 impl InspectorSnapshot {
+    #[allow(dead_code)]
+    pub fn selected_eye(&self) -> Option<usize> {
+        self.selected_eye
+    }
+
     fn from_snapshot(
         published: &RenderSnapshot,
         host: &ChannelHostPort,
@@ -12175,6 +12449,7 @@ impl InspectorSnapshot {
         let mut snapshot = InspectorSnapshot {
             total_agents: published.world.agents.len(),
             persistence_cached_interval: inspector.persistence_last_enabled,
+            selected_eye: inspector.selected_eye,
             ..InspectorSnapshot::default()
         };
 
@@ -12309,6 +12584,7 @@ impl InspectorSnapshot {
                         agent_id,
                         detail,
                         brain_capture.clone(),
+                        inspector.selected_eye,
                     )
                 }
                 Ok(_) => None,
@@ -12468,6 +12744,8 @@ enum CommandAction {
     ToggleStatsPanel,
     ToggleHistoryPanel,
     TogglePerfPanel,
+    CycleEyeForward,
+    CycleEyeBackward,
 }
 
 impl CommandAction {
@@ -12499,6 +12777,8 @@ impl CommandAction {
             CommandAction::ToggleStatsPanel => "Toggle stats panel",
             CommandAction::ToggleHistoryPanel => "Toggle history panel",
             CommandAction::TogglePerfPanel => "Toggle performance panel",
+            CommandAction::CycleEyeForward => "Cycle sense probe eye forward",
+            CommandAction::CycleEyeBackward => "Cycle sense probe eye backward",
         }
     }
 }
@@ -12616,6 +12896,14 @@ impl Default for InputBindings {
         map.insert(
             CommandAction::TogglePerfPanel,
             Keystroke::parse("3").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::CycleEyeForward,
+            Keystroke::parse(".").unwrap_or_default(),
+        );
+        map.insert(
+            CommandAction::CycleEyeBackward,
+            Keystroke::parse("ctrl-.").unwrap_or_default(),
         );
         Self { map }
     }
@@ -12836,6 +13124,12 @@ pub struct AgentInspectorDetails {
     pub eye_directions: [f32; NUM_EYES],
     /// Clamped per-eye fields of view, radians.
     pub eye_fovs: [f32; NUM_EYES],
+    /// Selected eye cone index for egocentric sensor filtering (bd-2z0.7.15).
+    ///
+    /// When `Some(eye)`, the sense probe panel renders the single-cone
+    /// projection from `SensorAttribution::for_eye(eye)` and highlights
+    /// the cone on the true-angle strip.
+    pub selected_eye: Option<usize>,
     /// Bounded genome browser view model (bd-16g.13.3).
     pub genome_browser: Option<scriptbots_core::genome_browser::GenomeBrowserViewModel>,
 }
@@ -12863,6 +13157,7 @@ impl AgentInspectorDetails {
         agent_id: AgentId,
         detail: scriptbots_runtime::channel::AgentInspectorData,
         brain_capture: Option<BrainInspectorCapture>,
+        selected_eye: Option<usize>,
     ) -> Option<Self> {
         let agent = snapshot
             .world
@@ -12923,6 +13218,7 @@ impl AgentInspectorDetails {
             sense_attribution: detail.sensor_attribution,
             eye_directions: detail.eye_direction,
             eye_fovs: detail.eye_fov,
+            selected_eye,
             genome_browser: detail.genome_browser,
         })
     }
@@ -13051,6 +13347,7 @@ impl AgentInspectorDetails {
             sense_attribution,
             eye_directions,
             eye_fovs,
+            selected_eye: None,
             genome_browser,
         })
     }
@@ -17879,6 +18176,8 @@ mod command_characterization_tests {
             ("p", CommandAction::ToggleSimulationPause),
             ("ctrl-p", CommandAction::CyclePalette),
             ("0", CommandAction::FitWorld),
+            (".", CommandAction::CycleEyeForward),
+            ("ctrl-.", CommandAction::CycleEyeBackward),
         ] {
             let stroke = Keystroke::parse(binding).expect("valid production shortcut");
             assert_eq!(
@@ -18940,8 +19239,9 @@ mod command_characterization_tests {
             .inspect_agent(uid, 3)
             .expect("owner inspector query")
             .expect("live owner inspector detail");
-        let detail = AgentInspectorDetails::from_snapshot(&snapshot, agent, owned_detail, None)
-            .expect("detail for the live agent");
+        let detail =
+            AgentInspectorDetails::from_snapshot(&snapshot, agent, owned_detail, None, None)
+                .expect("detail for the live agent");
         assert!(!detail.brain_bound, "fixture agent must be unbound");
         let outputs: &[f32; scriptbots_core::OUTPUT_SIZE] = detail.outputs
             [..scriptbots_core::OUTPUT_SIZE]
@@ -21463,5 +21763,356 @@ mod command_characterization_tests {
         assert_eq!(hud_snapshot.controls.speed_multiplier, 2.5);
         assert_eq!(canvas_snapshot.controls.speed_multiplier, 2.5);
         assert_eq!(host.port.snapshot_hub().latest().world.tick, 0);
+    }
+
+    #[test]
+    fn test_inspector_state_cycle_eye_selection_wraps_both_ways() {
+        let mut state = InspectorState::default();
+        assert_eq!(state.selected_eye, None, "starts with all cones selected");
+
+        // Forward cycling through every eye and wrapping back to None
+        let expected_forward = [Some(0), Some(1), Some(2), Some(3), None];
+        for (step, &expected) in expected_forward.iter().enumerate() {
+            state.cycle_eye_selection(true);
+            assert_eq!(
+                state.selected_eye, expected,
+                "forward step {step} must match expected"
+            );
+        }
+
+        // Multiple laps forward
+        for _ in 0..3 {
+            for &expected in &expected_forward {
+                state.cycle_eye_selection(true);
+                assert_eq!(state.selected_eye, expected);
+            }
+        }
+
+        // Backward cycling from None wraps to Some(3) down to Some(0) and back to None
+        let expected_backward = [Some(3), Some(2), Some(1), Some(0), None];
+        for (step, &expected) in expected_backward.iter().enumerate() {
+            state.cycle_eye_selection(false);
+            assert_eq!(
+                state.selected_eye, expected,
+                "backward step {step} must match expected"
+            );
+        }
+
+        // Multiple laps backward
+        for _ in 0..3 {
+            for &expected in &expected_backward {
+                state.cycle_eye_selection(false);
+                assert_eq!(state.selected_eye, expected);
+            }
+        }
+
+        // Direct select_eye
+        state.select_eye(Some(2));
+        assert_eq!(state.selected_eye, Some(2));
+        state.select_eye(Some(NUM_EYES)); // out of range
+        assert_eq!(state.selected_eye, None);
+        state.select_eye(Some(999));
+        assert_eq!(state.selected_eye, None);
+
+        // Toggle selection
+        state.toggle_eye_selection(1);
+        assert_eq!(state.selected_eye, Some(1));
+        state.toggle_eye_selection(1); // toggles off
+        assert_eq!(state.selected_eye, None);
+        state.toggle_eye_selection(2);
+        assert_eq!(state.selected_eye, Some(2));
+        state.toggle_eye_selection(3); // switches to 3
+        assert_eq!(state.selected_eye, Some(3));
+        state.toggle_eye_selection(100); // out of range no-op
+        assert_eq!(state.selected_eye, Some(3));
+    }
+
+    #[test]
+    fn test_hit_test_eye_cone_at_true_angles_and_boundaries() {
+        use std::f32::consts::PI;
+
+        let strip_width = 360.0_f32;
+        // 4 eyes arranged around the body:
+        // eye 0: 0° (0 rad), FOV 60° (π/3 rad) -> spans -30° to +30°
+        // eye 1: +60° (π/3 rad), FOV 60° -> spans +30° to +90°
+        // eye 2: -60° (-π/3 rad), FOV 60° -> spans -90° to -30°
+        // eye 3: 180° (π rad), FOV 60° -> spans 150° to 210° (wrapped: -150°)
+        let eye_dirs = [0.0, PI / 3.0, -PI / 3.0, PI];
+        let eye_fovs = [PI / 3.0, PI / 3.0, PI / 3.0, PI / 3.0];
+
+        // Center clicks
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 180.0),
+            Some(0)
+        ); // 0°
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 240.0),
+            Some(1)
+        ); // +60°
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 120.0),
+            Some(2)
+        ); // -60°
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 360.0),
+            Some(3)
+        ); // +180°
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 0.0),
+            Some(3)
+        ); // -180°
+
+        // Uncovered regions (100° is outside [30..90] and [150..210])
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 280.0),
+            None
+        ); // +100°
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 80.0),
+            None
+        ); // -100°
+
+        // Out of bounds / invalid inputs
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, -1.0),
+            None
+        );
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 361.0),
+            None
+        );
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, f32::NAN),
+            None
+        );
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, f32::INFINITY),
+            None
+        );
+        assert_eq!(hit_test_eye_cone(0.0, &eye_dirs, &eye_fovs, 180.0), None);
+        assert_eq!(hit_test_eye_cone(-360.0, &eye_dirs, &eye_fovs, 180.0), None);
+    }
+
+    #[test]
+    fn test_hit_test_eye_cone_overlapping_picks_closest_center() {
+        use std::f32::consts::PI;
+
+        let strip_width = 360.0_f32;
+        // Two overlapping eyes:
+        // eye 0: +20° (20 * PI / 180), FOV 60° (spans -10° to +50°)
+        // eye 1: +40° (40 * PI / 180), FOV 60° (spans +10° to +70°)
+        // eye 2: -120°
+        // eye 3: 180°
+        let to_rad = |deg: f32| deg * PI / 180.0;
+        let eye_dirs = [to_rad(20.0), to_rad(40.0), to_rad(-120.0), to_rad(180.0)];
+        let eye_fovs = [to_rad(60.0), to_rad(60.0), to_rad(40.0), to_rad(40.0)];
+
+        // At +25° (click_x = 180.0 + 25.0 = 205.0):
+        // Distance to eye 0 is 5°, distance to eye 1 is 15° -> eye 0 wins
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 205.0),
+            Some(0)
+        );
+
+        // At +35° (click_x = 180.0 + 35.0 = 215.0):
+        // Distance to eye 0 is 15°, distance to eye 1 is 5° -> eye 1 wins
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 215.0),
+            Some(1)
+        );
+
+        // At +30° (click_x = 210.0, exact midpoint):
+        // Symmetrical tie broken deterministically by smaller index -> eye 0 wins
+        assert_eq!(
+            hit_test_eye_cone(strip_width, &eye_dirs, &eye_fovs, 210.0),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_selected_eye_survives_focus_change_and_death() {
+        let world = command_characterization_world();
+        let (agent0_id, agent1_id) = {
+            let mut guard = world.lock().expect("lock world");
+            let a0 = guard
+                .try_spawn_agent(AgentData::default())
+                .expect("spawn agent 0");
+            let a1 = guard
+                .try_spawn_agent(AgentData::default())
+                .expect("spawn agent 1");
+            (a0, a1)
+        };
+        let host = TestHost::take(world);
+        let mut view = host_view(Arc::clone(&host));
+
+        // Focus agent 0
+        if let Ok(mut insp) = view.inspector.lock() {
+            insp.focused_agent = Some(agent0_id);
+            insp.cycle_eye_selection(true); // Some(0)
+            insp.cycle_eye_selection(true); // Some(1)
+            assert_eq!(insp.selected_eye, Some(1));
+        }
+
+        // Snapshot carries selected_eye
+        let snap = view.snapshot();
+        assert_eq!(snap.inspector.selected_eye(), Some(1));
+
+        // Change focus to agent 1
+        if let Ok(mut insp) = view.inspector.lock() {
+            insp.focused_agent = Some(agent1_id);
+        }
+        let snap2 = view.snapshot();
+        assert_eq!(
+            snap2.inspector.selected_eye(),
+            Some(1),
+            "selection is an eye index, not agent-bound, so it survives focus change"
+        );
+
+        // Clear focus (e.g. agent dies)
+        if let Ok(mut insp) = view.inspector.lock() {
+            insp.focused_agent = None;
+        }
+        let snap3 = view.snapshot();
+        assert_eq!(
+            snap3.inspector.selected_eye(),
+            Some(1),
+            "selection survives focus loss"
+        );
+    }
+
+    #[test]
+    fn test_canonical_eye_attribution_projection_matches_full_probe() {
+        use scriptbots_core::{AgentUid, SensorAttribution, SensorContribution, Tick};
+
+        let agent = AgentId::from(slotmap::KeyData::from_ffi(1));
+        let tick = Tick(42);
+        let mut raw = [0.0_f32; scriptbots_core::INPUT_SIZE];
+        let mut clamped = [0.0_f32; scriptbots_core::INPUT_SIZE];
+        let mut saturated = [false; scriptbots_core::INPUT_SIZE];
+
+        // SENSOR_LAYOUT channel indices:
+        // Eye 0: density at 0, R at 1, G at 2, B at 3
+        // Eye 1: density at 5, R at 6, G at 7, B at 8
+        // Eye 2: density at 12, R at 13, G at 14, B at 15
+        // Eye 3: density at 21, R at 22, G at 23, B at 24
+        raw[0] = 1.8;
+        clamped[0] = 1.0;
+        saturated[0] = true; // saturated density on eye 0
+
+        raw[1] = 0.5;
+        clamped[1] = 0.5;
+
+        // Neighbour 1: seen by eye 0
+        let mut eye_density1 = [0.0_f32; NUM_EYES];
+        eye_density1[0] = 0.8;
+        let mut eye_rgb1 = [[0.0_f32; 3]; NUM_EYES];
+        eye_rgb1[0] = [0.5, 0.0, 0.0];
+        let c1 = SensorContribution {
+            source: agent,
+            source_uid: AgentUid(101),
+            bearing: 0.1,
+            distance: 15.0,
+            color: [1.0, 0.0, 0.0],
+            eye_density: eye_density1,
+            eye_rgb: eye_rgb1,
+            smell: 0.0,
+            sound: 0.0,
+            hearing: 0.0,
+            blood: 0.0,
+            total: 1.3,
+        };
+
+        // Neighbour 2: seen ONLY by eye 2
+        let mut eye_density2 = [0.0_f32; NUM_EYES];
+        eye_density2[2] = 0.6;
+        let mut eye_rgb2 = [[0.0_f32; 3]; NUM_EYES];
+        eye_rgb2[2] = [0.0, 0.6, 0.0];
+        let c2 = SensorContribution {
+            source: agent,
+            source_uid: AgentUid(202),
+            bearing: -1.0,
+            distance: 25.0,
+            color: [0.0, 1.0, 0.0],
+            eye_density: eye_density2,
+            eye_rgb: eye_rgb2,
+            smell: 0.0,
+            sound: 0.0,
+            hearing: 0.0,
+            blood: 0.0,
+            total: 1.2,
+        };
+
+        let attribution = SensorAttribution {
+            agent,
+            tick,
+            raw,
+            clamped,
+            saturated,
+            contributions: vec![c1, c2],
+            truncated: 2,
+        };
+
+        // Projection for Eye 0:
+        let cone0 = attribution.for_eye(0).expect("eye 0 projection");
+        assert_eq!(cone0.eye, 0);
+        assert_eq!(cone0.clamped[0], 1.0);
+        assert_eq!(cone0.clamped[1], 0.5);
+        assert!(cone0.saturated[0], "eye 0 density must be saturated");
+        assert_eq!(cone0.contributions.len(), 1, "c1 is in eye 0");
+        assert_eq!(cone0.contributions[0].source_uid.get(), 101);
+        assert_eq!(cone0.filtered_out, 1, "c2 is filtered out from eye 0");
+        assert_eq!(
+            cone0.parent_truncated, 2,
+            "inherits parent truncation count"
+        );
+
+        // Projection for Eye 3 (empty cone):
+        let cone3 = attribution.for_eye(3).expect("eye 3 projection");
+        assert_eq!(cone3.contributions.len(), 0);
+        assert_eq!(cone3.filtered_out, 2);
+
+        // Render with detail:
+        let mut detail = AgentInspectorDetails {
+            agent_id: agent,
+            label: "Test Agent".to_string(),
+            color: [0.2, 0.8, 0.2],
+            position: Position::new(50.0, 50.0),
+            energy: 100.0,
+            health: 1.0,
+            age: 50,
+            generation: scriptbots_core::Generation(1),
+            brain_descriptor: "TestBrain".to_string(),
+            mutation_rates: scriptbots_core::MutationRates::default(),
+            trait_modifiers: scriptbots_core::TraitModifiers::default(),
+            spike_length: 0.0,
+            sensors: vec![0.0; scriptbots_core::INPUT_SIZE],
+            outputs: vec![0.0; scriptbots_core::OUTPUT_SIZE],
+            brain_bound: true,
+            brain_activations: None,
+            brain_source_tick: None,
+            brain_request_revision: None,
+            brain_payload_bytes: None,
+            brain_inspection_status: None,
+            sense_attribution: Some(attribution),
+            eye_directions: [0.0, 1.0, -1.0, 3.14],
+            eye_fovs: [1.0, 1.0, 1.0, 1.0],
+            selected_eye: Some(0),
+            genome_browser: None,
+        };
+
+        // Render selected eye 0 (in-cone contributor present, saturated density)
+        let _div0 = render_sense_attribution(&detail);
+
+        // Render selected eye 3 (empty cone: nobody in this cone)
+        detail.selected_eye = Some(3);
+        let _div3 = render_sense_attribution(&detail);
+
+        // Render selected out of range eye 99 (graceful fallback, no panic)
+        detail.selected_eye = Some(99);
+        let _div_oob = render_sense_attribution(&detail);
+
+        // Render all cones (selected_eye = None)
+        detail.selected_eye = None;
+        let _div_all = render_sense_attribution(&detail);
     }
 }
