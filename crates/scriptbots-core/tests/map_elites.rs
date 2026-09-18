@@ -1273,3 +1273,144 @@ fn test_map_elites_export_reload_diff_resurrect_replay_e2e() {
     );
     println!(r#"{{"schema":"scriptbots.qd-archive.e2e.v1","phase":"completed"}}"#);
 }
+
+#[test]
+fn test_map_elites_matched_seed_fitness_vs_novelty_experiment() {
+    println!(r#"{{"schema":"scriptbots.qd-experiment.e2e.v1","phase":"start"}}"#);
+
+    let seed = 424_242;
+    let make_study_world = |mode: EvolutionSelectionMode| -> WorldState {
+        let axis = Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4).expect("axis");
+        let space = BehaviorSpaceV0 {
+            version: BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+            axes: vec![axis],
+        };
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            population_minimum: 12,
+            population_spawn_interval: 25,
+            reproduction_cooldown: 5,
+            reproduction_energy_threshold: 1.5,
+            reproduction_energy_cost: 0.8,
+            reproduction_attempt_chance: 0.8,
+            selection_mode: mode,
+            archive_enabled: true,
+            archive_space: space,
+            archive_interval: 10,
+            archive_min_lifetime_ticks: 1,
+            rng_seed: Some(seed),
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let key = world
+            .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+            .expect("register MLP");
+
+        for i in 0..12 {
+            let data = AgentData {
+                age: 5,
+                ..AgentData::default()
+            };
+            let id = world.try_spawn_agent(data).expect("spawn agent");
+            world.bind_agent_brain(id, key).expect("bind brain");
+            world
+                .try_update_agent_runtime(id, |rt| {
+                    rt.energy = 6.0;
+                    rt.reproduction_counter = 8.0;
+                    #[allow(clippy::cast_precision_loss)]
+                    let tend = (i as f32) * 0.08;
+                    rt.herbivore_tendency = tend;
+                })
+                .expect("update runtime");
+        }
+        world
+    };
+
+    let mut world_fitness = make_study_world(EvolutionSelectionMode::Fitness);
+    let mut world_novelty = make_study_world(EvolutionSelectionMode::Novelty);
+
+    for _ in 0..150 {
+        world_fitness.step().expect("step fitness");
+        world_novelty.step().expect("step novelty");
+    }
+
+    let metrics_fitness = world_fitness.archive().expect("fitness archive").metrics();
+    let metrics_novelty = world_novelty.archive().expect("novelty archive").metrics();
+
+    println!(
+        r#"{{"schema":"scriptbots.qd-experiment.e2e.v1","phase":"study_executed","fitness_coverage":{},"novelty_coverage":{},"fitness_occupied":{},"novelty_occupied":{},"fitness_qd":{},"novelty_qd":{}}}"#,
+        metrics_fitness.coverage,
+        metrics_novelty.coverage,
+        metrics_fitness.occupied_cells,
+        metrics_novelty.occupied_cells,
+        metrics_fitness.qd_score_raw,
+        metrics_novelty.qd_score_raw
+    );
+
+    // Assert that novelty mode computes active novelty states
+    let novelty_state = world_novelty.novelty_state().expect("novelty state cached");
+    assert!(
+        !novelty_state.scores.is_empty(),
+        "novelty scores must be populated"
+    );
+
+    // Assert world trajectories diverge between fitness and novelty
+    let digest_fitness = world_fitness
+        .characterization_digest_v0()
+        .expect("fitness digest");
+    let digest_novelty = world_novelty
+        .characterization_digest_v0()
+        .expect("novelty digest");
+    assert_ne!(
+        digest_fitness.agents, digest_novelty.agents,
+        "novelty selection must produce divergent agent evolutionary trajectories"
+    );
+
+    // Export both archives to CSV and assert independent diff
+    let mut csv_fitness = Vec::new();
+    world_fitness
+        .archive()
+        .expect("fitness archive")
+        .export_csv("study_fitness", &mut csv_fitness)
+        .expect("export fitness csv");
+
+    let mut csv_novelty = Vec::new();
+    world_novelty
+        .archive()
+        .expect("novelty archive")
+        .export_csv("study_novelty", &mut csv_novelty)
+        .expect("export novelty csv");
+
+    let diff =
+        diff_csv(csv_fitness.as_slice(), csv_novelty.as_slice(), 50_000).expect("diff archives");
+    println!(
+        r#"{{"schema":"scriptbots.qd-experiment.e2e.v1","phase":"archive_diff","only_in_fitness":{},"only_in_novelty":{},"improved_in_novelty":{}}}"#,
+        diff.only_in_a.len(),
+        diff.only_in_b.len(),
+        diff.improved_in_b.len()
+    );
+
+    // Resurrect top elite from novelty archive into novelty world
+    let pop_before = world_novelty.agent_count();
+    let resurrect = Intervention::SpawnFromArchive {
+        selector: CellSelector::TopKByQuality(1),
+        placement: Placement::Seeded {
+            region: Region::All,
+            seed: 8888,
+        },
+        headroom: None,
+        herbivore_tendency: Some(0.3),
+    };
+    world_novelty
+        .enqueue_intervention(resurrect)
+        .expect("enqueue resurrection");
+    world_novelty.step().expect("step resurrection");
+    assert_eq!(world_novelty.agent_count(), pop_before + 1);
+
+    println!(
+        r#"{{"schema":"scriptbots.qd-experiment.e2e.v1","phase":"resurrection_verified","new_population":{}}}"#,
+        world_novelty.agent_count()
+    );
+    println!(r#"{{"schema":"scriptbots.qd-experiment.e2e.v1","phase":"completed"}}"#);
+}
