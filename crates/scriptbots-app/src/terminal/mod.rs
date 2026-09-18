@@ -39,7 +39,7 @@ use scriptbots_core::{
     ControlSettings, NUM_EYES, SENSOR_LAYOUT, SensorAttribution, SensorKind, SimulationCommand,
     TerrainKind, TickSummary,
     attribution::{AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs},
-    narrative::{EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord},
+    narrative::{EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord, SubjectRef},
     visual,
 };
 use scriptbots_runtime::{
@@ -596,6 +596,8 @@ struct TerminalApp<'a> {
     /// rendered buffer, and exporting anything else is what made the old
     /// screenshot describe a different renderer than the user's (bd-2z0.14.2.6).
     export_requested: bool,
+    /// Deterministic sub-step subdivision for tick-driven animations (bd-2z0.14.2.4).
+    sub_step: u8,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -720,9 +722,15 @@ impl<'a> TerminalApp<'a> {
             hover_tooltip: None,
             selected_eye: None,
             export_requested: false,
+            sub_step: 0,
         };
         app.refresh_snapshot();
         app
+    }
+
+    /// Derive the unified deterministic animation clock for this frame (bd-2z0.14.2.4).
+    pub fn tick_phase(&self) -> TickPhase {
+        TickPhase::compute(self.snapshot.tick, self.paused, self.sub_step, self.motion)
     }
 
     fn ensure_control_runtime_running(&self) -> Result<()> {
@@ -1089,6 +1097,10 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        if !self.paused && !self.motion.is_reduced() {
+            self.sub_step = (self.sub_step + 1) % 16;
+        }
+
         // Ensure we start from a clean buffer every frame to avoid ghosting artifacts
         frame.render_widget(Clear, frame.area());
 
@@ -1831,6 +1843,7 @@ impl<'a> TerminalApp<'a> {
                     self.canvas_capability.mode,
                 ));
             }
+            let tick_phase = self.tick_phase();
             let canvas = if use_canvas {
                 self.map_canvas.as_mut()
             } else {
@@ -1847,6 +1860,7 @@ impl<'a> TerminalApp<'a> {
                     day_night: self.day_night,
                     capability: self.canvas_capability,
                     motion: self.motion,
+                    tick_phase,
                     density: &mut self.map_density,
                     viewport,
                 },
@@ -2296,9 +2310,23 @@ impl<'a> TerminalApp<'a> {
         } else {
             items.push(ListItem::new(Span::raw("Metrics not yet available")));
         }
+        let border_style = if self.snapshot.focused_agent_uid.is_some()
+            && !self.motion.is_reduced()
+            && !self.paused
+        {
+            let p = self.tick_phase().pulse(0.15, 0.7, 1.0);
+            if p > 0.85 {
+                self.palette.accent_style()
+            } else {
+                Style::default()
+            }
+        } else {
+            Style::default()
+        };
         let block = Block::default()
             .title(self.palette.title("Brains"))
-            .borders(Borders::ALL);
+            .borders(Borders::ALL)
+            .border_style(border_style);
         frame.render_widget(List::new(items).block(block), area);
     }
 
@@ -2580,10 +2608,23 @@ impl<'a> TerminalApp<'a> {
         // runtime.sensors food 0.025 — small enough to read as rounding until you
         // check a channel where the world moved, which is exactly what makes an
         // unlabelled panel misleading rather than merely imprecise.
-        let block = Block::default().borders(Borders::ALL).title(Span::styled(
-            " Sense Probe (now, not what the brain saw) ",
-            self.palette.header_style(),
-        ));
+        let border_style = if self.motion.is_reduced() || self.paused {
+            self.palette.header_style()
+        } else {
+            let p = self.tick_phase().pulse(0.2, 0.7, 1.0);
+            if p > 0.85 {
+                self.palette.accent_style().add_modifier(Modifier::BOLD)
+            } else {
+                self.palette.header_style()
+            }
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(Span::styled(
+                " Sense Probe (now, not what the brain saw) ",
+                self.palette.header_style(),
+            ));
         let Some(probe) = &snapshot.probe else {
             frame.render_widget(
                 Paragraph::new(vec![
@@ -2820,7 +2861,21 @@ impl<'a> TerminalApp<'a> {
             .saturating_add(area.height.saturating_sub(box_height + 2));
         let toast_area = Rect::new(x, y, box_width, box_height);
 
-        let border_style = self.palette.accent_style();
+        let border_style = if self.motion.is_reduced() || self.paused {
+            self.palette.accent_style()
+        } else {
+            let min_remaining = self
+                .toasts
+                .iter()
+                .map(|t| t.expiry_tick.saturating_sub(current_tick))
+                .min()
+                .unwrap_or(u64::MAX);
+            if min_remaining <= 2 {
+                self.palette.accent_style().add_modifier(Modifier::DIM)
+            } else {
+                self.palette.accent_style()
+            }
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
@@ -2829,7 +2884,15 @@ impl<'a> TerminalApp<'a> {
         let lines: Vec<Line<'_>> = self
             .toasts
             .iter()
-            .map(|t| Line::from(Span::styled(format!(" • {}", t.message), Style::default())))
+            .map(|t| {
+                let remaining = t.expiry_tick.saturating_sub(current_tick);
+                let style = if !self.motion.is_reduced() && !self.paused && remaining <= 3 {
+                    Style::default().add_modifier(Modifier::DIM)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(format!(" • {}", t.message), style))
+            })
             .collect();
 
         let paragraph = Paragraph::new(lines).block(block);
@@ -4070,6 +4133,8 @@ struct Snapshot {
     narrative_dropped: u64,
     /// The narrative ring's configured capacity.
     narrative_capacity: usize,
+    /// Event pulse rings radiating on the world canvas (bd-2z0.14.2.4).
+    event_rings: Vec<EventPulseRing>,
     /// Focused agent's identity for the brain panel (bd-16g.4.3).
     focused_agent_uid: Option<u64>,
     /// Whether the focused agent's brain binding has a runner; an unbound agent's
@@ -4827,6 +4892,22 @@ impl Snapshot {
             food_cells.iter().sum::<f32>() / food_cells.len() as f32
         };
 
+        let mut event_rings = Vec::new();
+        let current_tick = summary.tick.0;
+        for ev in snapshot.narrative_events.as_ref() {
+            if let Some(SubjectRef::Agent(uid)) = ev.subject
+                && let Some(agent) = agents.iter().find(|a| a.uid == Some(uid.0))
+                && let Some(ring) = EventPulseRing::from_event(
+                    ev.tick.0,
+                    current_tick,
+                    agent.position.0,
+                    agent.position.1,
+                )
+            {
+                event_rings.push(ring);
+            }
+        }
+
         Self {
             tick: summary.tick.0,
             epoch: snapshot.world.epoch,
@@ -4862,6 +4943,7 @@ impl Snapshot {
             narrative: snapshot.narrative_events.as_ref().clone(),
             narrative_dropped: snapshot.narrative_dropped_events,
             narrative_capacity: config.narrative_capacity,
+            event_rings,
             focused_agent_uid: None,
             focused_brain_bound: false,
             focused_outputs: None,
@@ -6963,6 +7045,8 @@ struct MapWidget<'a> {
     /// food pulse). Carried rather than re-resolved so the frame cannot animate
     /// against the cause the startup log reported.
     motion: MotionPolicy,
+    /// Unified deterministic animation clock (bd-2z0.14.2.4).
+    tick_phase: TickPhase,
     /// Grow-only per-sub-pixel agent counts, reused across frames.
     density: &'a mut Vec<u16>,
     /// The world window being shown; the sole screen<->world transform.
@@ -6989,6 +7073,50 @@ fn tile_pulse(motion: MotionPolicy, tick: u64, tile_x: u32, tile_y: u32) -> f32 
         CANVAS_PULSE_STILL
     } else {
         visual::shimmer(tick, tile_x, tile_y)
+    }
+}
+
+/// Paint an expanding event pulse ring onto the Cues layer of the canvas (bd-2z0.14.2.4).
+fn paint_event_pulse_ring(
+    canvas: &mut SubCellBuffer,
+    viewport: &CanvasViewport,
+    ring: &EventPulseRing,
+    color: [f32; 3],
+) {
+    if ring.intensity <= 0.0 {
+        return;
+    }
+    let Some((fx, fy)) = viewport.canvas_at(ring.x, ring.y) else {
+        return;
+    };
+    let sub_w = canvas.sub_width();
+    let sub_h = canvas.sub_height();
+    if sub_w == 0 || sub_h == 0 {
+        return;
+    }
+    let span_w = f32::from(sub_w);
+    let span_h = f32::from(sub_h);
+    let cx = (fx * span_w).floor() as i32;
+    let cy = (fy * span_h).floor() as i32;
+
+    let r_sub = (ring.radius * viewport.zoom()).round() as i32;
+    let r = r_sub.clamp(1, 12);
+    let alpha = (ring.intensity * 0.75).clamp(0.1, 1.0);
+    let rgba = [color[0], color[1], color[2], alpha];
+
+    let r_inner = if r <= 1 { 1 } else { (r - 1) * (r - 1) };
+    let r_outer = (r + 1) * (r + 1);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d2 = dx * dx + dy * dy;
+            if d2 >= r_inner && d2 <= r_outer {
+                let px = cx + dx;
+                let py = cy + dy;
+                if px >= 0 && px < i32::from(sub_w) && py >= 0 && py < i32::from(sub_h) {
+                    canvas.set(Layer::Cues, px as u16, py as u16, rgba);
+                }
+            }
+        }
     }
 }
 
@@ -7025,8 +7153,10 @@ const CANVAS_FOOD_PULSE_SWING: f32 = 0.15;
 /// that a whisker never reads as a second agent, bright enough to see the sector.
 const CANVAS_WHISKER_DIM: f32 = 0.45;
 
-/// Brightness multiplier applied to a boosted agent's dot.
+/// Baseline brightness multiplier applied to a boosted agent's dot.
 const CANVAS_BOOST_FLARE: f32 = 1.6;
+/// Half-depth of the boosted agent pulse swing (bd-2z0.14.2.4).
+const CANVAS_BOOST_SWING: f32 = 0.4;
 
 /// Spike length above which the canvas paints an attack cue.
 const CANVAS_SPIKE_THRESHOLD: f32 = 0.5;
@@ -7114,6 +7244,15 @@ impl CanvasViewport {
         Self {
             centre: (clamp_axis(centre.0), clamp_axis(centre.1)),
             span,
+        }
+    }
+
+    /// The active magnification factor.
+    fn zoom(&self) -> f32 {
+        if self.span > 0.0 {
+            1.0 / self.span
+        } else {
+            1.0
         }
     }
 
@@ -7587,7 +7726,11 @@ impl MapWidget<'_> {
             // Boost is the one agent state with no other channel on this canvas:
             // a dot is a dot regardless of speed, so flare it instead.
             let flare = if agent.boosted {
-                CANVAS_BOOST_FLARE
+                ctx.tick_phase.pulse(
+                    0.25,
+                    CANVAS_BOOST_FLARE - CANVAS_BOOST_SWING,
+                    CANVAS_BOOST_FLARE + CANVAS_BOOST_SWING,
+                )
             } else {
                 1.0
             };
@@ -7634,6 +7777,15 @@ impl MapWidget<'_> {
                 ) {
                     canvas.set(Layer::Cues, tx, ty, [1.0, 0.32, 0.16, 1.0]);
                 }
+            }
+        }
+
+        // Event pulse rings on Layer::Cues (bd-2z0.14.2.4).
+        // Only render pulses when motion is permitted and world is not paused.
+        if !ctx.motion.is_reduced() && !ctx.tick_phase.paused {
+            let cue_color = [1.0, 0.85, 0.25];
+            for ring in &ctx.snapshot.event_rings {
+                paint_event_pulse_ring(canvas, &ctx.viewport, ring, cue_color);
             }
         }
 
@@ -7912,6 +8064,7 @@ mod tests {
         let mut density = Vec::new();
         let area = Rect::new(0, 0, cells.0, cells.1);
         let mut buf = Buffer::empty(area);
+        let tick_phase = TickPhase::compute(snapshot.tick, false, 0, motion);
         MapWidget {
             snapshot,
             terrain,
@@ -7922,6 +8075,7 @@ mod tests {
             day_night,
             capability,
             motion,
+            tick_phase,
             density: &mut density,
             viewport,
         }
@@ -8044,6 +8198,7 @@ mod tests {
             day_night: canvas_test_day_night(),
             capability: canvas_test_capability(),
             motion: MotionPolicy::Full,
+            tick_phase: TickPhase::compute(snapshot.tick, false, 0, MotionPolicy::Full),
             density: &mut Vec::new(),
             viewport: CanvasViewport::new(1.0, (0.5, 0.5)),
         }
@@ -8391,6 +8546,80 @@ mod tests {
         assert!(
             animated_somewhere,
             "food must pulse under full motion, or the freeze above proves nothing"
+        );
+    }
+
+    /// Boosted agents throb under full motion and freeze at baseline under reduced motion (bd-2z0.14.2.4).
+    #[test]
+    fn boosted_agent_throbs_under_full_motion_and_stills_under_reduced_motion() {
+        let land = canvas_test_terrain();
+        let frame_at = |tick: u64, motion: MotionPolicy| {
+            let mut agent = canvas_test_agent(0.5, 0.5);
+            agent.boosted = true;
+            let snapshot = Snapshot {
+                tick,
+                agents: vec![agent],
+                ..Snapshot::default()
+            };
+            render_canvas_frame_motion(&snapshot, &land, (4, 2), (0, 0.0), motion)
+        };
+
+        let still = frame_at(0, MotionPolicy::ReducedByEnvironment);
+        for tick in 1..8 {
+            assert_eq!(
+                frame_at(tick, MotionPolicy::ReducedByEnvironment),
+                still,
+                "reduced motion must freeze boosted agent flare at tick {tick}"
+            );
+        }
+
+        let animated_somewhere = (0..8).any(|tick| frame_at(tick, MotionPolicy::Full) != still);
+        assert!(
+            animated_somewhere,
+            "boosted agent must throb under full motion, or the freeze above proves nothing"
+        );
+    }
+
+    /// Event pulse rings render on Layer::Cues under full motion and are suppressed under reduced motion (bd-2z0.14.2.4).
+    #[test]
+    fn event_pulse_ring_renders_on_canvas_and_stills_under_reduced_motion() {
+        let land = canvas_test_terrain();
+        let mut empty_snapshot = Snapshot::default();
+        empty_snapshot.tick = 10;
+        let empty_frame = render_canvas_frame_motion(
+            &empty_snapshot,
+            &land,
+            (8, 4),
+            (0, 0.0),
+            MotionPolicy::Full,
+        );
+
+        let mut ring_snapshot = Snapshot::default();
+        ring_snapshot.tick = 10;
+        ring_snapshot.event_rings = vec![EventPulseRing {
+            x: 0.5,
+            y: 0.5,
+            radius: 2.0,
+            intensity: 1.0,
+        }];
+
+        let active_frame =
+            render_canvas_frame_motion(&ring_snapshot, &land, (8, 4), (0, 0.0), MotionPolicy::Full);
+        assert_ne!(
+            active_frame, empty_frame,
+            "event pulse ring must render onto canvas under full motion"
+        );
+
+        let reduced_frame = render_canvas_frame_motion(
+            &ring_snapshot,
+            &land,
+            (8, 4),
+            (0, 0.0),
+            MotionPolicy::ReducedByEnvironment,
+        );
+        assert_eq!(
+            reduced_frame, empty_frame,
+            "reduced motion must suppress event pulse rings on canvas"
         );
     }
 
@@ -9939,6 +10168,12 @@ mod tests {
                                 day_night: canvas_test_day_night(),
                                 capability: canvas_test_capability(),
                                 motion: MotionPolicy::Full,
+                                tick_phase: TickPhase::compute(
+                                    snapshot.tick,
+                                    false,
+                                    0,
+                                    MotionPolicy::Full,
+                                ),
                                 density: &mut Vec::new(),
                                 viewport: CanvasViewport::new(1.0, (0.5, 0.5)),
                             },
@@ -10085,6 +10320,7 @@ mod tests {
                 day_night: canvas_test_day_night(),
                 capability,
                 motion: MotionPolicy::Full,
+                tick_phase: TickPhase::compute(snapshot.tick, false, 0, MotionPolicy::Full),
                 density: &mut density,
                 viewport: CanvasViewport::new(1.0, (0.5, 0.5)),
             }
@@ -15968,6 +16204,107 @@ mod tests {
             app.map_zoom_level, 1.0,
             "zoom_out must decrease map_zoom_level"
         );
+    }
+
+    /// Status toast text and border fade in the final 3 ticks under full motion (bd-2z0.14.2.4).
+    #[test]
+    fn status_toast_fades_near_expiry_under_full_motion() {
+        with_shortcut_app(|app| {
+            app.motion = MotionPolicy::Full;
+            app.paused = false;
+            app.toasts.clear();
+            app.snapshot.tick = 100;
+            app.toasts
+                .push_back(ToastEntry::new("Expiring soon", 50, 52));
+            assert_eq!(app.toasts[0].expiry_tick, 102);
+
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(60, 24)).expect("test backend");
+            terminal
+                .draw(|frame| {
+                    app.draw_toasts(frame, Rect::new(0, 0, 60, 20));
+                })
+                .expect("draw toast");
+            let buffer = terminal.backend().buffer();
+            let mut found_dim = false;
+            for cell in &buffer.content {
+                if cell.symbol() == "E" && cell.modifier.contains(Modifier::DIM) {
+                    found_dim = true;
+                }
+            }
+            assert!(
+                found_dim,
+                "toast text must have Modifier::DIM when near expiry under full motion"
+            );
+
+            app.motion = MotionPolicy::ReducedByEnvironment;
+            terminal
+                .draw(|frame| {
+                    app.draw_toasts(frame, Rect::new(0, 0, 60, 20));
+                })
+                .expect("draw toast reduced");
+            let buffer_reduced = terminal.backend().buffer();
+            let mut found_dim_reduced = false;
+            for cell in &buffer_reduced.content {
+                if cell.symbol() == "E" && cell.modifier.contains(Modifier::DIM) {
+                    found_dim_reduced = true;
+                }
+            }
+            assert!(
+                !found_dim_reduced,
+                "toast text must NOT have Modifier::DIM under reduced motion"
+            );
+        });
+    }
+
+    /// Focused brain panel border pulses under full motion and stays static under reduced motion (bd-2z0.14.2.4).
+    #[test]
+    fn focused_brain_border_pulses_under_full_motion_and_stills_under_reduced_motion() {
+        with_shortcut_app(|app| {
+            app.snapshot.focused_agent_uid = Some(42);
+            app.paused = false;
+            app.motion = MotionPolicy::Full;
+
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(60, 24)).expect("test backend");
+            let area = Rect::new(0, 0, 30, 10);
+
+            let mut styles = Vec::new();
+            for sub in 0..16 {
+                app.sub_step = sub;
+                terminal
+                    .draw(|frame| {
+                        app.draw_brains(frame, area, &app.snapshot);
+                    })
+                    .expect("draw brains");
+                let border_cell = &terminal.backend().buffer()[(0, 0)];
+                styles.push((border_cell.fg, border_cell.modifier));
+            }
+
+            let dynamic = styles.windows(2).any(|w| w[0] != w[1]);
+            assert!(
+                dynamic,
+                "focused brain border must pulse across sub-steps under full motion"
+            );
+
+            app.motion = MotionPolicy::ReducedByEnvironment;
+            let mut reduced_styles = Vec::new();
+            for sub in 0..16 {
+                app.sub_step = sub;
+                terminal
+                    .draw(|frame| {
+                        app.draw_brains(frame, area, &app.snapshot);
+                    })
+                    .expect("draw brains reduced");
+                let border_cell = &terminal.backend().buffer()[(0, 0)];
+                reduced_styles.push((border_cell.fg, border_cell.modifier));
+            }
+            let reduced_static = reduced_styles.windows(2).all(|w| w[0] == w[1]);
+            assert!(
+                reduced_static,
+                "focused brain border must remain static across sub-steps under reduced motion"
+            );
+        });
     }
 }
 
