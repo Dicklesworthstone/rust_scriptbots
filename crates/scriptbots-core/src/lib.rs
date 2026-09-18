@@ -17487,6 +17487,7 @@ mod map_sandbox {
 
     /// Standard default 6-biome tileset suitable for procedural generation.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn default_tileset_spec() -> TilesetSpec {
         TilesetSpec {
             id: "default-v1".to_owned(),

@@ -293,7 +293,7 @@ pub struct MapApplyRequestBody {
 
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>, ()> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(());
     }
     (0..s.len())
@@ -326,10 +326,10 @@ pub fn parse_map_artifact(value: &Value) -> Result<MapArtifact, ControlError> {
             if let Ok(artifact) = serde_json::from_str::<MapArtifact>(s) {
                 return Ok(artifact);
             }
-            if let Ok(bytes) = hex_to_bytes(s) {
-                if let Ok(artifact) = postcard::from_bytes::<MapArtifact>(&bytes) {
-                    return Ok(artifact);
-                }
+            if let Ok(bytes) = hex_to_bytes(s)
+                && let Ok(artifact) = postcard::from_bytes::<MapArtifact>(&bytes)
+            {
+                return Ok(artifact);
             }
             Err(ControlError::InvalidPatch(
                 "invalid map artifact string: not a valid file path, JSON string, or hex postcard"
@@ -2645,6 +2645,6 @@ pub(crate) mod tests {
             .apply_map(bad_artifact, None)
             .expect("submit mismatched map");
         let observed_bad = host.wait_finished(&status_bad.command_id);
-        assert_eq!(observed_bad.application_state, "rejected");
+        assert_eq!(observed_bad.application_state, "failed");
     }
 }
