@@ -2581,4 +2581,70 @@ pub(crate) mod tests {
             APPLICATION_STATE_ADMITTED
         );
     }
+
+    #[test]
+    fn test_map_generate_deterministic_content_hash() {
+        let (handle, _receiver) = handle();
+
+        let map1 = handle
+            .generate_map(20, 20, Some(50), 12345, None)
+            .expect("generate map 1");
+        let map2 = handle
+            .generate_map(20, 20, Some(50), 12345, None)
+            .expect("generate map 2");
+
+        assert_eq!(map1.terrain().width(), 20);
+        assert_eq!(map1.terrain().height(), 20);
+        assert_eq!(map1.terrain().cell_size(), 50);
+        assert_eq!(
+            map1.scientific_content_hash(),
+            map2.scientific_content_hash()
+        );
+
+        let map_diff_seed = handle
+            .generate_map(20, 20, Some(50), 54321, None)
+            .expect("generate map different seed");
+        assert_ne!(
+            map1.scientific_content_hash(),
+            map_diff_seed.scientific_content_hash()
+        );
+    }
+
+    #[test]
+    fn test_map_apply_success_and_dimension_mismatch_rejection() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let (width, height) = world.config().food_dimensions().expect("food dimensions");
+        let cell_size = world.config().food_cell_size;
+
+        let host = TestHost::spawn(world);
+        let handle = host.handle();
+
+        // 1. Valid map application matching world dimensions
+        let artifact = handle
+            .generate_map(width, height, Some(cell_size), 42, None)
+            .expect("generate valid map");
+
+        let status = handle
+            .apply_map(artifact, None)
+            .expect("apply valid map command");
+        assert_eq!(status.application_state, APPLICATION_STATE_ADMITTED);
+
+        let observed = host.wait_applied(&status);
+        assert_eq!(observed.application_state, "applied");
+
+        // Verify revisions in the host's world state
+        let snapshot = handle.read_snapshot().expect("snapshot");
+        assert!(snapshot.revisions.control.get() > 0);
+        assert!(snapshot.revisions.scientific.get() > 0);
+
+        // 2. Mismatched map dimensions rejected by host
+        let bad_artifact = handle
+            .generate_map(width + 10, height + 10, Some(cell_size), 42, None)
+            .expect("generate mismatched map");
+        let status_bad = handle
+            .apply_map(bad_artifact, None)
+            .expect("submit mismatched map");
+        let observed_bad = host.wait_finished(&status_bad.command_id);
+        assert_eq!(observed_bad.application_state, "rejected");
+    }
 }

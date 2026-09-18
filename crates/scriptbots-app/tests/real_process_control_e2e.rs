@@ -475,6 +475,97 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
          restored as a convenience: {shot_body}"
     );
 
+    // (7b) REST map generation and application
+    let gen_payload = br#"{"width":120,"height":60,"cell_size":50,"seed":42}"#;
+    let (gen_code, gen_body) = http_with_body(
+        rest_addr,
+        "POST",
+        "/api/v1/map/generate",
+        gen_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(gen_code, 200, "REST map generate must succeed: {gen_body}");
+    let gen_json: serde_json::Value = serde_json::from_str(&gen_body)?;
+    assert_eq!(gen_json["terrain"]["width"], 120);
+    assert_eq!(gen_json["terrain"]["height"], 60);
+
+    let apply_req = serde_json::json!({ "artifact": gen_json });
+    let apply_payload = serde_json::to_vec(&apply_req)?;
+    let (apply_code, apply_body) = http_with_body(
+        rest_addr,
+        "POST",
+        "/api/v1/map/apply",
+        &apply_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(apply_code, 200, "REST map apply must succeed: {apply_body}");
+    let apply_id = json_str(&apply_body, "command_id")
+        .ok_or_else(|| anyhow!("map apply carried no command_id: {apply_body}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut map_apply_state = String::new();
+    while Instant::now() < deadline {
+        let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{apply_id}"))?;
+        if code == 200 {
+            map_apply_state = json_str(&body, "application_state").unwrap_or_default();
+            if map_apply_state == "applied" {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        map_apply_state, "applied",
+        "map apply must reach applied state"
+    );
+
+    // Negative REST control: mismatched dimensions
+    let bad_gen_payload = br#"{"width":130,"height":60,"cell_size":50,"seed":42}"#;
+    let (_, bad_gen_body) = http_with_body(
+        rest_addr,
+        "POST",
+        "/api/v1/map/generate",
+        bad_gen_payload,
+        Some("application/json"),
+    )?;
+    let bad_gen_json: serde_json::Value = serde_json::from_str(&bad_gen_body)?;
+    let bad_apply_req = serde_json::json!({ "artifact": bad_gen_json });
+    let bad_apply_payload = serde_json::to_vec(&bad_apply_req)?;
+    let (bad_apply_code, bad_apply_body) = http_with_body(
+        rest_addr,
+        "POST",
+        "/api/v1/map/apply",
+        &bad_apply_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        bad_apply_code, 200,
+        "bad map apply command must be enqueued: {bad_apply_body}"
+    );
+    let bad_apply_id = json_str(&bad_apply_body, "command_id")
+        .ok_or_else(|| anyhow!("bad map apply carried no command_id: {bad_apply_body}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut bad_map_apply_state = String::new();
+    while Instant::now() < deadline {
+        let (code, body) = http(
+            rest_addr,
+            "GET",
+            &format!("/api/control/status/{bad_apply_id}"),
+        )?;
+        if code == 200 {
+            bad_map_apply_state = json_str(&body, "application_state").unwrap_or_default();
+            if bad_map_apply_state == "rejected" {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        bad_map_apply_state, "rejected",
+        "mismatched map apply must reach rejected state"
+    );
+
     // (8) FastMCP HTTP protocol verification
     let (health_code, health_body) = http(mcp_addr, "GET", "/health")?;
     assert_eq!(health_code, 200, "MCP /health must return 200");
@@ -581,7 +672,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     let tools = list_json["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 13, "MCP tools/list must return all 13 tools");
+    assert_eq!(tools.len(), 15, "MCP tools/list must return all 15 tools");
 
     // MCP tools/call get_status
     let status_payload = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#;
@@ -599,6 +690,79 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     assert!(
         status_call_body.contains("tick"),
         "MCP get_status must report tick: {status_call_body}"
+    );
+
+    // MCP map_generate
+    let map_gen_payload = br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"map_generate","arguments":{"width":120,"height":60,"cell_size":50,"seed":42}}}"#;
+    let (mcp_gen_code, mcp_gen_body) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        map_gen_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        mcp_gen_code, 200,
+        "MCP map_generate must return 200: {mcp_gen_body}"
+    );
+    let mcp_gen_json: serde_json::Value = serde_json::from_str(&mcp_gen_body)?;
+    let artifact_text = mcp_gen_json["result"]["content"][0]["text"]
+        .as_str()
+        .expect("artifact text");
+    let artifact_val: serde_json::Value = serde_json::from_str(artifact_text)?;
+    assert_eq!(artifact_val["terrain"]["width"], 120);
+    assert_eq!(artifact_val["terrain"]["height"], 60);
+
+    // MCP map_apply
+    let mcp_apply_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {
+            "name": "map_apply",
+            "arguments": {
+                "artifact": artifact_val
+            }
+        }
+    });
+    let mcp_apply_payload = serde_json::to_vec(&mcp_apply_req)?;
+    let (mcp_apply_code, mcp_apply_body) = http_with_body(
+        mcp_addr,
+        "POST",
+        "/mcp",
+        &mcp_apply_payload,
+        Some("application/json"),
+    )?;
+    assert_eq!(
+        mcp_apply_code, 200,
+        "MCP map_apply must return 200: {mcp_apply_body}"
+    );
+    let mcp_apply_json: serde_json::Value = serde_json::from_str(&mcp_apply_body)?;
+    let status_text = mcp_apply_json["result"]["content"][0]["text"]
+        .as_str()
+        .expect("status text");
+    let status_obj: serde_json::Value = serde_json::from_str(status_text)?;
+    let mcp_cmd_id = status_obj["command_id"].as_str().expect("command_id");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut mcp_apply_state = String::new();
+    while Instant::now() < deadline {
+        let (code, body) = http(
+            rest_addr,
+            "GET",
+            &format!("/api/control/status/{mcp_cmd_id}"),
+        )?;
+        if code == 200 {
+            mcp_apply_state = json_str(&body, "application_state").unwrap_or_default();
+            if mcp_apply_state == "applied" {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        mcp_apply_state, "applied",
+        "MCP map_apply command must reach applied state"
     );
 
     // MCP tools/call unknown tool -> JSON-RPC error
@@ -820,5 +984,96 @@ fn verify_server_progress(storage: &str, seed: Option<u64>) -> Result<()> {
         "server progress observed: {result}; artifacts: {}",
         run_dir.display()
     );
+    Ok(())
+}
+
+/// Real CLI subcommand acceptance for procedural map generation and application/validation.
+#[test]
+#[serial]
+fn real_process_cli_map_generate_and_apply_roundtrip() -> Result<()> {
+    let run_dir = tempdir()?;
+    let json_map = run_dir.path().join("map.json");
+    let postcard_map = run_dir.path().join("map.postcard");
+
+    // 1. Generate JSON map artifact via CLI
+    let output_json = Command::new(binary())
+        .args([
+            "map-generate",
+            "--width",
+            "120",
+            "--height",
+            "60",
+            "--cell-size",
+            "50",
+            "--seed",
+            "42",
+            "--out",
+        ])
+        .arg(&json_map)
+        .output()
+        .context("execute map-generate --out map.json")?;
+    assert!(
+        output_json.status.success(),
+        "CLI map-generate JSON failed: {}",
+        String::from_utf8_lossy(&output_json.stderr)
+    );
+    assert!(json_map.exists(), "generated JSON map file must exist");
+
+    // 2. Validate the generated JSON map via CLI map-apply
+    let output_apply_json = Command::new(binary())
+        .args(["map-apply", "--file"])
+        .arg(&json_map)
+        .output()
+        .context("execute map-apply --file map.json")?;
+    assert!(
+        output_apply_json.status.success(),
+        "CLI map-apply JSON failed: {}",
+        String::from_utf8_lossy(&output_apply_json.stderr)
+    );
+    let stdout_apply = String::from_utf8_lossy(&output_apply_json.stdout);
+    assert!(
+        stdout_apply.contains("120x60"),
+        "output must describe dimensions: {stdout_apply}"
+    );
+
+    // 3. Generate Postcard map artifact via CLI
+    let output_postcard = Command::new(binary())
+        .args([
+            "map-generate",
+            "--width",
+            "120",
+            "--height",
+            "60",
+            "--cell-size",
+            "50",
+            "--seed",
+            "42",
+            "--out",
+        ])
+        .arg(&postcard_map)
+        .output()
+        .context("execute map-generate --out map.postcard")?;
+    assert!(
+        output_postcard.status.success(),
+        "CLI map-generate postcard failed: {}",
+        String::from_utf8_lossy(&output_postcard.stderr)
+    );
+    assert!(
+        postcard_map.exists(),
+        "generated postcard map file must exist"
+    );
+
+    // 4. Validate the postcard map via CLI map-apply
+    let output_apply_postcard = Command::new(binary())
+        .args(["map-apply", "--file"])
+        .arg(&postcard_map)
+        .output()
+        .context("execute map-apply --file map.postcard")?;
+    assert!(
+        output_apply_postcard.status.success(),
+        "CLI map-apply postcard failed: {}",
+        String::from_utf8_lossy(&output_apply_postcard.stderr)
+    );
+
     Ok(())
 }

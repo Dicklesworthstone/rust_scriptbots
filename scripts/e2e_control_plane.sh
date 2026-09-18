@@ -135,6 +135,46 @@ case "$BAD_CODE" in 4*) ok "malformed control/step rejected with HTTP $BAD_CODE"
 UNKNOWN_CODE="$(code "$REST/api/control/status/bd-does-not-exist")"
 case "$UNKNOWN_CODE" in 4*) ok "unknown command id answered with typed HTTP $UNKNOWN_CODE";; *) bad "unknown command id typed refusal (got HTTP $UNKNOWN_CODE)";; esac
 
+# -------------------------------------------------- procedural map endpoints ---
+# Query simulation config to determine world grid dimensions
+CFG_JSON="$(http "$REST/api/config" | jq -r '.config' 2>/dev/null)"
+W_UNITS="$(printf '%s' "$CFG_JSON" | jq -r '.world_width // 6000' 2>/dev/null)"
+H_UNITS="$(printf '%s' "$CFG_JSON" | jq -r '.world_height // 3000' 2>/dev/null)"
+CS="$(printf '%s' "$CFG_JSON" | jq -r '.food_cell_size // 50' 2>/dev/null)"
+GRID_W=$(( W_UNITS / CS ))
+GRID_H=$(( H_UNITS / CS ))
+
+# REST map generate produces a valid map artifact matching world dimensions
+MAP_GEN_JSON="$(http -X POST "$REST/api/v1/map/generate" -H 'content-type: application/json' \
+    -d "{\"width\":$GRID_W,\"height\":$GRID_H,\"cell_size\":$CS,\"seed\":42}")"
+MAP_W="$(printf '%s' "$MAP_GEN_JSON" | jq -r '.terrain.width // 0' 2>/dev/null)"
+MAP_H="$(printf '%s' "$MAP_GEN_JSON" | jq -r '.terrain.height // 0' 2>/dev/null)"
+check "REST map/generate produces artifact with matching width" "$MAP_W" "$GRID_W"
+check "REST map/generate produces artifact with matching height" "$MAP_H" "$GRID_H"
+
+# REST map apply submits the artifact and reaches terminal applied state
+MAP_TMP="$WORKDIR/map.json"
+printf '%s' "$MAP_GEN_JSON" > "$MAP_TMP"
+MAP_APPLY_BODY="$WORKDIR/apply.json"
+jq -n --slurpfile art "$MAP_TMP" '{"artifact": $art[0]}' > "$MAP_APPLY_BODY"
+
+MAP_APPLY_RES="$(http -X POST "$REST/api/v1/map/apply" -H 'content-type: application/json' --data-binary "@$MAP_APPLY_BODY")"
+MAP_APPLY_ID="$(printf '%s' "$MAP_APPLY_RES" | jq -r '.command_id // empty' 2>/dev/null)"
+[ -n "$MAP_APPLY_ID" ] && ok "REST map/apply enqueues command ($MAP_APPLY_ID)" || bad "REST map/apply enqueues command"
+MAP_APPLY_STATE="$(wait_command_terminal "$MAP_APPLY_ID")"
+check "REST map/apply reaches terminal applied state" "$MAP_APPLY_STATE" "applied"
+
+# REST map apply negative control: dimension mismatch is rejected
+BAD_MAP_GEN="$(http -X POST "$REST/api/v1/map/generate" -H 'content-type: application/json' \
+    -d "{\"width\":$((GRID_W + 10)),\"height\":$GRID_H,\"cell_size\":$CS,\"seed\":42}")"
+printf '%s' "$BAD_MAP_GEN" > "$WORKDIR/bad_map.json"
+jq -n --slurpfile art "$WORKDIR/bad_map.json" '{"artifact": $art[0]}' > "$WORKDIR/bad_apply.json"
+BAD_APPLY_RES="$(http -X POST "$REST/api/v1/map/apply" -H 'content-type: application/json' --data-binary "@$WORKDIR/bad_apply.json")"
+BAD_APPLY_ID="$(printf '%s' "$BAD_APPLY_RES" | jq -r '.command_id // empty' 2>/dev/null)"
+[ -n "$BAD_APPLY_ID" ] && ok "REST map/apply mismatched dimensions enqueues command ($BAD_APPLY_ID)" || bad "REST map/apply mismatched dimensions enqueues command"
+BAD_APPLY_STATE="$(wait_command_terminal "$BAD_APPLY_ID")"
+check "REST map/apply mismatched dimensions reaches rejected state" "$BAD_APPLY_STATE" "rejected"
+
 # ------------------------------------------------------------------- SSE ---
 SSE_COUNT="$(curl -s -N --max-time 10 -H 'Accept: text/event-stream' "$REST/api/ticks/stream" \
     | grep -c '^data:' 2>/dev/null)"
@@ -167,6 +207,28 @@ UNKNOWN_TOOL="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' \
     -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}' \
     | jq -r '.error.code // "no-error"' 2>/dev/null)"
 case "$UNKNOWN_TOOL" in no-error|null) bad "unknown MCP tool yields a JSON-RPC error";; *) ok "unknown MCP tool yields a JSON-RPC error ($UNKNOWN_TOOL)";; esac
+
+# MCP map_generate tool call
+MCP_MAP_CALL="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"map_generate\",\"arguments\":{\"width\":$GRID_W,\"height\":$GRID_H,\"cell_size\":$CS,\"seed\":123}}}")"
+MCP_MAP_TEXT="$(printf '%s' "$MCP_MAP_CALL" | jq -r '.result.content[0].text // empty' 2>/dev/null)"
+MCP_MAP_W="$(printf '%s' "$MCP_MAP_TEXT" | jq -r '.terrain.width // 0' 2>/dev/null)"
+check "MCP map_generate tool produces artifact with matching width" "$MCP_MAP_W" "$GRID_W"
+
+# MCP map_apply tool call
+printf '%s' "$MCP_MAP_TEXT" > "$WORKDIR/mcp_map.json"
+jq -n --slurpfile art "$WORKDIR/mcp_map.json" '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"map_apply","arguments":{"artifact":$art[0]}}}' > "$WORKDIR/mcp_apply.json"
+MCP_APPLY_RES="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' --data-binary "@$WORKDIR/mcp_apply.json")"
+MCP_CMD_ID="$(printf '%s' "$MCP_APPLY_RES" | jq -r '.result.content[0].text | fromjson | .command_id // empty' 2>/dev/null)"
+[ -n "$MCP_CMD_ID" ] && ok "MCP map_apply returns command_id ($MCP_CMD_ID)" || bad "MCP map_apply returns command_id"
+MCP_STATE="$(wait_command_terminal "$MCP_CMD_ID")"
+check "MCP map_apply reaches terminal applied state" "$MCP_STATE" "applied"
+
+# MCP map_apply negative control: missing artifact parameter yields error
+MCP_BAD_RES="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"map_apply","arguments":{}}}')"
+MCP_BAD_CODE="$(printf '%s' "$MCP_BAD_RES" | jq -r '.error.code // empty' 2>/dev/null)"
+check "MCP map_apply missing artifact yields -32602" "$MCP_BAD_CODE" "-32602"
 
 # ---------------------------------------------------------------- report ---
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
