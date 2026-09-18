@@ -254,7 +254,7 @@ pub struct SenseAccum {
     pub saturations: u32,
     /// Sticky per-channel saturation state used to keep [`Self::saturations`]
     /// independent of contribution order.
-    saturated_channels: u32,
+    pub saturated_channels: u32,
 }
 
 /// The finalized, clamped channels — what a brain actually reads.
@@ -334,6 +334,34 @@ pub(crate) fn quantize_contribution_term(term: f32) -> f32 {
 }
 
 impl SenseAccum {
+    /// Construct an accumulator from raw channel values and a saturation count.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_raw_channels(
+        density: [i64; NUM_EYES],
+        red: [i64; NUM_EYES],
+        green: [i64; NUM_EYES],
+        blue: [i64; NUM_EYES],
+        smell: i64,
+        sound: i64,
+        hearing: i64,
+        blood: i64,
+        saturations: u32,
+    ) -> Self {
+        Self {
+            density,
+            red,
+            green,
+            blue,
+            smell,
+            sound,
+            hearing,
+            blood,
+            saturations,
+            saturated_channels: 0,
+        }
+    }
+
     /// Fold one neighbour in.
     ///
     /// Pure integer adds: associative and commutative, therefore order-free. Two

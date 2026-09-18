@@ -549,6 +549,9 @@ fn validate_snapshot(snapshot: &WorldSnapshot<'_>) -> Result<(), ReadbackError> 
 }
 
 #[cfg(test)]
+pub(crate) static GPU_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod capture_smoke_test {
     use super::*;
 
@@ -589,6 +592,9 @@ mod capture_smoke_test {
     // It is not a GPUI window, Bevy render graph, or on-screen presentation test.
     #[test]
     fn wgpu_offscreen_gpu_framebuffer_readback_is_populated() {
+        let _gpu_lock = crate::GPU_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(adapter) = live_adapter("wgpu offscreen readback smoke") else {
             return;
         };
@@ -672,6 +678,9 @@ mod capture_smoke_test {
     /// evidence needs the DSR lanes this machine does not have.
     #[test]
     fn independent_renderers_produce_byte_identical_frames() {
+        let _gpu_lock = crate::GPU_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(adapter) = live_adapter("independent-renderer determinism") else {
             return;
         };
@@ -735,6 +744,9 @@ mod capture_smoke_test {
     fn canonical_bioluminescent_dark_field_v1_reference_capture() {
         use sha2::{Digest, Sha256};
 
+        let _gpu_lock = crate::GPU_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(adapter) = live_adapter("canonical dark-field reference capture") else {
             return;
         };
@@ -1930,6 +1942,10 @@ mod tests {
             ("AGENTS_WGSL", agents_source.as_str()),
             ("POST_WGSL", super::POST_WGSL),
             ("BLOOM_WGSL", super::BLOOM_WGSL),
+            (
+                "SENSE_COMPUTE_SHADER_WGSL",
+                super::sense_wgsl::SENSE_COMPUTE_SHADER_WGSL,
+            ),
         ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|error| panic!("{name} must parse as valid WGSL: {error}"));
@@ -1958,6 +1974,10 @@ mod tests {
             ("AGENTS_WGSL", agents_source.as_str()),
             ("POST_WGSL", super::POST_WGSL),
             ("BLOOM_WGSL", super::BLOOM_WGSL),
+            (
+                "SENSE_COMPUTE_SHADER_WGSL",
+                super::sense_wgsl::SENSE_COMPUTE_SHADER_WGSL,
+            ),
         ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|error| panic!("{name} must parse: {error}"));

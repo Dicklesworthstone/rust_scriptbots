@@ -1019,10 +1019,8 @@ pub fn bound_brain_inspection(
 
 const FULL_TURN: f32 = std::f32::consts::TAU;
 const HALF_TURN: f32 = std::f32::consts::PI;
-// Legacy-parity policy: World.cpp defines PI8 = π/16 and PI38 = 3 * PI8, then admits blood
-// targets only for `diff4 < PI38`. Commit e2d9aaa already corrected the former accidental 3π/8
-// cone on this baseline; the shared contribution function below proves its strict boundary.
-const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.1875;
+/// Blood sensor half-FOV angle in radians (3π/16 rad, matching World.cpp legacy parity).
+pub const BLOOD_HALF_FOV: f32 = std::f32::consts::PI * 0.1875;
 
 // bd-tqpj: while-on-float mirrors the legacy C++ wrap loop; a modulo rewrite would change
 // evaluation order for large angles and shift world digests.
@@ -1357,7 +1355,8 @@ fn angle_difference(a: f32, b: f32) -> f32 {
 /// The boundary is deliberately strict, matching `diff4 < PI38` in `World.cpp`. Within the
 /// model's valid health interval `[0, 2]`, the wound term is exactly `1 - health / 2`; clamping is
 /// retained only as a defensive Rust policy for invalid state outside that interval.
-fn blood_sensor_contribution(
+#[must_use]
+pub fn blood_sensor_contribution(
     forward_difference: f32,
     distance_factor: f32,
     target_health: f32,
@@ -1371,29 +1370,46 @@ fn blood_sensor_contribution(
     angular_factor * distance_factor * wound_factor
 }
 
+/// Observer geometry parameters required for evaluating agent visual and directional senses.
 #[derive(Debug, Clone, Copy)]
-struct SenseObserverGeometry {
-    eye_units: [[f32; 2]; NUM_EYES],
-    eye_fov: [f32; NUM_EYES],
-    heading_unit: [f32; 2],
-    eye_sensitivity: f32,
-    radius: f32,
+pub struct SenseObserverGeometry {
+    /// Unit vectors for each eye in world space.
+    pub eye_units: [[f32; 2]; NUM_EYES],
+    /// Field of view in radians for each eye.
+    pub eye_fov: [f32; NUM_EYES],
+    /// Heading unit vector in world space.
+    pub heading_unit: [f32; 2],
+    /// Sensitivity multiplier for visual sensors.
+    pub eye_sensitivity: f32,
+    /// Sensory perception radius.
+    pub radius: f32,
 }
 
+/// Neighbor state and attributes observed during sensing.
 #[derive(Debug, Clone, Copy)]
-struct SenseNeighborInputs {
-    dx: f32,
-    dy: f32,
-    distance: f32,
-    distance_factor: f32,
-    color: [f32; 3],
-    wheel_effort: f32,
-    sound_emitter: f32,
-    target_health: f32,
+pub struct SenseNeighborInputs {
+    /// Toroidal minimum-image delta x from observer to neighbor.
+    pub dx: f32,
+    /// Toroidal minimum-image delta y from observer to neighbor.
+    pub dy: f32,
+    /// Euclidean distance between observer and neighbor.
+    pub distance: f32,
+    /// Linear distance falloff factor in `[0, 1]`.
+    pub distance_factor: f32,
+    /// RGB body color of the neighbor agent.
+    pub color: [f32; 3],
+    /// Peak wheel effort exerted by the neighbor.
+    pub wheel_effort: f32,
+    /// Sound emitted by the neighbor.
+    pub sound_emitter: f32,
+    /// Health of the target neighbor.
+    pub target_health: f32,
 }
 
+/// Compute distance and linear distance factor for a candidate neighbor within sensory radius.
 #[inline]
-fn sense_distance_terms(
+#[must_use]
+pub fn sense_distance_terms(
     distance_squared: f32,
     radius: f32,
     radius_squared: f32,
@@ -1408,8 +1424,10 @@ fn sense_distance_terms(
 
 // bd-tqpj: pinned FP evaluation order for the WGSL-lane parity contract; fma fusion
 // would alter sensor contribution bytes.
+/// Compute the fixed-point sensor contribution of a single neighbor to an observer.
 #[allow(clippy::suboptimal_flops)]
-fn fixed_sense_contribution(
+#[must_use]
+pub fn fixed_sense_contribution(
     observer: &SenseObserverGeometry,
     neighbor: SenseNeighborInputs,
 ) -> sense_fixed::NeighborContribution {
@@ -18369,7 +18387,8 @@ mod map_sandbox {
             assert_eq!(sampled_temp, expected_temp);
             // The map's scalar field differs from the 1D default fallback
             assert!(
-                (sampled_temp - fallback_temp).abs() > 1e-4 || expected_temp == fallback_temp,
+                (sampled_temp - fallback_temp).abs() > 1e-4
+                    || (expected_temp - fallback_temp).abs() <= f32::EPSILON,
                 "sampled temperature should come from scalar field"
             );
 
