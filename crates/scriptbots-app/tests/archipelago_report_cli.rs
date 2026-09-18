@@ -552,3 +552,276 @@ fn test_archipelago_report_reconstructs_and_verifies_conservation_e2e()
 
     Ok(())
 }
+
+/// Full DSR proof for bd-5tyo / bd-16g.5.1:
+/// - Four heterogeneous islands configured canonically via [`IslandSpec::with_overlay`].
+/// - 2,000 ticks reached across 8 common barrier epochs (barrier_interval = 250).
+/// - Dynamic Ring migration topology with emigrant selection and population transfer.
+/// - Persisted into exactly ONE storage database file.
+/// - Every island remains populated and evolves distinct scientific digests.
+/// - Offline reconstruction and conservation audit succeed from the database alone.
+#[test]
+fn dsr_four_heterogeneous_islands_reach_2000_ticks_in_single_storage_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ISLANDS: u32 = 4;
+    const BARRIER_INTERVAL: u64 = 250;
+    const BARRIERS: u32 = 8;
+    const TARGET_TICKS: u64 = BARRIERS as u64 * BARRIER_INTERVAL; // 2,000 ticks
+
+    let dir = tempfile::Builder::new()
+        .prefix("archipelago-2k-single-db-")
+        .tempdir()?;
+    let db_path = dir.path().join("archipelago_2k.sqlite");
+    let path_str = db_path.to_string_lossy().to_string();
+
+    let mut storage = Storage::create_unattributed_file_with_thresholds(&path_str, 1, 1, 1, 1)?;
+    let captured: Rc<RefCell<Vec<(IslandId, PersistenceBatch)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+
+    let base = ScriptBotsConfig {
+        world_width: 64,
+        world_height: 64,
+        food_cell_size: 16,
+        food_max: 1.0,
+        food_growth_rate: 0.02,
+        food_respawn_amount: 0.5,
+        rng_seed: Some(0x0151_a4d0),
+        closed: true,
+        history_capacity: 8,
+        persistence_interval: BARRIER_INTERVAL as u32, // persists at each barrier tick
+        narrative_interval: 0,
+        population_minimum: 12,
+        population_spawn_interval: 5,
+        ..ScriptBotsConfig::default()
+    };
+
+    // Construct four heterogeneous islands using canonical scenario overlays
+    let overlays = [
+        serde_json::json!({ "food_growth_rate": 0.02 }),
+        serde_json::json!({ "food_growth_rate": 0.04, "food_respawn_amount": 0.6 }),
+        serde_json::json!({ "food_growth_rate": 0.06, "food_respawn_amount": 0.7 }),
+        serde_json::json!({ "food_growth_rate": 0.08, "bot_speed": 0.35 }),
+    ];
+
+    let specs: Vec<IslandSpec> = (0..ISLANDS)
+        .map(|id| {
+            IslandSpec::with_overlay(
+                IslandId(id),
+                format!("island-{id}"),
+                &base,
+                &overlays[id as usize],
+            )
+            .expect("canonical per-island overlay")
+        })
+        .collect();
+
+    // Verify heterogeneity up front
+    assert_ne!(
+        specs[0].config.food_growth_rate,
+        specs[1].config.food_growth_rate
+    );
+    assert_ne!(
+        specs[2].config.food_growth_rate,
+        specs[3].config.food_growth_rate
+    );
+
+    let capture_handle = Rc::clone(&captured);
+    let mut archipelago = Archipelago::with_factories(
+        ArchipelagoConfig {
+            islands: specs,
+            topology: Topology::Ring,
+            barrier_interval: std::num::NonZeroU64::new(BARRIER_INTERVAL).expect("nonzero"),
+            master_seed: 0x00c0_ffee_2000,
+            host_options: HostCoreOptions::default(),
+            migration: Some(ArchipelagoMigration {
+                interval_ticks: BARRIER_INTERVAL,
+                emigrants_per_edge: 1,
+                selection_rule: EmigrantSelectionRule::Fittest,
+            }),
+        },
+        |meta| {
+            let mut world = WorldState::new(meta.effective_config.clone())?;
+            for _ in 0..12 {
+                world
+                    .try_spawn_agent(AgentData::default())
+                    .expect("deterministic founding agent is finite");
+            }
+            Ok(world)
+        },
+        |meta| {
+            Some(Box::new(HarnessJournal {
+                island: meta.id,
+                captured: Rc::clone(&capture_handle),
+                pending: Rc::new(RefCell::new(VecDeque::new())),
+            }) as Box<dyn scriptbots_runtime::JournalPort>)
+        },
+    )?;
+
+    // Persist static metadata once at start into the single database
+    let metas: Vec<scriptbots_runtime::IslandMeta> = archipelago.islands().cloned().collect();
+    storage.persist_islands(&metas)?;
+
+    for epoch in 1..=BARRIERS {
+        let report = archipelago.step_to_barrier()?;
+        assert_eq!(
+            report.barrier_tick.0,
+            epoch as u64 * BARRIER_INTERVAL,
+            "barrier tick must match expected cadence"
+        );
+
+        let drained: Vec<(IslandId, PersistenceBatch)> = captured.borrow_mut().drain(..).collect();
+        let mut by_tick: BTreeMap<u64, Vec<(IslandId, PersistenceBatch)>> = BTreeMap::new();
+        for (island, batch) in drained {
+            by_tick
+                .entry(batch.summary.tick.0)
+                .or_default()
+                .push((island, batch));
+        }
+
+        for (tick, island_batches) in by_tick {
+            assert_eq!(
+                u32::try_from(island_batches.len())?,
+                ISLANDS,
+                "all {ISLANDS} islands must supply batches at barrier tick {tick}"
+            );
+            let mut sink = ArchipelagoBarrierSink::new((0..ISLANDS).map(IslandId))?;
+            for (island, batch) in island_batches {
+                sink.admit(island, batch)?;
+            }
+            if let Some(migration_report) = &report.migration {
+                sink.admit_migrations(migration_report.moves.clone());
+            }
+            storage.persist_barrier_from(&sink)?;
+        }
+    }
+
+    // 1. In-memory assertions at tick 2,000
+    assert_eq!(archipelago.barrier_tick().0, TARGET_TICKS);
+    assert_eq!(archipelago.epoch(), BARRIERS as u64);
+    assert!(archipelago.latched().is_none());
+
+    let mut digests = Vec::new();
+    for id in 0..ISLANDS {
+        let snapshot = archipelago
+            .island_snapshot(IslandId(id))
+            .expect("committed snapshot at tick 2,000");
+        assert_eq!(snapshot.world.tick, TARGET_TICKS);
+        assert!(
+            snapshot.world.summary.agent_count > 0,
+            "island {id} must remain populated at tick 2,000"
+        );
+        let digest = archipelago
+            .island_digest(IslandId(id))
+            .expect("island digest")
+            .overall;
+        digests.push(digest);
+    }
+    digests.sort_unstable();
+    digests.dedup();
+    assert_eq!(
+        digests.len(),
+        ISLANDS as usize,
+        "all {ISLANDS} heterogeneous islands must evolve distinct science"
+    );
+
+    // 2. Flush and close storage
+    storage.flush()?;
+    let run_id = storage.run_id();
+    let run_id_str = run_id.to_string();
+    storage.close()?;
+
+    // 3. Exactly ONE storage database file on disk
+    let sqlite_files: Vec<_> = std::fs::read_dir(dir.path())?
+        .filter_map(|entry| entry.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "sqlite"))
+        .collect();
+    assert_eq!(
+        sqlite_files.len(),
+        1,
+        "exactly ONE storage database file must exist"
+    );
+
+    // 4. Inspect the SQLite database alone
+    let conn = Connection::open(&path_str)?;
+
+    // tick_summaries: 4 distinct islands
+    let distinct_islands: i64 = conn
+        .query_row_with_params(
+            "SELECT COUNT(DISTINCT island_id) FROM tick_summaries WHERE run_id = ?1",
+            &[run_id_str.as_str().into()],
+        )?
+        .get_typed(0)?;
+    assert_eq!(distinct_islands, ISLANDS as i64);
+
+    // At every barrier tick (250, 500, ..., 2000), exactly 4 islands present
+    for b in 1..=BARRIERS {
+        let barrier_tick = (b as u64 * BARRIER_INTERVAL) as i64;
+        let count_at_tick: i64 = conn
+            .query_row_with_params(
+                "SELECT COUNT(DISTINCT island_id) FROM tick_summaries WHERE run_id = ?1 AND tick = ?2",
+                &[
+                    run_id_str.as_str().into(),
+                    barrier_tick.into(),
+                ],
+            )?
+            .get_typed(0)?;
+        assert_eq!(
+            count_at_tick, ISLANDS as i64,
+            "barrier tick {barrier_tick} must record all {ISLANDS} islands"
+        );
+    }
+
+    // replay_events: all 4 islands recorded
+    let replay_distinct_islands: i64 = conn
+        .query_row_with_params(
+            "SELECT COUNT(DISTINCT island_id) FROM replay_events WHERE run_id = ?1",
+            &[run_id_str.as_str().into()],
+        )?
+        .get_typed(0)?;
+    assert_eq!(replay_distinct_islands, ISLANDS as i64);
+
+    // islands table: static metadata for all 4 islands
+    let island_count_in_db: i64 = conn
+        .query_row_with_params(
+            "SELECT COUNT(*) FROM islands WHERE run_id = ?1",
+            &[run_id_str.as_str().into()],
+        )?
+        .get_typed(0)?;
+    assert_eq!(island_count_in_db, ISLANDS as i64);
+
+    // migrations table: migration moves were persisted
+    let migration_count: i64 = conn
+        .query_row_with_params(
+            "SELECT COUNT(*) FROM migrations WHERE run_id = ?1",
+            &[run_id_str.as_str().into()],
+        )?
+        .get_typed(0)?;
+    assert!(
+        migration_count > 0,
+        "migrations must be recorded in the single database"
+    );
+
+    conn.close()?;
+
+    // 5. Offline reconstruction report & conservation audit from DB alone
+    let reader = StorageReader::open(&path_str)?;
+    let report = reader.archipelago_report()?;
+    assert_eq!(report.islands.len(), ISLANDS as usize);
+    assert_eq!(
+        report.migration_graph.len(),
+        8,
+        "4-island Ring has 8 directed edges"
+    );
+    assert!(
+        report.conservation_audit.passed,
+        "conservation audit must hold across the 2,000-tick run"
+    );
+    assert_eq!(
+        report.conservation_audit.total_islands_checked,
+        ISLANDS as usize
+    );
+    assert_eq!(report.conservation_audit.breaches.len(), 0);
+    reader.close()?;
+
+    Ok(())
+}

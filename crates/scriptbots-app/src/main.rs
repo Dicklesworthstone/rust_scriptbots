@@ -568,6 +568,7 @@ fn main() -> Result<()> {
                 ticks,
                 cli.brain,
                 path,
+                &cli.island_overlays,
                 |world| {
                     let manifest = build_run_manifest_with_sense_policy(
                         world,
@@ -1772,12 +1773,19 @@ fn run_archipelago_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
     let build = |order: &[u32]| -> Result<Archipelago> {
         let specs: Vec<IslandSpec> = order
             .iter()
-            .map(|&id| IslandSpec {
-                id: IslandId(id),
-                label: format!("island-{id}"),
-                config: base_config.clone(),
+            .map(|&id| {
+                let overlay = serde_json::json!({
+                    "food_growth_rate": 0.02f32.mul_add(id as f32, 0.05),
+                });
+                IslandSpec::with_overlay(
+                    IslandId(id),
+                    format!("island-{id}"),
+                    &base_config,
+                    &overlay,
+                )
+                .with_context(|| format!("failed to apply overlay for island {id}"))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Archipelago::new(ArchipelagoConfig {
             islands: specs,
             topology: scriptbots_runtime::Topology::Ring,
@@ -3263,6 +3271,9 @@ struct AppCli {
     /// Number of complete recorded island ticks (requires persistence_interval=1).
     #[arg(long, default_value_t = 100, requires = "run_archipelago")]
     archipelago_ticks: u64,
+    /// Per-island scenario overlay JSON string or file path (format: "ID:JSON_OR_PATH", can be specified multiple times).
+    #[arg(long = "island-overlay", value_name = "ID:SPEC", action = ArgAction::Append)]
+    island_overlays: Vec<String>,
     /// Overlay a tiny debug watermark in the render canvas (diagnostics).
     #[arg(long = "debug-watermark", action = ArgAction::SetTrue)]
     debug_watermark: bool,

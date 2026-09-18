@@ -13968,6 +13968,78 @@ impl ScriptBotsConfig {
     fn resolved_rng_seed(&self) -> u64 {
         self.rng_seed.unwrap_or_else(rand::random)
     }
+
+    /// Return a new [`ScriptBotsConfig`] with a partial JSON overlay merged in.
+    ///
+    /// The merge follows canonical semantics: objects merge recursively key-by-key,
+    /// while leaves (scalars and arrays) replace earlier values wholesale.
+    /// The resulting configuration is fully validated before return.
+    pub fn with_overlay(&self, overlay: &serde_json::Value) -> Result<Self, ConfigOverlayError> {
+        let mut value =
+            serde_json::to_value(self).map_err(|err| ConfigOverlayError::BaseSerialization {
+                detail: err.to_string(),
+            })?;
+        merge_config_json(&mut value, overlay);
+        let config: Self = serde_json::from_value(value).map_err(|err| {
+            ConfigOverlayError::MergedDeserialization {
+                detail: err.to_string(),
+            }
+        })?;
+        config
+            .validate()
+            .map_err(|source| ConfigOverlayError::InvalidConfiguration { source })?;
+        Ok(config)
+    }
+
+    /// Mutate this [`ScriptBotsConfig`] in place by deep-merging a partial JSON overlay.
+    pub fn apply_overlay(&mut self, overlay: &serde_json::Value) -> Result<(), ConfigOverlayError> {
+        *self = self.with_overlay(overlay)?;
+        Ok(())
+    }
+}
+
+/// Failure when applying a partial configuration overlay to [`ScriptBotsConfig`].
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigOverlayError {
+    /// Serialization of base config to intermediate JSON failed.
+    #[error("failed to serialize base configuration: {detail}")]
+    BaseSerialization {
+        /// Underlying error description.
+        detail: String,
+    },
+    /// Deserialization of merged configuration JSON failed.
+    #[error("failed to deserialize merged configuration: {detail}")]
+    MergedDeserialization {
+        /// Underlying error description.
+        detail: String,
+    },
+    /// Merged configuration failed validation.
+    #[error("merged configuration failed validation: {source}")]
+    InvalidConfiguration {
+        /// Invalidation cause.
+        #[source]
+        source: WorldStateError,
+    },
+}
+
+/// Recursive JSON object merge (objects merge key-by-key; leaves replace wholesale).
+///
+/// This is the canonical merge function used for scenario overlays, archipelago
+/// per-island overrides, and REST PATCH configuration updates.
+pub fn merge_config_json(target: &mut serde_json::Value, incoming: &serde_json::Value) {
+    if let (serde_json::Value::Object(target_map), serde_json::Value::Object(incoming_map)) =
+        (&mut *target, incoming)
+    {
+        for (key, value) in incoming_map {
+            if let Some(existing) = target_map.get_mut(key) {
+                merge_config_json(existing, value);
+            } else {
+                target_map.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        *target = incoming.clone();
+    }
 }
 
 /// 2D food grid storing scalar energy values.
@@ -30042,6 +30114,42 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering as AtomicUsizeOrdering},
     };
+
+    #[test]
+    fn config_with_overlay_applies_overrides_recursively_and_validates() {
+        let base = ScriptBotsConfig {
+            world_width: 600,
+            world_height: 300,
+            food_cell_size: 50,
+            food_growth_rate: 0.05,
+            ..ScriptBotsConfig::default()
+        };
+        let overlay = serde_json::json!({
+            "food_growth_rate": 0.12,
+            "bot_speed": 0.45,
+            "neuroflow": {
+                "hidden_layers": [32, 16]
+            }
+        });
+        let composed = base.with_overlay(&overlay).expect("valid overlay");
+        assert_eq!(composed.world_width, 600);
+        assert_eq!(composed.food_growth_rate, 0.12);
+        assert_eq!(composed.bot_speed, 0.45);
+        assert_eq!(composed.neuroflow.hidden_layers, vec![32, 16]);
+    }
+
+    #[test]
+    fn config_with_overlay_rejects_invalid_values() {
+        let base = ScriptBotsConfig::default();
+        let invalid_overlay = serde_json::json!({
+            "world_width": 0
+        });
+        let err = base.with_overlay(&invalid_overlay).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigOverlayError::InvalidConfiguration { .. }
+        ));
+    }
 
     #[test]
     fn complete_config_roundtrips_recording_fields_without_positional_holes() {

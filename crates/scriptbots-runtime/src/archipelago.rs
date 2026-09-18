@@ -196,6 +196,56 @@ pub struct IslandSpec {
     pub config: ScriptBotsConfig,
 }
 
+/// Failure when applying a per-island configuration overlay.
+#[derive(Debug, thiserror::Error)]
+#[error("island {island} ({label}) failed to apply configuration overlay: {source}")]
+pub struct IslandOverlayError {
+    /// Target island identity.
+    pub island: IslandId,
+    /// Human-readable island label.
+    pub label: String,
+    /// Underlying configuration overlay error.
+    #[source]
+    pub source: scriptbots_core::ConfigOverlayError,
+}
+
+impl IslandSpec {
+    /// Construct an island spec with an already-composed configuration.
+    #[must_use]
+    pub fn new(id: IslandId, label: impl Into<String>, config: ScriptBotsConfig) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            config,
+        }
+    }
+
+    /// Construct an island spec by applying a per-island scenario overlay to a base configuration.
+    ///
+    /// The overlay is deep-merged into `base` using canonical merge semantics (objects merge
+    /// recursively, leaves replace) before validation.
+    pub fn with_overlay(
+        id: IslandId,
+        label: impl Into<String>,
+        base: &ScriptBotsConfig,
+        overlay: &serde_json::Value,
+    ) -> Result<Self, IslandOverlayError> {
+        let label_str = label.into();
+        let config = base
+            .with_overlay(overlay)
+            .map_err(|source| IslandOverlayError {
+                island: id,
+                label: label_str.clone(),
+                source,
+            })?;
+        Ok(Self {
+            id,
+            label: label_str,
+            config,
+        })
+    }
+}
+
 /// Cross-island connection topology consumed by the migrator (bd-16g.5.2).
 ///
 /// Edges are normalized at construction: each edge is ordered
@@ -232,6 +282,35 @@ pub struct ArchipelagoConfig {
     /// Cross-island migration policy, or `None` for isolated islands
     /// (bd-16g.5.2).
     pub migration: Option<ArchipelagoMigration>,
+}
+
+impl ArchipelagoConfig {
+    /// Construct an archipelago configuration from a base config and per-island overlay declarations.
+    ///
+    /// Each island's configuration is constructed using the canonical [`IslandSpec::with_overlay`]
+    /// path, allowing heterogeneous per-island overrides to be validated up front.
+    pub fn from_base_and_overlays(
+        base: &ScriptBotsConfig,
+        islands: Vec<(IslandId, String, serde_json::Value)>,
+        topology: Topology,
+        barrier_interval: NonZeroU64,
+        master_seed: u64,
+        host_options: HostCoreOptions,
+        migration: Option<ArchipelagoMigration>,
+    ) -> Result<Self, IslandOverlayError> {
+        let specs: Result<Vec<IslandSpec>, IslandOverlayError> = islands
+            .into_iter()
+            .map(|(id, label, overlay)| IslandSpec::with_overlay(id, label, base, &overlay))
+            .collect();
+        Ok(Self {
+            islands: specs?,
+            topology,
+            barrier_interval,
+            master_seed,
+            host_options,
+            migration,
+        })
+    }
 }
 
 /// Cross-island migration policy for an [`Archipelago`] (bd-16g.5.2).
@@ -3262,10 +3341,17 @@ mod tests {
     fn dsr_heterogeneous_islands_reach_tick_two_thousand_headless() {
         let island_specs: Vec<IslandSpec> = (0..4)
             .map(|id| {
-                let mut config = populated_config(None);
-                config.food_growth_rate =
-                    0.02f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.01);
-                spec(id, config)
+                let growth = 0.02f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.01);
+                let overlay = serde_json::json!({
+                    "food_growth_rate": growth,
+                });
+                IslandSpec::with_overlay(
+                    IslandId(id),
+                    format!("test-island-{id}"),
+                    &populated_config(None),
+                    &overlay,
+                )
+                .expect("valid overlay")
             })
             .collect();
         let mut archipelago = populated_archipelago(archipelago_config(island_specs, 250))
@@ -3298,6 +3384,47 @@ mod tests {
         digests.sort_unstable();
         digests.dedup();
         assert_eq!(digests.len(), 4, "islands must evolve distinct science");
+    }
+
+    #[test]
+    fn test_island_spec_with_overlay_and_archipelago_config_from_base_and_overlays() {
+        let base = populated_config(None);
+        let overlay0 = serde_json::json!({ "food_growth_rate": 0.03 });
+        let overlay1 = serde_json::json!({ "food_growth_rate": 0.06, "bot_speed": 0.4 });
+
+        let spec0 = IslandSpec::with_overlay(IslandId(0), "isle-0", &base, &overlay0)
+            .expect("valid overlay");
+        let spec1 = IslandSpec::with_overlay(IslandId(1), "isle-1", &base, &overlay1)
+            .expect("valid overlay");
+
+        assert_eq!(spec0.config.food_growth_rate, 0.03);
+        assert_eq!(spec1.config.food_growth_rate, 0.06);
+        assert_eq!(spec1.config.bot_speed, 0.4);
+
+        // Invalid overlay must fail with typed IslandOverlayError
+        let bad_overlay = serde_json::json!({ "world_width": 0 });
+        let err = IslandSpec::with_overlay(IslandId(2), "isle-2", &base, &bad_overlay).unwrap_err();
+        assert_eq!(err.island, IslandId(2));
+        assert_eq!(err.label, "isle-2");
+
+        // ArchipelagoConfig::from_base_and_overlays
+        let arch_config = ArchipelagoConfig::from_base_and_overlays(
+            &base,
+            vec![
+                (IslandId(0), "isle-0".to_owned(), overlay0),
+                (IslandId(1), "isle-1".to_owned(), overlay1),
+            ],
+            Topology::Ring,
+            NonZeroU64::new(10).expect("nonzero"),
+            0x1234_5678,
+            HostCoreOptions::default(),
+            None,
+        )
+        .expect("valid archipelago config from overlays");
+
+        assert_eq!(arch_config.islands.len(), 2);
+        assert_eq!(arch_config.islands[0].config.food_growth_rate, 0.03);
+        assert_eq!(arch_config.islands[1].config.food_growth_rate, 0.06);
     }
 
     #[test]

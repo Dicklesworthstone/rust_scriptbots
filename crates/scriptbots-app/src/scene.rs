@@ -298,46 +298,25 @@ impl SceneManifest {
 
     /// Compose the world's configuration: defaults + recursive override merge.
     pub fn compose_config(&self) -> Result<ScriptBotsConfig, SceneError> {
-        let mut value = serde_json::to_value(ScriptBotsConfig {
+        let mut config = ScriptBotsConfig {
             rng_seed: Some(self.seed),
             ..ScriptBotsConfig::default()
-        })
-        .map_err(|error| SceneError {
-            problems: vec![format!("serialize default config: {error}")],
-        })?;
+        };
         if let Some(overrides) = &self.config_overrides {
             let overrides_json = serde_json::to_value(overrides).map_err(|error| SceneError {
                 problems: vec![format!("encode config_overrides: {error}")],
             })?;
-            merge_json(&mut value, &overrides_json);
-        }
-        let config: ScriptBotsConfig =
-            serde_json::from_value(value).map_err(|error| SceneError {
-                problems: vec![format!("compose config: {error}")],
+            config
+                .apply_overlay(&overrides_json)
+                .map_err(|error| SceneError {
+                    problems: vec![format!("compose config: {error}")],
+                })?;
+        } else {
+            config.validate().map_err(|error| SceneError {
+                problems: vec![format!("composed config invalid: {error}")],
             })?;
-        config.validate().map_err(|error| SceneError {
-            problems: vec![format!("composed config invalid: {error}")],
-        })?;
-        Ok(config)
-    }
-}
-
-/// Recursive JSON object merge (objects merge; leaves replace) — the same
-/// shape the REST PATCH path uses for partial configuration.
-fn merge_json(target: &mut serde_json::Value, incoming: &serde_json::Value) {
-    if let (serde_json::Value::Object(target_map), serde_json::Value::Object(incoming_map)) =
-        (&mut *target, incoming)
-    {
-        for (key, value) in incoming_map {
-            match target_map.get_mut(key) {
-                Some(existing) => merge_json(existing, value),
-                None => {
-                    target_map.insert(key.clone(), value.clone());
-                }
-            }
         }
-    } else {
-        *target = incoming.clone();
+        Ok(config)
     }
 }
 

@@ -86,24 +86,60 @@ impl JournalPort for IslandCaptureJournal {
     }
 }
 
+/// Parse a CLI island overlay argument in `ID:JSON_OR_PATH` format.
+pub fn parse_island_overlay(spec: &str) -> Result<(u32, serde_json::Value)> {
+    let (id_str, rest) = spec
+        .split_once(':')
+        .context("expected island overlay format ID:JSON_OR_PATH")?;
+    let id: u32 = id_str
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid island id '{id_str}' in overlay spec"))?;
+    let rest = rest.trim();
+    let value = if rest.starts_with('{') {
+        serde_json::from_str(rest)
+            .with_context(|| format!("invalid overlay JSON for island {id}: '{rest}'"))?
+    } else {
+        let content = fs::read_to_string(rest)
+            .with_context(|| format!("failed to read overlay file '{rest}' for island {id}"))?;
+        if rest.ends_with(".toml") {
+            let toml_val: toml::Value = toml::from_str(&content)
+                .with_context(|| format!("invalid overlay TOML in '{rest}'"))?;
+            serde_json::to_value(toml_val)
+                .with_context(|| format!("failed to convert TOML overlay '{rest}' to JSON"))?
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("invalid overlay JSON in '{rest}'"))?
+        }
+    };
+    Ok((id, value))
+}
+
 fn build_recorded_archipelago(
     config: &ScriptBotsConfig,
     island_count: u32,
     root_seed: u64,
     preset: BrainPreset,
+    overlays: &BTreeMap<u32, serde_json::Value>,
     capture: &Rc<RefCell<BarrierCapture>>,
 ) -> Result<Archipelago> {
     let options = HostCoreOptions::default();
     let mut construction_error = None;
+    let specs: Result<Vec<IslandSpec>> = (0..island_count)
+        .map(|id| {
+            let label = format!("island-{id}");
+            if let Some(overlay) = overlays.get(&id) {
+                IslandSpec::with_overlay(IslandId(id), label, config, overlay)
+                    .with_context(|| format!("failed to apply overlay for island {id}"))
+            } else {
+                Ok(IslandSpec::new(IslandId(id), label, config.clone()))
+            }
+        })
+        .collect();
+    let island_specs = specs?;
     let constructed = Archipelago::with_factories(
         ArchipelagoConfig {
-            islands: (0..island_count)
-                .map(|id| IslandSpec {
-                    id: IslandId(id),
-                    label: format!("island-{id}"),
-                    config: config.clone(),
-                })
-                .collect(),
+            islands: island_specs,
             topology: Topology::Custom(Vec::new()),
             barrier_interval: NonZeroU64::MIN,
             master_seed: root_seed,
@@ -154,6 +190,7 @@ pub fn run_recorded_archipelago(
     ticks: u64,
     preset: BrainPreset,
     path: &str,
+    overlays: &[String],
     manifest_for_world: impl FnOnce(&WorldState) -> Result<RunManifestRecord>,
 ) -> Result<serde_json::Value> {
     ensure!(
@@ -170,6 +207,11 @@ pub fn run_recorded_archipelago(
         config.persistence_interval == 1,
         "recorded archipelago requires persistence_interval=1 so every island supplies every tick"
     );
+    let mut parsed_overlays = BTreeMap::new();
+    for spec in overlays {
+        let (id, val) = parse_island_overlay(spec)?;
+        parsed_overlays.insert(id, val);
+    }
     let root_seed = config
         .rng_seed
         .context("recorded archipelago requires an explicit rng_seed")?;
@@ -177,8 +219,14 @@ pub fn run_recorded_archipelago(
     // the runtime's versioned derivation instead of accidentally pinning identical seeds.
     config.rng_seed = None;
     let capture = Rc::new(RefCell::new(BarrierCapture::default()));
-    let mut archipelago =
-        build_recorded_archipelago(&config, island_count, root_seed, preset, &capture)?;
+    let mut archipelago = build_recorded_archipelago(
+        &config,
+        island_count,
+        root_seed,
+        preset,
+        &parsed_overlays,
+        &capture,
+    )?;
     let islands: Vec<_> = archipelago.islands().cloned().collect();
     let mut manifest = archipelago.with_island_world(IslandId(0), manifest_for_world)??;
     let mut manifest_json: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;

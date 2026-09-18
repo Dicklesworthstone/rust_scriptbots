@@ -87,8 +87,8 @@ const DEFAULT_PROJECTION_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 pub use archipelago::{
     AppliedMigration, Archipelago, ArchipelagoConfig, ArchipelagoError, ArchipelagoMigration,
-    BarrierReport, IslandBarrierReport, IslandId, IslandMeta, IslandSpec, MAX_ISLANDS,
-    MigrationBarrierReport, StepTopology, Topology,
+    BarrierReport, IslandBarrierReport, IslandId, IslandMeta, IslandOverlayError, IslandSpec,
+    MAX_ISLANDS, MigrationBarrierReport, StepTopology, Topology,
 };
 pub use host_core::{
     HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, MigrationArrival, VolatileJournal,

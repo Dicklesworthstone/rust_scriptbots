@@ -16224,21 +16224,28 @@ impl Storage {
             .buffer
             .deaths
             .iter()
-            .map(|row| row.agent_uid)
+            .map(|row| (row.island_id, row.agent_uid))
             .collect::<BTreeSet<_>>();
         for row in &prepared.deaths {
-            if buffered.contains(&row.agent_uid) {
+            if buffered.contains(&(row.island_id, row.agent_uid)) {
                 return Err(StorageError::InvalidData {
                     context: "deaths.agent_uid",
-                    reason: format!("agent uid {} already has a staged death", row.agent_uid),
+                    reason: format!(
+                        "agent uid {} already has a staged death on island {}",
+                        row.agent_uid, row.island_id
+                    ),
                 });
             }
             let existing = self.connection()?.query_with_params(
                 "SELECT agent_uid, tick
                  FROM deaths
-                 WHERE run_id = ?1 AND agent_uid = ?2
+                 WHERE run_id = ?1 AND island_id = ?2 AND agent_uid = ?3
                  LIMIT 1",
-                &[sqlite_run_id(self.run_id), row.agent_uid.into()],
+                &[
+                    sqlite_run_id(self.run_id),
+                    row.island_id.into(),
+                    row.agent_uid.into(),
+                ],
             )?;
             if let Some(existing) = existing.first() {
                 let existing_uid =
@@ -16248,7 +16255,8 @@ impl Storage {
                     return Err(StorageError::InvalidData {
                         context: "deaths.agent_uid",
                         reason: format!(
-                            "death lookup for uid {new_uid} returned uid {existing_uid}"
+                            "death lookup for uid {new_uid} on island {} returned uid {existing_uid}",
+                            row.island_id
                         ),
                     });
                 }
@@ -16257,7 +16265,8 @@ impl Storage {
                 return Err(StorageError::InvalidData {
                     context: "deaths.agent_uid",
                     reason: format!(
-                        "agent uid {new_uid} already has a persisted death at tick {existing_tick}"
+                        "agent uid {new_uid} on island {} already has a persisted death at tick {existing_tick}",
+                        row.island_id
                     ),
                 });
             }
@@ -33760,6 +33769,176 @@ mod tests {
         assert_eq!(
             narrative_distinct_islands, ISLANDS as i64,
             "every island must record its own narrative input stream"
+        );
+
+        storage.close()?;
+        Ok(())
+    }
+
+    /// bd-5tyo: DSR long lane: 4 heterogeneous islands reach tick 2,000 persisting into exactly
+    /// one storage file through complete barriers.
+    #[test]
+    #[ignore = "DSR long lane: 4 heterogeneous islands to tick 2000 in one storage database"]
+    fn dsr_four_heterogeneous_islands_reach_tick_two_thousand_in_one_storage_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_runtime::migrator::EmigrantSelectionRule;
+        use scriptbots_runtime::{
+            Archipelago, ArchipelagoConfig, ArchipelagoMigration, HostCoreOptions, IslandId,
+            IslandSpec, Topology,
+        };
+
+        const ISLANDS: u32 = 4;
+        const BARRIERS: u32 = 8;
+        const BARRIER_INTERVAL: u64 = 250;
+
+        let path = temp_db_path("storage-archipelago-2k-ticks");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+
+        let captured: Rc<RefCell<Vec<(IslandId, PersistenceBatch)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+
+        let base = ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: None,
+            closed: true,
+            history_capacity: 8,
+            persistence_interval: 250,
+            narrative_interval: 0,
+            population_minimum: 12,
+            population_spawn_interval: 5,
+            ..ScriptBotsConfig::default()
+        };
+
+        let specs: Vec<IslandSpec> = (0..ISLANDS)
+            .map(|id| {
+                let growth = 0.02f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.01);
+                let overlay = serde_json::json!({
+                    "food_growth_rate": growth,
+                });
+                IslandSpec::with_overlay(IslandId(id), format!("island-{id}"), &base, &overlay)
+                    .expect("valid overlay")
+            })
+            .collect();
+
+        let capture_handle = Rc::clone(&captured);
+        let mut archipelago = Archipelago::with_factories(
+            ArchipelagoConfig {
+                islands: specs,
+                topology: Topology::Ring,
+                barrier_interval: std::num::NonZeroU64::new(BARRIER_INTERVAL).expect("nonzero"),
+                master_seed: 0x00c0_ffee,
+                host_options: HostCoreOptions::default(),
+                migration: Some(ArchipelagoMigration {
+                    interval_ticks: BARRIER_INTERVAL,
+                    emigrants_per_edge: 1,
+                    selection_rule: EmigrantSelectionRule::Fittest,
+                }),
+            },
+            |meta| {
+                let mut world = WorldState::new(meta.effective_config.clone())?;
+                for _ in 0..12 {
+                    world
+                        .try_spawn_agent(AgentData::default())
+                        .expect("deterministic founding agent is finite");
+                }
+                Ok(world)
+            },
+            |meta| {
+                Some(Box::new(HarnessIslandJournal {
+                    island: meta.id,
+                    captured: Rc::clone(&capture_handle),
+                    pending: Rc::new(RefCell::new(VecDeque::new())),
+                })
+                    as Box<dyn scriptbots_runtime::JournalPort>)
+            },
+        )?;
+
+        // Persist static island metadata once at construction
+        let metas: Vec<scriptbots_runtime::IslandMeta> = archipelago.islands().cloned().collect();
+        storage.persist_islands(&metas)?;
+
+        for _ in 0..BARRIERS {
+            let report = archipelago.step_to_barrier()?;
+
+            let drained: Vec<(IslandId, PersistenceBatch)> =
+                captured.borrow_mut().drain(..).collect();
+            let mut by_tick: BTreeMap<u64, Vec<(IslandId, PersistenceBatch)>> = BTreeMap::new();
+            for (island, batch) in drained {
+                by_tick
+                    .entry(batch.summary.tick.0)
+                    .or_default()
+                    .push((island, batch));
+            }
+
+            for (_tick, island_batches) in by_tick {
+                if u32::try_from(island_batches.len())? != ISLANDS {
+                    continue;
+                }
+                let mut sink = ArchipelagoBarrierSink::new((0..ISLANDS).map(IslandId))?;
+                for (island, batch) in island_batches {
+                    sink.admit(island, batch)?;
+                }
+                if let Some(migration_report) = &report.migration {
+                    sink.admit_migrations(migration_report.moves.clone());
+                }
+                storage.persist_barrier_from(&sink)?;
+            }
+        }
+
+        assert_eq!(archipelago.barrier_tick(), scriptbots_core::Tick(2_000));
+        assert_eq!(archipelago.epoch(), 8);
+        assert!(archipelago.latched().is_none());
+
+        storage.flush()?;
+        let conn = storage.connection()?;
+
+        // 1. tick_summaries: distinct islands must equal ISLANDS
+        let distinct_islands: i64 = conn
+            .query_row_with_params(
+                "SELECT COUNT(DISTINCT island_id) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(distinct_islands, ISLANDS as i64);
+
+        // 2. islands table contains all 4 configured islands
+        let island_count: i64 = conn
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM islands WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
+            .get_typed(0)?;
+        assert_eq!(island_count, ISLANDS as i64);
+
+        // 3. migrations table contains recorded migrations
+        let migration_count: i64 = conn
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM migrations WHERE run_id = ?1",
+                &[sqlite_run_id(storage.run_id)],
+            )?
+            .get_typed(0)?;
+        assert!(migration_count > 0, "migrations must be recorded");
+
+        // 4. Verify islands evolved distinct overall digests
+        let mut digests = Vec::new();
+        for id in 0..ISLANDS {
+            digests.push(
+                archipelago
+                    .island_digest(IslandId(id))
+                    .expect("island digest")
+                    .overall,
+            );
+        }
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(
+            digests.len(),
+            ISLANDS as usize,
+            "heterogeneous islands must evolve distinct science"
         );
 
         storage.close()?;
