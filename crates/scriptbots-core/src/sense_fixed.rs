@@ -472,6 +472,27 @@ impl SenseAccum {
     }
 }
 
+/// Pluggable provider for sensory accumulation during the simulation sense stage.
+pub trait SenseProvider: Send {
+    /// Compute sensory accumulators for all agents in the world.
+    ///
+    /// Receives a reference to the world state and slice of active agent IDs in handle order.
+    /// Returns an accumulator per agent matching `handles.len()`.
+    fn compute_accumulators(
+        &mut self,
+        world: &crate::WorldState,
+        handles: &[crate::AgentId],
+    ) -> Result<Vec<SenseAccum>, SenseProviderError>;
+}
+
+/// Typed error returned by a [`SenseProvider`].
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum SenseProviderError {
+    /// Failure during sensory accumulator execution.
+    #[error("sense provider failed: {0}")]
+    Execution(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

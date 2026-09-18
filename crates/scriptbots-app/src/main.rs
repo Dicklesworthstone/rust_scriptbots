@@ -28,6 +28,7 @@ use scriptbots_app::{
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
 #[cfg(test)]
 use scriptbots_brain::{AssemblyBrain, DwraonBrain, MlpBrain};
+use scriptbots_core::sense_fixed::SenseProvider;
 use scriptbots_core::{
     LEGACY_RENDER_ENV_NAMES, MapArtifact, NeuroflowActivationKind, NullPersistence,
     PersistenceAdmissionSession, RenderQuality, RenderTonemapMode, ReplayEventKind,
@@ -46,6 +47,11 @@ use scriptbots_storage::{
     INTERACTION_REPLAY_SEQ_BASE, NARRATIVE_INPUT_REPLAY_SEQ, PersistedReplayEvent,
     PersistenceGuarantee, ShutdownReceipt, StoragePipeline, StorageReader,
 };
+use scriptbots_world_gfx::sense_parity::{
+    SenseBackendId, SenseDeterminism, SensePolicyV0, init_gpu_sense_provider,
+    is_adapter_certified_exact, probe_gpu_adapter,
+};
+use scriptbots_world_gfx::wgpu;
 use serde_json::{self, Value as JsonValue};
 use std::process::{Command, Stdio};
 use std::{
@@ -125,20 +131,258 @@ fn report_final_host_digest(result: &Result<HostThreadReceipt>) {
     }
 }
 
-fn emit_sense_startup_contract() {
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum SenseBackendMode {
+    /// Classical CPU fixed-point uniform grid spatial accumulator (deterministic reference).
+    Cpu,
+    /// GPU compute shader CSR binning and 64-bit integer tree reduction.
+    Gpu,
+    /// Auto-detect: select GPU only if certified exact on non-software adapter; otherwise honest CPU.
+    Auto,
+}
+
+impl SenseBackendMode {
+    #[allow(dead_code)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+struct ResolvedSenseConfig {
+    policy: SensePolicyV0,
+    provider: Option<Box<dyn SenseProvider>>,
+}
+
+fn resolve_sense_config(cli: &AppCli) -> Result<ResolvedSenseConfig> {
+    match cli.sense_backend {
+        SenseBackendMode::Cpu => Ok(ResolvedSenseConfig {
+            policy: SensePolicyV0 {
+                backend: SenseBackendId::Cpu,
+                determinism: SenseDeterminism::Exact,
+                source: "cli-flag".to_string(),
+                certified_exact: true,
+                allow_approximate: cli.allow_approximate_sense,
+                gate_evidence: None,
+                reason: "CPU fixed-point accumulator backend (default reference standard)"
+                    .to_string(),
+            },
+            provider: None,
+        }),
+        SenseBackendMode::Gpu => {
+            let (provider, info) = match init_gpu_sense_provider() {
+                Ok(pair) => pair,
+                Err(scriptbots_world_gfx::sense_wgsl::GpuSenseError::NoAdapter) => {
+                    bail!(
+                        "No compatible GPU adapter was found. Use '--sense-backend cpu' or install supported GPU hardware/drivers."
+                    );
+                }
+                Err(err) => {
+                    bail!(
+                        "Failed to initialize GPU sensing device: {err}. Use '--sense-backend cpu' or verify GPU driver configuration."
+                    );
+                }
+            };
+
+            let certified_evidence = is_adapter_certified_exact(&info, None);
+            if let Some(evidence) = certified_evidence {
+                info!(
+                    adapter = %info.name,
+                    backend = ?info.backend,
+                    "GPU sensing backend initialized and certified exact by parity gate"
+                );
+                Ok(ResolvedSenseConfig {
+                    policy: SensePolicyV0 {
+                        backend: SenseBackendId::Gpu,
+                        determinism: SenseDeterminism::Exact,
+                        source: "cli-flag".to_string(),
+                        certified_exact: true,
+                        allow_approximate: cli.allow_approximate_sense,
+                        gate_evidence: Some(evidence),
+                        reason: format!("GPU sense backend certified exact on {}", info.name),
+                    },
+                    provider: Some(Box::new(provider)),
+                })
+            } else if cli.allow_approximate_sense {
+                warn!(
+                    adapter = %info.name,
+                    backend = ?info.backend,
+                    "Using approximate GPU sense backend under --allow-approximate-sense; run is NOT bit-exact reproducible"
+                );
+                eprintln!(
+                    "WARNING: Using approximate GPU sense backend ({}). Simulation run is NOT bit-exact reproducible.",
+                    info.name
+                );
+                Ok(ResolvedSenseConfig {
+                    policy: SensePolicyV0 {
+                        backend: SenseBackendId::Gpu,
+                        determinism: SenseDeterminism::Approximate,
+                        source: "cli-flag".to_string(),
+                        certified_exact: false,
+                        allow_approximate: true,
+                        gate_evidence: None,
+                        reason: format!(
+                            "GPU sense backend permitted under --allow-approximate-sense for adapter '{}'",
+                            info.name
+                        ),
+                    },
+                    provider: Some(Box::new(provider)),
+                })
+            } else {
+                let adapter_type_desc = if info.device_type == wgpu::DeviceType::Cpu {
+                    " (software emulation)"
+                } else {
+                    ""
+                };
+                bail!(
+                    "GPU sensing has not been certified bit-exact for adapter '{}{}' (backend {:?}). Running with GPU sensing on this target may produce non-reproducible simulation results. To proceed, explicitly specify '--allow-approximate-sense'.",
+                    info.name,
+                    adapter_type_desc,
+                    info.backend
+                );
+            }
+        }
+        SenseBackendMode::Auto => {
+            let probed_info = probe_gpu_adapter();
+            let certified_evidence = probed_info
+                .as_ref()
+                .and_then(|info| is_adapter_certified_exact(info, None));
+
+            if let (Some(_info), Some(evidence)) = (probed_info.as_ref(), certified_evidence) {
+                match init_gpu_sense_provider() {
+                    Ok((provider, actual_info)) => {
+                        info!(
+                            adapter = %actual_info.name,
+                            "Auto selected GPU sense backend (certified exact)"
+                        );
+                        println!("Auto selected GPU sense backend ({})", actual_info.name);
+                        Ok(ResolvedSenseConfig {
+                            policy: SensePolicyV0 {
+                                backend: SenseBackendId::Gpu,
+                                determinism: SenseDeterminism::Exact,
+                                source: "auto".to_string(),
+                                certified_exact: true,
+                                allow_approximate: cli.allow_approximate_sense,
+                                gate_evidence: Some(evidence),
+                                reason: format!(
+                                    "Auto selected certified exact GPU sense backend on {}",
+                                    actual_info.name
+                                ),
+                            },
+                            provider: Some(Box::new(provider)),
+                        })
+                    }
+                    Err(e) => {
+                        let reason = format!(
+                            "Auto selected CPU sense backend (honest default; GPU initialization failed: {e})"
+                        );
+                        info!(reason = %reason, "Auto selected CPU sense backend");
+                        println!("{reason}");
+                        Ok(ResolvedSenseConfig {
+                            policy: SensePolicyV0 {
+                                backend: SenseBackendId::Cpu,
+                                determinism: SenseDeterminism::Exact,
+                                source: "auto".to_string(),
+                                certified_exact: true,
+                                allow_approximate: cli.allow_approximate_sense,
+                                gate_evidence: None,
+                                reason,
+                            },
+                            provider: None,
+                        })
+                    }
+                }
+            } else {
+                let reason = if let Some(ref info) = probed_info {
+                    if info.device_type == wgpu::DeviceType::Cpu {
+                        format!(
+                            "Auto selected CPU sense backend (honest default; detected adapter '{}' is a software fallback)",
+                            info.name
+                        )
+                    } else {
+                        format!(
+                            "Auto selected CPU sense backend (honest default; GPU adapter '{}' is not certified exact)",
+                            info.name
+                        )
+                    }
+                } else {
+                    "Auto selected CPU sense backend (honest default; no GPU adapter available)"
+                        .to_string()
+                };
+                info!(reason = %reason, "Auto selected CPU sense backend");
+                println!("{reason}");
+                Ok(ResolvedSenseConfig {
+                    policy: SensePolicyV0 {
+                        backend: SenseBackendId::Cpu,
+                        determinism: SenseDeterminism::Exact,
+                        source: "auto".to_string(),
+                        certified_exact: true,
+                        allow_approximate: cli.allow_approximate_sense,
+                        gate_evidence: None,
+                        reason,
+                    },
+                    provider: None,
+                })
+            }
+        }
+    }
+}
+
+fn emit_sense_startup_contract_policy(policy: &SensePolicyV0) {
     info!(
         target: "scriptbots::sense",
         sense_kernel = "fixed_point",
+        sense_backend = %policy.backend,
+        determinism = %policy.determinism,
+        certified_exact = policy.certified_exact,
         frac_bits = scriptbots_core::sense_fixed::SENSE_FRAC_BITS,
         max_neighbors_assumed = scriptbots_core::sense_fixed::MAX_NEIGHBORS_ASSUMED,
         headroom_bits = scriptbots_core::sense_fixed::SENSE_HEADROOM_BITS,
         geometry = scriptbots_core::sense_fixed::SENSE_GEOMETRY,
         poly_max_err = scriptbots_core::sense_fixed::ACOS_MAX_ERROR,
+        reason = %policy.reason,
         "sense numeric contract"
     );
+    if policy.determinism == SenseDeterminism::Approximate {
+        warn!(
+            target: "scriptbots::sense",
+            backend = %policy.backend,
+            "approximate sensing backend enabled; run is NOT bit-exact reproducible across platforms or driver versions"
+        );
+        eprintln!(
+            "WARNING: Using approximate GPU sense backend. Simulation run is NOT bit-exact reproducible across platforms/drivers."
+        );
+    }
+}
+
+fn emit_sense_startup_contract() {
+    emit_sense_startup_contract_policy(&SensePolicyV0::default());
 }
 
 fn emit_sense_run_end(summary: SenseRunSummary, completed: bool) {
+    emit_sense_run_end_policy(summary, completed, None);
+}
+
+fn emit_sense_run_end_policy(
+    summary: SenseRunSummary,
+    completed: bool,
+    policy: Option<&SensePolicyV0>,
+) {
+    let determinism = policy
+        .map(|p| p.determinism)
+        .unwrap_or(SenseDeterminism::Exact);
+    if determinism == SenseDeterminism::Approximate {
+        warn!(
+            target: "scriptbots::sense",
+            "run completed with approximate sensing; results are non-reproducible"
+        );
+        eprintln!(
+            "WARNING: Run completed with approximate GPU sense backend. Results are non-reproducible across platforms/drivers."
+        );
+    }
     let suspect = summary.saturations_total != 0;
     let status = if completed { "completed" } else { "error" };
     if suspect || !completed {
@@ -146,6 +390,7 @@ fn emit_sense_run_end(summary: SenseRunSummary, completed: bool) {
             target: "scriptbots::sense",
             tick = summary.tick,
             saturations_total = summary.saturations_total,
+            determinism = %determinism,
             suspect,
             status,
             "sense run ended"
@@ -155,6 +400,7 @@ fn emit_sense_run_end(summary: SenseRunSummary, completed: bool) {
             target: "scriptbots::sense",
             tick = summary.tick,
             saturations_total = summary.saturations_total,
+            determinism = %determinism,
             suspect,
             status,
             "sense run ended"
@@ -199,6 +445,11 @@ fn main() -> Result<()> {
 
     if let Some(AppSubcommand::MapApply(ref apply_args)) = cli.subcommand {
         run_map_apply(apply_args)?;
+        return Ok(());
+    }
+
+    if let Some(AppSubcommand::Tournament(ref tournament_args)) = cli.subcommand {
+        scriptbots_app::tournament::run_tournament_command(tournament_args)?;
         return Ok(());
     }
 
@@ -247,6 +498,10 @@ fn main() -> Result<()> {
         run_characterization_v0(&cli, config, launch_scenario, config_overrides, ticks)?;
         return Ok(());
     }
+
+    // Resolve sense backend policy and preflight adapter requirements before any storage writes.
+    let resolved_sense = resolve_sense_config(&cli)?;
+    emit_sense_startup_contract_policy(&resolved_sense.policy);
 
     // Validate any path that will eventually create a world/storage runtime
     // before configuration writes, auto-tuning sweeps, thread-priority
@@ -314,12 +569,13 @@ fn main() -> Result<()> {
                 cli.brain,
                 path,
                 |world| {
-                    let manifest = build_run_manifest(
+                    let manifest = build_run_manifest_with_sense_policy(
                         world,
                         identity,
                         launch_scenario,
                         policy,
                         config_overrides,
+                        Some(resolved_sense.policy.clone()),
                     )?;
                     Ok(manifest.to_storage_record()?)
                 },
@@ -532,6 +788,8 @@ fn main() -> Result<()> {
             thread_policy: policy,
             scenario: launch_scenario,
             config_overrides,
+            sense_policy: Some(resolved_sense.policy.clone()),
+            sense_provider: resolved_sense.provider,
         },
     )?;
     let session_id = HostSessionId::new(rand::random());
@@ -700,7 +958,12 @@ fn main() -> Result<()> {
         renderer.run(context)
     })();
     drop(host_port);
-    let teardown = close_runtime_regions(control_to_close, host, storage_pipeline);
+    let teardown = close_runtime_regions(
+        control_to_close,
+        host,
+        storage_pipeline,
+        Some(resolved_sense.policy),
+    );
     teardown.finish(runtime_result)
 }
 
@@ -709,6 +972,7 @@ struct RuntimeTeardown {
     control_result: Result<()>,
     storage_result: Result<()>,
     sense_summary: Option<SenseRunSummary>,
+    sense_policy: Option<SensePolicyV0>,
 }
 
 impl RuntimeTeardown {
@@ -725,7 +989,7 @@ impl RuntimeTeardown {
         debug!(regions = self.outcomes.len(), "runtime regions finalized");
         let result = prefer_storage_failure(runtime_result, self.storage_result, "runtime");
         if let Some(summary) = self.sense_summary {
-            emit_sense_run_end(summary, result.is_ok());
+            emit_sense_run_end_policy(summary, result.is_ok(), self.sense_policy.as_ref());
         }
         result
     }
@@ -737,6 +1001,7 @@ fn close_runtime_regions(
     control: Option<scriptbots_app::ControlRuntime>,
     host: HostThread,
     mut storage: StoragePipeline,
+    sense_policy: Option<SensePolicyV0>,
 ) -> RuntimeTeardown {
     let (host_tx, host_rx) = std::sync::mpsc::sync_channel::<Result<HostThreadReceipt>>(1);
     let (control_tx, control_rx) = std::sync::mpsc::sync_channel(1);
@@ -825,6 +1090,7 @@ fn close_runtime_regions(
         control_result,
         storage_result,
         sense_summary,
+        sense_policy,
     }
 }
 
@@ -1753,6 +2019,24 @@ fn build_run_manifest(
     thread_policy: ThreadPolicy,
     config_overrides: Vec<ConfigFieldOverride>,
 ) -> std::result::Result<RunManifestV3, scriptbots_app::RunManifestError> {
+    build_run_manifest_with_sense_policy(
+        world,
+        identity,
+        scenario,
+        thread_policy,
+        config_overrides,
+        None,
+    )
+}
+
+fn build_run_manifest_with_sense_policy(
+    world: &WorldState,
+    identity: RunIdentityV1,
+    scenario: ScenarioIdentityV0,
+    thread_policy: ThreadPolicy,
+    config_overrides: Vec<ConfigFieldOverride>,
+    sense_policy: Option<SensePolicyV0>,
+) -> std::result::Result<RunManifestV3, scriptbots_app::RunManifestError> {
     RunManifestV3::from_world_with_provenance(
         identity,
         scenario,
@@ -1764,7 +2048,7 @@ fn build_run_manifest(
         // captures environment declarations, which may have lost to a more specific policy layer.
         // The same rule covers the config itself: cross-layer displacements are part of how this
         // exact configuration came to be, so they ride beside the thread policy.
-        manifest
+        let manifest = manifest
             .with_thread_policy(ThreadPolicyV0 {
                 threads: thread_policy.threads,
                 source: thread_policy.source.wire_tag().to_owned(),
@@ -1772,7 +2056,12 @@ fn build_run_manifest(
                     .overridden
                     .map(|declined| declined.wire_tag().to_owned()),
             })
-            .with_config_overrides(config_overrides)
+            .with_config_overrides(config_overrides);
+        if let Some(policy) = sense_policy {
+            manifest.with_sense_policy(policy)
+        } else {
+            manifest
+        }
     })
 }
 
@@ -1944,6 +2233,8 @@ struct BootstrapRequest {
     thread_policy: ThreadPolicy,
     scenario: ScenarioIdentityV0,
     config_overrides: Vec<ConfigFieldOverride>,
+    sense_policy: Option<SensePolicyV0>,
+    sense_provider: Option<Box<dyn SenseProvider>>,
 }
 
 /// Prepare a seeded world, storage, and manifest inputs for owner-thread bootstrap.
@@ -1967,6 +2258,8 @@ fn bootstrap_world(
         thread_policy,
         mut scenario,
         config_overrides,
+        sense_policy,
+        sense_provider,
     } = request;
     // Bind manifest inputs to the same requested count passed to the owner.
     scenario.bootstrap_ticks = bootstrap_ticks;
@@ -1993,6 +2286,9 @@ fn bootstrap_world(
     // the actual initial roster rather than a planned approximation.
     let mut world =
         WorldState::new(config).context("failed to construct world before tick zero")?;
+    if let Some(provider) = sense_provider {
+        world.set_sense_provider(provider);
+    }
     let brain_keys = install_brains(&mut world, brain_preset)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
@@ -2006,8 +2302,15 @@ fn bootstrap_world(
     identity
         .validate()
         .context("invalid live-run identity before storage registration")?;
-    let manifest = build_run_manifest(&world, identity, scenario, thread_policy, config_overrides)
-        .context("failed to build durable run provenance before tick zero")?;
+    let manifest = build_run_manifest_with_sense_policy(
+        &world,
+        identity,
+        scenario,
+        thread_policy,
+        config_overrides,
+        sense_policy,
+    )
+    .context("failed to build durable run provenance before tick zero")?;
     let storage_record = manifest
         .to_storage_record()
         .context("failed to project durable run provenance before tick zero")?;
@@ -2698,6 +3001,8 @@ enum AppSubcommand {
     MapGenerate(MapGenerateArgs),
     /// Inspect and validate a procedural map artifact file.
     MapApply(MapApplyArgs),
+    /// Round-robin brain tournament, rating estimation, and leaderboard generation (bd-16g.12.3).
+    Tournament(scriptbots_app::tournament::TournamentArgs),
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]
@@ -2826,6 +3131,24 @@ struct AppCli {
         default_value_t = BrainPreset::Mixed
     )]
     brain: BrainPreset,
+    /// Sensing backend to evaluate spatial accumulators (eyes/ears/blood).
+    #[arg(
+        long = "sense-backend",
+        value_enum,
+        env = "SCRIPTBOTS_SENSE_BACKEND",
+        default_value_t = SenseBackendMode::Cpu
+    )]
+    sense_backend: SenseBackendMode,
+    /// Permit approximate (non-bit-exact) GPU sensing backend.
+    ///
+    /// When enabled on an uncertified GPU target, the run is explicitly marked non-reproducible,
+    /// emits startup and exit warnings, and records durable limitations in the run manifest.
+    #[arg(
+        long = "allow-approximate-sense",
+        action = ArgAction::SetTrue,
+        env = "SCRIPTBOTS_ALLOW_APPROXIMATE_SENSE"
+    )]
+    allow_approximate_sense: bool,
     /// Layered configuration files (TOML or RON) applied in order.
     #[arg(
         long = "config",
@@ -4987,7 +5310,7 @@ mod tests {
             } else {
                 Ok(())
             };
-            let teardown = close_runtime_regions(control, host, pipeline);
+            let teardown = close_runtime_regions(control, host, pipeline, None);
             assert_eq!(
                 teardown
                     .outcomes
@@ -5075,7 +5398,7 @@ mod tests {
             } = fixture;
             drop(port);
             drop(submit);
-            let teardown = close_runtime_regions(Some(runtime), host, pipeline);
+            let teardown = close_runtime_regions(Some(runtime), host, pipeline, None);
             assert!(matches!(teardown.outcomes[0].outcome, Outcome::Ok(_)));
             assert!(matches!(teardown.outcomes[1].outcome, Outcome::Err(_)));
             assert_eq!(
@@ -7611,6 +7934,8 @@ activation = "Sigmoid"
                     thread_policy: resolve_thread_policy(None, None, None, false),
                     scenario: ScenarioIdentityV0::caller_seeded("invalid-neuroflow-test"),
                     config_overrides: Vec::new(),
+                    sense_policy: None,
+                    sense_provider: None,
                 },
             )
             .err()

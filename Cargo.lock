@@ -11041,6 +11041,7 @@ dependencies = [
  "scriptbots-render",
  "scriptbots-runtime",
  "scriptbots-storage",
+ "scriptbots-world-gfx",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -11245,6 +11246,7 @@ dependencies = [
 name = "scriptbots-world-gfx"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytemuck",
  "image",
  "naga 27.0.3",
@@ -11252,8 +11254,12 @@ dependencies = [
  "rand 0.9.5",
  "scriptbots-core",
  "scriptbots-index",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.18",
  "tracing",
+ "tracing-subscriber",
  "wgpu 27.0.1",
  "winit",
 ]

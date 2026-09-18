@@ -2814,9 +2814,9 @@ impl ToolHandler for ControlTool {
                     )
                 })?;
                 let key = mcp_idempotency_key(&arguments);
+                let id_key = key.as_deref();
                 let handle = self.handle.clone();
-                let status =
-                    run_control_mcp_sync(move || handle.apply_map(artifact, key.as_deref()))?;
+                let status = run_control_mcp_sync(move || handle.apply_map(artifact, id_key))?;
                 make_tool_result(status)
             }
         }

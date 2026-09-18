@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use bytemuck::{Pod, Zeroable};
 use scriptbots_core::{NUM_EYES, RenderTonemapMode, visual};
@@ -16,7 +17,16 @@ use std::time::Instant;
 /// (bd-2z0.7.11). The value preserves the legacy ~60 ticks-per-second visual rate.
 pub const ANIM_SECONDS_PER_TICK: f32 = 1.0 / 60.0;
 
+pub mod sense_parity;
 pub mod sense_wgsl;
+pub use sense_parity::{
+    FaultInjectedGpuSenseProvider, FaultInjectionMode, GpuSenseProvider, SenseBackendId,
+    SenseDeterminism, SenseDivergenceCoordinates, SenseGateEvidenceV0, SenseLaneParityReport,
+    SenseParityError, SenseParityOptions, SensePolicyV0, compute_evidence_digest,
+    init_gpu_sense_provider, is_adapter_certified_exact, make_grid_uniforms, pack_agent_gpu_data,
+    probe_gpu_adapter, run_sense_parity_check,
+};
+pub use wgpu;
 
 /// Public snapshot format the renderer expects. Keep minimal; the app will adapt
 /// its internal world snapshot to this view before passing to the renderer.

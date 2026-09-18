@@ -14,6 +14,9 @@ use scriptbots_core::{
 use scriptbots_runtime::RunId;
 pub use scriptbots_storage::STORAGE_SIDECAR_SUFFIXES;
 use scriptbots_storage::{AnalyticsSnapshotProvider, RunManifestRecord};
+pub use scriptbots_world_gfx::{
+    SenseBackendId, SenseDeterminism, SenseGateEvidenceV0, SensePolicyV0,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -916,6 +919,9 @@ pub struct RunManifestV3 {
     pub reproducible: bool,
     pub warnings: Vec<String>,
     pub limitations: CharacterizationLimitationsV0,
+    /// Sensory accumulation policy and determinism certification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sense_policy: Option<SensePolicyV0>,
 }
 
 /// Errors returned while constructing a version-three run manifest.
@@ -1311,10 +1317,19 @@ impl RunManifestV3 {
         }
         self.validate_agent_rng_contract()?;
         let derived_provenance = validate_build_provenance_claim(&self.build)?;
-        if self.reproducible != derived_provenance {
+        let expected_reproducible = if let Some(ref policy) = self.sense_policy {
+            if policy.determinism == SenseDeterminism::Approximate {
+                false
+            } else {
+                derived_provenance
+            }
+        } else {
+            derived_provenance
+        };
+        if self.reproducible != expected_reproducible {
             return Err(RunManifestError::InconsistentReproducibilityClaim {
                 recorded: self.reproducible,
-                derived: derived_provenance,
+                derived: expected_reproducible,
             });
         }
         let normalized_config_json =
@@ -1400,6 +1415,37 @@ impl RunManifestV3 {
     #[must_use]
     pub fn with_thread_policy(mut self, policy: ThreadPolicyV0) -> Self {
         self.thread_policy = Some(policy);
+        self
+    }
+
+    /// Record the sensory accumulation policy and certified determinism status.
+    ///
+    /// If the policy's determinism is `Approximate`, this enforces that `reproducible` is set to `false`,
+    /// adds the required approximate sense warning, and notes the limitation.
+    #[must_use]
+    pub fn with_sense_policy(mut self, policy: SensePolicyV0) -> Self {
+        if policy.determinism == SenseDeterminism::Approximate {
+            self.reproducible = false;
+            let warning =
+                "gpu sensing is approximate; run is not certified as reproducible".to_string();
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning.clone());
+            }
+            if !self.build.warnings.contains(&warning) {
+                self.build.warnings.push(warning);
+            }
+            if !self
+                .limitations
+                .comparison_lane
+                .contains("approximate GPU sensing")
+            {
+                self.limitations.comparison_lane = format!(
+                    "{}; approximate GPU sensing (non-reproducible across platforms/drivers)",
+                    self.limitations.comparison_lane
+                );
+            }
+        }
+        self.sense_policy = Some(policy);
         self
     }
 
@@ -1579,6 +1625,7 @@ impl RunManifestV3 {
             // `with_thread_policy`, so a manifest that carries no policy is one that was built
             // outside a real run — which is a true statement, not a missing field.
             thread_policy: None,
+            sense_policy: None,
             config_overrides: Vec::new(),
             bootstrap_evidence: None,
             random_streams,
@@ -2074,7 +2121,7 @@ mod characterization_tests {
     use super::*;
     use scriptbots_core::{NullPersistence, PersistenceSessionError, WorldStepError};
 
-    fn test_world(seed: Option<u64>) -> WorldState {
+    pub(crate) fn test_world(seed: Option<u64>) -> WorldState {
         let mut world = WorldState::new(ScriptBotsConfig {
             world_width: 40,
             world_height: 40,
@@ -2097,7 +2144,7 @@ mod characterization_tests {
         world
     }
 
-    fn complete_test_build() -> BuildProvenanceV0 {
+    pub(crate) fn complete_test_build() -> BuildProvenanceV0 {
         BuildProvenanceV0 {
             package_name: "scriptbots-app".to_owned(),
             package_version: "0.1.0".to_owned(),
@@ -2130,7 +2177,7 @@ mod characterization_tests {
         }
     }
 
-    fn test_run_identity(run_id: u128) -> RunIdentityV1 {
+    pub(crate) fn test_run_identity(run_id: u128) -> RunIdentityV1 {
         RunIdentityV1::new(RunId::new(run_id), 1_752_515_200_000, Some(256), None)
     }
 
@@ -3520,6 +3567,66 @@ population_minimum = 40
         let document = ScenarioDocumentV1::parse_toml(missing_config.as_bytes())
             .expect("a config-less scenario is a valid identity-only document");
         assert_eq!(document.config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn sense_policy_approximate_forces_non_reproducible_and_records_warning_and_limitation() {
+        let world = crate::characterization_tests::test_world(Some(42));
+        let identity = crate::characterization_tests::test_run_identity(100);
+        let scenario = ScenarioIdentityV0::caller_seeded("sense-test");
+        let manifest = RunManifestV3::from_world_with_provenance(
+            identity,
+            scenario,
+            &world,
+            crate::characterization_tests::complete_test_build(),
+        )
+        .expect("manifest");
+
+        assert!(manifest.reproducible);
+
+        let approximate_policy = scriptbots_world_gfx::sense_parity::SensePolicyV0 {
+            backend: scriptbots_world_gfx::sense_parity::SenseBackendId::Gpu,
+            determinism: scriptbots_world_gfx::sense_parity::SenseDeterminism::Approximate,
+            source: "cli-flag".to_string(),
+            allow_approximate: true,
+            gate_evidence: None,
+            certified_exact: false,
+            reason: "GPU sensing permitted under --allow-approximate-sense".to_string(),
+        };
+
+        let updated = manifest.with_sense_policy(approximate_policy);
+        assert!(
+            !updated.reproducible,
+            "Approximate policy MUST force reproducible = false"
+        );
+        assert!(
+            updated
+                .warnings
+                .iter()
+                .any(|w| w.contains("gpu sensing is approximate")),
+            "Manifest must contain approximate sense warning"
+        );
+        assert!(
+            updated
+                .limitations
+                .comparison_lane
+                .contains("approximate GPU sensing"),
+            "Manifest comparison_lane limitation must name approximate GPU sensing"
+        );
+        assert_eq!(
+            updated.warnings, updated.build.warnings,
+            "Manifest warnings must match build.warnings exactly for storage projection"
+        );
+
+        let record = updated.to_storage_record().expect("storage record");
+        assert!(!record.reproducible);
+
+        let mut invalid = updated;
+        invalid.reproducible = true;
+        assert!(matches!(
+            invalid.to_storage_record(),
+            Err(RunManifestError::InconsistentReproducibilityClaim { .. })
+        ));
     }
 }
 

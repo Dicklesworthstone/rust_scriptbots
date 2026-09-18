@@ -1212,3 +1212,130 @@ fn interrupted_run_leaves_initial_manifest_sidecar() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_gpu_sense_backend_unvalidated_target_fails_pre_storage() {
+    let dir = run_dir("gpu_sense_unvalidated");
+    let output = launch_with(&dir, &[], &["--sense-backend", "gpu"]);
+
+    // On unvalidated hardware (or when no adapter exists), --sense-backend gpu
+    // without --allow-approximate-sense must fail closed before any storage artifacts exist.
+    assert!(
+        !output.status.success(),
+        "unvalidated GPU sense backend must fail without --allow-approximate-sense"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("GPU sense backend error")
+            || stderr.contains("not certified as exact")
+            || stderr.contains("not been certified")
+            || stderr.contains("certified bit-exact")
+            || stderr.contains("No compatible GPU adapter"),
+        "stderr must explain the GPU sense backend pre-storage refusal; got: {stderr}"
+    );
+    assert!(
+        !dir.join("run.sqlite").exists(),
+        "unvalidated GPU backend must fail closed BEFORE creating run database"
+    );
+    assert!(
+        !dir.join("run.manifest.json").exists(),
+        "unvalidated GPU backend must fail closed BEFORE creating run manifest"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_gpu_sense_backend_approximate_allowed() {
+    let dir = run_dir("gpu_sense_approximate");
+    let output = launch_with(
+        &dir,
+        &[],
+        &["--sense-backend", "gpu", "--allow-approximate-sense"],
+    );
+    println!(
+        "GPU_SENSE_APP_STDOUT:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    println!(
+        "GPU_SENSE_APP_STDERR:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    if output.status.success() {
+        let manifest = manifest_of(&output, &dir);
+        assert_eq!(
+            manifest["sense_policy"]["backend"], "gpu",
+            "manifest must record GPU sense backend"
+        );
+        assert_eq!(
+            manifest["sense_policy"]["determinism"], "approximate",
+            "manifest must record approximate determinism on uncertified GPU"
+        );
+        assert_eq!(
+            manifest["reproducible"], false,
+            "approximate GPU sensing must force reproducible = false"
+        );
+        let warnings = manifest["warnings"]
+            .as_array()
+            .expect("warnings must be an array");
+        assert!(
+            warnings.iter().any(|w| w
+                .as_str()
+                .unwrap_or("")
+                .contains("gpu sensing is approximate; run is not certified as reproducible")),
+            "manifest must contain approximate GPU warning; got: {:?}",
+            warnings
+        );
+        let comparison_lane = manifest["limitations"]["comparison_lane"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            comparison_lane.contains("approximate GPU sensing"),
+            "manifest limitations must declare approximate GPU sensing; got: {comparison_lane}"
+        );
+    } else {
+        // If the machine has no GPU adapter at all (neither hardware nor software)
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No compatible GPU adapter"),
+            "if run failed with --allow-approximate-sense, it must be because no adapter exists; got: {stderr}"
+        );
+        assert!(
+            !dir.join("run.sqlite").exists(),
+            "no-adapter refusal must fail closed before creating database"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sense_backend_auto_selects_cpu_honestly() {
+    let dir = run_dir("sense_auto");
+    let output = launch_with(&dir, &[], &["--sense-backend", "auto"]);
+    assert!(
+        output.status.success(),
+        "auto sense backend must succeed; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = manifest_of(&output, &dir);
+    assert_eq!(
+        manifest["sense_policy"]["backend"], "cpu",
+        "auto backend must resolve honestly to cpu reference lane"
+    );
+    assert_eq!(
+        manifest["sense_policy"]["determinism"], "exact",
+        "cpu reference lane has exact determinism"
+    );
+    let reason = manifest["sense_policy"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.to_lowercase().contains("auto selected cpu")
+            || reason.contains("auto mode chose CPU"),
+        "reason must record honest auto-resolution; got: {reason}"
+    );
+    assert_eq!(
+        manifest["reproducible"], manifest["build"]["provenance_complete"],
+        "CPU reference run reproducibility tracks build provenance completeness"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

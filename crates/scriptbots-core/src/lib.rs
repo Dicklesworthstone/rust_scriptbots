@@ -87,6 +87,7 @@ pub use replay::{
     ReplayScrubError, ReplayScrubFrame, ReplayScrubOutcome, replay_scrub_from_checkpoint,
 };
 pub mod sense_fixed;
+pub use sense_fixed::{SenseProvider, SenseProviderError};
 pub mod species;
 pub mod visual;
 
@@ -18842,6 +18843,7 @@ pub struct WorldState {
     archive_evaluations: u64,
     novelty_state: Option<NoveltyState>,
     consecutive_zero_novelty_samples: u32,
+    sense_provider: Option<Box<dyn SenseProvider>>,
 }
 
 // bd-tqpj: intentional curated summary — a full-field Debug would dump entire world
@@ -19728,6 +19730,7 @@ impl WorldState {
             archive_evaluations: 0,
             novelty_state: None,
             consecutive_zero_novelty_samples: 0,
+            sense_provider: None,
         })
     }
 
@@ -20542,49 +20545,66 @@ impl WorldState {
         let index = &self.index;
         let temperature_field = self.temperature.as_ref();
 
+        let gpu_accumulators = if let Some(mut provider) = self.sense_provider.take() {
+            let res = provider.compute_accumulators(self, handles).expect(
+                "sense provider compute_accumulators failed (silent fallback is forbidden)",
+            );
+            self.sense_provider = Some(provider);
+            Some(res)
+        } else {
+            None
+        };
+
         let sensor_results: Vec<([f32; INPUT_SIZE], u32)> =
             collect_handles!(handles, |idx, _handle| {
                 let mut sensors = [0.0f32; INPUT_SIZE];
                 let position = positions[idx];
                 let heading = headings[idx];
                 let traits = trait_modifiers[idx];
-                let observer = SenseObserverGeometry {
-                    eye_units: self.work_eye_units[idx],
-                    eye_fov: self.work_eye_fov[idx],
-                    heading_unit: [libm::cosf(heading), libm::sinf(heading)],
-                    eye_sensitivity: traits.eye,
-                    radius,
-                };
-                let mut accumulator = sense_fixed::SenseAccum::default();
+                let accumulator = if let Some(ref accums) = gpu_accumulators {
+                    accums[idx]
+                } else {
+                    let observer = SenseObserverGeometry {
+                        eye_units: self.work_eye_units[idx],
+                        eye_fov: self.work_eye_fov[idx],
+                        heading_unit: [libm::cosf(heading), libm::sinf(heading)],
+                        eye_sensitivity: traits.eye,
+                        radius,
+                    };
+                    let mut accumulator = sense_fixed::SenseAccum::default();
 
-                index.visit_neighbor_buckets(idx, radius, &mut |indices| {
-                    for &other_idx in indices {
-                        if other_idx == idx {
-                            continue;
+                    index.visit_neighbor_buckets(idx, radius, &mut |indices| {
+                        for &other_idx in indices {
+                            if other_idx == idx {
+                                continue;
+                            }
+                            let dx =
+                                toroidal_delta(positions[other_idx].x, position.x, world_width);
+                            let dy =
+                                toroidal_delta(positions[other_idx].y, position.y, world_height);
+                            let distance_squared = dx * dx + dy * dy;
+                            let Some((distance, distance_factor)) =
+                                sense_distance_terms(distance_squared, radius, radius_sq)
+                            else {
+                                continue;
+                            };
+                            accumulator.contribute(&fixed_sense_contribution(
+                                &observer,
+                                SenseNeighborInputs {
+                                    dx,
+                                    dy,
+                                    distance,
+                                    distance_factor,
+                                    color: colors[other_idx],
+                                    wheel_effort: peak_wheel_outputs[other_idx],
+                                    sound_emitter: sound_emitters[other_idx],
+                                    target_health: healths[other_idx],
+                                },
+                            ));
                         }
-                        let dx = toroidal_delta(positions[other_idx].x, position.x, world_width);
-                        let dy = toroidal_delta(positions[other_idx].y, position.y, world_height);
-                        let distance_squared = dx * dx + dy * dy;
-                        let Some((distance, distance_factor)) =
-                            sense_distance_terms(distance_squared, radius, radius_sq)
-                        else {
-                            continue;
-                        };
-                        accumulator.contribute(&fixed_sense_contribution(
-                            &observer,
-                            SenseNeighborInputs {
-                                dx,
-                                dy,
-                                distance,
-                                distance_factor,
-                                color: colors[other_idx],
-                                wheel_effort: peak_wheel_outputs[other_idx],
-                                sound_emitter: sound_emitters[other_idx],
-                                target_health: healths[other_idx],
-                            },
-                        ));
-                    }
-                });
+                    });
+                    accumulator
+                };
 
                 let channels = accumulator.finalize_with_multipliers(
                     traits.smell,
@@ -28484,6 +28504,52 @@ impl WorldState {
     #[must_use]
     const fn agents_mut(&mut self) -> &mut AgentArena {
         &mut self.agents
+    }
+
+    /// Reusable work buffer of precomputed per-eye unit vectors.
+    #[must_use]
+    pub fn work_eye_units(&self) -> &[[[f32; 2]; NUM_EYES]] {
+        &self.work_eye_units
+    }
+
+    /// Reusable work buffer of per-eye fields of view.
+    #[must_use]
+    pub fn work_eye_fov(&self) -> &[[f32; NUM_EYES]] {
+        &self.work_eye_fov
+    }
+
+    /// Reusable work buffer of agent trait modifiers.
+    #[must_use]
+    pub fn work_trait_modifiers(&self) -> &[TraitModifiers] {
+        &self.work_trait_modifiers
+    }
+
+    /// Reusable work buffer of peak wheel outputs.
+    #[must_use]
+    pub fn work_peak_wheel_outputs(&self) -> &[f32] {
+        &self.work_peak_wheel_outputs
+    }
+
+    /// Reusable work buffer of sound emission multipliers.
+    #[must_use]
+    pub fn work_sound_emitters(&self) -> &[f32] {
+        &self.work_sound_emitters
+    }
+
+    /// Bind a custom sensory accumulation provider (e.g. GPU compute).
+    pub fn set_sense_provider(&mut self, provider: Box<dyn SenseProvider>) {
+        self.sense_provider = Some(provider);
+    }
+
+    /// Clear and return the custom sensory accumulation provider, if one was bound.
+    pub fn clear_sense_provider(&mut self) -> Option<Box<dyn SenseProvider>> {
+        self.sense_provider.take()
+    }
+
+    /// Whether a custom sensory accumulation provider is bound.
+    #[must_use]
+    pub fn has_sense_provider(&self) -> bool {
+        self.sense_provider.is_some()
     }
 
     /// Number of live agents.

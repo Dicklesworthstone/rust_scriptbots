@@ -797,19 +797,25 @@ pub struct CarryInputPair {
 }
 
 /// Typed error classifications for GPU compute sensing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GpuSenseError {
     /// No adapter satisfied the GPU request.
+    #[error("no GPU adapter satisfied the request")]
     NoAdapter,
     /// Internal device error.
+    #[error("device error: {0}")]
     Device(String),
     /// wgpu validation error during shader/pipeline creation or dispatch.
+    #[error("validation error: {0}")]
     Validation(String),
     /// GPU device lost event occurred.
+    #[error("GPU device lost: {0}")]
     DeviceLost(String),
     /// Out of memory allocation error.
+    #[error("out of memory: {0}")]
     OutOfMemory(String),
     /// Staging buffer mapping failed.
+    #[error("buffer mapping failed: {0}")]
     Map(String),
 }
 
@@ -1284,7 +1290,7 @@ impl GpuSensePipeline {
         device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,
-                timeout: Some(std::time::Duration::from_millis(5_000)),
+                timeout: Some(std::time::Duration::from_secs(30)),
             })
             .map_err(|e| {
                 GpuSenseError::Device(format!(
@@ -1523,7 +1529,7 @@ impl GpuSensePipeline {
         device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,
-                timeout: Some(std::time::Duration::from_millis(5_000)),
+                timeout: Some(std::time::Duration::from_secs(30)),
             })
             .map_err(|e| {
                 GpuSenseError::Device(format!("device poll failed during binning readback: {e:?}"))

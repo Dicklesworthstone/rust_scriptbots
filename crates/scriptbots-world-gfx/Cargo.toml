@@ -14,6 +14,10 @@ bytemuck = { version = "1.16", features = ["derive"] }
 tracing = { workspace = true }
 pollster = "0.4"
 scriptbots-core = { path = "../scriptbots-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
 
 [features]
 default = []
@@ -46,3 +50,4 @@ scriptbots-index = { path = "../scriptbots-index" }
 # as scriptbots-render already uses, so no new lock entry.
 naga = { version = "27" }
 wgpu = { version = "27", default-features = false, features = ["noop"] }
+tracing-subscriber = { workspace = true }
