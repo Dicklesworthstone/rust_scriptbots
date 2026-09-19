@@ -7413,19 +7413,22 @@ impl SimulationView {
             .child(div().text_xs().text_color(rgb(0xcbd5f5)).child("Narration"))
             .child(narration_button)
     }
+}
 
+type EyeClickListener = Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
+
+impl SimulationView {
     fn render_inspector_sense_attribution(
         &self,
         detail: &AgentInspectorDetails,
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut listeners: [Option<Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>;
-            NUM_EYES] = [None, None, None, None];
-        for eye in 0..NUM_EYES {
+        let mut listeners: [Option<EyeClickListener>; NUM_EYES] = [None, None, None, None];
+        for (eye, slot) in listeners.iter_mut().enumerate() {
             let listener = cx.listener(move |this, _event: &MouseDownEvent, _, cx| {
                 this.toggle_eye_selection(eye, cx);
             });
-            listeners[eye] = Some(Arc::new(listener));
+            *slot = Some(Arc::new(listener));
         }
         render_sense_attribution_with_listeners(detail, Some(&listeners))
     }
@@ -7563,151 +7566,7 @@ impl SimulationView {
         browser: &scriptbots_core::genome_browser::GenomeBrowserViewModel,
         _cx: &mut Context<Self>,
     ) -> Div {
-        use scriptbots_core::genome_browser::MutationDiffStatus;
-
-        let header = div()
-            .flex()
-            .justify_between()
-            .items_center()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x38bdf8))
-                    .child(format!("Genome Browser · {}", browser.family_id.as_str())),
-            )
-            .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
-                "v{} · hash {:.8}",
-                browser.schema_version, browser.genome_digest
-            )));
-
-        // Topology / Node summary
-        let paging_text = if browser.paging.is_truncated {
-            format!(
-                "Nodes {}..{} of {} (LOD capped · {} total loci)",
-                browser.paging.page_offset,
-                browser.paging.page_offset + browser.nodes.len(),
-                browser.paging.total_nodes,
-                browser.paging.total_loci,
-            )
-        } else {
-            format!(
-                "{} nodes · {} loci",
-                browser.paging.total_nodes, browser.paging.total_loci
-            )
-        };
-
-        let topology_info = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(div().text_xs().text_color(rgb(0x64748b)).child(paging_text));
-
-        // Mutation diff block
-        let diff_block = match &browser.mutation_diff {
-            MutationDiffStatus::FounderNoParent => div()
-                .text_xs()
-                .text_color(rgb(0x94a3b8))
-                .child("Founder / Injected (no parent diff)"),
-            MutationDiffStatus::Computed {
-                parent_uid,
-                total_deltas,
-                summary,
-            } => {
-                let mut d_div = div().flex().flex_col().gap_1().child(
-                    div().text_xs().text_color(rgb(0xa3e635)).child(format!(
-                        "Parent Agent {} · {} mutations · L1 {:.3} · Linf {:.3}",
-                        parent_uid.get(),
-                        total_deltas,
-                        summary.l1,
-                        summary.linf,
-                    )),
-                );
-
-                // Show up to 4 preview deltas
-                for delta in browser.deltas.iter().take(4) {
-                    let desc = match delta {
-                        scriptbots_core::genome_diff::GenomeDelta::Scalar {
-                            locus,
-                            before,
-                            after,
-                        } => {
-                            format!("{}: {:.2} → {:.2}", locus.human(), before, after)
-                        }
-                        scriptbots_core::genome_diff::GenomeDelta::Retarget {
-                            locus,
-                            before,
-                            after,
-                        } => {
-                            format!("{}: node {} → node {}", locus.human(), before, after)
-                        }
-                        scriptbots_core::genome_diff::GenomeDelta::KindFlip {
-                            locus,
-                            before,
-                            after,
-                        } => {
-                            format!("{}: kind {} → kind {}", locus.human(), before, after)
-                        }
-                    };
-                    d_div = d_div.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xcbd5f5))
-                            .child(format!("  • {desc}")),
-                    );
-                }
-                d_div
-            }
-            MutationDiffStatus::SexualPrimary {
-                parent_uids,
-                total_deltas,
-                ..
-            } => {
-                let p_str = parent_uids
-                    .iter()
-                    .map(|u| u.get().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                div().text_xs().text_color(rgb(0xa3e635)).child(format!(
-                    "Sexual crossover parents [{}] · {} deltas",
-                    p_str, total_deltas
-                ))
-            }
-            MutationDiffStatus::Unavailable { reason } => div()
-                .text_xs()
-                .text_color(rgb(0xf87171))
-                .child(format!("Diff unavailable: {reason}")),
-        };
-
-        // Render preview of first few nodes and connections
-        let mut node_list = div().flex().flex_col().gap_1();
-        for node in browser.nodes.iter().take(4) {
-            let bias_str = node
-                .bias
-                .map_or(String::new(), |b| format!("bias {b:+.2} "));
-            let damp_str = node
-                .damping
-                .map_or(String::new(), |d| format!("damp {d:.2} "));
-            let conn_count = node.connections.len();
-            node_list = node_list.child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
-                "• Node {}: {bias_str}{damp_str}({conn_count} conns)",
-                node.node_index
-            )));
-        }
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x1e3a8a))
-            .bg(rgb(0x0f172a))
-            .px_3()
-            .py_2()
-            .child(header)
-            .child(topology_info)
-            .child(diff_block)
-            .child(node_list)
+        render_genome_browser_view(browser)
     }
 
     fn render_diet_gauges(&self) -> Div {
@@ -9413,6 +9272,252 @@ impl SimulationView {
     }
 }
 
+/// Render the bounded, protocol-only genome browser view model into a GPUI element tree (bd-16g.13.3).
+///
+/// Displays:
+/// 1. Header with family ID, schema version, and genome material digest.
+/// 2. Topology paging and LOD summary (nodes, total loci, truncation status).
+/// 3. Typed parent-to-child mutation deltas (L1/Linf metrics, scalar/retarget/kind deltas).
+/// 4. Decoded node preview (bias, damping, connection count).
+/// 5. Lineage locus plot (traced locus, total points, gaps, sample trajectory).
+pub fn render_genome_browser_view(
+    browser: &scriptbots_core::genome_browser::GenomeBrowserViewModel,
+) -> Div {
+    use scriptbots_core::genome_browser::MutationDiffStatus;
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    tracing::debug!(
+        target: "scriptbots::render::genome_browser",
+        selected_agent = browser.selected_agent.get(),
+        family = browser.family_id.as_str(),
+        visible_nodes = browser.nodes.len(),
+        delta_count = browser.deltas.len(),
+        has_locus_plot = browser.locus_plot.is_some(),
+        "rendered genome browser view"
+    );
+
+    let header = div()
+        .flex()
+        .justify_between()
+        .items_center()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x38bdf8))
+                .child(format!("Genome Browser · {}", browser.family_id.as_str())),
+        )
+        .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+            "v{} · hash {:.8}",
+            browser.schema_version, browser.genome_digest
+        )));
+
+    // Topology / Node summary
+    let paging_text = if browser.paging.is_truncated {
+        format!(
+            "Nodes {}..{} of {} (LOD capped · {} total loci)",
+            browser.paging.page_offset,
+            browser.paging.page_offset + browser.nodes.len(),
+            browser.paging.total_nodes,
+            browser.paging.total_loci,
+        )
+    } else {
+        format!(
+            "{} nodes · {} loci",
+            browser.paging.total_nodes, browser.paging.total_loci
+        )
+    };
+
+    let topology_info = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().text_xs().text_color(rgb(0x64748b)).child(paging_text));
+
+    // Mutation diff block
+    let diff_block = match &browser.mutation_diff {
+        MutationDiffStatus::FounderNoParent => div()
+            .text_xs()
+            .text_color(rgb(0x94a3b8))
+            .child("Founder / Injected (no parent diff)"),
+        MutationDiffStatus::Computed {
+            parent_uid,
+            total_deltas,
+            summary,
+        } => {
+            let mut d_div = div().flex().flex_col().gap_1().child(
+                div().text_xs().text_color(rgb(0xa3e635)).child(format!(
+                    "Parent Agent {} · {} mutations · L1 {:.3} · Linf {:.3}",
+                    parent_uid.get(),
+                    total_deltas,
+                    summary.l1,
+                    summary.linf,
+                )),
+            );
+
+            // Show up to 4 preview deltas
+            for delta in browser.deltas.iter().take(4) {
+                let desc = match delta {
+                    scriptbots_core::genome_diff::GenomeDelta::Scalar {
+                        locus,
+                        before,
+                        after,
+                    } => {
+                        format!("{}: {:.2} → {:.2}", locus.human(), before, after)
+                    }
+                    scriptbots_core::genome_diff::GenomeDelta::Retarget {
+                        locus,
+                        before,
+                        after,
+                    } => {
+                        format!("{}: node {} → node {}", locus.human(), before, after)
+                    }
+                    scriptbots_core::genome_diff::GenomeDelta::KindFlip {
+                        locus,
+                        before,
+                        after,
+                    } => {
+                        format!("{}: kind {} → kind {}", locus.human(), before, after)
+                    }
+                };
+                d_div = d_div.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xcbd5f5))
+                        .child(format!("  • {desc}")),
+                );
+            }
+            d_div
+        }
+        MutationDiffStatus::SexualPrimary {
+            parent_uids,
+            total_deltas,
+            ..
+        } => {
+            let p_str = parent_uids
+                .iter()
+                .map(|u| u.get().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            div().text_xs().text_color(rgb(0xa3e635)).child(format!(
+                "Sexual crossover parents [{}] · {} deltas",
+                p_str, total_deltas
+            ))
+        }
+        MutationDiffStatus::Unavailable { reason } => div()
+            .text_xs()
+            .text_color(rgb(0xf87171))
+            .child(format!("Diff unavailable: {reason}")),
+    };
+
+    // Render preview of first few nodes and connections
+    let mut node_list = div().flex().flex_col().gap_1();
+    for node in browser.nodes.iter().take(4) {
+        let bias_str = node
+            .bias
+            .map_or(String::new(), |b| format!("bias {b:+.2} "));
+        let damp_str = node
+            .damping
+            .map_or(String::new(), |d| format!("damp {d:.2} "));
+        let conn_count = node.connections.len();
+        node_list = node_list.child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+            "• Node {}: {bias_str}{damp_str}({conn_count} conns)",
+            node.node_index
+        )));
+    }
+
+    // Lineage plot block
+    let plot_block = if let Some(plot) = &browser.locus_plot {
+        let locus_name = plot.locus.human();
+        let mut p_div = div().flex().flex_col().gap_1().child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x38bdf8))
+                        .child(format!("Lineage Trace · {locus_name}")),
+                )
+                .child(div().text_xs().text_color(rgb(0x94a3b8)).child(format!(
+                    "{} points · {} gaps",
+                    plot.total_points, plot.gap_count
+                ))),
+        );
+
+        if plot.gap_count > 0 {
+            p_div = p_div.child(div().text_xs().text_color(rgb(0xfacc15)).child(format!(
+                "Warning: {} ancestral gap(s) detected",
+                plot.gap_count
+            )));
+        }
+
+        let mut samples_preview = div().flex().flex_col().gap_1();
+        let sample_count = plot.samples.len();
+        let preview_samples = if sample_count > 4 {
+            &plot.samples[sample_count - 4..]
+        } else {
+            &plot.samples[..]
+        };
+        for s in preview_samples {
+            let sample_desc = match &s.value {
+                Some(scriptbots_core::genome_diff::LocusValue::Scalar(v)) => {
+                    format!(
+                        "Gen {} (agent {}): {v:+.3}",
+                        s.generation,
+                        s.agent_uid.get()
+                    )
+                }
+                Some(scriptbots_core::genome_diff::LocusValue::Target(t)) => {
+                    format!(
+                        "Gen {} (agent {}): target {t}",
+                        s.generation,
+                        s.agent_uid.get()
+                    )
+                }
+                Some(scriptbots_core::genome_diff::LocusValue::Kind(k)) => {
+                    format!(
+                        "Gen {} (agent {}): kind {k}",
+                        s.generation,
+                        s.agent_uid.get()
+                    )
+                }
+                None => {
+                    format!("Gen {} (agent {}): [gap]", s.generation, s.agent_uid.get())
+                }
+            };
+            samples_preview = samples_preview.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child(format!("  • {sample_desc}")),
+            );
+        }
+        p_div.child(samples_preview)
+    } else {
+        div()
+            .text_xs()
+            .text_color(rgb(0x64748b))
+            .child("No locus selected for lineage tracing")
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(0x1e3a8a))
+        .bg(rgb(0x0f172a))
+        .px_3()
+        .py_2()
+        .child(header)
+        .child(topology_info)
+        .child(diff_block)
+        .child(node_list)
+        .child(plot_block)
+}
+
 /// Render an agent's sensor or actuator vector as labelled bars.
 ///
 /// The labels come from the canonical channel layout in `scriptbots-core`, not
@@ -9495,7 +9600,7 @@ pub fn hit_test_eye_cone(
 /// Render the egocentric sense attribution panel with optional interactive click listeners (bd-2z0.7.15).
 fn render_sense_attribution_with_listeners(
     detail: &AgentInspectorDetails,
-    eye_listeners: Option<&[Option<Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>]>,
+    eye_listeners: Option<&[Option<EyeClickListener>]>,
 ) -> Div {
     let container = div()
         .flex()
@@ -22094,7 +22199,7 @@ mod command_characterization_tests {
             brain_payload_bytes: None,
             brain_inspection_status: None,
             sense_attribution: Some(attribution),
-            eye_directions: [0.0, 1.0, -1.0, 3.14],
+            eye_directions: [0.0, 1.0, -1.0, std::f32::consts::PI],
             eye_fovs: [1.0, 1.0, 1.0, 1.0],
             selected_eye: Some(0),
             genome_browser: None,

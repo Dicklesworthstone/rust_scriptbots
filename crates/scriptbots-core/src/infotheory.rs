@@ -10,6 +10,7 @@
 use crate::SmallRngStream;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Error variants for infotheory estimations.
@@ -96,19 +97,19 @@ pub struct MiEstimate {
     /// Number of uniform discretization bins.
     pub bins: usize,
     /// Base estimator identity, before any bias correction ("plug-in").
-    pub estimator: &'static str,
+    pub estimator: Cow<'static, str>,
     /// Bias correction applied on top of the base estimator ("miller-madow").
     ///
     /// Reported separately from [`Self::estimator`] because they are independent choices: a
     /// consumer comparing two estimates has to know both, and "miller-madow" in a single field
     /// cannot say whether the plug-in value was corrected or merely labelled (bd-r4ja).
-    pub correction: &'static str,
+    pub correction: Cow<'static, str>,
     /// Which null the p-value was tested against ("circular-shift").
     ///
     /// This module previously substituted an i.i.d. shuffle for short series without telling the
     /// caller, which silently changed what the p-value meant. Recording the null makes that
     /// guarantee auditable from the record instead of from the source (bd-r4ja).
-    pub surrogate_kind: &'static str,
+    pub surrogate_kind: Cow<'static, str>,
     /// Seed that generated the surrogate and bootstrap draws.
     ///
     /// Without it the p-value and confidence interval are not reproducible from the report, and
@@ -223,7 +224,7 @@ pub struct CommunicationMiDiagnostics {
 }
 
 /// Context-bearing communication MI result used by offline study callers.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommunicationMiWindowReport {
     /// Caller-owned interval and pair identity.
     pub window: CommunicationMiWindow,
@@ -259,9 +260,9 @@ impl CommunicationMiWindowReport {
             tick_lo = self.window.tick_lo,
             tick_hi = self.window.tick_hi,
             pair = self.window.pair.as_str(),
-            estimator = self.estimate.estimator,
-            correction = self.estimate.correction,
-            surrogate_kind = self.estimate.surrogate_kind,
+            estimator = self.estimate.estimator.as_ref(),
+            correction = self.estimate.correction.as_ref(),
+            surrogate_kind = self.estimate.surrogate_kind.as_ref(),
             n = self.estimate.n,
             required_n = diagnostics.need,
             bins = self.estimate.bins,
@@ -336,11 +337,11 @@ pub struct TeEstimate {
     ///
     /// Transfer entropy reported no estimator identity at all, while mutual information reported
     /// one -- an asymmetry with no justification, since both go through Miller-Madow (bd-r4ja).
-    pub estimator: &'static str,
+    pub estimator: Cow<'static, str>,
     /// Bias correction applied on top of the base estimator ("miller-madow").
-    pub correction: &'static str,
+    pub correction: Cow<'static, str>,
     /// Which null the p-value was tested against ("circular-shift").
-    pub surrogate_kind: &'static str,
+    pub surrogate_kind: Cow<'static, str>,
     /// Seed that generated the surrogate and bootstrap draws.
     pub surrogate_seed: u64,
     /// The `bins + 1` uniform bin boundaries the discretization used.
@@ -1104,10 +1105,10 @@ pub fn compute_mi_with_surrogate(
         bits_corrected_unclamped: corrected_unclamped,
         n,
         bins: b,
-        estimator: ESTIMATOR_IDENTITY,
-        correction: CORRECTION_IDENTITY,
+        estimator: Cow::Borrowed(ESTIMATOR_IDENTITY),
+        correction: Cow::Borrowed(CORRECTION_IDENTITY),
         // bd-r4ja: reports the null that actually ran, not a constant.
-        surrogate_kind: surrogate.identity(),
+        surrogate_kind: Cow::Borrowed(surrogate.identity()),
         surrogate_seed: params.seed,
         bin_edges: uniform_bin_edges(b),
         surrogate: surrogate_stats,
@@ -1368,9 +1369,9 @@ pub fn compute_te_with_surrogate(
         te_bits,
         n,
         bins: b,
-        estimator: ESTIMATOR_IDENTITY,
-        correction: CORRECTION_IDENTITY,
-        surrogate_kind: SURROGATE_IDENTITY,
+        estimator: Cow::Borrowed(ESTIMATOR_IDENTITY),
+        correction: Cow::Borrowed(CORRECTION_IDENTITY),
+        surrogate_kind: Cow::Borrowed(SURROGATE_IDENTITY),
         surrogate_seed: params.seed,
         bin_edges: uniform_bin_edges(b),
         surrogate: surrogate_stats,

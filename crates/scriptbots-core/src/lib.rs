@@ -8252,6 +8252,9 @@ pub enum ReplayEventKind {
     },
     /// Recorded actuation decision.
     Action {
+        /// Explicit event tick where the action occurred.
+        #[serde(default)]
+        tick: Option<Tick>,
         /// Left wheel drive output.
         left_wheel: f32,
         /// Right wheel drive output.
@@ -8310,6 +8313,20 @@ pub enum ReplayEventKind {
         /// Versioned input, configuration revision, and fixed-width detector policy.
         record: narrative::NarrativeInputRecordV1,
     },
+    /// Exact brain-facing hearing observation realized during sensing.
+    RealizedHearing {
+        /// Completed boundary whose emitted sound was consumed.
+        source_tick: Tick,
+        /// Transition tick whose brain input received `hearing`.
+        observation_tick: Tick,
+        /// Exact clamped value copied from the production hearing sensor.
+        hearing: f32,
+    },
+    /// Communication mutual-information analysis window report.
+    CommunicationMiWindow {
+        /// Full estimator result including null, CI, and provenance.
+        report: Box<infotheory::CommunicationMiWindowReport>,
+    },
 }
 
 /// Default per-tick replay-event budget.
@@ -8364,6 +8381,12 @@ const fn default_selection_mode() -> EvolutionSelectionMode {
 }
 const fn default_novelty_k() -> usize {
     15
+}
+const fn default_communication_mi_interval() -> u32 {
+    0
+}
+const fn default_communication_mi_window() -> u32 {
+    500
 }
 
 /// Persistence event kind recording pairwise interactions observed by the simulation.
@@ -13054,6 +13077,12 @@ pub struct ScriptBotsConfig {
     /// Number of nearest neighbors k for behavior-space novelty scoring (default 15) (bd-16g.6.2).
     #[serde(default = "default_novelty_k")]
     pub novelty_k: usize,
+    /// Cadence in ticks for evaluating communication mutual-information windows (0 disables).
+    #[serde(default = "default_communication_mi_interval")]
+    pub communication_mi_interval: u32,
+    /// Window size in ticks for communication mutual-information analysis (default 500).
+    #[serde(default = "default_communication_mi_window")]
+    pub communication_mi_window: u32,
     }
 }
 }
@@ -13179,6 +13208,8 @@ impl Default for ScriptBotsConfig {
             archive_space: BehaviorSpaceV0::default(),
             selection_mode: EvolutionSelectionMode::Fitness,
             novelty_k: 15,
+            communication_mi_interval: default_communication_mi_interval(),
+            communication_mi_window: default_communication_mi_window(),
         }
     }
 }
@@ -13951,6 +13982,12 @@ impl ScriptBotsConfig {
         }
         if self.novelty_k == 0 {
             return Err(WorldStateError::InvalidConfig("novelty_k must be non-zero"));
+        }
+        if self.communication_mi_interval > 0 {
+            reject_unless!(
+                self.communication_mi_window >= 4,
+                "communication_mi_window must be at least 4 when communication_mi_interval is enabled"
+            );
         }
         Ok(())
     }
@@ -18907,6 +18944,11 @@ pub struct WorldState {
     sense_saturations_total: u64,
     realized_hearing_capture_enabled: bool,
     latest_realized_hearing_observations: Vec<RealizedHearingObservation>,
+    communication_emitted_history: VecDeque<f64>,
+    communication_realized_history: VecDeque<f64>,
+    pending_communication_metrics: Vec<MetricSample>,
+    latest_communication_mi_report: Option<infotheory::CommunicationMiWindowReport>,
+    last_tick_emitted_sound: f64,
     config_audit: Vec<ConfigAuditEntry>,
     config_revision: u64,
     resource_ledger: ResourceLedgerState,
@@ -19107,6 +19149,7 @@ struct BoundaryReady {
     genomes: Vec<PersistedGenome>,
     replay_events: Vec<ReplayEvent>,
     narrative_events: Vec<narrative::EventRecord>,
+    communication_metrics: Vec<MetricSample>,
 }
 
 /// The boundary decision plus, when a batch is owed, the drained data to build it from (bd-mv2j).
@@ -19572,6 +19615,7 @@ fn project_persistence_batch(drain: BoundaryDrain) -> PersistenceProjection {
             ready.carcass_reproduction_bonus,
         ));
     }
+    metrics.extend(ready.communication_metrics);
 
     if let Some(macro_metrics) = ready.macro_metrics.as_ref() {
         project_macro_metrics(macro_metrics, &mut metrics);
@@ -19682,6 +19726,7 @@ impl WorldState {
             validated_world_unit_f32(config.world_height),
         );
         let history_capacity = config.history_capacity;
+        let communication_mi_interval = config.communication_mi_interval;
         let cadence = TickCadence::from_config(&config);
         let archive = if config.archive_enabled {
             Some(
@@ -19792,8 +19837,13 @@ impl WorldState {
             combat_spike_attempts: 0,
             combat_spike_hits: 0,
             sense_saturations_total: 0,
-            realized_hearing_capture_enabled: false,
+            realized_hearing_capture_enabled: communication_mi_interval > 0,
             latest_realized_hearing_observations: Vec::new(),
+            communication_emitted_history: VecDeque::new(),
+            communication_realized_history: VecDeque::new(),
+            pending_communication_metrics: Vec::new(),
+            latest_communication_mi_report: None,
+            last_tick_emitted_sound: 0.0,
             config_audit: Vec::with_capacity(32),
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
@@ -23346,6 +23396,134 @@ impl WorldState {
         }
     }
 
+    /// Calculate mutual information between emitted sound and realized hearing over a sliding window.
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+    fn stage_communication_mi(&mut self, next_tick: Tick) {
+        let interval = self.config.communication_mi_interval;
+        if interval == 0 {
+            return;
+        }
+
+        let mean_hearing = if self.latest_realized_hearing_observations.is_empty() {
+            0.0
+        } else {
+            let sum: f64 = self
+                .latest_realized_hearing_observations
+                .iter()
+                .map(|obs| f64::from(obs.hearing))
+                .sum();
+            sum / (self.latest_realized_hearing_observations.len() as f64)
+        };
+
+        let mut sum_sound = 0.0f64;
+        let mut sound_agent_count = 0usize;
+        for id in self.agents.iter_handles() {
+            if let Some(runtime) = self.runtime.get(id) {
+                sum_sound += f64::from(runtime.sound_output);
+                sound_agent_count += 1;
+            }
+        }
+        let current_emitted_sound = if sound_agent_count > 0 {
+            sum_sound / (sound_agent_count as f64)
+        } else {
+            0.0
+        };
+
+        self.communication_emitted_history
+            .push_back(self.last_tick_emitted_sound);
+        self.communication_realized_history.push_back(mean_hearing);
+        self.last_tick_emitted_sound = current_emitted_sound;
+
+        let window = self.config.communication_mi_window as usize;
+        let retain_len = window.saturating_mul(2);
+        while self.communication_emitted_history.len() > retain_len {
+            self.communication_emitted_history.pop_front();
+            self.communication_realized_history.pop_front();
+        }
+
+        if next_tick.0.is_multiple_of(u64::from(interval))
+            && self.communication_emitted_history.len() >= window
+            && window > 0
+        {
+            let tick_lo = next_tick.0.saturating_sub(window as u64);
+            let tick_hi = next_tick.0;
+            let window_spec = match infotheory::CommunicationMiWindow::new(
+                tick_lo,
+                tick_hi,
+                "sound_to_hearing",
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    diag_warn!(error = %e, "failed to create communication MI window");
+                    return;
+                }
+            };
+            let emitter_samples: Vec<f64> = self
+                .communication_emitted_history
+                .iter()
+                .rev()
+                .take(window)
+                .rev()
+                .copied()
+                .collect();
+            let receiver_samples: Vec<f64> = self
+                .communication_realized_history
+                .iter()
+                .rev()
+                .take(window)
+                .rev()
+                .copied()
+                .collect();
+
+            let params = infotheory::MiParams {
+                seed: 0x4D49_5345_4544 ^ next_tick.0,
+                ..infotheory::MiParams::default()
+            };
+
+            match infotheory::report_communication_mi_window(
+                window_spec,
+                &emitter_samples,
+                &receiver_samples,
+                &params,
+                infotheory::SurrogateKind::CircularShift,
+            ) {
+                Ok(report) => {
+                    self.pending_communication_metrics.push(MetricSample::new(
+                        "comms.mi.bits",
+                        report.estimate.bits_corrected,
+                    ));
+                    self.pending_communication_metrics.push(MetricSample::new(
+                        "comms.mi.p_value",
+                        report.estimate.p_value,
+                    ));
+                    self.pending_communication_metrics
+                        .push(MetricSample::new("comms.mi.ci_lo", report.estimate.ci_lo));
+                    self.pending_communication_metrics
+                        .push(MetricSample::new("comms.mi.ci_hi", report.estimate.ci_hi));
+                    self.pending_communication_metrics.push(MetricSample::new(
+                        "comms.mi.saturated_fraction",
+                        report.estimate.saturated_fraction,
+                    ));
+
+                    self.replay_events.push(ReplayEvent {
+                        agent_uid: None,
+                        position: None,
+                        counterpart: None,
+                        counterpart_position: None,
+                        kind: ReplayEventKind::CommunicationMiWindow {
+                            report: Box::new(report.clone()),
+                        },
+                    });
+
+                    self.latest_communication_mi_report = Some(report);
+                }
+                Err(e) => {
+                    diag_warn!(error = %e, "failed to compute communication MI window report");
+                }
+            }
+        }
+    }
+
     /// Recently detected narrative events, oldest first.
     #[must_use]
     pub const fn narrative_events(&self) -> &VecDeque<narrative::EventRecord> {
@@ -26289,6 +26467,7 @@ impl WorldState {
             self.pending_lifecycle_death_metrics.clear();
             self.replay_events.clear();
             self.narrative.drain_pending_persistence();
+            self.pending_communication_metrics.clear();
             self.pending_birth_events = 0;
             self.pending_death_events = 0;
             self.pending_spike_attempt_events = 0;
@@ -26633,6 +26812,7 @@ impl WorldState {
             genomes,
             replay_events: std::mem::take(&mut self.replay_events),
             narrative_events: self.narrative.drain_pending_persistence(),
+            communication_metrics: std::mem::take(&mut self.pending_communication_metrics),
         };
         self.pending_persistence_runtime_tail.clear();
         self.pending_birth_events = 0;
@@ -26845,6 +27025,7 @@ impl WorldState {
         });
         observed_stage!(WorldStepStage::Sense, {
             self.stage_sense();
+            self.record_replay_hearing_events(next_tick);
         });
         let mut execution_faults = BTreeMap::new();
         let brain_evaluation = observed_stage!(WorldStepStage::Brains, {
@@ -27011,6 +27192,7 @@ impl WorldState {
                     }
                 }
             }
+            self.stage_communication_mi(next_tick);
             let summary = self.stage_record_history(next_tick);
             self.stage_narrative(next_tick);
             summary
@@ -28185,6 +28367,9 @@ impl WorldState {
         }
 
         self.config = new_config;
+        if self.config.communication_mi_interval > 0 {
+            self.realized_hearing_capture_enabled = true;
+        }
         self.food_profiles = food_profiles;
         self.cadence = TickCadence::from_config(&self.config);
         self.config_revision = self.config_revision.saturating_add(1);
@@ -28459,6 +28644,14 @@ impl WorldState {
     #[must_use]
     pub fn latest_realized_hearing_observations(&self) -> &[RealizedHearingObservation] {
         &self.latest_realized_hearing_observations
+    }
+
+    /// Latest communication mutual-information window report, if one has been evaluated.
+    #[must_use]
+    pub const fn latest_communication_mi_report(
+        &self,
+    ) -> Option<&infotheory::CommunicationMiWindowReport> {
+        self.latest_communication_mi_report.as_ref()
     }
 
     /// Total fixed-point sensing channel saturations observed over this world lifetime.
@@ -35731,6 +35924,149 @@ mod tests {
 
         instrumented.set_realized_hearing_capture_enabled(false);
         assert_eq!(instrumented.latest_realized_hearing_observations().len(), 0);
+    }
+
+    #[test]
+    fn communication_mi_metric_pipeline_is_deterministic_and_non_perturbing() {
+        let base_config = quiet_trace_config(0x004d_495f_5343_4945, 0);
+        let mut control = WorldState::new(base_config.clone()).expect("control world");
+        let mut instrumented = WorldState::new(ScriptBotsConfig {
+            communication_mi_interval: 5,
+            communication_mi_window: 10,
+            ..base_config
+        })
+        .expect("instrumented world");
+
+        for agent in [
+            AgentData {
+                position: Position::new(40.0, 50.0),
+                ..AgentData::default()
+            },
+            AgentData {
+                position: Position::new(50.0, 50.0),
+                ..AgentData::default()
+            },
+        ] {
+            control.spawn_agent(agent);
+            instrumented.spawn_agent(agent);
+        }
+
+        assert_eq!(
+            control.world_digest_v1().expect("control initial digest"),
+            instrumented
+                .world_digest_v1()
+                .expect("instrumented initial digest")
+        );
+
+        for tick in 1..=25 {
+            control.step().expect("control tick");
+            instrumented.step().expect("instrumented tick");
+
+            assert_eq!(
+                control.world_digest_v1().expect("control digest"),
+                instrumented.world_digest_v1().expect("instrumented digest"),
+                "communication MI observation changed world digest at tick {tick}"
+            );
+        }
+
+        assert!(
+            control.latest_communication_mi_report().is_none(),
+            "control with communication_mi_interval=0 must have no MI reports"
+        );
+        assert!(
+            instrumented.latest_communication_mi_report().is_some(),
+            "instrumented world must produce an MI report once window criteria are reached"
+        );
+    }
+
+    #[test]
+    fn communication_mi_pipeline_produces_reports_and_metrics() {
+        struct DynamicSoundBrain {
+            counter: u32,
+        }
+
+        impl BrainRunner for DynamicSoundBrain {
+            fn kind(&self) -> &'static str {
+                "test.dynamic-sound-brain"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                self.counter = self.counter.wrapping_add(1);
+                let mut outputs = [0.0; OUTPUT_SIZE];
+                outputs[OutputChannel::SoundLevel.index()] = if self.counter.is_multiple_of(2) {
+                    0.8
+                } else {
+                    0.1
+                };
+                outputs
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(u64::from(self.counter))
+            }
+        }
+
+        let mut config = quiet_trace_config(0x0043_4f4d_4d53_5f31, 0);
+        config.communication_mi_interval = 5;
+        config.communication_mi_window = 10;
+        config.persistence_interval = 5;
+
+        let (mut world, mut session) = world_with_session(config, NullPersistence);
+        let emitter = world.spawn_agent(AgentData {
+            position: Position::new(40.0, 50.0),
+            ..AgentData::default()
+        });
+        let receiver = world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            ..AgentData::default()
+        });
+
+        let key = world
+            .brain_registry_mut()
+            .expect("registry mutation")
+            .register("test.dynamic-sound-brain", |_rng| {
+                Ok(Box::new(DynamicSoundBrain { counter: 0 }))
+            });
+        world.bind_agent_brain(emitter, key).expect("bind emitter");
+        world
+            .bind_agent_brain(receiver, key)
+            .expect("bind receiver");
+
+        let mut seen_mi_metric = false;
+        let mut seen_replay_mi = false;
+
+        for _ in 1..=20 {
+            let completion = session.step_outcome(&mut world).expect("step outcome");
+            if let Some(batch) = completion.outcome.persistence.batch() {
+                for sample in &batch.metrics {
+                    if sample.name == "comms.mi.bits" {
+                        seen_mi_metric = true;
+                    }
+                }
+                for event in &batch.replay_events {
+                    if matches!(event.kind, ReplayEventKind::CommunicationMiWindow { .. }) {
+                        seen_replay_mi = true;
+                    }
+                }
+            }
+            session.admit_pending(&mut world).expect("admit pending");
+        }
+
+        assert!(
+            seen_mi_metric,
+            "persistence drain should include comms.mi.bits metrics"
+        );
+        assert!(
+            seen_replay_mi,
+            "persistence drain should include CommunicationMiWindow replay events"
+        );
+
+        let report = world
+            .latest_communication_mi_report()
+            .expect("latest communication MI report must be populated");
+        assert_eq!(report.window.pair, "sound_to_hearing");
+        assert!(report.estimate.n >= 10);
+        assert!(report.estimate.bits_corrected >= 0.0);
     }
 
     #[test]

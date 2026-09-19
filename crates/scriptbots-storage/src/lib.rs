@@ -24709,6 +24709,7 @@ where
             None,
         ),
         ReplayEventKind::Action {
+            tick: action_tick,
             left_wheel,
             right_wheel,
             boost,
@@ -24725,6 +24726,10 @@ where
             let spike_target = spike_target
                 .map(|agent_uid| encode_u64("replay_events.action.spike_target", agent_uid.get()))
                 .transpose()?;
+            let row_tick = match action_tick {
+                Some(t) => encode_u64("replay_events.action.tick", t.0)?,
+                None => tick,
+            };
             (
                 if event.agent_uid.is_some() {
                     "agent:action"
@@ -24742,7 +24747,52 @@ where
                     "give_intent": give_intent,
                 })
                 .to_string(),
-                tick,
+                row_tick,
+                fallback_seq,
+                None,
+            )
+        }
+        ReplayEventKind::RealizedHearing {
+            source_tick,
+            observation_tick,
+            hearing,
+        } => {
+            if !hearing.is_finite() {
+                return Err(invalid_non_finite("replay_events.realized_hearing"));
+            }
+            let row_tick = encode_u64("replay_events.realized_hearing.tick", observation_tick.0)?;
+            (
+                if event.agent_uid.is_some() {
+                    "agent:hearing"
+                } else {
+                    "world:hearing"
+                }
+                .to_string(),
+                "realized_hearing".to_string(),
+                json!({
+                    "source_tick": source_tick.0,
+                    "observation_tick": observation_tick.0,
+                    "hearing": hearing,
+                })
+                .to_string(),
+                row_tick,
+                fallback_seq,
+                None,
+            )
+        }
+        ReplayEventKind::CommunicationMiWindow { report } => {
+            let row_tick = encode_u64(
+                "replay_events.communication_mi_window.tick",
+                report.window.tick_hi,
+            )?;
+            (
+                "world:infotheory".to_string(),
+                "communication_mi_window".to_string(),
+                serde_json::to_string(report).map_err(|error| StorageError::InvalidData {
+                    context: "replay_events.communication_mi_window",
+                    reason: error.to_string(),
+                })?,
+                row_tick,
                 fallback_seq,
                 None,
             )
@@ -25057,6 +25107,13 @@ struct WorldDigestPayload {
 #[derive(Debug, Deserialize)]
 struct InteractionPayload {
     magnitude: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RealizedHearingPayload {
+    source_tick: u64,
+    observation_tick: u64,
+    hearing: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -25397,6 +25454,7 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
                 None => None,
             };
             ReplayEventKind::Action {
+                tick: Some(Tick(checked_u64("replay_events.action.tick", row.tick)?)),
                 left_wheel: payload.left_wheel,
                 right_wheel: payload.right_wheel,
                 boost: payload.boost,
@@ -25482,6 +25540,28 @@ fn replay_event_from_row(row: &ReplayEventRow) -> Result<ReplayEvent, StorageErr
                 ordinal,
                 kind: interaction_kind,
                 magnitude: payload.magnitude,
+            }
+        }
+        "realized_hearing" => {
+            let payload: RealizedHearingPayload = parse_payload(row)?;
+            if !payload.hearing.is_finite() {
+                return Err(StorageError::ReplayParse {
+                    tick: row.tick,
+                    seq: row.seq,
+                    reason: "realized hearing must be finite".to_string(),
+                });
+            }
+            ReplayEventKind::RealizedHearing {
+                source_tick: Tick(payload.source_tick),
+                observation_tick: Tick(payload.observation_tick),
+                hearing: payload.hearing,
+            }
+        }
+        "communication_mi_window" => {
+            let report: scriptbots_core::infotheory::CommunicationMiWindowReport =
+                parse_payload(row)?;
+            ReplayEventKind::CommunicationMiWindow {
+                report: Box::new(report),
             }
         }
         other => {
@@ -34946,6 +35026,7 @@ mod tests {
             counterpart: None,
             counterpart_position: None,
             kind: ReplayEventKind::Action {
+                tick: Some(Tick(6)),
                 left_wheel: -0.25,
                 right_wheel: 0.75,
                 boost: true,
@@ -34969,6 +35050,64 @@ mod tests {
         let replay = storage.load_replay_events()?;
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].event, batch.replay_events[0]);
+        storage.close()?;
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_realized_hearing_and_communication_mi_roundtrip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-replay-hearing-and-mi");
+        let path_string = path.to_string_lossy().to_string();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 64, 4096, 1024, 1024)?;
+        let receiver = AgentUid(0x0000_0003_0000_0001);
+        let mut batch = sample_batch(10, 1.0);
+        batch.replay_events.push(ReplayEvent {
+            agent_uid: Some(receiver),
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::RealizedHearing {
+                source_tick: Tick(9),
+                observation_tick: Tick(10),
+                hearing: 0.42,
+            },
+        });
+
+        let window =
+            scriptbots_core::infotheory::CommunicationMiWindow::new(0, 10, "sound_to_hearing")?;
+        let emitter_samples = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+        let receiver_samples = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+        let params = scriptbots_core::infotheory::MiParams {
+            seed: 42,
+            ..scriptbots_core::infotheory::MiParams::default()
+        };
+        let report = scriptbots_core::infotheory::report_communication_mi_window(
+            window,
+            &emitter_samples,
+            &receiver_samples,
+            &params,
+            scriptbots_core::infotheory::SurrogateKind::CircularShift,
+        )?;
+        batch.replay_events.push(ReplayEvent {
+            agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::CommunicationMiWindow {
+                report: Box::new(report),
+            },
+        });
+
+        storage.persist(&batch)?;
+        storage.flush()?;
+
+        let replay = storage.load_replay_events()?;
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].event, batch.replay_events[0]);
+        assert_eq!(replay[1].event, batch.replay_events[1]);
         storage.close()?;
         let _ = fs::remove_file(path);
         Ok(())
@@ -38469,6 +38608,7 @@ mod tests {
             counterpart: None,
             counterpart_position: None,
             kind: ReplayEventKind::Action {
+                tick: None,
                 left_wheel: 0.0,
                 right_wheel: 0.0,
                 boost: false,

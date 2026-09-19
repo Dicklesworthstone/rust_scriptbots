@@ -208,12 +208,39 @@ impl WorldState {
                 counterpart: None,
                 counterpart_position: None,
                 kind: ReplayEventKind::Action {
+                    tick: Some(tick),
                     left_wheel: outputs.channel_clamped(OutputChannel::WheelLeft),
                     right_wheel: outputs.channel_clamped(OutputChannel::WheelRight),
                     boost: outputs.boost_engaged(),
                     spike_target: None,
                     sound_level: outputs.channel_clamped(OutputChannel::SoundLevel),
                     give_intent: outputs.channel_clamped(OutputChannel::GiveIntent),
+                },
+            });
+        }
+    }
+
+    /// Record realized hearing observations from the latest sensing pass into the tick's replay stream.
+    pub(crate) fn record_replay_hearing_events(&mut self, tick: Tick) {
+        self.begin_replay_tick(tick);
+        let cap = self.config.replay_event_tick_cap;
+        if cap == 0 || !self.realized_hearing_capture_enabled {
+            return;
+        }
+        let budget_end = self.replay_events.len().saturating_add(cap);
+        for obs in &self.latest_realized_hearing_observations {
+            if self.replay_events.len() >= budget_end {
+                break;
+            }
+            self.replay_events.push(ReplayEvent {
+                agent_uid: Some(obs.receiver_uid),
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                kind: ReplayEventKind::RealizedHearing {
+                    source_tick: obs.source_tick,
+                    observation_tick: obs.observation_tick,
+                    hearing: obs.hearing,
                 },
             });
         }

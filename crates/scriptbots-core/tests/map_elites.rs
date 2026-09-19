@@ -1275,6 +1275,7 @@ fn test_map_elites_export_reload_diff_resurrect_replay_e2e() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_map_elites_matched_seed_fitness_vs_novelty_experiment() {
     println!(r#"{{"schema":"scriptbots.qd-experiment.e2e.v1","phase":"start"}}"#);
 

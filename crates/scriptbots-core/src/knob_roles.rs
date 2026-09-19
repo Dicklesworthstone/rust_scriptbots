@@ -215,6 +215,8 @@ pub static KNOB_ROLES: &[KnobSpec] = &[
     spec("archive_space.axes", Operational),
     spec("archive_space.version", Operational),
     spec("chart_flush_interval", Operational),
+    spec("communication_mi_interval", Operational),
+    spec("communication_mi_window", Operational),
     spec("control.auto_pause_age_above", Operational),
     spec("control.auto_pause_on_spike_hit", Operational),
     spec("control.auto_pause_population_below", Operational),

@@ -424,6 +424,7 @@ fn five_k_agent_interaction_window_fits_and_flushes_under_default_budget() {
                     counterpart: None,
                     counterpart_position: None,
                     kind: ReplayEventKind::Action {
+                        tick: None,
                         left_wheel: 0.25,
                         right_wheel: -0.25,
                         boost: false,

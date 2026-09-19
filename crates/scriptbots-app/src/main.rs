@@ -5029,6 +5029,8 @@ fn count_event_kinds(events: &[PersistedReplayEvent]) -> HashMap<&'static str, u
                 ..
             } => "food_share",
             ReplayEventKind::NarrativeInputV1 { .. } => "narrative_input_v1",
+            ReplayEventKind::RealizedHearing { .. } => "realized_hearing",
+            ReplayEventKind::CommunicationMiWindow { .. } => "communication_mi_window",
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -5099,6 +5101,7 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
             outputs.len()
         ),
         ReplayEventKind::Action {
+            tick: _,
             left_wheel,
             right_wheel,
             boost,
@@ -5144,6 +5147,22 @@ fn format_replay_event(event: &scriptbots_core::ReplayEvent) -> String {
             record.narrative_interval,
             record.history_capacity,
             record.event_capacity
+        ),
+        ReplayEventKind::RealizedHearing {
+            source_tick,
+            observation_tick,
+            hearing,
+        } => format!(
+            "RealizedHearing(agent={:?}, source_tick={}, observation_tick={}, hearing={:.3})",
+            event.agent_uid, source_tick.0, observation_tick.0, hearing
+        ),
+        ReplayEventKind::CommunicationMiWindow { report } => format!(
+            "CommunicationMiWindow(tick_lo={}, tick_hi={}, pair={}, bits={:.4}, p={:.4})",
+            report.window.tick_lo,
+            report.window.tick_hi,
+            report.window.pair,
+            report.estimate.bits_corrected,
+            report.estimate.p_value
         ),
     }
 }
