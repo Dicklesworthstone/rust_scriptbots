@@ -416,6 +416,11 @@ fn main() -> Result<()> {
     let cli = AppCli::parse();
     init_tracing();
 
+    if let Some(AppSubcommand::Lab(ref lab_args)) = cli.subcommand {
+        run_lab_subcommand(lab_args)?;
+        return Ok(());
+    }
+
     if let Some(AppSubcommand::LabReproduce(args)) = &cli.subcommand {
         return scriptbots_app::lab::reproduction::run(args);
     }
@@ -1533,57 +1538,75 @@ fn run_det_child(
     Ok(())
 }
 
-fn run_lab_cli(cli: &AppCli, goal: &str) -> Result<()> {
+fn run_lab_subcommand(args: &LabArgs) -> Result<()> {
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
     #[cfg(feature = "llm-anthropic")]
     use scriptbots_app::lab::llm::AnthropicClient;
     use scriptbots_app::lab::llm::{LlmClient, ScriptedClient};
-    use scriptbots_app::lab_assistant::{LabBudget, LabStateMachine};
+    use scriptbots_app::lab_assistant::{
+        LabStateMachine, builtin_offline_fixture, parse_lab_budget,
+    };
 
-    let output_root = cli
-        .lab_out
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("runs/lab"));
-    fs::create_dir_all(&output_root)
+    let output_root = &args.out;
+    fs::create_dir_all(output_root)
         .with_context(|| format!("create lab output directory: {}", output_root.display()))?;
 
-    let budget = LabBudget {
-        max_runs: cli.lab_runs,
-        max_ticks: cli.lab_ticks,
-        max_tokens: 100_000,
-        max_iterations: 20,
-    };
+    let mut budget = parse_lab_budget(&args.budget)
+        .map_err(|err| anyhow!("invalid lab budget '{}': {err}", args.budget))?;
+    if let Some(runs) = args.runs {
+        budget.max_runs = runs;
+    }
+    if let Some(ticks) = args.ticks {
+        budget.max_ticks = ticks;
+    }
 
-    let rng_seed = cli.rng_seed.unwrap_or(42);
+    let rng_seed = args.seed.unwrap_or(42);
     let rng = SmallRng::seed_from_u64(rng_seed);
 
-    let client: Box<dyn LlmClient> = if let Some(ref fixture_path) = cli.lab_fixture {
-        let bytes = fs::read(fixture_path)
-            .with_context(|| format!("read lab fixture from {}", fixture_path.display()))?;
-        let fixture_client = ScriptedClient::from_fixture("offline-fixture", &bytes)
-            .map_err(|err| anyhow!("invalid lab fixture: {err}"))?;
-        Box::new(fixture_client)
-    } else {
-        #[cfg(feature = "llm-anthropic")]
-        {
-            let anthropic = AnthropicClient::from_env("claude-3-5-sonnet-20241022", rng)
-                .map_err(|err| anyhow!("could not initialize Anthropic client: {err}"))?;
-            Box::new(anthropic)
+    let offline_mode = args.offline_fixture.as_deref().or_else(|| {
+        if std::env::var("SCRIPTBOTS_LAB_OFFLINE").is_ok() {
+            Some("builtin")
+        } else {
+            None
         }
-        #[cfg(not(feature = "llm-anthropic"))]
-        {
-            let _ = rng;
-            bail!(
-                "Autonomous lab assistant requires either an offline scripted fixture (--lab-fixture <FILE>) \
-                 or the binary compiled with --features llm-anthropic and ANTHROPIC_API_KEY exported."
-            );
+    });
+
+    let client: Box<dyn LlmClient> = match offline_mode {
+        Some("builtin") | Some("") => {
+            let fixture_turn = builtin_offline_fixture(&args.goal, &budget);
+            Box::new(ScriptedClient::new("scripted-builtin", vec![fixture_turn]))
+        }
+        Some(path_str) => {
+            let path = Path::new(path_str);
+            let bytes = fs::read(path)
+                .with_context(|| format!("read lab fixture from {}", path.display()))?;
+            let fixture_client = ScriptedClient::from_fixture("offline-fixture", &bytes)
+                .map_err(|err| anyhow!("invalid lab fixture: {err}"))?;
+            Box::new(fixture_client)
+        }
+        None => {
+            #[cfg(feature = "llm-anthropic")]
+            {
+                let anthropic = AnthropicClient::from_env("claude-3-5-sonnet-20241022", rng)
+                    .map_err(|err| anyhow!("could not initialize Anthropic client: {err}"))?;
+                Box::new(anthropic)
+            }
+            #[cfg(not(feature = "llm-anthropic"))]
+            {
+                let _ = rng;
+                bail!(
+                    "Autonomous lab assistant requires either an offline scripted fixture (--offline-fixture or --offline-fixture <FILE>) \
+                     or the binary compiled with --features llm-anthropic and ANTHROPIC_API_KEY exported."
+                );
+            }
         }
     };
 
-    let mut state_machine = LabStateMachine::new(client, budget, output_root);
+    let mut state_machine =
+        LabStateMachine::new(client, budget, output_root.clone()).with_goal(&args.goal);
 
-    info!(goal = %goal, "starting autonomous lab assistant loop");
+    info!(goal = %args.goal, budget = ?state_machine.budget, "starting autonomous lab assistant loop");
     let phase = state_machine
         .run_to_completion()
         .map_err(|err| anyhow!("lab assistant execution failure: {err}"))?;
@@ -1594,6 +1617,25 @@ fn run_lab_cli(cli: &AppCli, goal: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_lab_cli(cli: &AppCli, goal: &str) -> Result<()> {
+    let args = LabArgs {
+        goal: goal.to_owned(),
+        budget: format!("{}-runs", cli.lab_runs),
+        offline_fixture: cli
+            .lab_fixture
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        ticks: Some(cli.lab_ticks),
+        runs: Some(cli.lab_runs),
+        out: cli
+            .lab_out
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("runs/lab")),
+        seed: cli.rng_seed,
+    };
+    run_lab_subcommand(&args)
 }
 
 fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
@@ -2999,6 +3041,8 @@ fn maybe_emit_config(cli: &AppCli, config: &ScriptBotsConfig) -> Result<Option<C
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 enum AppSubcommand {
+    /// Autonomous LLM lab assistant: hypothesis -> matched-seed sweep -> analysis -> lab notebook (bd-16g.1).
+    Lab(LabArgs),
     /// Economy conservation audit (bd-9sg6 / bd-16g.11.2)
     EconomyAudit(EconomyAuditArgs),
     /// Offline archipelago reconstruction report and population conservation audit (bd-16g.5.5.5)
@@ -3011,6 +3055,37 @@ enum AppSubcommand {
     MapApply(MapApplyArgs),
     /// Round-robin brain tournament, rating estimation, and leaderboard generation (bd-16g.12.3).
     Tournament(scriptbots_app::tournament::TournamentArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+pub struct LabArgs {
+    /// Research goal or hypothesis for the autonomous lab assistant to investigate.
+    #[arg(long, short = 'g')]
+    pub goal: String,
+
+    /// Execution budget: e.g. "40-runs", "20", or "runs=20,ticks=10000,tokens=50000".
+    #[arg(long, default_value = "10-runs")]
+    pub budget: String,
+
+    /// Offline scripted fixture file path, or "builtin" for hermetic operation without API keys.
+    #[arg(long = "offline-fixture", visible_alias = "fixture", num_args = 0..=1, default_missing_value = "builtin")]
+    pub offline_fixture: Option<String>,
+
+    /// Override max ticks budget (optional).
+    #[arg(long)]
+    pub ticks: Option<u64>,
+
+    /// Override max runs budget (optional).
+    #[arg(long)]
+    pub runs: Option<usize>,
+
+    /// Output directory for experiment runs and generated lab notebook.
+    #[arg(long, short = 'o', default_value = "runs/lab")]
+    pub out: PathBuf,
+
+    /// Deterministic RNG seed.
+    #[arg(long = "seed", visible_alias = "rng-seed")]
+    pub seed: Option<u64>,
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]

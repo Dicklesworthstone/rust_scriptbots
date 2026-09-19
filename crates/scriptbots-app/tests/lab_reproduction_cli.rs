@@ -472,3 +472,75 @@ fn failing_executable_exit_fails_closed() {
         "failing executable must fail closed"
     );
 }
+
+#[test]
+fn autonomous_lab_subcommand_produces_notebook_and_passes_reproduction() {
+    let temp = tempfile::tempdir().expect("temp root");
+    let out_dir = temp.path().join("lab_out");
+
+    let status = std::process::Command::new(EXE)
+        .arg("lab")
+        .arg("--goal")
+        .arg("characterize how food_regrowth_rate affects carnivore/herbivore equilibrium")
+        .arg("--budget")
+        .arg("4-runs")
+        .arg("--ticks")
+        .arg("16")
+        .arg("--offline-fixture")
+        .arg("--out")
+        .arg(&out_dir)
+        .status()
+        .expect("spawn scriptbots-app lab");
+
+    assert!(
+        status.success(),
+        "scriptbots-app lab exited with status {status}"
+    );
+
+    let mut notebook_dir = None;
+    for entry in std::fs::read_dir(&out_dir).expect("read out_dir") {
+        let entry = entry.expect("entry");
+        let path = entry.path();
+        if path.is_dir() && path.join("notebook").is_dir() {
+            notebook_dir = Some(path.join("notebook"));
+            break;
+        }
+    }
+    let notebook = notebook_dir.expect("found generated notebook dir");
+    assert!(notebook.join("notebook.md").is_file(), "notebook.md exists");
+    assert!(
+        notebook.join("reproduce.sh").is_file(),
+        "reproduce.sh exists"
+    );
+    assert!(
+        notebook.join("reproduction.json").is_file(),
+        "reproduction.json exists"
+    );
+    assert!(
+        notebook.join("summaries.json").is_file(),
+        "summaries.json exists"
+    );
+    assert!(
+        notebook.join("analysis.json").is_file(),
+        "analysis.json exists"
+    );
+
+    let notebook_content =
+        std::fs::read_to_string(notebook.join("notebook.md")).expect("read notebook.md");
+    assert!(
+        notebook_content.contains("carnivore/herbivore equilibrium"),
+        "notebook should contain research goal: {notebook_content}"
+    );
+    assert!(
+        notebook_content.contains("reproduce.sh"),
+        "notebook should contain reproduction command"
+    );
+
+    let repro_output = run_script(&notebook);
+    assert_eq!(
+        repro_output.status.code(),
+        Some(0),
+        "reproduce.sh must pass:\n{}",
+        log(&repro_output)
+    );
+}

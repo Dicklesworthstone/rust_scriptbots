@@ -59,6 +59,132 @@ impl Default for LabBudget {
     }
 }
 
+/// Parse a multi-axis budget string such as "40-runs", "20", or "runs=20,ticks=10000,tokens=50000".
+pub fn parse_lab_budget(s: &str) -> Result<LabBudget, String> {
+    let mut budget = LabBudget::default();
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(budget);
+    }
+    let lower = s.to_ascii_lowercase();
+    if let Some(prefix) = lower
+        .strip_suffix("-runs")
+        .or_else(|| lower.strip_suffix("_runs"))
+        .or_else(|| lower.strip_suffix(" runs"))
+        .or_else(|| lower.strip_suffix("runs"))
+    {
+        let n = prefix
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| format!("invalid runs in budget '{s}': {e}"))?;
+        budget.max_runs = n;
+        return Ok(budget);
+    }
+    if let Ok(n) = s.parse::<usize>() {
+        budget.max_runs = n;
+        return Ok(budget);
+    }
+    for part in s.split([',', ';', ' ']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = part.split_once('=').or_else(|| part.split_once(':')) {
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim();
+            match k.as_str() {
+                "runs" | "max_runs" | "max-runs" => {
+                    budget.max_runs = v
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid budget runs '{v}': {e}"))?;
+                }
+                "ticks" | "max_ticks" | "max-ticks" => {
+                    budget.max_ticks = v
+                        .parse::<u64>()
+                        .map_err(|e| format!("invalid budget ticks '{v}': {e}"))?;
+                }
+                "tokens" | "max_tokens" | "max-tokens" => {
+                    budget.max_tokens = v
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid budget tokens '{v}': {e}"))?;
+                }
+                "iterations" | "max_iterations" | "max-iterations" => {
+                    budget.max_iterations = v
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid budget iterations '{v}': {e}"))?;
+                }
+                unknown => {
+                    return Err(format!(
+                        "unknown budget key '{unknown}', expected runs, ticks, tokens, or iterations"
+                    ));
+                }
+            }
+        } else if let Some(prefix) = part
+            .strip_suffix("-runs")
+            .or_else(|| part.strip_suffix("_runs"))
+            .or_else(|| part.strip_suffix("runs"))
+        {
+            if let Ok(n) = prefix.trim().parse::<usize>() {
+                budget.max_runs = n;
+            } else {
+                return Err(format!("invalid budget component '{part}'"));
+            }
+        } else {
+            return Err(format!(
+                "invalid budget component '{part}', expected format like '20-runs' or 'runs=20,ticks=10000'"
+            ));
+        }
+    }
+    Ok(budget)
+}
+
+impl std::str::FromStr for LabBudget {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_lab_budget(s)
+    }
+}
+
+/// Generate a canonical offline scripted fixture turn for a given goal and budget.
+#[must_use]
+pub fn builtin_offline_fixture(goal: &str, budget: &LabBudget) -> crate::lab::llm::ScriptedTurn {
+    let arm_count = 2;
+    let seed_count = (budget.max_runs / arm_count).max(1);
+    let runs = arm_count * seed_count;
+    let ticks_per_run = (budget.max_ticks / (runs as u64)).clamp(2, 50);
+    let total_ticks = (runs as u64) * ticks_per_run;
+
+    let hypothesis = if goal.trim().is_empty() {
+        "faster food growth raises the final population"
+    } else {
+        goal.trim()
+    };
+
+    crate::lab::llm::ScriptedTurn {
+        body: serde_json::json!({
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 120, "output_tokens": 80 },
+            "content": [{
+                "type": "tool_use",
+                "name": PROPOSE_EXPERIMENT_TOOL_NAME,
+                "input": {
+                    "hypothesis": hypothesis,
+                    "falsifier": "matched seeds show no increase in alive agents across conditions",
+                    "factors": [{
+                        "knob_path": "food_growth_rate",
+                        "values": [0.01, 0.02]
+                    }],
+                    "seeds": { "base": 41, "count": seed_count },
+                    "ticks_per_run": ticks_per_run,
+                    "metrics": ["alive_agents"],
+                    "budget": { "runs": runs, "ticks": total_ticks }
+                }
+            }]
+        }),
+    }
+}
+
 /// Successful execution accounting returned by an experiment executor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionReceipt {
@@ -438,6 +564,8 @@ pub enum LabError {
 /// Autonomous lab assistant state machine runner (bd-16g.1.3).
 pub struct LabStateMachine {
     pub phase: LabPhase,
+    /// Optional research goal from the operator.
+    pub goal: Option<String>,
     pub spec: Option<ExperimentSpec>,
     pub validated_spec: Option<ValidatedSpec>,
     pub validation_errors: Vec<SpecError>,
@@ -491,6 +619,13 @@ impl LabStateMachine {
         Self::with_executor_and_notebook_root(client, budget, executor, None)
     }
 
+    /// Attach an operator research goal to guide experiment proposals.
+    #[must_use]
+    pub fn with_goal(mut self, goal: impl Into<String>) -> Self {
+        self.goal = Some(goal.into());
+        self
+    }
+
     fn with_executor_and_notebook_root(
         client: Box<dyn LlmClient>,
         budget: LabBudget,
@@ -499,6 +634,7 @@ impl LabStateMachine {
     ) -> Self {
         Self {
             phase: LabPhase::Propose,
+            goal: None,
             spec: None,
             validated_spec: None,
             validation_errors: Vec::new(),
@@ -563,14 +699,22 @@ impl LabStateMachine {
                 allowed: self.budget.max_tokens,
             });
         }
+        let user_content = match &self.goal {
+            Some(goal) if !goal.trim().is_empty() => {
+                format!(
+                    "Propose one matched-seed experiment within the supplied schema to investigate this goal:\n\n{}",
+                    goal.trim()
+                )
+            }
+            _ => "Propose one matched-seed experiment within the supplied schema.".to_owned(),
+        };
         let request = LlmRequest {
             system: "You propose bounded, falsifiable ScriptBots experiments. Call the offered \
                      tool exactly once; prose is not an experiment."
                 .to_owned(),
             messages: vec![LlmMessage {
                 role: "user".to_owned(),
-                content: "Propose one matched-seed experiment within the supplied schema."
-                    .to_owned(),
+                content: user_content,
             }],
             tools: vec![propose_experiment_tool()?],
             max_tokens: u32::try_from(remaining_tokens.min(2_048)).unwrap_or(2_048),
@@ -607,7 +751,15 @@ impl LabStateMachine {
             Ok(spec) => spec,
             Err(error) => {
                 tracing::warn!(
+                    phase = "propose",
                     proposal_id = %proposal_id,
+                    hypothesis_id = %proposal_id,
+                    knobs = ?["unknown"],
+                    seeds = ?[0u64; 0],
+                    runs_spent = self.runs_spent,
+                    tokens_spent = self.tokens_spent,
+                    decision = "rejected",
+                    rationale = "lab proposal failed canonical schema decoding",
                     stage = "propose",
                     error_codes = ?["invalid_proposal"],
                     budget_decision = "not_allocated",
@@ -618,13 +770,33 @@ impl LabStateMachine {
                 return Err(LabError::InvalidProposal(error.to_string()));
             }
         };
+        let knob_names: Vec<String> = spec.factors.iter().map(|f| f.knob_path.clone()).collect();
         tracing::info!(
+            phase = "propose",
             proposal_id = %proposal_id,
+            hypothesis_id = %proposal_id,
+            hypothesis = %spec.hypothesis,
+            knobs = ?knob_names,
+            seeds = ?spec.seeds,
+            runs_spent = self.runs_spent,
+            tokens_spent = self.tokens_spent,
+            decision = "proposed",
+            rationale = "decoded through canonical tool schema",
             stage = "propose",
             model_id = self.client.model_id(),
-            tokens_spent = self.tokens_spent,
             "lab proposal decoded through canonical tool schema"
         );
+        if std::env::var("SCRIPTBOTS_LAB_TRACE").is_ok() {
+            eprintln!(
+                "[lab_trace] propose: proposal_id={} hypothesis=\"{}\" knobs={:?} seeds={:?} runs_spent={} tokens_spent={}",
+                proposal_id,
+                spec.hypothesis,
+                knob_names,
+                spec.seeds,
+                self.runs_spent,
+                self.tokens_spent
+            );
+        }
         self.proposal_id = Some(proposal_id);
         self.spec = Some(spec);
         self.phase = LabPhase::Validate;
@@ -645,13 +817,30 @@ impl LabStateMachine {
             Ok(validated) => validated,
             Err(errors) => {
                 let codes = errors.iter().map(SpecError::code).collect::<Vec<_>>();
+                let knob_names: Vec<String> =
+                    spec.factors.iter().map(|f| f.knob_path.clone()).collect();
                 tracing::warn!(
+                    phase = "validate",
                     proposal_id = self.proposal_id.as_deref().unwrap_or("unavailable"),
+                    hypothesis_id = self.proposal_id.as_deref().unwrap_or("unavailable"),
+                    knobs = ?knob_names,
+                    seeds = ?spec.seeds,
+                    runs_spent = self.runs_spent,
+                    tokens_spent = self.tokens_spent,
+                    decision = "rejected",
+                    rationale = "proposal failed canonical validation",
                     stage = "validate",
                     error_codes = ?codes,
                     budget_decision = "rejected",
                     "lab proposal rejected before execution"
                 );
+                if std::env::var("SCRIPTBOTS_LAB_TRACE").is_ok() {
+                    eprintln!(
+                        "[lab_trace] validate: REJECTED proposal_id={} errors={:?}",
+                        self.proposal_id.as_deref().unwrap_or("unavailable"),
+                        codes
+                    );
+                }
                 self.validation_errors.clone_from(&errors);
                 self.phase = LabPhase::Report;
                 return Err(LabError::Validation {
@@ -668,23 +857,46 @@ impl LabStateMachine {
         }
         if self.executed_spec_hashes.contains(&validated.spec_id) {
             self.phase = LabPhase::Report;
-            return Err(LabError::DuplicateExperiment(validated.spec_id));
+            return Err(LabError::DuplicateExperiment(validated.spec_id.clone()));
         }
+        let knob_names: Vec<String> = validated
+            .spec
+            .factors
+            .iter()
+            .map(|f| f.knob_path.clone())
+            .collect();
         let cost = validated.cost();
         tracing::info!(
+            phase = "validate",
             proposal_id = self.proposal_id.as_deref().unwrap_or("unavailable"),
+            hypothesis_id = %validated.spec_id,
             spec_id = %validated.spec_id,
+            knobs = ?knob_names,
+            seeds = ?validated.seeds,
+            runs_spent = self.runs_spent,
+            tokens_spent = self.tokens_spent,
             stage = "validate",
             expanded_arms = validated.arms.len(),
             arm_assignments = ?validated.arms,
-            seeds = ?validated.seeds,
             runs = cost.runs,
             ticks = cost.ticks,
             max_runs = operator_budget.runs,
             max_ticks = operator_budget.ticks,
+            decision = "accepted",
+            rationale = "passed canonical validation",
             budget_decision = "accepted",
             "lab proposal passed canonical validation"
         );
+        if std::env::var("SCRIPTBOTS_LAB_TRACE").is_ok() {
+            eprintln!(
+                "[lab_trace] validate: ACCEPTED spec_id={} arms={} seeds={:?} runs={} ticks={}",
+                validated.spec_id,
+                validated.arms.len(),
+                validated.seeds,
+                cost.runs,
+                cost.ticks
+            );
+        }
         self.validation_errors.clear();
         self.validated_spec = Some(validated);
         self.phase = LabPhase::Execute;
@@ -728,6 +940,36 @@ impl LabStateMachine {
                 receipt.summaries.len()
             )));
         }
+        let knob_names: Vec<String> = validated
+            .spec
+            .factors
+            .iter()
+            .map(|f| f.knob_path.clone())
+            .collect();
+        tracing::info!(
+            phase = "execute",
+            hypothesis_id = %validated.spec_id,
+            spec_id = %validated.spec_id,
+            knobs = ?knob_names,
+            seeds = ?validated.seeds,
+            runs_spent = self.runs_spent,
+            tokens_spent = self.tokens_spent,
+            decision = "executed",
+            rationale = "runs completed and verified",
+            stage = "execute",
+            runs = expected_runs,
+            ticks = cost.ticks,
+            "matched-seed runs executed successfully"
+        );
+        if std::env::var("SCRIPTBOTS_LAB_TRACE").is_ok() {
+            eprintln!(
+                "[lab_trace] execute: spec_id={} runs_spent={} ticks_spent={} summaries={}",
+                validated.spec_id,
+                self.runs_spent,
+                self.ticks_spent,
+                receipt.summaries.len()
+            );
+        }
         self.run_summaries = receipt.summaries;
         self.executed_spec_hashes.insert(validated.spec_id.clone());
         self.phase = LabPhase::Analyze;
@@ -751,8 +993,22 @@ impl LabStateMachine {
                 return Err(LabError::Analysis(error));
             }
         };
+        let knob_names: Vec<String> = validated
+            .spec
+            .factors
+            .iter()
+            .map(|f| f.knob_path.clone())
+            .collect();
         tracing::info!(
+            phase = "analyze",
+            hypothesis_id = %validated.spec_id,
             spec_id = %validated.spec_id,
+            knobs = ?knob_names,
+            seeds = ?validated.seeds,
+            runs_spent = self.runs_spent,
+            tokens_spent = self.tokens_spent,
+            decision = "analyzed",
+            rationale = "canonical statistics computed",
             stage = "analyze",
             inputs = self.run_summaries.len(),
             effects = analysis.effects.len(),
@@ -764,6 +1020,14 @@ impl LabStateMachine {
             elapsed_micros = started.elapsed().as_micros(),
             "matched-seed summaries analyzed by the canonical statistics authority"
         );
+        if std::env::var("SCRIPTBOTS_LAB_TRACE").is_ok() {
+            eprintln!(
+                "[lab_trace] analyze: spec_id={} effects={} correction={}",
+                validated.spec_id,
+                analysis.effects.len(),
+                analysis.params.correction.as_str()
+            );
+        }
         self.analysis = Some(analysis);
         self.phase = LabPhase::Report;
         Ok(())
@@ -794,12 +1058,13 @@ impl LabStateMachine {
             context
                 .failure_reason
                 .get_or_insert_with(|| "no validated statistical analysis was produced".to_owned());
-            let goal = self
-                .spec
-                .as_ref()
-                .map_or("No validated experiment hypothesis is available.", |spec| {
-                    spec.hypothesis.as_str()
-                });
+            let goal = self.goal.as_deref().unwrap_or_else(|| {
+                self.spec
+                    .as_ref()
+                    .map_or("No validated experiment hypothesis is available.", |spec| {
+                        spec.hypothesis.as_str()
+                    })
+            });
             let rendered = NotebookRenderer::render_markdown(goal, &[], &[], &context)
                 .map_err(LabError::Notebook)?;
             if let Some(root) = &self.notebook_root {
@@ -824,10 +1089,26 @@ impl LabStateMachine {
             return Ok(());
         };
         let known_runs = run_refs(&self.run_summaries);
-        let goal = format!(
-            "{}\n\n- Validated Spec ID: {}",
-            validated.spec.hypothesis, validated.spec_id
-        );
+        let goal = if let Some(ref user_goal) = self.goal {
+            if user_goal.trim() == validated.spec.hypothesis.trim() {
+                format!(
+                    "{}\n\n- Validated Spec ID: {}",
+                    validated.spec.hypothesis, validated.spec_id
+                )
+            } else {
+                format!(
+                    "{}\n\n- Research Goal: {}\n- Validated Spec ID: {}",
+                    validated.spec.hypothesis,
+                    user_goal.trim(),
+                    validated.spec_id
+                )
+            }
+        } else {
+            format!(
+                "{}\n\n- Validated Spec ID: {}",
+                validated.spec.hypothesis, validated.spec_id
+            )
+        };
         let claims = match claims_from_analysis(
             analysis,
             &self.run_summaries,
@@ -862,13 +1143,35 @@ impl LabStateMachine {
             .map_err(LabError::Notebook)?;
             self.notebook_path = Some(path);
         }
+        let knob_names: Vec<String> = validated
+            .spec
+            .factors
+            .iter()
+            .map(|f| f.knob_path.clone())
+            .collect();
         tracing::info!(
+            phase = "report",
+            hypothesis_id = %validated.spec_id,
             spec_id = %validated.spec_id,
+            knobs = ?knob_names,
+            seeds = ?validated.seeds,
+            runs_spent = self.runs_spent,
+            tokens_spent = self.tokens_spent,
+            decision = "reported",
+            rationale = "notebook rendered and verified",
             stage = "report",
             effects = analysis.effects.len(),
             notebook_bytes = rendered.len(),
             "provenance-checked lab notebook rendered"
         );
+        if std::env::var("SCRIPTBOTS_LAB_TRACE").is_ok() {
+            eprintln!(
+                "[lab_trace] report: spec_id={} notebook_bytes={} path={:?}",
+                validated.spec_id,
+                rendered.len(),
+                self.notebook_path
+            );
+        }
         self.rendered_notebook = Some(rendered);
         self.phase = LabPhase::Finished;
         Ok(())
@@ -1458,5 +1761,51 @@ mod tests {
         assert_eq!(runner.ticks_spent, 0);
         assert!(calls.lock().expect("calls").is_empty());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn parse_lab_budget_variants() {
+        let b1 = parse_lab_budget("40-runs").expect("40-runs");
+        assert_eq!(b1.max_runs, 40);
+
+        let b2 = parse_lab_budget("20_runs").expect("20_runs");
+        assert_eq!(b2.max_runs, 20);
+
+        let b3 = parse_lab_budget("15").expect("15");
+        assert_eq!(b3.max_runs, 15);
+
+        let b4 =
+            parse_lab_budget("runs=25,ticks=5000,tokens=80000,iterations=15").expect("multi-axis");
+        assert_eq!(b4.max_runs, 25);
+        assert_eq!(b4.max_ticks, 5000);
+        assert_eq!(b4.max_tokens, 80000);
+        assert_eq!(b4.max_iterations, 15);
+
+        assert!("invalid".parse::<LabBudget>().is_err());
+        assert!("unknown_key=10".parse::<LabBudget>().is_err());
+    }
+
+    #[test]
+    fn builtin_offline_fixture_generates_valid_spec() {
+        let budget = LabBudget {
+            max_runs: 4,
+            max_ticks: 16,
+            max_tokens: 100_000,
+            max_iterations: 20,
+        };
+        let turn = builtin_offline_fixture("test goal", &budget);
+        let content = &turn.body["content"][0]["input"];
+        assert_eq!(content["hypothesis"], "test goal");
+        assert_eq!(content["budget"]["runs"], 4);
+        assert_eq!(content["budget"]["ticks"], 16);
+    }
+
+    #[test]
+    fn with_goal_configures_state_machine() {
+        let budget = LabBudget::default();
+        let turn = builtin_offline_fixture("custom research goal", &budget);
+        let client = Box::new(ScriptedClient::new("test", vec![turn]));
+        let lab = LabStateMachine::new(client, budget, "/tmp").with_goal("custom research goal");
+        assert_eq!(lab.goal.as_deref(), Some("custom research goal"));
     }
 }
