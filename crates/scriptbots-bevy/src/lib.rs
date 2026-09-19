@@ -46,7 +46,9 @@ use scriptbots_core::{
 };
 #[cfg(test)]
 use scriptbots_core::{BrainInspectionClientId, BrainInspectionRequest, BrainInspectionRevision};
-use scriptbots_runtime::{HostPort, RenderSnapshot, channel::ChannelHostPort};
+use scriptbots_runtime::{
+    HostAccessError, HostClient, HostPort, RenderSnapshot, channel::ChannelHostPort,
+};
 use slotmap::Key;
 use std::{
     collections::{HashMap, HashSet},
@@ -75,6 +77,14 @@ pub struct BevyRendererContext {
     pub host: ChannelHostPort,
     pub command_submit: CommandSubmitFn,
     pub control_health: Option<ControlHealthFn>,
+}
+
+impl BevyRendererContext {
+    /// Construct a HostClient accessor for this renderer context.
+    #[must_use]
+    pub fn client(&self) -> HostClient<ChannelHostPort> {
+        HostClient::new(self.host.clone())
+    }
 }
 
 type BevyWorker = thread::JoinHandle<Result<()>>;
@@ -669,6 +679,8 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         .name("scriptbots-bevy-snapshot".into())
         .spawn(move || {
             run_reported_worker("snapshot worker", &snapshot_failures, &worker_flag, || {
+                let mut client = HostClient::new(host);
+                let mut subscription = client.subscribe_snapshots();
                 let mut last_snapshot: Option<WorldSnapshot> = None;
                 let mut next_revision = 1_u64;
                 // Client identity and revision for brain inspection are owned
@@ -677,13 +689,16 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                 let brain_client_id =
                     scriptbots_runtime::ProjectionClientId::new(BRAIN_OVERLAY_CLIENT_ID);
                 let mut next_brain_revision = 0_u64;
-                let mut host_revision = None;
                 while worker_flag.load(Ordering::Acquire) {
-                    let Some(published) = host.snapshot_after(host_revision)? else {
-                        thread::sleep(Duration::from_millis(30));
-                        continue;
+                    let published = match client.poll_snapshot(&mut subscription) {
+                        Ok(Some(published)) => published,
+                        Ok(None) => {
+                            thread::sleep(Duration::from_millis(15));
+                            continue;
+                        }
+                        Err(HostAccessError::Disconnected) => break,
+                        Err(error) => return Err(error.into()),
                     };
-                    host_revision = Some(published.revision);
                     controls_for_thread.update(|state| {
                         state.paused = published.playback.paused;
                         state.speed_multiplier = published.playback.speed_multiplier;
@@ -695,14 +710,13 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                             None
                         };
                     });
-                    let mut snapshot = WorldSnapshot::from_snapshot(&published)
-                    .ok_or_else(|| {
+                    let mut snapshot = WorldSnapshot::from_snapshot(&published).ok_or_else(|| {
                         anyhow!(
                             "Bevy snapshot worker rejected invalid dimensions or incomplete visual layers"
                         )
                     })?;
                     snapshot.brain = BrainOverlay::capture_host(
-                        &mut host,
+                        client.port_mut(),
                         &published,
                         brain_client_id,
                         &mut next_brain_revision,
@@ -719,7 +733,7 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
                         }
                     }
 
-                    thread::sleep(Duration::from_millis(30));
+                    thread::sleep(Duration::from_millis(15));
                 }
                 Ok(())
             })
@@ -1471,8 +1485,27 @@ fn despawn_agent_entities(record: AgentRecord, commands: &mut Commands) {
 }
 
 #[derive(Resource, Clone)]
-struct CommandSubmitter {
-    submit: CommandSubmitFn,
+pub struct CommandSubmitter {
+    pub submit: CommandSubmitFn,
+}
+
+impl CommandSubmitter {
+    #[must_use]
+    pub fn new(submit: CommandSubmitFn) -> Self {
+        Self { submit }
+    }
+
+    pub fn submit_command(&self, command: ControlCommand) -> Option<String> {
+        (self.submit)(command)
+    }
+
+    pub fn submit_simulation(&self, command: SimulationCommand) -> Option<String> {
+        self.submit_command(ControlCommand::UpdateSimulation(command))
+    }
+
+    pub fn submit_selection(&self, update: SelectionUpdate) -> Option<String> {
+        self.submit_command(ControlCommand::UpdateSelection(update))
+    }
 }
 
 const SPEED_STEP: f32 = 0.5;
@@ -12561,6 +12594,245 @@ mod tests {
             20.0,
             "toroidal_delta across opposite wrap seam must compute minimum distance"
         );
+    }
+
+    #[test]
+    fn test_zero_one_and_multiple_bevy_subscribers_preserve_exact_world_digest_and_tick_sequence() {
+        use scriptbots_runtime::{
+            HostCore, HostCoreOptions, HostSessionId, ManualHostDriver, ManualInstant,
+            PlaybackSnapshot,
+        };
+
+        let seed = 0x5EED_BEEF;
+        let tick_period = 10_000_000_u64;
+        let make_host = || {
+            let config = ScriptBotsConfig {
+                rng_seed: Some(seed),
+                world_width: 80,
+                world_height: 80,
+                food_cell_size: 40,
+                population_minimum: 5,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            };
+            let mut world = WorldState::new(config).expect("world init");
+            for _ in 0..5 {
+                let _ = world.try_spawn_agent(scriptbots_core::AgentData::default());
+            }
+            HostCore::new(
+                HostSessionId::new(0xBEEF),
+                world,
+                HostCoreOptions {
+                    tick_period_nanos: tick_period,
+                    initial_playback: PlaybackSnapshot {
+                        paused: false,
+                        speed_multiplier: 1.0,
+                    },
+                    capture_agent_visuals: true,
+                    ..HostCoreOptions::default()
+                },
+            )
+            .expect("host core init")
+        };
+
+        // Case 0: 0 Bevy subscribers. Step host for 30 ticks.
+        let mut host_0 = make_host();
+        host_0
+            .drive(ManualInstant::from_nanos(0))
+            .expect("init drive host 0");
+        for step in 1..=30 {
+            host_0
+                .drive(ManualInstant::from_nanos(step * tick_period))
+                .expect("drive host 0");
+        }
+        let digest_0 = host_0.scientific_digest_v1().expect("digest 0");
+        let tick_0 = host_0.latest_snapshot().world.tick;
+        assert_eq!(tick_0, 30);
+
+        // Case 1: 1 Bevy subscriber polling snapshots via HostClient/hub and updating presentation
+        let mut host_1 = make_host();
+        host_1
+            .drive(ManualInstant::from_nanos(0))
+            .expect("init drive host 1");
+        let hub_1 = host_1.snapshot_hub();
+        let mut sub_1 = hub_1.subscribe();
+
+        for step in 1..=30 {
+            host_1
+                .drive(ManualInstant::from_nanos(step * tick_period))
+                .expect("drive host 1");
+            let polled = hub_1.poll_latest(&mut sub_1).expect("poll subscriber 1");
+            assert!(polled.is_some());
+            let snapshot = polled.unwrap();
+            let world_snap = WorldSnapshot::from_snapshot(&snapshot).expect("bevy snapshot");
+            assert_eq!(world_snap.tick, step);
+        }
+        let digest_1 = host_1.scientific_digest_v1().expect("digest 1");
+        assert_eq!(
+            digest_0, digest_1,
+            "1 Bevy subscriber must yield bit-exact WorldDigest match to 0 subscribers"
+        );
+
+        // Case 2: 3 concurrent Bevy subscribers with varying polling cadences (simulating multiple windows)
+        let mut host_3 = make_host();
+        host_3
+            .drive(ManualInstant::from_nanos(0))
+            .expect("init drive host 3");
+        let hub_3 = host_3.snapshot_hub();
+        let mut sub_a = hub_3.subscribe();
+        let mut sub_b = hub_3.subscribe();
+        let mut sub_c = hub_3.subscribe();
+
+        for step in 1..=30 {
+            host_3
+                .drive(ManualInstant::from_nanos(step * tick_period))
+                .expect("drive host 3");
+            // sub_a polls every tick
+            let snap_a = hub_3
+                .poll_latest(&mut sub_a)
+                .expect("poll sub a")
+                .expect("snap a");
+            assert_eq!(snap_a.world.tick, step);
+
+            // sub_b polls every 3 ticks (coalescing)
+            if step % 3 == 0 {
+                let snap_b = hub_3
+                    .poll_latest(&mut sub_b)
+                    .expect("poll sub b")
+                    .expect("snap b");
+                assert_eq!(
+                    snap_b.world.tick, step,
+                    "coalesced subscriber catches up to current tick"
+                );
+            }
+
+            // sub_c polls only on tick 30 (massive coalescing / revision gap)
+            if step == 30 {
+                let snap_c = hub_3
+                    .poll_latest(&mut sub_c)
+                    .expect("poll sub c")
+                    .expect("snap c");
+                assert_eq!(
+                    snap_c.world.tick, 30,
+                    "subscriber with large revision gap catches up seamlessly"
+                );
+            }
+        }
+        let digest_3 = host_3.scientific_digest_v1().expect("digest 3");
+        assert_eq!(
+            digest_0, digest_3,
+            "Multiple Bevy subscribers must yield bit-exact WorldDigest match to 0 and 1 subscribers"
+        );
+    }
+
+    #[test]
+    fn test_bevy_snapshot_hub_coalescing_and_revision_gap_reconnect() {
+        use scriptbots_runtime::{
+            HostCore, HostCoreOptions, HostSessionId, ManualHostDriver, ManualInstant,
+            PlaybackSnapshot,
+        };
+
+        let tick_period = 10_000_000_u64;
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(123),
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 40,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let mut host = HostCore::new(
+            HostSessionId::new(42),
+            world,
+            HostCoreOptions {
+                tick_period_nanos: tick_period,
+                initial_playback: PlaybackSnapshot {
+                    paused: false,
+                    speed_multiplier: 1.0,
+                },
+                capture_agent_visuals: true,
+                ..HostCoreOptions::default()
+            },
+        )
+        .unwrap();
+        host.drive(ManualInstant::from_nanos(0))
+            .expect("init drive");
+        let hub = host.snapshot_hub();
+        let mut sub = hub.subscribe();
+
+        // Advance 10 ticks
+        for step in 1..=10 {
+            host.drive(ManualInstant::from_nanos(step * tick_period))
+                .unwrap();
+        }
+
+        // Subscriber reads tick 10 directly without backlog
+        let polled = hub
+            .poll_latest(&mut sub)
+            .unwrap()
+            .expect("snapshot after gap");
+        assert_eq!(polled.world.tick, 10);
+        let last_rev = polled.revision;
+
+        // Advance another 20 ticks while subscriber is idle
+        for step in 11..=30 {
+            host.drive(ManualInstant::from_nanos(step * tick_period))
+                .unwrap();
+        }
+
+        // Subscriber reconnects/polls and gets tick 30 immediately with monotonic revision
+        let polled_reconnect = hub
+            .poll_latest(&mut sub)
+            .unwrap()
+            .expect("snapshot after second gap");
+        assert_eq!(polled_reconnect.world.tick, 30);
+        assert!(polled_reconnect.revision > last_rev);
+    }
+
+    #[test]
+    fn test_bevy_typed_receipts_and_intent_lifecycle() {
+        let recorded_commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded_commands);
+        let next_id = std::sync::atomic::AtomicU64::new(100);
+
+        let submitter = CommandSubmitter::new(Arc::new(move |command| {
+            recorded_clone.lock().unwrap().push(command);
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            Some(format!("{:032x}", id))
+        }));
+
+        // 1. Submit simulation playback command
+        let receipt_pause = submitter.submit_simulation(SimulationCommand {
+            paused: Some(true),
+            speed_multiplier: Some(0.0),
+            step_once: false,
+        });
+        assert!(receipt_pause.is_some());
+        assert_eq!(receipt_pause.unwrap(), format!("{:032x}", 100));
+
+        // 2. Submit step command
+        let receipt_step = submitter.submit_simulation(SimulationCommand {
+            paused: None,
+            speed_multiplier: None,
+            step_once: true,
+        });
+        assert!(receipt_step.is_some());
+        assert_eq!(receipt_step.unwrap(), format!("{:032x}", 101));
+
+        // 3. Submit selection update
+        let receipt_sel = submitter.submit_selection(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: vec![42],
+            state: SelectionState::Selected,
+        });
+        assert!(receipt_sel.is_some());
+        assert_eq!(receipt_sel.unwrap(), format!("{:032x}", 102));
+
+        let commands = recorded_commands.lock().unwrap();
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(commands[0], ControlCommand::UpdateSimulation(_)));
+        assert!(matches!(commands[1], ControlCommand::UpdateSimulation(_)));
+        assert!(matches!(commands[2], ControlCommand::UpdateSelection(_)));
     }
 }
 
