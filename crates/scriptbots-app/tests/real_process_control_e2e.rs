@@ -707,7 +707,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         let tools = list_json["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 15, "MCP tools/list must return all 15 tools");
+        assert_eq!(tools.len(), 16, "MCP tools/list must return all 16 tools");
 
         // MCP tools/call get_status
         let status_payload = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#;
@@ -1134,6 +1134,99 @@ fn real_process_cli_map_generate_and_apply_roundtrip() -> Result<()> {
         output_apply_postcard.status.success(),
         "CLI map-apply postcard failed: {}",
         String::from_utf8_lossy(&output_apply_postcard.stderr)
+    );
+
+    Ok(())
+}
+
+/// Real process CLI replay subcommand test with positive replay, negative seed mismatch, and negative divergence.
+#[test]
+#[serial]
+fn real_process_cli_replay_journal_roundtrip_and_divergence() -> Result<()> {
+    let run_dir = tempdir()?;
+    let journal_path = run_dir.path().join("journal.jsonl");
+    let summary_path = run_dir.path().join("summary.json");
+
+    let cmd = scriptbots_core::interventions::drought(scriptbots_core::Region::All, 50, 0.5)
+        .expect("valid drought");
+
+    let mut journal =
+        scriptbots_core::interventions::InterventionJournal::new(42, "initial_test_config");
+    journal.push(
+        scriptbots_core::interventions::InterventionJournalRow::record(
+            1,
+            10,
+            scriptbots_core::interventions::InterventionSurface::Cli,
+            "operator",
+            &cmd,
+            true,
+            None,
+            0,
+            0,
+            None,
+        ),
+    );
+
+    journal
+        .to_file(&journal_path)
+        .expect("write journal to file");
+
+    // 1. Positive replay: run CLI replay with matching seed
+    let output_replay = Command::new(binary())
+        .args(["replay", "--journal"])
+        .arg(&journal_path)
+        .args(["--ticks", "60", "--seed", "42", "--out"])
+        .arg(&summary_path)
+        .output()
+        .context("execute replay subcommand")?;
+
+    assert!(
+        output_replay.status.success(),
+        "CLI replay failed: stderr={}",
+        String::from_utf8_lossy(&output_replay.stderr)
+    );
+    assert!(summary_path.exists(), "summary JSON file must exist");
+    let summary_content = std::fs::read_to_string(&summary_path)?;
+    assert!(
+        summary_content.contains("\"commands_applied\": 1"),
+        "summary must show 1 applied command: {summary_content}"
+    );
+
+    // 2. Negative control: CLI replay with mismatched seed must fail
+    let output_seed_mismatch = Command::new(binary())
+        .args(["replay", "--journal"])
+        .arg(&journal_path)
+        .args(["--ticks", "60", "--seed", "999"])
+        .output()
+        .context("execute replay with seed mismatch")?;
+
+    assert!(
+        !output_seed_mismatch.status.success(),
+        "CLI replay with wrong seed must fail"
+    );
+    let stderr_mismatch = String::from_utf8_lossy(&output_seed_mismatch.stderr);
+    assert!(
+        stderr_mismatch.contains("seed mismatch") || stderr_mismatch.contains("SeedMismatch"),
+        "stderr must report seed mismatch: {stderr_mismatch}"
+    );
+
+    // 3. Negative control: Tampered journal row causes loud error
+    let tampered_path = run_dir.path().join("tampered.jsonl");
+    let raw_journal = std::fs::read_to_string(&journal_path)?;
+    let tampered_content =
+        raw_journal.replace("\"kind\":\"drought\"", "\"kind\":\"unknown_weapon\"");
+    std::fs::write(&tampered_path, tampered_content)?;
+
+    let output_tampered = Command::new(binary())
+        .args(["replay", "--journal"])
+        .arg(&tampered_path)
+        .args(["--ticks", "60", "--seed", "42"])
+        .output()
+        .context("execute replay with tampered journal")?;
+
+    assert!(
+        !output_tampered.status.success(),
+        "CLI replay with tampered journal must fail"
     );
 
     Ok(())

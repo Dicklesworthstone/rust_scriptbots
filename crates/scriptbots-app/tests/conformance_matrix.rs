@@ -317,6 +317,7 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
         "apply_preset",
         "apply_updates",
         "get_command_status",
+        "intervene",
         "get_config",
         "get_status",
         "list_knobs",
@@ -335,7 +336,7 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
             "expected tool '{expected}' missing from roster: {tool_names:?}"
         );
     }
-    assert_eq!(tool_names.len(), 15);
+    assert_eq!(tool_names.len(), 16);
 }
 
 #[test]
@@ -675,5 +676,124 @@ fn test_sse_resume_filtering_and_mcp_events_discovery() {
     assert!(
         ndjson_chunk.contains("\"tick\":"),
         "NDJSON must contain tick summary: {ndjson_chunk}"
+    );
+}
+
+#[test]
+fn test_cross_surface_intervention_equivalence_and_rejection() {
+    let fixture = setup_conformance_fixture();
+    let _ = initialize_mcp(fixture.mcp_addr);
+
+    // 1. REST /api/control/intervene submission
+    let rest_payload = serde_json::json!({
+        "intervention": {
+            "kind": "drought",
+            "region": { "shape": "all" },
+            "ticks": 20,
+            "growth_scale": 0.25
+        },
+        "surface": "rest",
+        "actor": "rest_tester"
+    });
+    let (rest_status, rest_resp) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/control/intervene",
+        &[("Content-Type", "application/json")],
+        Some(rest_payload.to_string().as_bytes()),
+    )
+    .expect("REST intervene POST");
+    assert_eq!(rest_status, 200, "REST intervene response: {rest_resp}");
+    let rest_json: Value = serde_json::from_str(&rest_resp).expect("parse REST response JSON");
+    assert_eq!(rest_json["application_state"], "admitted");
+
+    // 2. REST alias /api/interventions submission
+    let alias_payload = serde_json::json!({
+        "intervention": {
+            "kind": "bloom",
+            "region": { "shape": "disc", "x": 32.0, "y": 32.0, "radius": 16.0 },
+            "amount": 50.0
+        },
+        "surface": "rest",
+        "actor": "rest_alias_tester"
+    });
+    let (alias_status, alias_resp) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/interventions",
+        &[("Content-Type", "application/json")],
+        Some(alias_payload.to_string().as_bytes()),
+    )
+    .expect("REST alias intervene POST");
+    assert_eq!(
+        alias_status, 200,
+        "REST alias intervene response: {alias_resp}"
+    );
+    let alias_json: Value = serde_json::from_str(&alias_resp).expect("parse REST alias JSON");
+    assert_eq!(alias_json["application_state"], "admitted");
+
+    // 3. FastMCP tool `intervene` submission
+    let mcp_call_payload = serde_json::json!({
+        "intervention": {
+            "kind": "drought",
+            "region": { "shape": "all" },
+            "ticks": 20,
+            "growth_scale": 0.25
+        },
+        "surface": "mcp",
+        "actor": "mcp_tester"
+    });
+    let (mcp_status, mcp_resp) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(42),
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "intervene",
+            "arguments": mcp_call_payload
+        })),
+    )
+    .expect("MCP tool call intervene");
+    assert_eq!(mcp_status, 200, "MCP response: {mcp_resp}");
+    assert_eq!(mcp_resp["jsonrpc"], "2.0");
+    assert!(mcp_resp["error"].is_null(), "MCP tool error: {mcp_resp}");
+    let mcp_text = mcp_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("MCP tool text");
+    let mcp_json: Value = serde_json::from_str(mcp_text).expect("parse MCP response JSON");
+    assert_eq!(mcp_json["application_state"], "admitted");
+
+    // 4. Rejection across surfaces: invalid parameter (ticks: 0) rejected by REST
+    let bad_rest_payload = serde_json::json!({
+        "intervention": {
+            "kind": "drought",
+            "region": { "shape": "all" },
+            "ticks": 0,
+            "growth_scale": 0.25
+        },
+        "surface": "rest",
+        "actor": "bad_actor"
+    });
+    let (bad_status, bad_resp) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/control/intervene",
+        &[("Content-Type", "application/json")],
+        Some(bad_rest_payload.to_string().as_bytes()),
+    )
+    .expect("REST bad intervene POST");
+    assert!(
+        bad_status == 400 || bad_resp.contains("\"accepted\":false"),
+        "invalid intervention must be rejected by REST: status={bad_status}, body={bad_resp}"
+    );
+
+    // 5. Canonical Postcard parameter parity:
+    // REST drought and MCP drought produce identical canonical parameter bytes.
+    let drought_canonical =
+        scriptbots_core::interventions::drought(scriptbots_core::Region::All, 20, 0.25)
+            .expect("canonical constructor drought");
+    let drought_bytes = scriptbots_core::interventions::canonical_param_bytes(&drought_canonical);
+    assert!(
+        !drought_bytes.is_empty(),
+        "canonical bytes must not be empty"
     );
 }

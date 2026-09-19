@@ -71,6 +71,7 @@ pub mod gallery;
 pub mod genome_browser;
 pub mod genome_diff;
 pub mod infotheory;
+/// Canonical intervention definitions, journal records, and replay validation.
 pub mod interventions;
 pub mod knob_roles;
 pub mod map_elites;
@@ -83,6 +84,12 @@ pub mod replay;
 pub mod rng_domains;
 
 pub use gallery::reconstruct_config_from_permalink;
+pub use interventions::{
+    InterventionCommand, InterventionJournal, InterventionJournalError, InterventionJournalHeader,
+    InterventionJournalRow, InterventionSurface, JournalCompletenessError, ReplaySummary,
+    canonical_param_bytes, intervention_from_param_bytes, replay_journal_against_world,
+    sort_interventions_deterministically, verify_journal_completeness,
+};
 pub use replay::{
     ReplayScrubError, ReplayScrubFrame, ReplayScrubOutcome, replay_scrub_from_checkpoint,
 };
@@ -1516,6 +1523,8 @@ pub enum ControlCommand {
     Shutdown,
     /// Replace the world environment with a validated procedural map artifact.
     ApplyMap(Box<map_sandbox::MapArtifact>),
+    /// Operator intervention applied at a simulation tick boundary (bd-16g.10.2).
+    Intervention(Box<interventions::InterventionCommand>),
 }
 
 /// Playback command carried to the external simulation driver.
@@ -1613,6 +1622,7 @@ impl ControlCommand {
             Self::ApplyMap(artifact) => artifact
                 .validate()
                 .map_err(|_| WorldStateError::InvalidConfig("invalid map artifact")),
+            Self::Intervention(cmd) => cmd.intervention.validate(),
         }
     }
 }
@@ -1687,6 +1697,10 @@ pub fn apply_control_command(
         ControlCommand::Shutdown => Ok(ControlDisposition::WorldApplied),
         ControlCommand::ApplyMap(artifact) => {
             world.apply_map_artifact(&artifact)?;
+            Ok(ControlDisposition::WorldApplied)
+        }
+        ControlCommand::Intervention(cmd) => {
+            world.enqueue_intervention(cmd.intervention.clone())?;
             Ok(ControlDisposition::WorldApplied)
         }
     }
@@ -23022,6 +23036,12 @@ impl WorldState {
     #[must_use]
     pub const fn applied_interventions(&self) -> &VecDeque<AppliedInterventionRecord> {
         &self.applied_interventions
+    }
+
+    /// Next monotonic intervention sequence counter.
+    #[must_use]
+    pub const fn next_intervention_seq(&self) -> u64 {
+        self.next_intervention_seq
     }
 
     fn record_intervention(

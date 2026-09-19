@@ -173,6 +173,97 @@ enum Command {
         #[arg(long, short)]
         file: PathBuf,
     },
+    /// Apply an environmental or population intervention via REST.
+    Intervene {
+        #[command(subcommand)]
+        sub: InterveneSubcommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InterveneSubcommand {
+    /// Drought intervention reducing food growth rate.
+    Drought {
+        /// Duration of the drought in simulation ticks.
+        duration_ticks: u64,
+        /// Severity penalty applied to food growth rate.
+        severity: f32,
+        /// Optional center x,y and radius disc region: "x,y,r".
+        #[arg(long)]
+        disc: Option<String>,
+        /// Optional x,y,width,height rect region: "x,y,w,h".
+        #[arg(long)]
+        rect: Option<String>,
+    },
+    /// Food embargo zeroing food growth and consumption in region.
+    Embargo {
+        /// Duration of the embargo in simulation ticks.
+        duration_ticks: u64,
+        /// Optional center x,y and radius disc region: "x,y,r".
+        #[arg(long)]
+        disc: Option<String>,
+        /// Optional x,y,width,height rect region: "x,y,w,h".
+        #[arg(long)]
+        rect: Option<String>,
+    },
+    /// Resource bloom increasing food growth and capacity.
+    Bloom {
+        /// Duration of the bloom in simulation ticks.
+        duration_ticks: u64,
+        /// Bonus growth rate factor.
+        bonus_rate: f32,
+        /// Optional center x,y and radius disc region: "x,y,r".
+        #[arg(long)]
+        disc: Option<String>,
+        /// Optional x,y,width,height rect region: "x,y,w,h".
+        #[arg(long)]
+        rect: Option<String>,
+    },
+    /// Meteor strike devastating life and terrain.
+    Meteor {
+        /// Blast energy.
+        energy: f32,
+        /// Blast radius.
+        radius: f32,
+        /// Impact center X coordinate.
+        center_x: f32,
+        /// Impact center Y coordinate.
+        center_y: f32,
+    },
+    /// Paint terrain in region.
+    PaintTerrain {
+        /// Terrain kind: deepwater, shallowwater, sand, grass, bloom, rock.
+        kind: String,
+        /// Optional center x,y and radius disc region: "x,y,r".
+        #[arg(long)]
+        disc: Option<String>,
+        /// Optional x,y,width,height rect region: "x,y,w,h".
+        #[arg(long)]
+        rect: Option<String>,
+    },
+    /// Inject cohort of founder agents.
+    InjectCohort {
+        /// Number of agents to spawn.
+        count: usize,
+        /// Herbivore tendency [0.0, 1.0].
+        tendency: f32,
+        /// Injection area center X coordinate.
+        center_x: f32,
+        /// Injection area center Y coordinate.
+        center_y: f32,
+        /// Injection area radius.
+        radius: f32,
+    },
+    /// Set world boundary open/closed.
+    SetClosedWorld {
+        /// Whether world boundaries are closed/reflective rather than toroidal.
+        closed: bool,
+    },
+    /// Spawn from MAP-Elites archive.
+    SpawnFromArchive {
+        /// Number of elite agents to resurrect.
+        count: usize,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -255,6 +346,9 @@ async fn main() -> Result<()> {
                 }
                 Command::MapApply { file } => {
                     map_apply_command(&client, &cli.base_url, file, key).await?
+                }
+                Command::Intervene { sub } => {
+                    intervene_command(&client, &cli.base_url, sub, key).await?
                 }
             }
         }
@@ -1250,6 +1344,152 @@ async fn map_apply_command(
     );
 
     Ok(())
+}
+
+fn parse_region_cli(disc: Option<&str>, rect: Option<&str>) -> Result<scriptbots_core::Region> {
+    if let Some(d) = disc {
+        let parts: Vec<&str> = d.split(',').map(|s| s.trim()).collect();
+        if parts.len() != 3 {
+            bail!("disc region format must be 'center_x,center_y,radius'");
+        }
+        let x: f32 = parts[0].parse().context("invalid center_x")?;
+        let y: f32 = parts[1].parse().context("invalid center_y")?;
+        let radius: f32 = parts[2].parse().context("invalid radius")?;
+        Ok(scriptbots_core::Region::Disc { x, y, radius })
+    } else if let Some(r) = rect {
+        let parts: Vec<&str> = r.split(',').map(|s| s.trim()).collect();
+        if parts.len() != 4 {
+            bail!("rect region format must be 'x,y,w,h'");
+        }
+        let x: f32 = parts[0].parse().context("invalid x")?;
+        let y: f32 = parts[1].parse().context("invalid y")?;
+        let w: f32 = parts[2].parse().context("invalid width")?;
+        let h: f32 = parts[3].parse().context("invalid height")?;
+        Ok(scriptbots_core::Region::Rect { x, y, w, h })
+    } else {
+        Ok(scriptbots_core::Region::All)
+    }
+}
+
+async fn intervene_command(
+    client: &Client,
+    base_url: &str,
+    sub: InterveneSubcommand,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
+    let intervention = match sub {
+        InterveneSubcommand::Drought {
+            duration_ticks,
+            severity,
+            disc,
+            rect,
+        } => {
+            let region = parse_region_cli(disc.as_deref(), rect.as_deref())?;
+            scriptbots_core::interventions::drought(region, duration_ticks as u32, severity)
+                .map_err(|e| anyhow::anyhow!("drought validation failed: {e}"))?
+        }
+        InterveneSubcommand::Embargo {
+            duration_ticks,
+            disc,
+            rect,
+        } => {
+            let region = parse_region_cli(disc.as_deref(), rect.as_deref())?;
+            scriptbots_core::interventions::embargo(region, duration_ticks as u32)
+                .map_err(|e| anyhow::anyhow!("embargo validation failed: {e}"))?
+        }
+        InterveneSubcommand::Bloom {
+            duration_ticks: _,
+            bonus_rate,
+            disc,
+            rect,
+        } => {
+            let region = parse_region_cli(disc.as_deref(), rect.as_deref())?;
+            scriptbots_core::interventions::bloom(region, bonus_rate)
+                .map_err(|e| anyhow::anyhow!("bloom validation failed: {e}"))?
+        }
+        InterveneSubcommand::Meteor {
+            energy,
+            radius,
+            center_x,
+            center_y,
+        } => {
+            let region = scriptbots_core::Region::Disc {
+                x: center_x,
+                y: center_y,
+                radius,
+            };
+            scriptbots_core::interventions::meteor(region, energy, energy)
+                .map_err(|e| anyhow::anyhow!("meteor validation failed: {e}"))?
+        }
+        InterveneSubcommand::PaintTerrain { kind, disc, rect } => {
+            let region = parse_region_cli(disc.as_deref(), rect.as_deref())?;
+            let tkind = match kind.to_ascii_lowercase().as_str() {
+                "deepwater" | "deep_water" => scriptbots_core::TerrainKind::DeepWater,
+                "shallowwater" | "shallow_water" => scriptbots_core::TerrainKind::ShallowWater,
+                "sand" => scriptbots_core::TerrainKind::Sand,
+                "grass" => scriptbots_core::TerrainKind::Grass,
+                "bloom" => scriptbots_core::TerrainKind::Bloom,
+                "rock" => scriptbots_core::TerrainKind::Rock,
+                other => bail!("unknown terrain kind: {other}"),
+            };
+            scriptbots_core::interventions::paint_terrain(region, tkind, None)
+                .map_err(|e| anyhow::anyhow!("paint terrain validation failed: {e}"))?
+        }
+        InterveneSubcommand::InjectCohort {
+            count,
+            tendency,
+            center_x,
+            center_y,
+            radius,
+        } => {
+            let region = scriptbots_core::Region::Disc {
+                x: center_x,
+                y: center_y,
+                radius,
+            };
+            scriptbots_core::interventions::inject_cohort(
+                count as u16,
+                scriptbots_core::CohortSource::RegisteredBrain { key: 0 },
+                scriptbots_core::Placement::Seeded { region, seed: 42 },
+                tendency,
+            )
+            .map_err(|e| anyhow::anyhow!("inject cohort validation failed: {e}"))?
+        }
+        InterveneSubcommand::SetClosedWorld { closed } => {
+            scriptbots_core::interventions::set_closed_world(closed)
+                .map_err(|e| anyhow::anyhow!("set closed world validation failed: {e}"))?
+        }
+        InterveneSubcommand::SpawnFromArchive { count } => {
+            scriptbots_core::interventions::spawn_from_archive(
+                scriptbots_core::CellSelector::TopKByQuality(count as u16),
+                scriptbots_core::Placement::Seeded {
+                    region: scriptbots_core::Region::All,
+                    seed: 42,
+                },
+                None,
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("spawn from archive validation failed: {e}"))?
+        }
+    };
+
+    use scriptbots_app::InterveneRequestBody;
+    let body = InterveneRequestBody {
+        intervention: serde_json::to_value(&intervention)?,
+        surface: Some("cli".to_owned()),
+        actor: Some("control_cli".to_owned()),
+        idempotency_key: idempotency_key.map(|k| k.to_owned()),
+    };
+
+    issue_control_command(
+        client,
+        base_url,
+        "/api/control/intervene",
+        "intervene",
+        Some(serde_json::to_value(&body)?),
+        idempotency_key,
+    )
+    .await
 }
 
 async fn presets_apply(client: &Client, base_url: &str, name: &str) -> Result<()> {

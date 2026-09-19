@@ -3683,6 +3683,7 @@ impl HostCore {
         shared.store_status(status)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_command(
         &mut self,
         admitted: AdmittedEnvelope,
@@ -3769,6 +3770,13 @@ impl HostCore {
                 admission,
                 &retry_envelope,
                 ControlCommand::ApplyMap(artifact),
+                next_control,
+                true,
+            ),
+            HostCommand::Intervention(cmd) => self.apply_world_control_command(
+                admission,
+                &retry_envelope,
+                ControlCommand::Intervention(cmd),
                 next_control,
                 true,
             ),
@@ -3878,6 +3886,7 @@ impl HostCore {
                     | HostCommand::Emigrate { .. }
                     | HostCommand::Immigrate { .. }
                     | HostCommand::ApplyMap(_)
+                    | HostCommand::Intervention(_)
             )
         {
             return Ok(None);

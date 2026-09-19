@@ -36,10 +36,10 @@ use crate::ScenarioIdentityV0;
 use crate::command::CommandSubmit;
 use crate::control::{
     AgentScoreEntry, AppliedInterventionDto, CommandStatusDto, ConfigSnapshot, ControlError,
-    ControlHandle, DietClassDto, EventEntry, EventKind, HydrologySnapshot, InterventionsPollDto,
-    KnobEntry, KnobUpdate, MapApplyRequestBody, MapGenerateRequestBody, Scoreboard,
-    SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
-    parse_map_artifact,
+    ControlHandle, DietClassDto, EventEntry, EventKind, HydrologySnapshot, InterveneRequestBody,
+    InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyRequestBody, MapGenerateRequestBody,
+    Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
+    SpeedRequest, parse_intervention_command, parse_map_artifact,
 };
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ConfigAuditEntry, Position, SelectionUpdate,
@@ -1122,7 +1122,8 @@ pub struct SpeedRequestBody {
         get_selection,
         get_interventions,
         post_map_generate,
-        post_map_apply
+        post_map_apply,
+        post_control_intervene
     ),
     components(
         schemas(
@@ -1157,7 +1158,8 @@ pub struct SpeedRequestBody {
             SpeedRequestBody,
             SimulationStatusDto,
             MapGenerateRequestBody,
-            MapApplyRequestBody
+            MapApplyRequestBody,
+            InterveneRequestBody
         )
     ),
     info(title = "ScriptBots Control API", version = "0.0.0"),
@@ -2292,6 +2294,26 @@ async fn post_map_apply(
     Ok(Json(status))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/control/intervene",
+    tag = "control",
+    request_body = InterveneRequestBody,
+    responses((status = 200, body = CommandStatusDto))
+)]
+async fn post_control_intervene(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<InterveneRequestBody>,
+) -> Result<Json<CommandStatusDto>, AppError> {
+    let key = idempotency_key(&headers).or(payload.idempotency_key.clone());
+    let command = parse_intervention_command(&payload)?;
+
+    let status = run_control(move || state.handle.intervene(command, key.as_deref())).await?;
+
+    Ok(Json(status))
+}
+
 /// The client-supplied idempotency key from an MCP tool call, if any.
 ///
 /// Same absent-is-absent rule as the HTTP header: a blank string is not a key.
@@ -2447,6 +2469,9 @@ fn prepare_rest_server(
             "/api/v1/map/apply",
             post(post_map_apply).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
+        // Interventions control commands
+        .route("/api/control/intervene", post(post_control_intervene))
+        .route("/api/interventions", post(post_control_intervene))
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
@@ -2751,6 +2776,33 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
             "additionalProperties": false
         }),
         ControlToolKind::MapApply,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "intervene",
+        "Apply an intervention (drought, embargo, meteor, bloom, terrain paint, cohort injection, closed world) to the simulation",
+        json!({
+            "type": "object",
+            "properties": {
+                "intervention": {
+                    "description": "Intervention definition object with kind and parameters"
+                },
+                "surface": {
+                    "type": "string",
+                    "description": "Originating surface (gpu, tui, rest, mcp, cli, script)"
+                },
+                "actor": {
+                    "type": "string",
+                    "description": "Actor identity"
+                },
+                "idempotency_key": {"type": "string"}
+            },
+            "required": ["intervention"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::Intervene,
         handle,
     );
 
@@ -2932,6 +2984,7 @@ enum ControlToolKind {
     GetCommandStatus,
     MapGenerate,
     MapApply,
+    Intervene,
 }
 
 impl ToolHandler for ControlTool {
@@ -3135,6 +3188,39 @@ impl ToolHandler for ControlTool {
                 let id_key = key.as_deref();
                 let handle = self.handle.clone();
                 let status = run_control_mcp_sync(move || handle.apply_map(artifact, id_key))?;
+                make_tool_result(status)
+            }
+            ControlToolKind::Intervene => {
+                let intervention_val = arguments.get("intervention").ok_or_else(|| {
+                    McpError::new(
+                        McpErrorCode::InvalidParams,
+                        "missing 'intervention' parameter",
+                    )
+                })?;
+                let req_body = InterveneRequestBody {
+                    intervention: intervention_val.clone(),
+                    surface: arguments
+                        .get("surface")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_owned())
+                        .or_else(|| Some("mcp".to_owned())),
+                    actor: arguments
+                        .get("actor")
+                        .and_then(|a| a.as_str())
+                        .map(|s| s.to_owned())
+                        .or_else(|| Some("mcp_client".to_owned())),
+                    idempotency_key: mcp_idempotency_key(&arguments),
+                };
+                let cmd = parse_intervention_command(&req_body).map_err(|e| {
+                    McpError::new(
+                        McpErrorCode::InvalidParams,
+                        format!("invalid intervention specification: {e}"),
+                    )
+                })?;
+                let key = mcp_idempotency_key(&arguments);
+                let id_key = key.as_deref();
+                let handle = self.handle.clone();
+                let status = run_control_mcp_sync(move || handle.intervene(cmd, id_key))?;
                 make_tool_result(status)
             }
         }

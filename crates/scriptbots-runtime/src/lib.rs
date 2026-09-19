@@ -1861,6 +1861,8 @@ pub enum HostCommand {
     UpdateSimulation(SimulationCommand),
     /// Replace the active world map with a pre-generated map artifact.
     ApplyMap(Box<scriptbots_core::MapArtifact>),
+    /// Apply an intervention command with canonical metadata and parameters.
+    Intervention(Box<scriptbots_core::interventions::InterventionCommand>),
 }
 
 impl HostCommand {
@@ -1918,6 +1920,11 @@ impl HostCommand {
                         message: error.to_string(),
                     })
             }
+            Self::Intervention(cmd) => cmd.intervention.validate().map_err(|error| {
+                CommandValidationError::InvalidWorldCommand {
+                    message: error.to_string(),
+                }
+            }),
             _ => Ok(()),
         }
     }
@@ -1942,6 +1949,7 @@ impl HostCommand {
             | Self::Immigrate { .. }
             | Self::UpdateSimulation(_)
             | Self::ApplyMap(_)
+            | Self::Intervention(_)
             | Self::Shutdown => true,
         }
     }
@@ -2010,6 +2018,7 @@ impl TryFrom<ControlCommand> for HostCommand {
             }
             ControlCommand::Shutdown => Ok(Self::Shutdown),
             ControlCommand::ApplyMap(artifact) => Ok(Self::ApplyMap(artifact)),
+            ControlCommand::Intervention(cmd) => Ok(Self::Intervention(cmd)),
         }
     }
 }
@@ -7437,7 +7446,8 @@ mod tests {
                     | HostCommand::SpawnCrossover { .. }
                     | HostCommand::Emigrate { .. }
                     | HostCommand::Immigrate { .. }
-                    | HostCommand::ApplyMap(_) => {
+                    | HostCommand::ApplyMap(_)
+                    | HostCommand::Intervention(_) => {
                         self.revisions.scientific =
                             self.revisions.scientific.checked_next().ok_or_else(|| {
                                 protocol_violation("scientific revision exhausted")

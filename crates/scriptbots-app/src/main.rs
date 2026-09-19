@@ -458,6 +458,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(AppSubcommand::Replay(ref replay_args)) = cli.subcommand {
+        run_replay_subcommand(replay_args)?;
+        return Ok(());
+    }
+
     if let Some(ref db_path) = cli.report_archipelago {
         let report_args = ReportArchipelagoArgs {
             db: db_path.clone(),
@@ -3055,6 +3060,27 @@ enum AppSubcommand {
     MapApply(MapApplyArgs),
     /// Round-robin brain tournament, rating estimation, and leaderboard generation (bd-16g.12.3).
     Tournament(scriptbots_app::tournament::TournamentArgs),
+    /// Replay an intervention journal or scripted experiment and verify against world characterization digest.
+    Replay(ReplayArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+pub struct ReplayArgs {
+    /// Path to the intervention journal JSONL file.
+    #[arg(long)]
+    pub journal: Option<PathBuf>,
+    /// Path to scripted intervention file (JSON or Postcard hex).
+    #[arg(long)]
+    pub script: Option<PathBuf>,
+    /// Ticks to advance when running a scripted intervention.
+    #[arg(long, default_value_t = 100)]
+    pub ticks: u64,
+    /// Random seed for replaying scripts or verifying journal seed.
+    #[arg(long)]
+    pub seed: Option<u64>,
+    /// Output file to write replay summary JSON.
+    #[arg(long, short)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]
@@ -3180,6 +3206,146 @@ fn run_map_apply(args: &MapApplyArgs) -> Result<()> {
         artifact.scientific_content_hash()
     );
     Ok(())
+}
+
+fn run_replay_subcommand(args: &ReplayArgs) -> Result<()> {
+    if let Some(ref journal_path) = args.journal {
+        let journal = scriptbots_core::interventions::InterventionJournal::from_file(journal_path)
+            .with_context(|| {
+                format!(
+                    "failed to read intervention journal from {}",
+                    journal_path.display()
+                )
+            })?;
+
+        let header = journal.header.as_ref().ok_or_else(|| {
+            anyhow!(
+                "empty journal or missing header in {}",
+                journal_path.display()
+            )
+        })?;
+
+        let seed = args.seed.unwrap_or(header.seed);
+        if let Some(explicit_seed) = args.seed
+            && explicit_seed != header.seed
+        {
+            return Err(anyhow!(
+                "seed mismatch: journal recorded seed {}, but CLI specified seed {}",
+                header.seed,
+                explicit_seed
+            ));
+        }
+        let config = ScriptBotsConfig {
+            rng_seed: Some(seed),
+            ..Default::default()
+        };
+        let mut world =
+            WorldState::new(config).map_err(|e| anyhow!("failed to initialize world: {e}"))?;
+
+        let journal_path_str = journal_path.display().to_string();
+        let summary = scriptbots_core::interventions::replay_journal_against_world(
+            &mut world,
+            &journal,
+            args.ticks,
+            &journal_path_str,
+        )
+        .map_err(|e| anyhow!("replay divergence error: {e}"))?;
+
+        scriptbots_core::interventions::verify_journal_completeness(&world, &journal)
+            .with_context(|| "intervention journal failed completeness verification")?;
+
+        println!(
+            "Replay completed successfully: {} ticks, {} applied, {} rejected, final_digest={}",
+            summary.ticks,
+            summary.commands_applied,
+            summary.commands_rejected,
+            summary.final_digest
+        );
+
+        if let Some(ref out_path) = args.out {
+            let json = serde_json::to_string_pretty(&summary)
+                .context("failed to serialize replay summary")?;
+            fs::write(out_path, json).with_context(|| {
+                format!("failed to write replay summary to {}", out_path.display())
+            })?;
+        }
+        Ok(())
+    } else if let Some(ref script_path) = args.script {
+        if let Ok(journal) =
+            scriptbots_core::interventions::InterventionJournal::from_file(script_path)
+        {
+            let header = journal.header.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "empty journal or missing header in {}",
+                    script_path.display()
+                )
+            })?;
+            let config = ScriptBotsConfig {
+                rng_seed: Some(header.seed),
+                ..Default::default()
+            };
+            let mut world =
+                WorldState::new(config).map_err(|e| anyhow!("failed to initialize world: {e}"))?;
+            let script_path_str = script_path.display().to_string();
+            let summary = scriptbots_core::interventions::replay_journal_against_world(
+                &mut world,
+                &journal,
+                args.ticks,
+                &script_path_str,
+            )
+            .map_err(|e| anyhow!("script replay divergence error: {e}"))?;
+            scriptbots_core::interventions::verify_journal_completeness(&world, &journal)
+                .with_context(|| "intervention journal failed completeness verification")?;
+            println!(
+                "Script replay completed: {} ticks, {} applied, {} rejected, final_digest={}",
+                summary.ticks,
+                summary.commands_applied,
+                summary.commands_rejected,
+                summary.final_digest
+            );
+            if let Some(ref out_path) = args.out {
+                let json = serde_json::to_string_pretty(&summary)?;
+                fs::write(out_path, json)?;
+            }
+            return Ok(());
+        }
+
+        let script_bytes = fs::read(script_path)
+            .with_context(|| format!("failed to read script file {}", script_path.display()))?;
+
+        let commands: Vec<scriptbots_core::interventions::InterventionCommand> = serde_json::from_slice(&script_bytes)
+            .with_context(|| "script file is neither an InterventionJournal nor a JSON array of InterventionCommand")?;
+
+        let seed = args.seed.unwrap_or(42);
+        let config = ScriptBotsConfig {
+            rng_seed: Some(seed),
+            ..Default::default()
+        };
+        let mut world =
+            WorldState::new(config).map_err(|e| anyhow!("failed to initialize world: {e}"))?;
+
+        for cmd in commands {
+            world
+                .enqueue_intervention(cmd.intervention)
+                .map_err(|e| anyhow!("failed to apply scripted intervention: {e}"))?;
+        }
+
+        for _ in 0..args.ticks {
+            world.step().map_err(|e| anyhow!("step failed: {e}"))?;
+        }
+
+        let final_digest = world
+            .characterization_digest_v0()
+            .map_or_else(|e| format!("digest_err:{e}"), |d| d.overall);
+
+        println!(
+            "Script execution completed: {} ticks, seed={}, final_digest={}",
+            args.ticks, seed, final_digest
+        );
+        Ok(())
+    } else {
+        bail!("either --journal or --script must be specified for replay");
+    }
 }
 
 #[derive(Parser, Debug)]

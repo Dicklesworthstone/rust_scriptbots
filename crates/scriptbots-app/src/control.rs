@@ -342,6 +342,76 @@ pub fn parse_map_artifact(value: &Value) -> Result<MapArtifact, ControlError> {
     }
 }
 
+/// Request payload for applying an intervention to the simulation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct InterveneRequestBody {
+    /// Canonical intervention specification or command.
+    #[schema(value_type = Object)]
+    pub intervention: Value,
+    /// Originating surface: gpu, tui, rest, mcp, cli, script (defaults to rest).
+    #[serde(default)]
+    pub surface: Option<String>,
+    /// Actor identifier (defaults to "rest_client").
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Optional idempotency key to prevent double application on retry.
+    pub idempotency_key: Option<String>,
+}
+
+/// Parse an `InterventionCommand` from an `InterveneRequestBody`.
+pub fn parse_intervention_command(
+    body: &InterveneRequestBody,
+) -> Result<scriptbots_core::interventions::InterventionCommand, ControlError> {
+    let intervention: scriptbots_core::Intervention = if let Ok(cmd) =
+        serde_json::from_value::<scriptbots_core::interventions::InterventionCommand>(
+            body.intervention.clone(),
+        ) {
+        return Ok(cmd);
+    } else if let Ok(interv) =
+        serde_json::from_value::<scriptbots_core::Intervention>(body.intervention.clone())
+    {
+        interv
+    } else if let Some(s) = body.intervention.as_str() {
+        if let Ok(bytes) = hex_to_bytes(s) {
+            scriptbots_core::interventions::intervention_from_param_bytes(&bytes).map_err(|e| {
+                ControlError::InvalidPatch(format!("invalid postcard intervention: {e}"))
+            })?
+        } else {
+            serde_json::from_str(s).map_err(|e| {
+                ControlError::InvalidPatch(format!("invalid JSON intervention: {e}"))
+            })?
+        }
+    } else {
+        serde_json::from_value(body.intervention.clone())
+            .map_err(|e| ControlError::InvalidPatch(format!("invalid intervention object: {e}")))?
+    };
+
+    let surface = body
+        .surface
+        .as_deref()
+        .map(|s| match s.to_ascii_lowercase().as_str() {
+            "gpu" => scriptbots_core::interventions::InterventionSurface::Gpu,
+            "tui" => scriptbots_core::interventions::InterventionSurface::Tui,
+            "rest" => scriptbots_core::interventions::InterventionSurface::Rest,
+            "mcp" => scriptbots_core::interventions::InterventionSurface::Mcp,
+            "cli" => scriptbots_core::interventions::InterventionSurface::Cli,
+            "script" => scriptbots_core::interventions::InterventionSurface::Script,
+            _ => scriptbots_core::interventions::InterventionSurface::Rest,
+        })
+        .unwrap_or(scriptbots_core::interventions::InterventionSurface::Rest);
+
+    let actor = body
+        .actor
+        .clone()
+        .unwrap_or_else(|| "rest_client".to_owned());
+
+    Ok(scriptbots_core::interventions::InterventionCommand {
+        intervention,
+        surface,
+        actor,
+    })
+}
+
 /// Shared handle used by REST, CLI, and MCP surfaces to access the running world.
 #[derive(Clone)]
 pub struct ControlHandle {
@@ -894,6 +964,18 @@ impl ControlHandle {
     ) -> Result<CommandStatusDto, ControlError> {
         self.submit_control_command_with_key(
             ControlCommand::ApplyMap(Box::new(artifact)),
+            idempotency_key,
+        )
+    }
+
+    /// Submit an Intervention command.
+    pub fn intervene(
+        &self,
+        cmd: scriptbots_core::interventions::InterventionCommand,
+        idempotency_key: Option<&str>,
+    ) -> Result<CommandStatusDto, ControlError> {
+        self.submit_control_command_with_key(
+            ControlCommand::Intervention(Box::new(cmd)),
             idempotency_key,
         )
     }

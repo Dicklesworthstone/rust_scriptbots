@@ -792,7 +792,12 @@ impl<'a> TerminalApp<'a> {
     /// Explicit batch-mode command barrier. Repainting never invokes this;
     /// only a requested headless science step waits for its own receipt.
     fn submit_and_wait(&mut self, command: ControlCommand) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let timeout_secs = std::env::var("SCRIPTBOTS_COMMAND_BARRIER_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+        let timeout = Duration::from_secs(timeout_secs);
+        let deadline = Instant::now() + timeout;
         let envelope = crate::control::ControlHandle::new(self.host.clone())
             .prepare_control_command(command, None)?;
         let command_id = envelope.command_id;
@@ -800,6 +805,10 @@ impl<'a> TerminalApp<'a> {
         // the exact identity/payload so retry cannot apply a second Step.
         loop {
             self.ensure_control_runtime_running()?;
+            ensure!(
+                Instant::now() < deadline,
+                "terminal command {command_id} did not complete admission within the {timeout_secs}-second barrier"
+            );
             match self.host.submit_before(envelope.clone(), deadline) {
                 Ok(status)
                     if matches!(
@@ -834,6 +843,10 @@ impl<'a> TerminalApp<'a> {
         }
         loop {
             self.ensure_control_runtime_running()?;
+            ensure!(
+                Instant::now() < deadline,
+                "terminal command {command_id} did not complete within the {timeout_secs}-second barrier"
+            );
             let status = self
                 .host
                 .command_status_before(command_id, deadline)
@@ -861,10 +874,6 @@ impl<'a> TerminalApp<'a> {
                     ));
                 }
             }
-            ensure!(
-                Instant::now() < deadline,
-                "terminal command {command_id} did not complete within the 30-second barrier"
-            );
             std::thread::park_timeout(Duration::from_millis(1));
         }
     }

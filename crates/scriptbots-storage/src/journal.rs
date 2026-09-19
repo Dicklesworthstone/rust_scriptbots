@@ -737,6 +737,7 @@ enum HostCommandPostcardV1 {
         step_once: bool,
     },
     ApplyMap(Box<MapArtifact>),
+    Intervention(Box<scriptbots_core::interventions::InterventionCommand>),
 }
 
 impl HostCommandPostcardV1 {
@@ -781,6 +782,7 @@ impl HostCommandPostcardV1 {
                 origin_uid: origin_uid.get(),
             },
             HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.clone()),
+            HostCommand::Intervention(cmd) => Self::Intervention(cmd.clone()),
         }
     }
 
@@ -831,6 +833,7 @@ impl HostCommandPostcardV1 {
                 origin_uid: AgentUid(origin_uid),
             },
             Self::ApplyMap(artifact) => HostCommand::ApplyMap(artifact),
+            Self::Intervention(cmd) => HostCommand::Intervention(cmd),
         }
     }
 }
@@ -871,6 +874,7 @@ enum HostCommandPostcardRefV1<'a> {
         step_once: bool,
     },
     ApplyMap(&'a MapArtifact),
+    Intervention(&'a scriptbots_core::interventions::InterventionCommand),
 }
 
 impl<'a> HostCommandPostcardRefV1<'a> {
@@ -915,6 +919,7 @@ impl<'a> HostCommandPostcardRefV1<'a> {
                 origin_uid: origin_uid.get(),
             },
             HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.as_ref()),
+            HostCommand::Intervention(cmd) => Self::Intervention(cmd.as_ref()),
         }
     }
 }
