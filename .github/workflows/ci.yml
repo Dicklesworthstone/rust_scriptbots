@@ -782,5 +782,5 @@ jobs:
         run: bash scripts/e2e_control_plane.sh
 
       - name: Run real-process control-plane E2E probe (bd-0n87)
-        run: cargo test -p scriptbots-app --test real_process_control_e2e -- --nocapture
+        run: bash scripts/e2e_real_process_control.sh
 

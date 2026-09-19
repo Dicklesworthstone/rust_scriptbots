@@ -831,13 +831,25 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         let exit = child.wait()?;
         guard.0 = None;
 
-        let commit = Command::new("git")
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .args(["rev-parse", "HEAD"])
-            .output()
+        let commit = std::env::var("SCRIPTBOTS_GIT_COMMIT")
             .ok()
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                Command::new("git")
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .ok()
+                    .and_then(|out| {
+                        if out.status.success() {
+                            String::from_utf8(out.stdout).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_else(|| "unknown".to_string());
         println!(
             "{{\"schema\":\"scriptbots.real-process-e2e.v2\",\"binary\":\"{}\",\"mode\":\"server\",\
