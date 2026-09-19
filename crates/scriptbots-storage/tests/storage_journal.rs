@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const WORKER_RETRY_LIMIT: usize = 10_000;
+const WORKER_RETRY_LIMIT: usize = 30_000;
 
 fn compact_world() -> WorldState {
     WorldState::new(ScriptBotsConfig {
