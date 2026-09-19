@@ -3671,9 +3671,10 @@ pub use command::{
     make_command_submit,
 };
 pub use control::{
-    CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, HydrologySnapshot, KnobEntry,
-    KnobKind, KnobUpdate, MapApplyRequestBody, MapGenerateRequestBody, SimulationStatusDto,
-    SpeedRequest, parse_map_artifact,
+    AppliedInterventionDto, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle,
+    HydrologySnapshot, InterventionsPollDto, KnobEntry, KnobKind, KnobUpdate, MapApplyRequestBody,
+    MapGenerateRequestBody, SelectionSnapshotDto, SimulationStatusDto, SpeedRequest,
+    parse_map_artifact,
 };
 pub use scriptbots_core::ControlCommand;
 pub use servers::{

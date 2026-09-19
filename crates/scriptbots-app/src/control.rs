@@ -567,6 +567,67 @@ impl ControlHandle {
         Ok(events)
     }
 
+    /// Retrieve current world selection state from the latest snapshot.
+    pub fn current_selection(&self) -> Result<SelectionSnapshotDto, ControlError> {
+        let snapshot = self.read_snapshot()?;
+        let mut selected_agent_ids = Vec::new();
+        for (i, state) in snapshot.agent_selection.iter().enumerate() {
+            if *state == SelectionState::Selected
+                && let Some(agent) = snapshot.world.agents.get(i)
+            {
+                selected_agent_ids.push(agent.id);
+            }
+        }
+        Ok(SelectionSnapshotDto {
+            revision: snapshot.revision.get(),
+            selected_count: selected_agent_ids.len(),
+            selected_agent_ids,
+            last_applied_command: snapshot.last_applied_command.map(|c| c.to_string()),
+        })
+    }
+
+    /// Retrieve applied interventions from the latest snapshot bounded ring.
+    ///
+    /// If `after_seq` is supplied, only records strictly greater than `after_seq`
+    /// are returned. If `after_seq` is older than the oldest retained record in the ring,
+    /// `gap_detected` is set to `true`, admitting that intermediate events were evicted.
+    pub fn applied_interventions(
+        &self,
+        after_seq: Option<u64>,
+    ) -> Result<InterventionsPollDto, ControlError> {
+        let snapshot = self.read_snapshot()?;
+        let min_seq = snapshot.applied_interventions.first().map(|r| r.seq);
+        let max_seq = snapshot
+            .applied_interventions
+            .last()
+            .map(|r| r.seq)
+            .unwrap_or(0);
+        let gap_detected = match (after_seq, min_seq) {
+            (Some(requested), Some(oldest)) => requested + 1 < oldest,
+            _ => false,
+        };
+        let records = snapshot
+            .applied_interventions
+            .iter()
+            .filter(|r| after_seq.is_none_or(|seq| r.seq > seq))
+            .map(|r| AppliedInterventionDto {
+                seq: r.seq,
+                tick: r.tick.0,
+                kind: r.kind.to_string(),
+                region: format!("{:?}", r.region),
+                agents_affected: r.agents_affected,
+                cells_affected: r.cells_affected,
+                expires_at: r.expires_at.map(|t| t.0),
+                expired: r.expired,
+            })
+            .collect();
+        Ok(InterventionsPollDto {
+            records,
+            watermark_seq: max_seq,
+            gap_detected,
+        })
+    }
+
     /// Render a coarse ASCII map of terrain, food, and agents — the server-side
     /// equivalent of the terminal renderer's saved snapshots.
     pub fn ascii_map(&self) -> Result<String, ControlError> {
@@ -1232,6 +1293,33 @@ impl From<SelectionMode> for SelectionModeDto {
             SelectionMode::Clear => SelectionModeDto::Clear,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, PartialEq, Eq)]
+pub struct SelectionSnapshotDto {
+    pub revision: u64,
+    pub selected_count: usize,
+    pub selected_agent_ids: Vec<u64>,
+    pub last_applied_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, PartialEq)]
+pub struct AppliedInterventionDto {
+    pub seq: u64,
+    pub tick: u64,
+    pub kind: String,
+    pub region: String,
+    pub agents_affected: usize,
+    pub cells_affected: usize,
+    pub expires_at: Option<u64>,
+    pub expired: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, PartialEq)]
+pub struct InterventionsPollDto {
+    pub records: Vec<AppliedInterventionDto>,
+    pub watermark_seq: u64,
+    pub gap_detected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]

@@ -35,16 +35,19 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::ScenarioIdentityV0;
 use crate::command::CommandSubmit;
 use crate::control::{
-    AgentScoreEntry, CommandStatusDto, ConfigSnapshot, ControlError, ControlHandle, DietClassDto,
-    EventEntry, EventKind, HydrologySnapshot, KnobEntry, KnobUpdate, MapApplyRequestBody,
-    MapGenerateRequestBody, Scoreboard, SelectionModeDto, SelectionStateDto, SimulationStatusDto,
-    SpeedRequest, parse_map_artifact,
+    AgentScoreEntry, AppliedInterventionDto, CommandStatusDto, ConfigSnapshot, ControlError,
+    ControlHandle, DietClassDto, EventEntry, EventKind, HydrologySnapshot, InterventionsPollDto,
+    KnobEntry, KnobUpdate, MapApplyRequestBody, MapGenerateRequestBody, Scoreboard,
+    SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
+    parse_map_artifact,
 };
-use scriptbots_core::{AgentDebugInfo, AgentDebugQuery, AgentDebugSort, Position, SelectionUpdate};
+use scriptbots_core::{
+    AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ConfigAuditEntry, Position, SelectionUpdate,
+    Tick, TickSummaryDto,
+};
+use scriptbots_runtime::RenderSnapshot;
 use scriptbots_runtime::channel::ChannelHostPort;
 // keep image out of servers unless needed
-use scriptbots_core::ConfigAuditEntry;
-use scriptbots_core::TickSummaryDto;
 
 /// Default loopback address for the REST control surface.
 pub const DEFAULT_CONTROL_REST_ADDRESS: SocketAddr =
@@ -1116,6 +1119,8 @@ pub struct SpeedRequestBody {
         post_control_shutdown,
         get_control_status,
         get_status,
+        get_selection,
+        get_interventions,
         post_map_generate,
         post_map_apply
     ),
@@ -1137,6 +1142,9 @@ pub struct SpeedRequestBody {
             DietClassDto,
             SelectionStateDto,
             SelectionModeDto,
+            SelectionSnapshotDto,
+            AppliedInterventionDto,
+            InterventionsPollDto,
             AgentScoreEntry,
             Scoreboard,
             HydrologySnapshot,
@@ -1160,6 +1168,7 @@ pub struct SpeedRequestBody {
 )]
 struct ApiDoc;
 
+#[derive(Debug)]
 struct AppError {
     status: StatusCode,
     message: String,
@@ -1312,36 +1321,249 @@ async fn get_hydrology_snapshot(
     }
 }
 
+#[derive(Debug, Default, Clone, Deserialize)]
+struct StreamResumeQuery {
+    after_tick: Option<u64>,
+    #[allow(dead_code)]
+    after_revision: Option<u64>,
+}
+
+fn current_tick_summary_from_snapshot(snapshot: &RenderSnapshot) -> scriptbots_core::TickSummary {
+    snapshot
+        .completed_summary
+        .clone()
+        .or_else(|| snapshot.summary_history.last().cloned())
+        .unwrap_or_else(|| scriptbots_core::TickSummary {
+            tick: Tick(snapshot.world.tick),
+            agent_count: snapshot.world.agents.len(),
+            births: snapshot.world.summary.births,
+            deaths: snapshot.world.summary.deaths,
+            total_energy: snapshot.world.summary.total_energy,
+            average_energy: snapshot.world.summary.average_energy,
+            average_health: snapshot.world.summary.average_health,
+            max_age: snapshot
+                .world
+                .agents
+                .iter()
+                .map(|agent| agent.age)
+                .max()
+                .unwrap_or(0),
+            spike_hits: 0,
+        })
+}
+
+fn poll_tick_summaries_for_sse(
+    handle: &ControlHandle,
+    last_sent_tick: &std::sync::atomic::AtomicU64,
+    has_filter: &std::sync::atomic::AtomicBool,
+) -> Vec<Result<Event, Infallible>> {
+    let mut events = Vec::new();
+    let snapshot = match handle.read_snapshot() {
+        Ok(s) => s,
+        Err(_) => return events,
+    };
+    let current_summary = current_tick_summary_from_snapshot(&snapshot);
+    let current_tick = current_summary.tick.0;
+
+    if !has_filter.load(std::sync::atomic::Ordering::Relaxed) {
+        let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
+            .unwrap_or_else(|_| "{}".to_string());
+        events.push(Ok(Event::default()
+            .event("tick")
+            .id(current_tick.to_string())
+            .data(json)));
+        last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
+        has_filter.store(true, std::sync::atomic::Ordering::Relaxed);
+        return events;
+    }
+
+    let last = last_sent_tick.load(std::sync::atomic::Ordering::Relaxed);
+    if last > current_tick {
+        let gap_data = serde_json::json!({
+            "gap": true,
+            "resumed_from": last,
+            "current": current_tick,
+            "reason": "world_reset_or_future_cursor",
+        });
+        events.push(Ok(Event::default()
+            .event("gap")
+            .id(current_tick.to_string())
+            .data(gap_data.to_string())));
+        let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
+            .unwrap_or_else(|_| "{}".to_string());
+        events.push(Ok(Event::default()
+            .event("tick")
+            .id(current_tick.to_string())
+            .data(json)));
+        last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
+        return events;
+    }
+    if current_tick <= last {
+        return events;
+    }
+
+    let oldest_tick_in_history = snapshot.summary_history.first().map(|s| s.tick.0);
+    if let Some(oldest) = oldest_tick_in_history
+        && last + 1 < oldest
+    {
+        let gap_data = serde_json::json!({
+            "gap": true,
+            "resumed_from": last,
+            "earliest_retained": oldest,
+            "current": current_tick,
+        });
+        events.push(Ok(Event::default()
+            .event("gap")
+            .id(last.to_string())
+            .data(gap_data.to_string())));
+    }
+
+    for summary in snapshot.summary_history.iter() {
+        if summary.tick.0 > last && summary.tick.0 < current_tick {
+            let json = serde_json::to_string(&TickSummaryDto::from(summary.clone()))
+                .unwrap_or_else(|_| "{}".to_string());
+            events.push(Ok(Event::default()
+                .event("tick")
+                .id(summary.tick.0.to_string())
+                .data(json)));
+        }
+    }
+
+    let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
+        .unwrap_or_else(|_| "{}".to_string());
+    events.push(Ok(Event::default()
+        .event("tick")
+        .id(current_tick.to_string())
+        .data(json)));
+
+    last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
+    events
+}
+
+fn poll_tick_summaries_for_ndjson(
+    handle: &ControlHandle,
+    last_sent_tick: &std::sync::atomic::AtomicU64,
+    has_filter: &std::sync::atomic::AtomicBool,
+) -> Vec<Result<axum::body::Bytes, Infallible>> {
+    let mut lines = Vec::new();
+    let snapshot = match handle.read_snapshot() {
+        Ok(s) => s,
+        Err(_) => return lines,
+    };
+    let current_summary = current_tick_summary_from_snapshot(&snapshot);
+    let current_tick = current_summary.tick.0;
+
+    if !has_filter.load(std::sync::atomic::Ordering::Relaxed) {
+        let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
+            .unwrap_or_else(|_| "{}".to_string());
+        lines.push(Ok(axum::body::Bytes::from(format!("{json}\n"))));
+        last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
+        has_filter.store(true, std::sync::atomic::Ordering::Relaxed);
+        return lines;
+    }
+
+    let last = last_sent_tick.load(std::sync::atomic::Ordering::Relaxed);
+    if last > current_tick {
+        let gap_data = serde_json::json!({
+            "gap": true,
+            "resumed_from": last,
+            "current": current_tick,
+            "reason": "world_reset_or_future_cursor",
+        });
+        lines.push(Ok(axum::body::Bytes::from(format!("{gap_data}\n"))));
+        let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
+            .unwrap_or_else(|_| "{}".to_string());
+        lines.push(Ok(axum::body::Bytes::from(format!("{json}\n"))));
+        last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
+        return lines;
+    }
+    if current_tick <= last {
+        return lines;
+    }
+
+    let oldest_tick_in_history = snapshot.summary_history.first().map(|s| s.tick.0);
+    if let Some(oldest) = oldest_tick_in_history
+        && last + 1 < oldest
+    {
+        let gap_data = serde_json::json!({
+            "gap": true,
+            "resumed_from": last,
+            "earliest_retained": oldest,
+            "current": current_tick,
+        });
+        lines.push(Ok(axum::body::Bytes::from(format!("{gap_data}\n"))));
+    }
+
+    for summary in snapshot.summary_history.iter() {
+        if summary.tick.0 > last && summary.tick.0 < current_tick {
+            let json = serde_json::to_string(&TickSummaryDto::from(summary.clone()))
+                .unwrap_or_else(|_| "{}".to_string());
+            lines.push(Ok(axum::body::Bytes::from(format!("{json}\n"))));
+        }
+    }
+
+    let json = serde_json::to_string(&TickSummaryDto::from(current_summary))
+        .unwrap_or_else(|_| "{}".to_string());
+    lines.push(Ok(axum::body::Bytes::from(format!("{json}\n"))));
+
+    last_sent_tick.store(current_tick, std::sync::atomic::Ordering::Relaxed);
+    lines
+}
+
 /// Stream latest tick summaries as Server-Sent Events (SSE).
+///
+/// Supports reconnection and gap detection via `Last-Event-ID` header or `?after_tick=`.
 #[utoipa::path(
     get,
     path = "/api/ticks/stream",
     tag = "control",
+    params(
+        ("after_tick" = Option<u64>, Query, description = "Resume strictly after tick"),
+        ("after_revision" = Option<u64>, Query, description = "Resume strictly after publication revision")
+    ),
     responses((status = 200, description = "SSE stream of tick summaries"))
 )]
 async fn stream_ticks_sse(
     State(state): State<ApiState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<StreamResumeQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let handle = state.handle.clone();
-    let stream =
-        IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).then(move |_| {
+    let requested_after = query.after_tick.or_else(|| {
+        headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+    });
+
+    let (initial_tick, has_filter) = match requested_after {
+        Some(tick) => (tick, true),
+        None => (0, false),
+    };
+
+    let last_sent = Arc::new(std::sync::atomic::AtomicU64::new(initial_tick));
+    let filter = Arc::new(std::sync::atomic::AtomicBool::new(has_filter));
+
+    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(250)))
+        .then(move |_| {
             let handle = handle.clone();
+            let last_sent = last_sent.clone();
+            let filter = filter.clone();
             async move {
-                // Poll on the blocking pool: a contended world mutex must park
-                // a blocking thread, never this stream's async worker (bd-134).
-                let summary = tokio::task::spawn_blocking(move || handle.latest_summary()).await;
-                let event = match summary {
-                    Ok(Ok(summary)) => {
-                        let json = serde_json::to_string(&TickSummaryDto::from(summary))
-                            .unwrap_or_else(|_| "{}".to_string());
-                        Event::default().data(json)
-                    }
-                    Ok(Err(_)) | Err(_) => Event::default().data("{}"),
-                };
-                Ok::<Event, Infallible>(event)
+                tokio::task::spawn_blocking(move || {
+                    poll_tick_summaries_for_sse(&handle, &last_sent, &filter)
+                })
+                .await
+                .unwrap_or_default()
             }
-        });
-    Ok(Sse::new(stream))
+        })
+        .flat_map(futures_util::stream::iter);
+
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 /// Upgrade HTTP connection to a WebSocket binary/text real-time stream.
@@ -1494,33 +1716,46 @@ async fn screenshot_png(State(state): State<ApiState>) -> Result<Response, AppEr
     Ok((StatusCode::OK, axum::body::Bytes::from(bytes)).into_response())
 }
 
-// NDJSON tick stream for simple clients
+// NDJSON tick stream for simple clients.
+///
+/// Supports reconnection and gap detection via `?after_tick=`.
 #[utoipa::path(
     get,
     path = "/api/ticks/ndjson",
     tag = "control",
+    params(
+        ("after_tick" = Option<u64>, Query, description = "Resume strictly after tick"),
+        ("after_revision" = Option<u64>, Query, description = "Resume strictly after publication revision")
+    ),
     responses((status = 200, description = "NDJSON stream of tick summaries"))
 )]
-async fn stream_ticks_ndjson(State(state): State<ApiState>) -> Result<Response, AppError> {
+async fn stream_ticks_ndjson(
+    State(state): State<ApiState>,
+    axum::extract::Query(query): axum::extract::Query<StreamResumeQuery>,
+) -> Result<Response, AppError> {
     let handle = state.handle.clone();
-    let stream =
-        IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).then(move |_| {
+    let (initial_tick, has_filter) = match query.after_tick {
+        Some(tick) => (tick, true),
+        None => (0, false),
+    };
+
+    let last_sent = Arc::new(std::sync::atomic::AtomicU64::new(initial_tick));
+    let filter = Arc::new(std::sync::atomic::AtomicBool::new(has_filter));
+
+    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(250)))
+        .then(move |_| {
             let handle = handle.clone();
+            let last_sent = last_sent.clone();
+            let filter = filter.clone();
             async move {
-                // Poll on the blocking pool: a contended world mutex must park
-                // a blocking thread, never this stream's async worker (bd-134).
-                let summary = tokio::task::spawn_blocking(move || handle.latest_summary()).await;
-                let line = match summary {
-                    Ok(Ok(summary)) => {
-                        let json = serde_json::to_string(&TickSummaryDto::from(summary))
-                            .unwrap_or_else(|_| "{}".to_string());
-                        format!("{json}\n")
-                    }
-                    Ok(Err(_)) | Err(_) => "{}\n".to_string(),
-                };
-                Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(line))
+                tokio::task::spawn_blocking(move || {
+                    poll_tick_summaries_for_ndjson(&handle, &last_sent, &filter)
+                })
+                .await
+                .unwrap_or_default()
             }
-        });
+        })
+        .flat_map(futures_util::stream::iter);
 
     let mut resp = Response::new(axum::body::Body::from_stream(stream));
     resp.headers_mut().insert(
@@ -1699,6 +1934,53 @@ async fn post_selection(
     // that this command has been accepted and not yet applied.
     let status = run_control(move || state.handle.update_selection(update, key.as_deref())).await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+/// Retrieve the current world selection state from the latest snapshot.
+#[utoipa::path(
+    get,
+    path = "/api/selection",
+    tag = "control",
+    responses(
+        (status = 200, body = SelectionSnapshotDto),
+        (status = 500, body = ErrorResponse)
+    )
+)]
+async fn get_selection(
+    State(state): State<ApiState>,
+) -> Result<Json<SelectionSnapshotDto>, AppError> {
+    let selection = run_control(move || state.handle.current_selection()).await?;
+    Ok(Json(selection))
+}
+
+#[derive(Debug, Deserialize)]
+struct InterventionsQuery {
+    after_seq: Option<u64>,
+}
+
+/// Retrieve applied interventions from the latest snapshot bounded ring.
+///
+/// If `after_seq` is supplied, only records strictly greater than `after_seq`
+/// are returned. If `after_seq` is older than the oldest retained record in the ring,
+/// `gap_detected` is set to `true`, admitting that intermediate events were evicted.
+#[utoipa::path(
+    get,
+    path = "/api/interventions",
+    tag = "control",
+    params(
+        ("after_seq" = Option<u64>, Query, description = "Resume strictly after intervention monotonic sequence")
+    ),
+    responses(
+        (status = 200, body = InterventionsPollDto),
+        (status = 500, body = ErrorResponse)
+    )
+)]
+async fn get_interventions(
+    State(state): State<ApiState>,
+    axum::extract::Query(query): axum::extract::Query<InterventionsQuery>,
+) -> Result<Json<InterventionsPollDto>, AppError> {
+    let poll = run_control(move || state.handle.applied_interventions(query.after_seq)).await?;
+    Ok(Json(poll))
 }
 
 #[utoipa::path(
@@ -2029,7 +2311,12 @@ fn mcp_idempotency_key(arguments: &serde_json::Map<String, Value>) -> Option<Str
 /// retry collide with every other one, which is worse than not keying at all
 /// (bd-k7nq).
 fn idempotency_key(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get("Idempotency-Key")?.to_str().ok()?.trim();
+    let value = headers
+        .get("Idempotency-Key")
+        .or_else(|| headers.get("X-Idempotency-Key"))?
+        .to_str()
+        .ok()?
+        .trim();
     (!value.is_empty()).then(|| value.to_owned())
 }
 
@@ -2134,7 +2421,8 @@ fn prepare_rest_server(
         .route("/api/narrative/search", get(get_narrative_search))
         .route("/api/scoreboard", get(get_scoreboard))
         .route("/api/agents/debug", get(get_agents_debug))
-        .route("/api/selection", post(post_selection))
+        .route("/api/selection", post(post_selection).get(get_selection))
+        .route("/api/interventions", get(get_interventions))
         // Scenario identity and presets
         .route("/api/scenario", get(get_scenario))
         .route("/api/presets", get(list_presets))
@@ -2209,14 +2497,14 @@ async fn prepare_mcp_server(
         server.info().clone(),
         server.capabilities().clone(),
     )));
-    // HTTP has no persistent outbound channel, so server-initiated
-    // notifications are only observable in the trace log. Tool callers never
-    // depend on them; the request/response path below is the product surface.
-    let notification_sender: NotificationSender = Arc::new(|request: JsonRpcRequest| {
+    let (notifications_tx, _) = tokio::sync::broadcast::channel::<JsonRpcRequest>(128);
+    let tx_for_sender = notifications_tx.clone();
+    let notification_sender: NotificationSender = Arc::new(move |request: JsonRpcRequest| {
         debug!(
             method = %request.method,
-            "MCP notification not deliverable over stateless HTTP transport"
+            "MCP broadcasting notification to SSE clients"
         );
+        let _ = tx_for_sender.send(request);
     });
     let request_sender = RequestSender::new(
         Arc::new(PendingRequests::new()),
@@ -2236,6 +2524,7 @@ async fn prepare_mcp_server(
             session,
             notification_sender,
             request_sender,
+            notifications_tx,
         });
     let listener = tokio::net::TcpListener::from_std(reserved.listener)
         .context("failed to adopt reserved MCP HTTP listener")?;
@@ -2493,6 +2782,7 @@ struct McpHttpState {
     session: Arc<Mutex<Session>>,
     notification_sender: NotificationSender,
     request_sender: RequestSender,
+    notifications_tx: tokio::sync::broadcast::Sender<JsonRpcRequest>,
 }
 
 impl McpHttpState {
@@ -2514,6 +2804,26 @@ async fn handle_mcp_http_request(
     State(state): State<McpHttpState>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
+    if request.method == "initialize"
+        && let Some(version) = request
+            .params
+            .as_ref()
+            .and_then(|p| p.get("protocolVersion"))
+            .and_then(|v| v.as_str())
+        && version != "2024-11-05"
+        && let Some(request_id) = request.id
+    {
+        let err_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32602,
+                "message": "Unsupported protocol version; supported versions: [\"2024-11-05\"]"
+            }
+        });
+        return Json(err_response).into_response();
+    }
+
     let method = request.method.clone();
     let id = request.id.clone();
     let cx = state.request_cx();
@@ -2558,11 +2868,34 @@ async fn handle_mcp_http_notification(Json(_notification): Json<Value>) -> Statu
     StatusCode::OK
 }
 
-async fn handle_mcp_http_events() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = futures_util::stream::pending::<Result<Event, Infallible>>();
-    Sse::new(stream).keep_alive(
+async fn handle_mcp_http_events(
+    State(state): State<McpHttpState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Send initial MCP SSE endpoint event informing client where to POST JSON-RPC requests.
+    let endpoint_event = Ok(Event::default().event("endpoint").data("/mcp"));
+    let initial_stream = futures_util::stream::once(async move { endpoint_event });
+
+    // Broadcast stream for server-initiated notifications.
+    let rx = state.notifications_tx.subscribe();
+    let notif_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(request) => {
+                let json = serde_json::to_string(&request).unwrap_or_default();
+                let event = Event::default().event("message").data(json);
+                Some((Ok::<Event, Infallible>(event), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let event = Event::default().event("gap").data(r#"{"gap":true}"#);
+                Some((Ok::<Event, Infallible>(event), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
+
+    let combined = initial_stream.chain(notif_stream);
+    Sse::new(combined).keep_alive(
         axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(30))
+            .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
 }
@@ -3347,6 +3680,7 @@ mod tests {
         let server = Arc::new(
             register_control_tools(ServerBuilder::new("context-test", "0"), handle).build(),
         );
+        let (notifications_tx, _) = tokio::sync::broadcast::channel(128);
         let state = McpHttpState {
             session: Arc::new(Mutex::new(Session::new(
                 server.info().clone(),
@@ -3359,6 +3693,7 @@ mod tests {
                 Arc::new(PendingRequests::new()),
                 Arc::new(|_| Err("no outbound HTTP request channel".into())),
             ),
+            notifications_tx,
         };
         assert!(
             Cx::current().is_none(),
@@ -4053,6 +4388,153 @@ mod tests {
              missing from spec: {:?}, present only in spec: {:?}",
             routed.difference(&published).collect::<Vec<_>>(),
             published.difference(&routed).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_events_sse_stream_serves_endpoint_and_broadcasts_notifications() {
+        let (handle, _receiver) = handle();
+        let server = Arc::new(
+            register_control_tools(ServerBuilder::new("test-mcp", "0.1.0"), handle).build(),
+        );
+        let runtime = mcp_context_test_runtime();
+        let (notifications_tx, _) = tokio::sync::broadcast::channel::<JsonRpcRequest>(128);
+        let session = Arc::new(Mutex::new(Session::new(
+            server.info().clone(),
+            server.capabilities().clone(),
+        )));
+        let state = McpHttpState {
+            server,
+            context_runtime: runtime,
+            session,
+            notification_sender: Arc::new(|_| {}),
+            request_sender: RequestSender::new(
+                Arc::new(PendingRequests::new()),
+                Arc::new(|_| Err("no outbound channel".into())),
+            ),
+            notifications_tx: notifications_tx.clone(),
+        };
+
+        let response = handle_mcp_http_events(State(state)).await.into_response();
+        let mut stream = response.into_body().into_data_stream();
+
+        // 1. First event must be the MCP SSE endpoint discovery event.
+        let first = stream.next().await.expect("first event").expect("ok");
+        let first_str = String::from_utf8_lossy(&first);
+        assert!(
+            first_str.contains("event: endpoint"),
+            "first event must be endpoint: {first_str}"
+        );
+        assert!(
+            first_str.contains("/mcp"),
+            "endpoint must point to /mcp: {first_str}"
+        );
+
+        // 2. Broadcast a notification on the channel.
+        let notif = JsonRpcRequest {
+            jsonrpc: std::borrow::Cow::Borrowed("2.0"),
+            id: None,
+            method: "notifications/tools/list_changed".to_string(),
+            params: None,
+        };
+        notifications_tx.send(notif).expect("send notification");
+
+        // 3. Second event must be the broadcast message.
+        let second = stream.next().await.expect("second event").expect("ok");
+        let second_str = String::from_utf8_lossy(&second);
+        assert!(
+            second_str.contains("event: message"),
+            "second event must be message: {second_str}"
+        );
+        assert!(
+            second_str.contains("notifications/tools/list_changed"),
+            "message content: {second_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_selection_get_and_post_lifecycle() {
+        let (handle, _receiver) = handle();
+        let state = ApiState {
+            handle,
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+
+        let initial = get_selection(State(state.clone()))
+            .await
+            .expect("get_selection");
+        assert_eq!(initial.selected_count, 0);
+
+        let body = SelectionUpdateRequestBody {
+            mode: SelectionModeDto::Replace,
+            agent_ids: vec![42],
+            state: Some(SelectionStateDto::Selected),
+        };
+        let (status, receipt) = post_selection(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .expect("post_selection");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(receipt.application_state, "admitted");
+
+        let current = get_selection(State(state)).await.expect("get_selection");
+        assert!(current.revision >= initial.revision);
+    }
+
+    #[tokio::test]
+    async fn rest_interventions_query_and_gap_reporting() {
+        let (handle, _receiver) = handle();
+        let state = ApiState {
+            handle,
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+
+        let poll = get_interventions(
+            State(state.clone()),
+            axum::extract::Query(InterventionsQuery { after_seq: None }),
+        )
+        .await
+        .expect("get_interventions");
+        assert!(!poll.gap_detected);
+
+        let poll_seq = get_interventions(
+            State(state),
+            axum::extract::Query(InterventionsQuery { after_seq: Some(0) }),
+        )
+        .await
+        .expect("get_interventions with after_seq");
+        assert!(!poll_seq.gap_detected);
+    }
+
+    #[test]
+    fn sse_and_ndjson_resume_filtering_and_gap_events() {
+        let (handle, _receiver) = handle();
+        let last_sent = std::sync::atomic::AtomicU64::new(0);
+        let has_filter = std::sync::atomic::AtomicBool::new(false);
+
+        let initial_events = poll_tick_summaries_for_sse(&handle, &last_sent, &has_filter);
+        assert_eq!(
+            initial_events.len(),
+            1,
+            "initial SSE poll must yield current summary"
+        );
+        assert!(has_filter.load(std::sync::atomic::Ordering::Relaxed));
+
+        let second_events = poll_tick_summaries_for_sse(&handle, &last_sent, &has_filter);
+        assert_eq!(
+            second_events.len(),
+            0,
+            "no duplicate events when tick has not advanced"
+        );
+
+        let last_sent_nd = std::sync::atomic::AtomicU64::new(0);
+        let has_filter_nd = std::sync::atomic::AtomicBool::new(false);
+        let nd_lines = poll_tick_summaries_for_ndjson(&handle, &last_sent_nd, &has_filter_nd);
+        assert_eq!(
+            nd_lines.len(),
+            1,
+            "initial NDJSON poll must yield current summary line"
         );
     }
 }
