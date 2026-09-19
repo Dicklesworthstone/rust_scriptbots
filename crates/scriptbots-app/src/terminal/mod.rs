@@ -36,15 +36,17 @@ use ratatui::{
 use scriptbots_core::{AgentId, ControlDisposition, TerrainLayer, WorldState};
 use scriptbots_core::{
     BrainActivations, BrainInspectionClientId, BrainInspectionRevision, ControlCommand,
-    ControlSettings, NUM_EYES, SENSOR_LAYOUT, SensorAttribution, SensorKind, SimulationCommand,
-    TerrainKind, TickSummary,
+    ControlSettings, NUM_EYES, SENSOR_LAYOUT, ScriptBotsConfig, SelectionUpdate, SensorAttribution,
+    SensorKind, SimulationCommand, TerrainKind, TickSummary,
     attribution::{AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs},
     narrative::{EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord, SubjectRef},
     visual,
 };
 use scriptbots_runtime::{
-    BrainProjectionRequest, HostPort, ProjectionClientId, ProjectionRequestRevision,
-    RenderSnapshot, channel::ChannelHostPort,
+    ApplicationState, BrainProjectionRequest, CommandEnvelope, CommandId, CommandStatus,
+    ControlRevision, HostAccessError, HostClient, HostCommand, HostCommandMappingError, HostEvent,
+    HostPort, JournalState, ProjectionClientId, ProjectionRequestRevision, ProtocolEventCursor,
+    RenderSnapshot, SnapshotSubscription, channel::ChannelHostPort,
 };
 use scriptbots_storage::{AnalyticsSnapshot, IslandSnapshot, MetricReading};
 #[cfg(test)]
@@ -477,8 +479,50 @@ enum FocusLockMode {
     Oldest,
 }
 
+/// Report returned by typed HostClient command submission from the terminal.
+#[derive(Debug, Clone)]
+pub struct TerminalCommandReport {
+    pub command_id: CommandId,
+    pub expected_control_revision: Option<ControlRevision>,
+    pub application: ApplicationState,
+    pub journal: JournalState,
+}
+
+impl TerminalCommandReport {
+    #[must_use]
+    pub fn from_status(
+        status: &CommandStatus,
+        expected_control_revision: Option<ControlRevision>,
+    ) -> Self {
+        Self {
+            command_id: status.command_id(),
+            expected_control_revision,
+            application: status.application().clone(),
+            journal: status.journal().clone(),
+        }
+    }
+}
+
+/// Typed error from terminal HostClient command submission.
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalCommandError {
+    /// Failed to map control command to host command.
+    #[error("failed to map control command: {0}")]
+    Mapping(#[from] HostCommandMappingError),
+    /// Host port access error.
+    #[error(transparent)]
+    Host(#[from] HostAccessError),
+}
+
 struct TerminalApp<'a> {
     host: ChannelHostPort,
+    client: HostClient<ChannelHostPort>,
+    snapshot_subscription: SnapshotSubscription,
+    #[allow(dead_code)]
+    protocol_cursor: ProtocolEventCursor,
+    command_namespace: u64,
+    command_sequence: u64,
+    retained_render: Arc<RenderSnapshot>,
     analytics_provider: SharedAnalytics,
     control: &'a ControlRuntime,
     command_submit: CommandSubmit,
@@ -604,12 +648,14 @@ struct TerminalApp<'a> {
 
 impl<'a> TerminalApp<'a> {
     fn new(renderer: &TerminalRenderer, ctx: RendererContext<'a>) -> Self {
-        let snapshot = ctx
-            .host
-            .clone()
-            .snapshot_after(None)
+        let mut client = HostClient::new(ctx.host.clone());
+        let mut snapshot_subscription = client.subscribe_snapshots();
+        let initial_snapshot = client
+            .poll_snapshot(&mut snapshot_subscription)
             .expect("host snapshot access")
             .expect("host publishes its initial snapshot before starting a renderer");
+        let retained_render = Arc::clone(&initial_snapshot);
+        let snapshot = &initial_snapshot;
         let mut palette = Palette::detect();
         // Adopt the run's configured chrome theme. bd-2z0.14.2.2's V11 reopen
         // recorded that core's TuiThemeId was declared but never consumed, so a
@@ -636,7 +682,7 @@ impl<'a> TerminalApp<'a> {
         let (terrain, day_night, config_reduced_motion, quality) = {
             let render = &snapshot.config.render;
             (
-                TerrainView::from_snapshot(&snapshot),
+                TerrainView::from_snapshot(snapshot),
                 render.resolved_day_night(),
                 render.reduced_motion,
                 render.quality,
@@ -662,8 +708,17 @@ impl<'a> TerminalApp<'a> {
             quality = ?quality,
             "terminal motion policy resolved"
         );
+        let session_id = client.session_id();
+        let command_namespace =
+            0x5455_4900_0000_0000_u64 | (session_id.get() & 0x0000_00ff_ffff_ffff);
         let mut app = Self {
             host: ctx.host.clone(),
+            client,
+            snapshot_subscription,
+            protocol_cursor: ProtocolEventCursor::beginning(session_id),
+            command_namespace,
+            command_sequence: 0,
+            retained_render,
             analytics_provider: ctx.analytics.clone(),
             control: ctx.control_runtime,
             command_submit: Arc::clone(&ctx.command_submit),
@@ -736,6 +791,144 @@ impl<'a> TerminalApp<'a> {
         TickPhase::compute(self.snapshot.tick, self.paused, self.sub_step, self.motion)
     }
 
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn client(&self) -> &HostClient<ChannelHostPort> {
+        &self.client
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn client_mut(&mut self) -> &mut HostClient<ChannelHostPort> {
+        &mut self.client
+    }
+
+    #[allow(dead_code)]
+    pub fn poll_protocol_events(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<HostEvent>, HostAccessError> {
+        self.client
+            .read_protocol_events(&mut self.protocol_cursor, limit)
+    }
+
+    pub fn next_command_id(&mut self) -> CommandId {
+        self.command_sequence = self.command_sequence.saturating_add(1);
+        CommandId::from_client_sequence(self.command_namespace, self.command_sequence)
+    }
+
+    pub fn prepare_envelope(
+        &mut self,
+        command: ControlCommand,
+        expected_control_revision: Option<ControlRevision>,
+    ) -> Result<CommandEnvelope, HostCommandMappingError> {
+        let host_command = HostCommand::try_from(command)?;
+        let command_id = self.next_command_id();
+        let mut envelope = CommandEnvelope::new(command_id, host_command);
+        if let Some(rev) = expected_control_revision {
+            envelope = envelope.expecting_control_revision(rev);
+        }
+        Ok(envelope)
+    }
+
+    pub fn submit_envelope(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandStatus, HostAccessError> {
+        let command_id = envelope.command_id;
+        let expected_revision = envelope.expected_control_revision;
+        let snapshot_revision = self.retained_render.revision.get();
+        let start = Instant::now();
+        let result = self.client.submit(envelope);
+        let latency = start.elapsed();
+        match &result {
+            Ok(status) => {
+                info!(
+                    %command_id,
+                    ?expected_revision,
+                    snapshot_revision,
+                    application = ?status.application(),
+                    journal = ?status.journal(),
+                    latency_micros = latency.as_micros(),
+                    "terminal submitted command envelope via HostClient"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    %command_id,
+                    ?expected_revision,
+                    snapshot_revision,
+                    %error,
+                    latency_micros = latency.as_micros(),
+                    "terminal failed to submit command envelope via HostClient"
+                );
+            }
+        }
+        result
+    }
+
+    #[allow(dead_code)]
+    pub fn submit_typed_command(
+        &mut self,
+        command: ControlCommand,
+        expected_control_revision: Option<ControlRevision>,
+    ) -> Result<TerminalCommandReport, TerminalCommandError> {
+        let envelope = self.prepare_envelope(command, expected_control_revision)?;
+        let status = self.submit_envelope(envelope)?;
+        Ok(TerminalCommandReport::from_status(
+            &status,
+            expected_control_revision,
+        ))
+    }
+
+    #[allow(dead_code)]
+    pub fn submit_pause(
+        &mut self,
+        expected_control_revision: Option<ControlRevision>,
+    ) -> Result<TerminalCommandReport, TerminalCommandError> {
+        self.submit_typed_command(ControlCommand::Pause, expected_control_revision)
+    }
+
+    #[allow(dead_code)]
+    pub fn submit_resume(
+        &mut self,
+        expected_control_revision: Option<ControlRevision>,
+    ) -> Result<TerminalCommandReport, TerminalCommandError> {
+        self.submit_typed_command(ControlCommand::Resume, expected_control_revision)
+    }
+
+    #[allow(dead_code)]
+    pub fn submit_step(
+        &mut self,
+        expected_control_revision: Option<ControlRevision>,
+    ) -> Result<TerminalCommandReport, TerminalCommandError> {
+        self.submit_typed_command(ControlCommand::Step, expected_control_revision)
+    }
+
+    #[allow(dead_code)]
+    pub fn submit_config(
+        &mut self,
+        config: Box<ScriptBotsConfig>,
+        expected_control_revision: Option<ControlRevision>,
+    ) -> Result<TerminalCommandReport, TerminalCommandError> {
+        self.submit_typed_command(
+            ControlCommand::UpdateConfig(config),
+            expected_control_revision,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn submit_selection(
+        &mut self,
+        selection: SelectionUpdate,
+        expected_control_revision: Option<ControlRevision>,
+    ) -> Result<TerminalCommandReport, TerminalCommandError> {
+        self.submit_typed_command(
+            ControlCommand::UpdateSelection(selection),
+            expected_control_revision,
+        )
+    }
+
     fn ensure_control_runtime_running(&self) -> Result<()> {
         self.control
             .health()
@@ -745,24 +938,39 @@ impl<'a> TerminalApp<'a> {
     fn interactive_runtime_finished(&self) -> Result<bool> {
         // The retained publication is readable after command ingress closes.
         // Do not infer host liveness from a cached frame or a command receipt.
-        let snapshot = self.host.snapshot_hub().latest();
+        let snapshot = self.client.port().snapshot_hub().latest();
         terminal_runtime_finished(&snapshot, || self.ensure_control_runtime_running())
     }
 
     fn submit_simulation_command(&mut self, command: ControlCommand) {
-        // `CommandSubmit` now yields the receipt id on admission rather than a
-        // bare bool, so a rejection is `None` and a success carries something an
-        // operator can correlate with the command ledger.
-        match (self.command_submit.as_ref())(command) {
-            Some(receipt) => {
-                debug!(%receipt, "simulation command enqueued");
+        if (self.command_submit.as_ref())(command.clone()).is_none() {
+            warn!("terminal renderer failed to enqueue simulation command");
+            if let Ok(Some(snapshot)) = self.client.latest_snapshot() {
+                self.paused = snapshot.playback.paused;
+                self.speed_multiplier = snapshot.playback.speed_multiplier;
             }
-            None => {
-                warn!("terminal renderer failed to enqueue simulation command");
-                if let Ok(Some(snapshot)) = self.host.snapshot_after(None) {
-                    self.paused = snapshot.playback.paused;
-                    self.speed_multiplier = snapshot.playback.speed_multiplier;
-                }
+            return;
+        }
+
+        let Ok(envelope) = self.prepare_envelope(command, None) else {
+            warn!("terminal renderer failed to prepare envelope for simulation command");
+            return;
+        };
+        let command_id = envelope.command_id;
+        match self.submit_envelope(envelope) {
+            Ok(status)
+                if matches!(
+                    status.application(),
+                    ApplicationState::Admitted | ApplicationState::Applied(_)
+                ) =>
+            {
+                debug!(%command_id, "simulation command enqueued via HostClient");
+            }
+            Ok(status) => {
+                warn!(%command_id, status = ?status.application(), "terminal simulation command was not admitted");
+            }
+            Err(error) => {
+                warn!(%command_id, %error, "terminal failed to submit simulation command via HostClient");
             }
         }
     }
@@ -779,13 +987,28 @@ impl<'a> TerminalApp<'a> {
             }),
             step_once: false,
         });
-        // Admission does not change observed playback. refresh_snapshot owns
-        // that transition, including commands rejected after admission.
-        if let Some(receipt) = (self.command_submit.as_ref())(command) {
-            debug!(%receipt, "playback request enqueued");
-            self.push_toast(format!("{action} request submitted"));
-        } else {
+        if (self.command_submit.as_ref())(command.clone()).is_none() {
             self.push_toast(format!("{action} request not submitted"));
+            return;
+        }
+        let Ok(envelope) = self.prepare_envelope(command, None) else {
+            self.push_toast(format!("{action} request not submitted"));
+            return;
+        };
+        let command_id = envelope.command_id;
+        match self.submit_envelope(envelope) {
+            Ok(status)
+                if matches!(
+                    status.application(),
+                    ApplicationState::Admitted | ApplicationState::Applied(_)
+                ) =>
+            {
+                debug!(%command_id, "playback request enqueued via HostClient");
+                self.push_toast(format!("{action} request submitted"));
+            }
+            _ => {
+                self.push_toast(format!("{action} request not submitted"));
+            }
         }
     }
 
@@ -798,8 +1021,9 @@ impl<'a> TerminalApp<'a> {
             .unwrap_or(120);
         let timeout = Duration::from_secs(timeout_secs);
         let deadline = Instant::now() + timeout;
-        let envelope = crate::control::ControlHandle::new(self.host.clone())
-            .prepare_control_command(command, None)?;
+        let envelope = self
+            .prepare_envelope(command, None)
+            .map_err(|err| anyhow!("failed to prepare control command envelope: {err:?}"))?;
         let command_id = envelope.command_id;
         // A durable claim may finish after its acknowledgement times out. Keep
         // the exact identity/payload so retry cannot apply a second Step.
@@ -809,12 +1033,11 @@ impl<'a> TerminalApp<'a> {
                 Instant::now() < deadline,
                 "terminal command {command_id} did not complete admission within the {timeout_secs}-second barrier"
             );
-            match self.host.submit_before(envelope.clone(), deadline) {
+            match self.client.submit(envelope.clone()) {
                 Ok(status)
                     if matches!(
                         status.application(),
-                        scriptbots_runtime::ApplicationState::Admitted
-                            | scriptbots_runtime::ApplicationState::Applied(_)
+                        ApplicationState::Admitted | ApplicationState::Applied(_)
                     ) =>
                 {
                     break;
@@ -826,7 +1049,7 @@ impl<'a> TerminalApp<'a> {
                     ));
                 }
                 Err(
-                    error @ scriptbots_runtime::HostAccessError::CommandAuthorityLookup {
+                    error @ HostAccessError::CommandAuthorityLookup {
                         failure: scriptbots_runtime::CommandAuthorityLookupFailure::Timeout { .. },
                         ..
                     },
@@ -848,8 +1071,8 @@ impl<'a> TerminalApp<'a> {
                 "terminal command {command_id} did not complete within the {timeout_secs}-second barrier"
             );
             let status = self
-                .host
-                .command_status_before(command_id, deadline)
+                .client
+                .command_status(command_id)
                 .with_context(|| {
                     self.batch_command_failure_context(command_id, "status lookup failed")
                 })?
@@ -857,17 +1080,22 @@ impl<'a> TerminalApp<'a> {
                     anyhow!("terminal command {command_id} lost its admitted identity")
                 })?;
             match status.application() {
-                scriptbots_runtime::ApplicationState::Applied(applied) => {
-                    if self.host.snapshot_after(None)?.is_some_and(|snapshot| {
-                        snapshot.world.tick >= applied.tick.0
-                            && snapshot.revisions.control >= applied.revisions.control
-                            && snapshot.revisions.config >= applied.revisions.config
-                            && snapshot.revisions.scientific >= applied.revisions.scientific
-                    }) {
+                ApplicationState::Applied(applied) => {
+                    if let Some(polled) =
+                        self.client.poll_snapshot(&mut self.snapshot_subscription)?
+                    {
+                        self.retained_render = polled;
+                    }
+                    let snapshot = &self.retained_render;
+                    if snapshot.world.tick >= applied.tick.0
+                        && snapshot.revisions.control >= applied.revisions.control
+                        && snapshot.revisions.config >= applied.revisions.config
+                        && snapshot.revisions.scientific >= applied.revisions.scientific
+                    {
                         return Ok(());
                     }
                 }
-                scriptbots_runtime::ApplicationState::Admitted => {}
+                ApplicationState::Admitted => {}
                 failure => {
                     return Err(anyhow!(
                         "terminal command {command_id} did not apply: {failure:?}"
@@ -878,13 +1106,10 @@ impl<'a> TerminalApp<'a> {
         }
     }
 
-    fn batch_command_failure_context(
-        &self,
-        command_id: scriptbots_runtime::CommandId,
-        phase: &str,
-    ) -> String {
+    fn batch_command_failure_context(&self, command_id: CommandId, phase: &str) -> String {
         let context = format!("terminal command {command_id} {phase}");
-        match self.host.clone().snapshot_after(None) {
+        let mut port = self.client.port().clone();
+        match port.snapshot_after(None) {
             Ok(Some(snapshot)) => format!(
                 "{context}; latest publication: published_tick={}, lifecycle={:?}, health={:?}, queued_commands={}, last_applied={:?}",
                 snapshot.world.tick,
@@ -893,53 +1118,25 @@ impl<'a> TerminalApp<'a> {
                 snapshot.command_queue_depth,
                 snapshot.last_applied_command,
             ),
-            Ok(None) => format!("{context}; no host publication available"),
-            Err(error) => format!("{context}; host publication read failed: {error}"),
+            outcome => format!("{context}; latest publication unavailable: {outcome:?}"),
         }
     }
 
-    /// Persist the chosen chrome theme through the run config path.
-    ///
-    /// Without this, the theme system forgot on exit: bd-2z0.14.2.2 landed the
-    /// READ half (config initialises the palette, with a proven serde round trip)
-    /// and nothing wrote back, so Ctrl+T changed the current session only and a
-    /// restart silently returned the user to the default.
-    ///
-    /// Goes through `ControlCommand::UpdateConfig` on the same command bus every
-    /// other mutation uses rather than writing `WorldState` directly — bd-37m's
-    /// rule, and the reason a themed session is replayable at all: the change
-    /// lands inside the tick loop as a journaled command instead of whenever the
-    /// world mutex happened to be free.
-    ///
-    /// Reads the CURRENT config and edits one field rather than composing a fresh
-    /// `ScriptBotsConfig`. A default-constructed config would silently revert
-    /// every other setting in the run — world size, seed, thresholds — which is a
-    /// far worse bug than the one being fixed, and it would look like a theme
-    /// change in the journal.
-    fn persist_theme_choice(&self, theme: CuratedThemeId) -> Option<String> {
-        let mut config = match self.host.clone().snapshot_after(None) {
-            Ok(Some(snapshot)) => snapshot.config.as_ref().clone(),
-            outcome => {
-                warn!(
-                    ?outcome,
-                    "terminal host snapshot unavailable; chrome theme not submitted"
-                );
-                return None;
+    fn persist_theme_choice(&mut self, theme: CuratedThemeId) -> Option<String> {
+        let mut port = self.client.port().clone();
+        let mut config = match port.snapshot_after(None) {
+            Ok(Some(snapshot)) => {
+                self.retained_render = Arc::clone(&snapshot);
+                snapshot.config.as_ref().clone()
             }
+            _ => self.retained_render.config.as_ref().clone(),
         };
         if config.render.theme == Some(theme.to_config()) {
-            // Already recorded. Skipping keeps the journal free of no-op config
-            // rows, which matter here: a replay reader counting interventions
-            // should not see one per keypress that changed nothing.
             return None;
         }
         config.render.theme = Some(theme.to_config());
-        if let Some(receipt) =
-            (self.command_submit.as_ref())(ControlCommand::UpdateConfig(Box::new(config)))
-        {
-            // Submission proves admission. The logged identity lets a caller
-            // query application and journal commitment from the owner; this
-            // surface has not waited for either outcome (bd-0s7x).
+        let command = ControlCommand::UpdateConfig(Box::new(config));
+        if let Some(receipt) = (self.command_submit.as_ref())(command) {
             info!(
                 theme = theme.label(),
                 %receipt,
@@ -947,13 +1144,6 @@ impl<'a> TerminalApp<'a> {
             );
             Some(receipt)
         } else {
-            // Surfaced rather than swallowed: a theme that silently fails to
-            // persist is exactly the bug this method exists to fix, wearing a
-            // different hat.
-            warn!(
-                theme = theme.label(),
-                "terminal renderer failed to enqueue the chrome theme config update"
-            );
             None
         }
     }
@@ -991,10 +1181,7 @@ impl<'a> TerminalApp<'a> {
     /// draw from a resilience experiment.
     fn report_applied_interventions(&mut self) {
         let fresh: Vec<(u64, u64, String, EventKind)> = {
-            let world = match self.host.clone().snapshot_after(None) {
-                Ok(Some(world)) => world,
-                _ => return,
-            };
+            let world = &self.retained_render;
             world
                 .applied_interventions
                 .iter()
@@ -3990,153 +4177,158 @@ impl<'a> TerminalApp<'a> {
         let cached_inspection = self.brain_inspection_cache.clone();
         let mut next_inspection_cache = None;
         let mut request_issued = false;
-        let (new_snapshot, source_snapshot) = match self.host.clone().snapshot_after(None) {
-            Ok(Some(world)) => {
-                self.paused = world.playback.paused;
-                self.speed_multiplier = world.playback.speed_multiplier;
-                self.terrain = TerrainView::from_snapshot(&world);
-                let mut snap = Snapshot::from_render(&world);
-                // Determine focused agent id
-                let agent_id_opt =
-                    match self.focus_lock {
-                        FocusLockMode::Manual => {
-                            if snap.agent_count > 0 {
-                                world
-                                    .world
-                                    .agents
-                                    .get(self.focused_agent_cursor % snap.agent_count)
-                            } else {
-                                None
-                            }
-                        }
-                        FocusLockMode::TopPredator => snap.leaderboard.first().and_then(|e| {
-                            world.world.agents.iter().find(|agent| agent.id == e.handle)
-                        }),
-                        FocusLockMode::Oldest => snap.oldest.first().and_then(|e| {
-                            world.world.agents.iter().find(|agent| agent.id == e.handle)
-                        }),
-                    };
-                if let Some(agent_uid) = agent_id_opt.map(|agent| agent.uid) {
-                    snap.focused_agent_uid = Some(agent_uid.get());
-                    match self.host.inspect_agent(
-                        agent_uid,
-                        if self.probe_enabled {
-                            PROBE_MAX_CONTRIBUTORS
-                        } else {
-                            0
-                        },
-                    ) {
-                        Ok(Some(detail)) if detail.source.matches_snapshot(&world) => {
-                            snap.focused_brain_bound = detail.brain_bound;
-                            snap.focused_outputs = Some(detail.outputs);
-                            if self.probe_enabled {
-                                snap.probe =
-                                    detail.sensor_attribution.map(|attribution| ProbeSnapshot {
-                                        agent_uid: agent_uid.get(),
-                                        attribution,
-                                    });
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(%error, agent_uid = agent_uid.get(), "terminal agent inspection failed")
-                        }
-                    }
-                    if let Some(cached) = cached_inspection.as_ref().filter(|cached| {
-                        cached.metadata.agent_uid == agent_uid.get()
-                            && cached.metadata.source_tick == world.world.tick
-                            && cached.source_revision == world.revision
-                    }) {
-                        snap.brain_layers.clone_from(&cached.layers);
-                        snap.brain_inspection = Some(cached.metadata);
-                        snap.focused_activations.clone_from(&cached.activations);
-                        next_inspection_cache = Some(cached.clone());
-                    } else {
-                        request_issued = true;
-                        let request = BrainProjectionRequest::focused(
-                            ProjectionClientId::new(TERMINAL_BRAIN_INSPECTION_CLIENT_ID.get()),
-                            ProjectionRequestRevision::new(next_request_revision.get()),
-                            agent_uid,
-                        );
-                        let cache = match self.host.project_brain(&request) {
-                            Ok(projection) => {
-                                let coherent = projection.source.matches_snapshot(&world);
-                                let response = projection.inspection;
-                                let mut metadata = BrainInspectionViewMetadata {
-                                    agent_uid: agent_uid.get(),
-                                    source_tick: response.source_tick.0,
-                                    request_revision: response.request_revision.get(),
-                                    truncated: false,
-                                    retained_payload_bytes: response.build.retained_payload_bytes,
-                                    ready: false,
-                                };
-                                let layers = response.ready_for(agent_uid).map_or_else(
-                                    Vec::new,
-                                    |telemetry| {
-                                        metadata.truncated = telemetry.inspection.build.truncated;
-                                        metadata.retained_payload_bytes =
-                                            telemetry.inspection.build.retained_payload_bytes;
-                                        metadata.ready = true;
-                                        convert_layers(&telemetry.inspection.activations)
-                                    },
-                                );
-                                let activations = coherent
-                                    .then(|| {
-                                        response.ready_for(agent_uid).map(|telemetry| {
-                                            telemetry.inspection.activations.clone()
-                                        })
-                                    })
-                                    .flatten();
-                                TerminalBrainInspectionCache {
-                                    source_revision: projection.source.published_snapshot,
-                                    metadata,
-                                    layers,
-                                    activations,
-                                }
-                            }
-                            Err(error) => {
-                                warn!(
-                                    %error,
-                                    agent_uid = agent_uid.get(),
-                                    request_revision = next_request_revision.get(),
-                                    "terminal brain inspection failed"
-                                );
-                                TerminalBrainInspectionCache {
-                                    source_revision: world.revision,
-                                    metadata: BrainInspectionViewMetadata {
-                                        agent_uid: agent_uid.get(),
-                                        source_tick: world.world.tick,
-                                        request_revision: next_request_revision.get(),
-                                        truncated: false,
-                                        retained_payload_bytes: 0,
-                                        ready: false,
-                                    },
-                                    layers: Vec::new(),
-                                    activations: None,
-                                }
-                            }
-                        };
-                        snap.brain_layers.clone_from(&cache.layers);
-                        snap.brain_inspection = Some(cache.metadata);
-                        snap.focused_activations.clone_from(&cache.activations);
-                        next_inspection_cache = Some(cache);
-                    }
-                }
-                (snap, world)
+
+        match self.client.poll_snapshot(&mut self.snapshot_subscription) {
+            Ok(Some(polled)) => {
+                self.retained_render = polled;
             }
-            Ok(None) => return,
+            Ok(None) => {}
             Err(error) => {
                 self.simulation_fault = Some(Arc::from(error.to_string()));
                 return;
             }
+        }
+
+        let world = Arc::clone(&self.retained_render);
+        self.paused = world.playback.paused;
+        self.speed_multiplier = world.playback.speed_multiplier;
+        self.terrain = TerrainView::from_snapshot(&world);
+        let mut snap = Snapshot::from_render(&world);
+
+        // Determine focused agent id
+        let agent_id_opt = match self.focus_lock {
+            FocusLockMode::Manual => {
+                if snap.agent_count > 0 {
+                    world
+                        .world
+                        .agents
+                        .get(self.focused_agent_cursor % snap.agent_count)
+                } else {
+                    None
+                }
+            }
+            FocusLockMode::TopPredator => snap
+                .leaderboard
+                .first()
+                .and_then(|e| world.world.agents.iter().find(|agent| agent.id == e.handle)),
+            FocusLockMode::Oldest => snap
+                .oldest
+                .first()
+                .and_then(|e| world.world.agents.iter().find(|agent| agent.id == e.handle)),
         };
+        if let Some(agent_uid) = agent_id_opt.map(|agent| agent.uid) {
+            snap.focused_agent_uid = Some(agent_uid.get());
+            match self.client.port().inspect_agent(
+                agent_uid,
+                if self.probe_enabled {
+                    PROBE_MAX_CONTRIBUTORS
+                } else {
+                    0
+                },
+            ) {
+                Ok(Some(detail)) if detail.source.matches_snapshot(&world) => {
+                    snap.focused_brain_bound = detail.brain_bound;
+                    snap.focused_outputs = Some(detail.outputs);
+                    if self.probe_enabled {
+                        snap.probe = detail.sensor_attribution.map(|attribution| ProbeSnapshot {
+                            agent_uid: agent_uid.get(),
+                            attribution,
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(%error, agent_uid = agent_uid.get(), "terminal agent inspection failed");
+                }
+            }
+            if let Some(cached) = cached_inspection.as_ref().filter(|cached| {
+                cached.metadata.agent_uid == agent_uid.get()
+                    && cached.metadata.source_tick == world.world.tick
+                    && cached.source_revision == world.revision
+            }) {
+                snap.brain_layers.clone_from(&cached.layers);
+                snap.brain_inspection = Some(cached.metadata);
+                snap.focused_activations.clone_from(&cached.activations);
+                next_inspection_cache = Some(cached.clone());
+            } else {
+                request_issued = true;
+                let request = BrainProjectionRequest::focused(
+                    ProjectionClientId::new(TERMINAL_BRAIN_INSPECTION_CLIENT_ID.get()),
+                    ProjectionRequestRevision::new(next_request_revision.get()),
+                    agent_uid,
+                );
+                let cache = match self.client.port().project_brain(&request) {
+                    Ok(projection) => {
+                        let coherent = projection.source.matches_snapshot(&world);
+                        let response = projection.inspection;
+                        let mut metadata = BrainInspectionViewMetadata {
+                            agent_uid: agent_uid.get(),
+                            source_tick: response.source_tick.0,
+                            request_revision: response.request_revision.get(),
+                            truncated: false,
+                            retained_payload_bytes: response.build.retained_payload_bytes,
+                            ready: false,
+                        };
+                        let layers =
+                            response
+                                .ready_for(agent_uid)
+                                .map_or_else(Vec::new, |telemetry| {
+                                    metadata.truncated = telemetry.inspection.build.truncated;
+                                    metadata.retained_payload_bytes =
+                                        telemetry.inspection.build.retained_payload_bytes;
+                                    metadata.ready = true;
+                                    convert_layers(&telemetry.inspection.activations)
+                                });
+                        let activations = coherent
+                            .then(|| {
+                                response
+                                    .ready_for(agent_uid)
+                                    .map(|telemetry| telemetry.inspection.activations.clone())
+                            })
+                            .flatten();
+                        TerminalBrainInspectionCache {
+                            source_revision: projection.source.published_snapshot,
+                            metadata,
+                            layers,
+                            activations,
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            agent_uid = agent_uid.get(),
+                            request_revision = next_request_revision.get(),
+                            "terminal brain inspection failed"
+                        );
+                        TerminalBrainInspectionCache {
+                            source_revision: world.revision,
+                            metadata: BrainInspectionViewMetadata {
+                                agent_uid: agent_uid.get(),
+                                source_tick: world.world.tick,
+                                request_revision: next_request_revision.get(),
+                                truncated: false,
+                                retained_payload_bytes: 0,
+                                ready: false,
+                            },
+                            layers: Vec::new(),
+                            activations: None,
+                        }
+                    }
+                };
+                snap.brain_layers.clone_from(&cache.layers);
+                snap.brain_inspection = Some(cache.metadata);
+                snap.focused_activations.clone_from(&cache.activations);
+                next_inspection_cache = Some(cache);
+            }
+        }
+
         self.brain_inspection_cache = next_inspection_cache;
         if request_issued {
             self.brain_inspection_revision = next_request_revision;
         }
-        self.ingest_events(&new_snapshot);
-        self.snapshot = new_snapshot;
-        self.report_scheduled_patches(&source_snapshot);
+        self.ingest_events(&snap);
+        self.snapshot = snap;
+        self.report_scheduled_patches(&world);
         self.validate_rail_selection();
         self.maybe_log_rail_first_show();
         self.maybe_log_brain_panel();
@@ -4486,6 +4678,8 @@ fn diff_f(value: f32) -> String {
 
 #[derive(Clone, Default, Debug)]
 struct Snapshot {
+    #[allow(dead_code)]
+    revision: u64,
     tick: u64,
     epoch: u64,
     agent_count: usize,
@@ -5293,6 +5487,7 @@ impl Snapshot {
         }
 
         Self {
+            revision: snapshot.revision.get(),
             tick: summary.tick.0,
             epoch: snapshot.world.epoch,
             agent_count,
@@ -16141,6 +16336,250 @@ mod tests {
         // 3. Report tick equals snapshot tick
         let report = app.snapshot();
         assert_eq!(report.tick, 1);
+    }
+
+    #[test]
+    fn test_terminal_app_host_client_command_semantics_and_status_exposure() {
+        let config = ScriptBotsConfig::default();
+        let world = WorldState::new(config.clone()).expect("world");
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let mut host = TerminalTestHost::take(world);
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = host.context(&runtime);
+        let mut app = TerminalApp::new(&renderer, ctx);
+
+        // 1. Verify client accessor and protocol events polling
+        assert_eq!(app.client().session_id(), app.client_mut().session_id());
+        let _events = app.poll_protocol_events(10).expect("poll protocol events");
+
+        // 2. submit_pause exposes report with valid command_id and application state
+        let pause_report = app.submit_pause(None).expect("submit pause");
+        assert!(pause_report.command_id.client_sequence() > 0);
+        assert!(matches!(
+            pause_report.application,
+            ApplicationState::Applied(_) | ApplicationState::Admitted
+        ));
+        assert!(matches!(
+            pause_report.journal,
+            JournalState::NotRequired
+                | JournalState::Pending
+                | JournalState::CommittedVolatile
+                | JournalState::Durable
+        ));
+
+        // 3. submit_resume exposes report
+        let resume_report = app.submit_resume(None).expect("submit resume");
+        assert!(
+            resume_report.command_id.client_sequence() > pause_report.command_id.client_sequence()
+        );
+        assert!(matches!(
+            resume_report.application,
+            ApplicationState::Applied(_) | ApplicationState::Admitted
+        ));
+
+        // 4. Pause again for exact stepping tests
+        app.submit_pause(None).expect("pause again");
+        app.refresh_snapshot();
+        let tick_before = app.snapshot().tick;
+
+        // 5. submit_step while paused advances tick exactly once
+        let step_report = app.submit_step(None).expect("submit step");
+        assert!(
+            step_report.command_id.client_sequence() > resume_report.command_id.client_sequence()
+        );
+        // Wait until applied
+        app.submit_and_wait(ControlCommand::Step)
+            .expect("step barrier");
+        app.refresh_snapshot();
+        assert_eq!(
+            app.snapshot().tick,
+            tick_before + 2,
+            "step commands advance tick by exactly 1 each"
+        );
+
+        // 6. submit_config exposes command report and config revision
+        let mut new_config = config;
+        new_config.world_width = 120;
+        let config_report = app
+            .submit_config(Box::new(new_config), None)
+            .expect("submit config");
+        assert!(
+            config_report.command_id.client_sequence() > step_report.command_id.client_sequence()
+        );
+
+        // 7. submit_selection exposes command report
+        let selection_report = app
+            .submit_selection(
+                SelectionUpdate {
+                    mode: scriptbots_core::SelectionMode::Replace,
+                    agent_ids: Vec::new(),
+                    state: scriptbots_core::SelectionState::Selected,
+                },
+                None,
+            )
+            .expect("submit selection");
+        assert!(
+            selection_report.command_id.client_sequence()
+                > config_report.command_id.client_sequence()
+        );
+
+        // 8. Typed conflict: submitting with stale expected_control_revision admits,
+        // then resolves to RejectionReason::ControlRevisionConflict at the application boundary
+        let stale_revision = ControlRevision::new(0);
+        let conflict_report = app
+            .submit_pause(Some(stale_revision))
+            .expect("conflict command admitted");
+        assert!(matches!(
+            conflict_report.application,
+            ApplicationState::Admitted | ApplicationState::Rejected(_)
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut resolved_status = None;
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = app.client_mut().command_status(conflict_report.command_id)
+                && matches!(status.application(), ApplicationState::Rejected(_))
+            {
+                resolved_status = Some(status);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let status = resolved_status.expect("conflict resolved at application boundary");
+        assert!(
+            matches!(
+                status.application(),
+                ApplicationState::Rejected(
+                    scriptbots_runtime::RejectionReason::ControlRevisionConflict { .. }
+                )
+            ),
+            "expected rejection on control revision mismatch, got {:?}",
+            status.application()
+        );
+
+        // 9. Typed disconnect: when host owner is shut down, subsequent command returns Disconnected
+        app.submit_envelope(CommandEnvelope::new(
+            CommandId::new(u128::MAX),
+            HostCommand::Shutdown,
+        ))
+        .expect("shutdown command");
+        host.owner
+            .take()
+            .expect("owner thread")
+            .join()
+            .expect("join");
+        let disconnect_result = app.submit_pause(None);
+        assert!(
+            matches!(
+                disconnect_result,
+                Err(TerminalCommandError::Host(HostAccessError::Disconnected))
+            ),
+            "expected Disconnected error after host shutdown, got {disconnect_result:?}"
+        );
+    }
+
+    #[test]
+    fn test_terminal_header_and_reports_derive_from_explicit_snapshot_revision() {
+        let config = ScriptBotsConfig::default();
+        let world = WorldState::new(config).expect("world");
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let host = TerminalTestHost::take(world);
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = host.context(&runtime);
+        let mut app = TerminalApp::new(&renderer, ctx);
+
+        let initial_revision = app.snapshot().revision;
+        assert_eq!(
+            initial_revision,
+            app.retained_render.revision.get(),
+            "Snapshot revision must match retained_render revision"
+        );
+
+        // Header derived from explicit snapshot revision
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| app.draw(f)).expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut buffer_text = String::new();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                buffer_text.push_str(buffer[(x, y)].symbol());
+            }
+            buffer_text.push('\n');
+        }
+        assert!(
+            buffer_text.contains(&format!("Tick {:>6}", app.snapshot().tick)),
+            "Header must derive from the explicit snapshot tick"
+        );
+
+        // Step simulation and assert revision advances
+        app.submit_and_wait(ControlCommand::Step).expect("step");
+        // Prior to refresh_snapshot, the app snapshot and header remain strictly at initial_revision
+        assert_eq!(app.snapshot().revision, initial_revision);
+        assert_eq!(app.snapshot().tick, 0);
+
+        app.refresh_snapshot();
+        let stepped_revision = app.snapshot().revision;
+        assert!(
+            stepped_revision > initial_revision,
+            "stepped snapshot revision must advance beyond initial revision"
+        );
+        assert_eq!(stepped_revision, app.retained_render.revision.get());
+        assert_eq!(app.snapshot().tick, 1);
+    }
+
+    #[test]
+    fn test_buffer_level_shadow_comparison_and_cadence_neutrality() {
+        let config = ScriptBotsConfig::default();
+        let world = WorldState::new(config).expect("world");
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let host = TerminalTestHost::take(world);
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = host.context(&runtime);
+        let mut app = TerminalApp::new(&renderer, ctx);
+
+        app.paused = true;
+        let backend = ratatui::backend::TestBackend::new(80, 36);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        // First draw
+        terminal.draw(|f| app.draw(f)).expect("draw 1");
+        let buffer_1 = terminal.backend().buffer().clone();
+
+        // Simulate renderer cadence ticking without science step
+        let now = Instant::now();
+        for _ in 0..5 {
+            app.advance_simulation(now, false);
+        }
+
+        // Second draw at same science state
+        terminal.draw(|f| app.draw(f)).expect("draw 2");
+        let buffer_2 = terminal.backend().buffer().clone();
+
+        // Cadence neutrality: buffer 1 and buffer 2 must be identical
+        assert_eq!(
+            buffer_1, buffer_2,
+            "Buffer must remain identical when renderer ticks without science step (cadence neutrality)"
+        );
+
+        // Now step simulation exactly once
+        app.submit_and_wait(ControlCommand::Step).expect("step");
+        app.refresh_snapshot();
+
+        // Third draw after real science step
+        terminal.draw(|f| app.draw(f)).expect("draw 3");
+        let buffer_3 = terminal.backend().buffer().clone();
+
+        // Buffer must now reflect the new science tick
+        assert_ne!(
+            buffer_2, buffer_3,
+            "Buffer must change when simulation is stepped"
+        );
     }
 
     #[test]

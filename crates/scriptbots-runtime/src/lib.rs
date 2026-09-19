@@ -4970,6 +4970,35 @@ impl<P: HostPort> HostClient<P> {
         Self { port }
     }
 
+    /// Reference to the underlying host port.
+    #[must_use]
+    pub const fn port(&self) -> &P {
+        &self.port
+    }
+
+    /// Mutable reference to the underlying host port.
+    #[must_use]
+    pub const fn port_mut(&mut self) -> &mut P {
+        &mut self.port
+    }
+
+    /// Unwrap the underlying host port.
+    #[must_use]
+    pub fn into_port(self) -> P {
+        self.port
+    }
+
+    /// Stable identity of the host reached through this client.
+    #[must_use]
+    pub fn session_id(&self) -> HostSessionId {
+        self.port.session_id()
+    }
+
+    /// Return the latest published snapshot without advancing any subscription.
+    pub fn latest_snapshot(&mut self) -> Result<Option<Arc<RenderSnapshot>>, HostAccessError> {
+        self.port.snapshot_after(None)
+    }
+
     /// Submit a new command or retry an existing idempotency key.
     pub fn submit(&mut self, envelope: CommandEnvelope) -> Result<CommandStatus, HostAccessError> {
         let requested_id = envelope.command_id;
