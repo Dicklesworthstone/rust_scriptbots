@@ -1,0 +1,21 @@
+{
+  "name": "09_provider_rate_limited_429",
+  "description": "Provider returns HTTP 429 rate limited error",
+  "turns": [
+    {
+      "status": 429,
+      "raw": "{\"error\": {\"message\": \"Rate limit exceeded\"}}"
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "rate limited",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

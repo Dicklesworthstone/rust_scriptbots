@@ -1,0 +1,38 @@
+{
+  "name": "06_missing_usage_block",
+  "description": "200 response with content but missing required usage block",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "name": "propose_experiment",
+            "input": {
+              "hypothesis": "test hypothesis",
+              "falsifier": "test falsifier",
+              "factors": [{ "knob_path": "food_growth_rate", "values": [0.01, 0.02] }],
+              "seeds": { "base": 41, "count": 2 },
+              "ticks_per_run": 2,
+              "metrics": ["alive_agents"],
+              "budget": { "runs": 4, "ticks": 8 }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "has no usage block",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "name": "19_operator_budget_exceeded",
+  "description": "Proposal requests 8 runs exceeding operator budget of 2 runs",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "name": "propose_experiment",
+            "input": {
+              "hypothesis": "large sweep exceeding operator allocation",
+              "falsifier": "no change across conditions",
+              "factors": [
+                {
+                  "knob_path": "food_growth_rate",
+                  "values": [0.01, 0.02, 0.03, 0.04]
+                }
+              ],
+              "seeds": { "base": 41, "count": 2 },
+              "ticks_per_run": 4,
+              "metrics": ["alive_agents"],
+              "budget": { "runs": 8, "ticks": 32 }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "cost_exceeds_budget",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

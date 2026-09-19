@@ -39,17 +39,15 @@ fn materialize_real_notebook(
     root: &std::path::Path,
     shuffled_rerender: bool,
 ) -> std::path::PathBuf {
-    let turn = ScriptedTurn {
-        body: serde_json::json!({
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 4, "output_tokens": 6},
-            "content": [{
-                "type": "tool_use",
-                "name": PROPOSE_EXPERIMENT_TOOL_NAME,
-                "input": spec_input()
-            }]
-        }),
-    };
+    let turn = ScriptedTurn::from_body(serde_json::json!({
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 4, "output_tokens": 6},
+        "content": [{
+            "type": "tool_use",
+            "name": PROPOSE_EXPERIMENT_TOOL_NAME,
+            "input": spec_input()
+        }]
+    }));
     let mut lab = LabStateMachine::new(
         Box::new(ScriptedClient::new("offline-scripted", vec![turn])),
         LabBudget {

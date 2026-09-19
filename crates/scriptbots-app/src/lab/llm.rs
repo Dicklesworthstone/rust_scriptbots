@@ -532,10 +532,55 @@ impl RetryPolicy {
 }
 
 /// One pre-recorded turn.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScriptedTurn {
     /// The response body, exactly as a provider would have sent it.
+    #[serde(default)]
     pub body: serde_json::Value,
+    /// Raw unparsed bytes/string for malformed-transport tests (e.g. invalid JSON, truncated stream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    /// Simulated provider HTTP status code, if simulating a provider error (e.g. 429, 529, 500).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Provider request identifier, if supplied with this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl ScriptedTurn {
+    /// Build a turn from an already-parsed JSON body.
+    #[must_use]
+    pub fn from_body(body: serde_json::Value) -> Self {
+        Self {
+            body,
+            raw: None,
+            status: None,
+            request_id: None,
+        }
+    }
+
+    /// Build a turn from a raw unparsed string (for malformed transport tests).
+    #[must_use]
+    pub fn from_raw(raw: impl Into<String>) -> Self {
+        Self {
+            body: serde_json::Value::Null,
+            raw: Some(raw.into()),
+            status: None,
+            request_id: None,
+        }
+    }
+
+    /// Build a turn with an explicit HTTP status code and optional body.
+    #[must_use]
+    pub fn from_status(status: u16, raw: impl Into<String>) -> Self {
+        Self {
+            body: serde_json::Value::Null,
+            raw: Some(raw.into()),
+            status: Some(status),
+            request_id: None,
+        }
+    }
 }
 
 /// The CI client: a fixture, replayed in order.
@@ -561,13 +606,24 @@ impl ScriptedClient {
         }
     }
 
-    /// Load a fixture from JSON.
+    /// Load a fixture from JSON. Accepts either a bare JSON array of turns or a
+    /// fixture envelope object containing a `"turns"` array.
     ///
     /// # Errors
     ///
     /// [`LlmError::InvalidResponse`] if the fixture itself is malformed — better
     /// to fail loudly at load than to discover it three turns into a run.
     pub fn from_fixture(model_id: impl Into<String>, json: &[u8]) -> Result<Self, LlmError> {
+        if let Ok(turns) = serde_json::from_slice::<Vec<ScriptedTurn>>(json) {
+            return Ok(Self::new(model_id, turns));
+        }
+        #[derive(Deserialize)]
+        struct FixtureEnvelope {
+            turns: Vec<ScriptedTurn>,
+        }
+        if let Ok(envelope) = serde_json::from_slice::<FixtureEnvelope>(json) {
+            return Ok(Self::new(model_id, envelope.turns));
+        }
         let turns: Vec<ScriptedTurn> = serde_json::from_slice(json).map_err(|err| {
             LlmError::InvalidResponse(format!("fixture is not valid JSON: {err}"))
         })?;
@@ -587,9 +643,26 @@ impl LlmClient for ScriptedClient {
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let index = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let turn = self.turns.get(index).ok_or(LlmError::FixtureExhausted)?;
-        let body = serde_json::to_vec(&turn.body).map_err(|err| {
-            LlmError::InvalidResponse(format!("fixture turn is not encodable: {err}"))
-        })?;
+        let body = if let Some(raw) = &turn.raw {
+            raw.as_bytes().to_vec()
+        } else {
+            serde_json::to_vec(&turn.body).map_err(|err| {
+                LlmError::InvalidResponse(format!("fixture turn is not encodable: {err}"))
+            })?
+        };
+        if let Some(status) = turn.status {
+            if status == 429 {
+                return Err(LlmError::RateLimited {
+                    retry_after_ms: None,
+                });
+            }
+            if status == 529 {
+                return Err(LlmError::Overloaded);
+            }
+            if status != 200 {
+                return Err(parse_error_body(status, &body, turn.request_id.clone()));
+            }
+        }
         // Parsed through exactly the same path as a live response — a fixture
         // that skipped the parser would test nothing.
         parse_response(request, &body)
@@ -1085,16 +1158,12 @@ mod tests {
         let client = ScriptedClient::new(
             "fixture",
             vec![
-                ScriptedTurn {
-                    body: tool_use_body(),
-                },
-                ScriptedTurn {
-                    body: serde_json::json!({
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 2, "output_tokens": 3},
-                        "content": [{"type": "text", "text": "done"}]
-                    }),
-                },
+                ScriptedTurn::from_body(tool_use_body()),
+                ScriptedTurn::from_body(serde_json::json!({
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 2, "output_tokens": 3},
+                    "content": [{"type": "text", "text": "done"}]
+                })),
             ],
         );
         let request = request();
@@ -1115,10 +1184,8 @@ mod tests {
 
     #[test]
     fn the_same_fixture_and_seed_produce_the_same_transcript_twice() {
-        let fixture = serde_json::to_vec(&vec![ScriptedTurn {
-            body: tool_use_body(),
-        }])
-        .expect("fixture encodes");
+        let fixture = serde_json::to_vec(&vec![ScriptedTurn::from_body(tool_use_body())])
+            .expect("fixture encodes");
         let transcript = || {
             let client = ScriptedClient::from_fixture("fixture", &fixture).expect("fixture loads");
             let response = client.complete(&request()).expect("turn");

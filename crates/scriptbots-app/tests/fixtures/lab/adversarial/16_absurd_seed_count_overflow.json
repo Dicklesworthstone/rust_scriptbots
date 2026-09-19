@@ -1,0 +1,44 @@
+{
+  "name": "16_absurd_seed_count_overflow",
+  "description": "Proposal requests 1,000,000,000 seeds exceeding MAX_SEEDS limit",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "name": "propose_experiment",
+            "input": {
+              "hypothesis": "large scale sweep",
+              "falsifier": "no difference observed",
+              "factors": [
+                {
+                  "knob_path": "food_growth_rate",
+                  "values": [0.01, 0.02]
+                }
+              ],
+              "seeds": { "base": 41, "count": 100 },
+              "ticks_per_run": 4,
+              "metrics": ["alive_agents"],
+              "budget": { "runs": 200, "ticks": 800 }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "seeds.count",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

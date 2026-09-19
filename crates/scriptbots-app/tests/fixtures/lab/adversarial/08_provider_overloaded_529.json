@@ -1,0 +1,21 @@
+{
+  "name": "08_provider_overloaded_529",
+  "description": "Provider returns HTTP 529 overloaded error",
+  "turns": [
+    {
+      "status": 529,
+      "raw": "{\"error\": {\"message\": \"Provider is overloaded\"}}"
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "overloaded",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

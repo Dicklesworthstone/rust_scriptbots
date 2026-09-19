@@ -1,0 +1,44 @@
+{
+  "name": "23_forbidden_factor_rng_seed",
+  "description": "rng_seed swept as a factor confounds matched-seed design and is rejected",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "name": "propose_experiment",
+            "input": {
+              "hypothesis": "sweep rng seed across arms",
+              "falsifier": "no change across conditions",
+              "factors": [
+                {
+                  "knob_path": "rng_seed",
+                  "values": [42.0, 43.0]
+                }
+              ],
+              "seeds": { "base": 41, "count": 2 },
+              "ticks_per_run": 4,
+              "metrics": ["alive_agents"],
+              "budget": { "runs": 4, "ticks": 16 }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "seed_as_factor",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

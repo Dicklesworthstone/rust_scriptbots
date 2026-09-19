@@ -1,0 +1,24 @@
+{
+  "name": "30_missing_usage_infinite_loop_protection",
+  "description": "Unenforceable token budget due to missing usage terminates safely at max_iterations backstop",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "stop_reason": "tool_use",
+        "content": [{ "type": "tool_use", "name": "propose_experiment", "input": {} }]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "has no usage block",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "10_provider_refusal",
+  "description": "Provider returns stop_reason refusal",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "stop_reason": "refusal",
+        "content": [
+          {
+            "type": "text",
+            "text": "I decline to propose experiments."
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "refused",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

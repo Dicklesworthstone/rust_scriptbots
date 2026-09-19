@@ -1,0 +1,44 @@
+{
+  "name": "17_absurd_ticks_per_run_overflow",
+  "description": "Proposal requests 10^12 ticks per run exceeding MAX_TICKS_PER_RUN limit",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "name": "propose_experiment",
+            "input": {
+              "hypothesis": "infinite horizon dynamics",
+              "falsifier": "no difference observed",
+              "factors": [
+                {
+                  "knob_path": "food_growth_rate",
+                  "values": [0.01, 0.02]
+                }
+              ],
+              "seeds": { "base": 41, "count": 2 },
+              "ticks_per_run": 1000000000000,
+              "metrics": ["alive_agents"],
+              "budget": { "runs": 4, "ticks": 4000000000000 }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "ticks_per_run",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

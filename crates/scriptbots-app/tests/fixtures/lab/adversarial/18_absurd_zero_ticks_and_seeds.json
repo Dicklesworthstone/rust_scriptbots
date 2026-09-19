@@ -1,0 +1,44 @@
+{
+  "name": "18_absurd_zero_ticks_and_seeds",
+  "description": "Proposal requests zero ticks per run",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "name": "propose_experiment",
+            "input": {
+              "hypothesis": "zero tick study",
+              "falsifier": "no change across conditions",
+              "factors": [
+                {
+                  "knob_path": "food_growth_rate",
+                  "values": [0.01, 0.02]
+                }
+              ],
+              "seeds": { "base": 41, "count": 2 },
+              "ticks_per_run": 0,
+              "metrics": ["alive_agents"],
+              "budget": { "runs": 4, "ticks": 0 }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "zero_ticks",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}

@@ -161,28 +161,26 @@ pub fn builtin_offline_fixture(goal: &str, budget: &LabBudget) -> crate::lab::ll
         goal.trim()
     };
 
-    crate::lab::llm::ScriptedTurn {
-        body: serde_json::json!({
-            "stop_reason": "tool_use",
-            "usage": { "input_tokens": 120, "output_tokens": 80 },
-            "content": [{
-                "type": "tool_use",
-                "name": PROPOSE_EXPERIMENT_TOOL_NAME,
-                "input": {
-                    "hypothesis": hypothesis,
-                    "falsifier": "matched seeds show no increase in alive agents across conditions",
-                    "factors": [{
-                        "knob_path": "food_growth_rate",
-                        "values": [0.01, 0.02]
-                    }],
-                    "seeds": { "base": 41, "count": seed_count },
-                    "ticks_per_run": ticks_per_run,
-                    "metrics": ["alive_agents"],
-                    "budget": { "runs": runs, "ticks": total_ticks }
-                }
-            }]
-        }),
-    }
+    crate::lab::llm::ScriptedTurn::from_body(serde_json::json!({
+    "stop_reason": "tool_use",
+        "usage": { "input_tokens": 120, "output_tokens": 80 },
+        "content": [{
+            "type": "tool_use",
+            "name": PROPOSE_EXPERIMENT_TOOL_NAME,
+            "input": {
+                "hypothesis": hypothesis,
+                "falsifier": "matched seeds show no increase in alive agents across conditions",
+                "factors": [{
+                    "knob_path": "food_growth_rate",
+                    "values": [0.01, 0.02]
+                }],
+                "seeds": { "base": 41, "count": seed_count },
+                "ticks_per_run": ticks_per_run,
+                "metrics": ["alive_agents"],
+                "budget": { "runs": runs, "ticks": total_ticks }
+            }
+        }]
+    }))
 }
 
 /// Successful execution accounting returned by an experiment executor.
@@ -719,7 +717,13 @@ impl LabStateMachine {
             tools: vec![propose_experiment_tool()?],
             max_tokens: u32::try_from(remaining_tokens.min(2_048)).unwrap_or(2_048),
         };
-        let response = self.client.complete(&request)?;
+        let response = match self.client.complete(&request) {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.phase = LabPhase::Report;
+                return Err(LabError::Llm(err));
+            }
+        };
         let used =
             usize::try_from(u64::from(response.usage.input) + u64::from(response.usage.output))
                 .unwrap_or(usize::MAX);
@@ -1065,24 +1069,33 @@ impl LabStateMachine {
                         spec.hypothesis.as_str()
                     })
             });
-            let rendered = NotebookRenderer::render_markdown(goal, &[], &[], &context)
-                .map_err(LabError::Notebook)?;
+            let rendered = match NotebookRenderer::render_markdown(goal, &[], &[], &context) {
+                Ok(rendered) => rendered,
+                Err(_) => self.generate_notebook(),
+            };
             if let Some(root) = &self.notebook_root {
                 let report_id = self
                     .proposal_id
                     .as_deref()
                     .unwrap_or("unvalidated-proposal");
                 let directory = root.join(report_id).join("notebook");
-                let path = NotebookRenderer::render_notebook(
+                let path = match NotebookRenderer::render_notebook(
                     report_id,
                     goal,
                     &[],
                     &[],
                     &directory,
                     &context,
-                )
-                .map_err(LabError::Notebook)?;
-                self.notebook_path = Some(path);
+                ) {
+                    Ok(path) => Some(path),
+                    Err(_) => {
+                        let _ = std::fs::create_dir_all(&directory);
+                        let notebook_file = directory.join("notebook.md");
+                        let _ = std::fs::write(&notebook_file, &rendered);
+                        Some(notebook_file)
+                    }
+                };
+                self.notebook_path = path;
             }
             self.rendered_notebook = Some(rendered);
             self.phase = LabPhase::Finished;
@@ -1236,7 +1249,7 @@ impl LabStateMachine {
                 Ok(phase) => phase,
                 Err(error) => {
                     if self.phase == LabPhase::Report {
-                        self.report()?;
+                        let _ = self.report();
                     }
                     return Err(error);
                 }
@@ -1354,17 +1367,15 @@ mod tests {
     }
 
     fn tool_turn(input: serde_json::Value) -> ScriptedTurn {
-        ScriptedTurn {
-            body: serde_json::json!({
-                "stop_reason": "tool_use",
-                "usage": {"input_tokens": 4, "output_tokens": 6},
-                "content": [{
-                    "type": "tool_use",
-                    "name": PROPOSE_EXPERIMENT_TOOL_NAME,
-                    "input": input
-                }]
-            }),
-        }
+        ScriptedTurn::from_body(serde_json::json!({
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 4, "output_tokens": 6},
+            "content": [{
+                "type": "tool_use",
+                "name": PROPOSE_EXPERIMENT_TOOL_NAME,
+                "input": input
+            }]
+        }))
     }
 
     fn state_machine(

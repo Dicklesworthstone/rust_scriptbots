@@ -1,0 +1,20 @@
+{
+  "name": "07_empty_response_body",
+  "description": "Provider returns HTTP 200 with an empty body",
+  "turns": [
+    {
+      "raw": ""
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "empty body",
+    "must_not": [
+      "panic",
+      "budget_overrun",
+      "write_outside_session_dir",
+      "process_spawn"
+    ]
+  }
+}
