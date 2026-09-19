@@ -6,7 +6,7 @@
   "backend": "Vulkan",
   "driver": "Mesa 24.2.8-1ubuntu1~24.04.1",
   "driver_info": "Mesa 24.2.8-1ubuntu1~24.04.1 (LLVM 18.1.8)",
-  "shader_digest": "c09296f799f365eba4a0277e461ac7dcfd020c570649d4a8fa9413641ad6a30b",
+  "shader_digest": "01491cd61bca7ed0a474e6966a97da61403706509f6a131294dc431c22a84066",
   "build_identity": "0.1.0",
   "toolchain_identity": "rustc 1.89-nightly (x86_64-unknown-linux-gnu)",
   "fixture_digest": "blake3:seed_42",

@@ -157,7 +157,7 @@ fn poly_acos(x_in: f32) -> f32 {
 }
 
 // Toroidal minimum-image delta on a periodic interval [0, extent).
-fn toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
+fn sense_toroidal_delta(a: f32, b: f32, extent: f32) -> f32 {
     let raw = a - b;
     let half = extent * 0.5;
     var delta = raw;
@@ -278,8 +278,8 @@ fn main(
                     }
                     let neighbor = agents[other_idx];
 
-                    let dx = toroidal_delta(neighbor.pos_x, observer.pos_x, uniforms.world_width);
-                    let dy = toroidal_delta(neighbor.pos_y, observer.pos_y, uniforms.world_height);
+                    let dx = sense_toroidal_delta(neighbor.pos_x, observer.pos_x, uniforms.world_width);
+                    let dy = sense_toroidal_delta(neighbor.pos_y, observer.pos_y, uniforms.world_height);
                     let dist_sq = dx * dx + dy * dy;
                     if (dist_sq <= F32_EPSILON || dist_sq > radius_sq) {
                         continue;
@@ -1560,7 +1560,7 @@ impl GpuSensePipeline {
 #[must_use]
 pub fn sense_shader_digest() -> &'static str {
     // Computed over SENSE_COMPUTE_SHADER_WGSL source bytes.
-    "c09296f799f365eba4a0277e461ac7dcfd020c570649d4a8fa9413641ad6a30b"
+    "01491cd61bca7ed0a474e6966a97da61403706509f6a131294dc431c22a84066"
 }
 
 /// Produce the shader source parameterized by the specified workgroup size.

@@ -9024,12 +9024,18 @@ fn spawn_agent_entity(
     );
     commands.entity(root).add_child(spike.entity);
 
+    let boost_style = visual::visual_style().events.boost;
+    let boost_core = boost_style.core_srgb;
     let boost = spawn_part(
         commands,
         &meshes.quad,
         materials,
-        Color::srgb(0.2, 0.36, 0.95),
-        Color::linear_rgb(0.25, 0.5, 1.18),
+        Color::srgb(boost_core[0], boost_core[1], boost_core[2]),
+        Color::linear_rgb(
+            boost_core[0] * 0.5,
+            boost_core[1] * 0.5,
+            boost_core[2] * 0.5,
+        ),
         AlphaMode::Add,
         true,
         true,
@@ -9037,12 +9043,13 @@ fn spawn_agent_entity(
     );
     commands.entity(root).add_child(boost.entity);
 
+    let ear_srgb = visual::visual_style().agents.ear_srgb;
     let ear_left = spawn_part(
         commands,
         &meshes.sphere,
         materials,
-        Color::srgb(0.82, 0.78, 0.58),
-        Color::linear_rgb(0.22, 0.24, 0.12),
+        Color::srgb(ear_srgb[0], ear_srgb[1], ear_srgb[2]),
+        Color::linear_rgb(ear_srgb[0] * 0.18, ear_srgb[1] * 0.2, ear_srgb[2] * 0.15),
         AlphaMode::Opaque,
         false,
         false,
@@ -9054,8 +9061,8 @@ fn spawn_agent_entity(
         commands,
         &meshes.sphere,
         materials,
-        Color::srgb(0.82, 0.78, 0.58),
-        Color::linear_rgb(0.22, 0.24, 0.12),
+        Color::srgb(ear_srgb[0], ear_srgb[1], ear_srgb[2]),
+        Color::linear_rgb(ear_srgb[0] * 0.18, ear_srgb[1] * 0.2, ear_srgb[2] * 0.15),
         AlphaMode::Opaque,
         false,
         false,
@@ -9116,13 +9123,19 @@ fn spawn_agent_entity(
     commands.entity(root).add_child(sound_outer.entity);
 
     let mut eyes = Vec::with_capacity(NUM_EYES);
+    let sclera_srgb = visual::visual_style().agents.eye_sclera_srgb;
+    let pupil_srgb = visual::visual_style().agents.eye_pupil_srgb;
     for _ in 0..NUM_EYES {
         let sclera = spawn_part(
             commands,
             &meshes.sphere,
             materials,
-            Color::srgb(0.92, 0.95, 1.0),
-            Color::linear_rgb(0.18, 0.2, 0.24),
+            Color::srgb(sclera_srgb[0], sclera_srgb[1], sclera_srgb[2]),
+            Color::linear_rgb(
+                sclera_srgb[0] * 0.18,
+                sclera_srgb[1] * 0.2,
+                sclera_srgb[2] * 0.24,
+            ),
             AlphaMode::Opaque,
             false,
             false,
@@ -9132,8 +9145,12 @@ fn spawn_agent_entity(
             commands,
             &meshes.sphere,
             materials,
-            Color::srgb(0.08, 0.09, 0.12),
-            Color::linear_rgb(0.1, 0.14, 0.2),
+            Color::srgb(pupil_srgb[0], pupil_srgb[1], pupil_srgb[2]),
+            Color::linear_rgb(
+                pupil_srgb[0] * 0.1,
+                pupil_srgb[1] * 0.14,
+                pupil_srgb[2] * 0.2,
+            ),
             AlphaMode::Opaque,
             false,
             false,
@@ -9370,11 +9387,10 @@ fn apply_agent_visuals(
         ),
     };
     update_part_transform(commands, &record.boost, boost_transform);
-    let boost_rgb = Vec3::new(
-        0.22 + boost_strength * 0.25,
-        0.48 + boost_strength * 0.45,
-        1.0 + boost_strength * 0.55,
-    );
+    let boost_style = visual::visual_style().events.boost;
+    let boost_core = Vec3::from_array(boost_style.core_srgb);
+    let boost_accent = Vec3::from_array(boost_style.accent_srgb);
+    let boost_rgb = mix_vec3(boost_core, boost_accent, clamp01(agent.sound_output));
     let boost_color = srgb_from_vec_with_palette(boost_rgb, 0.45 + boost_strength * 0.4, palette);
     let boost_emissive = palette_emissive_from_vec(
         Vec3::new(
@@ -9407,7 +9423,8 @@ fn apply_agent_visuals(
     };
     update_part_transform(commands, &record.ear_left, ear_left_transform);
     update_part_transform(commands, &record.ear_right, ear_right_transform);
-    let ear_rgb = Vec3::new(0.82, 0.75 + hearing * 0.18, 0.54);
+    let ear_base = Vec3::from_array(visual::visual_style().agents.ear_srgb);
+    let ear_rgb = ear_base * (0.9 + hearing * 0.45);
     let ear_color = srgb_from_vec_with_palette(ear_rgb, 1.0, palette);
     let ear_emissive = palette_emissive_from_vec(
         Vec3::new(ear_rgb.x * 0.18, ear_rgb.y * 0.2, ear_rgb.z * 0.15),
@@ -9573,11 +9590,7 @@ fn apply_agent_visuals(
         };
         update_part_transform(commands, &eye.pupil, pupil_transform);
 
-        let sclera_rgb = mix_vec3(
-            Vec3::new(0.92, 0.94, 1.0),
-            Vec3::new(0.88, 0.93, 1.05),
-            clamp01(agent.trait_modifiers.eye * 0.3),
-        );
+        let sclera_rgb = Vec3::from_array(visual::visual_style().agents.eye_sclera_srgb);
         let sclera_color = srgb_from_vec_with_palette(sclera_rgb, 1.0, palette);
         let sclera_emissive = palette_emissive_from_vec(
             Vec3::new(sclera_rgb.x * 0.18, sclera_rgb.y * 0.2, sclera_rgb.z * 0.24),
@@ -9585,8 +9598,8 @@ fn apply_agent_visuals(
         );
         update_part_colors(materials, &eye.sclera, sclera_color, sclera_emissive);
 
-        let pupil_rgb =
-            Vec3::new(0.08, 0.09, 0.12) * (1.0 + clamp01(agent.sound_multiplier - 1.0) * 0.25);
+        let pupil_base = Vec3::from_array(visual::visual_style().agents.eye_pupil_srgb);
+        let pupil_rgb = pupil_base * (1.0 + clamp01(agent.sound_multiplier - 1.0) * 0.25);
         let pupil_color = srgb_from_vec_with_palette(pupil_rgb, 1.0, palette);
         let pupil_emissive = palette_emissive_from_vec(
             Vec3::new(
