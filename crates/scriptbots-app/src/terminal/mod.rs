@@ -11787,17 +11787,9 @@ mod tests {
     /// bd-ikts.5 lost time twice to guards that matched their own literals.
     const TERMINAL_DUPLICATE_GUARD_MARKER: &str = "fn no_two_terminal_modules_define_the_same_item";
 
-    /// The one duplicate pair this guard cannot fail on yet, and why.
-    ///
-    /// `paint.rs` is a second, entirely dead sub-cell painter engine. `subcell.rs`
-    /// is the canonical one — it is wired into the live `MapWidget` canvas path
-    /// and covered by the bd-2z0.14.2.1 tests, while every identifier `paint.rs`
-    /// exports is referenced only inside `paint.rs` itself. Removing the file
-    /// needs the user's explicit written permission under AGENTS.md Rule 1, which
-    /// bd-c1z8 has been waiting on. Listing it here rather than weakening the
-    /// predicate keeps the guard live for every NEW duplicate in the meantime;
-    /// this entry is deleted together with the file.
-    const KNOWN_DUPLICATE_MODULES: &[&str] = &["paint.rs"];
+    /// Known duplicate modules allowlist. Kept empty now that dead `paint.rs` has
+    /// been deleted under Rule 1 authorization (bd-8doj).
+    const KNOWN_DUPLICATE_MODULES: &[&str] = &[];
 
     /// No two sibling modules under `terminal/` may define the same item name.
     ///
@@ -11933,66 +11925,6 @@ mod tests {
             vec!["ColorDepth"],
             "the predicate must flag exactly the duplicated name and leave singles alone"
         );
-    }
-
-    /// `paint.rs` is exempt from the duplicate guard only because it is OUT OF THE
-    /// BUILD and unreferenced. Both halves are checked here, because an allowlist
-    /// that silently starts covering live code is worse than no allowlist.
-    ///
-    /// The module-declaration half is the load-bearing one: re-adding
-    /// `pub mod paint;` would put a second painter engine back into the crate,
-    /// which is precisely the state bd-c1z8 exists to prevent, and the name-based
-    /// guard alone would not catch it because `paint.rs` is on its exempt list.
-    #[test]
-    fn the_exempt_duplicate_painter_stays_out_of_the_build() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal");
-
-        let module_root =
-            std::fs::read_to_string(dir.join("mod.rs")).expect("read terminal mod.rs");
-        let declarations = module_root
-            .split_once(TERMINAL_DUPLICATE_GUARD_MARKER)
-            .map_or(module_root.as_str(), |(before, _)| before);
-        assert!(
-            !declarations
-                .lines()
-                .any(|line| line.trim_start().starts_with("pub mod paint")
-                    || line.trim_start().starts_with("mod paint")),
-            "paint.rs has been declared as a module again, putting a SECOND sub-cell \
-             painter engine back into the crate. subcell.rs is the canonical one \
-             (bd-c1z8); converge on it rather than compiling both."
-        );
-
-        let exports = [
-            "PixelBuffer",
-            "CellGlyph",
-            "DirtyCell",
-            "DitherMode",
-            "braille_char",
-        ];
-
-        let entries = std::fs::read_dir(&dir).expect("terminal module directory");
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if !path.extension().is_some_and(|ext| ext == "rs") || file == "paint.rs" {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read terminal module");
-            let text = text
-                .split_once(TERMINAL_DUPLICATE_GUARD_MARKER)
-                .map_or(text.as_str(), |(before, _)| before);
-            for export in exports {
-                assert!(
-                    !text.contains(export),
-                    "{file} references {export} from the dead painter paint.rs. \
-                     It is exempt from the duplicate guard ONLY because nothing uses it; \
-                     if it is live, converge the two engines instead (bd-c1z8)."
-                );
-            }
-        }
     }
 
     /// Shared scenario identity for renderer contexts built by tests.
