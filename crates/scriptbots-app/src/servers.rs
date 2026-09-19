@@ -4363,6 +4363,7 @@ mod tests {
             "get_config",
             "apply_updates",
             "apply_patch",
+            "intervene",
             "pause",
             "resume",
             "step",

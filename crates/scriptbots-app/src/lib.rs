@@ -25,6 +25,7 @@ pub type SharedAnalytics = AnalyticsSnapshotProvider;
 
 pub mod archipelago_report;
 pub mod brains;
+pub mod branch_study;
 pub mod economy_audit;
 pub mod experiment_runner;
 pub mod host_thread;
@@ -33,6 +34,11 @@ pub mod montage;
 pub mod tournament;
 
 pub use archipelago_report::{ReportArchipelagoArgs, run_archipelago_report};
+pub use branch_study::{
+    BranchEffectSize, BranchOutcomeReport, BranchStudyError, BranchStudyOrchestrator,
+    BranchStudyPlan, BranchStudyReport, BranchTickSample, CooperationParams, ExtinctionMeasure,
+    FirstDivergence, HysteresisMeasure, RecoveryMeasure, StudyBranchSpec, StudyIntervention,
+};
 
 #[cfg(feature = "neuro")]
 pub use brains::validated_neuroflow_config;
