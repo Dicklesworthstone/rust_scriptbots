@@ -26,6 +26,10 @@ use reqwest::{Client, StatusCode};
 use scriptbots_app::{
     ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest, KnobEntry, KnobKind,
     KnobUpdate, STORAGE_SIDECAR_SUFFIXES, default_control_rest_base_url,
+    narrative_search::{
+        NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery,
+        execute_narrative_around, execute_narrative_search, format_hits_table,
+    },
 };
 use scriptbots_storage::StorageReader;
 use serde::de::DeserializeOwned;
@@ -177,6 +181,49 @@ enum Command {
     Intervene {
         #[command(subcommand)]
         sub: InterveneSubcommand,
+    },
+    /// Search or browse narrative event records via REST or FrankenSQLite.
+    Narrative {
+        #[command(subcommand)]
+        sub: NarrativeSubcommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NarrativeSubcommand {
+    /// Full-text search over narrative events using BM25 ranking.
+    Search {
+        /// Query string to match against narrative events.
+        query: String,
+        /// Optional inclusive starting tick.
+        #[arg(long = "from-tick")]
+        from_tick: Option<u64>,
+        /// Optional exclusive ending tick.
+        #[arg(long = "to-tick")]
+        to_tick: Option<u64>,
+        /// Maximum number of events to return.
+        #[arg(long, short)]
+        limit: Option<usize>,
+        /// Emit results as structured JSON instead of a formatted table.
+        #[arg(long)]
+        json: bool,
+        /// Optional path to SQLite database for direct querying without a running server.
+        #[arg(long = "db")]
+        db: Option<PathBuf>,
+    },
+    /// Retrieve chronological event window around a specific tick.
+    Around {
+        /// Center tick to retrieve events around.
+        tick: u64,
+        /// Half-window size in ticks (events within [tick - window, tick + window]).
+        #[arg(long)]
+        window: Option<u64>,
+        /// Emit results as structured JSON instead of a formatted table.
+        #[arg(long)]
+        json: bool,
+        /// Optional path to SQLite database for direct querying without a running server.
+        #[arg(long = "db")]
+        db: Option<PathBuf>,
     },
 }
 
@@ -349,6 +396,9 @@ async fn main() -> Result<()> {
                 }
                 Command::Intervene { sub } => {
                     intervene_command(&client, &cli.base_url, sub, key).await?
+                }
+                Command::Narrative { sub } => {
+                    narrative_command(&client, &cli.base_url, sub).await?
                 }
             }
         }
@@ -1490,6 +1540,110 @@ async fn intervene_command(
         idempotency_key,
     )
     .await
+}
+
+async fn narrative_command(
+    client: &Client,
+    base_url: &str,
+    sub: NarrativeSubcommand,
+) -> Result<()> {
+    match sub {
+        NarrativeSubcommand::Search {
+            query,
+            from_tick,
+            to_tick,
+            limit,
+            json,
+            db,
+        } => {
+            let hits: Vec<NarrativeSearchHitDto> = if let Some(ref db_path) = db {
+                execute_narrative_search(
+                    Some(db_path.as_path()),
+                    None,
+                    NarrativeSearchQuery {
+                        query,
+                        from_tick,
+                        to_tick,
+                        limit,
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            } else {
+                let url = join_url(base_url, "/api/narrative/search");
+                let mut req = client.get(url).query(&[("q", &query)]);
+                if let Some(from) = from_tick {
+                    let s = from.to_string();
+                    req = req.query(&[("from", s)]);
+                }
+                if let Some(to) = to_tick {
+                    let s = to.to_string();
+                    req = req.query(&[("to", s)]);
+                }
+                if let Some(lim) = limit {
+                    let s = lim.to_string();
+                    req = req.query(&[("limit", s)]);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .context("failed to send narrative search request")?;
+                if !resp.status().is_success() {
+                    let err_text = resp.text().await.unwrap_or_default();
+                    bail!("narrative search request failed: {err_text}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to parse narrative search response")?
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+            } else {
+                print!("{}", format_hits_table(&hits));
+            }
+        }
+        NarrativeSubcommand::Around {
+            tick,
+            window,
+            json,
+            db,
+        } => {
+            let hits: Vec<NarrativeSearchHitDto> = if let Some(ref db_path) = db {
+                execute_narrative_around(
+                    Some(db_path.as_path()),
+                    None,
+                    NarrativeAroundQuery { tick, window },
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            } else {
+                let path = format!("/api/narrative/around/{tick}");
+                let url = join_url(base_url, &path);
+                let mut req = client.get(url);
+                if let Some(w) = window {
+                    let s = w.to_string();
+                    req = req.query(&[("window", s)]);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .context("failed to send narrative around request")?;
+                if !resp.status().is_success() {
+                    let err_text = resp.text().await.unwrap_or_default();
+                    bail!("narrative around request failed: {err_text}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to parse narrative around response")?
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+            } else {
+                print!("{}", format_hits_table(&hits));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn presets_apply(client: &Client, base_url: &str, name: &str) -> Result<()> {

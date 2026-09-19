@@ -329,6 +329,8 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
         "set_speed",
         "shutdown",
         "step",
+        "narrative_search",
+        "narrative_around",
     ];
     for expected in expected_tools {
         assert!(
@@ -336,7 +338,7 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
             "expected tool '{expected}' missing from roster: {tool_names:?}"
         );
     }
-    assert_eq!(tool_names.len(), 16);
+    assert_eq!(tool_names.len(), 18);
 }
 
 #[test]

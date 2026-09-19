@@ -1,6 +1,7 @@
 use std::{
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::Duration,
@@ -29,7 +30,7 @@ use std::convert::Infallible;
 use tokio::sync::watch;
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{debug, error, info, warn};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::ScenarioIdentityV0;
@@ -40,6 +41,9 @@ use crate::control::{
     InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyRequestBody, MapGenerateRequestBody,
     Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
     SpeedRequest, parse_intervention_command, parse_map_artifact,
+};
+use crate::narrative_search::{
+    NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery,
 };
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ConfigAuditEntry, Position, SelectionUpdate,
@@ -119,6 +123,8 @@ pub struct ControlServerConfig {
     /// Shared with the terminal frontend so the API serves exactly the frame
     /// that was presented, including its viewport and revision.
     pub presented_frame: SharedPresentedFrame,
+    /// Optional FrankenSQLite database path for offline storage queries (narrative search).
+    pub database_path: Option<PathBuf>,
 }
 
 impl Default for ControlServerConfig {
@@ -133,6 +139,7 @@ impl Default for ControlServerConfig {
             scenario: None,
             environment_errors: Vec::new(),
             presented_frame: empty_presented_frame(),
+            database_path: None,
         }
     }
 }
@@ -223,6 +230,22 @@ impl ControlServerConfig {
             }
         } else if let Some(addr) = http_override {
             config.mcp_transport = McpTransportConfig::Http { bind_address: addr };
+        }
+
+        if let Some(db_path) = read_control_environment(
+            "SCRIPTBOTS_DATABASE_PATH",
+            &mut config.environment_errors,
+        )
+        .or_else(|| {
+            read_control_environment(
+                "SCRIPTBOTS_STORAGE_PATH",
+                &mut config.environment_errors,
+            )
+        }) {
+            let trimmed = db_path.trim();
+            if !trimmed.is_empty() {
+                config.database_path = Some(PathBuf::from(trimmed));
+            }
         }
 
         config
@@ -436,7 +459,8 @@ impl ControlRuntime {
         reservation: ControlServerReservation,
         startup_timeout: Duration,
     ) -> Result<(Self, CommandSubmit)> {
-        let handle = ControlHandle::new(host);
+        let handle = ControlHandle::new(host)
+            .with_database(reservation.config.database_path.clone());
         let submit_handle = handle.clone();
         let command_submit: CommandSubmit = Arc::new(move |command| {
             match submit_handle.submit_command(command, None) {
@@ -1101,6 +1125,7 @@ pub struct SpeedRequestBody {
         screenshot_png,
         get_events_tail,
         get_narrative_search,
+        get_narrative_around,
         get_scoreboard,
         get_agents_debug,
         get_config_audit,
@@ -1233,6 +1258,15 @@ impl From<ControlError> for AppError {
             ControlError::CommandQueueClosed => {
                 Self::service_unavailable("command queue is closed")
             }
+            ControlError::NarrativeSearch(err) => match err {
+                crate::narrative_search::NarrativeSearchError::StorageUnavailable(msg) => {
+                    Self::service_unavailable(msg)
+                }
+                crate::narrative_search::NarrativeSearchError::Storage(err) => {
+                    Self::internal(err.to_string())
+                }
+                other => Self::bad_request(other.to_string()),
+            },
         }
     }
 }
@@ -1786,28 +1820,78 @@ async fn get_events_tail(
     Ok(Json(events))
 }
 
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct NarrativeSearchHitDto {
-    pub tick: u64,
-    pub kind: String,
-    pub severity: f32,
-    pub human_text: String,
-    pub score: f64,
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct NarrativeSearchQueryParams {
+    /// Full-text search query (e.g. population, extinction, drought)
+    #[serde(alias = "query")]
+    pub q: Option<String>,
+    /// Optional inclusive lower tick bound
+    #[serde(alias = "from_tick")]
+    pub from: Option<u64>,
+    /// Optional exclusive upper tick bound
+    #[serde(alias = "to_tick")]
+    pub to: Option<u64>,
+    /// Optional maximum number of hits (capped at 4096, default 32)
+    pub limit: Option<usize>,
 }
 
 #[utoipa::path(
     get,
     path = "/api/narrative/search",
     tag = "control",
-    params(("q" = String, Query, description = "Search query")),
-    responses((status = 200, body = [NarrativeSearchHitDto]))
+    params(NarrativeSearchQueryParams),
+    responses(
+        (status = 200, body = [NarrativeSearchHitDto]),
+        (status = 400, body = ErrorResponse),
+        (status = 503, body = ErrorResponse)
+    )
 )]
 async fn get_narrative_search(
-    State(_state): State<ApiState>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<NarrativeSearchQueryParams>,
 ) -> Result<Json<Vec<NarrativeSearchHitDto>>, AppError> {
-    let _q = params.get("q").cloned().unwrap_or_default();
-    Ok(Json(vec![]))
+    let query_str = params.q.unwrap_or_default();
+    let query = NarrativeSearchQuery {
+        query: query_str,
+        from_tick: params.from,
+        to_tick: params.to,
+        limit: params.limit,
+    };
+    let hits = run_control(move || state.handle.narrative_search(query)).await?;
+    Ok(Json(hits))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct NarrativeAroundQueryParams {
+    /// Half-window size in ticks (capped at 10000, default 100)
+    pub window: Option<u64>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/narrative/around/{tick}",
+    tag = "control",
+    params(
+        ("tick" = u64, Path, description = "Center tick for chronological event window"),
+        NarrativeAroundQueryParams
+    ),
+    responses(
+        (status = 200, body = [NarrativeSearchHitDto]),
+        (status = 400, body = ErrorResponse),
+        (status = 503, body = ErrorResponse)
+    )
+)]
+async fn get_narrative_around(
+    State(state): State<ApiState>,
+    axum::extract::Path(tick): axum::extract::Path<u64>,
+    axum::extract::Query(params): axum::extract::Query<NarrativeAroundQueryParams>,
+) -> Result<Json<Vec<NarrativeSearchHitDto>>, AppError> {
+    let query = NarrativeAroundQuery {
+        tick,
+        window: params.window,
+    };
+    let hits = run_control(move || state.handle.narrative_around(query)).await?;
+    Ok(Json(hits))
 }
 
 #[utoipa::path(
@@ -2441,6 +2525,7 @@ fn prepare_rest_server(
         // Event tail and scoreboard
         .route("/api/events/tail", get(get_events_tail))
         .route("/api/narrative/search", get(get_narrative_search))
+        .route("/api/narrative/around/{tick}", get(get_narrative_around))
         .route("/api/scoreboard", get(get_scoreboard))
         .route("/api/agents/debug", get(get_agents_debug))
         .route("/api/selection", post(post_selection).get(get_selection))
@@ -2803,6 +2888,67 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
             "additionalProperties": false
         }),
         ControlToolKind::Intervene,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "narrative_search",
+        "Search simulation narrative events using full-text BM25 index or in-memory fallback",
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Full-text query string (e.g. population, extinction, drought)"
+                },
+                "from_tick": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional inclusive start tick"
+                },
+                "to_tick": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional exclusive end tick"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4096,
+                    "description": "Max events to return (default 32, max 4096)"
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::NarrativeSearch,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "narrative_around",
+        "Retrieve a chronological window of simulation narrative events around a specific tick",
+        json!({
+            "type": "object",
+            "properties": {
+                "tick": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Center tick to retrieve events around"
+                },
+                "window": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000,
+                    "description": "Half-window size in ticks (default 100, max 10000)"
+                }
+            },
+            "required": ["tick"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::NarrativeAround,
         handle,
     );
 
@@ -2985,6 +3131,8 @@ enum ControlToolKind {
     MapGenerate,
     MapApply,
     Intervene,
+    NarrativeSearch,
+    NarrativeAround,
 }
 
 impl ToolHandler for ControlTool {
@@ -3223,6 +3371,42 @@ impl ToolHandler for ControlTool {
                 let status = run_control_mcp_sync(move || handle.intervene(cmd, id_key))?;
                 make_tool_result(status)
             }
+            ControlToolKind::NarrativeSearch => {
+                let query_str = arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(McpErrorCode::InvalidParams, "missing 'query' field")
+                    })?;
+                let from_tick = arguments.get("from_tick").and_then(|v| v.as_u64());
+                let to_tick = arguments.get("to_tick").and_then(|v| v.as_u64());
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let query = NarrativeSearchQuery {
+                    query: query_str.to_string(),
+                    from_tick,
+                    to_tick,
+                    limit,
+                };
+                let handle = self.handle.clone();
+                let hits = run_control_mcp_sync(move || handle.narrative_search(query))?;
+                make_tool_result(hits)
+            }
+            ControlToolKind::NarrativeAround => {
+                let tick = arguments
+                    .get("tick")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| {
+                        McpError::new(McpErrorCode::InvalidParams, "missing 'tick' field")
+                    })?;
+                let window = arguments.get("window").and_then(|v| v.as_u64());
+                let query = NarrativeAroundQuery { tick, window };
+                let handle = self.handle.clone();
+                let hits = run_control_mcp_sync(move || handle.narrative_around(query))?;
+                make_tool_result(hits)
+            }
         }
     }
 }
@@ -3286,6 +3470,15 @@ fn map_control_error(err: ControlError) -> McpError {
         ControlError::CommandQueueClosed => {
             McpError::new(McpErrorCode::InternalError, "command queue is closed")
         }
+        ControlError::NarrativeSearch(err) => match err {
+            crate::narrative_search::NarrativeSearchError::StorageUnavailable(msg) => {
+                McpError::new(McpErrorCode::InternalError, msg)
+            }
+            crate::narrative_search::NarrativeSearchError::Storage(err) => {
+                McpError::new(McpErrorCode::InternalError, err.to_string())
+            }
+            other => McpError::new(McpErrorCode::InvalidParams, other.to_string()),
+        },
     }
 }
 
@@ -4373,6 +4566,8 @@ mod tests {
             "get_command_status",
             "map_generate",
             "map_apply",
+            "narrative_search",
+            "narrative_around",
         ]
         .into_iter()
         .map(str::to_owned)

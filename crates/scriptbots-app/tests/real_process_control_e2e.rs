@@ -707,7 +707,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         let tools = list_json["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 16, "MCP tools/list must return all 16 tools");
+        assert_eq!(tools.len(), 18, "MCP tools/list must return all 18 tools");
 
         // MCP tools/call get_status
         let status_payload = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#;
