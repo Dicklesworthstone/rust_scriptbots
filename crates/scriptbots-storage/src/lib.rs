@@ -5494,6 +5494,35 @@ pub struct AdmissionReceipt {
     pub watermarks: PersistenceWatermarks,
 }
 
+/// Per-island metrics and history snapshot published in [`AnalyticsSnapshot`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct IslandSnapshot {
+    /// Island identity.
+    pub island_id: u32,
+    /// Human-readable scenario label.
+    pub label: Arc<str>,
+    /// Committed agent population count.
+    pub agent_count: usize,
+    /// Total energy across agents.
+    pub total_energy: f64,
+    /// Average energy per agent.
+    pub average_energy: f64,
+    /// Biological births at this barrier/tick.
+    pub births: usize,
+    /// Deaths at this barrier/tick.
+    pub deaths: usize,
+    /// Bounded recent history of population counts for sparkline rendering.
+    pub sparkline: Arc<[f32]>,
+}
+
+/// Migration movement between two islands published in [`AnalyticsSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationSnapshotArc {
+    pub from_island: u32,
+    pub to_island: u32,
+    pub count: usize,
+}
+
 /// Immutable, lock-free read model published after successful storage commits.
 #[derive(Debug, Clone)]
 pub struct AnalyticsSnapshot {
@@ -5503,6 +5532,9 @@ pub struct AnalyticsSnapshot {
     pub committed_agent_count: Option<usize>,
     pub watermarks: PersistenceWatermarks,
     pub readings: Arc<[MetricReading]>,
+    pub islands: Arc<[IslandSnapshot]>,
+    pub migration_arcs: Arc<[MigrationSnapshotArc]>,
+    pub barrier_epoch: Option<u64>,
     pub last_error: Option<Arc<str>>,
     pub last_failure: Option<Arc<StorageFailureStatus>>,
     pub stopped: bool,
@@ -5517,6 +5549,9 @@ impl Default for AnalyticsSnapshot {
             committed_agent_count: None,
             watermarks: PersistenceWatermarks::default(),
             readings: Arc::from([]),
+            islands: Arc::from([]),
+            migration_arcs: Arc::from([]),
+            barrier_epoch: None,
             last_error: None,
             last_failure: None,
             stopped: false,
@@ -5561,6 +5596,9 @@ impl AnalyticsSnapshotProvider {
                 committed_agent_count: current.committed_agent_count,
                 watermarks: current.watermarks,
                 readings: Arc::clone(&current.readings),
+                islands: Arc::clone(&current.islands),
+                migration_arcs: Arc::clone(&current.migration_arcs),
+                barrier_epoch: current.barrier_epoch,
                 last_error: current.last_error.clone(),
                 last_failure: current.last_failure.clone(),
                 stopped: current.stopped,
@@ -5585,6 +5623,9 @@ impl AnalyticsSnapshotProvider {
                 committed_agent_count: current.committed_agent_count,
                 watermarks,
                 readings: Arc::clone(&current.readings),
+                islands: Arc::clone(&current.islands),
+                migration_arcs: Arc::clone(&current.migration_arcs),
+                barrier_epoch: current.barrier_epoch,
                 last_error: current.last_error.clone(),
                 last_failure: current.last_failure.clone(),
                 stopped: false,
@@ -5604,6 +5645,39 @@ impl AnalyticsSnapshotProvider {
                 committed_agent_count: Some(pending.agent_count),
                 watermarks,
                 readings: Arc::clone(&pending.readings),
+                islands: Arc::clone(&pending.islands),
+                migration_arcs: Arc::clone(&pending.migration_arcs),
+                barrier_epoch: pending.barrier_epoch,
+                last_error: None,
+                last_failure: None,
+                stopped: false,
+            })
+        });
+    }
+
+    /// Atomically publish an archipelago barrier snapshot containing per-island and migration telemetry.
+    pub fn publish_barrier_snapshot(
+        &self,
+        islands: &[IslandSnapshot],
+        migration_arcs: &[MigrationSnapshotArc],
+        barrier_epoch: Option<u64>,
+        tick: u64,
+        total_agent_count: usize,
+    ) {
+        self.inner.rcu(|current| {
+            if current.stopped {
+                return Arc::clone(current);
+            }
+            Arc::new(AnalyticsSnapshot {
+                run_id: current.run_id,
+                revision: current.revision.saturating_add(1),
+                committed_tick: Some(tick),
+                committed_agent_count: Some(total_agent_count),
+                watermarks: current.watermarks,
+                readings: Arc::clone(&current.readings),
+                islands: Arc::from(islands),
+                migration_arcs: Arc::from(migration_arcs),
+                barrier_epoch,
                 last_error: None,
                 last_failure: None,
                 stopped: false,
@@ -5647,6 +5721,9 @@ impl AnalyticsSnapshotProvider {
                 committed_agent_count: cur.committed_agent_count,
                 watermarks: cur.watermarks,
                 readings: Arc::clone(&cur.readings),
+                islands: Arc::clone(&cur.islands),
+                migration_arcs: Arc::clone(&cur.migration_arcs),
+                barrier_epoch: cur.barrier_epoch,
                 last_error: Some(Arc::clone(&error_text)),
                 last_failure: Some(Arc::clone(&incoming)),
                 stopped,
@@ -5679,6 +5756,9 @@ impl AnalyticsSnapshotProvider {
                 committed_agent_count: current.committed_agent_count,
                 watermarks: current.watermarks,
                 readings: Arc::clone(&current.readings),
+                islands: Arc::clone(&current.islands),
+                migration_arcs: Arc::clone(&current.migration_arcs),
+                barrier_epoch: current.barrier_epoch,
                 last_error: current.last_error.clone(),
                 last_failure: current.last_failure.clone(),
                 stopped: true,
@@ -5692,6 +5772,9 @@ struct PendingAnalytics {
     tick: u64,
     agent_count: usize,
     readings: Arc<[MetricReading]>,
+    islands: Arc<[IslandSnapshot]>,
+    migration_arcs: Arc<[MigrationSnapshotArc]>,
+    barrier_epoch: Option<u64>,
 }
 
 /// Test-only deterministic fault points for persistence preparation and error publication.
@@ -5953,11 +6036,17 @@ where
 impl PendingAnalytics {
     fn from_batch(batch: &PersistenceBatch) -> Result<Self, StorageError> {
         let mut observer = UnboundedPreparation;
-        Self::from_batch_observed(batch, &mut observer, PreparationProgress::default())
+        Self::from_batch_observed(
+            batch,
+            IslandId(0),
+            &mut observer,
+            PreparationProgress::default(),
+        )
     }
 
     fn from_batch_observed<Observer>(
         batch: &PersistenceBatch,
+        island: IslandId,
         observer: &mut Observer,
         progress: PreparationProgress,
     ) -> Result<Self, StorageError>
@@ -5990,10 +6079,24 @@ impl PendingAnalytics {
         observer.checkpoint(PreparationStage::Analytics, progress)?;
         let readings = Arc::from(readings);
         observer.checkpoint(PreparationStage::Analytics, progress)?;
+        let sparkline: Arc<[f32]> = Arc::from([batch.summary.agent_count as f32]);
+        let island_snap = IslandSnapshot {
+            island_id: island.0,
+            label: Arc::from(format!("Island {}", island.0)),
+            agent_count: batch.summary.agent_count,
+            total_energy: f64::from(batch.summary.total_energy),
+            average_energy: f64::from(batch.summary.average_energy),
+            births: batch.summary.births,
+            deaths: batch.summary.deaths,
+            sparkline,
+        };
         Ok(Self {
             tick,
             agent_count: batch.summary.agent_count,
             readings,
+            islands: Arc::from([island_snap]),
+            migration_arcs: Arc::from([]),
+            barrier_epoch: None,
         })
     }
 }
@@ -6029,7 +6132,7 @@ impl PreparedPersistenceBatch {
     {
         let storage = Storage::prepare_batch_observed(batch, island, observer, progress)?;
         let storage_guard = PartialBufferGuard::new(storage);
-        let analytics = PendingAnalytics::from_batch_observed(batch, observer, progress)?;
+        let analytics = PendingAnalytics::from_batch_observed(batch, island, observer, progress)?;
         observer.checkpoint(PreparationStage::Complete, progress)?;
         Ok(Self {
             tick: batch.summary.tick.0,
@@ -13679,9 +13782,28 @@ pub struct Storage {
     birth_flush_threshold: usize,
     death_flush_threshold: usize,
     replay_flush_threshold: usize,
+    analytics: Option<AnalyticsSnapshotProvider>,
+    island_sparklines: BTreeMap<u32, VecDeque<f32>>,
 }
 
 impl Storage {
+    /// Attach an analytics snapshot provider so barrier persistence updates frontends lock-free.
+    pub fn attach_analytics_provider(&mut self, provider: AnalyticsSnapshotProvider) {
+        self.analytics = Some(provider);
+    }
+
+    /// Return or create a lock-free analytics snapshot provider for this storage instance.
+    pub fn analytics_provider(&mut self) -> AnalyticsSnapshotProvider {
+        match &self.analytics {
+            Some(p) => p.clone(),
+            None => {
+                let p = AnalyticsSnapshotProvider::for_run(self.run_id);
+                self.analytics = Some(p.clone());
+                p
+            }
+        }
+    }
+
     /// Store a real core science checkpoint on the connection-owning thread.
     ///
     /// Tick, wire format, payload and digest are derived from the validated core artifact.
@@ -14099,6 +14221,8 @@ impl Storage {
             birth_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
             death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
             replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
+            analytics: None,
+            island_sparklines: BTreeMap::new(),
         };
         if initialize_schema && let Err(error) = storage.initialize_schema() {
             storage.terminally_failed = true;
@@ -19546,6 +19670,51 @@ impl Storage {
             });
         }
 
+        if let Some(analytics) = &self.analytics {
+            let mut snapshots = Vec::with_capacity(ordered.len());
+            let mut total_agents = 0usize;
+            for (island, payload) in &ordered {
+                total_agents += payload.summary.agent_count;
+                let history = self.island_sparklines.entry(island.0).or_default();
+                history.push_back(payload.summary.agent_count as f32);
+                if history.len() > 32 {
+                    history.pop_front();
+                }
+                let sparkline: Arc<[f32]> = Arc::from(history.iter().copied().collect::<Vec<_>>());
+                snapshots.push(IslandSnapshot {
+                    island_id: island.0,
+                    label: Arc::from(format!("Island {}", island.0)),
+                    agent_count: payload.summary.agent_count,
+                    total_energy: f64::from(payload.summary.total_energy),
+                    average_energy: f64::from(payload.summary.average_energy),
+                    births: payload.summary.births,
+                    deaths: payload.summary.deaths,
+                    sparkline,
+                });
+            }
+            let mut arc_counts = BTreeMap::new();
+            for m in migrations {
+                *arc_counts
+                    .entry((m.from.island.0, m.to.island.0))
+                    .or_insert(0usize) += 1;
+            }
+            let migration_arcs: Vec<MigrationSnapshotArc> = arc_counts
+                .into_iter()
+                .map(|((from_island, to_island), count)| MigrationSnapshotArc {
+                    from_island,
+                    to_island,
+                    count,
+                })
+                .collect();
+            analytics.publish_barrier_snapshot(
+                &snapshots,
+                &migration_arcs,
+                ordered.first().map(|(_, p)| p.epoch),
+                tick,
+                total_agents,
+            );
+        }
+
         let (receipt, newly_admitted) = self.stage_outbox(tick, &fused)?;
         if newly_admitted {
             self.enqueue_staged(receipt.batch_id, fused)?;
@@ -21081,10 +21250,92 @@ impl Storage {
                 value: decode(&row, 1, "metrics.value")?,
             });
         }
+        let island_rows = self.connection()?.query_with_params(
+            "SELECT island_id, agent_count, total_energy, average_energy, births, deaths
+             FROM tick_summaries
+             WHERE run_id = ?1 AND tick = ?2
+             ORDER BY island_id ASC",
+            &[
+                sqlite_run_id(self.run_id),
+                i64::try_from(tick)
+                    .map_err(|error| StorageError::InvalidData {
+                        context: "tick_summaries.tick",
+                        reason: error.to_string(),
+                    })?
+                    .into(),
+            ],
+        )?;
+        let mut islands = Vec::with_capacity(island_rows.len());
+        for row in island_rows {
+            let id = checked_u32(
+                "tick_summaries.island_id",
+                decode(&row, 0, "tick_summaries.island_id")?,
+            )?;
+            let count = checked_usize(
+                "tick_summaries.agent_count",
+                decode(&row, 1, "tick_summaries.agent_count")?,
+            )?;
+            let total_energy: f64 = decode(&row, 2, "tick_summaries.total_energy")?;
+            let average_energy: f64 = decode(&row, 3, "tick_summaries.average_energy")?;
+            let births = checked_usize(
+                "tick_summaries.births",
+                decode(&row, 4, "tick_summaries.births")?,
+            )?;
+            let deaths = checked_usize(
+                "tick_summaries.deaths",
+                decode(&row, 5, "tick_summaries.deaths")?,
+            )?;
+            islands.push(IslandSnapshot {
+                island_id: id,
+                label: Arc::from(format!("Island {id}")),
+                agent_count: count,
+                total_energy,
+                average_energy,
+                births,
+                deaths,
+                sparkline: Arc::from([count as f32]),
+            });
+        }
+        let migration_rows = self.connection()?.query_with_params(
+            "SELECT island_id_from, island_id_to, COUNT(*)
+             FROM migrations
+             WHERE run_id = ?1 AND tick = ?2
+             GROUP BY island_id_from, island_id_to
+             ORDER BY island_id_from ASC, island_id_to ASC",
+            &[
+                sqlite_run_id(self.run_id),
+                i64::try_from(tick)
+                    .map_err(|error| StorageError::InvalidData {
+                        context: "migrations.tick",
+                        reason: error.to_string(),
+                    })?
+                    .into(),
+            ],
+        )?;
+        let mut migration_arcs = Vec::with_capacity(migration_rows.len());
+        for row in migration_rows {
+            let from = checked_u32(
+                "migrations.island_id_from",
+                decode(&row, 0, "migrations.island_id_from")?,
+            )?;
+            let to = checked_u32(
+                "migrations.island_id_to",
+                decode(&row, 1, "migrations.island_id_to")?,
+            )?;
+            let count = checked_usize("migrations.count", decode(&row, 2, "migrations.count")?)?;
+            migration_arcs.push(MigrationSnapshotArc {
+                from_island: from,
+                to_island: to,
+                count,
+            });
+        }
         Ok(Some(PendingAnalytics {
             tick,
             agent_count,
             readings: Arc::from(readings),
+            islands: Arc::from(islands),
+            migration_arcs: Arc::from(migration_arcs),
+            barrier_epoch: None,
         }))
     }
 }
@@ -23034,6 +23285,24 @@ impl StoragePipeline {
     #[must_use]
     pub fn analytics_provider(&self) -> AnalyticsSnapshotProvider {
         self.sink.analytics.clone()
+    }
+
+    /// Publish an archipelago barrier snapshot containing per-island and migration telemetry lock-free.
+    pub fn publish_barrier_snapshot(
+        &self,
+        islands: &[IslandSnapshot],
+        migration_arcs: &[MigrationSnapshotArc],
+        barrier_epoch: Option<u64>,
+        tick: u64,
+        total_agent_count: usize,
+    ) {
+        self.sink.analytics.publish_barrier_snapshot(
+            islands,
+            migration_arcs,
+            barrier_epoch,
+            tick,
+            total_agent_count,
+        );
     }
 
     /// Durable run identity bound to this pipeline.
@@ -39204,6 +39473,162 @@ mod tests {
                 "the guard must catch the synthetic unwritten table"
             );
         }
+    }
+
+    #[test]
+    fn analytics_snapshot_carries_per_island_telemetry_and_migration_arcs() {
+        let provider = AnalyticsSnapshotProvider::empty();
+        let initial = provider.snapshot();
+        assert_eq!(initial.islands.len(), 0);
+        assert_eq!(initial.migration_arcs.len(), 0);
+        assert_eq!(initial.barrier_epoch, None);
+
+        let sparkline: Arc<[f32]> = Arc::from([10.0, 12.0, 14.0]);
+        let island0 = IslandSnapshot {
+            island_id: 0,
+            label: Arc::from("Island 0"),
+            agent_count: 14,
+            total_energy: 1400.0,
+            average_energy: 100.0,
+            births: 3,
+            deaths: 1,
+            sparkline: Arc::clone(&sparkline),
+        };
+        let island1 = IslandSnapshot {
+            island_id: 1,
+            label: Arc::from("Island 1"),
+            agent_count: 8,
+            total_energy: 800.0,
+            average_energy: 100.0,
+            births: 1,
+            deaths: 2,
+            sparkline: Arc::from([5.0, 7.0, 8.0]),
+        };
+        let arc = MigrationSnapshotArc {
+            from_island: 0,
+            to_island: 1,
+            count: 2,
+        };
+
+        provider.publish_barrier_snapshot(
+            &[island0, island1],
+            std::slice::from_ref(&arc),
+            Some(42),
+            100,
+            22,
+        );
+
+        let published = provider.snapshot();
+        assert_eq!(published.committed_tick, Some(100));
+        assert_eq!(published.committed_agent_count, Some(22));
+        assert_eq!(published.barrier_epoch, Some(42));
+        assert_eq!(published.islands.len(), 2);
+        assert_eq!(published.islands[0].island_id, 0);
+        assert_eq!(published.islands[0].agent_count, 14);
+        assert_eq!(published.islands[0].sparkline.as_ref(), &[10.0, 12.0, 14.0]);
+        assert_eq!(published.islands[1].island_id, 1);
+        assert_eq!(published.islands[1].agent_count, 8);
+        assert_eq!(published.migration_arcs.len(), 1);
+        assert_eq!(published.migration_arcs[0], arc);
+    }
+
+    #[test]
+    fn storage_persist_barrier_updates_attached_analytics_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("archipelago_analytics.sqlite");
+        let mut storage =
+            Storage::create_unattributed_file(path.to_str().unwrap()).expect("create storage");
+        let analytics = AnalyticsSnapshotProvider::empty();
+        storage.attach_analytics_provider(analytics.clone());
+
+        let batch0 = PersistenceBatch {
+            summary: TickSummary {
+                tick: Tick(1),
+                agent_count: 50,
+                births: 5,
+                deaths: 2,
+                total_energy: 5000.0,
+                average_energy: 100.0,
+                average_health: 1.0,
+                max_age: 10,
+                spike_hits: 0,
+            },
+            epoch: 7,
+            closed: false,
+            metrics: Vec::new(),
+            events: Vec::new(),
+            agents: Vec::new(),
+            births: Vec::new(),
+            deaths: Vec::new(),
+            replay_events: Vec::new(),
+            narrative_events: Vec::new(),
+            genomes: Vec::new(),
+        };
+        let batch1 = PersistenceBatch {
+            summary: TickSummary {
+                tick: Tick(1),
+                agent_count: 30,
+                births: 2,
+                deaths: 1,
+                total_energy: 3000.0,
+                average_energy: 100.0,
+                average_health: 1.0,
+                max_age: 8,
+                spike_hits: 0,
+            },
+            epoch: 7,
+            closed: false,
+            metrics: Vec::new(),
+            events: Vec::new(),
+            agents: Vec::new(),
+            births: Vec::new(),
+            deaths: Vec::new(),
+            replay_events: Vec::new(),
+            narrative_events: Vec::new(),
+            genomes: Vec::new(),
+        };
+
+        let migration = scriptbots_runtime::AppliedMigration {
+            from: scriptbots_core::rng_domains::OrganismId {
+                island: scriptbots_core::rng_domains::IslandId(0),
+                uid: scriptbots_core::AgentUid(1),
+            },
+            to: scriptbots_core::rng_domains::OrganismId {
+                island: scriptbots_core::rng_domains::IslandId(1),
+                uid: scriptbots_core::AgentUid(2),
+            },
+            rule: scriptbots_runtime::migrator::EmigrantSelectionRule::Random,
+            rank: 0,
+            key_value: 100.0,
+        };
+
+        storage
+            .persist_barrier_with_migrations(
+                &[(IslandId(0), &batch0), (IslandId(1), &batch1)],
+                &[migration],
+            )
+            .expect("persist barrier");
+
+        let snap = analytics.snapshot();
+        assert_eq!(snap.committed_tick, Some(1));
+        assert_eq!(snap.committed_agent_count, Some(80));
+        assert_eq!(snap.barrier_epoch, Some(7));
+        assert_eq!(snap.islands.len(), 2);
+        assert_eq!(snap.islands[0].island_id, 0);
+        assert_eq!(snap.islands[0].agent_count, 50);
+        assert_eq!(snap.islands[0].sparkline.as_ref(), &[50.0]);
+        assert_eq!(snap.islands[1].island_id, 1);
+        assert_eq!(snap.islands[1].agent_count, 30);
+        assert_eq!(snap.islands[1].sparkline.as_ref(), &[30.0]);
+        assert_eq!(snap.migration_arcs.len(), 1);
+        assert_eq!(
+            snap.migration_arcs[0],
+            MigrationSnapshotArc {
+                from_island: 0,
+                to_island: 1,
+                count: 1,
+            }
+        );
     }
 
     mod lab_runtime_chaos {
