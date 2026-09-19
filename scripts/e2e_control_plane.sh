@@ -35,7 +35,8 @@ PASS=0
 FAIL=0
 WORKDIR="$(mktemp -d)"
 APP_LOG="$WORKDIR/app.log"
-trap 'kill "$APP_PID" 2>/dev/null; wait "$APP_PID" 2>/dev/null' EXIT
+APP_PID=""
+trap 'if [ -n "${APP_PID:-}" ]; then kill "$APP_PID" 2>/dev/null; wait "$APP_PID" 2>/dev/null; fi' EXIT
 
 ok()   { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf 'FAIL %s\n' "$1"; }

@@ -309,4 +309,124 @@ mod tests {
         };
         assert!(ok.validate().is_ok());
     }
+
+    #[test]
+    fn test_drought_duration_zero_is_rejected() {
+        let record = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::Drought {
+                region: ToroidalRegion::All,
+                duration_ticks: 0,
+            },
+            issued_by: "REST".into(),
+        };
+        let err = record
+            .validate()
+            .expect_err("drought with duration 0 must be rejected");
+        assert!(err.contains("drought duration must be > 0"));
+    }
+
+    #[test]
+    fn test_predator_injection_count_bounds_are_rejected() {
+        let zero_count = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::PredatorInjection {
+                count: 0,
+                position: Vec2::new(10.0, 10.0),
+            },
+            issued_by: "REST".into(),
+        };
+        let err_zero = zero_count
+            .validate()
+            .expect_err("predator injection count 0 must be rejected");
+        assert!(err_zero.contains("predator injection count must be between 1 and 1000"));
+
+        let excess_count = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::PredatorInjection {
+                count: 1001,
+                position: Vec2::new(10.0, 10.0),
+            },
+            issued_by: "REST".into(),
+        };
+        let err_excess = excess_count
+            .validate()
+            .expect_err("predator injection count 1001 must be rejected");
+        assert!(err_excess.contains("predator injection count must be between 1 and 1000"));
+
+        let boundary_low = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::PredatorInjection {
+                count: 1,
+                position: Vec2::new(10.0, 10.0),
+            },
+            issued_by: "REST".into(),
+        };
+        assert!(boundary_low.validate().is_ok());
+
+        let boundary_high = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::PredatorInjection {
+                count: 1000,
+                position: Vec2::new(10.0, 10.0),
+            },
+            issued_by: "REST".into(),
+        };
+        assert!(boundary_high.validate().is_ok());
+    }
+
+    #[test]
+    fn test_food_embargo_duration_zero_is_rejected() {
+        let zero_embargo = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::FoodEmbargo { duration_ticks: 0 },
+            issued_by: "REST".into(),
+        };
+        let err = zero_embargo
+            .validate()
+            .expect_err("food embargo with duration 0 must be rejected");
+        assert!(err.contains("food embargo duration must be > 0"));
+
+        let valid_embargo = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::FoodEmbargo { duration_ticks: 20 },
+            issued_by: "REST".into(),
+        };
+        assert!(valid_embargo.validate().is_ok());
+    }
+
+    #[test]
+    fn test_non_finite_rect_bounds_are_rejected() {
+        let nan_min = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::TerrainPaint {
+                region: ToroidalRegion::Rect {
+                    min: Vec2::new(f32::NAN, 0.0),
+                    max: Vec2::new(100.0, 100.0),
+                },
+                terrain_kind: 1,
+            },
+            issued_by: "REST".into(),
+        };
+        let err_nan = nan_min
+            .validate()
+            .expect_err("NaN rect bound must be rejected");
+        assert!(err_nan.contains("rect bounds must be finite"));
+
+        let inf_max = InterventionRecord {
+            tick: Tick(100),
+            action: InterventionAction::TerrainPaint {
+                region: ToroidalRegion::Rect {
+                    min: Vec2::new(0.0, 0.0),
+                    max: Vec2::new(100.0, f32::INFINITY),
+                },
+                terrain_kind: 1,
+            },
+            issued_by: "REST".into(),
+        };
+        let err_inf = inf_max
+            .validate()
+            .expect_err("infinite rect bound must be rejected");
+        assert!(err_inf.contains("rect bounds must be finite"));
+    }
 }

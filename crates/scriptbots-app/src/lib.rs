@@ -447,8 +447,14 @@ impl ScenarioDocumentV1 {
         let text = std::str::from_utf8(bytes).map_err(|error| {
             ScenarioError::Parse(format!("document is not valid UTF-8: {error}"))
         })?;
-        let document: Self =
+        let value: toml::Value =
             toml::from_str(text).map_err(|error| ScenarioError::Parse(error.to_string()))?;
+        if !value.is_table() {
+            return Err(ScenarioError::NotATable);
+        }
+        let document: Self = value
+            .try_into()
+            .map_err(|error| ScenarioError::Parse(error.to_string()))?;
         document.validate()?;
         Ok(document)
     }
@@ -458,8 +464,14 @@ impl ScenarioDocumentV1 {
         let text = std::str::from_utf8(bytes).map_err(|error| {
             ScenarioError::Parse(format!("document is not valid UTF-8: {error}"))
         })?;
-        let document: Self =
+        let value: ron::Value =
             ron::from_str(text).map_err(|error| ScenarioError::Parse(error.to_string()))?;
+        if !matches!(value, ron::Value::Map(_)) {
+            return Err(ScenarioError::NotATable);
+        }
+        let document: Self = value
+            .into_rust()
+            .map_err(|error| ScenarioError::Parse(error.to_string()))?;
         document.validate()?;
         Ok(document)
     }
@@ -3567,6 +3579,143 @@ population_minimum = 40
         let document = ScenarioDocumentV1::parse_toml(missing_config.as_bytes())
             .expect("a config-less scenario is a valid identity-only document");
         assert_eq!(document.config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn scenario_document_rejects_non_table_toplevel() {
+        assert!(matches!(
+            ScenarioDocumentV1::parse_ron(b"42"),
+            Err(ScenarioError::NotATable)
+        ));
+        assert!(matches!(
+            ScenarioDocumentV1::parse_ron(b"[1, 2, 3]"),
+            Err(ScenarioError::NotATable)
+        ));
+        assert!(matches!(
+            ScenarioDocumentV1::parse_ron(b"\"just a string\""),
+            Err(ScenarioError::NotATable)
+        ));
+    }
+
+    #[test]
+    fn scenario_document_rejects_description_exceeding_byte_limit() {
+        let long_desc = format!(
+            "schema = \"scriptbots.scenario.v1\"\nschema_version = 1\nid = \"valid-id\"\ndescription = \"{}\"\n",
+            "d".repeat(MAX_SCENARIO_DESCRIPTION_BYTES + 1)
+        );
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(long_desc.as_bytes()),
+            Err(ScenarioError::DescriptionTooLong { actual, maximum })
+                if actual == MAX_SCENARIO_DESCRIPTION_BYTES + 1 && maximum == MAX_SCENARIO_DESCRIPTION_BYTES
+        ));
+    }
+
+    #[test]
+    fn scenario_document_rejects_hypothesis_exceeding_byte_limit() {
+        let long_hyp = format!(
+            "schema = \"scriptbots.scenario.v1\"\nschema_version = 1\nid = \"valid-id\"\nhypothesis = \"{}\"\n",
+            "h".repeat(MAX_SCENARIO_DESCRIPTION_BYTES + 1)
+        );
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(long_hyp.as_bytes()),
+            Err(ScenarioError::HypothesisTooLong { actual, maximum })
+                if actual == MAX_SCENARIO_DESCRIPTION_BYTES + 1 && maximum == MAX_SCENARIO_DESCRIPTION_BYTES
+        ));
+    }
+
+    #[test]
+    fn scenario_document_rejects_envelope_with_zero_ticks() {
+        let zero_ticks = r#"
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "valid-id"
+[envelope]
+ticks = 0
+"#;
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(zero_ticks.as_bytes()),
+            Err(ScenarioError::EnvelopeZeroTicks { actual: 0 })
+        ));
+    }
+
+    #[test]
+    fn scenario_document_rejects_intervention_after_or_at_envelope_horizon() {
+        let at_horizon = r#"
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "valid-id"
+[envelope]
+ticks = 100
+
+[[interventions]]
+tick = 100
+[interventions.set]
+food_max = 0.5
+"#;
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(at_horizon.as_bytes()),
+            Err(ScenarioError::InterventionAfterHorizon {
+                tick: 100,
+                horizon: 100,
+            })
+        ));
+
+        let after_horizon = r#"
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "valid-id"
+[envelope]
+ticks = 100
+
+[[interventions]]
+tick = 150
+[interventions.set]
+food_max = 0.5
+"#;
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(after_horizon.as_bytes()),
+            Err(ScenarioError::InterventionAfterHorizon {
+                tick: 150,
+                horizon: 100,
+            })
+        ));
+    }
+
+    #[test]
+    fn scenario_document_rejects_intervention_with_non_object_set() {
+        let non_object_set = r#"
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "valid-id"
+
+[[interventions]]
+tick = 50
+set = [1, 2, 3]
+"#;
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(non_object_set.as_bytes()),
+            Err(ScenarioError::InterventionNotObject {
+                tick: 50,
+                actual: "array",
+            })
+        ));
+
+        let scalar_set = r#"
+schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "valid-id"
+
+[[interventions]]
+tick = 50
+set = 42
+"#;
+        assert!(matches!(
+            ScenarioDocumentV1::parse_toml(scalar_set.as_bytes()),
+            Err(ScenarioError::InterventionNotObject {
+                tick: 50,
+                actual: "number",
+            })
+        ));
     }
 
     #[test]

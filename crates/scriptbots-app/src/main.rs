@@ -4470,6 +4470,65 @@ fn replay_event_identity(
     event: &scriptbots_core::ReplayEvent,
 ) -> std::result::Result<(u64, u64), ReplayIdentityError> {
     match &event.kind {
+        ReplayEventKind::Action { tick, .. } => {
+            let event_tick = match tick {
+                Some(t) => {
+                    if t.0 > enclosing_tick {
+                        return Err(ReplayIdentityError::SourceTickAfterEnclosing {
+                            kind: "action",
+                            source_tick: t.0,
+                            enclosing_tick,
+                        });
+                    }
+                    t.0
+                }
+                None => enclosing_tick,
+            };
+            if fallback_seq >= NARRATIVE_INPUT_REPLAY_SEQ {
+                return Err(ReplayIdentityError::OrdinarySequenceReserved {
+                    tick: event_tick,
+                    seq: fallback_seq,
+                    reserved_from: NARRATIVE_INPUT_REPLAY_SEQ,
+                });
+            }
+            Ok((event_tick, fallback_seq))
+        }
+        ReplayEventKind::RealizedHearing {
+            observation_tick, ..
+        } => {
+            if observation_tick.0 > enclosing_tick {
+                return Err(ReplayIdentityError::SourceTickAfterEnclosing {
+                    kind: "realized_hearing",
+                    source_tick: observation_tick.0,
+                    enclosing_tick,
+                });
+            }
+            if fallback_seq >= NARRATIVE_INPUT_REPLAY_SEQ {
+                return Err(ReplayIdentityError::OrdinarySequenceReserved {
+                    tick: observation_tick.0,
+                    seq: fallback_seq,
+                    reserved_from: NARRATIVE_INPUT_REPLAY_SEQ,
+                });
+            }
+            Ok((observation_tick.0, fallback_seq))
+        }
+        ReplayEventKind::CommunicationMiWindow { report } => {
+            if report.window.tick_hi > enclosing_tick {
+                return Err(ReplayIdentityError::SourceTickAfterEnclosing {
+                    kind: "communication_mi_window",
+                    source_tick: report.window.tick_hi,
+                    enclosing_tick,
+                });
+            }
+            if fallback_seq >= NARRATIVE_INPUT_REPLAY_SEQ {
+                return Err(ReplayIdentityError::OrdinarySequenceReserved {
+                    tick: report.window.tick_hi,
+                    seq: fallback_seq,
+                    reserved_from: NARRATIVE_INPUT_REPLAY_SEQ,
+                });
+            }
+            Ok((report.window.tick_hi, fallback_seq))
+        }
         ReplayEventKind::Interaction { tick, ordinal, .. } => {
             if tick.0 > enclosing_tick {
                 return Err(ReplayIdentityError::SourceTickAfterEnclosing {
