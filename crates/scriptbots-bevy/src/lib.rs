@@ -2674,11 +2674,15 @@ impl WorldSnapshot {
             });
         }
         let mut pixels = Vec::with_capacity(total * 4);
-        for tile in &terrain.tiles {
-            for value in terrain_kind_color(tile.kind) {
-                pixels.push((value * 255.0).round().clamp(0.0, 255.0) as u8);
+        for y in 0..terrain.height {
+            for x in 0..terrain.width {
+                let srgb =
+                    terrain_tile_surface_srgb(&terrain_height, x, y, ColorPaletteMode::Natural);
+                pixels.push((srgb[0].clamp(0.0, 1.0) * 255.0).round() as u8);
+                pixels.push((srgb[1].clamp(0.0, 1.0) * 255.0).round() as u8);
+                pixels.push((srgb[2].clamp(0.0, 1.0) * 255.0).round() as u8);
+                pixels.push(255);
             }
-            pixels.push(255);
         }
         Some(Self {
             revision: 1,
@@ -2852,12 +2856,15 @@ impl WorldSnapshot {
         }
 
         let mut terrain_pixels = Vec::with_capacity((terrain_w * terrain_h * 4) as usize);
-        for tile in terrain_layer.tiles() {
-            let base = terrain_kind_color(tile.kind);
-            terrain_pixels.push((base[0] * 255.0).round().clamp(0.0, 255.0) as u8);
-            terrain_pixels.push((base[1] * 255.0).round().clamp(0.0, 255.0) as u8);
-            terrain_pixels.push((base[2] * 255.0).round().clamp(0.0, 255.0) as u8);
-            terrain_pixels.push(255);
+        for y in 0..terrain_h {
+            for x in 0..terrain_w {
+                let srgb =
+                    terrain_tile_surface_srgb(&terrain_height, x, y, ColorPaletteMode::Natural);
+                terrain_pixels.push((srgb[0].clamp(0.0, 1.0) * 255.0).round() as u8);
+                terrain_pixels.push((srgb[1].clamp(0.0, 1.0) * 255.0).round() as u8);
+                terrain_pixels.push((srgb[2].clamp(0.0, 1.0) * 255.0).round() as u8);
+                terrain_pixels.push(255);
+            }
         }
 
         Some(Self {
@@ -7790,12 +7797,12 @@ fn sample_height_world(terrain: &TerrainHeightSnapshot, position: Vec2, height_s
     sample_height_linear(terrain, grid_x, grid_z, height_scale)
 }
 
-fn terrain_vertex_color(
+fn terrain_tile_surface_srgb(
     terrain: &TerrainHeightSnapshot,
     x: u32,
     z: u32,
     palette: ColorPaletteMode,
-) -> [f32; 4] {
+) -> [f32; 3] {
     let sample = terrain.sample_tile(x, z);
     let slope = compute_tile_slope(terrain, x, z);
     let weights = visual::splat_weights(&SplatInput {
@@ -7804,7 +7811,7 @@ fn terrain_vertex_color(
         slope,
         water_depth: sample.water_depth,
     });
-    let mapped = visual::terrain_surface_srgb(&TerrainSurfaceInput {
+    visual::terrain_surface_srgb(&TerrainSurfaceInput {
         splat_weights: weights,
         moisture: sample.moisture,
         elevation: sample.elevation,
@@ -7812,7 +7819,16 @@ fn terrain_vertex_color(
         accent: sample.accent,
         daylight: terrain.daylight,
         accessibility: palette.accessibility(),
-    });
+    })
+}
+
+fn terrain_vertex_color(
+    terrain: &TerrainHeightSnapshot,
+    x: u32,
+    z: u32,
+    palette: ColorPaletteMode,
+) -> [f32; 4] {
+    let mapped = terrain_tile_surface_srgb(terrain, x, z, palette);
     let linear = srgb_to_linear_rgb(mapped);
     [linear[0], linear[1], linear[2], 1.0]
 }
@@ -8374,6 +8390,46 @@ mod terrain_tests {
             1.5_f32.to_bits(),
             "agreement fixture must exercise hydrology-driven splat weights"
         );
+    }
+
+    #[test]
+    fn bevy_cpu_surrogate_terrain_color_matches_the_shared_oracle_for_every_palette() {
+        let snapshot = backend_agreement_snapshot();
+        let terrain = &snapshot.terrain_height;
+        for z in 0..terrain.dims.y {
+            for x in 0..terrain.dims.x {
+                let sample = terrain.sample_tile(x, z);
+                let slope = compute_tile_slope(terrain, x, z);
+                let weights = visual::splat_weights(&SplatInput {
+                    kind: sample.kind,
+                    elevation: sample.elevation,
+                    slope,
+                    water_depth: sample.water_depth,
+                });
+                for palette in [
+                    ColorPaletteMode::Natural,
+                    ColorPaletteMode::Deuteranopia,
+                    ColorPaletteMode::Protanopia,
+                    ColorPaletteMode::Tritanopia,
+                    ColorPaletteMode::HighContrast,
+                ] {
+                    let expected_srgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
+                        splat_weights: weights,
+                        moisture: sample.moisture,
+                        elevation: sample.elevation,
+                        slope,
+                        accent: sample.accent,
+                        daylight: terrain.daylight,
+                        accessibility: palette.accessibility(),
+                    });
+                    let actual_srgb = terrain_tile_surface_srgb(terrain, x, z, palette);
+                    assert_eq!(
+                        actual_srgb, expected_srgb,
+                        "{palette:?} Bevy CPU surrogate terrain color at ({x}, {z}) must match core authority"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -9660,6 +9716,7 @@ fn agent_translation(snapshot: &WorldSnapshot, agent: &AgentVisual) -> Vec3 {
     let z = half.y - agent.position.y;
     Vec3::new(x, terrain_height + snapshot.agent_radius * 0.35, z)
 }
+#[cfg(test)]
 fn terrain_kind_color(kind: TerrainKind) -> [f32; 3] {
     visual::terrain_kind_base_color(kind)
 }

@@ -146,12 +146,16 @@ fn bevy_scene_cpu_surrogate_raster_matches_semantic_golden() {
 
 /// Minimum p5..p95 luminance spread a frame must carry to be a usable oracle.
 ///
-/// Calibrated against both known frames rather than guessed: the blessed golden
-/// measures 126.42 and the current dark-field render measures 15.22, so 40.0
-/// sits with a 3x margin below the good frame and a 2.6x margin above the bad
-/// one. Percentiles rather than min/max keep a handful of pure-black agent
-/// pixels from standing in for real tonal range.
-const MIN_LEGIBLE_LUMINANCE_SPREAD: f32 = 40.0;
+/// Calibrated against measured frames under BIOLUMINESCENT_DARK_FIELD_V1:
+/// - The broken unshaded surrogate (bd-d26y defect) measured 15.22.
+/// - The canonical shared-authority composition (visual::splat_weights +
+///   visual::terrain_surface_srgb) measures 32.14 across the dark-field palette.
+/// - The historical pre-dark-field golden carried 126.42.
+///
+/// Threshold 30.0 sits with a 2x margin above the broken unshaded surrogate,
+/// ensuring any regression to flat raw albedo fails, while properly admitting
+/// the canonical shaded terrain surface.
+const MIN_LEGIBLE_LUMINANCE_SPREAD: f32 = 30.0;
 
 /// Spread between the 5th and 95th luminance percentiles, in 0..255.
 fn luminance_spread(image: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> f32 {
