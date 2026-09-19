@@ -22221,3 +22221,323 @@ mod command_characterization_tests {
         let _div_all = render_sense_attribution(&detail);
     }
 }
+
+#[cfg(test)]
+mod backend_agreement_tests {
+    use super::*;
+
+    #[test]
+    fn render_agent_ornament_colors_match_core_visual_authority_for_every_palette() {
+        let visuals = visual::agent_visual_params(&AgentVisualInput {
+            genome_color: [0.2, 0.7, 0.4],
+            health: 0.85,
+            age_ticks: 120,
+            reference_age_ticks: 300,
+            herbivore_tendency: 0.75,
+            temperature_preference: 0.6,
+            wheel_left: 0.5,
+            wheel_right: 0.8,
+            heading: 1.2,
+            spike_extended: true,
+            spike_length: 6.0,
+            boosting: true,
+            sound_output: 0.4,
+            sound_multiplier: 1.1,
+            sound_level: 0.2,
+            food_delta: 0.3,
+            trait_smell: 0.7,
+            trait_hearing: 0.9,
+            selection: VisualSelection::Selected,
+        });
+
+        for palette in ColorPaletteMode::ALL {
+            let is_natural = palette == ColorPaletteMode::Natural;
+            let accessibility = accessibility_palette(palette);
+
+            let ornaments: [(&str, [f32; 3], Rgba); 7] = [
+                (
+                    "stripe",
+                    visuals.stripe_color,
+                    palette_color(
+                        rgba_from_triplet_with_alpha(visuals.stripe_color, 0.42),
+                        palette,
+                        is_natural,
+                    ),
+                ),
+                (
+                    "wheel_left",
+                    visuals.wheel_colors[0],
+                    palette_color(
+                        rgba_from_triplet_with_alpha(visuals.wheel_colors[0], 1.0),
+                        palette,
+                        is_natural,
+                    ),
+                ),
+                (
+                    "wheel_right",
+                    visuals.wheel_colors[1],
+                    palette_color(
+                        rgba_from_triplet_with_alpha(visuals.wheel_colors[1], 1.0),
+                        palette,
+                        is_natural,
+                    ),
+                ),
+                (
+                    "mouth",
+                    visuals.mouth_color,
+                    palette_color(
+                        rgba_from_triplet_with_alpha(
+                            visuals.mouth_color,
+                            0.72 + visuals.mouth_activity * 0.2,
+                        ),
+                        palette,
+                        is_natural,
+                    ),
+                ),
+                (
+                    "nose",
+                    visuals.nose_color,
+                    palette_color(
+                        rgba_from_triplet_with_alpha(visuals.nose_color, 0.8),
+                        palette,
+                        is_natural,
+                    ),
+                ),
+                (
+                    "spike",
+                    visuals.spike_color,
+                    palette_color(
+                        rgba_from_triplet_with_alpha(visuals.spike_color, 1.0),
+                        palette,
+                        is_natural,
+                    ),
+                ),
+                (
+                    "selection_rim",
+                    visuals.selection_rim_color,
+                    palette_color(
+                        rgba_from_triplet_with_alpha(visuals.selection_rim_color, 0.86),
+                        palette,
+                        is_natural,
+                    ),
+                ),
+            ];
+
+            for (name, core_srgb, render_color) in ornaments {
+                let expected_srgb = visual::apply_accessibility_palette(core_srgb, accessibility);
+                let actual_srgb = [render_color.r, render_color.g, render_color.b];
+
+                for (channel, (actual, expected)) in [
+                    ("red", (actual_srgb[0], expected_srgb[0])),
+                    ("green", (actual_srgb[1], expected_srgb[1])),
+                    ("blue", (actual_srgb[2], expected_srgb[2])),
+                ] {
+                    assert!(
+                        (actual - expected).abs() < 1.0e-5,
+                        "{palette:?} {name} sRGB {channel} {actual} disagrees with core authority {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "world_wgpu")]
+    #[test]
+    fn render_gpu_agent_instance_transfer_preserves_mouth_and_body_color_agreements() {
+        let agent = AgentRenderData {
+            agent_id: AgentId::from(slotmap::KeyData::from_ffi(1)),
+            position: Position::new(50.0, 50.0),
+            color: [0.2, 0.7, 0.4],
+            spike_length: 6.0,
+            velocity: Velocity::new(1.0, 0.0),
+            heading: 1.2,
+            health: 0.85,
+            age: 120,
+            boost: 0.8,
+            wheel_left: 0.5,
+            wheel_right: 0.8,
+            herbivore_tendency: 0.75,
+            temperature_preference: 0.6,
+            food_delta: 0.3,
+            sound_level: 0.2,
+            sound_output: 0.4,
+            sound_multiplier: 1.1,
+            trait_smell: 0.7,
+            trait_sound: 0.5,
+            trait_hearing: 0.9,
+            trait_eye: 1.0,
+            trait_blood: 0.3,
+            eye_dirs: [0.0; NUM_EYES],
+            eye_fov: [1.0; NUM_EYES],
+            selection: SelectionState::Selected,
+            indicator: IndicatorState::default(),
+            spike_extended: true,
+            spike_struck: false,
+            spike_victim: false,
+            reproduction_intent: 0.0,
+        };
+
+        let mut frame = RenderFrame {
+            tick: 100,
+            tonemap_mode: None,
+            day_night_cycle_ticks: 2400,
+            day_night_start_phase: 0.0,
+            world_size: (1000.0, 1000.0),
+            terrain: TerrainFrame {
+                dimensions: (10, 10),
+                cell_size: 100,
+                tiles: Vec::new(),
+            },
+            food_dimensions: (10, 10),
+            food_cell_size: 100,
+            food_cells: Vec::new(),
+            food_max: 1.0,
+            agents: Vec::new(),
+            agent_reference_age: 300,
+            agent_base_radius: 12.0,
+            sense_radius: 50.0,
+            post_stack: PostProcessStack { passes: Vec::new() },
+            palette: ColorPaletteMode::Natural,
+        };
+
+        let visuals = resolve_agent_visual(&agent, frame.agent_reference_age);
+
+        for palette in ColorPaletteMode::ALL {
+            let is_natural = palette == ColorPaletteMode::Natural;
+            let accessibility = accessibility_palette(palette);
+            frame.palette = palette;
+
+            let instance = build_gpu_agent_instance(&frame, &agent, palette, is_natural);
+
+            // 1. Mouth color is transferred in semantic sRGB, transformed by the accessibility palette
+            let expected_mouth =
+                visual::apply_accessibility_palette(visuals.mouth_color, accessibility);
+            for c in 0..3 {
+                assert!(
+                    (instance.mouth_color[c] - expected_mouth[c]).abs() < 1.0e-5,
+                    "GPU instance mouth_color[{c}] {} disagrees with core authority {} for {palette:?}",
+                    instance.mouth_color[c],
+                    expected_mouth[c]
+                );
+            }
+
+            // 2. Body color is transferred in semantic sRGB to the instance buffer
+            let expected_body_srgb =
+                visual::apply_accessibility_palette(visuals.body_color, accessibility);
+            for c in 0..3 {
+                assert!(
+                    (instance.color[c] - expected_body_srgb[c]).abs() < 1.0e-5,
+                    "GPU instance body color[{c}] {} disagrees with core authority {} for {palette:?}",
+                    instance.color[c],
+                    expected_body_srgb[c]
+                );
+            }
+
+            // 3. world-gfx declared transfer: when instance is uploaded to GPU, body is converted to linear
+            let linear_body = scriptbots_world_gfx::semantic_srgba_to_linear(instance.color);
+            let expected_linear_body = [
+                scriptbots_world_gfx::srgb_component_to_linear(expected_body_srgb[0]),
+                scriptbots_world_gfx::srgb_component_to_linear(expected_body_srgb[1]),
+                scriptbots_world_gfx::srgb_component_to_linear(expected_body_srgb[2]),
+                instance.color[3],
+            ];
+            assert_eq!(
+                linear_body.map(f32::to_bits),
+                expected_linear_body.map(f32::to_bits),
+                "GPU instance body linear decode must match canonical sRGB decode for {palette:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "world_wgpu")]
+    #[test]
+    fn cross_backend_ornament_chroma_and_transfer_agreement() {
+        // Per 2026-07-25 14:34 precedent (jemanuel note on bd-2z0.7.11 comment 601):
+        // GPUI, Bevy, and world-gfx agree on the same semantic ornament colors for the same agent inputs;
+        // backend numeric buffers differ only by the explicitly tested color-space transfer required
+        // by each backend (sRGB for GPUI canvas compositing, sRGB-to-linear for Bevy PBR,
+        // and sRGB layer blending with linear body for world-gfx).
+
+        let sample_input = AgentVisualInput {
+            genome_color: [0.15, 0.65, 0.85],
+            health: 0.9,
+            age_ticks: 150,
+            reference_age_ticks: 300,
+            herbivore_tendency: 0.6,
+            temperature_preference: 0.5,
+            wheel_left: 0.4,
+            wheel_right: 0.7,
+            heading: 0.785,
+            spike_extended: true,
+            spike_length: 5.0,
+            boosting: false,
+            sound_output: 0.3,
+            sound_multiplier: 1.0,
+            sound_level: 0.1,
+            food_delta: 0.2,
+            trait_smell: 0.5,
+            trait_hearing: 0.8,
+            selection: VisualSelection::Hovered,
+        };
+
+        let core_visuals = visual::agent_visual_params(&sample_input);
+
+        let stripe_core = core_visuals.stripe_color;
+        let mouth_core = core_visuals.mouth_color;
+        let rim_core = core_visuals.selection_rim_color;
+
+        for palette in ColorPaletteMode::ALL {
+            let is_natural = palette == ColorPaletteMode::Natural;
+            let accessibility = accessibility_palette(palette);
+
+            // 1. GPUI render: canvas compositing uses semantic sRGB directly
+            let gpui_stripe = palette_color(
+                rgba_from_triplet_with_alpha(stripe_core, 1.0),
+                palette,
+                is_natural,
+            );
+            let gpui_mouth = palette_color(
+                rgba_from_triplet_with_alpha(mouth_core, 1.0),
+                palette,
+                is_natural,
+            );
+            let gpui_rim = palette_color(
+                rgba_from_triplet_with_alpha(rim_core, 1.0),
+                palette,
+                is_natural,
+            );
+
+            let expected_stripe = visual::apply_accessibility_palette(stripe_core, accessibility);
+            let expected_mouth = visual::apply_accessibility_palette(mouth_core, accessibility);
+            let expected_rim = visual::apply_accessibility_palette(rim_core, accessibility);
+
+            assert_eq!(
+                [gpui_stripe.r, gpui_stripe.g, gpui_stripe.b],
+                expected_stripe
+            );
+            assert_eq!([gpui_mouth.r, gpui_mouth.g, gpui_mouth.b], expected_mouth);
+            assert_eq!([gpui_rim.r, gpui_rim.g, gpui_rim.b], expected_rim);
+
+            // 2. Bevy declared transfer: sRGB decoded to linear for PBR StandardMaterial
+            let linear_stripe_r =
+                scriptbots_world_gfx::srgb_component_to_linear(expected_stripe[0]);
+            let linear_stripe_g =
+                scriptbots_world_gfx::srgb_component_to_linear(expected_stripe[1]);
+            let linear_stripe_b =
+                scriptbots_world_gfx::srgb_component_to_linear(expected_stripe[2]);
+            assert!((0.0..=1.0).contains(&linear_stripe_r));
+            assert!((0.0..=1.0).contains(&linear_stripe_g));
+            assert!((0.0..=1.0).contains(&linear_stripe_b));
+
+            // 3. world-gfx declared transfer: WGSL layer() blends in sRGB, with mouth_color carried in sRGB
+            // and body_color decoded to linear via semantic_srgba_to_linear
+            let body_linear = scriptbots_world_gfx::semantic_srgba_to_linear([
+                core_visuals.body_color[0],
+                core_visuals.body_color[1],
+                core_visuals.body_color[2],
+                1.0,
+            ]);
+            assert_eq!(body_linear[3], 1.0);
+        }
+    }
+}

@@ -8463,6 +8463,125 @@ mod terrain_tests {
     }
 
     #[test]
+    fn bevy_agent_ornament_colors_match_the_core_visual_authority_for_every_palette() {
+        let agent = sample_agent_visual();
+        let visuals = canonical_agent_visual_params(&agent);
+
+        for palette in [
+            ColorPaletteMode::Natural,
+            ColorPaletteMode::Deuteranopia,
+            ColorPaletteMode::Protanopia,
+            ColorPaletteMode::Tritanopia,
+            ColorPaletteMode::HighContrast,
+        ] {
+            let accessibility = palette.accessibility();
+
+            let ear_srgb = visual::visual_style().agents.ear_srgb;
+            let sclera_srgb = visual::visual_style().agents.eye_sclera_srgb;
+            let pupil_srgb = visual::visual_style().agents.eye_pupil_srgb;
+
+            let ornaments: [(&str, [f32; 3], Color); 10] = [
+                (
+                    "stripe",
+                    visuals.stripe_color,
+                    srgb_from_vec_with_palette(
+                        Vec3::from_array(visuals.stripe_color),
+                        0.9,
+                        palette,
+                    ),
+                ),
+                (
+                    "wheel_left",
+                    visuals.wheel_colors[0],
+                    srgb_from_vec_with_palette(
+                        Vec3::from_array(visuals.wheel_colors[0]),
+                        1.0,
+                        palette,
+                    ),
+                ),
+                (
+                    "wheel_right",
+                    visuals.wheel_colors[1],
+                    srgb_from_vec_with_palette(
+                        Vec3::from_array(visuals.wheel_colors[1]),
+                        1.0,
+                        palette,
+                    ),
+                ),
+                (
+                    "mouth",
+                    visuals.mouth_color,
+                    srgb_from_vec_with_palette(Vec3::from_array(visuals.mouth_color), 0.9, palette),
+                ),
+                (
+                    "nose",
+                    visuals.nose_color,
+                    srgb_from_vec_with_palette(Vec3::from_array(visuals.nose_color), 1.0, palette),
+                ),
+                (
+                    "spike",
+                    visuals.spike_color,
+                    srgb_from_vec_with_palette(Vec3::from_array(visuals.spike_color), 1.0, palette),
+                ),
+                (
+                    "selection_rim",
+                    visuals.selection_rim_color,
+                    srgb_from_vec_with_palette(
+                        Vec3::from_array(visuals.selection_rim_color),
+                        0.65,
+                        palette,
+                    ),
+                ),
+                (
+                    "ear",
+                    ear_srgb,
+                    srgb_from_vec_with_palette(Vec3::from_array(ear_srgb), 1.0, palette),
+                ),
+                (
+                    "eye_sclera",
+                    sclera_srgb,
+                    srgb_from_vec_with_palette(Vec3::from_array(sclera_srgb), 1.0, palette),
+                ),
+                (
+                    "eye_pupil",
+                    pupil_srgb,
+                    srgb_from_vec_with_palette(Vec3::from_array(pupil_srgb), 1.0, palette),
+                ),
+            ];
+
+            for (name, core_srgb, bevy_color) in ornaments {
+                let expected_srgb = visual::apply_accessibility_palette(core_srgb, accessibility);
+                let actual_srgb = bevy_color.to_srgba();
+
+                for (channel, (actual, expected)) in [
+                    ("red", (actual_srgb.red, expected_srgb[0])),
+                    ("green", (actual_srgb.green, expected_srgb[1])),
+                    ("blue", (actual_srgb.blue, expected_srgb[2])),
+                ] {
+                    assert!(
+                        (actual - expected).abs() < 1.0e-5,
+                        "{palette:?} {name} sRGB {channel} {actual} disagrees with core authority {expected}"
+                    );
+                }
+
+                let expected_linear =
+                    Color::srgb(expected_srgb[0], expected_srgb[1], expected_srgb[2]).to_linear();
+                let actual_linear = bevy_color.to_linear();
+                for (channel, (actual, expected)) in [
+                    ("red", (actual_linear.red, expected_linear.red)),
+                    ("green", (actual_linear.green, expected_linear.green)),
+                    ("blue", (actual_linear.blue, expected_linear.blue)),
+                ] {
+                    assert!(
+                        (actual - expected).abs() < 1.0e-5,
+                        "{palette:?} {name} linear {channel} {actual} disagrees with declared PBR transfer {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn same_tick_motion_preferences_reach_both_native_easing_systems() {
         let mut app = App::new();
         let (publisher, inbox) = SnapshotInbox::pair();

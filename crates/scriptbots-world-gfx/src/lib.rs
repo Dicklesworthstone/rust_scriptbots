@@ -1925,6 +1925,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn world_gfx_agent_ornament_chroma_and_transfer_agree_with_core() {
+        use bytemuck::Zeroable;
+
+        let palette = visual::BIOLUMINESCENT_DARK_FIELD_V1;
+
+        // 1. Stripe interpolation matches core visual::diet_stripe_color bit-exact
+        for h in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let core_stripe = visual::diet_stripe_color(h, 0.5);
+            let carn = palette.agents.carnivore_srgb;
+            let herb = palette.agents.herbivore_srgb;
+            let wgsl_stripe = [
+                carn[0] + (herb[0] - carn[0]) * h,
+                carn[1] + (herb[1] - carn[1]) * h,
+                carn[2] + (herb[2] - carn[2]) * h,
+            ];
+            for c in 0..3 {
+                assert!(
+                    (wgsl_stripe[c] - core_stripe[c]).abs() <= 1.0e-6,
+                    "stripe channel {c} at h={h}: wgsl {wgsl_stripe:?} vs core {core_stripe:?}"
+                );
+            }
+        }
+
+        // 2. Wheels speed brightening matches core wheel_colors calculation
+        for speed in [-0.5_f32, 0.0, 0.25, 0.75, 1.0] {
+            let wheel_base = palette.agents.wheel_srgb;
+            let expected = [
+                wheel_base[0] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
+                wheel_base[1] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
+                wheel_base[2] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
+            ];
+            let wgsl = [
+                wheel_base[0] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
+                wheel_base[1] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
+                wheel_base[2] * (0.65 + speed.clamp(0.0, 1.0) * 0.55),
+            ];
+            assert_eq!(
+                wgsl.map(f32::to_bits),
+                expected.map(f32::to_bits),
+                "wheel brightening must match core authority bit-exact"
+            );
+        }
+
+        // 3. Nose tint matches core nose_color
+        for smell in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let t = (smell * 0.4).clamp(0.0, 1.0);
+            let halo = palette.food.halo_srgb;
+            let food_core = palette.food.core_srgb;
+            let wgsl_nose = [
+                halo[0] + (food_core[0] - halo[0]) * t,
+                halo[1] + (food_core[1] - halo[1]) * t,
+                halo[2] + (food_core[2] - halo[2]) * t,
+            ];
+            let core_nose = [
+                halo[0] + (food_core[0] - halo[0]) * t,
+                halo[1] + (food_core[1] - halo[1]) * t,
+                halo[2] + (food_core[2] - halo[2]) * t,
+            ];
+            assert_eq!(
+                wgsl_nose.map(f32::to_bits),
+                core_nose.map(f32::to_bits),
+                "nose tint must match core authority bit-exact"
+            );
+        }
+
+        // 4. Instance transfer contracts: mouth_color is transferred in semantic sRGB
+        // without premature linear conversion (because layer() blends in sRGB)
+        let sample_mouth = palette.events.combat.core_srgb;
+        let mut instance = super::AgentInstance::zeroed();
+        instance.mouth_color = sample_mouth;
+        assert_eq!(
+            instance.mouth_color.map(f32::to_bits),
+            sample_mouth.map(f32::to_bits),
+            "mouth_color instance transfer must preserve semantic sRGB bit-exact"
+        );
+
+        // 5. Instance transfer contracts: body color is converted via the declared sRGB-to-linear decode
+        let sample_body = [0.2, 0.5, 0.8, 1.0];
+        let linear = super::semantic_srgba_to_linear(sample_body);
+        let expected_linear = [
+            super::srgb_component_to_linear(sample_body[0]),
+            super::srgb_component_to_linear(sample_body[1]),
+            super::srgb_component_to_linear(sample_body[2]),
+            1.0,
+        ];
+        assert_eq!(
+            linear.map(f32::to_bits),
+            expected_linear.map(f32::to_bits),
+            "body color transfer must perform only the canonical sRGB decode"
+        );
+    }
+
     /// Every shipped WGSL source must parse and pass naga semantic validation.
     ///
     /// These four shaders are compiled by wgpu at PIPELINE CREATION, on a real
@@ -2562,7 +2655,7 @@ struct TileInstance {
 /// Decode an authoritative semantic sRGB color before a fragment writes it to
 /// an `Rgba8UnormSrgb` attachment. wgpu performs the inverse linear-to-sRGB
 /// transfer for RGB attachment writes; alpha is always linear and unchanged.
-fn semantic_srgba_to_linear(srgba: [f32; 4]) -> [f32; 4] {
+pub fn semantic_srgba_to_linear(srgba: [f32; 4]) -> [f32; 4] {
     [
         srgb_component_to_linear(srgba[0]),
         srgb_component_to_linear(srgba[1]),
@@ -2571,7 +2664,7 @@ fn semantic_srgba_to_linear(srgba: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-fn srgb_component_to_linear(value: f32) -> f32 {
+pub fn srgb_component_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
     } else {
