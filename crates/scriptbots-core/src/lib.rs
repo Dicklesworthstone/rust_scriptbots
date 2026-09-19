@@ -8388,6 +8388,29 @@ const fn default_communication_mi_interval() -> u32 {
 const fn default_communication_mi_window() -> u32 {
     500
 }
+const fn default_food_requires_stillness() -> bool {
+    false
+}
+const fn default_stillness_speed_threshold() -> f32 {
+    0.05
+}
+const fn default_communication_scramble() -> bool {
+    false
+}
+const fn default_communication_scramble_seed() -> Option<u64> {
+    None
+}
+
+/// Permute a slice of hearing values across agents using a dedicated pseudo-random stream (bd-16g.7.3).
+pub fn scramble_hearing_slice(hearing: &mut [f32], stream: &mut SmallRngStream) {
+    let n = hearing.len();
+    if n > 1 {
+        for i in (1..n).rev() {
+            let j = (stream.next_u64() as usize) % (i + 1);
+            hearing.swap(i, j);
+        }
+    }
+}
 
 /// Persistence event kind recording pairwise interactions observed by the simulation.
 pub const INTERACTION_EVENTS_OBSERVED_KIND: &str = "interaction_events_observed";
@@ -13083,6 +13106,22 @@ pub struct ScriptBotsConfig {
     /// Window size in ticks for communication mutual-information analysis (default 500).
     #[serde(default = "default_communication_mi_window")]
     pub communication_mi_window: u32,
+    /// Whether the food sensor and consumption require stillness (bd-16g.7.3).
+    ///
+    /// When true, an agent whose speed is strictly greater than `stillness_speed_threshold`
+    /// reads `sensors[4] == 0.0` regardless of the food cell value, and cannot feed. When speed
+    /// is less than or equal to the threshold, it reads the true cell food value and feeds normally.
+    #[serde(default = "default_food_requires_stillness")]
+    pub food_requires_stillness: bool,
+    /// Speed threshold for stillness-gated food sensing and consumption (default 0.05).
+    #[serde(default = "default_stillness_speed_threshold")]
+    pub stillness_speed_threshold: f32,
+    /// Whether communication hearing channels are scrambled with a dedicated seeded stream (bd-16g.7.3).
+    #[serde(default = "default_communication_scramble")]
+    pub communication_scramble: bool,
+    /// Dedicated seed for the communication scramble stream (bd-16g.7.3).
+    #[serde(default = "default_communication_scramble_seed")]
+    pub communication_scramble_seed: Option<u64>,
     }
 }
 }
@@ -13210,6 +13249,10 @@ impl Default for ScriptBotsConfig {
             novelty_k: 15,
             communication_mi_interval: default_communication_mi_interval(),
             communication_mi_window: default_communication_mi_window(),
+            food_requires_stillness: default_food_requires_stillness(),
+            stillness_speed_threshold: default_stillness_speed_threshold(),
+            communication_scramble: default_communication_scramble(),
+            communication_scramble_seed: default_communication_scramble_seed(),
         }
     }
 }
@@ -13989,6 +14032,10 @@ impl ScriptBotsConfig {
                 "communication_mi_window must be at least 4 when communication_mi_interval is enabled"
             );
         }
+        reject_unless!(
+            self.stillness_speed_threshold.is_finite() && self.stillness_speed_threshold >= 0.0,
+            "stillness_speed_threshold must be finite and >= 0.0"
+        );
         Ok(())
     }
 
@@ -18949,6 +18996,7 @@ pub struct WorldState {
     pending_communication_metrics: Vec<MetricSample>,
     latest_communication_mi_report: Option<infotheory::CommunicationMiWindowReport>,
     last_tick_emitted_sound: f64,
+    communication_scramble_stream: Option<SmallRngStream>,
     config_audit: Vec<ConfigAuditEntry>,
     config_revision: u64,
     resource_ledger: ResourceLedgerState,
@@ -19750,6 +19798,14 @@ impl WorldState {
                 "novelty/curiosity selection mode enabled: world trajectories will not match fitness-mode fixtures"
             );
         }
+        let communication_scramble_stream = if config.communication_scramble {
+            let scramble_seed = config
+                .communication_scramble_seed
+                .unwrap_or_else(|| config.resolved_rng_seed() ^ 0x5C8A_3B1E_C044_5EED);
+            Some(SmallRngStream::seed_from_u64(scramble_seed))
+        } else {
+            None
+        };
         Ok(Self {
             food,
             terrain,
@@ -19844,6 +19900,7 @@ impl WorldState {
             pending_communication_metrics: Vec::new(),
             latest_communication_mi_report: None,
             last_tick_emitted_sound: 0.0,
+            communication_scramble_stream,
             config_audit: Vec::with_capacity(32),
             config_revision: 0,
             resource_ledger: ResourceLedgerState::default(),
@@ -20576,6 +20633,7 @@ impl WorldState {
         let headings = columns.headings();
         let colors = columns.colors();
         let healths = columns.health();
+        let velocities = columns.velocities();
 
         // Build and reuse position pairs buffer
         self.work_position_pairs.clear();
@@ -20677,7 +20735,7 @@ impl WorldState {
             None
         };
 
-        let sensor_results: Vec<([f32; INPUT_SIZE], u32)> =
+        let mut sensor_results: Vec<([f32; INPUT_SIZE], u32)> =
             collect_handles!(handles, |idx, _handle| {
                 let mut sensors = [0.0f32; INPUT_SIZE];
                 let position = positions[idx];
@@ -20759,7 +20817,18 @@ impl WorldState {
                 sensors[1] = clamp01(eye_r[0]);
                 sensors[2] = clamp01(eye_g[0]);
                 sensors[3] = clamp01(eye_b[0]);
-                sensors[4] = clamp01(food_value);
+                let food_sensor = if self.config.food_requires_stillness {
+                    let v = velocities[idx];
+                    let speed = v.vx.hypot(v.vy);
+                    if speed > self.config.stillness_speed_threshold {
+                        0.0
+                    } else {
+                        clamp01(food_value)
+                    }
+                } else {
+                    clamp01(food_value)
+                };
+                sensors[4] = food_sensor;
                 sensors[5] = clamp01(density[1]);
                 sensors[6] = clamp01(eye_r[1]);
                 sensors[7] = clamp01(eye_g[1]);
@@ -20786,6 +20855,20 @@ impl WorldState {
                 sensors[24] = clamp01(eye_b[3]);
                 (sensors, accumulator.saturations)
             });
+
+        if let Some(ref mut scramble_rng) = self.communication_scramble_stream {
+            let n = sensor_results.len();
+            if n > 1 {
+                for i in (1..n).rev() {
+                    let j = (scramble_rng.next_u64() as usize) % (i + 1);
+                    if i != j {
+                        let tmp = sensor_results[i].0[18];
+                        sensor_results[i].0[18] = sensor_results[j].0[18];
+                        sensor_results[j].0[18] = tmp;
+                    }
+                }
+            }
+        }
 
         let mut missing_realized_hearing_identity = None;
         if self.realized_hearing_capture_enabled {
@@ -20984,12 +21067,24 @@ impl WorldState {
             sample_temperature_with_field(&self.config, self.temperature.as_ref(), position);
         let discomfort = temperature_discomfort(env_temperature, observer.temperature_preference);
 
+        let food_sensor = if self.config.food_requires_stillness {
+            let v = columns.velocities()[idx];
+            let speed = v.vx.hypot(v.vy);
+            if speed > self.config.stillness_speed_threshold {
+                0.0
+            } else {
+                food_value
+            }
+        } else {
+            food_value
+        };
+
         let mut raw = [0.0f32; INPUT_SIZE];
         raw[0] = density[0];
         raw[1] = eye_r[0];
         raw[2] = eye_g[0];
         raw[3] = eye_b[0];
-        raw[4] = food_value;
+        raw[4] = food_sensor;
         raw[5] = density[1];
         raw[6] = eye_r[1];
         raw[7] = eye_g[1];
@@ -23573,6 +23668,7 @@ impl WorldState {
         let reproduction_bonus = self.config.reproduction_food_bonus.max(0.0);
         let fertility_bonus_scale = self.config.reproduction_fertility_bonus.max(0.0);
         let healths = self.agents.columns().health();
+        let velocities = self.agents.columns().velocities();
         for (idx, agent_id) in handles.iter().enumerate() {
             let pos = positions[idx];
             // Computed before the mutable runtime borrow: the embargo scale
@@ -23590,7 +23686,14 @@ impl WorldState {
                     };
                 #[cfg(not(feature = "economy-faults"))]
                 let health_gate = healths[idx] < 2.0;
-                if (intake_rate > 0.0 || waste_rate > 0.0) && health_gate {
+                let stillness_gate = if self.config.food_requires_stillness {
+                    let v = velocities[idx];
+                    let speed = v.vx.hypot(v.vy);
+                    speed <= self.config.stillness_speed_threshold
+                } else {
+                    true
+                };
+                if (intake_rate > 0.0 || waste_rate > 0.0) && health_gate && stillness_gate {
                     // bd-9zq2: positions are wrapped into [0, extent) by the toroidal
                     // geometry before this stage, so the value floored here is non-negative
                     // and in range. NOTE: unlike the two sense paths, this one relies on that
@@ -28370,10 +28473,28 @@ impl WorldState {
         if self.config.communication_mi_interval > 0 {
             self.realized_hearing_capture_enabled = true;
         }
+        if self.config.communication_scramble {
+            if self.communication_scramble_stream.is_none() {
+                let scramble_seed = self
+                    .config
+                    .communication_scramble_seed
+                    .unwrap_or_else(|| self.config.resolved_rng_seed() ^ 0x5C8A_3B1E_C044_5EED);
+                self.communication_scramble_stream =
+                    Some(SmallRngStream::seed_from_u64(scramble_seed));
+            }
+        } else {
+            self.communication_scramble_stream = None;
+        }
         self.food_profiles = food_profiles;
         self.cadence = TickCadence::from_config(&self.config);
         self.config_revision = self.config_revision.saturating_add(1);
         Ok(())
+    }
+
+    /// Return the active communication scramble stream, if scramble is enabled (bd-16g.7.3).
+    #[must_use]
+    pub const fn communication_scramble_stream(&self) -> Option<&SmallRngStream> {
+        self.communication_scramble_stream.as_ref()
     }
 
     /// Monotonic count of applied configuration updates. Unlike the capped
@@ -36153,6 +36274,347 @@ mod tests {
         assert_eq!(report.window.pair, "sound_to_hearing");
         assert!(report.estimate.n >= 10);
         assert!(report.estimate.bits_corrected >= 0.0);
+    }
+
+    #[test]
+    fn stillness_gated_food_sensing_and_consumption() {
+        let mut config = quiet_trace_config(0x5449_4c4c, 0);
+        config.food_requires_stillness = true;
+        config.stillness_speed_threshold = 0.05;
+        config.food_intake_rate = 0.1;
+        config.food_waste_rate = 0.05;
+        let mut world = WorldState::new(config).expect("world");
+
+        let moving = world.spawn_agent(AgentData {
+            position: Position::new(10.0, 10.0),
+            ..AgentData::default()
+        });
+        let still = world.spawn_agent(AgentData {
+            position: Position::new(10.0, 10.0),
+            ..AgentData::default()
+        });
+
+        let moving_idx = world.agents().index_of(moving).unwrap();
+        let still_idx = world.agents().index_of(still).unwrap();
+
+        {
+            let columns = world.agents_mut().columns_mut();
+            // moving speed = 0.1 > 0.05
+            columns.velocities_mut()[moving_idx] = Velocity::new(0.1, 0.0);
+            // still speed = 0.0 <= 0.05
+            columns.velocities_mut()[still_idx] = Velocity::new(0.0, 0.0);
+        }
+
+        let cell_size = validated_world_unit_f32(world.config().food_cell_size);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cell_x = (10.0 / cell_size).floor() as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cell_y = (10.0 / cell_size).floor() as u32;
+        if let Some(cell) = world.food_mut().get_mut(cell_x, cell_y) {
+            *cell = 1.0;
+        }
+
+        world.stage_sense();
+
+        let moving_sensors = world.agent_runtime(moving).unwrap().sensors;
+        let still_sensors = world.agent_runtime(still).unwrap().sensors;
+
+        assert_eq!(
+            moving_sensors[4], 0.0,
+            "moving agent (speed 0.1 > 0.05) must read 0.0 for food sensor under stillness gating"
+        );
+        assert!(
+            still_sensors[4] > 0.0,
+            "still agent (speed 0.0 <= 0.05) must read true food value"
+        );
+
+        let moving_attr = world.explain_sensors(moving, 1).unwrap();
+        let still_attr = world.explain_sensors(still, 1).unwrap();
+        assert_eq!(moving_attr.raw[4], 0.0);
+        assert!(still_attr.raw[4] > 0.0);
+
+        let moving_energy_before = world.agent_runtime(moving).unwrap().energy;
+        let still_energy_before = world.agent_runtime(still).unwrap().energy;
+
+        world.stage_food();
+
+        let moving_rt = world.agent_runtime(moving).unwrap();
+        let still_rt = world.agent_runtime(still).unwrap();
+
+        assert_eq!(
+            moving_rt.food_delta, 0.0,
+            "moving agent must consume 0 food under stillness gating"
+        );
+        assert_eq!(
+            moving_rt.energy, moving_energy_before,
+            "moving agent energy must not increase from food"
+        );
+
+        assert!(still_rt.food_delta > 0.0, "still agent must consume food");
+        assert!(
+            still_rt.energy > still_energy_before,
+            "still agent energy must increase from food"
+        );
+    }
+
+    #[test]
+    fn stillness_gate_exact_boundary() {
+        let mut config = quiet_trace_config(0x424f_554e_4459, 0);
+        config.food_requires_stillness = true;
+        config.stillness_speed_threshold = 0.05;
+        let mut world = WorldState::new(config).expect("world");
+
+        let at_boundary = world.spawn_agent(AgentData {
+            position: Position::new(10.0, 10.0),
+            ..AgentData::default()
+        });
+        let just_above = world.spawn_agent(AgentData {
+            position: Position::new(10.0, 10.0),
+            ..AgentData::default()
+        });
+
+        let at_idx = world.agents().index_of(at_boundary).unwrap();
+        let above_idx = world.agents().index_of(just_above).unwrap();
+
+        {
+            let columns = world.agents_mut().columns_mut();
+            // Exactly at boundary
+            columns.velocities_mut()[at_idx] = Velocity::new(0.05, 0.0);
+            // Just above boundary
+            columns.velocities_mut()[above_idx] = Velocity::new(0.0501, 0.0);
+        }
+
+        let cell_size = validated_world_unit_f32(world.config().food_cell_size);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cell_x = (10.0 / cell_size).floor() as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cell_y = (10.0 / cell_size).floor() as u32;
+        if let Some(cell) = world.food_mut().get_mut(cell_x, cell_y) {
+            *cell = 1.0;
+        }
+
+        world.stage_sense();
+
+        let at_sensors = world.agent_runtime(at_boundary).unwrap().sensors;
+        let above_sensors = world.agent_runtime(just_above).unwrap().sensors;
+
+        assert!(
+            at_sensors[4] > 0.0,
+            "speed exactly at threshold (0.05 <= 0.05) must read food"
+        );
+        assert_eq!(
+            above_sensors[4], 0.0,
+            "speed strictly greater than threshold (0.0501 > 0.05) must read 0.0"
+        );
+
+        world.stage_food();
+        assert!(
+            world.agent_runtime(at_boundary).unwrap().food_delta > 0.0,
+            "agent at boundary must feed"
+        );
+        assert_eq!(
+            world.agent_runtime(just_above).unwrap().food_delta,
+            0.0,
+            "agent above boundary must not feed"
+        );
+    }
+
+    #[test]
+    fn stillness_gate_inert_when_disabled() {
+        let mut config = quiet_trace_config(0x494e_4552_5431, 0);
+        config.food_requires_stillness = false;
+        let mut world = WorldState::new(config).expect("world");
+
+        let fast_agent = world.spawn_agent(AgentData {
+            position: Position::new(10.0, 10.0),
+            ..AgentData::default()
+        });
+        let idx = world.agents().index_of(fast_agent).unwrap();
+        world.agents_mut().columns_mut().velocities_mut()[idx] = Velocity::new(1.0, 1.0);
+
+        let cell_size = validated_world_unit_f32(world.config().food_cell_size);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cell_x = (10.0 / cell_size).floor() as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cell_y = (10.0 / cell_size).floor() as u32;
+        if let Some(cell) = world.food_mut().get_mut(cell_x, cell_y) {
+            *cell = 1.0;
+        }
+
+        world.stage_sense();
+        assert!(
+            world.agent_runtime(fast_agent).unwrap().sensors[4] > 0.0,
+            "when gate is disabled, fast agent still senses food"
+        );
+
+        world.stage_food();
+        assert!(
+            world.agent_runtime(fast_agent).unwrap().food_delta > 0.0,
+            "when gate is disabled, fast agent still feeds"
+        );
+    }
+
+    #[test]
+    fn communication_scramble_permutes_hearing_and_preserves_multiset() {
+        let mut config = quiet_trace_config(0x5343_5241_4d42, 0);
+        config.communication_scramble = true;
+        config.communication_scramble_seed = Some(0xDEAD_BEEF_CAFE);
+        let mut world = WorldState::new(config).expect("world");
+
+        let a1 = world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            ..AgentData::default()
+        });
+        let a2 = world.spawn_agent(AgentData {
+            position: Position::new(51.0, 50.0),
+            ..AgentData::default()
+        });
+        let a3 = world.spawn_agent(AgentData {
+            position: Position::new(52.0, 50.0),
+            ..AgentData::default()
+        });
+        let a4 = world.spawn_agent(AgentData {
+            position: Position::new(53.0, 50.0),
+            ..AgentData::default()
+        });
+
+        world.agent_runtime_mut(a1).unwrap().sound_multiplier = 0.2;
+        world.agent_runtime_mut(a2).unwrap().sound_multiplier = 0.4;
+        world.agent_runtime_mut(a3).unwrap().sound_multiplier = 0.6;
+        world.agent_runtime_mut(a4).unwrap().sound_multiplier = 0.8;
+
+        world.set_realized_hearing_capture_enabled(true);
+        world.step().expect("step 1");
+        world.step().expect("step 2");
+
+        let scrambled_hearings: Vec<f32> = [a1, a2, a3, a4]
+            .iter()
+            .map(|&id| world.agent_runtime(id).unwrap().sensors[18])
+            .collect();
+
+        let mut ctrl_config = quiet_trace_config(0x5343_5241_4d42, 0);
+        ctrl_config.communication_scramble = false;
+        let mut ctrl_world = WorldState::new(ctrl_config).expect("ctrl world");
+        let c1 = ctrl_world.spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            ..AgentData::default()
+        });
+        let c2 = ctrl_world.spawn_agent(AgentData {
+            position: Position::new(51.0, 50.0),
+            ..AgentData::default()
+        });
+        let c3 = ctrl_world.spawn_agent(AgentData {
+            position: Position::new(52.0, 50.0),
+            ..AgentData::default()
+        });
+        let c4 = ctrl_world.spawn_agent(AgentData {
+            position: Position::new(53.0, 50.0),
+            ..AgentData::default()
+        });
+        ctrl_world.agent_runtime_mut(c1).unwrap().sound_multiplier = 0.2;
+        ctrl_world.agent_runtime_mut(c2).unwrap().sound_multiplier = 0.4;
+        ctrl_world.agent_runtime_mut(c3).unwrap().sound_multiplier = 0.6;
+        ctrl_world.agent_runtime_mut(c4).unwrap().sound_multiplier = 0.8;
+        ctrl_world.set_realized_hearing_capture_enabled(true);
+        ctrl_world.step().expect("ctrl step 1");
+        ctrl_world.step().expect("ctrl step 2");
+
+        let control_hearings: Vec<f32> = [c1, c2, c3, c4]
+            .iter()
+            .map(|&id| ctrl_world.agent_runtime(id).unwrap().sensors[18])
+            .collect();
+
+        let mut sorted_scrambled = scrambled_hearings.clone();
+        sorted_scrambled.sort_by(|a, b| a.total_cmp(b));
+        let mut sorted_control = control_hearings.clone();
+        sorted_control.sort_by(|a, b| a.total_cmp(b));
+
+        for (s, c) in sorted_scrambled.iter().zip(&sorted_control) {
+            assert!(
+                (s - c).abs() < 1e-6,
+                "scramble must preserve multi-set of hearing values: scrambled={sorted_scrambled:?}, control={sorted_control:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn communication_scramble_does_not_perturb_world_domain_rng() {
+        let base_config = quiet_trace_config(0x524e_475f_5345_4544, 0);
+        let mut world_plain = WorldState::new(base_config.clone()).expect("plain world");
+        let mut world_scramble = WorldState::new(ScriptBotsConfig {
+            communication_scramble: true,
+            communication_scramble_seed: Some(0x9999_8888_7777),
+            ..base_config
+        })
+        .expect("scramble world");
+
+        for i in 0..5 {
+            world_plain.spawn_agent(sample_agent(i));
+            world_scramble.spawn_agent(sample_agent(i));
+        }
+
+        for _ in 0..10 {
+            world_plain.step().expect("plain step");
+            world_scramble.step().expect("scramble step");
+        }
+
+        assert_eq!(
+            world_plain.random_streams_checkpoint(),
+            world_scramble.random_streams_checkpoint(),
+            "communication scramble stream must be completely isolated and not draw from world RNG"
+        );
+    }
+
+    #[test]
+    fn scramble_collapses_copy_channel_mutual_information() {
+        let n = 1000;
+        let mut e = Vec::with_capacity(n);
+        let mut r = Vec::with_capacity(n);
+        for i in 0..n {
+            let val = f64::from(u8::from(!i.is_multiple_of(2)));
+            e.push(val);
+            r.push(val);
+        }
+        let params = infotheory::MiParams {
+            bins: 2,
+            surrogate_runs: 50,
+            bootstrap_runs: 50,
+            seed: 42,
+        };
+        let est_clean = infotheory::compute_mi(&e, &r, &params).unwrap();
+        assert!(
+            (est_clean.bits_corrected - 1.0).abs() < 0.05,
+            "Clean copy channel should be ~1 bit, got {}",
+            est_clean.bits_corrected
+        );
+
+        let mut r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
+        let mut stream = SmallRngStream::seed_from_u64(0xC0DE_5C8A_1234);
+        scramble_hearing_slice(&mut r_f32, &mut stream);
+        let r_scrambled: Vec<f64> = r_f32.iter().map(|&v| f64::from(v)).collect();
+
+        let est_scrambled = infotheory::compute_mi(&e, &r_scrambled, &params).unwrap();
+        assert!(
+            est_scrambled.bits_corrected < 0.05,
+            "Scrambled copy channel MI must collapse to ~0, got {}",
+            est_scrambled.bits_corrected
+        );
+    }
+
+    #[test]
+    fn config_validation_checks_stillness_speed_threshold() {
+        let mut config = ScriptBotsConfig::default();
+        config.stillness_speed_threshold = -0.01;
+        assert!(config.validate().is_err());
+
+        config.stillness_speed_threshold = f32::NAN;
+        assert!(config.validate().is_err());
+
+        config.stillness_speed_threshold = 0.0;
+        assert!(config.validate().is_ok());
+
+        config.stillness_speed_threshold = 0.05;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
