@@ -33541,7 +33541,7 @@ mod tests {
             // mints uids from its own counter, so island 0 and island 1 both hold agent 1 --
             // and V15's lifted unique indexes make that storable. The Rust-side ancestry guard
             // still refuses it because it reasons run-scoped;
-            // `ancestry_coherence_is_run_scoped_and_refuses_per_island_uid_reuse` pins that,
+            // `per_island_ancestry_guards_admit_real_islands_and_still_reject_wrong_arrivals` pins that,
             // and this test sidesteps it so it can measure the per-table partition instead.
             let uid = u64::try_from(island)? + 1;
             arrival.births = vec![sample_birth(arrival_tick, uid, BirthOrigin::Born)];
@@ -34388,7 +34388,7 @@ mod tests {
             let mut batch = sample_batch(BARRIER_TICK, 5.5);
             // Distinct uids per island: the run-scoped arrival guard still refuses the reuse an
             // archipelago actually produces, which is the next item on this bead and is pinned
-            // by `ancestry_coherence_is_run_scoped_and_refuses_per_island_uid_reuse`.
+            // by `per_island_ancestry_guards_admit_real_islands_and_still_reject_wrong_arrivals`.
             let uid = u64::try_from(island)? + 1;
             batch.births = vec![sample_birth(BARRIER_TICK, uid, BirthOrigin::Born)];
             batch.summary.births = 1;
@@ -39008,6 +39008,202 @@ mod tests {
         storage.close()?;
         eprintln!("retained archive fixture: {}", path.display());
         Ok(())
+    }
+
+    /// Defence 3 (bd-akjh / bd-0oro): Every declared capability must have a consumer.
+    ///
+    /// A table, knob, or public API with no writer and no reader is a capability claim
+    /// with nothing behind it (instance 15).
+    ///
+    /// This guard extracts all `CREATE TABLE` definitions across schema revisions in this
+    /// crate and asserts that every declared table has a production writer (`INSERT INTO <table>`),
+    /// or is explicitly exempted with a tracking bead and rationale.
+    mod declared_schema_capability_guard {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// Explicitly reviewed exemptions for declared schema tables that lack a production writer.
+        ///
+        /// (table_name, tracking_bead, rationale)
+        ///
+        /// Defence 3 (bd-akjh / bd-0oro): Every declared capability must have a consumer.
+        /// A table, knob, or public API with no writer and no reader is a capability claim
+        /// with nothing behind it (instance 15).
+        ///
+        /// IMPORTANT: Like the acknowledgement guard exemptions in scriptbots-bevy (bd-h3nt),
+        /// these exemptions cover strictly the declared-table capability form (absence of
+        /// production writer in this crate, e.g. legacy/frozen DDL tables superseded by newer
+        /// schema revisions) and disclaim wider immunity from bd-0oro rules on signals outrunning
+        /// their evidence.
+        const EXEMPT_SCHEMA_TABLES: &[(&str, &str, &str)] = &[
+            (
+                "artifacts",
+                "bd-0oro",
+                "legacy V6 table superseded by run-scoped artifacts; retained in frozen DDL for schema migration compatibility (outside the UNWRITTEN-TABLE capability form: not exempt from wider bd-0oro signals-outrunning-evidence rules)",
+            ),
+            (
+                "command_status_transitions",
+                "bd-0oro",
+                "legacy V6 table superseded by host_command_application_transitions and host_command_storage_transitions in V9; retained in frozen DDL for schema migration compatibility (outside the UNWRITTEN-TABLE capability form: not exempt from wider bd-0oro signals-outrunning-evidence rules)",
+            ),
+            (
+                "commands",
+                "bd-0oro",
+                "legacy V6 table superseded by host_command_records in V9; retained in frozen DDL for schema migration compatibility (outside the UNWRITTEN-TABLE capability form: not exempt from wider bd-0oro signals-outrunning-evidence rules)",
+            ),
+            (
+                "domain_events",
+                "bd-0oro",
+                "legacy V6 table superseded by host_domain_events in V8; retained in frozen DDL for schema migration compatibility (outside the UNWRITTEN-TABLE capability form: not exempt from wider bd-0oro signals-outrunning-evidence rules)",
+            ),
+            (
+                "state_digests",
+                "bd-0oro",
+                "legacy V6 table; state digest checkpoints are persisted in checkpoints table; retained in frozen DDL for schema migration compatibility (outside the UNWRITTEN-TABLE capability form: not exempt from wider bd-0oro signals-outrunning-evidence rules)",
+            ),
+        ];
+
+        fn extract_declared_tables(source: &str) -> BTreeSet<String> {
+            let mut tables = BTreeSet::new();
+            for line in source.lines() {
+                let trimmed = line.trim();
+                let lower = trimmed.to_ascii_lowercase();
+                for prefix in ["create table if not exists ", "create table "] {
+                    if let Some(rest) = lower.strip_prefix(prefix) {
+                        let table = rest.split([' ', '(']).next().unwrap_or("").trim();
+                        if !table.is_empty()
+                            && !table.starts_with('_')
+                            && !table.ends_with("_fts")
+                            && !table.ends_with("_pre_v18")
+                        {
+                            tables.insert(table.to_string());
+                        }
+                    }
+                }
+            }
+            tables
+        }
+
+        fn extract_production_writers(prod_source: &str) -> BTreeSet<String> {
+            let mut writers = BTreeSet::new();
+            for line in prod_source.lines() {
+                let trimmed = line.trim();
+                let lower = trimmed.to_ascii_lowercase();
+                if let Some(idx) = lower.find("into ") {
+                    let after = lower[idx + 5..].trim();
+                    let table = after.split([' ', '(', '\n']).next().unwrap_or("").trim();
+                    if !table.is_empty() && !table.starts_with('_') && !table.ends_with("_pre_v18")
+                    {
+                        writers.insert(table.to_string());
+                    }
+                }
+            }
+            writers
+        }
+
+        fn production_source() -> &'static str {
+            let full_source = include_str!("lib.rs");
+            let marker = "\n#[cfg(test)]\nmod tests {";
+            full_source
+                .split(marker)
+                .next()
+                .expect("storage crate must have production code before mod tests")
+        }
+
+        #[test]
+        fn every_declared_schema_table_has_a_production_writer_or_explicit_exemption() {
+            let prod_source = production_source();
+            let tables = extract_declared_tables(prod_source);
+            assert!(
+                tables.len() >= 25,
+                "declared table sweep found only {} tables; parser is broken",
+                tables.len()
+            );
+            let writers = extract_production_writers(prod_source);
+            let exempt: BTreeMap<&str, (&str, &str)> = EXEMPT_SCHEMA_TABLES
+                .iter()
+                .map(|(table, bead, why)| (*table, (*bead, *why)))
+                .collect();
+
+            let mut unwritten_without_exemption = Vec::new();
+            for table in &tables {
+                let has_writer = writers.contains(table.as_str());
+                if !has_writer && !exempt.contains_key(table.as_str()) {
+                    unwritten_without_exemption.push(table.clone());
+                }
+            }
+
+            assert!(
+                unwritten_without_exemption.is_empty(),
+                "tables declared in schema have no production writer and no exemption: {unwritten_without_exemption:?}. \
+                 A declared table with no writer is a capability claim with nothing behind it (bd-akjh / bd-0oro instance 15). \
+                 Either implement the production writer or add an explicit exemption with a tracking bead."
+            );
+        }
+
+        /// Every exemption must name a tracking bead and qualify that it covers only
+        /// the unwritten-table form, disclaiming wider immunity from bd-0oro.
+        #[test]
+        fn every_exemption_names_a_bead_and_qualifies_only_unwritten_table_form() {
+            for (table, bead, why) in EXEMPT_SCHEMA_TABLES {
+                assert!(
+                    bead.starts_with("bd-"),
+                    "exemption for table '{table}' must name a tracking bead, got: {bead}"
+                );
+                assert!(
+                    why.contains("outside the UNWRITTEN-TABLE capability form")
+                        && why.contains("bd-0oro"),
+                    "exemption for table '{table}' must qualify that it covers only the \
+                     unwritten-table form and disclaim wider bd-0oro immunity, got: {why}"
+                );
+            }
+        }
+
+        /// Exemptions must not rot: if a declared table in the exemption list acquires
+        /// an actual production writer, the exemption is stale and must be removed.
+        #[test]
+        fn no_exemption_is_stale() {
+            let prod_source = production_source();
+            let writers = extract_production_writers(prod_source);
+            let mut stale = Vec::new();
+            for (table, bead, _) in EXEMPT_SCHEMA_TABLES {
+                if writers.contains(*table) {
+                    stale.push(format!("{table} ({bead})"));
+                }
+            }
+            assert!(
+                stale.is_empty(),
+                "these declared tables are exempt but now have production writers; \
+                 remove them from EXEMPT_SCHEMA_TABLES: {stale:?}"
+            );
+        }
+
+        /// The guard must actively detect an unwritten table that is not exempt.
+        #[test]
+        fn guard_detects_an_unwritten_table() {
+            let prod_source = production_source();
+            let mut tables = extract_declared_tables(prod_source);
+            let synthetic = "totally_unwritten_synthetic_table_bd_akjh";
+            tables.insert(synthetic.to_string());
+
+            let writers = extract_production_writers(prod_source);
+            let exempt: BTreeMap<&str, (&str, &str)> = EXEMPT_SCHEMA_TABLES
+                .iter()
+                .map(|(table, bead, why)| (*table, (*bead, *why)))
+                .collect();
+
+            let mut unwritten = Vec::new();
+            for table in &tables {
+                let has_writer = writers.contains(table.as_str());
+                if !has_writer && !exempt.contains_key(table.as_str()) {
+                    unwritten.push(table.clone());
+                }
+            }
+            assert_eq!(
+                unwritten,
+                vec![synthetic.to_string()],
+                "the guard must catch the synthetic unwritten table"
+            );
+        }
     }
 
     mod lab_runtime_chaos {
