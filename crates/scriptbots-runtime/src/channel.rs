@@ -56,7 +56,7 @@ pub const DEFAULT_CHANNEL_INGRESS_DRAIN_BUDGET: usize = 64;
 /// Default bound for mirrored command statuses and protocol events.
 pub const DEFAULT_CHANNEL_BOARD_CAPACITY: usize = 4_096;
 /// Default worst-case wait for ingress space or an admission reply.
-pub const DEFAULT_CHANNEL_SUBMIT_DEADLINE: Duration = Duration::from_millis(2_000);
+pub const DEFAULT_CHANNEL_SUBMIT_DEADLINE: Duration = Duration::from_millis(10_000);
 /// Default polling cadence while journal or shutdown work drains.
 pub const DEFAULT_CHANNEL_MAINTENANCE_PERIOD: Duration = Duration::from_millis(20);
 /// Maximum retained contributors in an on-demand focused-agent explanation.

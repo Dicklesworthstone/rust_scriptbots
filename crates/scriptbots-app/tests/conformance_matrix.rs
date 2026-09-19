@@ -244,13 +244,13 @@ fn initialize_mcp(mcp_addr: SocketAddr) -> Value {
 fn test_mcp_protocol_negotiation_and_tool_discovery() {
     let fixture = setup_conformance_fixture();
 
-    // 1. Unsupported protocolVersion on uninitialized session returns typed error code -32602.
+    // 1. Malformed protocolVersion parameter type returns typed error code -32602.
     let (status_bad, bad_res) = mcp_json_rpc(
         fixture.mcp_addr,
         Some(99),
         "initialize",
         Some(serde_json::json!({
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": 42,
             "capabilities": {},
             "clientInfo": { "name": "bad-version", "version": "1.0" }
         })),
@@ -261,9 +261,26 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
     assert_eq!(bad_res["error"]["code"], -32602);
     let msg = bad_res["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains("Unsupported protocol version"),
-        "error message should explain unsupported version: {msg}"
+        !msg.is_empty(),
+        "error message should explain invalid parameter: {msg}"
     );
+
+    // 1b. Future protocolVersion string negotiates down to supported version 2024-11-05.
+    let (status_future, future_res) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(100),
+        "initialize",
+        Some(serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "future-version", "version": "1.0" }
+        })),
+    )
+    .expect("mcp future version initialize");
+    assert_eq!(status_future, 200);
+    assert_eq!(future_res["id"], 100);
+    assert!(future_res.get("error").is_none());
+    assert_eq!(future_res["result"]["protocolVersion"], "2024-11-05");
 
     // 2. Valid protocolVersion 2024-11-05 negotiates successfully.
     let init_res = initialize_mcp(fixture.mcp_addr);

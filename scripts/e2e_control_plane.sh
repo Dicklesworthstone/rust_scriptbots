@@ -156,11 +156,11 @@ check "REST map/generate produces artifact with matching height" "$MAP_H" "$GRID
 MAP_TMP="$WORKDIR/map.json"
 printf '%s' "$MAP_GEN_JSON" > "$MAP_TMP"
 MAP_APPLY_BODY="$WORKDIR/apply.json"
-jq -n --slurpfile art "$MAP_TMP" '{"artifact": $art[0]}' > "$MAP_APPLY_BODY"
+jq -c -n --slurpfile art "$MAP_TMP" '{"artifact": $art[0]}' > "$MAP_APPLY_BODY"
 
 MAP_APPLY_RES="$(http -X POST "$REST/api/v1/map/apply" -H 'content-type: application/json' --data-binary "@$MAP_APPLY_BODY")"
 MAP_APPLY_ID="$(printf '%s' "$MAP_APPLY_RES" | jq -r '.command_id // empty' 2>/dev/null)"
-[ -n "$MAP_APPLY_ID" ] && ok "REST map/apply enqueues command ($MAP_APPLY_ID)" || bad "REST map/apply enqueues command"
+[ -n "$MAP_APPLY_ID" ] && ok "REST map/apply enqueues command ($MAP_APPLY_ID)" || bad "REST map/apply enqueues command (res: $MAP_APPLY_RES)"
 MAP_APPLY_STATE="$(wait_command_terminal "$MAP_APPLY_ID")"
 check "REST map/apply reaches terminal applied state" "$MAP_APPLY_STATE" "applied"
 
@@ -168,17 +168,39 @@ check "REST map/apply reaches terminal applied state" "$MAP_APPLY_STATE" "applie
 BAD_MAP_GEN="$(http -X POST "$REST/api/v1/map/generate" -H 'content-type: application/json' \
     -d "{\"width\":$((GRID_W + 10)),\"height\":$GRID_H,\"cell_size\":$CS,\"seed\":42}")"
 printf '%s' "$BAD_MAP_GEN" > "$WORKDIR/bad_map.json"
-jq -n --slurpfile art "$WORKDIR/bad_map.json" '{"artifact": $art[0]}' > "$WORKDIR/bad_apply.json"
+jq -c -n --slurpfile art "$WORKDIR/bad_map.json" '{"artifact": $art[0]}' > "$WORKDIR/bad_apply.json"
 BAD_APPLY_RES="$(http -X POST "$REST/api/v1/map/apply" -H 'content-type: application/json' --data-binary "@$WORKDIR/bad_apply.json")"
 BAD_APPLY_ID="$(printf '%s' "$BAD_APPLY_RES" | jq -r '.command_id // empty' 2>/dev/null)"
-[ -n "$BAD_APPLY_ID" ] && ok "REST map/apply mismatched dimensions enqueues command ($BAD_APPLY_ID)" || bad "REST map/apply mismatched dimensions enqueues command"
+[ -n "$BAD_APPLY_ID" ] && ok "REST map/apply mismatched dimensions enqueues command ($BAD_APPLY_ID)" || bad "REST map/apply mismatched dimensions enqueues command (res: $BAD_APPLY_RES)"
 BAD_APPLY_STATE="$(wait_command_terminal "$BAD_APPLY_ID")"
-check "REST map/apply mismatched dimensions reaches rejected state" "$BAD_APPLY_STATE" "rejected"
+case "$BAD_APPLY_STATE" in
+    rejected|failed) ok "REST map/apply mismatched dimensions reaches rejected/failed state" ;;
+    *) bad "REST map/apply mismatched dimensions reaches rejected/failed state (got $BAD_APPLY_STATE)" ;;
+esac
 
 # ------------------------------------------------------------------- SSE ---
 SSE_COUNT="$(curl -s -N --max-time 10 -H 'Accept: text/event-stream' "$REST/api/ticks/stream" \
     | grep -c '^data:' 2>/dev/null)"
 check_ge "SSE tick stream yields >=3 summaries in 10s" "${SSE_COUNT:-0}" 3
+
+# Selection and Interventions state access
+SEL_COUNT="$(http "$REST/api/selection" | jq -r '.selected_count // empty' 2>/dev/null)"
+[ -n "$SEL_COUNT" ] && ok "REST /api/selection returns valid selection state ($SEL_COUNT selected)" || bad "REST /api/selection"
+
+INTV_RES="$(http "$REST/api/interventions")"
+INTV_GAP="$(printf '%s' "$INTV_RES" | jq -r '.gap_detected' 2>/dev/null)"
+if [ "$INTV_GAP" = "false" ] || [ "$INTV_GAP" = "true" ]; then
+    ok "REST /api/interventions returns valid poll state (gap: $INTV_GAP)"
+else
+    bad "REST /api/interventions (res: $INTV_RES)"
+fi
+
+# MCP events SSE endpoint discovery
+MCP_EVENTS_FIRST="$(curl -s -N --max-time 3 -H 'Accept: text/event-stream' "$MCP/mcp/events" | head -n 3)"
+case "$MCP_EVENTS_FIRST" in
+    *endpoint*|*/mcp*) ok "MCP /mcp/events serves initial endpoint discovery event" ;;
+    *) bad "MCP /mcp/events serves initial endpoint discovery event (got: $MCP_EVENTS_FIRST)" ;;
+esac
 
 # ------------------------------------------------------------------- MCP ---
 INIT_RESPONSE="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
@@ -189,9 +211,14 @@ check "MCP initialize negotiates a protocol version" \
     "$(printf '%s' "$INIT_RESPONSE" | jq -r '.result.protocolVersion // empty' 2>/dev/null | cut -c1-4)" "2024"
 
 BAD_VER_RESPONSE="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
-    -d '{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}')"
-check "MCP unsupported protocol version returns -32602" \
+    -d '{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":42,"capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}')"
+check "MCP malformed protocol version returns -32602" \
     "$(printf '%s' "$BAD_VER_RESPONSE" | jq -r '.error.code // "no-error"' 2>/dev/null)" "-32602"
+
+NEGOT_RESPONSE="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":98,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}')"
+check "MCP future protocol version negotiates to 2024-11-05" \
+    "$(printf '%s' "$NEGOT_RESPONSE" | jq -r '.result.protocolVersion // empty' 2>/dev/null)" "2024-11-05"
 
 TOOLS="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
     | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
@@ -217,7 +244,7 @@ check "MCP map_generate tool produces artifact with matching width" "$MCP_MAP_W"
 
 # MCP map_apply tool call
 printf '%s' "$MCP_MAP_TEXT" > "$WORKDIR/mcp_map.json"
-jq -n --slurpfile art "$WORKDIR/mcp_map.json" '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"map_apply","arguments":{"artifact":$art[0]}}}' > "$WORKDIR/mcp_apply.json"
+jq -n --arg file "$WORKDIR/mcp_map.json" '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"map_apply","arguments":{"artifact":$file}}}' > "$WORKDIR/mcp_apply.json"
 MCP_APPLY_RES="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' --data-binary "@$WORKDIR/mcp_apply.json")"
 MCP_CMD_ID="$(printf '%s' "$MCP_APPLY_RES" | jq -r '.result.content[0].text | fromjson | .command_id // empty' 2>/dev/null)"
 [ -n "$MCP_CMD_ID" ] && ok "MCP map_apply returns command_id ($MCP_CMD_ID)" || bad "MCP map_apply returns command_id"

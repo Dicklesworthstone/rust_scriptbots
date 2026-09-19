@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -31,7 +32,8 @@ fn http_with_body(
     body_bytes: &[u8],
     content_type: Option<&str>,
 ) -> Result<(u16, String)> {
-    let mut stream = TcpStream::connect(addr)?;
+    let mut stream = TcpStream::connect(addr)
+        .with_context(|| format!("connect failed for {method} {path} to {addr}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     let ct_header = match content_type {
         Some(ct) => format!("Content-Type: {ct}\r\n"),
@@ -41,23 +43,31 @@ fn http_with_body(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{ct_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body_bytes.len()
-    )?;
+    )
+    .with_context(|| format!("write header failed for {method} {path} to {addr}"))?;
     if !body_bytes.is_empty() {
-        stream.write_all(body_bytes)?;
+        stream
+            .write_all(body_bytes)
+            .with_context(|| format!("write body failed for {method} {path} to {addr}"))?;
     }
-    stream.flush()?;
+    stream
+        .flush()
+        .with_context(|| format!("flush failed for {method} {path} to {addr}"))?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
+    stream
+        .read_to_end(&mut raw)
+        .with_context(|| format!("read_to_end failed for {method} {path} to {addr}"))?;
     let text = String::from_utf8_lossy(&raw).into_owned();
     let (head, body) = text
         .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow!("malformed HTTP response: {text:?}"))?;
+        .ok_or_else(|| anyhow!("malformed HTTP response for {method} {path}: {text:?}"))?;
     let status: u16 = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1).map(str::to_string))
-        .ok_or_else(|| anyhow!("no status line in {head:?}"))?
-        .parse()?;
+        .ok_or_else(|| anyhow!("no status line in {head:?} for {method} {path}"))?
+        .parse()
+        .with_context(|| format!("parse status line for {method} {path}"))?;
     Ok((status, body.to_string()))
 }
 
@@ -119,53 +129,58 @@ impl Drop for ChildGuard {
     }
 }
 
+type ServerLog = Arc<Mutex<Vec<String>>>;
+type ServerEndpoints = (SocketAddr, SocketAddr, ServerLog);
+
 /// Read the child's stderr until both REST and MCP listeners announce their bound addresses.
-fn wait_for_control_addresses(
-    child: &mut Child,
-    timeout: Duration,
-) -> Result<(SocketAddr, SocketAddr, Vec<String>)> {
+fn wait_for_control_addresses(child: &mut Child, timeout: Duration) -> Result<ServerEndpoints> {
     let stderr = child
         .stderr
         .take()
         .ok_or_else(|| anyhow!("child stderr was not captured"))?;
 
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = Arc::clone(&log);
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(std::result::Result::ok) {
-            if tx.send(line).is_err() {
-                break;
+            let trimmed = line.trim_end().to_string();
+            if let Ok(mut l) = log_clone.lock() {
+                l.push(trimmed.clone());
             }
+            let _ = tx.send(trimmed);
         }
     });
 
     let deadline = Instant::now() + timeout;
-    let mut log = Vec::new();
     let mut rest_addr: Option<SocketAddr> = None;
     let mut mcp_addr: Option<SocketAddr> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            let log_dump = log.lock().map_or_else(
+                |_| "<log poisoned>".to_string(),
+                |l| {
+                    l.iter()
+                        .rev()
+                        .take(40)
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                },
+            );
             bail!(
                 "timed out after {timeout:?} waiting for REST/MCP listeners; child alive={}; \
-                 rest={:?}, mcp={:?}; last {} stderr lines:\n{}",
+                 rest={:?}, mcp={:?}; last lines:\n{log_dump}",
                 child.try_wait().ok().flatten().is_none(),
                 rest_addr,
                 mcp_addr,
-                log.len().min(40),
-                log.iter()
-                    .rev()
-                    .take(40)
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n")
             );
         }
         match rx.recv_timeout(remaining) {
-            Ok(line) => {
-                let trimmed = line.trim_end().to_string();
-                log.push(trimmed.clone());
+            Ok(trimmed) => {
                 if trimmed.contains("REST control server listening")
                     && let Some(parsed) = parse_announced_address(&trimmed)
                 {
@@ -181,21 +196,27 @@ fn wait_for_control_addresses(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => bail!(
-                "child stderr closed before announcing listeners; child alive={}; \
-                 rest={:?}, mcp={:?}; last {} lines:\n{}",
-                child.try_wait().ok().flatten().is_none(),
-                rest_addr,
-                mcp_addr,
-                log.len().min(40),
-                log.iter()
-                    .rev()
-                    .take(40)
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let log_dump = log.lock().map_or_else(
+                    |_| "<log poisoned>".to_string(),
+                    |l| {
+                        l.iter()
+                            .rev()
+                            .take(40)
+                            .rev()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    },
+                );
+                bail!(
+                    "child stderr closed before announcing listeners; child alive={}; \
+                     rest={:?}, mcp={:?}; last lines:\n{log_dump}",
+                    child.try_wait().ok().flatten().is_none(),
+                    rest_addr,
+                    mcp_addr,
+                );
+            }
         }
     }
 }
@@ -239,7 +260,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         .spawn()
         .context("failed to spawn the shipped binary")?;
 
-    let (rest_addr, mcp_addr, boot_log) =
+    let (rest_addr, mcp_addr, server_log) =
         match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
             Ok(found) => found,
             Err(error) => {
@@ -250,574 +271,602 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         };
     let mut guard = ChildGuard(Some(child));
 
-    // (1) REST /api/status is reachable and reports live world state.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut status_val: serde_json::Value = serde_json::Value::Null;
-    let mut status_code = 0;
-    while Instant::now() < deadline {
-        if let Ok((code, body)) = http(rest_addr, "GET", "/api/status") {
-            status_code = code;
-            if code == 200
-                && let Ok(v) = serde_json::from_str(&body)
+    let outcome: Result<()> = (|| {
+        // (1) REST /api/status is reachable and reports live world state.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut status_val: serde_json::Value = serde_json::Value::Null;
+        let mut status_code = 0;
+        while Instant::now() < deadline {
+            if let Ok((code, body)) = http(rest_addr, "GET", "/api/status") {
+                status_code = code;
+                if code == 200
+                    && let Ok(v) = serde_json::from_str(&body)
+                {
+                    status_val = v;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            status_code, 200,
+            "the shipped binary must serve /api/status in --mode server, got {status_code}"
+        );
+        assert!(
+            status_val["agent_count"].as_u64().unwrap_or(0) >= 1,
+            "world must report a live founding population; got: {status_val:?}"
+        );
+
+        // (2) REST metadata reads: OpenAPI and Knobs
+        let (open_code, open_body) = http(rest_addr, "GET", "/api-docs/openapi.json")?;
+        assert_eq!(open_code, 200, "openapi endpoint must return 200");
+        let open_json: serde_json::Value = serde_json::from_str(&open_body)?;
+        let paths_count = open_json["paths"].as_object().map_or(0, |p| p.len());
+        assert!(
+            paths_count >= 29,
+            "openapi must publish >= 29 paths, found {paths_count}"
+        );
+
+        let (knobs_code, knobs_body) = http(rest_addr, "GET", "/api/knobs")?;
+        assert_eq!(knobs_code, 200, "knobs endpoint must return 200");
+        let knobs_json: serde_json::Value = serde_json::from_str(&knobs_body)?;
+        let knobs_count = knobs_json.as_array().map_or(0, |a| a.len());
+        assert!(
+            knobs_count >= 100,
+            "knobs roster must publish >= 100 knobs, found {knobs_count}"
+        );
+
+        // (3) Two-axis playback semantics: Pause
+        let (pause_code, pause_body) = http(rest_addr, "POST", "/api/control/pause")?;
+        assert_eq!(
+            pause_code, 200,
+            "pause must be accepted, got {pause_code}: {pause_body}"
+        );
+        let pause_id = json_str(&pause_body, "command_id")
+            .ok_or_else(|| anyhow!("pause response carried no command_id: {pause_body}"))?;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut pause_app_state = String::new();
+        let mut journal_state = String::new();
+        let mut receipt_body = String::new();
+        while Instant::now() < deadline {
+            let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{pause_id}"))?;
+            if code == 200 {
+                receipt_body = body.clone();
+                pause_app_state = json_str(&body, "application_state").unwrap_or_default();
+                journal_state = json_str(&body, "journal_state").unwrap_or_default();
+                if pause_app_state == "applied" {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            pause_app_state, "applied",
+            "the pause command must reach the WORLD, not merely the queue; receipt: {receipt_body}"
+        );
+        assert!(
+            !journal_state.is_empty(),
+            "the receipt must report a journal state, even if it is not_required: {receipt_body}"
+        );
+
+        // Verify ticks are frozen
+        std::thread::sleep(Duration::from_millis(150));
+        let (_, b1) = http(rest_addr, "GET", "/api/status")?;
+        let f1: serde_json::Value = serde_json::from_str(&b1)?;
+        let tick1 = f1["tick"].as_u64().expect("tick u64");
+        std::thread::sleep(Duration::from_millis(150));
+        let (_, b2) = http(rest_addr, "GET", "/api/status")?;
+        let f2: serde_json::Value = serde_json::from_str(&b2)?;
+        let tick2 = f2["tick"].as_u64().expect("tick u64");
+        assert_eq!(
+            tick2, tick1,
+            "pause must freeze world ticks; got {tick1} then {tick2}"
+        );
+
+        // (4) Single step: exactly one tick, remains paused
+        let (step_code, step_body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/control/step",
+            b"{\"count\":1}",
+            Some("application/json"),
+        )?;
+        assert_eq!(step_code, 200, "step must be accepted: {step_body}");
+        let step_id = json_str(&step_body, "command_id")
+            .ok_or_else(|| anyhow!("step response carried no command_id: {step_body}"))?;
+
+        let step_deadline = Instant::now() + Duration::from_secs(30);
+        let mut step_app_state = String::new();
+        while Instant::now() < step_deadline {
+            let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{step_id}"))?;
+            if code == 200 {
+                step_app_state = json_str(&body, "application_state").unwrap_or_default();
+                if step_app_state == "applied" {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            step_app_state, "applied",
+            "step command must reach applied state"
+        );
+
+        let (_, b_step) = http(rest_addr, "GET", "/api/status")?;
+        let v_step: serde_json::Value = serde_json::from_str(&b_step)?;
+        let tick_step = v_step["tick"].as_u64().expect("tick u64");
+        assert_eq!(
+            tick_step,
+            tick2 + 1,
+            "step count 1 must advance tick by exactly 1"
+        );
+
+        std::thread::sleep(Duration::from_millis(150));
+        let (_, b_step2) = http(rest_addr, "GET", "/api/status")?;
+        let v_step2: serde_json::Value = serde_json::from_str(&b_step2)?;
+        let tick_step2 = v_step2["tick"].as_u64().expect("tick u64");
+        assert_eq!(tick_step2, tick_step, "stepped world must remain paused");
+
+        // (5) Resume: unfreezes the world
+        let (resume_code, resume_body) = http(rest_addr, "POST", "/api/control/resume")?;
+        assert_eq!(resume_code, 200, "resume must be accepted: {resume_body}");
+        let resume_id = json_str(&resume_body, "command_id")
+            .ok_or_else(|| anyhow!("resume response carried no command_id: {resume_body}"))?;
+
+        let res_deadline = Instant::now() + Duration::from_secs(30);
+        let mut res_app_state = String::new();
+        while Instant::now() < res_deadline {
+            let (code, body) = http(
+                rest_addr,
+                "GET",
+                &format!("/api/control/status/{resume_id}"),
+            )?;
+            if code == 200 {
+                res_app_state = json_str(&body, "application_state").unwrap_or_default();
+                if res_app_state == "applied" {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            res_app_state, "applied",
+            "resume command must reach applied state"
+        );
+
+        let advance_deadline = Instant::now() + Duration::from_secs(30);
+        let mut advanced = false;
+        while Instant::now() < advance_deadline {
+            if let Ok((code, body)) = http(rest_addr, "GET", "/api/status")
+                && code == 200
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(t) = v["tick"].as_u64()
+                && t > tick_step
             {
-                status_val = v;
+                advanced = true;
                 break;
             }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert_eq!(
-        status_code, 200,
-        "the shipped binary must serve /api/status in --mode server, got {status_code}"
-    );
-    assert!(
-        status_val["agent_count"].as_u64().unwrap_or(0) >= 1,
-        "world must report a live founding population; got: {status_val:?}"
-    );
+        assert!(
+            advanced,
+            "resume must unfreeze world ticks past {tick_step}"
+        );
 
-    // (2) REST metadata reads: OpenAPI and Knobs
-    let (open_code, open_body) = http(rest_addr, "GET", "/api-docs/openapi.json")?;
-    assert_eq!(open_code, 200, "openapi endpoint must return 200");
-    let open_json: serde_json::Value = serde_json::from_str(&open_body)?;
-    let paths_count = open_json["paths"].as_object().map_or(0, |p| p.len());
-    assert!(
-        paths_count >= 29,
-        "openapi must publish >= 29 paths, found {paths_count}"
-    );
+        // (6) Negative paths: malformed payload/identifier and a valid unknown ID.
+        let (bad_step_code, _) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/control/step",
+            b"not-json",
+            Some("application/json"),
+        )?;
+        assert_eq!(bad_step_code, 400, "malformed step payload must return 400");
 
-    let (knobs_code, knobs_body) = http(rest_addr, "GET", "/api/knobs")?;
-    assert_eq!(knobs_code, 200, "knobs endpoint must return 200");
-    let knobs_json: serde_json::Value = serde_json::from_str(&knobs_body)?;
-    let knobs_count = knobs_json.as_array().map_or(0, |a| a.len());
-    assert!(
-        knobs_count >= 100,
-        "knobs roster must publish >= 100 knobs, found {knobs_count}"
-    );
-
-    // (3) Two-axis playback semantics: Pause
-    let (pause_code, pause_body) = http(rest_addr, "POST", "/api/control/pause")?;
-    assert_eq!(
-        pause_code, 200,
-        "pause must be accepted, got {pause_code}: {pause_body}"
-    );
-    let pause_id = json_str(&pause_body, "command_id")
-        .ok_or_else(|| anyhow!("pause response carried no command_id: {pause_body}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut pause_app_state = String::new();
-    let mut journal_state = String::new();
-    let mut receipt_body = String::new();
-    while Instant::now() < deadline {
-        let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{pause_id}"))?;
-        if code == 200 {
-            receipt_body = body.clone();
-            pause_app_state = json_str(&body, "application_state").unwrap_or_default();
-            journal_state = json_str(&body, "journal_state").unwrap_or_default();
-            if pause_app_state == "applied" {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert_eq!(
-        pause_app_state, "applied",
-        "the pause command must reach the WORLD, not merely the queue; receipt: {receipt_body}"
-    );
-    assert!(
-        !journal_state.is_empty(),
-        "the receipt must report a journal state, even if it is not_required: {receipt_body}"
-    );
-
-    // Verify ticks are frozen
-    std::thread::sleep(Duration::from_millis(150));
-    let (_, b1) = http(rest_addr, "GET", "/api/status")?;
-    let f1: serde_json::Value = serde_json::from_str(&b1)?;
-    let tick1 = f1["tick"].as_u64().expect("tick u64");
-    std::thread::sleep(Duration::from_millis(150));
-    let (_, b2) = http(rest_addr, "GET", "/api/status")?;
-    let f2: serde_json::Value = serde_json::from_str(&b2)?;
-    let tick2 = f2["tick"].as_u64().expect("tick u64");
-    assert_eq!(
-        tick2, tick1,
-        "pause must freeze world ticks; got {tick1} then {tick2}"
-    );
-
-    // (4) Single step: exactly one tick, remains paused
-    let (step_code, step_body) = http_with_body(
-        rest_addr,
-        "POST",
-        "/api/control/step",
-        b"{\"count\":1}",
-        Some("application/json"),
-    )?;
-    assert_eq!(step_code, 200, "step must be accepted: {step_body}");
-    let step_id = json_str(&step_body, "command_id")
-        .ok_or_else(|| anyhow!("step response carried no command_id: {step_body}"))?;
-
-    let step_deadline = Instant::now() + Duration::from_secs(30);
-    let mut step_app_state = String::new();
-    while Instant::now() < step_deadline {
-        let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{step_id}"))?;
-        if code == 200 {
-            step_app_state = json_str(&body, "application_state").unwrap_or_default();
-            if step_app_state == "applied" {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert_eq!(
-        step_app_state, "applied",
-        "step command must reach applied state"
-    );
-
-    let (_, b_step) = http(rest_addr, "GET", "/api/status")?;
-    let v_step: serde_json::Value = serde_json::from_str(&b_step)?;
-    let tick_step = v_step["tick"].as_u64().expect("tick u64");
-    assert_eq!(
-        tick_step,
-        tick2 + 1,
-        "step count 1 must advance tick by exactly 1"
-    );
-
-    std::thread::sleep(Duration::from_millis(150));
-    let (_, b_step2) = http(rest_addr, "GET", "/api/status")?;
-    let v_step2: serde_json::Value = serde_json::from_str(&b_step2)?;
-    let tick_step2 = v_step2["tick"].as_u64().expect("tick u64");
-    assert_eq!(tick_step2, tick_step, "stepped world must remain paused");
-
-    // (5) Resume: unfreezes the world
-    let (resume_code, resume_body) = http(rest_addr, "POST", "/api/control/resume")?;
-    assert_eq!(resume_code, 200, "resume must be accepted: {resume_body}");
-    let resume_id = json_str(&resume_body, "command_id")
-        .ok_or_else(|| anyhow!("resume response carried no command_id: {resume_body}"))?;
-
-    let res_deadline = Instant::now() + Duration::from_secs(30);
-    let mut res_app_state = String::new();
-    while Instant::now() < res_deadline {
-        let (code, body) = http(
+        let (malformed_id_code, _) =
+            http(rest_addr, "GET", "/api/control/status/no-such-command-xyz")?;
+        assert_eq!(
+            malformed_id_code, 400,
+            "malformed command ID must return 400"
+        );
+        let unknown_id = scriptbots_runtime::CommandId::new(u128::MAX);
+        let (not_found_code, _) = http(
             rest_addr,
             "GET",
-            &format!("/api/control/status/{resume_id}"),
+            &format!("/api/control/status/{unknown_id}"),
         )?;
-        if code == 200 {
-            res_app_state = json_str(&body, "application_state").unwrap_or_default();
-            if res_app_state == "applied" {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert_eq!(
-        res_app_state, "applied",
-        "resume command must reach applied state"
-    );
+        assert_eq!(
+            not_found_code, 404,
+            "unknown command status must return 404"
+        );
 
-    let advance_deadline = Instant::now() + Duration::from_secs(30);
-    let mut advanced = false;
-    while Instant::now() < advance_deadline {
-        if let Ok((code, body)) = http(rest_addr, "GET", "/api/status")
-            && code == 200
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
-            && let Some(t) = v["tick"].as_u64()
-            && t > tick_step
-        {
-            advanced = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        advanced,
-        "resume must unfreeze world ticks past {tick_step}"
-    );
-
-    // (6) Negative paths: malformed payload/identifier and a valid unknown ID.
-    let (bad_step_code, _) = http_with_body(
-        rest_addr,
-        "POST",
-        "/api/control/step",
-        b"not-json",
-        Some("application/json"),
-    )?;
-    assert_eq!(bad_step_code, 400, "malformed step payload must return 400");
-
-    let (malformed_id_code, _) = http(rest_addr, "GET", "/api/control/status/no-such-command-xyz")?;
-    assert_eq!(
-        malformed_id_code, 400,
-        "malformed command ID must return 400"
-    );
-    let unknown_id = scriptbots_runtime::CommandId::new(u128::MAX);
-    let (not_found_code, _) = http(
-        rest_addr,
-        "GET",
-        &format!("/api/control/status/{unknown_id}"),
-    )?;
-    assert_eq!(
-        not_found_code, 404,
-        "unknown command status must return 404"
-    );
-
-    // (7) Terminal unpresented screenshot refusal
-    let (shot_code, shot_body) = http(rest_addr, "GET", "/api/screenshot/ascii")?;
-    assert_eq!(
-        shot_code, 409,
-        "--mode server presents no terminal frame, so the endpoint must refuse \
+        // (7) Terminal unpresented screenshot refusal
+        let (shot_code, shot_body) = http(rest_addr, "GET", "/api/screenshot/ascii")?;
+        assert_eq!(
+            shot_code, 409,
+            "--mode server presents no terminal frame, so the endpoint must refuse \
          rather than substitute a re-rasterized world map; got {shot_code}: {shot_body}"
-    );
-    assert!(
-        shot_body.contains("no terminal frame has been presented"),
-        "the refusal must explain itself: {shot_body}"
-    );
-    assert!(
-        shot_body.contains("re-rasterized"),
-        "and must name what it is deliberately not doing, so the fallback is not \
+        );
+        assert!(
+            shot_body.contains("no terminal frame has been presented"),
+            "the refusal must explain itself: {shot_body}"
+        );
+        assert!(
+            shot_body.contains("re-rasterized"),
+            "and must name what it is deliberately not doing, so the fallback is not \
          restored as a convenience: {shot_body}"
-    );
+        );
 
-    // (7b) REST map generation and application
-    let gen_payload = br#"{"width":120,"height":60,"cell_size":50,"seed":42}"#;
-    let (gen_code, gen_body) = http_with_body(
-        rest_addr,
-        "POST",
-        "/api/v1/map/generate",
-        gen_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(gen_code, 200, "REST map generate must succeed: {gen_body}");
-    let gen_json: serde_json::Value = serde_json::from_str(&gen_body)?;
-    assert_eq!(gen_json["terrain"]["width"], 120);
-    assert_eq!(gen_json["terrain"]["height"], 60);
-
-    let apply_req = serde_json::json!({ "artifact": gen_json });
-    let apply_payload = serde_json::to_vec(&apply_req)?;
-    let (apply_code, apply_body) = http_with_body(
-        rest_addr,
-        "POST",
-        "/api/v1/map/apply",
-        &apply_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(apply_code, 200, "REST map apply must succeed: {apply_body}");
-    let apply_id = json_str(&apply_body, "command_id")
-        .ok_or_else(|| anyhow!("map apply carried no command_id: {apply_body}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut map_apply_state = String::new();
-    while Instant::now() < deadline {
-        let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{apply_id}"))?;
-        if code == 200 {
-            map_apply_state = json_str(&body, "application_state").unwrap_or_default();
-            if map_apply_state == "applied" {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert_eq!(
-        map_apply_state, "applied",
-        "map apply must reach applied state"
-    );
-
-    // Negative REST control: mismatched dimensions
-    let bad_gen_payload = br#"{"width":130,"height":60,"cell_size":50,"seed":42}"#;
-    let (_, bad_gen_body) = http_with_body(
-        rest_addr,
-        "POST",
-        "/api/v1/map/generate",
-        bad_gen_payload,
-        Some("application/json"),
-    )?;
-    let bad_gen_json: serde_json::Value = serde_json::from_str(&bad_gen_body)?;
-    let bad_apply_req = serde_json::json!({ "artifact": bad_gen_json });
-    let bad_apply_payload = serde_json::to_vec(&bad_apply_req)?;
-    let (bad_apply_code, bad_apply_body) = http_with_body(
-        rest_addr,
-        "POST",
-        "/api/v1/map/apply",
-        &bad_apply_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        bad_apply_code, 200,
-        "bad map apply command must be enqueued: {bad_apply_body}"
-    );
-    let bad_apply_id = json_str(&bad_apply_body, "command_id")
-        .ok_or_else(|| anyhow!("bad map apply carried no command_id: {bad_apply_body}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut bad_map_apply_state = String::new();
-    while Instant::now() < deadline {
-        let (code, body) = http(
+        // (7b) REST map generation and application
+        let gen_payload = br#"{"width":120,"height":60,"cell_size":50,"seed":42}"#;
+        let (gen_code, gen_body) = http_with_body(
             rest_addr,
-            "GET",
-            &format!("/api/control/status/{bad_apply_id}"),
+            "POST",
+            "/api/v1/map/generate",
+            gen_payload,
+            Some("application/json"),
         )?;
-        if code == 200 {
-            bad_map_apply_state = json_str(&body, "application_state").unwrap_or_default();
-            if bad_map_apply_state == "rejected" {
+        assert_eq!(gen_code, 200, "REST map generate must succeed: {gen_body}");
+        let gen_json: serde_json::Value = serde_json::from_str(&gen_body)?;
+        assert_eq!(gen_json["terrain"]["width"], 120);
+        assert_eq!(gen_json["terrain"]["height"], 60);
+
+        let apply_req = serde_json::json!({ "artifact": gen_json });
+        let apply_payload = serde_json::to_vec(&apply_req)?;
+        let (apply_code, apply_body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/map/apply",
+            &apply_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(apply_code, 200, "REST map apply must succeed: {apply_body}");
+        let apply_id = json_str(&apply_body, "command_id")
+            .ok_or_else(|| anyhow!("map apply carried no command_id: {apply_body}"))?;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut map_apply_state = String::new();
+        while Instant::now() < deadline {
+            let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{apply_id}"))?;
+            if code == 200 {
+                map_apply_state = json_str(&body, "application_state").unwrap_or_default();
+                let journal_state = json_str(&body, "journal_state").unwrap_or_default();
+                if map_apply_state == "applied" && journal_state != "pending" {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            map_apply_state, "applied",
+            "map apply must reach applied state"
+        );
+
+        // Negative REST control: mismatched dimensions
+        let bad_gen_payload = br#"{"width":130,"height":60,"cell_size":50,"seed":42}"#;
+        let (_, bad_gen_body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/map/generate",
+            bad_gen_payload,
+            Some("application/json"),
+        )?;
+        let bad_gen_json: serde_json::Value = serde_json::from_str(&bad_gen_body)?;
+        let bad_apply_req = serde_json::json!({ "artifact": bad_gen_json });
+        let bad_apply_payload = serde_json::to_vec(&bad_apply_req)?;
+        let mut bad_apply_code = 0;
+        let mut bad_apply_body = String::new();
+        let retry_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < retry_deadline {
+            let (code, body) = http_with_body(
+                rest_addr,
+                "POST",
+                "/api/v1/map/apply",
+                &bad_apply_payload,
+                Some("application/json"),
+            )?;
+            bad_apply_code = code;
+            bad_apply_body = body;
+            if bad_apply_code == 200 {
                 break;
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert_eq!(
-        bad_map_apply_state, "rejected",
-        "mismatched map apply must reach rejected state"
-    );
+        assert_eq!(
+            bad_apply_code, 200,
+            "bad map apply command must be enqueued: {bad_apply_body}"
+        );
+        let bad_apply_id = json_str(&bad_apply_body, "command_id")
+            .ok_or_else(|| anyhow!("bad map apply carried no command_id: {bad_apply_body}"))?;
 
-    // (8) FastMCP HTTP protocol verification
-    let (health_code, health_body) = http(mcp_addr, "GET", "/health")?;
-    assert_eq!(health_code, 200, "MCP /health must return 200");
-    assert!(
-        health_body.contains("healthy"),
-        "MCP /health body: {health_body}"
-    );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut bad_map_apply_state = String::new();
+        while Instant::now() < deadline {
+            let (code, body) = http(
+                rest_addr,
+                "GET",
+                &format!("/api/control/status/{bad_apply_id}"),
+            )?;
+            if code == 200 {
+                bad_map_apply_state = json_str(&body, "application_state").unwrap_or_default();
+                if bad_map_apply_state == "failed" || bad_map_apply_state == "rejected" {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            bad_map_apply_state == "failed" || bad_map_apply_state == "rejected",
+            "mismatched map apply must reach failed or rejected state, got: {bad_map_apply_state}"
+        );
 
-    // MCP initialize (protocolVersion 2024-11-05)
-    let init_payload = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
-    let (init_code, init_body) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        init_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        init_code, 200,
-        "MCP initialize must return 200: {init_body}"
-    );
-    let init_json: serde_json::Value = serde_json::from_str(&init_body)?;
-    assert_eq!(
-        init_json["result"]["protocolVersion"], "2024-11-05",
-        "MCP must negotiate protocolVersion: {init_body}"
-    );
+        // (8) FastMCP HTTP protocol verification
+        let (health_code, health_body) = http(mcp_addr, "GET", "/health")?;
+        assert_eq!(health_code, 200, "MCP /health must return 200");
+        assert!(
+            health_body.contains("healthy"),
+            "MCP /health body: {health_body}"
+        );
 
-    // MCP 2024-11-05 lifecycle, Version Negotiation: an unsupported requested version
-    // receives a server-supported alternative, not an echo of the unsupported value.
-    // https://modelcontextprotocol.io/specification/2024-11-05/basic/lifecycle
-    let future_version_payload = br#"{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
-    let (future_version_code, future_version_body) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        future_version_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        future_version_code, 200,
-        "MCP version negotiation must return a response: {future_version_body}"
-    );
-    let future_version: serde_json::Value = serde_json::from_str(&future_version_body)?;
-    assert_eq!(future_version["id"], 99);
-    assert!(future_version.get("error").is_none());
-    assert_eq!(
-        future_version["result"]["protocolVersion"], "2024-11-05",
-        "MCP must choose its supported version: {future_version_body}"
-    );
+        // MCP initialize (protocolVersion 2024-11-05)
+        let init_payload = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
+        let (init_code, init_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            init_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            init_code, 200,
+            "MCP initialize must return 200: {init_body}"
+        );
+        let init_json: serde_json::Value = serde_json::from_str(&init_body)?;
+        assert_eq!(
+            init_json["result"]["protocolVersion"], "2024-11-05",
+            "MCP must negotiate protocolVersion: {init_body}"
+        );
 
-    // A malformed version TYPE is invalid initialize input, regardless of negotiation.
-    let invalid_version_payload = br#"{"jsonrpc":"2.0","id":100,"method":"initialize","params":{"protocolVersion":42,"capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
-    let (invalid_version_code, invalid_version_body) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        invalid_version_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(invalid_version_code, 200);
-    let invalid_version: serde_json::Value = serde_json::from_str(&invalid_version_body)?;
-    assert_eq!(invalid_version["id"], 100);
-    assert!(invalid_version.get("result").is_none());
-    assert_eq!(
-        invalid_version["error"]["code"], -32602,
-        "MCP malformed initialize parameters must be rejected: {invalid_version_body}"
-    );
-    assert!(
-        !invalid_version["error"]["message"]
+        // MCP 2024-11-05 lifecycle, Version Negotiation: an unsupported requested version
+        // receives a server-supported alternative, not an echo of the unsupported value.
+        // https://modelcontextprotocol.io/specification/2024-11-05/basic/lifecycle
+        let future_version_payload = br#"{"jsonrpc":"2.0","id":99,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
+        let (future_version_code, future_version_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            future_version_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            future_version_code, 200,
+            "MCP version negotiation must return a response: {future_version_body}"
+        );
+        let future_version: serde_json::Value = serde_json::from_str(&future_version_body)?;
+        assert_eq!(future_version["id"], 99);
+        assert!(future_version.get("error").is_none());
+        assert_eq!(
+            future_version["result"]["protocolVersion"], "2024-11-05",
+            "MCP must choose its supported version: {future_version_body}"
+        );
+
+        // A malformed version TYPE is invalid initialize input, regardless of negotiation.
+        let invalid_version_payload = br#"{"jsonrpc":"2.0","id":100,"method":"initialize","params":{"protocolVersion":42,"capabilities":{},"clientInfo":{"name":"e2e-control-plane","version":"0"}}}"#;
+        let (invalid_version_code, invalid_version_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            invalid_version_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(invalid_version_code, 200);
+        let invalid_version: serde_json::Value = serde_json::from_str(&invalid_version_body)?;
+        assert_eq!(invalid_version["id"], 100);
+        assert!(invalid_version.get("result").is_none());
+        assert_eq!(
+            invalid_version["error"]["code"], -32602,
+            "MCP malformed initialize parameters must be rejected: {invalid_version_body}"
+        );
+        assert!(
+            !invalid_version["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "MCP malformed-input refusal must include a diagnostic: {invalid_version_body}"
+        );
+
+        // MCP notifications/initialized
+        let notify_payload = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let (notify_code, _) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            notify_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            notify_code, 202,
+            "MCP notifications/initialized must return 202"
+        );
+
+        // MCP tools/list
+        let list_payload = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let (list_code, list_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            list_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            list_code, 200,
+            "MCP tools/list must return 200: {list_body}"
+        );
+        let list_json: serde_json::Value = serde_json::from_str(&list_body)?;
+        let tools = list_json["result"]["tools"]
+            .as_array()
+            .expect("tools array");
+        assert_eq!(tools.len(), 15, "MCP tools/list must return all 15 tools");
+
+        // MCP tools/call get_status
+        let status_payload = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#;
+        let (status_call_code, status_call_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            status_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            status_call_code, 200,
+            "MCP tools/call get_status must return 200: {status_call_body}"
+        );
+        assert!(
+            status_call_body.contains("tick"),
+            "MCP get_status must report tick: {status_call_body}"
+        );
+
+        // MCP map_generate
+        let map_gen_payload = br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"map_generate","arguments":{"width":120,"height":60,"cell_size":50,"seed":42}}}"#;
+        let (mcp_gen_code, mcp_gen_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            map_gen_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            mcp_gen_code, 200,
+            "MCP map_generate must return 200: {mcp_gen_body}"
+        );
+        let mcp_gen_json: serde_json::Value = serde_json::from_str(&mcp_gen_body)?;
+        let artifact_text = mcp_gen_json["result"]["content"][0]["text"]
             .as_str()
-            .unwrap_or_default()
-            .is_empty(),
-        "MCP malformed-input refusal must include a diagnostic: {invalid_version_body}"
-    );
+            .expect("artifact text");
+        let artifact_val: serde_json::Value = serde_json::from_str(artifact_text)?;
+        assert_eq!(artifact_val["terrain"]["width"], 120);
+        assert_eq!(artifact_val["terrain"]["height"], 60);
 
-    // MCP notifications/initialized
-    let notify_payload = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-    let (notify_code, _) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        notify_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        notify_code, 202,
-        "MCP notifications/initialized must return 202"
-    );
-
-    // MCP tools/list
-    let list_payload = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
-    let (list_code, list_body) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        list_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        list_code, 200,
-        "MCP tools/list must return 200: {list_body}"
-    );
-    let list_json: serde_json::Value = serde_json::from_str(&list_body)?;
-    let tools = list_json["result"]["tools"]
-        .as_array()
-        .expect("tools array");
-    assert_eq!(tools.len(), 15, "MCP tools/list must return all 15 tools");
-
-    // MCP tools/call get_status
-    let status_payload = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#;
-    let (status_call_code, status_call_body) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        status_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        status_call_code, 200,
-        "MCP tools/call get_status must return 200: {status_call_body}"
-    );
-    assert!(
-        status_call_body.contains("tick"),
-        "MCP get_status must report tick: {status_call_body}"
-    );
-
-    // MCP map_generate
-    let map_gen_payload = br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"map_generate","arguments":{"width":120,"height":60,"cell_size":50,"seed":42}}}"#;
-    let (mcp_gen_code, mcp_gen_body) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        map_gen_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        mcp_gen_code, 200,
-        "MCP map_generate must return 200: {mcp_gen_body}"
-    );
-    let mcp_gen_json: serde_json::Value = serde_json::from_str(&mcp_gen_body)?;
-    let artifact_text = mcp_gen_json["result"]["content"][0]["text"]
-        .as_str()
-        .expect("artifact text");
-    let artifact_val: serde_json::Value = serde_json::from_str(artifact_text)?;
-    assert_eq!(artifact_val["terrain"]["width"], 120);
-    assert_eq!(artifact_val["terrain"]["height"], 60);
-
-    // MCP map_apply
-    let mcp_apply_req = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 6,
-        "method": "tools/call",
-        "params": {
-            "name": "map_apply",
-            "arguments": {
-                "artifact": artifact_val
+        // MCP map_apply via generated file path (large maps use file path / hex postcard to respect JSON-RPC node limits)
+        let map_file = run_dir.path().join("mcp_generated_map.json");
+        std::fs::write(&map_file, artifact_text.as_bytes())?;
+        let mcp_apply_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "map_apply",
+                "arguments": {
+                    "artifact": map_file.to_string_lossy()
+                }
             }
-        }
-    });
-    let mcp_apply_payload = serde_json::to_vec(&mcp_apply_req)?;
-    let (mcp_apply_code, mcp_apply_body) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        &mcp_apply_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        mcp_apply_code, 200,
-        "MCP map_apply must return 200: {mcp_apply_body}"
-    );
-    let mcp_apply_json: serde_json::Value = serde_json::from_str(&mcp_apply_body)?;
-    let status_text = mcp_apply_json["result"]["content"][0]["text"]
-        .as_str()
-        .expect("status text");
-    let status_obj: serde_json::Value = serde_json::from_str(status_text)?;
-    let mcp_cmd_id = status_obj["command_id"].as_str().expect("command_id");
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut mcp_apply_state = String::new();
-    while Instant::now() < deadline {
-        let (code, body) = http(
-            rest_addr,
-            "GET",
-            &format!("/api/control/status/{mcp_cmd_id}"),
+        });
+        let mcp_apply_payload = serde_json::to_vec(&mcp_apply_req)?;
+        let (mcp_apply_code, mcp_apply_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            &mcp_apply_payload,
+            Some("application/json"),
         )?;
-        if code == 200 {
-            mcp_apply_state = json_str(&body, "application_state").unwrap_or_default();
-            if mcp_apply_state == "applied" {
-                break;
+        assert_eq!(
+            mcp_apply_code, 200,
+            "MCP map_apply must return 200: {mcp_apply_body}"
+        );
+        let mcp_apply_json: serde_json::Value = serde_json::from_str(&mcp_apply_body)?;
+        let status_text = mcp_apply_json["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("status text missing in mcp_apply_body: {mcp_apply_body}"));
+        let status_obj: serde_json::Value = serde_json::from_str(status_text)?;
+        let mcp_cmd_id = status_obj["command_id"].as_str().expect("command_id");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut mcp_apply_state = String::new();
+        while Instant::now() < deadline {
+            let (code, body) = http(
+                rest_addr,
+                "GET",
+                &format!("/api/control/status/{mcp_cmd_id}"),
+            )?;
+            if code == 200 {
+                mcp_apply_state = json_str(&body, "application_state").unwrap_or_default();
+                if mcp_apply_state == "applied" {
+                    break;
+                }
             }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert_eq!(
-        mcp_apply_state, "applied",
-        "MCP map_apply command must reach applied state"
-    );
+        assert_eq!(
+            mcp_apply_state, "applied",
+            "MCP map_apply command must reach applied state"
+        );
 
-    // MCP tools/call unknown tool -> JSON-RPC error
-    let unknown_payload = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#;
-    let (unknown_code, unknown_body) = http_with_body(
-        mcp_addr,
-        "POST",
-        "/mcp",
-        unknown_payload,
-        Some("application/json"),
-    )?;
-    assert_eq!(
-        unknown_code, 200,
-        "MCP unknown tool call returns JSON-RPC error response"
-    );
-    let unknown_json: serde_json::Value = serde_json::from_str(&unknown_body)?;
-    assert!(
-        unknown_json["error"].is_object(),
-        "MCP unknown tool must return JSON-RPC error object: {unknown_body}"
-    );
+        // MCP tools/call unknown tool -> JSON-RPC error
+        let unknown_payload = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#;
+        let (unknown_code, unknown_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            unknown_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            unknown_code, 200,
+            "MCP unknown tool call returns JSON-RPC error response"
+        );
+        let unknown_json: serde_json::Value = serde_json::from_str(&unknown_body)?;
+        assert!(
+            unknown_json["error"].is_object(),
+            "MCP unknown tool must return JSON-RPC error object: {unknown_body}"
+        );
 
-    // (9) Lifecycle: observe a live child, then deliberately kill and reap it.
-    let child = guard.0.as_mut().expect("child still held");
-    assert!(
-        child.try_wait()?.is_none(),
-        "--mode server must still be running after the assertions; it exited early"
-    );
-    child.kill()?;
-    let exit = child.wait()?;
-    guard.0 = None;
+        // (9) Lifecycle: observe a live child, then deliberately kill and reap it.
+        let child = guard.0.as_mut().expect("child still held");
+        assert!(
+            child.try_wait()?.is_none(),
+            "--mode server must still be running after the assertions; it exited early"
+        );
+        child.kill()?;
+        let exit = child.wait()?;
+        guard.0 = None;
 
-    let commit = Command::new("git")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    println!(
-        "{{\"schema\":\"scriptbots.real-process-e2e.v2\",\"binary\":\"{}\",\"mode\":\"server\",\
+        let commit = Command::new("git")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "{{\"schema\":\"scriptbots.real-process-e2e.v2\",\"binary\":\"{}\",\"mode\":\"server\",\
          \"storage\":\"memory\",\"rest_address\":\"{rest_addr}\",\"mcp_address\":\"{mcp_addr}\",\
          \"boot_log_lines\":{},\"status_code\":{status_code},\"pause_code\":{pause_code},\
          \"pause_id\":\"{pause_id}\",\"step_id\":\"{step_id}\",\"resume_id\":\"{resume_id}\",\
          \"application_state\":\"applied\",\"journal_state\":\"{journal_state}\",\
          \"proved_level\":\"applied\",\"screenshot_code\":{shot_code},\
          \"tools_count\":{},\"child_exit\":\"{}\",\"source_commit\":\"{commit}\"}}",
-        binary().display(),
-        boot_log.len(),
-        tools.len(),
-        exit.code()
-            .map_or_else(|| "signalled".to_string(), |code| code.to_string()),
-    );
+            binary().display(),
+            server_log.lock().map_or(0, |l| l.len()),
+            tools.len(),
+            exit.code()
+                .map_or_else(|| "signalled".to_string(), |code| code.to_string()),
+        );
 
-    Ok(())
+        Ok(())
+    })();
+
+    if let Err(ref e) = outcome {
+        eprintln!("TEST FAILED WITH: {e:?}");
+        if let Ok(lines) = server_log.lock() {
+            eprintln!("=== SERVER STDERR ({} lines) ===", lines.len());
+            for line in lines.iter().rev().take(100).rev() {
+                eprintln!("{line}");
+            }
+        }
+    }
+    outcome
 }
 
 /// The original bd-w1oi command must keep advancing for the full 600-second

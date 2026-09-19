@@ -11,7 +11,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::sse::{Event, Sse};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -2443,7 +2443,10 @@ fn prepare_rest_server(
         .route("/api/control/status/{command_id}", get(get_control_status))
         // Procedural map generation and application controls
         .route("/api/v1/map/generate", post(post_map_generate))
-        .route("/api/v1/map/apply", post(post_map_apply))
+        .route(
+            "/api/v1/map/apply",
+            post(post_map_apply).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
@@ -2739,7 +2742,9 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
         json!({
             "type": "object",
             "properties": {
-                "artifact": {"type": "object"},
+                "artifact": {
+                    "description": "Map artifact as a JSON object, file path, raw JSON string, or hex-encoded postcard"
+                },
                 "idempotency_key": {"type": "string"}
             },
             "required": ["artifact"],
@@ -2804,26 +2809,6 @@ async fn handle_mcp_http_request(
     State(state): State<McpHttpState>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
-    if request.method == "initialize"
-        && let Some(version) = request
-            .params
-            .as_ref()
-            .and_then(|p| p.get("protocolVersion"))
-            .and_then(|v| v.as_str())
-        && version != "2024-11-05"
-        && let Some(request_id) = request.id
-    {
-        let err_response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": -32602,
-                "message": "Unsupported protocol version; supported versions: [\"2024-11-05\"]"
-            }
-        });
-        return Json(err_response).into_response();
-    }
-
     let method = request.method.clone();
     let id = request.id.clone();
     let cx = state.request_cx();
