@@ -42,9 +42,7 @@ use crate::control::{
     Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
     SpeedRequest, parse_intervention_command, parse_map_artifact,
 };
-use crate::narrative_search::{
-    NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery,
-};
+use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ConfigAuditEntry, Position, SelectionUpdate,
     Tick, TickSummaryDto,
@@ -232,16 +230,15 @@ impl ControlServerConfig {
             config.mcp_transport = McpTransportConfig::Http { bind_address: addr };
         }
 
-        if let Some(db_path) = read_control_environment(
-            "SCRIPTBOTS_DATABASE_PATH",
-            &mut config.environment_errors,
-        )
-        .or_else(|| {
-            read_control_environment(
-                "SCRIPTBOTS_STORAGE_PATH",
-                &mut config.environment_errors,
-            )
-        }) {
+        if let Some(db_path) =
+            read_control_environment("SCRIPTBOTS_DATABASE_PATH", &mut config.environment_errors)
+                .or_else(|| {
+                    read_control_environment(
+                        "SCRIPTBOTS_STORAGE_PATH",
+                        &mut config.environment_errors,
+                    )
+                })
+        {
             let trimmed = db_path.trim();
             if !trimmed.is_empty() {
                 config.database_path = Some(PathBuf::from(trimmed));
@@ -459,8 +456,8 @@ impl ControlRuntime {
         reservation: ControlServerReservation,
         startup_timeout: Duration,
     ) -> Result<(Self, CommandSubmit)> {
-        let handle = ControlHandle::new(host)
-            .with_database(reservation.config.database_path.clone());
+        let handle =
+            ControlHandle::new(host).with_database(reservation.config.database_path.clone());
         let submit_handle = handle.clone();
         let command_submit: CommandSubmit = Arc::new(move |command| {
             match submit_handle.submit_command(command, None) {
@@ -3372,12 +3369,13 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::NarrativeSearch => {
-                let query_str = arguments
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        McpError::new(McpErrorCode::InvalidParams, "missing 'query' field")
-                    })?;
+                let query_str =
+                    arguments
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            McpError::new(McpErrorCode::InvalidParams, "missing 'query' field")
+                        })?;
                 let from_tick = arguments.get("from_tick").and_then(|v| v.as_u64());
                 let to_tick = arguments.get("to_tick").and_then(|v| v.as_u64());
                 let limit = arguments

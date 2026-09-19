@@ -561,6 +561,7 @@ fn test_archipelago_report_reconstructs_and_verifies_conservation_e2e()
 /// - Every island remains populated and evolves distinct scientific digests.
 /// - Offline reconstruction and conservation audit succeed from the database alone.
 #[test]
+#[ignore = "DSR long lane: 4 heterogeneous islands to tick 2000 in one storage database"]
 fn dsr_four_heterogeneous_islands_reach_2000_ticks_in_single_storage_file()
 -> Result<(), Box<dyn std::error::Error>> {
     const ISLANDS: u32 = 4;

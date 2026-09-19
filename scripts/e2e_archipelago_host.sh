@@ -71,6 +71,7 @@ printf 'e2e_archipelago_host: (4) running full 4-island / 2,000-tick / single-st
   --test archipelago_report_cli \
   dsr_four_heterogeneous_islands_reach_2000_ticks_in_single_storage_file \
   -- \
+  --ignored \
   --nocapture 2>&1 | tee "$log_file"
 
 grep -q "test dsr_four_heterogeneous_islands_reach_2000_ticks_in_single_storage_file \.\.\. ok" "$log_file" ||
