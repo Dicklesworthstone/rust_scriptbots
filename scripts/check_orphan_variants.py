@@ -69,7 +69,6 @@ KNOWN_REFINED_CANDIDATES = (
         "EffectSizeEstimator",
         "HedgesG",
     ),
-    ("crates/scriptbots-app/src/lib.rs", "ScenarioError", "NotATable"),
 )
 MANUAL_DISPOSITIONS = {
     (
@@ -174,19 +173,6 @@ MANUAL_DISPOSITIONS = {
             "This identifier has no producer in the never-wired lab/stats layer. bd-7453 "
             "establishes that the layer is superseded; remove it only with that owner-authorized "
             "module-level resolution."
-        ),
-    },
-    (
-        "crates/scriptbots-app/src/lib.rs",
-        "ScenarioError",
-        "NotATable",
-    ): {
-        "classification": "required_unreached",
-        "decision": "construct_on_non_table_scenario_input",
-        "rationale": (
-            "The public error and its documentation promise a typed top-level-table refusal, "
-            "but TOML/RON parsing currently maps that condition into the generic Parse variant. "
-            "The branch should be wired, not deleted."
         ),
     },
     (
