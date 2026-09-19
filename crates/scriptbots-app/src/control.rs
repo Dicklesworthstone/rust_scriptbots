@@ -192,6 +192,8 @@ pub enum ControlError {
     CommandQueueFull,
     #[error("command queue has been closed")]
     CommandQueueClosed,
+    #[error("narrative search error: {0}")]
+    NarrativeSearch(#[from] crate::narrative_search::NarrativeSearchError),
 }
 
 impl ControlError {
@@ -419,6 +421,7 @@ pub struct ControlHandle {
     knobs_cache: KnobsCache,
     command_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     command_namespace: u64,
+    database_path: Option<std::path::PathBuf>,
 }
 
 impl ControlHandle {
@@ -429,7 +432,19 @@ impl ControlHandle {
             knobs_cache: std::sync::Arc::new(Mutex::new(None)),
             command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             command_namespace: NEXT_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            database_path: None,
         }
+    }
+
+    /// Attach a FrankenSQLite database path for offline storage queries.
+    pub fn with_database(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.database_path = path;
+        self
+    }
+
+    /// Return the attached database path, if configured.
+    pub fn database_path(&self) -> Option<&std::path::Path> {
+        self.database_path.as_deref()
     }
 
     /// Produce a PNG snapshot of the world without a live window.
@@ -635,6 +650,34 @@ impl ControlHandle {
             }
         }
         Ok(events)
+    }
+
+    /// Search narrative events using FrankenSQLite FTS5 full-text index with in-memory fallback.
+    pub fn narrative_search(
+        &self,
+        query: crate::narrative_search::NarrativeSearchQuery,
+    ) -> Result<Vec<crate::narrative_search::NarrativeSearchHitDto>, ControlError> {
+        let snapshot = self.read_snapshot().ok();
+        let events = snapshot.as_ref().map(|s| s.narrative_events.as_slice());
+        Ok(crate::narrative_search::execute_narrative_search(
+            self.database_path.as_deref(),
+            events,
+            query,
+        )?)
+    }
+
+    /// Retrieve a chronological window of narrative events around a tick.
+    pub fn narrative_around(
+        &self,
+        query: crate::narrative_search::NarrativeAroundQuery,
+    ) -> Result<Vec<crate::narrative_search::NarrativeSearchHitDto>, ControlError> {
+        let snapshot = self.read_snapshot().ok();
+        let events = snapshot.as_ref().map(|s| s.narrative_events.as_slice());
+        Ok(crate::narrative_search::execute_narrative_around(
+            self.database_path.as_deref(),
+            events,
+            query,
+        )?)
     }
 
     /// Retrieve current world selection state from the latest snapshot.

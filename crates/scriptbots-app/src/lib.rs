@@ -3788,6 +3788,7 @@ set = 42
 pub mod command;
 pub mod control;
 pub mod lab;
+pub mod narrative_search;
 pub mod precedence;
 pub mod regions;
 pub mod scene;
