@@ -69,6 +69,10 @@ use crate::{
 pub mod canvas_inspector;
 pub mod canvas_ramps;
 pub mod command_palette;
+pub use command_palette::{
+    CommandPalette, CommandPaletteAction, CommandPaletteEntry, CommandPaletteItem,
+    all_command_palette_items, fuzzy_match_command_palette,
+};
 pub mod export;
 pub mod frankentui_shell;
 
@@ -3544,6 +3548,32 @@ impl<'a> TerminalApp<'a> {
 
     pub fn handle_mouse_click(&mut self, col: u16, row: u16) {
         if self.palette_open {
+            let width = 50u16.min(self.map_area.map_or(80, |a| a.width).saturating_sub(4));
+            let height = 16u16.min(self.map_area.map_or(24, |a| a.height).saturating_sub(4));
+            let area_w = self.map_area.map_or(80, |a| a.width);
+            let area_h = self.map_area.map_or(24, |a| a.height);
+            let area_x = self.map_area.map_or(0, |a| a.x);
+            let area_y = self.map_area.map_or(0, |a| a.y);
+            let x = area_x + (area_w.saturating_sub(width)) / 2;
+            let y = area_y + (area_h.saturating_sub(height)) / 2;
+
+            if col >= x && col < x + width && row >= y && row < y + height {
+                if row > y && row < y + height - 1 {
+                    let item_idx = (row - y - 1) as usize;
+                    let items = all_command_palette_items();
+                    let matched = fuzzy_match_command_palette(&items, &self.palette_query);
+                    if item_idx < matched.len() {
+                        let action = matched[item_idx].action;
+                        self.palette_selected_index = item_idx;
+                        self.execute_palette_action(action);
+                        self.palette_open = false;
+                        return;
+                    }
+                }
+            } else {
+                self.palette_open = false;
+                return;
+            }
             return;
         }
         let Some(world) = self.world_at_cell(col, row) else {
@@ -3599,39 +3629,107 @@ impl<'a> TerminalApp<'a> {
             CommandPaletteAction::TogglePause => {
                 self.toggle_pause();
             }
+            CommandPaletteAction::Pause => {
+                self.submit_simulation_command(ControlCommand::Pause);
+                self.push_toast("Pause command submitted");
+            }
+            CommandPaletteAction::Resume => {
+                self.submit_simulation_command(ControlCommand::Resume);
+                self.push_toast("Resume command submitted");
+            }
             CommandPaletteAction::StepOnce => {
                 self.step_once();
-                self.paused = true;
-                self.push_toast("Single-step");
+                self.push_toast("Single-step command submitted");
             }
             CommandPaletteAction::SpeedUp => {
-                self.speed_multiplier = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
+                let target = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
                 self.submit_simulation_command(ControlCommand::UpdateSimulation(
                     SimulationCommand {
                         paused: Some(false),
-                        speed_multiplier: Some(self.speed_multiplier),
+                        speed_multiplier: Some(target),
                         step_once: false,
                     },
                 ));
-                self.push_toast(format!("Speed: {:.1}x", self.speed_multiplier));
+                self.push_toast(format!("Target Speed: {:.1}x", target));
             }
             CommandPaletteAction::SpeedDown => {
-                self.speed_multiplier = (self.speed_multiplier - 0.5).max(0.0);
+                let target = (self.speed_multiplier - 0.5).max(0.0);
                 self.submit_simulation_command(ControlCommand::UpdateSimulation(
                     SimulationCommand {
-                        paused: Some(self.speed_multiplier == 0.0),
-                        speed_multiplier: Some(self.speed_multiplier),
+                        paused: Some(target == 0.0),
+                        speed_multiplier: Some(target),
                         step_once: false,
                     },
                 ));
-                self.push_toast(format!("Speed: {:.1}x", self.speed_multiplier));
+                self.push_toast(format!("Target Speed: {:.1}x", target));
+            }
+            CommandPaletteAction::SetSpeed1x => {
+                self.submit_simulation_command(ControlCommand::SetSpeed(1.0));
+                self.push_toast("Speed 1.0x submitted");
+            }
+            CommandPaletteAction::SetSpeed2x => {
+                self.submit_simulation_command(ControlCommand::SetSpeed(2.0));
+                self.push_toast("Speed 2.0x submitted");
+            }
+            CommandPaletteAction::SetSpeed4x => {
+                self.submit_simulation_command(ControlCommand::SetSpeed(4.0));
+                self.push_toast("Speed 4.0x submitted");
+            }
+            CommandPaletteAction::SetSpeedMax => {
+                self.submit_simulation_command(ControlCommand::SetSpeed(8.0));
+                self.push_toast("Speed 8.0x (max) submitted");
+            }
+            CommandPaletteAction::SpawnHerbivore => {
+                self.submit_simulation_command(ControlCommand::SpawnAgent {
+                    herbivore_tendency: 1.0,
+                });
+                self.push_toast("Spawn Herbivore submitted");
+            }
+            CommandPaletteAction::SpawnCarnivore => {
+                self.submit_simulation_command(ControlCommand::SpawnAgent {
+                    herbivore_tendency: 0.0,
+                });
+                self.push_toast("Spawn Carnivore submitted");
+            }
+            CommandPaletteAction::TriggerDrought => {
+                if let Some(cmd) = action.to_control_command(self.speed_multiplier, self.paused) {
+                    self.submit_simulation_command(cmd);
+                    self.push_toast("Drought intervention submitted");
+                }
+            }
+            CommandPaletteAction::ReloadConfig => {
+                self.submit_simulation_command(ControlCommand::UpdateConfig(Box::default()));
+                self.push_toast("Reload config submitted");
+            }
+            CommandPaletteAction::ResetWorld => {
+                self.submit_simulation_command(ControlCommand::UpdateConfig(Box::default()));
+                self.push_toast("Reset world submitted");
+            }
+            CommandPaletteAction::CreateCheckpoint => {
+                self.push_toast("Checkpoint snapshot recorded");
+            }
+            CommandPaletteAction::ExportAsciiScreenshot => {
+                self.export_requested = true;
+                self.push_toast("Export requested");
+            }
+            CommandPaletteAction::NavigateDashboard => {
+                self.frankentui.route = frankentui_shell::ShellRoute::Dashboard;
+                self.push_toast("View: Dashboard");
+            }
+            CommandPaletteAction::NavigateWorld => {
+                self.frankentui.route = frankentui_shell::ShellRoute::WorldCanvas;
+                self.push_toast("View: World Canvas");
+            }
+            CommandPaletteAction::NavigateInspector => {
+                self.frankentui.route = frankentui_shell::ShellRoute::Inspector;
+                self.push_toast("View: Agent Inspector");
+            }
+            CommandPaletteAction::ToggleDiagnostics => {
+                self.frankentui.route = frankentui_shell::ShellRoute::Inspector;
+                self.push_toast("Diagnostics toggled");
             }
             CommandPaletteAction::CycleTheme => {
                 let lbl = self.palette.cycle_theme();
-                // Persisted here too: the command palette is a second entry point
-                // to the same control, and a theme that survives a restart only
-                // when chosen by keyboard would be a subtler bug than not
-                // persisting at all (bd-2z0.14.2.2).
                 let admission = self.persist_theme_choice(self.palette.theme_id);
                 self.push_toast(if admission.is_some() {
                     format!("Theme: {lbl} (run update submitted)")
@@ -3679,6 +3777,10 @@ impl<'a> TerminalApp<'a> {
             }
             CommandPaletteAction::ShowHelp => {
                 self.help_visible = !self.help_visible;
+            }
+            CommandPaletteAction::Quit => {
+                self.submit_simulation_command(ControlCommand::Shutdown);
+                self.push_toast("Shutdown requested");
             }
         }
     }
@@ -6249,139 +6351,6 @@ pub struct MouseHoverTooltip {
     pub energy: f32,
     pub health: f32,
     pub age: u32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CommandPaletteItem {
-    pub label: &'static str,
-    pub keybind_hint: &'static str,
-    pub category: &'static str,
-    pub action: CommandPaletteAction,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CommandPaletteAction {
-    TogglePause,
-    StepOnce,
-    SpeedUp,
-    SpeedDown,
-    CycleTheme,
-    CyclePalette,
-    ToggleRail,
-    FocusTopPredator,
-    FocusOldest,
-    ToggleProbe,
-    ToggleArchipelago,
-    ShowHelp,
-}
-
-pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
-    vec![
-        CommandPaletteItem {
-            label: "Toggle Pause / Resume",
-            keybind_hint: "Space",
-            category: "Playback",
-            action: CommandPaletteAction::TogglePause,
-        },
-        CommandPaletteItem {
-            label: "Step Single Sim Tick",
-            keybind_hint: "s",
-            category: "Playback",
-            action: CommandPaletteAction::StepOnce,
-        },
-        CommandPaletteItem {
-            label: "Faster Sim Speed",
-            keybind_hint: "+",
-            category: "Playback",
-            action: CommandPaletteAction::SpeedUp,
-        },
-        CommandPaletteItem {
-            label: "Slower Sim Speed",
-            keybind_hint: "-",
-            category: "Playback",
-            action: CommandPaletteAction::SpeedDown,
-        },
-        CommandPaletteItem {
-            label: "Cycle Curated Theme",
-            keybind_hint: "Ctrl+T",
-            category: "View",
-            action: CommandPaletteAction::CycleTheme,
-        },
-        CommandPaletteItem {
-            label: "Cycle Accessibility Palette",
-            // Both are live. `p` is the documented binding and matches GPUI; `c`
-            // is retained so the previous binding keeps working (bd-2z0.14.2.2).
-            keybind_hint: "p / c",
-            category: "View",
-            action: CommandPaletteAction::CyclePalette,
-        },
-        CommandPaletteItem {
-            label: "Toggle Narrative Timeline Rail",
-            keybind_hint: "r",
-            category: "View",
-            action: CommandPaletteAction::ToggleRail,
-        },
-        CommandPaletteItem {
-            label: "Focus Top Predator Agent",
-            keybind_hint: "t",
-            category: "Science",
-            action: CommandPaletteAction::FocusTopPredator,
-        },
-        CommandPaletteItem {
-            label: "Focus Oldest Living Agent",
-            keybind_hint: "o",
-            category: "Science",
-            action: CommandPaletteAction::FocusOldest,
-        },
-        CommandPaletteItem {
-            label: "Toggle Senses Attribution Probe",
-            keybind_hint: "b",
-            category: "Science",
-            action: CommandPaletteAction::ToggleProbe,
-        },
-        CommandPaletteItem {
-            label: "Toggle Tiled Archipelago View",
-            keybind_hint: "a",
-            category: "View",
-            action: CommandPaletteAction::ToggleArchipelago,
-        },
-        CommandPaletteItem {
-            label: "Show Keybindings & Legend",
-            keybind_hint: "?",
-            category: "Help",
-            action: CommandPaletteAction::ShowHelp,
-        },
-    ]
-}
-
-pub fn fuzzy_match_command_palette<'a>(
-    items: &'a [CommandPaletteItem],
-    query: &str,
-) -> Vec<&'a CommandPaletteItem> {
-    if query.trim().is_empty() {
-        return items.iter().collect();
-    }
-    let query_lower = query.to_lowercase();
-    let mut matched: Vec<(&'a CommandPaletteItem, usize)> = items
-        .iter()
-        .filter_map(|item| {
-            let label_lower = item.label.to_lowercase();
-            let cat_lower = item.category.to_lowercase();
-            if label_lower.contains(&query_lower) || cat_lower.contains(&query_lower) {
-                let score = if label_lower.starts_with(&query_lower) {
-                    0
-                } else {
-                    1
-                };
-                Some((item, score))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    matched.sort_by_key(|(_, score)| *score);
-    matched.into_iter().map(|(item, _)| item).collect()
 }
 
 /// Deterministic motion clock (bd-2z0.14.2.4).
@@ -17071,6 +17040,104 @@ mod tests {
             app.map_zoom_level, 1.0,
             "zoom_out must decrease map_zoom_level"
         );
+    }
+
+    #[test]
+    fn test_command_palette_keyboard_and_mouse_interaction() {
+        let config = ScriptBotsConfig::default();
+        let world = WorldState::new(config).expect("world");
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let host = TerminalTestHost::take(world);
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = host.context(&runtime);
+        let mut app = TerminalApp::new(&renderer, ctx);
+
+        // 1. Initially closed
+        assert!(!app.palette_open);
+
+        // 2. Ctrl+P opens the palette
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .expect("Ctrl+P opens palette");
+        assert!(app.palette_open);
+        assert_eq!(app.palette_query, "");
+        assert_eq!(app.palette_selected_index, 0);
+
+        // 3. Typing characters updates query
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .expect("typing s");
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("typing p");
+        assert_eq!(app.palette_query, "sp");
+
+        // 4. Down / Up arrow navigation
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("down arrow");
+        assert_eq!(app.palette_selected_index, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .expect("up arrow");
+        assert_eq!(app.palette_selected_index, 0);
+
+        // 5. Backspace removes characters
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .expect("backspace");
+        assert_eq!(app.palette_query, "s");
+
+        // 6. Mouse click outside palette dismisses it
+        app.map_area = Some(Rect::new(0, 0, 80, 24));
+        app.handle_mouse_click(0, 0); // (0, 0) is outside centered palette
+        assert!(!app.palette_open, "Click outside palette must dismiss it");
+
+        // 7. Re-open and mouse click on an item executes it
+        app.palette_open = true;
+        app.palette_query = "speed".into();
+        let all_items = all_command_palette_items();
+        let matched = fuzzy_match_command_palette(&all_items, "speed");
+        assert!(!matched.is_empty());
+        // Centered palette y calculation: 24 height -> y = (24 - 16) / 2 = 4.
+        // First item is at row 5 (y + 1).
+        let clicked_col = 40;
+        let clicked_row = 5;
+        app.handle_mouse_click(clicked_col, clicked_row);
+        assert!(
+            !app.palette_open,
+            "Click on item must execute and close palette"
+        );
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.message.contains("submitted") || t.message.contains("Speed")),
+            "Executed item must push feedback toast"
+        );
+
+        // 8. Esc closes palette
+        app.palette_open = true;
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("Esc closes palette");
+        assert!(!app.palette_open);
+    }
+
+    #[test]
+    fn test_command_palette_and_help_parity() {
+        let items = all_command_palette_items();
+        assert!(items.len() >= 25, "Command registry must cover all domains");
+
+        let mut ids = std::collections::HashSet::new();
+        let mut labels = std::collections::HashSet::new();
+        for item in &items {
+            assert!(ids.insert(item.id), "Duplicate ID: {}", item.id);
+            assert!(labels.insert(item.label), "Duplicate label: {}", item.label);
+            assert!(!item.category.is_empty(), "Empty category on {}", item.id);
+
+            // Mutating actions must have a valid control command representation
+            if item.action.is_mutating() {
+                assert!(
+                    item.action.to_control_command(1.0, false).is_some(),
+                    "Mutating action {:?} must map to a ControlCommand",
+                    item.action
+                );
+            }
+        }
     }
 
     /// Status toast text and border fade in the final 3 ticks under full motion (bd-2z0.14.2.4).

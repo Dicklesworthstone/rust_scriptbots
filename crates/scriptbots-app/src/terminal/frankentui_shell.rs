@@ -1199,4 +1199,134 @@ mod tests {
             "Cursor must be shown after panic unwind"
         );
     }
+
+    #[test]
+    fn test_program_simulator_command_palette_and_acknowledged_receipts_e2e() {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.init();
+
+        // 1. Initial snapshot state
+        harness.dispatch(ShellMessage::UpdateSnapshot {
+            tick: 100,
+            epoch: 1,
+            agent_count: 50,
+            food_energy: 800.0,
+            control_revision: 5,
+            scientific_revision: 100,
+        });
+        assert_eq!(harness.model().tick, 100);
+
+        // 2. Flow 1: Accepted, Applied, and Durable Mutating Control Flow
+        harness.dispatch(ShellMessage::SubmitCommand(ControlCommand::Pause));
+        assert!(harness.model().has_pending_receipts());
+        let cmd1_id = harness.model().latest_receipt().unwrap().command_id.clone();
+
+        // Host admission
+        harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
+            command_id: cmd1_id.clone(),
+            action: "Pause".into(),
+            status: ReceiptStatusKind::Admitted,
+            control_revision: 5,
+            scientific_revision: 100,
+            timestamp_tick: 100,
+        }));
+        assert_eq!(
+            harness.model().receipt_for(&cmd1_id).unwrap().status,
+            ReceiptStatusKind::Admitted
+        );
+
+        // Host application
+        harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
+            command_id: cmd1_id.clone(),
+            action: "Pause".into(),
+            status: ReceiptStatusKind::Applied,
+            control_revision: 5,
+            scientific_revision: 100,
+            timestamp_tick: 100,
+        }));
+        assert_eq!(
+            harness.model().receipt_for(&cmd1_id).unwrap().status,
+            ReceiptStatusKind::Applied
+        );
+
+        // Durable persistence
+        harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
+            command_id: cmd1_id.clone(),
+            action: "Pause".into(),
+            status: ReceiptStatusKind::Durable,
+            control_revision: 5,
+            scientific_revision: 100,
+            timestamp_tick: 100,
+        }));
+        assert_eq!(
+            harness.model().receipt_for(&cmd1_id).unwrap().status,
+            ReceiptStatusKind::Durable
+        );
+
+        // 3. Flow 2: Rejected Control Flow (application boundary rejection)
+        harness.dispatch(ShellMessage::SubmitCommand(ControlCommand::SpawnAgent {
+            herbivore_tendency: 0.5,
+        }));
+        let cmd2_id = harness.model().latest_receipt().unwrap().command_id.clone();
+        harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
+            command_id: cmd2_id.clone(),
+            action: "SpawnAgent".into(),
+            status: ReceiptStatusKind::Rejected("maximum population capacity reached".into()),
+            control_revision: 5,
+            scientific_revision: 100,
+            timestamp_tick: 100,
+        }));
+        assert!(harness.model().has_rejected_receipt());
+
+        // 4. Flow 3: Stale Revision Recovery Flow
+        harness.dispatch(ShellMessage::RecoverStaleRevision {
+            command_id: "cmd-stale-flow".into(),
+            observed: 12,
+            expected: 5,
+        });
+        assert!(harness.model().has_stale_receipt());
+        assert_eq!(
+            harness
+                .model()
+                .receipt_for("cmd-stale-flow")
+                .unwrap()
+                .status,
+            ReceiptStatusKind::StaleRevision {
+                observed: 12,
+                expected: 5,
+            }
+        );
+
+        // 5. Flow 4: Queue-Failed Flow (ingress queue overload)
+        harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
+            command_id: "cmd-queue-fail".into(),
+            action: "SetSpeed".into(),
+            status: ReceiptStatusKind::Failed("HostClient queue full: depth 64 exceeded".into()),
+            control_revision: 5,
+            scientific_revision: 100,
+            timestamp_tick: 100,
+        }));
+        assert!(harness.model().has_failed_receipt());
+
+        // 6. Capture rendered frame without live terminal and verify structured receipt presentation
+        let frame_str = harness.capture_frame_str(80, 24);
+        assert!(frame_str.contains("ScriptBots Evolution Lab"));
+        assert!(frame_str.contains("COMMAND BUS RECEIPTS"));
+        assert!(
+            frame_str.contains("[DURABLE]"),
+            "Must render Durable receipt badge"
+        );
+        assert!(
+            frame_str.contains("[REJECTED]"),
+            "Must render Rejected receipt badge"
+        );
+        assert!(
+            frame_str.contains("[STALE_REV]"),
+            "Must render StaleRevision receipt badge"
+        );
+        assert!(
+            frame_str.contains("[FAILED]"),
+            "Must render Failed receipt badge"
+        );
+    }
 }
