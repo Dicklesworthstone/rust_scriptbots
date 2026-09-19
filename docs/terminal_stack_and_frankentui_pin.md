@@ -17,11 +17,10 @@ This document specifies the exact terminal stack modernization and FrankenTUI de
 - **Pinned Revision**: `15cc6543f76b814394c590f9e7719dedd6684e4c` (includes upstream lifecycle/simulator model completion fix `15cc6543`)
 - **Default Features**: `false`
 - **Enabled Features**: `["crossterm"]`
-- **Adoption status**: **PREPARED, NOT ADOPTED.** No workspace crate consumes
-  `ftui.workspace`, and `ftui` does not appear in `Cargo.lock`. This matches
-  `docs/franken_integration.md`, which lists the ftui family as *planned* rather
-  than in-tree. Adoption is an admission decision under that document, not a
-  side effect of correcting a pin.
+- **Adoption status**: **ADOPTED IN SCRIPTBOTS-APP (bd-2z0.6.8).** Consumed by
+  `scriptbots-app` (`ftui.workspace = true`) for the real FrankenTUI Model shell,
+  command receipts, and ProgramSimulator harness. Pinned revision resolves in
+  `Cargo.lock`. Legacy Ratatui TUI fallback is retained in accordance with Rule 1.
 
 > **Why the revision was wrong, recorded so it is not repeated (bd-phj8).** This
 > field previously read `15cc65438a2095fbe8dd0dfce9adcfc7edab7612`, which is not

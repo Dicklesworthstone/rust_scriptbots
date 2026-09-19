@@ -1,6 +1,6 @@
 # Franken Ecosystem Integration — Program Guide (bd-2js6)
 
-Last reconciled: **2026-07-26** (update this line whenever a program bead
+Last reconciled: **2026-09-19** (update this line whenever a program bead
 closes — that is part of each bead's close checklist by convention). This
 document is what a new contributor reads INSTEAD of re-running the six-repo
 survey that produced the program. Style: terse, factual. Authority order when
@@ -15,7 +15,8 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | `franken-kernel` / `-evidence` / `-decision` 0.5.0 | transitive | crates.io | n/a | in tree via fsqlite/asupersync |
 | `fastmcp-rust` 0.10.0 | direct (`scriptbots-app`) | crates.io exact `=0.10.0` | existing default features; custom MCP HTTP dispatch remains legacy 2024 | published family shares Asupersync 0.5; native protocol/lifecycle validation pending |
 | `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` (`ft-api`, `ft-core`, `ft-kernel-cpu`, `ft-nn`, `ft-optim`) | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | code-first FtBrain implemented; bd-2z0.3.12.3 compile/determinism/benchmark proof pending |
-| everything else (ftui, fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
+| `ftui` (frankentui) 0.5.0 | direct (`scriptbots-app`) | git rev `15cc6543f76b814394c590f9e7719dedd6684e4c` | `crossterm` | Evolution Lab TUI shell, receipts, and ProgramSimulator harness (bd-2z0.6.8); legacy Ratatui fallback retained |
+| everything else (fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
 
 ## 2. Verdicts (with the one-paragraph why)
 

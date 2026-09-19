@@ -644,6 +644,7 @@ struct TerminalApp<'a> {
     sub_step: u8,
     /// Whether the tiled archipelago view is active instead of the single-world terrain map (bd-16g.5.5.4).
     archipelago_view: bool,
+    pub frankentui: frankentui_shell::FrankenTuiModel,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -781,6 +782,7 @@ impl<'a> TerminalApp<'a> {
             export_requested: false,
             sub_step: 0,
             archipelago_view: false,
+            frankentui: frankentui_shell::FrankenTuiModel::new(),
         };
         app.refresh_snapshot();
         app
@@ -836,8 +838,12 @@ impl<'a> TerminalApp<'a> {
         envelope: CommandEnvelope,
     ) -> Result<CommandStatus, HostAccessError> {
         let command_id = envelope.command_id;
+        let action_name = format!("{:?}", envelope.command);
         let expected_revision = envelope.expected_control_revision;
         let snapshot_revision = self.retained_render.revision.get();
+        let tick = self.snapshot.tick;
+        let control_rev = self.retained_render.revisions.control.get();
+        let scientific_rev = self.retained_render.revisions.scientific.get();
         let start = Instant::now();
         let result = self.client.submit(envelope);
         let latency = start.elapsed();
@@ -852,6 +858,15 @@ impl<'a> TerminalApp<'a> {
                     latency_micros = latency.as_micros(),
                     "terminal submitted command envelope via HostClient"
                 );
+                let entry = frankentui_shell::CommandReceiptEntry::from_runtime_status(
+                    &command_id,
+                    action_name,
+                    status,
+                    tick,
+                    control_rev,
+                    scientific_rev,
+                );
+                self.frankentui.record_receipt(entry);
             }
             Err(error) => {
                 warn!(
@@ -862,6 +877,15 @@ impl<'a> TerminalApp<'a> {
                     latency_micros = latency.as_micros(),
                     "terminal failed to submit command envelope via HostClient"
                 );
+                let entry = frankentui_shell::CommandReceiptEntry {
+                    command_id: command_id.to_string(),
+                    action: action_name,
+                    status: frankentui_shell::ReceiptStatusKind::Failed(error.to_string()),
+                    control_revision: control_rev,
+                    scientific_revision: scientific_rev,
+                    timestamp_tick: tick,
+                };
+                self.frankentui.record_receipt(entry);
             }
         }
         result
@@ -4328,6 +4352,16 @@ impl<'a> TerminalApp<'a> {
         }
         self.ingest_events(&snap);
         self.snapshot = snap;
+        self.frankentui.update_from_snapshot(
+            self.snapshot.tick,
+            self.snapshot.epoch,
+            self.snapshot.agent_count,
+            self.snapshot.food.mean,
+            world.revisions.control.get(),
+            world.revisions.scientific.get(),
+        );
+        self.frankentui.paused = self.paused;
+        self.frankentui.speed_multiplier = self.speed_multiplier;
         self.report_scheduled_patches(&world);
         self.validate_rail_selection();
         self.maybe_log_rail_first_show();
@@ -16477,6 +16511,12 @@ mod tests {
             ),
             "expected Disconnected error after host shutdown, got {disconnect_result:?}"
         );
+        assert!(app.frankentui.has_failed_receipt());
+        let latest = app.frankentui.latest_receipt().expect("latest receipt");
+        assert!(matches!(
+            latest.status,
+            frankentui_shell::ReceiptStatusKind::Failed(_)
+        ));
     }
 
     #[test]
