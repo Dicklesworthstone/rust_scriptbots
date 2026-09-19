@@ -32869,6 +32869,92 @@ mod tests {
     }
 
     #[test]
+    fn bd_akjh_every_structural_geometry_guard_has_an_observed_failing_case() {
+        // Defence 1 (bd-akjh / bd-0oro): Every guard must have a case that fails it.
+        // Deleting a guard entirely also passes correct data, so a guard tested only against
+        // correct data has demonstrated nothing. These test cases ensure that every
+        // structural reject_unless! guard in ScriptBotsConfig::validate actively rejects
+        // invalid values with its exact error message.
+
+        // 1. world_width != 0
+        let zero_width = ScriptBotsConfig {
+            world_width: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let err = zero_width
+            .validate()
+            .expect_err("world_width == 0 must fail validation");
+        assert_eq!(invalid_config_message(&err), "world_width must be non-zero");
+
+        // 2. world_height != 0
+        let zero_height = ScriptBotsConfig {
+            world_height: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let err = zero_height
+            .validate()
+            .expect_err("world_height == 0 must fail validation");
+        assert_eq!(
+            invalid_config_message(&err),
+            "world_height must be non-zero"
+        );
+
+        // 3. food_cell_size != 0
+        let zero_cell = ScriptBotsConfig {
+            food_cell_size: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let err = zero_cell
+            .validate()
+            .expect_err("food_cell_size == 0 must fail validation");
+        assert_eq!(
+            invalid_config_message(&err),
+            "food_cell_size must be non-zero"
+        );
+
+        // 4. interaction_event_tick_stride < u32::MAX
+        let max_stride = ScriptBotsConfig {
+            interaction_event_tick_stride: u32::MAX,
+            ..ScriptBotsConfig::default()
+        };
+        let err = max_stride
+            .validate()
+            .expect_err("interaction_event_tick_stride == u32::MAX must fail validation");
+        assert_eq!(
+            invalid_config_message(&err),
+            "interaction_event_tick_stride must be less than u32::MAX"
+        );
+
+        // 5. world_width.is_multiple_of(food_cell_size)
+        let indivisible_width = ScriptBotsConfig {
+            world_width: 1001, // default food_cell_size is 20
+            food_cell_size: 20,
+            ..ScriptBotsConfig::default()
+        };
+        let err = indivisible_width
+            .validate()
+            .expect_err("indivisible world_width must fail validation");
+        assert_eq!(
+            invalid_config_message(&err),
+            "world_width must be divisible by food_cell_size"
+        );
+
+        // 6. world_height.is_multiple_of(food_cell_size)
+        let indivisible_height = ScriptBotsConfig {
+            world_height: 1001, // default food_cell_size is 20
+            food_cell_size: 20,
+            ..ScriptBotsConfig::default()
+        };
+        let err = indivisible_height
+            .validate()
+            .expect_err("indivisible world_height must fail validation");
+        assert_eq!(
+            invalid_config_message(&err),
+            "world_height must be divisible by food_cell_size"
+        );
+    }
+
+    #[test]
     fn default_config_matches_legacy_food_settings() {
         let config = ScriptBotsConfig::default();
         assert!(
