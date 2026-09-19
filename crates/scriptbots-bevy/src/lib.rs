@@ -12525,6 +12525,16 @@ mod tests {
 /// before the submitter is even asked, which was `426f4083a9` — because that is
 /// not a discard and a rule loose enough to catch it would fire on ordinary
 /// logging. A noisy guard gets suppressed, which is worse than none.
+///
+/// DEFECT-CLASS BOUNDARY (bd-h3nt, bd-0oro):
+/// Being listed in `EXEMPT_CRATE_DIRS` means ONLY that a crate has no command
+/// submission surface and therefore cannot commit the DISCARD form of this defect.
+/// It does NOT mean the crate is immune to or exempt from the wider `bd-0oro`
+/// defect class ("a success signal that claims more than the code observed").
+/// Crates like `scriptbots-core` and `scriptbots-storage` are dense with signals
+/// (invariants, constraints, schemas, digests, receipts) that can overclaim.
+/// See AGENTS.md ("Signals Must Name What They Observed") for the authoring
+/// obligations governing those forms.
 #[cfg(test)]
 mod acknowledgement_guard {
     use std::collections::{BTreeMap, BTreeSet};
@@ -12549,6 +12559,12 @@ mod acknowledgement_guard {
 
     /// Crates deliberately NOT scanned, each with the bead that decided it.
     ///
+    /// DEFECT-CLASS NOTICE (bd-h3nt, bd-0oro): Exemption here means ONLY "outside the
+    /// DISCARD form: this crate has no command submission surface". It does NOT
+    /// mean the crate cannot carry signals that outrun their evidence. Do NOT
+    /// cite this list as evidence that an exempt crate is free of the `bd-0oro`
+    /// defect class. See AGENTS.md ("Signals Must Name What They Observed").
+    ///
     /// The point of this list is that it does not exist to shrink the work — it
     /// exists so that a crate is never merely FORGOTTEN. Before it, the scanned
     /// set was an explicit list and a newly added crate was silently outside
@@ -12565,37 +12581,37 @@ mod acknowledgement_guard {
         (
             "crates/scriptbots-core/src",
             "bd-hhsl",
-            "defines and APPLIES ControlCommand; it is the target of commands, not a submitter",
+            "outside the DISCARD form: defines and APPLIES ControlCommand; it is the target of commands, not a submitter (not exempt from wider bd-0oro signals-outrunning-evidence rules)",
         ),
         (
             "crates/scriptbots-storage/src",
             "bd-hhsl",
-            "persistence; no control surface",
+            "outside the DISCARD form: persistence layer with no command submission surface (not exempt from wider bd-0oro signals-outrunning-evidence rules)",
         ),
         (
             "crates/scriptbots-analytics/src",
             "bd-hhsl",
-            "offline analysis over persisted data; no control surface",
+            "outside the DISCARD form: offline analysis over persisted data with no command submission surface (not exempt from wider bd-0oro signals-outrunning-evidence rules)",
         ),
         (
             "crates/scriptbots-index/src",
             "bd-hhsl",
-            "spatial index; no control surface",
+            "outside the DISCARD form: spatial index with no command submission surface (not exempt from wider bd-0oro signals-outrunning-evidence rules)",
         ),
         (
             "crates/scriptbots-brain/src",
             "bd-hhsl",
-            "neural substrate; no control surface",
+            "outside the DISCARD form: neural substrate with no command submission surface (not exempt from wider bd-0oro signals-outrunning-evidence rules)",
         ),
         (
             "crates/scriptbots-brain-ml/src",
             "bd-hhsl",
-            "neural substrate; no control surface",
+            "outside the DISCARD form: neural substrate with no command submission surface (not exempt from wider bd-0oro signals-outrunning-evidence rules)",
         ),
         (
             "crates/scriptbots-brain-neuro/src",
             "bd-hhsl",
-            "neural substrate; no control surface",
+            "outside the DISCARD form: neural substrate with no command submission surface (not exempt from wider bd-0oro signals-outrunning-evidence rules)",
         ),
     ];
 
@@ -13525,6 +13541,26 @@ mod acknowledgement_guard {
                 root.join(dir).is_dir(),
                 "exemption for {dir} ({bead}) points at a directory that does not exist; \
                  remove the entry rather than leaving a stale claim"
+            );
+        }
+    }
+
+    /// Every exemption must explicitly state that it covers only the command DISCARD
+    /// form of bd-0oro (bd-h3nt).
+    ///
+    /// The danger of an exemption list is that a later reader takes it to mean
+    /// "this crate cannot carry a signal that outruns its evidence". That is
+    /// false: storage and core are dense with signals (invariants, schemas,
+    /// digests, constraints). This test asserts that every exemption reasons
+    /// about the DISCARD form specifically and disclaims coverage of the wider
+    /// bd-0oro defect class.
+    #[test]
+    fn every_exemption_explicitly_qualifies_that_it_covers_only_the_discard_form() {
+        for (dir, bead, why) in EXEMPT_CRATE_DIRS {
+            assert!(
+                why.contains("DISCARD form") && why.contains("bd-0oro"),
+                "exemption for {dir} ({bead}) must state that it covers only the DISCARD form \
+                 and disclaim wider bd-0oro immunity: \"{why}\""
             );
         }
     }
