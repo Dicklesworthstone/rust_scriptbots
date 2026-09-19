@@ -39545,8 +39545,8 @@ mod tests {
             summary: TickSummary {
                 tick: Tick(1),
                 agent_count: 50,
-                births: 5,
-                deaths: 2,
+                births: 0,
+                deaths: 0,
                 total_energy: 5000.0,
                 average_energy: 100.0,
                 average_health: 1.0,
@@ -39568,8 +39568,8 @@ mod tests {
             summary: TickSummary {
                 tick: Tick(1),
                 agent_count: 30,
-                births: 2,
-                deaths: 1,
+                births: 0,
+                deaths: 0,
                 total_energy: 3000.0,
                 average_energy: 100.0,
                 average_health: 1.0,
