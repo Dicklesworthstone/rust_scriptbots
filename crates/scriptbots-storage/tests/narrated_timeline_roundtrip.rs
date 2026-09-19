@@ -388,7 +388,6 @@ fn detector_window(path: &str, series: &[Sample]) -> (Vec<DetectionEvidence>, Ve
 }
 
 /// Independent metric recovery, all-four complete evidence bytes, and the populated bridge.
-#[ignore = "bd-w1oi: file-backed admission stalls inside the fsqlite/asupersync async bridge; unignore when bd-w1oi lands"]
 #[test]
 fn persisted_inputs_reproduce_all_detector_evidence_and_bridge() {
     let original = crashing_population(0.0);
