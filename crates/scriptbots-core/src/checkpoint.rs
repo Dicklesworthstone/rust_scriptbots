@@ -2936,11 +2936,12 @@ mod tests {
         assert_eq!(
             (wire.len(), actual.as_str()),
             (
-                8_703,
-                "eb3446372221348720f28aeb8e8c36e320e4877e9fa75e5e91204a72dfb86f47",
+                8_710,
+                "8a4878dc1806275afa25de4696333d5e7d994ea251239342ffe1363fcc1b420c",
             ),
-            "the reviewed V1.3/codec-8 wire must remain byte-identical. bd-m1e.10 adds \
-             communication_mi_interval and communication_mi_window to configuration serialization (adding exactly 3 bytes). \
+            "the reviewed V1.3/codec-8 wire must remain byte-identical. bd-16g.7.3 adds \
+             food_requires_stillness, stillness_speed_threshold, communication_scramble, and \
+             communication_scramble_seed to configuration serialization (adding exactly 7 bytes). \
              Pinned DSR25 at 6c89bef produced identical canonical wires in default and economy-fault builds. \
              Science digest goldens and checkpoint tamper/continuation guards remain unchanged"
         );

@@ -116,6 +116,9 @@ pub static KNOB_ROLES: &[KnobSpec] = &[
     spec("carcass_maturity_age", ScientificTransition),
     spec("carcass_neighbor_exponent", ScientificTransition),
     spec("carcass_reproduction_reward", ScientificTransition),
+    // --- Communication ablation arms (bd-16g.7.3) ---
+    spec("communication_scramble", ScientificTransition),
+    spec("communication_scramble_seed", ScientificTransition),
     // --- Diet and world mode ---
     spec("carnivore_threshold", ScientificTransition),
     spec("closed", ScientificTransition),
@@ -132,6 +135,7 @@ pub static KNOB_ROLES: &[KnobSpec] = &[
     spec("food_intake_rate", ScientificTransition),
     spec("food_max", ScientificTransition),
     spec("food_moisture_weight", ScientificTransition),
+    spec("food_requires_stillness", ScientificTransition),
     spec("food_respawn_amount", ScientificTransition),
     spec("food_respawn_interval", ScientificTransition),
     spec("food_sharing_distance", ScientificTransition),
@@ -174,6 +178,7 @@ pub static KNOB_ROLES: &[KnobSpec] = &[
     spec("selection_mode", ScientificTransition),
     // --- Sensing ---
     spec("sense_radius", ScientificTransition),
+    spec("stillness_speed_threshold", ScientificTransition),
     // --- Combat ---
     spec("spike_alignment_cosine", ScientificTransition),
     spec("spike_damage", ScientificTransition),

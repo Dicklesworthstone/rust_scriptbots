@@ -8406,7 +8406,8 @@ pub fn scramble_hearing_slice(hearing: &mut [f32], stream: &mut SmallRngStream) 
     let n = hearing.len();
     if n > 1 {
         for i in (1..n).rev() {
-            let j = (stream.next_u64() as usize) % (i + 1);
+            let bound = u64::try_from(i + 1).unwrap_or(u64::MAX);
+            let j = usize::try_from(stream.next_u64() % bound).unwrap_or(0);
             hearing.swap(i, j);
         }
     }
@@ -20860,7 +20861,8 @@ impl WorldState {
             let n = sensor_results.len();
             if n > 1 {
                 for i in (1..n).rev() {
-                    let j = (scramble_rng.next_u64() as usize) % (i + 1);
+                    let bound = u64::try_from(i + 1).unwrap_or(u64::MAX);
+                    let j = usize::try_from(scramble_rng.next_u64() % bound).unwrap_or(0);
                     if i != j {
                         let tmp = sensor_results[i].0[18];
                         sensor_results[i].0[18] = sensor_results[j].0[18];
@@ -32417,7 +32419,7 @@ mod tests {
         }
 
         type Setter = fn(&mut ScriptBotsConfig, f32);
-        let fields: [(&str, Setter); 72] = [
+        let fields: [(&str, Setter); 73] = [
             ("initial_food", |config, value| config.initial_food = value),
             ("food_respawn_amount", |config, value| {
                 config.food_respawn_amount = value;
@@ -32623,6 +32625,9 @@ mod tests {
                 "render.auto_exposure.speed_darken",
                 set_render_auto_exposure_speed_darken,
             ),
+            ("stillness_speed_threshold", |config, value| {
+                config.stillness_speed_threshold = value;
+            }),
         ];
 
         let expected_paths = fields
@@ -36362,6 +36367,8 @@ mod tests {
         let mut config = quiet_trace_config(0x424f_554e_4459, 0);
         config.food_requires_stillness = true;
         config.stillness_speed_threshold = 0.05;
+        config.food_intake_rate = 0.1;
+        config.food_waste_rate = 0.05;
         let mut world = WorldState::new(config).expect("world");
 
         let at_boundary = world.spawn_agent(AgentData {
@@ -36423,6 +36430,8 @@ mod tests {
     fn stillness_gate_inert_when_disabled() {
         let mut config = quiet_trace_config(0x494e_4552_5431, 0);
         config.food_requires_stillness = false;
+        config.food_intake_rate = 0.1;
+        config.food_waste_rate = 0.05;
         let mut world = WorldState::new(config).expect("world");
 
         let fast_agent = world.spawn_agent(AgentData {
@@ -36487,7 +36496,7 @@ mod tests {
         world.step().expect("step 1");
         world.step().expect("step 2");
 
-        let scrambled_hearings: Vec<f32> = [a1, a2, a3, a4]
+        let mut scrambled_hearings: Vec<f32> = [a1, a2, a3, a4]
             .iter()
             .map(|&id| world.agent_runtime(id).unwrap().sensors[18])
             .collect();
@@ -36519,20 +36528,18 @@ mod tests {
         ctrl_world.step().expect("ctrl step 1");
         ctrl_world.step().expect("ctrl step 2");
 
-        let control_hearings: Vec<f32> = [c1, c2, c3, c4]
+        let mut control_hearings: Vec<f32> = [c1, c2, c3, c4]
             .iter()
             .map(|&id| ctrl_world.agent_runtime(id).unwrap().sensors[18])
             .collect();
 
-        let mut sorted_scrambled = scrambled_hearings.clone();
-        sorted_scrambled.sort_by(|a, b| a.total_cmp(b));
-        let mut sorted_control = control_hearings.clone();
-        sorted_control.sort_by(|a, b| a.total_cmp(b));
+        scrambled_hearings.sort_by(f32::total_cmp);
+        control_hearings.sort_by(f32::total_cmp);
 
-        for (s, c) in sorted_scrambled.iter().zip(&sorted_control) {
+        for (s, c) in scrambled_hearings.iter().zip(&control_hearings) {
             assert!(
                 (s - c).abs() < 1e-6,
-                "scramble must preserve multi-set of hearing values: scrambled={sorted_scrambled:?}, control={sorted_control:?}"
+                "scramble must preserve multi-set of hearing values: scrambled={scrambled_hearings:?}, control={control_hearings:?}"
             );
         }
     }
@@ -36603,8 +36610,10 @@ mod tests {
 
     #[test]
     fn config_validation_checks_stillness_speed_threshold() {
-        let mut config = ScriptBotsConfig::default();
-        config.stillness_speed_threshold = -0.01;
+        let mut config = ScriptBotsConfig {
+            stillness_speed_threshold: -0.01,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         config.stillness_speed_threshold = f32::NAN;

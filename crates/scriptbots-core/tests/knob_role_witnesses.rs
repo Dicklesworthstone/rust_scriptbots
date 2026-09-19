@@ -1287,6 +1287,18 @@ struct BlockedKnob {
 
 static BLOCKED_SCIENTIFIC_KNOBS: &[BlockedKnob] = &[
     BlockedKnob {
+        path: "communication_scramble",
+        reason: "Ablation arm knob for bd-16g.7.3; requires emergent communication scenario with sound-emitting agents and hearing-responsive brains",
+    },
+    BlockedKnob {
+        path: "communication_scramble_seed",
+        reason: "Ablation arm knob for bd-16g.7.3; requires emergent communication scenario with sound-emitting agents and active communication_scramble",
+    },
+    BlockedKnob {
+        path: "food_requires_stillness",
+        reason: "Ablation arm knob for bd-16g.7.3; requires moving agents in food cells to diverge from still feeding baseline",
+    },
+    BlockedKnob {
         path: "neuroflow.activation",
         reason: "Consumer is application-level brain installer in scriptbots-app behind cfg(feature = \"neuro\"); core WorldState has no built-in neuroflow dependency or evaluation",
     },
@@ -1297,6 +1309,10 @@ static BLOCKED_SCIENTIFIC_KNOBS: &[BlockedKnob] = &[
     BlockedKnob {
         path: "neuroflow.hidden_layers",
         reason: "Consumer is application-level brain installer in scriptbots-app behind cfg(feature = \"neuro\"); core WorldState has no built-in neuroflow dependency or evaluation",
+    },
+    BlockedKnob {
+        path: "stillness_speed_threshold",
+        reason: "Ablation arm knob for bd-16g.7.3; requires food_requires_stillness enabled and agents moving near the velocity threshold",
     },
 ];
 
