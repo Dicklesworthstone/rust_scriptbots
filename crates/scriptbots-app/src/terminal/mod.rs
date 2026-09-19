@@ -46,9 +46,9 @@ use scriptbots_runtime::{
     BrainProjectionRequest, HostPort, ProjectionClientId, ProjectionRequestRevision,
     RenderSnapshot, channel::ChannelHostPort,
 };
+use scriptbots_storage::{AnalyticsSnapshot, IslandSnapshot, MetricReading};
 #[cfg(test)]
-use scriptbots_storage::AnalyticsSnapshotProvider;
-use scriptbots_storage::MetricReading;
+use scriptbots_storage::{AnalyticsSnapshotProvider, MigrationSnapshotArc};
 use serde::Serialize;
 #[cfg(test)]
 use slotmap::Key;
@@ -598,6 +598,8 @@ struct TerminalApp<'a> {
     export_requested: bool,
     /// Deterministic sub-step subdivision for tick-driven animations (bd-2z0.14.2.4).
     sub_step: u8,
+    /// Whether the tiled archipelago view is active instead of the single-world terrain map (bd-16g.5.5.4).
+    archipelago_view: bool,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -723,6 +725,7 @@ impl<'a> TerminalApp<'a> {
             selected_eye: None,
             export_requested: false,
             sub_step: 0,
+            archipelago_view: false,
         };
         app.refresh_snapshot();
         app
@@ -1135,9 +1138,14 @@ impl<'a> TerminalApp<'a> {
             self.draw_rail(frame, rail, &self.snapshot);
         }
 
-        // Draw the map while avoiding holding an external borrow across &mut self
+        // Draw the map (or tiled archipelago view) while avoiding holding an external borrow across &mut self
         let world_size = self.snapshot.world_size;
-        self.draw_map(frame, layout.map, world_size);
+        if self.archipelago_view {
+            let published = self.analytics_provider.snapshot();
+            self.draw_archipelago(frame, layout.map, &published);
+        } else {
+            self.draw_map(frame, layout.map, world_size);
+        }
         if let Some(probe) = layout.probe {
             self.draw_probe(frame, probe, &self.snapshot);
         }
@@ -1867,6 +1875,351 @@ impl<'a> TerminalApp<'a> {
                 inner,
             );
         }
+    }
+
+    /// Tiled archipelago view rendering per-island panels and migration flows from lock-free `AnalyticsSnapshot` (bd-16g.5.5.4).
+    fn draw_archipelago(&self, frame: &mut Frame<'_>, area: Rect, published: &AnalyticsSnapshot) {
+        let total_islands = published.islands.len();
+        let title = format!(
+            "Archipelago Overview ({} Island{}, Barrier Epoch {})",
+            total_islands,
+            if total_islands == 1 { "" } else { "s" },
+            published
+                .barrier_epoch
+                .map_or_else(|| "none".to_string(), |e| e.to_string())
+        );
+        let block = Block::default()
+            .title(self.palette.title(title))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width < 4 || inner.height < 3 {
+            return;
+        }
+
+        if total_islands == 0 {
+            let empty_lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "No archipelago telemetry recorded in current snapshot.",
+                    self.palette.muted_style(),
+                )),
+                Line::from(Span::styled(
+                    "Barrier snapshots will populate island panels automatically when multi-island mode is active.",
+                    self.palette.label_style(),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Press ", self.palette.label_style()),
+                    Span::styled("'a'", self.palette.accent_style()),
+                    Span::styled(" to toggle single-world map.", self.palette.label_style()),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(empty_lines), inner);
+            return;
+        }
+
+        const MAX_TILED_ISLAND_PANELS: usize = 8;
+        let is_degraded = total_islands > MAX_TILED_ISLAND_PANELS;
+        let (live_islands, aggregated_islands) = if is_degraded {
+            (
+                &published.islands[..MAX_TILED_ISLAND_PANELS - 1],
+                Some(&published.islands[MAX_TILED_ISLAND_PANELS - 1..]),
+            )
+        } else {
+            (&published.islands[..], None)
+        };
+
+        let show_degradation_banner = is_degraded && inner.height >= 5;
+        let show_migration_bar = !published.migration_arcs.is_empty() && inner.height >= 8;
+
+        let mut constraints = Vec::new();
+        if show_degradation_banner {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(3));
+        if show_migration_bar {
+            constraints.push(Constraint::Length(3));
+        }
+
+        let vertical_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(inner);
+
+        let mut chunk_idx = 0;
+
+        if show_degradation_banner {
+            let banner_area = vertical_chunks[chunk_idx];
+            chunk_idx += 1;
+            let agg_count = aggregated_islands.as_ref().map_or(0, |slice| slice.len());
+            let banner_msg = format!(
+                "⚠ [DEGRADATION ADMISSION: Displaying {} of {} islands live; remaining {} islands are aggregated in summary panel to preserve frame rate]",
+                live_islands.len(),
+                total_islands,
+                agg_count,
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    banner_msg,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                banner_area,
+            );
+        }
+
+        let grid_area = vertical_chunks[chunk_idx];
+        chunk_idx += 1;
+
+        if show_migration_bar {
+            let mig_area = vertical_chunks[chunk_idx];
+            let epoch_val = published.barrier_epoch.unwrap_or(0);
+            let mig_block = Block::default()
+                .title(
+                    self.palette
+                        .title(format!("Migration Flows (Epoch {epoch_val})")),
+                )
+                .borders(Borders::ALL);
+            let mig_inner = mig_block.inner(mig_area);
+            frame.render_widget(mig_block, mig_area);
+
+            let anim_phase = ((epoch_val.wrapping_add(u64::from(self.sub_step) / 4)) % 4) as usize;
+            let anim_glyph = match anim_phase {
+                0 => "[⤳   ]",
+                1 => "[ ⤳  ]",
+                2 => "[  ⤳ ]",
+                _ => "[   ⤳]",
+            };
+
+            let arc_spans: Vec<Span> = published
+                .migration_arcs
+                .iter()
+                .enumerate()
+                .flat_map(|(i, arc)| {
+                    let sep = if i > 0 { "  │  " } else { "" };
+                    vec![
+                        Span::styled(sep, self.palette.muted_style()),
+                        Span::styled(
+                            format!("Isl {}", arc.from_island),
+                            self.palette.accent_style(),
+                        ),
+                        Span::raw(" ─("),
+                        Span::styled(format!("{}", arc.count), self.palette.value_style()),
+                        Span::raw(")─"),
+                        Span::styled(anim_glyph, Style::default().fg(Color::Cyan)),
+                        Span::raw("─> "),
+                        Span::styled(
+                            format!("Isl {}", arc.to_island),
+                            self.palette.accent_style(),
+                        ),
+                    ]
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(Line::from(arc_spans)), mig_inner);
+        }
+
+        let total_panels = live_islands.len() + if aggregated_islands.is_some() { 1 } else { 0 };
+        if total_panels > 0 && grid_area.width >= 4 && grid_area.height >= 2 {
+            let rows = if total_panels <= 2 { 1 } else { 2 };
+            let cols = total_panels.div_ceil(rows);
+
+            let row_constraints = vec![Constraint::Ratio(1, rows as u32); rows];
+            let row_areas = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(row_constraints)
+                .split(grid_area);
+
+            for r in 0..rows {
+                let start = r * cols;
+                let end = (start + cols).min(total_panels);
+                if start >= total_panels {
+                    break;
+                }
+                let count_in_row = end - start;
+                let col_constraints = vec![Constraint::Ratio(1, cols as u32); cols];
+                let col_areas = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(col_constraints)
+                    .split(row_areas[r]);
+
+                for i in 0..count_in_row {
+                    let panel_idx = start + i;
+                    let target = col_areas[i];
+                    if panel_idx < live_islands.len() {
+                        let island = &live_islands[panel_idx];
+                        self.draw_island_panel(frame, target, island, published);
+                    } else if let Some(rest) = aggregated_islands {
+                        self.draw_aggregated_island_panel(frame, target, rest);
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_island_panel(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        island: &IslandSnapshot,
+        published: &AnalyticsSnapshot,
+    ) {
+        let title = format!("Island {} [{}]", island.island_id, island.label);
+        let block = Block::default()
+            .title(self.palette.title(title))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width < 4 || inner.height < 2 {
+            return;
+        }
+
+        let incoming: usize = published
+            .migration_arcs
+            .iter()
+            .filter(|a| a.to_island == island.island_id)
+            .map(|a| a.count)
+            .sum();
+        let outgoing: usize = published
+            .migration_arcs
+            .iter()
+            .filter(|a| a.from_island == island.island_id)
+            .map(|a| a.count)
+            .sum();
+
+        let spark_str = render_sparkline_str(&island.sparkline);
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("Agents: ", self.palette.label_style()),
+            Span::styled(
+                format!("{}", island.agent_count),
+                self.palette.value_style(),
+            ),
+            Span::raw("  "),
+            Span::styled("Births/Deaths: ", self.palette.label_style()),
+            Span::styled(
+                format!("{}/{}", island.births, island.deaths),
+                self.palette.value_style(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Energy: ", self.palette.label_style()),
+            Span::styled(
+                format!("{:.0}", island.total_energy),
+                self.palette.value_style(),
+            ),
+            Span::styled(
+                format!(" (avg {:.1})", island.average_energy),
+                self.palette.muted_style(),
+            ),
+        ]));
+
+        if incoming > 0 || outgoing > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("Migr: ", self.palette.label_style()),
+                Span::styled(format!("+{incoming} in"), self.palette.accent_style()),
+                Span::raw(" / "),
+                Span::styled(format!("-{outgoing} out"), self.palette.muted_style()),
+            ]));
+        }
+
+        if !spark_str.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Trend: ", self.palette.label_style()),
+                Span::styled(spark_str, self.palette.population_spark_style()),
+            ]));
+        }
+
+        if inner.height >= 5 && !island.sparkline.is_empty() {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(1)])
+                .split(inner);
+            frame.render_widget(Paragraph::new(lines), chunks[0]);
+            let spark_data: Vec<u64> = island
+                .sparkline
+                .iter()
+                .map(|&v| v.max(0.0).round() as u64)
+                .collect();
+            frame.render_widget(
+                Sparkline::default()
+                    .style(self.palette.population_spark_style())
+                    .data(&spark_data),
+                chunks[1],
+            );
+        } else {
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+    }
+
+    fn draw_aggregated_island_panel(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        islands: &[IslandSnapshot],
+    ) {
+        let count = islands.len();
+        let title = format!("+{} More Islands (Summary)", count);
+        let block = Block::default()
+            .title(self.palette.title(title))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width < 4 || inner.height < 2 {
+            return;
+        }
+
+        let sum_agents: usize = islands.iter().map(|i| i.agent_count).sum();
+        let sum_energy: f64 = islands.iter().map(|i| i.total_energy).sum();
+        let avg_energy = if sum_agents > 0 {
+            sum_energy / sum_agents as f64
+        } else {
+            0.0
+        };
+        let sum_births: usize = islands.iter().map(|i| i.births).sum();
+        let sum_deaths: usize = islands.iter().map(|i| i.deaths).sum();
+        let min_id = islands.iter().map(|i| i.island_id).min().unwrap_or(0);
+        let max_id = islands.iter().map(|i| i.island_id).max().unwrap_or(0);
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Islands: ", self.palette.label_style()),
+                Span::styled(
+                    format!("{count} (IDs {min_id}..{max_id})"),
+                    self.palette.value_style(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Agg. Agents: ", self.palette.label_style()),
+                Span::styled(format!("{sum_agents}"), self.palette.value_style()),
+            ]),
+            Line::from(vec![
+                Span::styled("Total Energy: ", self.palette.label_style()),
+                Span::styled(format!("{sum_energy:.0}"), self.palette.value_style()),
+                Span::styled(
+                    format!(" (avg {avg_energy:.1})"),
+                    self.palette.muted_style(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Births/Deaths: ", self.palette.label_style()),
+                Span::styled(
+                    format!("{sum_births}/{sum_deaths}"),
+                    self.palette.value_style(),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "Aggregated to preserve FPS",
+                self.palette.muted_style(),
+            )),
+        ];
+
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_leaderboard(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
@@ -2778,6 +3131,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" c        Cycle palette (accessibility modes)"),
             Line::raw(" b        Toggle metrics baseline (set/clear)"),
             Line::raw(" x        Toggle expanded panels (auto-on on wide terminals)"),
+            Line::raw(" a        Toggle tiled archipelago view"),
             Line::raw(" [ / ]    Cycle brain layers (console view)"),
             Line::raw(" ↑ / ↓    Page brain heatmap rows (console view)"),
             Line::raw(" ← / →    Change focused agent (console view)"),
@@ -3093,6 +3447,14 @@ impl<'a> TerminalApp<'a> {
                     "Probe On"
                 } else {
                     "Probe Off"
+                });
+            }
+            CommandPaletteAction::ToggleArchipelago => {
+                self.archipelago_view = !self.archipelago_view;
+                self.push_toast(if self.archipelago_view {
+                    "Archipelago View ON"
+                } else {
+                    "Archipelago View OFF"
                 });
             }
             CommandPaletteAction::ShowHelp => {
@@ -3419,6 +3781,23 @@ impl<'a> TerminalApp<'a> {
                         "Expanded panels ON"
                     } else {
                         "Expanded panels OFF"
+                    },
+                );
+            }
+            (KeyCode::Char('a') | KeyCode::Char('A'), _) => {
+                self.archipelago_view = !self.archipelago_view;
+                self.push_toast(if self.archipelago_view {
+                    "Archipelago View ON"
+                } else {
+                    "Archipelago View OFF"
+                });
+                self.push_event(
+                    self.snapshot.tick,
+                    EventKind::Info,
+                    if self.archipelago_view {
+                        "Tiled archipelago view ON"
+                    } else {
+                        "Tiled archipelago view OFF (single-world map)"
                     },
                 );
             }
@@ -5654,6 +6033,7 @@ pub enum CommandPaletteAction {
     FocusTopPredator,
     FocusOldest,
     ToggleProbe,
+    ToggleArchipelago,
     ShowHelp,
 }
 
@@ -5720,6 +6100,12 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "b",
             category: "Science",
             action: CommandPaletteAction::ToggleProbe,
+        },
+        CommandPaletteItem {
+            label: "Toggle Tiled Archipelago View",
+            keybind_hint: "a",
+            category: "View",
+            action: CommandPaletteAction::ToggleArchipelago,
         },
         CommandPaletteItem {
             label: "Show Keybindings & Legend",
@@ -16299,6 +16685,200 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn render_sparkline_str_renders_deterministic_unicode() {
+        assert_eq!(render_sparkline_str(&[]), "");
+        assert_eq!(render_sparkline_str(&[10.0, 10.0, 10.0]), "▄▄▄");
+        let ramp = render_sparkline_str(&[0.0, 5.0, 10.0]);
+        assert_eq!(ramp.chars().count(), 3);
+        assert_eq!(ramp.chars().next().unwrap(), ' ');
+        assert_eq!(ramp.chars().last().unwrap(), '█');
+        let with_nan = render_sparkline_str(&[f32::NAN, 10.0]);
+        assert_eq!(with_nan.chars().count(), 2);
+    }
+
+    #[test]
+    fn archipelago_view_empty_state_rendered_when_no_islands() {
+        with_shortcut_app(|app| {
+            app.palette = Palette::test_backend_evidence();
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test backend");
+            let empty_snapshot = AnalyticsSnapshot::default();
+            terminal
+                .draw(|frame| {
+                    app.draw_archipelago(frame, Rect::new(0, 0, 80, 24), &empty_snapshot);
+                })
+                .expect("draw archipelago");
+            let text = buffer_text(&terminal);
+            assert!(text.contains("Archipelago Overview (0 Islands"));
+            assert!(text.contains("No archipelago telemetry recorded in current snapshot."));
+        });
+    }
+
+    #[test]
+    fn archipelago_view_renders_two_islands_with_sparkline_and_migration_arcs() {
+        with_shortcut_app(|app| {
+            app.palette = Palette::test_backend_evidence();
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("test backend");
+
+            let isl0 = IslandSnapshot {
+                island_id: 0,
+                label: Arc::from("Atoll"),
+                agent_count: 42,
+                total_energy: 4200.0,
+                average_energy: 100.0,
+                births: 4,
+                deaths: 2,
+                sparkline: Arc::from([10.0, 20.0, 30.0, 40.0]),
+            };
+            let isl1 = IslandSnapshot {
+                island_id: 1,
+                label: Arc::from("Lagoon"),
+                agent_count: 18,
+                total_energy: 1800.0,
+                average_energy: 100.0,
+                births: 1,
+                deaths: 0,
+                sparkline: Arc::from([5.0, 10.0, 15.0, 18.0]),
+            };
+            let arc = MigrationSnapshotArc {
+                from_island: 0,
+                to_island: 1,
+                count: 3,
+            };
+
+            let snapshot = AnalyticsSnapshot {
+                committed_tick: Some(50),
+                committed_agent_count: Some(60),
+                islands: Arc::from([isl0, isl1]),
+                migration_arcs: Arc::from([arc]),
+                barrier_epoch: Some(12),
+                ..AnalyticsSnapshot::default()
+            };
+
+            app.sub_step = 0;
+            terminal
+                .draw(|frame| {
+                    app.draw_archipelago(frame, Rect::new(0, 0, 100, 30), &snapshot);
+                })
+                .expect("draw archipelago");
+            let text0 = buffer_text(&terminal);
+            assert!(text0.contains("Island 0 [Atoll]"));
+            assert!(text0.contains("Island 1 [Lagoon]"));
+            assert!(text0.contains("Agents: 42"));
+            assert!(text0.contains("Agents: 18"));
+            assert!(text0.contains("Migration Flows (Epoch 12)"));
+            assert!(text0.contains("[⤳   ]"));
+
+            // Sub-step animation progression:
+            app.sub_step = 4;
+            terminal
+                .draw(|frame| {
+                    app.draw_archipelago(frame, Rect::new(0, 0, 100, 30), &snapshot);
+                })
+                .expect("draw archipelago animated");
+            let text1 = buffer_text(&terminal);
+            assert!(text1.contains("[ ⤳  ]"));
+        });
+    }
+
+    #[test]
+    fn archipelago_view_honest_degradation_admits_aggregating_64_islands() {
+        with_shortcut_app(|app| {
+            app.palette = Palette::test_backend_evidence();
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(140, 40)).expect("test backend");
+
+            let islands: Vec<IslandSnapshot> = (0..64)
+                .map(|i| IslandSnapshot {
+                    island_id: i,
+                    label: Arc::from(format!("Island-{i}")),
+                    agent_count: 10 + i as usize,
+                    total_energy: (10 + i as usize) as f64 * 50.0,
+                    average_energy: 50.0,
+                    births: 1,
+                    deaths: 1,
+                    sparkline: Arc::from([10.0, 12.0]),
+                })
+                .collect();
+
+            let total_agent_count = islands.iter().map(|i| i.agent_count).sum();
+            let snapshot = AnalyticsSnapshot {
+                committed_tick: Some(200),
+                committed_agent_count: Some(total_agent_count),
+                islands: Arc::from(islands),
+                migration_arcs: Arc::from([]),
+                barrier_epoch: Some(5),
+                ..AnalyticsSnapshot::default()
+            };
+
+            terminal
+                .draw(|frame| {
+                    app.draw_archipelago(frame, Rect::new(0, 0, 140, 40), &snapshot);
+                })
+                .expect("draw archipelago degraded");
+            let text = buffer_text(&terminal);
+
+            // 1. Degradation admission banner must be clearly displayed!
+            assert!(
+                text.contains("⚠ [DEGRADATION ADMISSION: Displaying 7 of 64 islands live; remaining 57 islands are aggregated in summary panel to preserve frame rate]"),
+                "expected degradation banner in rendered buffer: {text}"
+            );
+
+            // 2. The first 7 islands are displayed individually:
+            for i in 0..7 {
+                assert!(
+                    text.contains(&format!("Island {i} [Island-{i}]")),
+                    "expected island {i} in buffer"
+                );
+            }
+
+            // 3. Islands 7..64 are NOT displayed as individual panels:
+            assert!(!text.contains("Island 7 [Island-7]"));
+            assert!(!text.contains("Island 63 [Island-63]"));
+
+            // 4. Summary panel is displayed with exact aggregate numbers:
+            assert!(text.contains("+57 More Islands (Summary)"));
+            assert!(text.contains("Islands: 57 (IDs 7..63)"));
+            let expected_agg_agents: usize = (7..64).map(|i| 10 + i).sum();
+            assert!(text.contains(&format!("Agg. Agents: {expected_agg_agents}")));
+        });
+    }
+
+    #[test]
+    fn archipelago_view_key_toggle_and_command_palette_integration() {
+        with_shortcut_app(|app| {
+            assert!(!app.archipelago_view);
+
+            // Key 'a' toggles on:
+            let handled = app
+                .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+                .unwrap();
+            assert!(!handled);
+            assert!(app.archipelago_view);
+            assert_eq!(app.toasts.back().unwrap().message, "Archipelago View ON");
+
+            // Key 'a' toggles off:
+            app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+                .unwrap();
+            assert!(!app.archipelago_view);
+            assert_eq!(app.toasts.back().unwrap().message, "Archipelago View OFF");
+
+            // Command palette execution:
+            app.execute_palette_action(CommandPaletteAction::ToggleArchipelago);
+            assert!(app.archipelago_view);
+
+            // Item exists in palette:
+            let items = all_command_palette_items();
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.action == CommandPaletteAction::ToggleArchipelago)
+            );
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -16337,4 +16917,36 @@ fn convert_layers(act: &BrainActivations) -> Vec<BrainLayerView> {
 #[must_use]
 pub fn render_trophic_table(table: Option<&scriptbots_core::economy::TrophicTable>) -> String {
     scriptbots_core::economy::render_trophic_table(table)
+}
+
+/// Compact unicode sparkline string renderer (bd-16g.5.5.4).
+#[must_use]
+pub fn render_sparkline_str(values: &[f32]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    const TICKS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let finite_vals: Vec<f32> = values
+        .iter()
+        .copied()
+        .map(|v| if v.is_finite() { v } else { 0.0 })
+        .collect();
+    let min = finite_vals.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = finite_vals
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let range = max - min;
+    finite_vals
+        .iter()
+        .map(|&v| {
+            if range <= f32::EPSILON {
+                TICKS[3]
+            } else {
+                let normalized = ((v - min) / range).clamp(0.0, 1.0);
+                let idx = (normalized * 7.0).round() as usize;
+                TICKS[idx.min(7)]
+            }
+        })
+        .collect()
 }
