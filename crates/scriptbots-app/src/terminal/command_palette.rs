@@ -495,7 +495,7 @@ pub fn fuzzy_match_command_palette_rich<'a>(
             })
             .collect();
         // Recent pinned first, then original order
-        results.sort_by(|a, b| b.score.cmp(&a.score));
+        results.sort_by_key(|a| std::cmp::Reverse(a.score));
         return results;
     }
 
@@ -589,7 +589,7 @@ pub fn fuzzy_match_command_palette_rich<'a>(
         })
         .collect();
 
-    matches.sort_by(|a, b| b.score.cmp(&a.score));
+    matches.sort_by_key(|a| std::cmp::Reverse(a.score));
     matches
 }
 
@@ -910,8 +910,14 @@ mod tests {
         palette.record_action(CommandPaletteAction::SpawnCarnivore);
 
         assert_eq!(palette.recent_actions.len(), 2);
-        assert_eq!(palette.recent_actions[0], CommandPaletteAction::SpawnCarnivore);
-        assert_eq!(palette.recent_actions[1], CommandPaletteAction::TriggerDrought);
+        assert_eq!(
+            palette.recent_actions[0],
+            CommandPaletteAction::SpawnCarnivore
+        );
+        assert_eq!(
+            palette.recent_actions[1],
+            CommandPaletteAction::TriggerDrought
+        );
 
         // Empty query matches all, with recent pinned at top
         let matches = fuzzy_match_command_palette_rich(&items, "", &palette.recent_actions);

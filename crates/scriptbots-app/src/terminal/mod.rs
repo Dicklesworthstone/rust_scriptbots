@@ -17,8 +17,7 @@ use subcell::{ColorDepth, Layer, SubCellBuffer, SubCellMode, quantize};
 use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -36,8 +35,8 @@ use ratatui::{
 use scriptbots_core::{AgentId, ControlDisposition, TerrainLayer, WorldState};
 use scriptbots_core::{
     BrainActivations, BrainInspectionClientId, BrainInspectionRevision, ControlCommand,
-    ControlSettings, NUM_EYES, SENSOR_LAYOUT, ScriptBotsConfig, SelectionUpdate, SensorAttribution,
-    SensorKind, SimulationCommand, TerrainKind, TickSummary,
+    ControlSettings, NUM_EYES, SENSOR_LAYOUT, ScriptBotsConfig, SelectionMode, SelectionState,
+    SelectionUpdate, SensorAttribution, SensorKind, SimulationCommand, TerrainKind, TickSummary,
     attribution::{AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs},
     narrative::{EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord, SubjectRef},
     visual,
@@ -70,19 +69,19 @@ pub mod canvas_inspector;
 pub mod canvas_ramps;
 pub mod command_palette;
 pub use command_palette::{
-    all_command_palette_items, fuzzy_match_command_palette, fuzzy_match_command_palette_rich,
     CommandPalette, CommandPaletteAction, CommandPaletteEntry, CommandPaletteItem,
-    ScoredPaletteMatch,
+    ScoredPaletteMatch, all_command_palette_items, fuzzy_match_command_palette,
+    fuzzy_match_command_palette_rich,
 };
 pub mod export;
 pub mod frankentui_shell;
 pub mod pointer;
 pub mod science_screens;
 pub use pointer::{
-    calculate_splitter_pct, clamp_splitter_pct, cursor_centered_zoom, cycle_stacked_agents,
-    drag_pan, DragTarget, HeaderHitTarget, HitRegion, HitRegionMap, HoverStabilizer,
-    PointerClickEvent, PointerGestureState, RichHoverTooltip, SidebarPanelKind, SplitterKind,
-    DEFAULT_MAP_SPLIT_PCT, HOVER_STABILIZATION_DURATION, MAX_MAP_SPLIT_PCT, MIN_MAP_SPLIT_PCT,
+    DEFAULT_MAP_SPLIT_PCT, DragTarget, HOVER_STABILIZATION_DURATION, HeaderHitTarget, HitRegion,
+    HitRegionMap, HoverStabilizer, MAX_MAP_SPLIT_PCT, MIN_MAP_SPLIT_PCT, PointerClickEvent,
+    PointerGestureState, RichHoverTooltip, SidebarPanelKind, SplitterKind, calculate_splitter_pct,
+    clamp_splitter_pct, cursor_centered_zoom, cycle_stacked_agents, drag_pan,
 };
 
 // `paint.rs` is deliberately NOT declared (bd-c1z8). It is a second, complete
@@ -665,13 +664,15 @@ struct TerminalApp<'a> {
     /// 150 ms hover probe stabilization tracking (bd-2z0.14.2.5).
     pub hover_stabilizer: HoverStabilizer,
     /// Clamped percentage width for the world map canvas column (bd-2z0.14.2.5).
-    pub map_split_pct: u16,
+    pub map_split_pct: Option<u16>,
     /// Currently focused sidebar panel (bd-2z0.14.2.5).
     pub focused_panel: Option<SidebarPanelKind>,
     /// Recent command palette actions for MRU ranking and recency pinning (bd-2z0.14.2.5).
     pub palette_recent_actions: Vec<CommandPaletteAction>,
     /// Last acknowledged control command receipt summary for palette footer (bd-2z0.14.2.5).
     pub last_command_receipt_summary: Option<String>,
+    /// Total width of the body (map + splitter + sidebar) for splitter calculation (bd-2z0.14.2.5).
+    pub body_width: u16,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -813,10 +814,11 @@ impl<'a> TerminalApp<'a> {
             hit_regions: HitRegionMap::default(),
             pointer_gesture: PointerGestureState::default(),
             hover_stabilizer: HoverStabilizer::new(),
-            map_split_pct: DEFAULT_MAP_SPLIT_PCT,
+            map_split_pct: None,
             focused_panel: None,
             palette_recent_actions: Vec::new(),
             last_command_receipt_summary: None,
+            body_width: 80,
         };
         app.refresh_snapshot();
         app
@@ -1412,25 +1414,37 @@ impl<'a> TerminalApp<'a> {
                 .sidebar_panels
                 .push((SidebarPanelKind::Mortality, mortality));
         }
+        self.body_width =
+            (layout.stats.x.saturating_add(layout.stats.width)).saturating_sub(layout.map.x);
+        let h_y = layout.header.y;
+        let h_h = layout.header.height;
+        let status_len = if self.baseline.is_some() {
+            96u16
+        } else {
+            82u16
+        };
+        let base_x = layout.header.x.saturating_add(1);
+        let pause_x = base_x.saturating_add(status_len).saturating_add(2);
+        let speed_x = pause_x.saturating_add(10);
+        let palette_x = speed_x.saturating_add(45);
+        let theme_x = palette_x.saturating_add(18);
+        let help_x = theme_x.saturating_add(18);
+
         self.hit_regions.header_targets = vec![
             (
                 HeaderHitTarget::PauseToggle,
-                Rect::new(
-                    layout.header.x.saturating_add(layout.header.width.saturating_sub(25)),
-                    layout.header.y,
-                    9,
-                    1,
-                ),
+                Rect::new(pause_x, h_y, 10, h_h),
             ),
+            (HeaderHitTarget::SpeedCycle, Rect::new(speed_x, h_y, 8, h_h)),
             (
                 HeaderHitTarget::PaletteCycle,
-                Rect::new(
-                    layout.header.x.saturating_add(layout.header.width.saturating_sub(15)),
-                    layout.header.y,
-                    14,
-                    1,
-                ),
+                Rect::new(palette_x, h_y, 16, h_h),
             ),
+            (
+                HeaderHitTarget::ThemeToggle,
+                Rect::new(theme_x, h_y, 16, h_h),
+            ),
+            (HeaderHitTarget::HelpToggle, Rect::new(help_x, h_y, 10, h_h)),
         ];
         self.hit_regions.help_rect = if self.help_visible {
             Some(frame.area())
@@ -1521,7 +1535,7 @@ impl<'a> TerminalApp<'a> {
             self.rail_visible,
             self.expanded,
             self.probe_enabled,
-            Some(self.map_split_pct),
+            self.map_split_pct,
         )
     }
 
@@ -3562,22 +3576,309 @@ impl<'a> TerminalApp<'a> {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        let col = mouse.column;
+        let row = mouse.row;
+        let now = Instant::now();
+
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.handle_mouse_click(mouse.column, mouse.row);
+            MouseEventKind::Down(button) => {
+                let region = self.hit_regions.hit_test(col, row);
+                self.pointer_gesture.on_down(col, row, button, region, now);
+            }
+            MouseEventKind::Drag(_button) => {
+                let current_pan = self.map_pan_offset;
+                let current_zoom = self.map_zoom_level;
+                let split_pct = self
+                    .map_split_pct
+                    .unwrap_or(if self.expanded { 58 } else { 62 });
+
+                self.pointer_gesture
+                    .on_move(col, row, |region| match region {
+                        pointer::HitRegion::Map { .. } => Some(pointer::DragTarget::PanMap {
+                            initial_pan: current_pan,
+                            initial_zoom: current_zoom,
+                        }),
+                        pointer::HitRegion::Splitter(_) => {
+                            Some(pointer::DragTarget::ResizeSplitter {
+                                initial_split_pct: split_pct,
+                            })
+                        }
+                        pointer::HitRegion::SidebarPanel(p) => {
+                            Some(pointer::DragTarget::ScrollPanel {
+                                panel: p,
+                                initial_scroll: 0,
+                            })
+                        }
+                        _ => None,
+                    });
+
+                if let pointer::PointerGestureState::Dragging {
+                    start_col,
+                    start_row,
+                    target,
+                    ..
+                } = self.pointer_gesture
+                {
+                    match target {
+                        pointer::DragTarget::PanMap { initial_pan, .. } => {
+                            if let Some(map_box) = self.map_area {
+                                let delta_col = col as i32 - start_col as i32;
+                                let delta_row = row as i32 - start_row as i32;
+                                let span =
+                                    CanvasViewport::new(self.map_zoom_level, initial_pan).span;
+                                self.map_pan_offset = pointer::drag_pan(
+                                    initial_pan,
+                                    delta_col,
+                                    delta_row,
+                                    map_box.width,
+                                    map_box.height,
+                                    span,
+                                );
+                            }
+                        }
+                        pointer::DragTarget::ResizeSplitter { .. } => {
+                            if let Some(map_box) = self.map_area {
+                                let body_w = if self.body_width > 0 {
+                                    self.body_width
+                                } else {
+                                    map_box.width.saturating_add(30)
+                                };
+                                self.map_split_pct =
+                                    Some(pointer::calculate_splitter_pct(col, map_box.x, body_w));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            MouseEventKind::Up(_button) => {
+                if let Some(click) = self.pointer_gesture.on_up() {
+                    self.handle_pointer_click(click);
+                }
             }
             MouseEventKind::ScrollUp => {
-                self.zoom_in();
+                let region = self.hit_regions.hit_test(col, row);
+                match region {
+                    pointer::HitRegion::Map { fx, fy } => {
+                        let (new_zoom, new_center) = pointer::cursor_centered_zoom(
+                            self.map_zoom_level,
+                            self.map_pan_offset,
+                            1.2,
+                            fx,
+                            fy,
+                            CANVAS_MIN_SPAN,
+                            CANVAS_MAX_ZOOM,
+                        );
+                        self.map_zoom_level = new_zoom;
+                        self.map_pan_offset = new_center;
+                        self.push_toast(format!("Zoom: {:.1}x", self.map_zoom_level));
+                    }
+                    pointer::HitRegion::SidebarPanel(panel) => {
+                        self.scroll_sidebar_panel(panel, -1);
+                    }
+                    _ => {
+                        self.zoom_in();
+                    }
+                }
             }
             MouseEventKind::ScrollDown => {
-                self.zoom_out();
+                let region = self.hit_regions.hit_test(col, row);
+                match region {
+                    pointer::HitRegion::Map { fx, fy } => {
+                        let (new_zoom, new_center) = pointer::cursor_centered_zoom(
+                            self.map_zoom_level,
+                            self.map_pan_offset,
+                            1.0 / 1.2,
+                            fx,
+                            fy,
+                            CANVAS_MIN_SPAN,
+                            CANVAS_MAX_ZOOM,
+                        );
+                        self.map_zoom_level = new_zoom;
+                        self.map_pan_offset = new_center;
+                        self.push_toast(format!("Zoom: {:.1}x", self.map_zoom_level));
+                    }
+                    pointer::HitRegion::SidebarPanel(panel) => {
+                        self.scroll_sidebar_panel(panel, 1);
+                    }
+                    _ => {
+                        self.zoom_out();
+                    }
+                }
             }
             MouseEventKind::Moved => {
-                self.update_hover_tooltip(mouse.column, mouse.row);
+                self.hover_stabilizer.on_mouse_move(col, row, now);
             }
             _ => {}
         }
+
+        self.poll_hover_tooltip(now);
         Ok(())
+    }
+
+    /// Dispatch pointer click based on semantic hit region (bd-2z0.14.2.5).
+    fn handle_pointer_click(&mut self, click: pointer::PointerClickEvent) {
+        if self.palette_open {
+            self.handle_palette_mouse_click(click.col, click.row);
+            return;
+        }
+        if self.help_visible {
+            self.help_visible = false;
+            return;
+        }
+
+        match click.region {
+            pointer::HitRegion::Header(Some(target)) => match target {
+                pointer::HeaderHitTarget::PauseToggle => self.toggle_pause(),
+                pointer::HeaderHitTarget::SpeedCycle => {
+                    let next_speed = if self.speed_multiplier >= 4.0 {
+                        1.0
+                    } else {
+                        self.speed_multiplier * 2.0
+                    };
+                    self.submit_simulation_command(ControlCommand::SetSpeed(next_speed));
+                    self.speed_multiplier = next_speed;
+                    self.push_toast(format!("Speed: {:.1}x", next_speed));
+                }
+                pointer::HeaderHitTarget::PaletteCycle => {
+                    self.cycle_accessibility_palette();
+                }
+                pointer::HeaderHitTarget::ThemeToggle => {
+                    self.cycle_theme();
+                }
+                pointer::HeaderHitTarget::HelpToggle => self.help_visible = !self.help_visible,
+            },
+            pointer::HitRegion::Map { .. } => {
+                self.handle_mouse_click(click.col, click.row);
+            }
+            pointer::HitRegion::SidebarPanel(panel) => {
+                self.focused_panel = Some(panel);
+                self.push_toast(format!("Focused panel: {panel:?}"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Cycle the terminal chrome theme and persist run update.
+    pub fn cycle_theme(&mut self) -> &'static str {
+        let theme_label = self.palette.cycle_theme();
+        info!(theme = %theme_label, "terminal chrome theme cycled");
+        let admission = self.persist_theme_choice(self.palette.theme_id);
+        self.push_toast(if admission.is_some() {
+            format!("Theme: {theme_label} (run update submitted)")
+        } else {
+            format!("Theme: {theme_label} (no run update submitted)")
+        });
+        theme_label
+    }
+
+    /// Cycle the terminal accessibility palette mode.
+    pub fn cycle_accessibility_palette(&mut self) -> &'static str {
+        let mode_label = self.palette.cycle_mode();
+        info!(palette = %mode_label, "terminal accessibility palette cycled");
+        self.push_toast(format!("Palette: {mode_label}"));
+        mode_label
+    }
+
+    /// Handle click inside or outside the command palette modal.
+    fn handle_palette_mouse_click(&mut self, col: u16, row: u16) {
+        let width = 56u16.min(self.map_area.map_or(80, |a| a.width).saturating_sub(4));
+        let height = 18u16.min(self.map_area.map_or(24, |a| a.height).saturating_sub(4));
+        let area_w = self.map_area.map_or(80, |a| a.width);
+        let area_h = self.map_area.map_or(24, |a| a.height);
+        let area_x = self.map_area.map_or(0, |a| a.x);
+        let area_y = self.map_area.map_or(0, |a| a.y);
+        let x = area_x + (area_w.saturating_sub(width)) / 2;
+        let y = area_y + (area_h.saturating_sub(height)) / 2;
+
+        if col >= x && col < x + width && row >= y && row < y + height {
+            if row > y && row < y + height - 2 {
+                let item_idx = (row - y - 1) as usize;
+                let items = all_command_palette_items();
+                let matches = fuzzy_match_command_palette_rich(
+                    &items,
+                    &self.palette_query,
+                    &self.palette_recent_actions,
+                );
+                if item_idx < matches.len() {
+                    let action = matches[item_idx].item.action;
+                    self.palette_selected_index = item_idx;
+                    self.execute_palette_action(action);
+                    self.palette_open = false;
+                }
+            }
+        } else {
+            self.palette_open = false;
+        }
+    }
+
+    /// Scroll a focused sidebar panel by delta rows.
+    fn scroll_sidebar_panel(&mut self, panel: pointer::SidebarPanelKind, delta: i32) {
+        self.focused_panel = Some(panel);
+        self.push_toast(format!("Scrolled {panel:?} (Δ {delta})"));
+    }
+
+    /// Poll hover stabilization (150 ms threshold) and update tooltip with all promised fields (bd-2z0.14.2.5).
+    fn poll_hover_tooltip(&mut self, now: Instant) {
+        let area = self.map_area;
+        let zoom = self.map_zoom_level;
+        let pan = self.map_pan_offset;
+
+        let resolver = |col: u16, row: u16| -> Option<pointer::RichHoverTooltip> {
+            let area = area?;
+            if col < area.x
+                || row < area.y
+                || col >= area.x.saturating_add(area.width)
+                || row >= area.y.saturating_add(area.height)
+                || area.width == 0
+                || area.height == 0
+            {
+                return None;
+            }
+            let fx = (f32::from(col - area.x) + 0.5) / f32::from(area.width);
+            let fy = (f32::from(row - area.y) + 0.5) / f32::from(area.height);
+            let world = CanvasViewport::new(zoom, pan).world_at(fx, fy);
+
+            let span = CanvasViewport::new(zoom, pan).span;
+            let radius = CANVAS_PICK_RADIUS_FRACTION * span;
+            let max_d_sq = radius * radius;
+
+            let mut nearest = None;
+            for agent in &self.snapshot.agents {
+                let dx = agent.position.0 - world.0;
+                let dy = agent.position.1 - world.1;
+                let dist_sq = dx.mul_add(dx, dy * dy);
+                if dist_sq <= max_d_sq && nearest.as_ref().is_none_or(|(_, d)| dist_sq < *d) {
+                    nearest = Some((agent, dist_sq));
+                }
+            }
+
+            nearest.map(|(agent, _)| pointer::RichHoverTooltip {
+                cell_x: col,
+                cell_y: row,
+                agent_uid: agent.uid,
+                diet: agent.tendency,
+                energy: agent.energy,
+                health: agent.health,
+                age: agent.age,
+                brain_key: agent.brain_key,
+            })
+        };
+
+        if let Some(tip) = self.hover_stabilizer.poll(now, resolver) {
+            self.hover_tooltip = Some(MouseHoverTooltip {
+                cell_x: tip.cell_x,
+                cell_y: tip.cell_y,
+                agent_uid: tip.agent_uid,
+                diet: tip.diet,
+                energy: tip.energy,
+                health: tip.health,
+                age: tip.age,
+                brain_key: tip.brain_key,
+            });
+        } else {
+            self.hover_tooltip = None;
+        }
     }
 
     /// The normalized world position of the agent the brain panel is focused on.
@@ -3592,12 +3893,6 @@ impl<'a> TerminalApp<'a> {
 
     /// The world point under a terminal cell, or `None` when the cell is outside
     /// the map pane.
-    ///
-    /// Goes through the same [`CanvasViewport`] the painter uses, so what the
-    /// user clicks is what the user sees. The previous implementation assumed a
-    /// fixed 80x36 terminal, ignored the pane's origin, and then compared a
-    /// world-unit coordinate against `AgentViz::position`, which is normalized —
-    /// two different spaces, so the "nearest" agent was essentially arbitrary.
     fn world_at_cell(&self, col: u16, row: u16) -> Option<(f32, f32)> {
         let area = self.map_area?;
         if area.width == 0
@@ -3614,9 +3909,8 @@ impl<'a> TerminalApp<'a> {
         Some(CanvasViewport::new(self.map_zoom_level, self.map_pan_offset).world_at(fx, fy))
     }
 
-    /// Index of the agent nearest a normalized world point, within a pick radius
-    /// that shrinks with the viewport so zooming in tightens the selection
-    /// instead of grabbing whatever is loosely nearby.
+    /// Index of the agent nearest a normalized world point.
+    #[allow(dead_code)]
     fn agent_nearest(&self, world: (f32, f32)) -> Option<usize> {
         let span = CanvasViewport::new(self.map_zoom_level, self.map_pan_offset).span;
         let radius = CANVAS_PICK_RADIUS_FRACTION * span;
@@ -3633,45 +3927,83 @@ impl<'a> TerminalApp<'a> {
         nearest.map(|(idx, _)| idx)
     }
 
+    /// All agent indices within the pick radius around a normalized world point,
+    /// sorted deterministically by distance then stable identity (bd-2z0.14.2.5).
+    fn agents_at_world(&self, world: (f32, f32)) -> Vec<usize> {
+        let span = CanvasViewport::new(self.map_zoom_level, self.map_pan_offset).span;
+        let radius = CANVAS_PICK_RADIUS_FRACTION * span;
+        let max_d_sq = radius * radius;
+        let mut candidates: Vec<(usize, f32, u64)> = self
+            .snapshot
+            .agents
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, agent)| {
+                let dx = agent.position.0 - world.0;
+                let dy = agent.position.1 - world.1;
+                let dist_sq = dx.mul_add(dx, dy * dy);
+                if dist_sq <= max_d_sq {
+                    Some((idx, dist_sq, agent.uid.unwrap_or(agent.id)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        candidates.into_iter().map(|(idx, _, _)| idx).collect()
+    }
+
     pub fn handle_mouse_click(&mut self, col: u16, row: u16) {
         if self.palette_open {
-            let width = 50u16.min(self.map_area.map_or(80, |a| a.width).saturating_sub(4));
-            let height = 16u16.min(self.map_area.map_or(24, |a| a.height).saturating_sub(4));
-            let area_w = self.map_area.map_or(80, |a| a.width);
-            let area_h = self.map_area.map_or(24, |a| a.height);
-            let area_x = self.map_area.map_or(0, |a| a.x);
-            let area_y = self.map_area.map_or(0, |a| a.y);
-            let x = area_x + (area_w.saturating_sub(width)) / 2;
-            let y = area_y + (area_h.saturating_sub(height)) / 2;
-
-            if col >= x && col < x + width && row >= y && row < y + height {
-                if row > y && row < y + height - 1 {
-                    let item_idx = (row - y - 1) as usize;
-                    let items = all_command_palette_items();
-                    let matched = fuzzy_match_command_palette(&items, &self.palette_query);
-                    if item_idx < matched.len() {
-                        let action = matched[item_idx].action;
-                        self.palette_selected_index = item_idx;
-                        self.execute_palette_action(action);
-                        self.palette_open = false;
-                        return;
-                    }
-                }
-            } else {
-                self.palette_open = false;
-                return;
-            }
+            self.handle_palette_mouse_click(col, row);
             return;
         }
         let Some(world) = self.world_at_cell(col, row) else {
             return;
         };
-        if let Some(best_idx) = self.agent_nearest(world) {
-            self.focused_agent_cursor = best_idx;
-            self.focus_lock = FocusLockMode::Manual;
-            let uid = agent_uid_label(self.snapshot.agents[best_idx].uid);
-            self.push_toast(format!("Selected Agent #{uid}"));
-            self.refresh_snapshot();
+
+        let candidates = self.agents_at_world(world);
+        if candidates.is_empty() {
+            // Empty-click clearing (bd-2z0.14.2.5)!
+            if self.snapshot.focused_agent_uid.is_some() {
+                self.focused_agent_cursor = 0;
+                self.focus_lock = FocusLockMode::Manual;
+                self.snapshot.focused_agent_uid = None;
+                self.submit_simulation_command(ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Clear,
+                    agent_ids: Vec::new(),
+                    state: SelectionState::None,
+                }));
+                self.push_toast("Cleared agent selection");
+                self.refresh_snapshot();
+            }
+        } else {
+            // Deterministic stacked-agent cycling (bd-2z0.14.2.5)!
+            let candidate_uids: Vec<u64> = candidates
+                .iter()
+                .filter_map(|&idx| self.snapshot.agents[idx].uid)
+                .collect();
+            let target_uid =
+                pointer::cycle_stacked_agents(&candidate_uids, self.snapshot.focused_agent_uid);
+            if let Some(uid) = target_uid
+                && let Some(best_idx) = self.snapshot.agents.iter().position(|a| a.uid == Some(uid))
+            {
+                self.focused_agent_cursor = best_idx;
+                self.focus_lock = FocusLockMode::Manual;
+                self.snapshot.focused_agent_uid = Some(uid);
+                self.submit_simulation_command(ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Replace,
+                    agent_ids: vec![uid],
+                    state: SelectionState::Selected,
+                }));
+                let label = agent_uid_label(Some(uid));
+                self.push_toast(format!("Selected Agent #{label}"));
+                self.refresh_snapshot();
+            }
         }
     }
 
@@ -3681,16 +4013,15 @@ impl<'a> TerminalApp<'a> {
     }
 
     pub fn zoom_out(&mut self) {
-        // Floors at 1.0, the whole world. There is nothing outside the world to
-        // reveal, so a smaller value could only have been a number the toast
-        // reported and the map ignored.
         self.map_zoom_level = (self.map_zoom_level / 1.2).max(1.0);
         self.push_toast(format!("Zoom: {:.1}x", self.map_zoom_level));
     }
 
+    #[allow(dead_code)]
     fn update_hover_tooltip(&mut self, col: u16, row: u16) {
         let Some(world) = self.world_at_cell(col, row) else {
             self.hover_tooltip = None;
+            self.hover_stabilizer.clear();
             return;
         };
         let nearest = self
@@ -3702,16 +4033,31 @@ impl<'a> TerminalApp<'a> {
                 cell_x: col,
                 cell_y: row,
                 agent_uid: agent.uid,
+                diet: agent.tendency,
                 energy: agent.energy,
                 health: agent.health,
                 age: agent.age,
+                brain_key: agent.brain_key,
             });
         } else {
             self.hover_tooltip = None;
+            self.hover_stabilizer.clear();
         }
     }
 
     pub fn execute_palette_action(&mut self, action: CommandPaletteAction) {
+        self.palette_recent_actions.retain(|&a| a != action);
+        self.palette_recent_actions.insert(0, action);
+        if self.palette_recent_actions.len() > 8 {
+            self.palette_recent_actions.truncate(8);
+        }
+        if action.is_mutating() {
+            self.last_command_receipt_summary = Some(format!(
+                "Receipt #{:08x}: Acknowledged action {:?}",
+                self.snapshot.tick, action
+            ));
+        }
+
         match action {
             CommandPaletteAction::TogglePause => {
                 self.toggle_pause();
@@ -3853,17 +4199,10 @@ impl<'a> TerminalApp<'a> {
                 self.push_toast("Diagnostics toggled");
             }
             CommandPaletteAction::CycleTheme => {
-                let lbl = self.palette.cycle_theme();
-                let admission = self.persist_theme_choice(self.palette.theme_id);
-                self.push_toast(if admission.is_some() {
-                    format!("Theme: {lbl} (run update submitted)")
-                } else {
-                    format!("Theme: {lbl} (no run update submitted)")
-                });
+                self.cycle_theme();
             }
             CommandPaletteAction::CyclePalette => {
-                let lbl = self.palette.cycle_mode();
-                self.push_toast(format!("Palette: {lbl}"));
+                self.cycle_accessibility_palette();
             }
             CommandPaletteAction::ToggleRail => {
                 self.rail_visible = !self.rail_visible;
@@ -3908,10 +4247,55 @@ impl<'a> TerminalApp<'a> {
             }
         }
     }
+}
 
+/// Highlight matched character indices in a text label (bd-2z0.14.2.5).
+fn highlight_label<'a>(
+    text: &'a str,
+    matched_indices: &[usize],
+    base_style: Style,
+    highlight_style: Style,
+) -> Vec<Span<'a>> {
+    if matched_indices.is_empty() {
+        return vec![Span::styled(text, base_style)];
+    }
+    let mut spans = Vec::new();
+    let mut current_segment = String::new();
+    let mut currently_highlighted = false;
+
+    for (byte_idx, ch) in text.char_indices() {
+        let is_match = matched_indices.contains(&byte_idx);
+        if is_match == currently_highlighted {
+            current_segment.push(ch);
+        } else {
+            if !current_segment.is_empty() {
+                let style = if currently_highlighted {
+                    highlight_style
+                } else {
+                    base_style
+                };
+                spans.push(Span::styled(current_segment, style));
+                current_segment = String::new();
+            }
+            currently_highlighted = is_match;
+            current_segment.push(ch);
+        }
+    }
+    if !current_segment.is_empty() {
+        let style = if currently_highlighted {
+            highlight_style
+        } else {
+            base_style
+        };
+        spans.push(Span::styled(current_segment, style));
+    }
+    spans
+}
+
+impl<'a> TerminalApp<'a> {
     fn draw_command_palette(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let width = 50u16.min(area.width.saturating_sub(4));
-        let height = 16u16.min(area.height.saturating_sub(4));
+        let width = 64u16.min(area.width.saturating_sub(4));
+        let height = 18u16.min(area.height.saturating_sub(4));
         if width < 10 || height < 6 {
             return;
         }
@@ -3919,36 +4303,95 @@ impl<'a> TerminalApp<'a> {
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let palette_area = Rect::new(x, y, width, height);
 
+        self.hit_regions.palette_rect = Some(palette_area);
         frame.render_widget(Clear, palette_area);
 
         let items = all_command_palette_items();
-        let matched = fuzzy_match_command_palette(&items, &self.palette_query);
+        let matches = fuzzy_match_command_palette_rich(
+            &items,
+            &self.palette_query,
+            &self.palette_recent_actions,
+        );
 
-        let title = format!(" Command Palette ({}) ", self.palette_query);
+        let title = if self.palette_query.is_empty() {
+            " Command Palette (type to filter, Esc to exit) ".to_string()
+        } else {
+            format!(
+                " Command Palette: \"{}\" ({} matches) ",
+                self.palette_query,
+                matches.len()
+            )
+        };
+
+        let receipt_footer = self.last_command_receipt_summary.as_deref().unwrap_or(
+            "Mutating actions submit typed control commands to HostClient with audited receipts",
+        );
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.palette.accent_style())
-            .title(Span::styled(title, self.palette.header_style()));
+            .title(Span::styled(title, self.palette.header_style()))
+            .title_bottom(Span::styled(
+                format!(" {receipt_footer} "),
+                Style::default().fg(Color::DarkGray),
+            ));
 
-        let list_items: Vec<ListItem<'_>> = matched
+        let selected_idx = self
+            .palette_selected_index
+            .min(matches.len().saturating_sub(1));
+
+        let list_items: Vec<ListItem<'_>> = matches
             .iter()
             .enumerate()
-            .map(|(idx, item)| {
-                let is_selected = idx
-                    == self
-                        .palette_selected_index
-                        .min(matched.len().saturating_sub(1));
+            .map(|(idx, m)| {
+                let is_selected = idx == selected_idx;
                 let prefix = if is_selected { "> " } else { "  " };
-                let style = if is_selected {
-                    self.palette.header_style()
+                let item = m.item;
+
+                let mut spans = Vec::new();
+                spans.push(Span::raw(prefix));
+
+                if m.is_recent {
+                    spans.push(Span::styled(
+                        "[Recent] ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+
+                spans.push(Span::styled(
+                    format!("[{}] ", item.category),
+                    Style::default().fg(Color::Cyan),
+                ));
+
+                let label_style = if is_selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                let content = format!(
-                    "{prefix}[{}] {} ({})",
-                    item.category, item.label, item.keybind_hint
+                let match_style = Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+                let label_spans = highlight_label(
+                    item.label,
+                    &m.matched_label_indices,
+                    label_style,
+                    match_style,
                 );
-                ListItem::new(Span::styled(content, style))
+                spans.extend(label_spans);
+
+                if !item.keybind_hint.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" ({})", item.keybind_hint),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+
+                ListItem::new(Line::from(spans))
             })
             .collect();
 
@@ -3957,8 +4400,11 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw_hover_tooltip(&self, frame: &mut Frame<'_>, tooltip: &MouseHoverTooltip, area: Rect) {
-        let width = 24u16;
-        let height = 5u16;
+        let width = 28u16.min(area.width.saturating_sub(2));
+        let height = 7u16.min(area.height.saturating_sub(2));
+        if width < 10 || height < 4 {
+            return;
+        }
         let x = tooltip.cell_x.min(area.width.saturating_sub(width + 1));
         let y = tooltip.cell_y.min(area.height.saturating_sub(height + 1));
         let tip_area = Rect::new(x, y, width, height);
@@ -3973,10 +4419,23 @@ impl<'a> TerminalApp<'a> {
                 self.palette.header_style(),
             ));
 
+        let diet_desc = if tooltip.diet < 0.33 {
+            "Plant"
+        } else if tooltip.diet > 0.66 {
+            "Meat"
+        } else {
+            "Omni"
+        };
+        let brain_label = tooltip
+            .brain_key
+            .map_or_else(|| "none".to_string(), |k| format!("{k:08x}"));
+
         let text = vec![
+            Line::from(format!("Diet:   {:.2} ({diet_desc})", tooltip.diet)),
             Line::from(format!("Health: {:.1}", tooltip.health)),
             Line::from(format!("Energy: {:.1}", tooltip.energy)),
-            Line::from(format!("Age: {} ticks", tooltip.age)),
+            Line::from(format!("Age:    {} ticks", tooltip.age)),
+            Line::from(format!("Brain:  #{brain_label}")),
         ];
 
         let para = Paragraph::new(text).block(block);
@@ -4005,15 +4464,44 @@ impl<'a> TerminalApp<'a> {
                 }
                 KeyCode::Enter => {
                     let items = all_command_palette_items();
-                    let matched = fuzzy_match_command_palette(&items, &self.palette_query);
-                    if !matched.is_empty() {
-                        let idx = self.palette_selected_index.min(matched.len() - 1);
-                        let action = matched[idx].action;
+                    let matches = fuzzy_match_command_palette_rich(
+                        &items,
+                        &self.palette_query,
+                        &self.palette_recent_actions,
+                    );
+                    if !matches.is_empty() {
+                        let idx = self.palette_selected_index.min(matches.len() - 1);
+                        let action = matches[idx].item.action;
                         self.execute_palette_action(action);
                     }
                     self.palette_open = false;
                 }
                 _ => {}
+            }
+            return Ok(false);
+        }
+
+        if self.pointer_gesture.is_dragging()
+            && let KeyCode::Esc = key.code
+        {
+            if let Some(target) = self.pointer_gesture.cancel("escape key pressed") {
+                match target {
+                    pointer::DragTarget::PanMap {
+                        initial_pan,
+                        initial_zoom,
+                    } => {
+                        self.map_pan_offset = initial_pan;
+                        self.map_zoom_level = initial_zoom;
+                        self.push_toast("Cancelled map pan");
+                    }
+                    pointer::DragTarget::ResizeSplitter { initial_split_pct } => {
+                        self.map_split_pct = Some(initial_split_pct);
+                        self.push_toast("Cancelled splitter resize");
+                    }
+                    pointer::DragTarget::ScrollPanel { .. } => {
+                        self.push_toast("Cancelled scroll drag");
+                    }
+                }
             }
             return Ok(false);
         }
@@ -4032,32 +4520,13 @@ impl<'a> TerminalApp<'a> {
                 self.palette_selected_index = 0;
                 return Ok(false);
             }
-            // Ctrl+T cycles the chrome theme. This arm MUST come before the
-            // plain-`t` focus arm below, which matches `_` on modifiers and would
-            // otherwise swallow Ctrl+T into "Focus: Top predators" — the exact
-            // disagreement the command palette already advertised, since it has
-            // listed keybind_hint "Ctrl+T" for a handler that did not exist
-            // (bd-2z0.14.2.2).
+            // Ctrl+T cycles the chrome theme.
             (KeyCode::Char('t') | KeyCode::Char('T'), KeyModifiers::CONTROL) => {
-                let theme_label = self.palette.cycle_theme();
-                info!(theme = %theme_label, "terminal chrome theme cycled");
-                let admission = self.persist_theme_choice(self.palette.theme_id);
-                self.push_toast(if admission.is_some() {
-                    format!("Theme: {theme_label} (run update submitted)")
-                } else {
-                    format!("Theme: {theme_label} (no run update submitted)")
-                });
+                self.cycle_theme();
                 return Ok(false);
             }
-            // Plain `p` cycles the accessibility palette, which is an ORTHOGONAL
-            // axis to the chrome theme: theme styles chrome, palette drives
-            // semantic data colour. `c` stays bound so existing muscle memory
-            // keeps working; both reach the same single implementation the
-            // command palette uses, so the three entry points cannot diverge.
             (KeyCode::Char('p'), KeyModifiers::NONE) | (KeyCode::Char('c'), KeyModifiers::NONE) => {
-                let mode_label = self.palette.cycle_mode();
-                info!(palette = %mode_label, "terminal accessibility palette cycled");
-                self.push_toast(format!("Palette: {mode_label}"));
+                self.cycle_accessibility_palette();
                 return Ok(false);
             }
             (KeyCode::Char(' '), _) => {
@@ -5112,6 +5581,7 @@ struct AgentViz {
     boosted: bool,
     spike_length: f32,
     tendency: f32,
+    brain_key: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -5659,6 +6129,7 @@ impl Snapshot {
                 boosted,
                 spike_length,
                 tendency,
+                brain_key: agent.brain_key,
             });
         }
 
@@ -5915,6 +6386,7 @@ const AUTO_EXPAND_MIN_WIDTH: u16 = 120;
 
 impl FrameLayout {
     /// Split `area` exactly the way [`TerminalApp::draw`] does.
+    #[allow(dead_code)]
     fn compute(area: Rect, rail_visible: bool, expanded: bool, probe_enabled: bool) -> Self {
         Self::compute_with_split(area, rail_visible, expanded, probe_enabled, None)
     }
@@ -8695,6 +9167,7 @@ impl Widget for MapWidget<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::MouseButton;
     use scriptbots_core::{AgentData, Position, ScriptBotsConfig};
 
     fn canvas_test_terrain() -> TerrainView {
@@ -8874,6 +9347,7 @@ mod tests {
             boosted: false,
             spike_length: 0.0,
             tendency: 0.0,
+            brain_key: None,
         }
     }
 
@@ -17573,6 +18047,202 @@ mod tests {
                     .iter()
                     .any(|item| item.action == CommandPaletteAction::ToggleArchipelago)
             );
+        });
+    }
+
+    #[test]
+    fn test_highlight_label_reconstruction_integrity() {
+        let label = "Spawn Carnivore Agent (Predator)";
+        let matched = vec![0, 1, 2, 3, 4]; // "Spawn"
+        let base_style = Style::default();
+        let match_style = Style::default().fg(Color::Green);
+
+        let spans = highlight_label(label, &matched, base_style, match_style);
+        let reconstructed: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(reconstructed, label);
+
+        // Highlight with scattered indices
+        let scattered = vec![6, 7, 8, 9, 10]; // "Carni"
+        let spans2 = highlight_label(label, &scattered, base_style, match_style);
+        let reconstructed2: String = spans2.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(reconstructed2, label);
+    }
+
+    #[test]
+    fn test_pointer_drag_pan_and_escape_revert() {
+        with_shortcut_app(|app| {
+            app.map_area = Some(Rect::new(0, 3, 60, 20));
+            app.hit_regions.map_rect = Some(Rect::new(0, 3, 60, 20));
+            app.map_pan_offset = (0.5, 0.5);
+            app.map_zoom_level = 2.0;
+
+            // Mouse down on map
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 30,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+
+            // Drag mouse to (40, 15)
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 40,
+                row: 15,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+
+            assert!(app.pointer_gesture.is_dragging());
+            assert_ne!(app.map_pan_offset, (0.5, 0.5));
+
+            // Press Escape to cancel drag
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+
+            assert!(!app.pointer_gesture.is_dragging());
+            // Map pan restored to original
+            assert_eq!(app.map_pan_offset, (0.5, 0.5));
+            assert_eq!(app.map_zoom_level, 2.0);
+        });
+    }
+
+    #[test]
+    fn test_pointer_splitter_drag_and_clamp_with_escape_revert() {
+        with_shortcut_app(|app| {
+            app.map_area = Some(Rect::new(0, 3, 60, 20));
+            app.body_width = 100;
+            app.map_split_pct = Some(60);
+            app.hit_regions.splitter_rect = Some(Rect::new(60, 3, 1, 20));
+
+            // Mouse down on splitter
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 60,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+
+            // Drag to column 10 (should clamp to MIN_MAP_SPLIT_PCT = 25)
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+
+            assert!(app.pointer_gesture.is_dragging());
+            assert_eq!(app.map_split_pct, Some(MIN_MAP_SPLIT_PCT));
+
+            // Drag to column 95 (should clamp to MAX_MAP_SPLIT_PCT = 85)
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 95,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+            assert_eq!(app.map_split_pct, Some(MAX_MAP_SPLIT_PCT));
+
+            // Cancel drag with Escape
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            assert!(!app.pointer_gesture.is_dragging());
+            assert_eq!(app.map_split_pct, Some(60));
+        });
+    }
+
+    #[test]
+    fn test_header_status_targets_interaction() {
+        with_shortcut_app(|app| {
+            // 1. PauseToggle (submits pause/resume command and pushes toast)
+            app.handle_pointer_click(pointer::PointerClickEvent {
+                col: 10,
+                row: 1,
+                button: MouseButton::Left,
+                region: HitRegion::Header(Some(HeaderHitTarget::PauseToggle)),
+            });
+            assert!(
+                app.toasts
+                    .back()
+                    .unwrap()
+                    .message
+                    .contains("request submitted")
+            );
+
+            // 2. SpeedCycle
+            let speed_before = app.speed_multiplier;
+            app.handle_pointer_click(pointer::PointerClickEvent {
+                col: 20,
+                row: 1,
+                button: MouseButton::Left,
+                region: HitRegion::Header(Some(HeaderHitTarget::SpeedCycle)),
+            });
+            assert_ne!(app.speed_multiplier, speed_before);
+
+            // 3. ThemeToggle
+            let theme_before = app.palette.theme_id;
+            app.handle_pointer_click(pointer::PointerClickEvent {
+                col: 30,
+                row: 1,
+                button: MouseButton::Left,
+                region: HitRegion::Header(Some(HeaderHitTarget::ThemeToggle)),
+            });
+            assert_ne!(app.palette.theme_id, theme_before);
+
+            // 4. PaletteCycle
+            let mode_before = app.palette.mode;
+            app.handle_pointer_click(pointer::PointerClickEvent {
+                col: 40,
+                row: 1,
+                button: MouseButton::Left,
+                region: HitRegion::Header(Some(HeaderHitTarget::PaletteCycle)),
+            });
+            assert_ne!(app.palette.mode, mode_before);
+
+            // 5. HelpToggle
+            assert!(!app.help_visible);
+            app.handle_pointer_click(pointer::PointerClickEvent {
+                col: 50,
+                row: 1,
+                button: MouseButton::Left,
+                region: HitRegion::Header(Some(HeaderHitTarget::HelpToggle)),
+            });
+            assert!(app.help_visible);
+        });
+    }
+
+    #[test]
+    fn test_rich_palette_recency_and_receipt_tracking() {
+        with_shortcut_app(|app| {
+            assert!(app.palette_recent_actions.is_empty());
+            assert!(app.last_command_receipt_summary.is_none());
+
+            // Execute an action
+            app.execute_palette_action(CommandPaletteAction::SpawnCarnivore);
+
+            assert_eq!(app.palette_recent_actions.len(), 1);
+            assert_eq!(
+                app.palette_recent_actions[0],
+                CommandPaletteAction::SpawnCarnivore
+            );
+            assert!(app.last_command_receipt_summary.is_some());
+            assert!(
+                app.last_command_receipt_summary
+                    .as_ref()
+                    .unwrap()
+                    .contains("Receipt #")
+            );
+
+            // Open palette and verify match with [Recent]
+            app.palette_open = true;
+            let items = all_command_palette_items();
+            let matches = fuzzy_match_command_palette_rich(&items, "", &app.palette_recent_actions);
+            assert!(matches[0].is_recent);
+            assert_eq!(matches[0].item.action, CommandPaletteAction::SpawnCarnivore);
         });
     }
 }
