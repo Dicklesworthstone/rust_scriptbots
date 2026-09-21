@@ -61,6 +61,9 @@ pub enum CommandPaletteAction {
     FocusOldest,
     CycleTheme,
     CyclePalette,
+    CycleChartWindow,
+    CycleEventFilter,
+    FocusEventSubject,
     ShowHelp,
     Quit,
 }
@@ -416,6 +419,27 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "b",
             category: "Science",
             action: CommandPaletteAction::ToggleProbe,
+        },
+        CommandPaletteItem {
+            id: "science.cycle_chart_window",
+            label: "Cycle Time-Series Chart Window (30/60/120/300t)",
+            keybind_hint: "w",
+            category: "Science",
+            action: CommandPaletteAction::CycleChartWindow,
+        },
+        CommandPaletteItem {
+            id: "science.cycle_event_filter",
+            label: "Cycle Event Feed Filter (All/Birth/Death/Combat/Eat/Mutation/Config/Info)",
+            keybind_hint: "f",
+            category: "Science",
+            action: CommandPaletteAction::CycleEventFilter,
+        },
+        CommandPaletteItem {
+            id: "science.focus_event_subject",
+            label: "Focus Selected Event Agent or Pan Location",
+            keybind_hint: "Enter",
+            category: "Science",
+            action: CommandPaletteAction::FocusEventSubject,
         },
         CommandPaletteItem {
             id: "diag.toggle_diagnostics",

@@ -77,12 +77,14 @@ pub mod export;
 pub mod frankentui_shell;
 pub mod pointer;
 pub mod science_screens;
+pub mod science_widgets;
 pub use pointer::{
     DEFAULT_MAP_SPLIT_PCT, DragTarget, HOVER_STABILIZATION_DURATION, HeaderHitTarget, HitRegion,
     HitRegionMap, HoverStabilizer, MAX_MAP_SPLIT_PCT, MIN_MAP_SPLIT_PCT, PointerClickEvent,
     PointerGestureState, RichHoverTooltip, SidebarPanelKind, SplitterKind, calculate_splitter_pct,
     clamp_splitter_pct, cursor_centered_zoom, cycle_stacked_agents, drag_pan,
 };
+pub use science_widgets::*;
 
 // `paint.rs` is deliberately NOT declared (bd-c1z8). It is a second, complete
 // sub-cell painter engine, shipped by the same task that produced `subcell`, and
@@ -673,6 +675,14 @@ struct TerminalApp<'a> {
     pub last_command_receipt_summary: Option<String>,
     /// Total width of the body (map + splitter + sidebar) for splitter calculation (bd-2z0.14.2.5).
     pub body_width: u16,
+    /// Upgraded science time-series chart with axes, legends, and rolling windows (bd-2z0.14.2.3).
+    pub science_chart: science_widgets::ScienceChartData,
+    /// Typed event feed with kind icons, relative ticks, filtering, and focus (bd-2z0.14.2.3).
+    pub typed_event_feed: science_widgets::TypedEventFeedData,
+    /// 2D per-layer brain activation grid with provenance and sparklines (bd-2z0.14.2.3).
+    pub brain_activation_grid: science_widgets::BrainActivationGridData,
+    /// Storage progress strip showing admitted, applied, durable watermarks and lag (bd-2z0.14.2.3).
+    pub watermark_status: science_widgets::WatermarkStatusData,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -819,6 +829,12 @@ impl<'a> TerminalApp<'a> {
             palette_recent_actions: Vec::new(),
             last_command_receipt_summary: None,
             body_width: 80,
+            science_chart: science_widgets::ScienceChartData::new(
+                science_widgets::ChartRollingWindow::Ticks60,
+            ),
+            typed_event_feed: science_widgets::TypedEventFeedData::new(200),
+            brain_activation_grid: science_widgets::BrainActivationGridData::new(),
+            watermark_status: science_widgets::WatermarkStatusData::default(),
         };
         app.refresh_snapshot();
         app
@@ -1545,6 +1561,15 @@ impl<'a> TerminalApp<'a> {
         self.analytics_revision = Some(published.revision);
 
         let committed_tick = published.committed_tick.unwrap_or(self.snapshot.tick);
+        let admitted = published.watermarks.admitted.map_or(0, |b| b.get());
+        let applied = published.watermarks.applied.map_or(0, |b| b.get());
+        let durable = published.watermarks.durable.map_or(0, |b| b.get());
+        let err_str = published.last_error.as_deref();
+        self.watermark_status
+            .update(admitted, applied, durable, err_str);
+        self.frankentui
+            .update_watermarks(admitted, applied, durable, err_str);
+
         self.analytics_status = AnalyticsStatus {
             revision: published.revision,
             committed_tick: published.committed_tick,
@@ -2033,6 +2058,11 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw_trends(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+        if self.expanded && area.height >= 6 {
+            self.science_chart.render(area, frame.buffer_mut());
+            return;
+        }
+
         let block = Block::default()
             .title(self.palette.title("Population, Energy, Births/Deaths"))
             .borders(Borders::ALL);
@@ -2614,6 +2644,11 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw_events(&self, frame: &mut Frame<'_>, area: Rect, _snapshot: &Snapshot) {
+        if self.expanded && area.height >= 4 {
+            self.typed_event_feed.render(area, frame.buffer_mut());
+            return;
+        }
+
         let events: Vec<ListItem> = self
             .event_log
             .iter()
@@ -4245,6 +4280,56 @@ impl<'a> TerminalApp<'a> {
                 self.submit_simulation_command(ControlCommand::Shutdown);
                 self.push_toast("Shutdown requested");
             }
+            CommandPaletteAction::CycleChartWindow => {
+                self.science_chart.cycle_window();
+                let label = self.science_chart.window.label();
+                self.push_toast(format!("Chart Window: {label}"));
+            }
+            CommandPaletteAction::CycleEventFilter => {
+                self.typed_event_feed.cycle_filter_kind();
+                let label = match self.typed_event_feed.filter_kind {
+                    science_widgets::EventKindFilter::All => "All",
+                    science_widgets::EventKindFilter::Only(k) => k.label(),
+                };
+                self.push_toast(format!("Event Filter: {label}"));
+            }
+            CommandPaletteAction::FocusEventSubject => {
+                if let Some(intent) = self.typed_event_feed.focus_intent_for_selected() {
+                    match intent {
+                        science_widgets::EventFocusIntent::FocusAgent(uid) => {
+                            if let Some(idx) =
+                                self.snapshot.agents.iter().position(|a| a.uid == Some(uid))
+                            {
+                                self.focused_agent_cursor = idx;
+                                self.focus_lock = FocusLockMode::Manual;
+                                self.snapshot.focused_agent_uid = Some(uid);
+                                self.submit_simulation_command(ControlCommand::UpdateSelection(
+                                    SelectionUpdate {
+                                        mode: SelectionMode::Replace,
+                                        agent_ids: vec![uid],
+                                        state: SelectionState::Selected,
+                                    },
+                                ));
+                                let label = agent_uid_label(Some(uid));
+                                self.push_toast(format!("Selected Agent #{label}"));
+                                self.refresh_snapshot();
+                            } else {
+                                self.push_toast(format!("Agent #{uid} is no longer active"));
+                            }
+                        }
+                        science_widgets::EventFocusIntent::PanLocation(x, y) => {
+                            let (ww, wh) = self.snapshot.world_size;
+                            if ww > 0 && wh > 0 {
+                                self.map_pan_offset = (x / ww as f32, y / wh as f32);
+                                self.push_toast(format!("Pan to ({x:.1}, {y:.1})"));
+                            }
+                        }
+                        science_widgets::EventFocusIntent::StaleTarget { uid, reason } => {
+                            self.push_toast(format!("Cannot focus #{uid}: {reason}"));
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -4742,10 +4827,27 @@ impl<'a> TerminalApp<'a> {
                 }
             }
             (KeyCode::Up, _) => {
-                self.activation_row_offset = self.activation_row_offset.saturating_sub(1);
+                if self.focused_panel == Some(SidebarPanelKind::Events) {
+                    self.typed_event_feed.scroll_up(1);
+                } else {
+                    self.activation_row_offset = self.activation_row_offset.saturating_sub(1);
+                }
             }
             (KeyCode::Down, _) => {
-                self.activation_row_offset = self.activation_row_offset.saturating_add(1);
+                if self.focused_panel == Some(SidebarPanelKind::Events) {
+                    self.typed_event_feed.scroll_down(1);
+                } else {
+                    self.activation_row_offset = self.activation_row_offset.saturating_add(1);
+                }
+            }
+            (KeyCode::Char('w') | KeyCode::Char('W'), _) => {
+                self.execute_palette_action(CommandPaletteAction::CycleChartWindow);
+            }
+            (KeyCode::Char('f') | KeyCode::Char('F'), _) => {
+                self.execute_palette_action(CommandPaletteAction::CycleEventFilter);
+            }
+            (KeyCode::Enter, _) => {
+                self.execute_palette_action(CommandPaletteAction::FocusEventSubject);
             }
             (KeyCode::Left, _) => {
                 if self.rail_visible && !self.snapshot.narrative.is_empty() {
@@ -5047,6 +5149,106 @@ impl<'a> TerminalApp<'a> {
         }
         self.ingest_events(&snap);
         self.snapshot = snap;
+
+        // Ingest science chart time-series samples (bd-2z0.14.2.3)
+        let chart_sample = science_widgets::ChartSample {
+            tick: self.snapshot.tick,
+            population: self.snapshot.agent_count as u64,
+            avg_energy: self.snapshot.avg_energy,
+            births: self.snapshot.births as u32,
+            deaths: self.snapshot.deaths as u32,
+        };
+        self.science_chart
+            .push_sample(chart_sample.clone(), self.snapshot.tick);
+        self.frankentui
+            .ingest_chart_sample(chart_sample, self.snapshot.tick);
+
+        // Update 2D brain activation grid view (bd-2z0.14.2.3)
+        let brain_grid_data = {
+            let provenance = self.snapshot.focused_agent_uid.map(|uid| {
+                let (src_tick, bytes, ready, clipped) =
+                    if let Some(ref bi) = self.snapshot.brain_inspection {
+                        (
+                            bi.source_tick,
+                            bi.retained_payload_bytes,
+                            bi.ready,
+                            if bi.truncated { 1 } else { 0 },
+                        )
+                    } else {
+                        (self.snapshot.tick, 0, false, 0)
+                    };
+                science_widgets::BrainProvenanceBanner {
+                    agent_uid: uid,
+                    tick: src_tick,
+                    control_revision: world.revisions.control.get(),
+                    payload_bytes: bytes,
+                    clipped_count: clipped,
+                    is_stale: !ready || src_tick < self.snapshot.tick,
+                }
+            });
+
+            let layers: Vec<science_widgets::LayerActivationData> = self
+                .snapshot
+                .brain_layers
+                .iter()
+                .enumerate()
+                .map(|(idx, l)| science_widgets::LayerActivationData {
+                    name: l.name.clone().unwrap_or_else(|| format!("Layer {idx}")),
+                    dimensions: vec![l.width, l.height],
+                    values: l.values.clone(),
+                })
+                .collect();
+
+            let outputs: Vec<science_widgets::EffectiveOutputEntry> =
+                self.snapshot.focused_outputs.map_or_else(Vec::new, |outs| {
+                    outs.iter()
+                        .enumerate()
+                        .map(|(idx, &val)| science_widgets::EffectiveOutputEntry {
+                            actuator_name: format!("out_{idx}"),
+                            value: val,
+                            interpretation: if val > 0.0 {
+                                "Active".into()
+                            } else {
+                                "Idle".into()
+                            },
+                            spark_history: vec![val],
+                        })
+                        .collect()
+                });
+
+            let attributions: Vec<science_widgets::SensorAttributionEntry> =
+                if let Some(ref pr) = self.snapshot.probe {
+                    let total_energy: f32 = pr
+                        .attribution
+                        .contributions
+                        .iter()
+                        .map(|c| c.total)
+                        .sum::<f32>()
+                        .max(1e-6);
+                    pr.attribution
+                        .contributions
+                        .iter()
+                        .take(5)
+                        .map(|c| science_widgets::SensorAttributionEntry {
+                            sensor_name: format!("agent #{}", c.source_uid.0),
+                            signed_weight: c.total,
+                            contribution_pct: (c.total / total_energy) * 100.0,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+            science_widgets::BrainActivationGridData {
+                provenance,
+                layers,
+                outputs,
+                attributions,
+            }
+        };
+        self.brain_activation_grid = brain_grid_data.clone();
+        self.frankentui.set_brain_grid(brain_grid_data);
+
         self.frankentui.update_from_snapshot(
             self.snapshot.tick,
             self.snapshot.epoch,
@@ -5131,11 +5333,29 @@ impl<'a> TerminalApp<'a> {
         if self.event_log.len() >= EVENT_LOG_CAPACITY {
             self.event_log.pop_front();
         }
+        let msg = message.into();
         self.event_log.push_back(EventEntry {
             tick,
             kind,
-            message: message.into(),
+            message: msg.clone(),
         });
+        let typed_kind = match kind {
+            EventKind::Birth => science_widgets::TypedEventKind::Birth,
+            EventKind::Death => science_widgets::TypedEventKind::Death,
+            EventKind::Population => science_widgets::TypedEventKind::Info,
+            EventKind::Info => science_widgets::TypedEventKind::Info,
+        };
+        let typed_rec = science_widgets::TypedEventRecord {
+            id: tick,
+            tick,
+            kind: typed_kind,
+            subject_uid: None,
+            location: None,
+            message: msg,
+            target_alive: true,
+        };
+        self.typed_event_feed.push_event(typed_rec.clone());
+        self.frankentui.ingest_event(typed_rec);
     }
 
     /// Evaluate auto-pause triggers from the current snapshot and update
