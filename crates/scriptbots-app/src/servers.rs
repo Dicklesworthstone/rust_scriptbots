@@ -3425,9 +3425,20 @@ where
 
 fn run_control_mcp_sync<T, F>(operation: F) -> Result<T, McpError>
 where
-    F: FnOnce() -> Result<T, ControlError>,
+    F: FnOnce() -> Result<T, ControlError> + Send,
+    T: Send,
 {
-    operation().map_err(map_control_error)
+    std::thread::scope(|s| {
+        s.spawn(operation)
+            .join()
+            .map_err(|panic| {
+                McpError::new(
+                    McpErrorCode::InternalError,
+                    format!("control operation thread panicked: {panic:?}"),
+                )
+            })?
+            .map_err(map_control_error)
+    })
 }
 
 /// MCP twin of [`run_control`]: a contended world mutex parks a blocking-pool

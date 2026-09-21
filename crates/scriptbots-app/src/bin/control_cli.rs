@@ -1557,17 +1557,26 @@ async fn narrative_command(
             db,
         } => {
             let hits: Vec<NarrativeSearchHitDto> = if let Some(ref db_path) = db {
-                execute_narrative_search(
-                    Some(db_path.as_path()),
-                    None,
-                    NarrativeSearchQuery {
-                        query,
-                        from_tick,
-                        to_tick,
-                        limit,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+                let db_path = db_path.clone();
+                std::thread::Builder::new()
+                    .name("control-cli-narrative-search".into())
+                    .stack_size(64 * 1024 * 1024)
+                    .spawn(move || {
+                        execute_narrative_search(
+                            Some(db_path.as_path()),
+                            None,
+                            NarrativeSearchQuery {
+                                query,
+                                from_tick,
+                                to_tick,
+                                limit,
+                            },
+                        )
+                    })
+                    .context("failed to spawn narrative search worker thread")?
+                    .join()
+                    .map_err(|e| anyhow::anyhow!("narrative search thread panicked: {e:?}"))?
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
             } else {
                 let url = join_url(base_url, "/api/narrative/search");
                 let mut req = client.get(url).query(&[("q", &query)]);
@@ -1609,12 +1618,21 @@ async fn narrative_command(
             db,
         } => {
             let hits: Vec<NarrativeSearchHitDto> = if let Some(ref db_path) = db {
-                execute_narrative_around(
-                    Some(db_path.as_path()),
-                    None,
-                    NarrativeAroundQuery { tick, window },
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+                let db_path = db_path.clone();
+                std::thread::Builder::new()
+                    .name("control-cli-narrative-around".into())
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        execute_narrative_around(
+                            Some(db_path.as_path()),
+                            None,
+                            NarrativeAroundQuery { tick, window },
+                        )
+                    })
+                    .context("failed to spawn narrative around worker thread")?
+                    .join()
+                    .map_err(|e| anyhow::anyhow!("narrative around thread panicked: {e:?}"))?
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
             } else {
                 let path = format!("/api/narrative/around/{tick}");
                 let url = join_url(base_url, &path);
