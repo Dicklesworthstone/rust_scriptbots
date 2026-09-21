@@ -1118,7 +1118,7 @@ mod tests {
         if let ChartDegradedState::Empty { message } = chart.degraded_state(0) {
             assert!(message.contains("waiting for snapshot history"));
         } else {
-            assert!(false, "Expected Empty degraded state");
+            panic!("Expected Empty degraded state");
         }
 
         // 2. Normal state
@@ -1138,7 +1138,7 @@ mod tests {
         if let ChartDegradedState::Stale { lag } = chart.degraded_state(30) {
             assert_eq!(lag, 20);
         } else {
-            assert!(false, "Expected Stale degraded state");
+            panic!("Expected Stale degraded state");
         }
     }
 

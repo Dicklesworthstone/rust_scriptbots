@@ -1,14 +1,12 @@
 use std::cmp::Reverse;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-// removed duplicate import
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
-// removed duplicate import
-
-use std::fs;
-use std::path::Path;
 
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
@@ -194,6 +192,14 @@ pub enum ControlError {
     CommandQueueClosed,
     #[error("narrative search error: {0}")]
     NarrativeSearch(#[from] crate::narrative_search::NarrativeSearchError),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("bad request: {0}")]
+    BadRequest(String),
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 impl ControlError {
@@ -414,6 +420,389 @@ pub fn parse_intervention_command(
     })
 }
 
+/// Version and runtime discovery descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ApiVersionDto {
+    pub service_name: String,
+    pub version: String,
+    pub git_commit: Option<String>,
+    pub rustc_version: String,
+    pub protocol_version: u32,
+    pub features: Vec<String>,
+    pub capabilities: Vec<String>,
+}
+
+/// OpenAPI and schema discovery descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ApiSchemaDto {
+    pub openapi_version: String,
+    pub title: String,
+    pub version: String,
+    pub routes: Vec<String>,
+    pub mcp_tools: Vec<String>,
+    pub schemas: Vec<String>,
+}
+
+/// Scenario variant arm within an experiment plan.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExperimentVariantDto {
+    pub variant_id: String,
+    pub brain_family: String,
+    #[schema(value_type = Option<Object>)]
+    pub config_overrides: Option<Value>,
+}
+
+/// Request payload for creating a matched-seed experiment batch.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExperimentCreateRequest {
+    pub experiment_id: Option<String>,
+    pub description: Option<String>,
+    pub variants: Vec<ExperimentVariantDto>,
+    pub seeds: Vec<u64>,
+    pub ticks_per_run: Option<u64>,
+    pub max_concurrency: Option<usize>,
+    pub idempotency_key: Option<String>,
+}
+
+/// Record of an individual run within an experiment.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExperimentRunRecordDto {
+    pub run_id: String,
+    pub variant_id: String,
+    pub brain_family: String,
+    pub seed: u64,
+    pub state: String,
+    pub total_ticks: u64,
+    pub final_digest: Option<String>,
+    pub bundle_path: Option<String>,
+    pub error_reason: Option<String>,
+}
+
+/// Complete batch status report for an experiment.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExperimentBatchStatusDto {
+    pub schema_version: u16,
+    pub generation: u64,
+    pub plan_digest: String,
+    pub experiment_id: String,
+    pub status: String,
+    pub total_runs: usize,
+    pub completed_runs: usize,
+    pub failed_runs: usize,
+    pub runs: Vec<ExperimentRunRecordDto>,
+    pub created_at_utc: String,
+    pub updated_at_utc: String,
+}
+
+/// Summary of an experiment for paginated listings.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExperimentSummaryDto {
+    pub experiment_id: String,
+    pub status: String,
+    pub total_runs: usize,
+    pub completed_runs: usize,
+    pub failed_runs: usize,
+    pub created_at_utc: String,
+    pub updated_at_utc: String,
+}
+
+/// Request payload for creating a simulation checkpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CheckpointCreateRequest {
+    pub description: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+/// Metadata descriptor for a simulation checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CheckpointMetadataDto {
+    pub checkpoint_id: String,
+    pub tick: u64,
+    pub byte_size: u64,
+    pub checksum_blake3: String,
+    pub checksum_sha256: String,
+    pub schema: String,
+    pub created_at_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Metadata descriptor for a discoverable and downloadable artifact or bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ArtifactMetadataDto {
+    pub artifact_id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub byte_size: u64,
+    pub checksum_blake3: String,
+    pub checksum_sha256: String,
+    pub created_at_utc: String,
+    pub relative_path: String,
+}
+
+/// Paginated response for experiments.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PaginatedExperimentsResponse {
+    pub items: Vec<ExperimentSummaryDto>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+/// Paginated response for checkpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PaginatedCheckpointsResponse {
+    pub items: Vec<CheckpointMetadataDto>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+/// Paginated response for artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PaginatedArtifactsResponse {
+    pub items: Vec<ArtifactMetadataDto>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+/// Maximum artifact download size enforced at boundary (64 MB).
+pub const MAX_ARTIFACT_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Standard FIPS 180-4 SHA-256 digest in pure Rust.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
+pub fn compute_sha256(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let k: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0x00);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, item) in w.iter_mut().take(16).enumerate() {
+            *item = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut h_val = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h_val
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h_val = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(h_val);
+    }
+
+    format!(
+        "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
+    )
+}
+
+/// Compute hex BLAKE3 hash of arbitrary bytes.
+pub fn compute_blake3(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
+/// Canonical in-process data services managing experiments, checkpoints, and artifacts.
+#[derive(Debug)]
+pub struct DataServices {
+    experiments: Mutex<BTreeMap<String, ExperimentBatchStatusDto>>,
+    checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
+    checkpoint_data: Mutex<BTreeMap<String, Vec<u8>>>,
+    artifacts: Mutex<BTreeMap<String, ArtifactMetadataDto>>,
+    idempotency: Mutex<BTreeMap<String, (String, Value)>>,
+    artifacts_dir: RwLock<PathBuf>,
+}
+
+impl DataServices {
+    pub fn new(artifacts_dir: PathBuf) -> Self {
+        let _ = fs::create_dir_all(&artifacts_dir);
+        Self {
+            experiments: Mutex::new(BTreeMap::new()),
+            checkpoints: Mutex::new(BTreeMap::new()),
+            checkpoint_data: Mutex::new(BTreeMap::new()),
+            artifacts: Mutex::new(BTreeMap::new()),
+            idempotency: Mutex::new(BTreeMap::new()),
+            artifacts_dir: RwLock::new(artifacts_dir),
+        }
+    }
+
+    pub fn set_artifacts_dir(&self, dir: PathBuf) {
+        let _ = fs::create_dir_all(&dir);
+        if let Ok(mut lock) = self.artifacts_dir.write() {
+            *lock = dir;
+        }
+    }
+
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.artifacts_dir
+            .read()
+            .map(|p| p.clone())
+            .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_artifacts"))
+    }
+
+    /// Register an external artifact with computed checksums and metadata.
+    pub fn register_artifact(&self, meta: ArtifactMetadataDto, data: Option<Vec<u8>>) {
+        let id = meta.artifact_id.clone();
+        if let Some(bytes) = data
+            && let Ok(mut lock) = self.checkpoint_data.lock()
+        {
+            lock.insert(id.clone(), bytes);
+        }
+        if let Ok(mut lock) = self.artifacts.lock() {
+            lock.insert(id, meta);
+        }
+    }
+}
+
+impl Default for DataServices {
+    fn default() -> Self {
+        let dir = std::env::var("SCRIPTBOTS_ARTIFACTS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_artifacts"));
+        Self::new(dir)
+    }
+}
+
 /// Shared handle used by REST, CLI, and MCP surfaces to access the running world.
 #[derive(Clone)]
 pub struct ControlHandle {
@@ -422,6 +811,7 @@ pub struct ControlHandle {
     command_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     command_namespace: u64,
     database_path: Option<std::path::PathBuf>,
+    data_services: std::sync::Arc<DataServices>,
 }
 
 impl ControlHandle {
@@ -433,7 +823,24 @@ impl ControlHandle {
             command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             command_namespace: NEXT_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             database_path: None,
+            data_services: std::sync::Arc::new(DataServices::default()),
         }
+    }
+
+    /// Return a reference to the canonical data services.
+    pub fn data_services(&self) -> &std::sync::Arc<DataServices> {
+        &self.data_services
+    }
+
+    /// Set custom artifacts directory for data services.
+    pub fn with_artifacts_dir(self, dir: std::path::PathBuf) -> Self {
+        self.data_services.set_artifacts_dir(dir);
+        self
+    }
+
+    /// Return the active artifacts directory.
+    pub fn artifacts_dir(&self) -> std::path::PathBuf {
+        self.data_services.artifacts_dir()
     }
 
     /// Attach a FrankenSQLite database path for offline storage queries.
@@ -445,6 +852,705 @@ impl ControlHandle {
     /// Return the attached database path, if configured.
     pub fn database_path(&self) -> Option<&std::path::Path> {
         self.database_path.as_deref()
+    }
+
+    /// Return version and runtime discovery information.
+    pub fn version(&self) -> ApiVersionDto {
+        ApiVersionDto {
+            service_name: "scriptbots-control".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            git_commit: option_env!("SCRIPTBOTS_GIT_SHA").map(str::to_string),
+            rustc_version: "rustc 2024 nightly".to_string(),
+            protocol_version: 1,
+            features: vec![
+                #[cfg(feature = "gui")]
+                "gui".into(),
+                #[cfg(feature = "ml")]
+                "ml".into(),
+                #[cfg(feature = "neuro")]
+                "neuro".into(),
+                "fastmcp".into(),
+                "rest".into(),
+            ],
+            capabilities: vec![
+                "simulation_control".into(),
+                "config_patching".into(),
+                "experiments_batch".into(),
+                "checkpoints_v1".into(),
+                "artifacts_storage".into(),
+                "map_generation".into(),
+                "narrative_search".into(),
+            ],
+        }
+    }
+
+    /// Return schema and route discovery information.
+    pub fn schema(&self) -> ApiSchemaDto {
+        ApiSchemaDto {
+            openapi_version: "3.0.3".to_string(),
+            title: "ScriptBots Control API".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            routes: vec![
+                "/api/version".into(),
+                "/api/v1/version".into(),
+                "/api/schema".into(),
+                "/api/v1/schema".into(),
+                "/api/status".into(),
+                "/api/config".into(),
+                "/api/knobs".into(),
+                "/api/pause".into(),
+                "/api/resume".into(),
+                "/api/step".into(),
+                "/api/speed".into(),
+                "/api/v1/experiments".into(),
+                "/api/v1/experiments/{experiment_id}".into(),
+                "/api/v1/experiments/{experiment_id}/cancel".into(),
+                "/api/v1/experiments/{experiment_id}/resume".into(),
+                "/api/v1/checkpoints".into(),
+                "/api/v1/checkpoints/{checkpoint_id}".into(),
+                "/api/v1/artifacts".into(),
+                "/api/v1/artifacts/{artifact_id}".into(),
+                "/api/v1/artifacts/{artifact_id}/download".into(),
+            ],
+            mcp_tools: vec![
+                "list_presets".into(),
+                "apply_preset".into(),
+                "list_knobs".into(),
+                "get_config".into(),
+                "apply_updates".into(),
+                "apply_patch".into(),
+                "pause".into(),
+                "resume".into(),
+                "step".into(),
+                "set_speed".into(),
+                "get_status".into(),
+                "shutdown".into(),
+                "get_command_status".into(),
+                "map_generate".into(),
+                "map_apply".into(),
+                "intervene".into(),
+                "narrative_search".into(),
+                "narrative_around".into(),
+                "get_version".into(),
+                "get_schema".into(),
+                "experiment_create".into(),
+                "experiment_list".into(),
+                "experiment_status".into(),
+                "experiment_cancel".into(),
+                "experiment_resume".into(),
+                "checkpoint_create".into(),
+                "checkpoint_list".into(),
+                "checkpoint_status".into(),
+                "artifact_list".into(),
+                "artifact_get".into(),
+            ],
+            schemas: vec![
+                "ApiVersionDto".into(),
+                "ApiSchemaDto".into(),
+                "ExperimentBatchStatusDto".into(),
+                "ExperimentSummaryDto".into(),
+                "ExperimentCreateRequest".into(),
+                "CheckpointCreateRequest".into(),
+                "CheckpointMetadataDto".into(),
+                "ArtifactMetadataDto".into(),
+                "PaginatedExperimentsResponse".into(),
+                "PaginatedCheckpointsResponse".into(),
+                "PaginatedArtifactsResponse".into(),
+                "CommandStatusDto".into(),
+                "SimulationStatusDto".into(),
+            ],
+        }
+    }
+
+    /// Create and enqueue a deterministic matched-seed experiment batch.
+    pub fn create_experiment(
+        &self,
+        request: ExperimentCreateRequest,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        if request.variants.is_empty() {
+            return Err(ControlError::BadRequest("variants cannot be empty".into()));
+        }
+        if request.variants.len() > 64 {
+            return Err(ControlError::BadRequest(
+                "variants exceed maximum limit of 64".into(),
+            ));
+        }
+        for v in &request.variants {
+            let trimmed_id = v.variant_id.trim();
+            if trimmed_id.is_empty() || trimmed_id.len() > 64 {
+                return Err(ControlError::BadRequest(format!(
+                    "invalid variant_id '{}': must be 1..=64 characters",
+                    v.variant_id
+                )));
+            }
+            if !trimmed_id
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(ControlError::BadRequest(format!(
+                    "invalid variant_id '{}': must contain only alphanumeric, dash, or underscore",
+                    v.variant_id
+                )));
+            }
+            let fam = v.brain_family.trim().to_lowercase();
+            if !matches!(
+                fam.as_str(),
+                "mlp"
+                    | "mlp.baseline"
+                    | "dwraon"
+                    | "dwraon.baseline"
+                    | "assembly"
+                    | "assembly.experimental"
+            ) {
+                return Err(ControlError::BadRequest(format!(
+                    "unknown brain family '{}': must be mlp, dwraon, or assembly",
+                    v.brain_family
+                )));
+            }
+        }
+        if request.seeds.is_empty() {
+            return Err(ControlError::BadRequest("seeds cannot be empty".into()));
+        }
+        if request.seeds.len() > 128 {
+            return Err(ControlError::BadRequest(
+                "seeds exceed maximum limit of 128".into(),
+            ));
+        }
+        let total_runs = request.variants.len().saturating_mul(request.seeds.len());
+        if total_runs > 4096 {
+            return Err(ControlError::BadRequest(format!(
+                "total batch runs ({total_runs}) exceed maximum limit of 4096"
+            )));
+        }
+
+        let ticks_per_run = request.ticks_per_run.unwrap_or(1000).clamp(1, 10_000_000);
+
+        if let Some(ref key) = request.idempotency_key {
+            if key.is_empty() || key.len() > 1024 {
+                return Err(ControlError::BadRequest(
+                    "idempotency key must contain 1..=1024 bytes".into(),
+                ));
+            }
+            let payload_hash = compute_blake3(
+                serde_json::to_string(&request)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            if let Ok(lock) = self.data_services.idempotency.lock()
+                && let Some((stored_hash, cached_val)) = lock.get(key)
+            {
+                if stored_hash == &payload_hash {
+                    if let Ok(dto) =
+                        serde_json::from_value::<ExperimentBatchStatusDto>(cached_val.clone())
+                    {
+                        return Ok(dto);
+                    }
+                } else {
+                    return Err(ControlError::Conflict(
+                        "idempotency key reused with different payload".into(),
+                    ));
+                }
+            }
+        }
+
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+
+        let experiment_id = if let Some(ref id) = request.experiment_id {
+            let trimmed = id.trim();
+            if trimmed.is_empty() || trimmed.len() > 128 {
+                return Err(ControlError::BadRequest(
+                    "experiment_id must be 1..=128 characters".into(),
+                ));
+            }
+            if !trimmed
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+                || trimmed.contains("..")
+            {
+                return Err(ControlError::BadRequest(
+                    "experiment_id contains invalid characters or path traversal".into(),
+                ));
+            }
+            if let Ok(lock) = self.data_services.experiments.lock()
+                && lock.contains_key(trimmed)
+            {
+                return Err(ControlError::Conflict(format!(
+                    "experiment_id '{trimmed}' already exists"
+                )));
+            }
+            trimmed.to_string()
+        } else {
+            format!("exp-{secs}{nanos:04}")
+        };
+
+        let mut runs = Vec::with_capacity(total_runs);
+        for v in &request.variants {
+            for &s in &request.seeds {
+                let run_id = format!("{}_{}_s{}", experiment_id, v.variant_id, s);
+                runs.push(ExperimentRunRecordDto {
+                    run_id,
+                    variant_id: v.variant_id.clone(),
+                    brain_family: v.brain_family.clone(),
+                    seed: s,
+                    state: "pending".into(),
+                    total_ticks: ticks_per_run,
+                    final_digest: None,
+                    bundle_path: None,
+                    error_reason: None,
+                });
+            }
+        }
+
+        let plan_digest = compute_blake3(
+            format!("{}:{}:{}", experiment_id, runs.len(), ticks_per_run).as_bytes(),
+        );
+        let status_dto = ExperimentBatchStatusDto {
+            schema_version: 2,
+            generation: 1,
+            plan_digest,
+            experiment_id: experiment_id.clone(),
+            status: "pending".into(),
+            total_runs: runs.len(),
+            completed_runs: 0,
+            failed_runs: 0,
+            runs,
+            created_at_utc: format!("{secs}"),
+            updated_at_utc: format!("{secs}"),
+        };
+
+        if let Ok(mut lock) = self.data_services.experiments.lock() {
+            lock.insert(experiment_id, status_dto.clone());
+        }
+
+        if let Some(ref key) = request.idempotency_key {
+            let payload_hash = compute_blake3(
+                serde_json::to_string(&request)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            if let Ok(mut lock) = self.data_services.idempotency.lock()
+                && let Ok(val) = serde_json::to_value(&status_dto)
+            {
+                lock.insert(key.clone(), (payload_hash, val));
+            }
+        }
+
+        Ok(status_dto)
+    }
+
+    /// Look up status of an experiment by ID.
+    pub fn get_experiment(
+        &self,
+        experiment_id: &str,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        let lock = self
+            .data_services
+            .experiments
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        lock.get(experiment_id).cloned().ok_or_else(|| {
+            ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
+        })
+    }
+
+    /// Cancel a running or pending experiment.
+    pub fn cancel_experiment(
+        &self,
+        experiment_id: &str,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        let mut lock = self
+            .data_services
+            .experiments
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let exp = lock.get_mut(experiment_id).ok_or_else(|| {
+            ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
+        })?;
+        if exp.status == "completed" || exp.status == "failed" || exp.status == "cancelled" {
+            return Ok(exp.clone());
+        }
+        exp.status = "cancelled".into();
+        exp.generation += 1;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        exp.updated_at_utc = format!("{secs}");
+        for run in &mut exp.runs {
+            if run.state == "pending" || run.state == "running" {
+                run.state = "cancelled".into();
+            }
+        }
+        Ok(exp.clone())
+    }
+
+    /// Resume a cancelled experiment.
+    pub fn resume_experiment(
+        &self,
+        experiment_id: &str,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        let mut lock = self
+            .data_services
+            .experiments
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let exp = lock.get_mut(experiment_id).ok_or_else(|| {
+            ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
+        })?;
+        if exp.status == "completed" {
+            return Err(ControlError::Conflict(format!(
+                "cannot resume completed experiment '{experiment_id}'"
+            )));
+        }
+        if exp.status == "cancelled" {
+            exp.status = "running".into();
+            exp.generation += 1;
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            exp.updated_at_utc = format!("{secs}");
+            for run in &mut exp.runs {
+                if run.state == "cancelled" {
+                    run.state = "pending".into();
+                }
+            }
+        }
+        Ok(exp.clone())
+    }
+
+    /// List experiments with bounded pagination.
+    pub fn list_experiments(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedExperimentsResponse, ControlError> {
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let offset = if let Some(c) = cursor {
+            c.trim()
+                .parse::<usize>()
+                .map_err(|_| ControlError::BadRequest(format!("invalid cursor: '{c}'")))?
+        } else {
+            0
+        };
+
+        let lock = self
+            .data_services
+            .experiments
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let total = lock.len();
+        let items: Vec<ExperimentSummaryDto> = lock
+            .values()
+            .skip(offset)
+            .take(limit)
+            .map(|e| ExperimentSummaryDto {
+                experiment_id: e.experiment_id.clone(),
+                status: e.status.clone(),
+                total_runs: e.total_runs,
+                completed_runs: e.completed_runs,
+                failed_runs: e.failed_runs,
+                created_at_utc: e.created_at_utc.clone(),
+                updated_at_utc: e.updated_at_utc.clone(),
+            })
+            .collect();
+
+        let has_more = offset + items.len() < total;
+        let next_cursor = if has_more {
+            Some((offset + items.len()).to_string())
+        } else {
+            None
+        };
+
+        Ok(PaginatedExperimentsResponse {
+            items,
+            total,
+            limit,
+            offset,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    /// Create a simulation checkpoint and register it as an artifact.
+    pub fn create_checkpoint(
+        &self,
+        request: CheckpointCreateRequest,
+    ) -> Result<CheckpointMetadataDto, ControlError> {
+        if let Some(ref key) = request.idempotency_key {
+            if key.is_empty() || key.len() > 1024 {
+                return Err(ControlError::BadRequest(
+                    "idempotency key must contain 1..=1024 bytes".into(),
+                ));
+            }
+            let payload_hash =
+                compute_blake3(format!("{}:{:?}", key, request.description).as_bytes());
+            if let Ok(lock) = self.data_services.idempotency.lock()
+                && let Some((stored_hash, cached_val)) = lock.get(key)
+            {
+                if stored_hash == &payload_hash {
+                    if let Ok(dto) =
+                        serde_json::from_value::<CheckpointMetadataDto>(cached_val.clone())
+                    {
+                        return Ok(dto);
+                    }
+                } else {
+                    return Err(ControlError::Conflict(
+                        "idempotency key reused with different payload".into(),
+                    ));
+                }
+            }
+        }
+
+        let snapshot = self.read_snapshot()?;
+        let encoded_bytes = postcard::to_stdvec(&snapshot)
+            .or_else(|_| serde_json::to_vec(&snapshot))
+            .map_err(|e| ControlError::Serialization(e.to_string()))?;
+
+        let blake3_hex = compute_blake3(&encoded_bytes);
+        let sha256_hex = compute_sha256(&encoded_bytes);
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let checkpoint_id = format!("ckpt-{secs}{nanos:04}-t{}", snapshot.world.tick);
+
+        let meta = CheckpointMetadataDto {
+            checkpoint_id: checkpoint_id.clone(),
+            tick: snapshot.world.tick,
+            byte_size: encoded_bytes.len() as u64,
+            checksum_blake3: blake3_hex.clone(),
+            checksum_sha256: sha256_hex.clone(),
+            schema: "scriptbots.world-checkpoint.v1.3".into(),
+            created_at_utc: format!("{secs}"),
+            description: request.description.clone(),
+        };
+
+        let filename = format!("{checkpoint_id}.bin");
+        let art_meta = ArtifactMetadataDto {
+            artifact_id: checkpoint_id.clone(),
+            filename: filename.clone(),
+            content_type: "application/octet-stream".into(),
+            byte_size: encoded_bytes.len() as u64,
+            checksum_blake3: blake3_hex,
+            checksum_sha256: sha256_hex,
+            created_at_utc: format!("{secs}"),
+            relative_path: filename.clone(),
+        };
+
+        let dir = self.data_services.artifacts_dir();
+        let file_path = dir.join(&filename);
+        let _ = fs::write(&file_path, &encoded_bytes);
+
+        if let Ok(mut lock) = self.data_services.checkpoints.lock() {
+            lock.insert(checkpoint_id.clone(), meta.clone());
+        }
+        if let Ok(mut lock) = self.data_services.checkpoint_data.lock() {
+            lock.insert(checkpoint_id.clone(), encoded_bytes);
+        }
+        if let Ok(mut lock) = self.data_services.artifacts.lock() {
+            lock.insert(checkpoint_id, art_meta);
+        }
+
+        if let Some(ref key) = request.idempotency_key {
+            let payload_hash = compute_blake3(format!("{}:{:?}", key, meta.description).as_bytes());
+            if let Ok(mut lock) = self.data_services.idempotency.lock()
+                && let Ok(val) = serde_json::to_value(&meta)
+            {
+                lock.insert(key.clone(), (payload_hash, val));
+            }
+        }
+
+        Ok(meta)
+    }
+
+    /// Look up checkpoint metadata by ID.
+    pub fn get_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<CheckpointMetadataDto, ControlError> {
+        let lock = self
+            .data_services
+            .checkpoints
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        lock.get(checkpoint_id).cloned().ok_or_else(|| {
+            ControlError::NotFound(format!("checkpoint '{checkpoint_id}' not found"))
+        })
+    }
+
+    /// List checkpoints with bounded pagination.
+    pub fn list_checkpoints(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedCheckpointsResponse, ControlError> {
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let offset = if let Some(c) = cursor {
+            c.trim()
+                .parse::<usize>()
+                .map_err(|_| ControlError::BadRequest(format!("invalid cursor: '{c}'")))?
+        } else {
+            0
+        };
+
+        let lock = self
+            .data_services
+            .checkpoints
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let total = lock.len();
+        let items: Vec<CheckpointMetadataDto> =
+            lock.values().skip(offset).take(limit).cloned().collect();
+
+        let has_more = offset + items.len() < total;
+        let next_cursor = if has_more {
+            Some((offset + items.len()).to_string())
+        } else {
+            None
+        };
+
+        Ok(PaginatedCheckpointsResponse {
+            items,
+            total,
+            limit,
+            offset,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    /// Look up artifact metadata by ID.
+    pub fn get_artifact(&self, artifact_id: &str) -> Result<ArtifactMetadataDto, ControlError> {
+        let lock = self
+            .data_services
+            .artifacts
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        lock.get(artifact_id)
+            .cloned()
+            .ok_or_else(|| ControlError::NotFound(format!("artifact '{artifact_id}' not found")))
+    }
+
+    /// List discoverable artifacts with bounded pagination.
+    pub fn list_artifacts(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedArtifactsResponse, ControlError> {
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let offset = if let Some(c) = cursor {
+            c.trim()
+                .parse::<usize>()
+                .map_err(|_| ControlError::BadRequest(format!("invalid cursor: '{c}'")))?
+        } else {
+            0
+        };
+
+        let lock = self
+            .data_services
+            .artifacts
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let total = lock.len();
+        let items: Vec<ArtifactMetadataDto> =
+            lock.values().skip(offset).take(limit).cloned().collect();
+
+        let has_more = offset + items.len() < total;
+        let next_cursor = if has_more {
+            Some((offset + items.len()).to_string())
+        } else {
+            None
+        };
+
+        Ok(PaginatedArtifactsResponse {
+            items,
+            total,
+            limit,
+            offset,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    /// Read artifact bytes with fail-closed traversal checks, size caps, and checksum verification.
+    pub fn read_artifact_bytes(
+        &self,
+        artifact_id: &str,
+    ) -> Result<(ArtifactMetadataDto, Vec<u8>), ControlError> {
+        let artifact = self.get_artifact(artifact_id)?;
+        let rel_path = &artifact.relative_path;
+
+        if rel_path.contains("..")
+            || rel_path.contains('\0')
+            || rel_path.starts_with('/')
+            || rel_path.starts_with('\\')
+        {
+            return Err(ControlError::BadRequest(
+                "invalid artifact path: traversal rejected".into(),
+            ));
+        }
+
+        let bytes = if let Ok(lock) = self.data_services.checkpoint_data.lock() {
+            if let Some(b) = lock.get(artifact_id) {
+                b.clone()
+            } else {
+                let dir = self.data_services.artifacts_dir();
+                let file_path = dir.join(rel_path);
+                let canonical_dir = dir
+                    .canonicalize()
+                    .map_err(|e| ControlError::BadRequest(format!("invalid artifacts dir: {e}")))?;
+                let canonical_file = file_path
+                    .canonicalize()
+                    .map_err(|e| ControlError::NotFound(format!("artifact file not found: {e}")))?;
+                if !canonical_file.starts_with(&canonical_dir) {
+                    return Err(ControlError::BadRequest(
+                        "path traversal detected: outside artifacts dir".into(),
+                    ));
+                }
+                let metadata = fs::metadata(&canonical_file)
+                    .map_err(|e| ControlError::NotFound(format!("artifact metadata error: {e}")))?;
+                if metadata.len() > MAX_ARTIFACT_DOWNLOAD_BYTES as u64 {
+                    return Err(ControlError::PayloadTooLarge(format!(
+                        "artifact byte size {} exceeds 64MB download limit",
+                        metadata.len()
+                    )));
+                }
+                fs::read(&canonical_file).map_err(|e| {
+                    ControlError::BadRequest(format!("failed to read artifact: {e}"))
+                })?
+            }
+        } else {
+            return Err(ControlError::Lock);
+        };
+
+        if bytes.len() > MAX_ARTIFACT_DOWNLOAD_BYTES {
+            return Err(ControlError::PayloadTooLarge(format!(
+                "artifact byte size {} exceeds 64MB download limit",
+                bytes.len()
+            )));
+        }
+
+        let actual_blake3 = compute_blake3(&bytes);
+        if actual_blake3 != artifact.checksum_blake3 {
+            return Err(ControlError::InvalidPatch(format!(
+                "artifact integrity verification failed: expected blake3 {}, got {}",
+                artifact.checksum_blake3, actual_blake3
+            )));
+        }
+
+        Ok((artifact, bytes))
     }
 
     /// Produce a PNG snapshot of the world without a live window.

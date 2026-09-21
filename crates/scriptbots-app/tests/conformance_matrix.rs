@@ -331,6 +331,18 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
         "step",
         "narrative_search",
         "narrative_around",
+        "get_version",
+        "get_schema",
+        "experiment_create",
+        "experiment_list",
+        "experiment_status",
+        "experiment_cancel",
+        "experiment_resume",
+        "checkpoint_create",
+        "checkpoint_list",
+        "checkpoint_status",
+        "artifact_list",
+        "artifact_get",
     ];
     for expected in expected_tools {
         assert!(
@@ -338,7 +350,7 @@ fn test_mcp_protocol_negotiation_and_tool_discovery() {
             "expected tool '{expected}' missing from roster: {tool_names:?}"
         );
     }
-    assert_eq!(tool_names.len(), 18);
+    assert_eq!(tool_names.len(), 30);
 }
 
 #[test]
@@ -798,4 +810,478 @@ fn test_cross_surface_intervention_equivalence_and_rejection() {
         !drought_bytes.is_empty(),
         "canonical bytes must not be empty"
     );
+}
+
+fn http_request_raw(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>)> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut header_bytes = Vec::new();
+    let body_len = body.map_or(0, |b| b.len());
+    write!(
+        header_bytes,
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {body_len}\r\nConnection: close\r\n"
+    )?;
+    for (k, v) in headers {
+        write!(header_bytes, "{k}: {v}\r\n")?;
+    }
+    write!(header_bytes, "\r\n")?;
+    stream.write_all(&header_bytes)?;
+    if let Some(b) = body {
+        stream.write_all(b)?;
+    }
+    stream.flush()?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let sep = b"\r\n\r\n";
+    let pos = raw
+        .windows(sep.len())
+        .position(|window| window == sep)
+        .ok_or_else(|| anyhow!("malformed HTTP response"))?;
+    let head = std::str::from_utf8(&raw[..pos])?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .ok_or_else(|| anyhow!("no status line in {head:?}"))?
+        .parse()?;
+    let body_bytes = raw[pos + sep.len()..].to_vec();
+    Ok((status, body_bytes))
+}
+
+#[test]
+fn test_version_and_schema_cross_surface_parity() {
+    let fixture = setup_conformance_fixture();
+    initialize_mcp(fixture.mcp_addr);
+
+    // 1. Version parity: GET /api/v1/version vs GET /api/version vs MCP get_version
+    let (status_v1, body_v1) = http_request(fixture.rest_addr, "GET", "/api/v1/version", &[], None)
+        .expect("GET /api/v1/version");
+    assert_eq!(status_v1, 200);
+    let v1_json: Value = serde_json::from_str(&body_v1).expect("parse /api/v1/version");
+
+    let (status_v_alias, body_v_alias) =
+        http_request(fixture.rest_addr, "GET", "/api/version", &[], None)
+            .expect("GET /api/version");
+    assert_eq!(status_v_alias, 200);
+    let v_alias_json: Value = serde_json::from_str(&body_v_alias).expect("parse /api/version");
+    assert_eq!(v1_json, v_alias_json, "version alias parity");
+
+    let (mcp_status, mcp_call) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(100),
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "get_version",
+            "arguments": {}
+        })),
+    )
+    .expect("mcp call get_version");
+    assert_eq!(mcp_status, 200);
+    let mcp_text = mcp_call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text");
+    let mcp_version: Value = serde_json::from_str(mcp_text).expect("parse mcp version");
+
+    assert_eq!(v1_json["service_name"], mcp_version["service_name"]);
+    assert_eq!(v1_json["version"], mcp_version["version"]);
+    assert_eq!(v1_json["capabilities"], mcp_version["capabilities"]);
+
+    // 2. Schema parity: GET /api/v1/schema vs GET /api/schema vs MCP get_schema
+    let (status_schema1, body_schema1) =
+        http_request(fixture.rest_addr, "GET", "/api/v1/schema", &[], None)
+            .expect("GET /api/v1/schema");
+    assert_eq!(status_schema1, 200);
+    let schema1_json: Value = serde_json::from_str(&body_schema1).expect("parse /api/v1/schema");
+
+    let (status_schema_alias, body_schema_alias) =
+        http_request(fixture.rest_addr, "GET", "/api/schema", &[], None).expect("GET /api/schema");
+    assert_eq!(status_schema_alias, 200);
+    let schema_alias_json: Value =
+        serde_json::from_str(&body_schema_alias).expect("parse /api/schema");
+    assert_eq!(schema1_json, schema_alias_json, "schema alias parity");
+
+    let (mcp_schema_status, mcp_schema_call) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(101),
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "get_schema",
+            "arguments": {}
+        })),
+    )
+    .expect("mcp call get_schema");
+    assert_eq!(mcp_schema_status, 200);
+    let mcp_schema_text = mcp_schema_call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text");
+    let mcp_schema: Value = serde_json::from_str(mcp_schema_text).expect("parse mcp schema");
+
+    assert_eq!(schema1_json["title"], mcp_schema["title"]);
+    assert_eq!(
+        schema1_json["mcp_tools"].as_array().map(|a| a.len()),
+        Some(30)
+    );
+    assert_eq!(
+        mcp_schema["mcp_tools"].as_array().map(|a| a.len()),
+        Some(30)
+    );
+    assert!(schema1_json["routes"].as_array().map_or(0, |a| a.len()) >= 20);
+}
+
+#[test]
+fn test_experiments_checkpoints_and_artifacts_lifecycle() {
+    let fixture = setup_conformance_fixture();
+    initialize_mcp(fixture.mcp_addr);
+
+    // --- 1. Experiment Validation & Error Semantics ---
+    // 1a. Empty variants rejected with 400 Bad Request
+    let empty_variants = serde_json::json!({
+        "variants": [],
+        "seeds": [42]
+    });
+    let (st_err1, body_err1) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/v1/experiments",
+        &[("Content-Type", "application/json")],
+        Some(empty_variants.to_string().as_bytes()),
+    )
+    .expect("POST empty variants");
+    assert_eq!(st_err1, 400);
+    assert!(
+        body_err1.contains("variants cannot be empty"),
+        "body={body_err1}"
+    );
+
+    // 1b. Empty seeds rejected with 400 Bad Request
+    let empty_seeds = serde_json::json!({
+        "variants": [{ "variant_id": "v1", "brain_family": "mlp" }],
+        "seeds": []
+    });
+    let (st_err2, body_err2) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/v1/experiments",
+        &[("Content-Type", "application/json")],
+        Some(empty_seeds.to_string().as_bytes()),
+    )
+    .expect("POST empty seeds");
+    assert_eq!(st_err2, 400);
+    assert!(
+        body_err2.contains("seeds cannot be empty"),
+        "body={body_err2}"
+    );
+
+    // 1c. Invalid brain family rejected with 400 Bad Request
+    let bad_brain = serde_json::json!({
+        "variants": [{ "variant_id": "v1", "brain_family": "nonexistent_brain_architecture" }],
+        "seeds": [1]
+    });
+    let (st_err3, body_err3) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/v1/experiments",
+        &[("Content-Type", "application/json")],
+        Some(bad_brain.to_string().as_bytes()),
+    )
+    .expect("POST bad brain");
+    assert_eq!(st_err3, 400);
+    assert!(
+        body_err3.contains("unknown brain family"),
+        "body={body_err3}"
+    );
+
+    // --- 2. Create Experiment & Idempotency ---
+    let create_payload = serde_json::json!({
+        "description": "conformance batch test",
+        "variants": [
+            { "variant_id": "mlp_std", "brain_family": "mlp" }
+        ],
+        "seeds": [101, 102],
+        "ticks_per_run": 5,
+        "idempotency_key": "conformance-exp-idem-42"
+    });
+    let (st_create, body_create) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/v1/experiments",
+        &[("Content-Type", "application/json")],
+        Some(create_payload.to_string().as_bytes()),
+    )
+    .expect("POST create experiment");
+    assert_eq!(st_create, 201, "create response: {body_create}");
+    let create_json: Value = serde_json::from_str(&body_create).expect("parse create experiment");
+    let exp_id = create_json["experiment_id"]
+        .as_str()
+        .expect("experiment_id string")
+        .to_string();
+    assert_eq!(create_json["total_runs"], 2);
+
+    // Idempotent retry returns identical experiment
+    let (st_create_retry, body_create_retry) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/v1/experiments",
+        &[("Content-Type", "application/json")],
+        Some(create_payload.to_string().as_bytes()),
+    )
+    .expect("POST create experiment retry");
+    assert_eq!(st_create_retry, 201);
+    let retry_json: Value = serde_json::from_str(&body_create_retry).expect("parse retry");
+    assert_eq!(retry_json["experiment_id"], exp_id);
+
+    // --- 3. Experiment Lookup & Status Parity (REST vs MCP) ---
+    let (st_get, body_get) = http_request(
+        fixture.rest_addr,
+        "GET",
+        &format!("/api/v1/experiments/{exp_id}"),
+        &[],
+        None,
+    )
+    .expect("GET experiment");
+    assert_eq!(st_get, 200);
+    let get_json: Value = serde_json::from_str(&body_get).expect("parse get experiment");
+    assert_eq!(get_json["experiment_id"], exp_id);
+
+    let (mcp_exp_st, mcp_exp_call) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(102),
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "experiment_status",
+            "arguments": { "experiment_id": exp_id }
+        })),
+    )
+    .expect("mcp call experiment_status");
+    assert_eq!(mcp_exp_st, 200);
+    let mcp_exp_text = mcp_exp_call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text");
+    let mcp_exp_json: Value =
+        serde_json::from_str(mcp_exp_text).expect("parse mcp experiment status");
+    assert_eq!(mcp_exp_json["experiment_id"], exp_id);
+
+    // Cancel experiment via REST
+    let (st_cancel, body_cancel) = http_request(
+        fixture.rest_addr,
+        "POST",
+        &format!("/api/v1/experiments/{exp_id}/cancel"),
+        &[],
+        None,
+    )
+    .expect("POST cancel experiment");
+    assert_eq!(st_cancel, 200);
+    let cancel_json: Value = serde_json::from_str(&body_cancel).expect("parse cancel");
+    assert_eq!(cancel_json["status"], "cancelled");
+
+    // Resume experiment via MCP
+    let (mcp_resume_st, mcp_resume_call) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(103),
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "experiment_resume",
+            "arguments": { "experiment_id": exp_id }
+        })),
+    )
+    .expect("mcp call experiment_resume");
+    assert_eq!(mcp_resume_st, 200);
+    let mcp_resume_text = mcp_resume_call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text");
+    let mcp_resume_json: Value = serde_json::from_str(mcp_resume_text).expect("parse resume");
+    assert_eq!(mcp_resume_json["status"], "running");
+
+    // List experiments via REST and MCP with pagination bounds
+    let (st_exp_list, body_exp_list) = http_request(
+        fixture.rest_addr,
+        "GET",
+        "/api/v1/experiments?limit=500",
+        &[],
+        None,
+    )
+    .expect("GET experiments list");
+    assert_eq!(st_exp_list, 200);
+    let exp_list_json: Value = serde_json::from_str(&body_exp_list).expect("parse exp list");
+    assert!(exp_list_json["items"].as_array().map_or(0, |a| a.len()) >= 1);
+
+    // --- 4. Checkpoint Creation & Parity ---
+    let chk_payload = serde_json::json!({
+        "description": "conformance test checkpoint",
+        "idempotency_key": "chk-idem-001"
+    });
+    let (st_chk_create, body_chk_create) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/v1/checkpoints",
+        &[("Content-Type", "application/json")],
+        Some(chk_payload.to_string().as_bytes()),
+    )
+    .expect("POST create checkpoint");
+    assert_eq!(st_chk_create, 201, "body: {body_chk_create}");
+    let chk_create_json: Value = serde_json::from_str(&body_chk_create).expect("parse chk create");
+    let chk_id = chk_create_json["checkpoint_id"]
+        .as_str()
+        .expect("checkpoint_id")
+        .to_string();
+    let artifact_id = chk_id.clone();
+    let expected_sha256 = chk_create_json["checksum_sha256"]
+        .as_str()
+        .expect("sha256")
+        .to_string();
+    let expected_blake3 = chk_create_json["checksum_blake3"]
+        .as_str()
+        .expect("blake3")
+        .to_string();
+
+    // Checkpoint lookup via REST & MCP
+    let (st_chk_get, _body_chk_get) = http_request(
+        fixture.rest_addr,
+        "GET",
+        &format!("/api/v1/checkpoints/{chk_id}"),
+        &[],
+        None,
+    )
+    .expect("GET checkpoint");
+    assert_eq!(st_chk_get, 200);
+
+    let (mcp_chk_st, mcp_chk_call) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(104),
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "checkpoint_status",
+            "arguments": { "checkpoint_id": chk_id }
+        })),
+    )
+    .expect("mcp call checkpoint_status");
+    assert_eq!(mcp_chk_st, 200);
+    let mcp_chk_text = mcp_chk_call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text");
+    let mcp_chk_json: Value = serde_json::from_str(mcp_chk_text).expect("parse mcp chk");
+    assert_eq!(mcp_chk_json["checkpoint_id"], chk_id);
+
+    // List checkpoints via REST & MCP
+    let (st_chk_list, body_chk_list) =
+        http_request(fixture.rest_addr, "GET", "/api/v1/checkpoints", &[], None)
+            .expect("GET checkpoints");
+    assert_eq!(st_chk_list, 200);
+    let chk_list_json: Value = serde_json::from_str(&body_chk_list).expect("parse chk list");
+    assert!(chk_list_json["items"].as_array().map_or(0, |a| a.len()) >= 1);
+
+    // --- 5. Artifact Discovery, Download, and Negative Tests ---
+    // 5a. List artifacts via REST & MCP
+    let (st_art_list, body_art_list) =
+        http_request(fixture.rest_addr, "GET", "/api/v1/artifacts", &[], None)
+            .expect("GET artifacts");
+    assert_eq!(st_art_list, 200);
+    let art_list_json: Value = serde_json::from_str(&body_art_list).expect("parse art list");
+    assert!(art_list_json["items"].as_array().map_or(0, |a| a.len()) >= 1);
+
+    let (mcp_art_st, _mcp_art_call) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(105),
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "artifact_list",
+            "arguments": {}
+        })),
+    )
+    .expect("mcp call artifact_list");
+    assert_eq!(mcp_art_st, 200);
+
+    // 5b. Get artifact metadata via REST & MCP
+    let (st_art_get, body_art_get) = http_request(
+        fixture.rest_addr,
+        "GET",
+        &format!("/api/v1/artifacts/{artifact_id}"),
+        &[],
+        None,
+    )
+    .expect("GET artifact metadata");
+    assert_eq!(st_art_get, 200);
+    let art_get_json: Value = serde_json::from_str(&body_art_get).expect("parse art get");
+    assert_eq!(art_get_json["artifact_id"], artifact_id);
+    assert_eq!(art_get_json["checksum_sha256"], expected_sha256);
+
+    let (mcp_art_meta_st, _mcp_art_meta_call) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(106),
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "artifact_get",
+            "arguments": { "artifact_id": artifact_id }
+        })),
+    )
+    .expect("mcp call artifact_get");
+    assert_eq!(mcp_art_meta_st, 200);
+
+    // 5c. Download artifact bytes and verify checksums!
+    let (st_dl, dl_bytes) = http_request_raw(
+        fixture.rest_addr,
+        "GET",
+        &format!("/api/v1/artifacts/{artifact_id}/download"),
+        &[],
+        None,
+    )
+    .expect("download artifact");
+    assert_eq!(st_dl, 200);
+    assert!(
+        !dl_bytes.is_empty(),
+        "downloaded artifact bytes must not be empty"
+    );
+
+    let computed_sha256 = scriptbots_app::control::compute_sha256(&dl_bytes);
+    let computed_blake3 = scriptbots_app::control::compute_blake3(&dl_bytes);
+    assert_eq!(
+        computed_sha256, expected_sha256,
+        "sha256 checksum mismatch on downloaded bytes"
+    );
+    assert_eq!(
+        computed_blake3, expected_blake3,
+        "blake3 checksum mismatch on downloaded bytes"
+    );
+
+    // 5d. Path traversal attack rejection
+    let (st_traversal, _) = http_request(
+        fixture.rest_addr,
+        "GET",
+        "/api/v1/artifacts/..%2F..%2Fetc%2Fpasswd/download",
+        &[],
+        None,
+    )
+    .expect("traversal request");
+    assert!(
+        st_traversal == 400 || st_traversal == 404,
+        "path traversal must be rejected: {st_traversal}"
+    );
+
+    // 5e. Non-existent artifact lookup and download returns 404
+    let (st_art_missing, _) = http_request(
+        fixture.rest_addr,
+        "GET",
+        "/api/v1/artifacts/nonexistent_artifact_xyz",
+        &[],
+        None,
+    )
+    .expect("missing artifact get");
+    assert_eq!(st_art_missing, 404);
+
+    let (st_art_missing_dl, _) = http_request(
+        fixture.rest_addr,
+        "GET",
+        "/api/v1/artifacts/nonexistent_artifact_xyz/download",
+        &[],
+        None,
+    )
+    .expect("missing artifact dl");
+    assert_eq!(st_art_missing_dl, 404);
 }

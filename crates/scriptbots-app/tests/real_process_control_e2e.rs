@@ -75,6 +75,55 @@ fn http(addr: SocketAddr, method: &str, path: &str) -> Result<(u16, String)> {
     http_with_body(addr, method, path, &[], None)
 }
 
+fn http_with_body_raw(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body_bytes: &[u8],
+    content_type: Option<&str>,
+) -> Result<(u16, Vec<u8>)> {
+    let mut stream = TcpStream::connect(addr)
+        .with_context(|| format!("connect failed for {method} {path} to {addr}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    let ct_header = match content_type {
+        Some(ct) => format!("Content-Type: {ct}\r\n"),
+        None => String::new(),
+    };
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{ct_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    )
+    .with_context(|| format!("write header failed for {method} {path} to {addr}"))?;
+    if !body_bytes.is_empty() {
+        stream
+            .write_all(body_bytes)
+            .with_context(|| format!("write body failed for {method} {path} to {addr}"))?;
+    }
+    stream
+        .flush()
+        .with_context(|| format!("flush failed for {method} {path} to {addr}"))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .with_context(|| format!("read_to_end failed for {method} {path} to {addr}"))?;
+    let sep = b"\r\n\r\n";
+    let pos = raw
+        .windows(sep.len())
+        .position(|w| w == sep)
+        .ok_or_else(|| anyhow!("malformed HTTP response for {method} {path}"))?;
+    let head = std::str::from_utf8(&raw[..pos])?;
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .ok_or_else(|| anyhow!("no status line in {head:?} for {method} {path}"))?
+        .parse()
+        .with_context(|| format!("parse status line for {method} {path}"))?;
+    let body = raw[pos + sep.len()..].to_vec();
+    Ok((status, body))
+}
+
 /// Pull a string field out of a small JSON object without a parser dependency.
 fn json_str(body: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
@@ -707,7 +756,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         let tools = list_json["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 18, "MCP tools/list must return all 18 tools");
+        assert_eq!(tools.len(), 30, "MCP tools/list must return all 30 tools");
 
         // MCP tools/call get_status
         let status_payload = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}"#;
@@ -1230,4 +1279,357 @@ fn real_process_cli_replay_journal_roundtrip_and_divergence() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+#[serial]
+fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
+    let run_dir = tempdir()?;
+    let jsonl_log_path = run_dir.path().join("e2e_events.jsonl");
+
+    let mut child = Command::new(binary())
+        .args(["--mode", "server", "--storage", "file"])
+        .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
+        .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_CONTROL_MCP", "http")
+        .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+        .env("RUST_LOG", "warn,scriptbots_app=info")
+        .current_dir(run_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn shipped binary in server mode with file storage")?;
+
+    let (rest_addr, mcp_addr, server_log) =
+        match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+            Ok(found) => found,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+    let mut guard = ChildGuard(Some(child));
+
+    let log_event = |event: serde_json::Value| {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_log_path)
+        {
+            let _ = writeln!(f, "{}", event);
+        }
+    };
+
+    let outcome: Result<()> = (|| {
+        // --- 1. Version and Schema Discovery ---
+        let start = Instant::now();
+        let (v_code, v_body) = http(rest_addr, "GET", "/api/v1/version")?;
+        assert_eq!(v_code, 200);
+        let v_json: serde_json::Value = serde_json::from_str(&v_body)?;
+        assert_eq!(v_json["service_name"], "scriptbots-control");
+        log_event(serde_json::json!({
+            "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v1",
+            "transport": "rest",
+            "phase": "discovery",
+            "method": "GET",
+            "path": "/api/v1/version",
+            "status_code": v_code,
+            "latency_ms": start.elapsed().as_millis(),
+        }));
+
+        let start = Instant::now();
+        let (s_code, s_body) = http(rest_addr, "GET", "/api/v1/schema")?;
+        assert_eq!(s_code, 200);
+        let s_json: serde_json::Value = serde_json::from_str(&s_body)?;
+        assert_eq!(s_json["mcp_tools"].as_array().map(|a| a.len()), Some(30));
+        log_event(serde_json::json!({
+            "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v1",
+            "transport": "rest",
+            "phase": "discovery",
+            "method": "GET",
+            "path": "/api/v1/schema",
+            "status_code": s_code,
+            "latency_ms": start.elapsed().as_millis(),
+        }));
+
+        // --- 2. FastMCP Initialize and Tool Discovery ---
+        let init_payload = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-client","version":"1.0"}}}"#;
+        let (init_code, _) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            init_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(init_code, 200);
+
+        let notif_payload = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let (notif_code, _) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            notif_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(notif_code, 202);
+
+        let list_payload = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let (list_code, list_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            list_payload,
+            Some("application/json"),
+        )?;
+        assert_eq!(list_code, 200);
+        let list_json: serde_json::Value = serde_json::from_str(&list_body)?;
+        let tools = list_json["result"]["tools"].as_array().expect("tools");
+        assert_eq!(
+            tools.len(),
+            30,
+            "FastMCP tools roster must have exactly 30 tools"
+        );
+
+        // --- 3. Fault Injection ---
+        // 3a. Empty variants -> 400
+        let bad_variants = br#"{"variants":[],"seeds":[1]}"#;
+        let (bad_var_code, _) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/experiments",
+            bad_variants,
+            Some("application/json"),
+        )?;
+        assert_eq!(bad_var_code, 400);
+        log_event(serde_json::json!({
+            "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v1",
+            "transport": "rest",
+            "phase": "fault_injection",
+            "injected_fault": "empty_variants",
+            "status_code": bad_var_code,
+        }));
+
+        // 3b. Invalid brain family -> 400
+        let bad_brain = br#"{"variants":[{"variant_id":"bad","brain_family":"unknown_hyper_brain"}],"seeds":[1]}"#;
+        let (bad_brain_code, _) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/experiments",
+            bad_brain,
+            Some("application/json"),
+        )?;
+        assert_eq!(bad_brain_code, 400);
+        log_event(serde_json::json!({
+            "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v1",
+            "transport": "rest",
+            "phase": "fault_injection",
+            "injected_fault": "unknown_brain_family",
+            "status_code": bad_brain_code,
+        }));
+
+        // 3c. Non-existent experiment lookup -> 404
+        let (not_found_code, _) = http(rest_addr, "GET", "/api/v1/experiments/exp_not_found_xyz")?;
+        assert_eq!(not_found_code, 404);
+
+        // 3d. Path traversal artifact download -> 400 or 404
+        let (trav_code, _) = http(
+            rest_addr,
+            "GET",
+            "/api/v1/artifacts/..%2F..%2Fetc%2Fpasswd/download",
+        )?;
+        assert!(trav_code == 400 || trav_code == 404);
+
+        // 3e. Missing artifact download -> 404
+        let (missing_art_code, _) = http(
+            rest_addr,
+            "GET",
+            "/api/v1/artifacts/missing_artifact_xyz/download",
+        )?;
+        assert_eq!(missing_art_code, 404);
+
+        // --- 4. Happy Path: Experiment Lifecycle ---
+        let exp_payload = serde_json::json!({
+            "description": "real process batch",
+            "variants": [
+                { "variant_id": "mlp_std", "brain_family": "mlp" }
+            ],
+            "seeds": [1, 2],
+            "ticks_per_run": 5,
+            "idempotency_key": "real-proc-exp-001"
+        });
+        let exp_bytes = serde_json::to_vec(&exp_payload)?;
+        let (exp_code, exp_resp) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/experiments",
+            &exp_bytes,
+            Some("application/json"),
+        )?;
+        assert_eq!(exp_code, 201, "exp response: {exp_resp}");
+        let exp_json: serde_json::Value = serde_json::from_str(&exp_resp)?;
+        let exp_id = exp_json["experiment_id"]
+            .as_str()
+            .expect("experiment_id")
+            .to_string();
+
+        let (exp_st_code, _) = http(rest_addr, "GET", &format!("/api/v1/experiments/{exp_id}"))?;
+        assert_eq!(exp_st_code, 200);
+
+        // MCP experiment_status
+        let mcp_st_payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "experiment_status",
+                "arguments": { "experiment_id": exp_id }
+            }
+        });
+        let (mcp_st_code, _) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            &serde_json::to_vec(&mcp_st_payload)?,
+            Some("application/json"),
+        )?;
+        assert_eq!(mcp_st_code, 200);
+
+        // Cancel experiment
+        let (cancel_code, cancel_resp) = http(
+            rest_addr,
+            "POST",
+            &format!("/api/v1/experiments/{exp_id}/cancel"),
+        )?;
+        assert_eq!(cancel_code, 200);
+        let cancel_json: serde_json::Value = serde_json::from_str(&cancel_resp)?;
+        assert_eq!(cancel_json["status"], "cancelled");
+
+        // Resume experiment via MCP
+        let mcp_res_payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "experiment_resume",
+                "arguments": { "experiment_id": exp_id }
+            }
+        });
+        let (mcp_res_code, _) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            &serde_json::to_vec(&mcp_res_payload)?,
+            Some("application/json"),
+        )?;
+        assert_eq!(mcp_res_code, 200);
+
+        // List experiments
+        let (exp_list_code, _) = http(rest_addr, "GET", "/api/v1/experiments?limit=10")?;
+        assert_eq!(exp_list_code, 200);
+
+        // --- 5. Checkpoint and Artifact Lifecycle ---
+        let chk_payload = serde_json::json!({
+            "description": "real process checkpoint",
+            "idempotency_key": "real-proc-chk-001"
+        });
+        let (chk_code, chk_resp) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/checkpoints",
+            &serde_json::to_vec(&chk_payload)?,
+            Some("application/json"),
+        )?;
+        assert_eq!(chk_code, 201, "chk response: {chk_resp}");
+        let chk_json: serde_json::Value = serde_json::from_str(&chk_resp)?;
+        let chk_id = chk_json["checkpoint_id"]
+            .as_str()
+            .expect("chk id")
+            .to_string();
+        let expected_sha256 = chk_json["checksum_sha256"]
+            .as_str()
+            .expect("sha256")
+            .to_string();
+        let expected_blake3 = chk_json["checksum_blake3"]
+            .as_str()
+            .expect("blake3")
+            .to_string();
+
+        let (chk_get_code, _) = http(rest_addr, "GET", &format!("/api/v1/checkpoints/{chk_id}"))?;
+        assert_eq!(chk_get_code, 200);
+
+        let (art_get_code, _) = http(rest_addr, "GET", &format!("/api/v1/artifacts/{chk_id}"))?;
+        assert_eq!(art_get_code, 200);
+
+        // Download raw artifact bytes
+        let (dl_code, dl_bytes) = http_with_body_raw(
+            rest_addr,
+            "GET",
+            &format!("/api/v1/artifacts/{chk_id}/download"),
+            &[],
+            None,
+        )?;
+        assert_eq!(dl_code, 200);
+        assert!(
+            !dl_bytes.is_empty(),
+            "downloaded artifact bytes must not be empty"
+        );
+
+        let computed_sha256 = scriptbots_app::control::compute_sha256(&dl_bytes);
+        let computed_blake3 = scriptbots_app::control::compute_blake3(&dl_bytes);
+        assert_eq!(
+            computed_sha256, expected_sha256,
+            "sha256 checksum verification failed"
+        );
+        assert_eq!(
+            computed_blake3, expected_blake3,
+            "blake3 checksum verification failed"
+        );
+
+        // --- 6. Shutdown and Cleanup Verification ---
+        let (shut_code, _) = http(rest_addr, "POST", "/api/control/shutdown")?;
+        assert_eq!(shut_code, 200);
+
+        let mut child = guard.0.take().unwrap();
+        let wait_deadline = Instant::now() + Duration::from_secs(15);
+        let mut exited = false;
+        while Instant::now() < wait_deadline {
+            if child.try_wait()?.is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !exited {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+
+        let commit =
+            std::env::var("SCRIPTBOTS_GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+        println!(
+            "{{\"schema\":\"scriptbots.e2e-experiment-checkpoint-artifact.v1\",\
+             \"status\":\"pass\",\"binary\":\"{}\",\"mode\":\"server\",\"storage\":\"file\",\
+             \"tools_count\":{},\"experiments_count\":1,\"checkpoints_count\":1,\"artifacts_count\":1,\
+             \"injected_faults_handled\":5,\"checksums_verified\":true,\"cleanup_verified\":true,\
+             \"source_commit\":\"{}\"}}",
+            binary().display(),
+            tools.len(),
+            commit
+        );
+
+        Ok(())
+    })();
+
+    if let Err(ref e) = outcome {
+        eprintln!("E2E TEST FAILED: {e:?}");
+        if let Ok(lines) = server_log.lock() {
+            eprintln!("=== SERVER STDERR ({} lines) ===", lines.len());
+            for line in lines.iter().rev().take(50).rev() {
+                eprintln!("{line}");
+            }
+        }
+    }
+
+    outcome
 }

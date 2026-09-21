@@ -46,7 +46,7 @@ trap 'rm -f "$e2e_log"' EXIT
   -- \
   --nocapture 2>&1 | tee "$e2e_log"
 
-grep -q -E '(2|3) passed; 0 failed;' "$e2e_log" ||
+grep -q -E '(2|3|4) passed; 0 failed;' "$e2e_log" ||
   fail "real_process_control_e2e test suite did not pass with 0 failed"
 
 evidence="$(grep -o '{"schema":"scriptbots.real-process-e2e.v2".*}' "$e2e_log" | tail -1)"

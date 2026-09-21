@@ -36,11 +36,15 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::ScenarioIdentityV0;
 use crate::command::CommandSubmit;
 use crate::control::{
-    AgentScoreEntry, AppliedInterventionDto, CommandStatusDto, ConfigSnapshot, ControlError,
-    ControlHandle, DietClassDto, EventEntry, EventKind, HydrologySnapshot, InterveneRequestBody,
-    InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyRequestBody, MapGenerateRequestBody,
-    Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
-    SpeedRequest, parse_intervention_command, parse_map_artifact,
+    AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
+    CheckpointCreateRequest, CheckpointMetadataDto, CommandStatusDto, ConfigSnapshot, ControlError,
+    ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
+    ExperimentCreateRequest, ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto,
+    HydrologySnapshot, InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate,
+    MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
+    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
+    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
+    parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use scriptbots_core::{
@@ -1145,7 +1149,22 @@ pub struct SpeedRequestBody {
         get_interventions,
         post_map_generate,
         post_map_apply,
-        post_control_intervene
+        post_control_intervene,
+        get_version,
+        get_v1_version,
+        get_schema,
+        get_v1_schema,
+        post_v1_experiments,
+        get_v1_experiments,
+        get_v1_experiment_by_id,
+        post_v1_experiment_cancel,
+        post_v1_experiment_resume,
+        post_v1_checkpoints,
+        get_v1_checkpoints,
+        get_v1_checkpoint_by_id,
+        get_v1_artifacts,
+        get_v1_artifact_by_id,
+        get_v1_artifact_download
     ),
     components(
         schemas(
@@ -1181,13 +1200,30 @@ pub struct SpeedRequestBody {
             SimulationStatusDto,
             MapGenerateRequestBody,
             MapApplyRequestBody,
-            InterveneRequestBody
+            InterveneRequestBody,
+            ApiVersionDto,
+            ApiSchemaDto,
+            ExperimentVariantDto,
+            ExperimentCreateRequest,
+            ExperimentRunRecordDto,
+            ExperimentBatchStatusDto,
+            ExperimentSummaryDto,
+            CheckpointCreateRequest,
+            CheckpointMetadataDto,
+            ArtifactMetadataDto,
+            PaginatedExperimentsResponse,
+            PaginatedCheckpointsResponse,
+            PaginatedArtifactsResponse
         )
     ),
     info(title = "ScriptBots Control API", version = "0.0.0"),
     tags(
         (name = "control", description = "Runtime configuration controls"),
-        (name = "map", description = "Procedural map generation and application controls")
+        (name = "map", description = "Procedural map generation and application controls"),
+        (name = "system", description = "System metadata and schema discovery"),
+        (name = "experiments", description = "Batch experiments lifecycle controls"),
+        (name = "checkpoints", description = "Simulation checkpoint operations"),
+        (name = "artifacts", description = "Discoverable run artifacts and bundle downloads")
     )
 )]
 struct ApiDoc;
@@ -1224,6 +1260,13 @@ impl AppError {
         }
     }
 
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+        }
+    }
+
     fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1242,6 +1285,10 @@ impl AppError {
 impl From<ControlError> for AppError {
     fn from(err: ControlError) -> Self {
         match err {
+            ControlError::NotFound(msg) => Self::not_found(msg),
+            ControlError::BadRequest(msg) => Self::bad_request(msg),
+            ControlError::PayloadTooLarge(msg) => Self::payload_too_large(msg),
+            ControlError::Conflict(msg) => Self::conflict(msg),
             ControlError::UnknownPath(path) => {
                 Self::bad_request(format!("unknown knob path: {path}"))
             }
@@ -2493,6 +2540,267 @@ async fn get_status(State(state): State<ApiState>) -> Result<Json<SimulationStat
     Ok(Json(status))
 }
 
+/// Query parameters for paginated list endpoints.
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
+pub struct PaginationQueryParams {
+    /// Maximum items to return (1..=100, default 20)
+    pub limit: Option<usize>,
+    /// Opaque pagination offset cursor
+    pub cursor: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/version",
+    tag = "system",
+    responses((status = 200, body = ApiVersionDto))
+)]
+async fn get_version(State(state): State<ApiState>) -> Result<Json<ApiVersionDto>, AppError> {
+    let version = run_control(move || Ok(state.handle.version())).await?;
+    Ok(Json(version))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/version",
+    tag = "system",
+    responses((status = 200, body = ApiVersionDto))
+)]
+async fn get_v1_version(State(state): State<ApiState>) -> Result<Json<ApiVersionDto>, AppError> {
+    let version = run_control(move || Ok(state.handle.version())).await?;
+    Ok(Json(version))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/schema",
+    tag = "system",
+    responses((status = 200, body = ApiSchemaDto))
+)]
+async fn get_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDto>, AppError> {
+    let schema = run_control(move || Ok(state.handle.schema())).await?;
+    Ok(Json(schema))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/schema",
+    tag = "system",
+    responses((status = 200, body = ApiSchemaDto))
+)]
+async fn get_v1_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDto>, AppError> {
+    let schema = run_control(move || Ok(state.handle.schema())).await?;
+    Ok(Json(schema))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/experiments",
+    tag = "experiments",
+    request_body = ExperimentCreateRequest,
+    responses((status = 201, body = ExperimentBatchStatusDto))
+)]
+async fn post_v1_experiments(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(mut body): Json<ExperimentCreateRequest>,
+) -> Result<(StatusCode, Json<ExperimentBatchStatusDto>), AppError> {
+    if body.idempotency_key.is_none() {
+        body.idempotency_key = idempotency_key(&headers);
+    }
+    let status = run_control(move || state.handle.create_experiment(body)).await?;
+    Ok((StatusCode::CREATED, Json(status)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/experiments",
+    tag = "experiments",
+    params(PaginationQueryParams),
+    responses((status = 200, body = PaginatedExperimentsResponse))
+)]
+async fn get_v1_experiments(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
+) -> Result<Json<PaginatedExperimentsResponse>, AppError> {
+    let res = run_control(move || {
+        state
+            .handle
+            .list_experiments(params.limit, params.cursor.as_deref())
+    })
+    .await?;
+    Ok(Json(res))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/experiments/{experiment_id}",
+    tag = "experiments",
+    params(("experiment_id" = String, Path, description = "Unique experiment identifier")),
+    responses((status = 200, body = ExperimentBatchStatusDto))
+)]
+async fn get_v1_experiment_by_id(
+    State(state): State<ApiState>,
+    axum::extract::Path(experiment_id): axum::extract::Path<String>,
+) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
+    let status = run_control(move || state.handle.get_experiment(&experiment_id)).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/experiments/{experiment_id}/cancel",
+    tag = "experiments",
+    params(("experiment_id" = String, Path, description = "Unique experiment identifier")),
+    responses((status = 200, body = ExperimentBatchStatusDto))
+)]
+async fn post_v1_experiment_cancel(
+    State(state): State<ApiState>,
+    axum::extract::Path(experiment_id): axum::extract::Path<String>,
+) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
+    let status = run_control(move || state.handle.cancel_experiment(&experiment_id)).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/experiments/{experiment_id}/resume",
+    tag = "experiments",
+    params(("experiment_id" = String, Path, description = "Unique experiment identifier")),
+    responses((status = 200, body = ExperimentBatchStatusDto))
+)]
+async fn post_v1_experiment_resume(
+    State(state): State<ApiState>,
+    axum::extract::Path(experiment_id): axum::extract::Path<String>,
+) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
+    let status = run_control(move || state.handle.resume_experiment(&experiment_id)).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/checkpoints",
+    tag = "checkpoints",
+    request_body(content = Option<CheckpointCreateRequest>, description = "Optional checkpoint creation configuration"),
+    responses((status = 201, body = CheckpointMetadataDto))
+)]
+async fn post_v1_checkpoints(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Result<(StatusCode, Json<CheckpointMetadataDto>), AppError> {
+    let mut body: CheckpointCreateRequest =
+        if bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace) {
+            CheckpointCreateRequest::default()
+        } else {
+            serde_json::from_slice(&bytes)
+                .map_err(|e| AppError::bad_request(format!("invalid checkpoint request: {e}")))?
+        };
+    if body.idempotency_key.is_none() {
+        body.idempotency_key = idempotency_key(&headers);
+    }
+    let meta = run_control(move || state.handle.create_checkpoint(body)).await?;
+    Ok((StatusCode::CREATED, Json(meta)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints",
+    tag = "checkpoints",
+    params(PaginationQueryParams),
+    responses((status = 200, body = PaginatedCheckpointsResponse))
+)]
+async fn get_v1_checkpoints(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
+) -> Result<Json<PaginatedCheckpointsResponse>, AppError> {
+    let res = run_control(move || {
+        state
+            .handle
+            .list_checkpoints(params.limit, params.cursor.as_deref())
+    })
+    .await?;
+    Ok(Json(res))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/{checkpoint_id}",
+    tag = "checkpoints",
+    params(("checkpoint_id" = String, Path, description = "Unique checkpoint identifier")),
+    responses((status = 200, body = CheckpointMetadataDto))
+)]
+async fn get_v1_checkpoint_by_id(
+    State(state): State<ApiState>,
+    axum::extract::Path(checkpoint_id): axum::extract::Path<String>,
+) -> Result<Json<CheckpointMetadataDto>, AppError> {
+    let meta = run_control(move || state.handle.get_checkpoint(&checkpoint_id)).await?;
+    Ok(Json(meta))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/artifacts",
+    tag = "artifacts",
+    params(PaginationQueryParams),
+    responses((status = 200, body = PaginatedArtifactsResponse))
+)]
+async fn get_v1_artifacts(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
+) -> Result<Json<PaginatedArtifactsResponse>, AppError> {
+    let res = run_control(move || {
+        state
+            .handle
+            .list_artifacts(params.limit, params.cursor.as_deref())
+    })
+    .await?;
+    Ok(Json(res))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/artifacts/{artifact_id}",
+    tag = "artifacts",
+    params(("artifact_id" = String, Path, description = "Unique artifact identifier")),
+    responses((status = 200, body = ArtifactMetadataDto))
+)]
+async fn get_v1_artifact_by_id(
+    State(state): State<ApiState>,
+    axum::extract::Path(artifact_id): axum::extract::Path<String>,
+) -> Result<Json<ArtifactMetadataDto>, AppError> {
+    let meta = run_control(move || state.handle.get_artifact(&artifact_id)).await?;
+    Ok(Json(meta))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/artifacts/{artifact_id}/download",
+    tag = "artifacts",
+    params(("artifact_id" = String, Path, description = "Unique artifact identifier")),
+    responses((status = 200, description = "Stream artifact binary payload bytes"))
+)]
+async fn get_v1_artifact_download(
+    State(state): State<ApiState>,
+    axum::extract::Path(artifact_id): axum::extract::Path<String>,
+) -> Result<Response, AppError> {
+    let (meta, bytes) = run_control(move || state.handle.read_artifact_bytes(&artifact_id)).await?;
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, meta.content_type)
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", meta.filename),
+        )
+        .header(axum::http::header::CONTENT_LENGTH, bytes.len())
+        .header("ETag", format!("\"{}\"", meta.checksum_blake3))
+        .header("X-Scriptbots-Checksum-Blake3", meta.checksum_blake3)
+        .header("X-Scriptbots-Checksum-Sha256", meta.checksum_sha256)
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(response)
+}
+
 fn prepare_rest_server(
     handle: ControlHandle,
     config: &ControlServerConfig,
@@ -2554,6 +2862,47 @@ fn prepare_rest_server(
         // Interventions control commands
         .route("/api/control/intervene", post(post_control_intervene))
         .route("/api/interventions", post(post_control_intervene))
+        // Version and schema discovery
+        .route("/api/version", get(get_version))
+        .route("/api/v1/version", get(get_v1_version))
+        .route("/api/schema", get(get_schema))
+        .route("/api/v1/schema", get(get_v1_schema))
+        // Experiments lifecycle
+        .route(
+            "/api/v1/experiments",
+            post(post_v1_experiments).get(get_v1_experiments),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}",
+            get(get_v1_experiment_by_id),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/cancel",
+            post(post_v1_experiment_cancel),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/resume",
+            post(post_v1_experiment_resume),
+        )
+        // Checkpoints lifecycle
+        .route(
+            "/api/v1/checkpoints",
+            post(post_v1_checkpoints).get(get_v1_checkpoints),
+        )
+        .route(
+            "/api/v1/checkpoints/{checkpoint_id}",
+            get(get_v1_checkpoint_by_id),
+        )
+        // Artifacts discovery and download
+        .route("/api/v1/artifacts", get(get_v1_artifacts))
+        .route(
+            "/api/v1/artifacts/{artifact_id}",
+            get(get_v1_artifact_by_id),
+        )
+        .route(
+            "/api/v1/artifacts/{artifact_id}/download",
+            get(get_v1_artifact_download),
+        )
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
@@ -2946,6 +3295,204 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
             "additionalProperties": false
         }),
         ControlToolKind::NarrativeAround,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "get_version",
+        "Retrieve simulation version, build git commit, rustc version, and capability flags",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::GetVersion,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "get_schema",
+        "Retrieve system API schema, available REST routes, and registered MCP tool roster",
+        json!({"type": "object", "additionalProperties": false}),
+        ControlToolKind::GetSchema,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "experiment_create",
+        "Create a matched-seed batch experiment across scenario variants and seeds",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {"type": "string"},
+                "description": {"type": "string"},
+                "variants": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["variant_id", "brain_family"],
+                        "properties": {
+                            "variant_id": {"type": "string"},
+                            "brain_family": {"type": "string"},
+                            "config_overrides": {"type": "object"}
+                        }
+                    }
+                },
+                "seeds": {
+                    "type": "array",
+                    "items": {"type": "integer"}
+                },
+                "ticks_per_run": {"type": "integer"},
+                "max_concurrency": {"type": "integer"},
+                "idempotency_key": {"type": "string"}
+            },
+            "required": ["variants", "seeds"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentCreate,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "experiment_list",
+        "List experiments with bounded pagination",
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentList,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "experiment_status",
+        "Look up full status and run records for an experiment by ID",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {"type": "string"}
+            },
+            "required": ["experiment_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentStatus,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "experiment_cancel",
+        "Cancel an active or pending experiment",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {"type": "string"}
+            },
+            "required": ["experiment_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentCancel,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "experiment_resume",
+        "Resume a cancelled experiment",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {"type": "string"}
+            },
+            "required": ["experiment_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentResume,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "checkpoint_create",
+        "Create a simulation checkpoint from current world state and persist as artifact",
+        json!({
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "idempotency_key": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+        ControlToolKind::CheckpointCreate,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "checkpoint_list",
+        "List saved simulation checkpoints with bounded pagination",
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+        ControlToolKind::CheckpointList,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "checkpoint_status",
+        "Look up checkpoint metadata by ID",
+        json!({
+            "type": "object",
+            "properties": {
+                "checkpoint_id": {"type": "string"}
+            },
+            "required": ["checkpoint_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::CheckpointStatus,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "artifact_list",
+        "List registered run artifacts and bundles with bounded pagination",
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+        ControlToolKind::ArtifactList,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "artifact_get",
+        "Get metadata for an artifact by ID",
+        json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string"}
+            },
+            "required": ["artifact_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ArtifactGet,
         handle,
     );
 
@@ -3130,6 +3677,18 @@ enum ControlToolKind {
     Intervene,
     NarrativeSearch,
     NarrativeAround,
+    GetVersion,
+    GetSchema,
+    ExperimentCreate,
+    ExperimentList,
+    ExperimentStatus,
+    ExperimentCancel,
+    ExperimentResume,
+    CheckpointCreate,
+    CheckpointList,
+    CheckpointStatus,
+    ArtifactList,
+    ArtifactGet,
 }
 
 impl ToolHandler for ControlTool {
@@ -3405,6 +3964,146 @@ impl ToolHandler for ControlTool {
                 let hits = run_control_mcp_sync(move || handle.narrative_around(query))?;
                 make_tool_result(hits)
             }
+            ControlToolKind::GetVersion => {
+                let handle = self.handle.clone();
+                let version = run_control_mcp_sync(move || Ok(handle.version()))?;
+                make_tool_result(version)
+            }
+            ControlToolKind::GetSchema => {
+                let handle = self.handle.clone();
+                let schema = run_control_mcp_sync(move || Ok(handle.schema()))?;
+                make_tool_result(schema)
+            }
+            ControlToolKind::ExperimentCreate => {
+                let req: ExperimentCreateRequest = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|e| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid experiment_create parameters: {e}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || handle.create_experiment(req))?;
+                make_tool_result(res)
+            }
+            ControlToolKind::ExperimentList => {
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let cursor = arguments
+                    .get("cursor")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || {
+                    handle.list_experiments(limit, cursor.as_deref())
+                })?;
+                make_tool_result(res)
+            }
+            ControlToolKind::ExperimentStatus => {
+                let experiment_id = arguments
+                    .get("experiment_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(McpErrorCode::InvalidParams, "missing 'experiment_id' field")
+                    })?
+                    .to_string();
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || handle.get_experiment(&experiment_id))?;
+                make_tool_result(res)
+            }
+            ControlToolKind::ExperimentCancel => {
+                let experiment_id = arguments
+                    .get("experiment_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(McpErrorCode::InvalidParams, "missing 'experiment_id' field")
+                    })?
+                    .to_string();
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || handle.cancel_experiment(&experiment_id))?;
+                make_tool_result(res)
+            }
+            ControlToolKind::ExperimentResume => {
+                let experiment_id = arguments
+                    .get("experiment_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(McpErrorCode::InvalidParams, "missing 'experiment_id' field")
+                    })?
+                    .to_string();
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || handle.resume_experiment(&experiment_id))?;
+                make_tool_result(res)
+            }
+            ControlToolKind::CheckpointCreate => {
+                let req: CheckpointCreateRequest = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|e| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid checkpoint_create parameters: {e}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || handle.create_checkpoint(req))?;
+                make_tool_result(res)
+            }
+            ControlToolKind::CheckpointList => {
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let cursor = arguments
+                    .get("cursor")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || {
+                    handle.list_checkpoints(limit, cursor.as_deref())
+                })?;
+                make_tool_result(res)
+            }
+            ControlToolKind::CheckpointStatus => {
+                let checkpoint_id = arguments
+                    .get("checkpoint_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(McpErrorCode::InvalidParams, "missing 'checkpoint_id' field")
+                    })?
+                    .to_string();
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || handle.get_checkpoint(&checkpoint_id))?;
+                make_tool_result(res)
+            }
+            ControlToolKind::ArtifactList => {
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let cursor = arguments
+                    .get("cursor")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || {
+                    let cursor_ref = cursor.as_deref();
+                    handle.list_artifacts(limit, cursor_ref)
+                })?;
+                make_tool_result(res)
+            }
+            ControlToolKind::ArtifactGet => {
+                let artifact_id = arguments
+                    .get("artifact_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        McpError::new(McpErrorCode::InvalidParams, "missing 'artifact_id' field")
+                    })?
+                    .to_string();
+                let handle = self.handle.clone();
+                let res = run_control_mcp_sync(move || handle.get_artifact(&artifact_id))?;
+                make_tool_result(res)
+            }
         }
     }
 }
@@ -3462,6 +4161,10 @@ where
 
 fn map_control_error(err: ControlError) -> McpError {
     match err {
+        ControlError::NotFound(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
+        ControlError::BadRequest(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
+        ControlError::PayloadTooLarge(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
+        ControlError::Conflict(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::UnknownPath(path) => McpError::new(
             McpErrorCode::InvalidParams,
             format!("unknown knob path: {path}"),
@@ -4577,6 +5280,18 @@ mod tests {
             "map_apply",
             "narrative_search",
             "narrative_around",
+            "get_version",
+            "get_schema",
+            "experiment_create",
+            "experiment_list",
+            "experiment_status",
+            "experiment_cancel",
+            "experiment_resume",
+            "checkpoint_create",
+            "checkpoint_list",
+            "checkpoint_status",
+            "artifact_list",
+            "artifact_get",
         ]
         .into_iter()
         .map(str::to_owned)
