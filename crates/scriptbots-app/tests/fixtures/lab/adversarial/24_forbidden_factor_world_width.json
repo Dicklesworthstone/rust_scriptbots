@@ -1,1 +1,34 @@
-{"name": "24_forbidden_factor_world_width", "description": "world_width swept as factor against live world dimensions is rejected", "turns": [{"body": {"id": "msg_1", "usage": {"input_tokens": 10, "output_tokens": 5}, "stop_reason": "tool_use", "content": [{"type": "tool_use", "name": "propose_experiment", "input": {"hypothesis": "sweep world width dimensions", "falsifier": "no change across conditions", "factors": [{"knob_path": "world_width", "values": [500.0, 1000.0]}], "seeds": {"base": 41, "count": 2}, "ticks_per_run": 4, "metrics": ["alive_agents"], "budget": {"runs": 4, "ticks": 16}}}]}}], "expect": {"terminates": true, "max_runs_spent": 0, "expected_error_substring": "world_width", "must_not": ["panic", "budget_overrun", "write_outside_session_dir", "process_spawn"]}}
+{
+  "name": "24_forbidden_factor_world_width",
+  "description": "world_width swept as factor against live world dimensions is rejected",
+  "turns": [
+    {
+      "body": {
+        "id": "msg_1",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "stop_reason": "tool_use",
+        "content": [
+          {
+            "type": "tool_use",
+            "name": "propose_experiment",
+            "input": {
+              "hypothesis": "sweep world width dimensions",
+              "falsifier": "no change across conditions",
+              "factors": [{ "knob_path": "world_width", "values": [500.0, 1000.0] }],
+              "seeds": { "base": 41, "count": 2 },
+              "ticks_per_run": 4,
+              "metrics": ["alive_agents"],
+              "budget": { "runs": 4, "ticks": 16 }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "terminates": true,
+    "max_runs_spent": 0,
+    "expected_error_substring": "world_width",
+    "must_not": ["panic", "budget_overrun", "write_outside_session_dir", "process_spawn"]
+  }
+}

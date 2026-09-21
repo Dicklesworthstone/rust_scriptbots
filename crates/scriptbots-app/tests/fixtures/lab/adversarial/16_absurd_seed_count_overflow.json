@@ -34,11 +34,6 @@
     "terminates": true,
     "max_runs_spent": 0,
     "expected_error_substring": "seeds.count",
-    "must_not": [
-      "panic",
-      "budget_overrun",
-      "write_outside_session_dir",
-      "process_spawn"
-    ]
+    "must_not": ["panic", "budget_overrun", "write_outside_session_dir", "process_spawn"]
   }
 }
