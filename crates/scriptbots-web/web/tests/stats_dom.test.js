@@ -1,8 +1,8 @@
 // crates/scriptbots-web/web/tests/stats_dom.test.js
 // Real-browser DOM execution test for the WASM browser stats refresh (bd-2z0.12.6).
 
-import http from "node:http";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -131,7 +131,7 @@ async function runTests() {
           status: 200,
           contentType: "application/javascript; charset=utf-8",
           body: camelCaseWasmModule,
-        })
+        }),
       );
 
       await page.goto(`${baseUrl}/`);
@@ -151,7 +151,7 @@ async function runTests() {
 
       if (earlyPop !== "–" || earlyTps !== "–" || earlyEnergy !== "–" || earlyHealth !== "–") {
         throw new Error(
-          `Scheduling defect: stats updated before 500ms boundary: pop=${earlyPop}, tps=${earlyTps}`
+          `Scheduling defect: stats updated before 500ms boundary: pop=${earlyPop}, tps=${earlyTps}`,
         );
       }
 
@@ -171,7 +171,9 @@ async function runTests() {
 
       // Assert Window 1 DOM node values
       if (w1.pop === "–" || w1.tps === "–" || w1.energy === "–" || w1.health === "–") {
-        throw new Error(`Window 1 failed to refresh DOM metrics after 550ms: ${JSON.stringify(w1)}`);
+        throw new Error(
+          `Window 1 failed to refresh DOM metrics after 550ms: ${JSON.stringify(w1)}`,
+        );
       }
 
       const popNum1 = Number.parseInt(w1.pop.replace(/,/g, ""), 10);
@@ -197,7 +199,9 @@ async function runTests() {
       await context.clock.runFor(250);
       const interPop = await page.textContent("#metric-population");
       if (interPop !== w1.pop) {
-        throw new Error(`Stats refreshed prematurely at t=800ms: expected ${w1.pop}, got ${interPop}`);
+        throw new Error(
+          `Stats refreshed prematurely at t=800ms: expected ${w1.pop}, got ${interPop}`,
+        );
       }
 
       // Advance clock past second 500ms boundary: run additional 350ms (total 1150ms) -> Window 2 fires!
@@ -236,14 +240,28 @@ async function runTests() {
       const expectedWindow2MinTps = 80.0; // At least 80 TPS for a healthy simulated loop
       if (tpsNum2 < expectedWindow2MinTps) {
         throw new Error(
-          `TPS underreported in window 2: got ${tpsNum2}, expected >= ${expectedWindow2MinTps}`
+          `TPS underreported in window 2: got ${tpsNum2}, expected >= ${expectedWindow2MinTps}`,
         );
       }
 
       observations.camelCasePositive = {
         passed: true,
-        window1: { ...w1, popNum: popNum1, tpsNum: tpsNum1, tickNum: tickNum1, energyNum: energyNum1, healthNum: healthNum1 },
-        window2: { ...w2, popNum: popNum2, tpsNum: tpsNum2, tickNum: tickNum2, energyNum: energyNum2, healthNum: healthNum2 },
+        window1: {
+          ...w1,
+          popNum: popNum1,
+          tpsNum: tpsNum1,
+          tickNum: tickNum1,
+          energyNum: energyNum1,
+          healthNum: healthNum1,
+        },
+        window2: {
+          ...w2,
+          popNum: popNum2,
+          tpsNum: tpsNum2,
+          tickNum: tickNum2,
+          energyNum: energyNum2,
+          healthNum: healthNum2,
+        },
         deltaTicksWindow2,
         pageErrorsCount: pageErrors.length,
       };
@@ -268,7 +286,7 @@ async function runTests() {
           status: 200,
           contentType: "application/javascript; charset=utf-8",
           body: snakeCaseWasmModule,
-        })
+        }),
       );
 
       await page.goto(`${baseUrl}/`);
@@ -282,21 +300,21 @@ async function runTests() {
         clockError = err;
       }
 
-      const allErrors = [
-        ...(clockError ? [clockError.message] : []),
-        ...pageErrors,
-      ];
+      const allErrors = [...(clockError ? [clockError.message] : []), ...pageErrors];
 
       // Expect an unhandled TypeError because agentCount is undefined:
       // snapshot.summary.agentCount.toLocaleString() throws TypeError
-      const hasExpectedTypeError = allErrors.some((err) =>
-        err.includes("Cannot read properties of undefined (reading 'toLocaleString')") ||
-        err.includes("undefined is not an object (evaluating 'snapshot.summary.agentCount.toLocaleString')")
+      const hasExpectedTypeError = allErrors.some(
+        (err) =>
+          err.includes("Cannot read properties of undefined (reading 'toLocaleString')") ||
+          err.includes(
+            "undefined is not an object (evaluating 'snapshot.summary.agentCount.toLocaleString')",
+          ),
       );
 
       if (!hasExpectedTypeError) {
         throw new Error(
-          `Snake_case negative control failed to catch contract violation! Errors: ${JSON.stringify(allErrors)}`
+          `Snake_case negative control failed to catch contract violation! Errors: ${JSON.stringify(allErrors)}`,
         );
       }
 
@@ -304,7 +322,7 @@ async function runTests() {
       const popAfterCrash = await page.textContent("#metric-population");
       if (popAfterCrash !== "–") {
         throw new Error(
-          `Population was populated despite snake_case contract error: ${popAfterCrash}`
+          `Population was populated despite snake_case contract error: ${popAfterCrash}`,
         );
       }
 
@@ -339,7 +357,7 @@ async function runTests() {
           status: 200,
           contentType: "application/javascript; charset=utf-8",
           body: camelCaseWasmModule,
-        })
+        }),
       );
 
       await page.goto(`${baseUrl}/`);
@@ -350,7 +368,7 @@ async function runTests() {
       const earlyTps150 = await page.textContent("#metric-tps");
       if (earlyPop150 !== "–" || earlyTps150 !== "–") {
         throw new Error(
-          `Premature stats update detected before 500ms at +150ms: pop=${earlyPop150}, tps=${earlyTps150}`
+          `Premature stats update detected before 500ms at +150ms: pop=${earlyPop150}, tps=${earlyTps150}`,
         );
       }
 
@@ -359,7 +377,7 @@ async function runTests() {
       const earlyTps350 = await page.textContent("#metric-tps");
       if (earlyPop350 !== "–" || earlyTps350 !== "–") {
         throw new Error(
-          `Premature stats update detected before 500ms at +350ms: pop=${earlyPop350}, tps=${earlyTps350}`
+          `Premature stats update detected before 500ms at +350ms: pop=${earlyPop350}, tps=${earlyTps350}`,
         );
       }
 

@@ -2,8 +2,8 @@
 // Real-browser Playwright test for permalink loading, fork-this-world UX,
 // parent-diff display, and honest build mismatch banner (bd-16g.8.2).
 
-import http from "node:http";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -176,23 +176,31 @@ async function runTests() {
           status: 200,
           contentType: "application/javascript; charset=utf-8",
           body: mockWasmModule,
-        })
+        }),
       );
 
       // Load with mismatch permalink
       await page.goto(`${baseUrl}/?world=sbw1.mismatch_sample`);
 
       // Verify the banner is rendered in the DOM with mismatch warning
-      const bannerDisplay = await page.$eval("#mismatch-banner", (el) => window.getComputedStyle(el).display);
+      const bannerDisplay = await page.$eval(
+        "#mismatch-banner",
+        (el) => window.getComputedStyle(el).display,
+      );
       if (bannerDisplay === "none") {
-        throw new Error("Expected #mismatch-banner to be visible on mismatch, but display was none");
+        throw new Error(
+          "Expected #mismatch-banner to be visible on mismatch, but display was none",
+        );
       }
 
       const bannerText = await page.textContent("#mismatch-banner");
       if (!bannerText.includes("Build Mismatch Warning")) {
         throw new Error(`Expected mismatch warning title in banner text, got: ${bannerText}`);
       }
-      if (!bannerText.includes("0xcccccccccccccccc") || !bannerText.includes("0x3333333333333333")) {
+      if (
+        !bannerText.includes("0xcccccccccccccccc") ||
+        !bannerText.includes("0x3333333333333333")
+      ) {
         throw new Error(`Expected core digests in banner details, got: ${bannerText}`);
       }
 
@@ -218,13 +226,16 @@ async function runTests() {
           status: 200,
           contentType: "application/javascript; charset=utf-8",
           body: mockWasmModule,
-        })
+        }),
       );
 
       // Load with permalink that has diffs
       await page.goto(`${baseUrl}/?world=sbw1.with_diff_test`);
 
-      const tableDisplay = await page.$eval("#diff-table", (el) => window.getComputedStyle(el).display);
+      const tableDisplay = await page.$eval(
+        "#diff-table",
+        (el) => window.getComputedStyle(el).display,
+      );
       if (tableDisplay === "none") {
         throw new Error("Expected #diff-table to be visible for permalink with diffs");
       }
@@ -254,7 +265,7 @@ async function runTests() {
           status: 200,
           contentType: "application/javascript; charset=utf-8",
           body: mockWasmModule,
-        })
+        }),
       );
 
       await page.goto(`${baseUrl}/?world=sbw1.root_world_link`);
@@ -264,7 +275,10 @@ async function runTests() {
       await page.click("#fork-btn");
 
       // Verify fork-output displays child link
-      const outputDisplay = await page.$eval("#fork-output", (el) => window.getComputedStyle(el).display);
+      const outputDisplay = await page.$eval(
+        "#fork-output",
+        (el) => window.getComputedStyle(el).display,
+      );
       if (outputDisplay === "none") {
         throw new Error("Expected #fork-output to be visible after fork");
       }
@@ -277,7 +291,9 @@ async function runTests() {
       // Verify running world permalink input is unchanged
       const currentInput = await page.$eval("#permalink-input", (el) => el.value);
       if (currentInput !== "sbw1.root_world_link") {
-        throw new Error(`Running world was mutated! Expected sbw1.root_world_link, got: ${currentInput}`);
+        throw new Error(
+          `Running world was mutated! Expected sbw1.root_world_link, got: ${currentInput}`,
+        );
       }
 
       await context.close();
@@ -297,7 +313,7 @@ async function runTests() {
           status: 200,
           contentType: "application/javascript; charset=utf-8",
           body: mockWasmModule,
-        })
+        }),
       );
 
       await page.goto(`${baseUrl}/`);
