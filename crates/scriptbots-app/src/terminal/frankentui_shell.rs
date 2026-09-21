@@ -8,6 +8,7 @@
 //! `ProgramSimulator` test harness that operates without a live `WorldState`.
 
 use super::science_screens::{self, *};
+use super::science_widgets::*;
 use crate::control::CommandStatusDto;
 use ftui::core::event::{Event, KeyCode, KeyEvent};
 use ftui::render::buffer::Buffer;
@@ -314,6 +315,20 @@ pub enum ShellMessage {
     /// Move selection cursor in active screen table.
     SelectNextItem,
     SelectPreviousItem,
+    /// Cycle chart rolling window.
+    CycleChartWindow,
+    /// Cycle event feed filter kind.
+    CycleEventFilter,
+    /// Focus agent or location for selected event.
+    FocusSelectedEvent,
+    /// Ingest a typed event record.
+    IngestTypedEvent(TypedEventRecord),
+    /// Ingest a time-series chart sample.
+    IngestChartSample(ChartSample),
+    /// Ingest deep brain activation grid telemetry.
+    SetBrainGridData(BrainActivationGridData),
+    /// Ingest persistence watermark status.
+    UpdateWatermarkStatus(WatermarkStatusData),
 }
 
 impl From<Event> for ShellMessage {
@@ -344,6 +359,10 @@ pub struct FrankenTuiModel {
     pub shutdown_called: bool,
     pub command_counter: u64,
     pub science: ScienceScreensState,
+    pub chart_data: ScienceChartData,
+    pub event_feed: TypedEventFeedData,
+    pub brain_grid: BrainActivationGridData,
+    pub watermark_status: WatermarkStatusData,
 }
 
 impl Default for FrankenTuiModel {
@@ -368,6 +387,10 @@ impl Default for FrankenTuiModel {
             shutdown_called: false,
             command_counter: 0,
             science: ScienceScreensState::default(),
+            chart_data: ScienceChartData::default(),
+            event_feed: TypedEventFeedData::default(),
+            brain_grid: BrainActivationGridData::default(),
+            watermark_status: WatermarkStatusData::default(),
         }
     }
 }
@@ -417,6 +440,48 @@ impl FrankenTuiModel {
         self.food_energy = food_energy;
         self.control_revision = control_revision;
         self.scientific_revision = scientific_revision;
+        self.chart_data.push_sample(
+            ChartSample {
+                tick,
+                population: agent_count as u64,
+                avg_energy: food_energy,
+                births: 0,
+                deaths: 0,
+            },
+            tick,
+        );
+        self.watermark_status.applied_tick = tick;
+        self.watermark_status.applied_scientific_revision = scientific_revision;
+        self.watermark_status.admitted_control_revision = control_revision;
+    }
+
+    /// Ingest a science chart sample into the rolling window.
+    pub fn ingest_chart_sample(&mut self, sample: ChartSample, current_tick: u64) {
+        self.chart_data.push_sample(sample, current_tick);
+    }
+
+    /// Ingest a typed event into the event feed.
+    pub fn ingest_event(&mut self, record: TypedEventRecord) {
+        self.event_feed.push_event(record);
+    }
+
+    /// Update 2D brain activation grid inspection data.
+    pub fn set_brain_grid(&mut self, data: BrainActivationGridData) {
+        self.brain_grid = data;
+    }
+
+    /// Update storage persistence watermarks.
+    pub fn update_watermarks(
+        &mut self,
+        admitted: u64,
+        applied: u64,
+        durable: u64,
+        err: Option<&str>,
+    ) {
+        self.watermark_status.admitted_seq = admitted;
+        self.watermark_status.applied_tick = applied;
+        self.watermark_status.durable_storage_tick = Some(durable);
+        self.watermark_status.storage_error = err.map(Into::into);
     }
 
     pub fn latest_receipt(&self) -> Option<&CommandReceiptEntry> {
@@ -492,6 +557,7 @@ impl Model for FrankenTuiModel {
                 KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Char('2') => {
                     self.update(ShellMessage::Navigate(ShellRoute::WorldCanvas))
                 }
+                KeyCode::Tab => self.update(ShellMessage::CycleChartWindow),
                 KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Char('3') => {
                     self.update(ShellMessage::Navigate(ShellRoute::Inspector))
                 }
@@ -553,6 +619,10 @@ impl Model for FrankenTuiModel {
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.update(ShellMessage::SelectNextItem),
                 KeyCode::Up => self.update(ShellMessage::SelectPreviousItem),
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    self.update(ShellMessage::CycleEventFilter)
+                }
+                KeyCode::Enter => self.update(ShellMessage::FocusSelectedEvent),
                 KeyCode::Char('?') => self.update(ShellMessage::ToggleHelp),
                 KeyCode::Char(' ') => {
                     let cmd = if self.paused {
@@ -900,8 +970,9 @@ impl Model for FrankenTuiModel {
                         .map(|a| a.mean_fitness)
                         .unwrap_or(1.85);
                     let diff = m2 - m1;
-                    let hedges_g = diff / 0.45;
-                    let p_val = (1.0 / (1.0 + hedges_g.abs())).clamp(0.001, 0.5);
+                    let hedges_g: f32 = diff / 0.45;
+                    let p_val: f32 =
+                        (1.0_f32 / (1.0_f32 + hedges_g.abs())).clamp(0.001_f32, 0.5_f32);
                     let verdict = if hedges_g > 0.8 {
                         "Significant advantage (Large effect)"
                     } else if hedges_g > 0.2 {
@@ -974,6 +1045,9 @@ impl Model for FrankenTuiModel {
                                 (d.selected_checkpoint_index + 1) % d.checkpoints.len();
                         }
                     }
+                    ShellRoute::Dashboard => {
+                        self.event_feed.select_next();
+                    }
                     _ => {}
                 }
                 Cmd::none()
@@ -1024,8 +1098,63 @@ impl Model for FrankenTuiModel {
                             };
                         }
                     }
+                    ShellRoute::Dashboard => {
+                        self.event_feed.select_prev();
+                    }
                     _ => {}
                 }
+                Cmd::none()
+            }
+            ShellMessage::CycleChartWindow => {
+                self.chart_data.cycle_window();
+                Cmd::none()
+            }
+            ShellMessage::CycleEventFilter => {
+                self.event_feed.cycle_filter_kind();
+                Cmd::none()
+            }
+            ShellMessage::FocusSelectedEvent => {
+                if let Some(intent) = self.event_feed.focus_intent_for_selected() {
+                    match intent {
+                        EventFocusIntent::FocusAgent(uid) => {
+                            self.status_message = Some(format!("Focused agent #{}", uid));
+                            self.update(ShellMessage::SubmitCommand(
+                                ControlCommand::UpdateSelection(scriptbots_core::SelectionUpdate {
+                                    mode: scriptbots_core::SelectionMode::Replace,
+                                    agent_ids: vec![uid],
+                                    state: scriptbots_core::SelectionState::Selected,
+                                }),
+                            ))
+                        }
+                        EventFocusIntent::PanLocation(x, y) => {
+                            self.status_message = Some(format!("Pan to ({:.1}, {:.1})", x, y));
+                            Cmd::none()
+                        }
+                        EventFocusIntent::StaleTarget { uid, reason } => {
+                            self.status_message =
+                                Some(format!("Cannot focus #{} (stale: {})", uid, reason));
+                            Cmd::none()
+                        }
+                    }
+                } else {
+                    Cmd::none()
+                }
+            }
+            ShellMessage::IngestTypedEvent(rec) => {
+                self.event_feed.push_event(rec);
+                Cmd::none()
+            }
+            ShellMessage::IngestChartSample(sample) => {
+                let tick = sample.tick;
+                self.chart_data.push_sample(sample, tick);
+                Cmd::none()
+            }
+            ShellMessage::SetBrainGridData(grid) => {
+                self.brain_grid = grid;
+                Cmd::none()
+            }
+            ShellMessage::UpdateWatermarkStatus(status) => {
+                self.watermark_status = status;
                 Cmd::none()
             }
             ShellMessage::Tick => {
@@ -1129,13 +1258,56 @@ impl Model for FrankenTuiModel {
                         );
                         print_to_frame(frame, 2, 6, &pop_stats);
 
+                        // Truthful Watermark Status Strip
+                        if height > 7 {
+                            let wm = self
+                                .watermark_status
+                                .format_strip((width.saturating_sub(4)) as usize);
+                            print_to_frame(frame, 2, 7, &format!("  {}", wm));
+                        }
+
+                        let receipts_start_y = if height > 28 {
+                            let half_w = (width / 2).saturating_sub(3);
+                            let chart_h = 8u16.min(height.saturating_sub(18));
+                            self.chart_data.render_ftui(
+                                frame,
+                                2,
+                                9,
+                                half_w,
+                                chart_h,
+                                self.reduced_color,
+                            );
+                            self.event_feed.render_ftui(
+                                frame,
+                                half_w + 3,
+                                9,
+                                half_w,
+                                chart_h,
+                                self.tick,
+                                !self.reduced_color,
+                            );
+                            9 + chart_h + 1
+                        } else {
+                            8
+                        };
+
                         // Receipt History Section
-                        print_to_frame(frame, 2, 8, "COMMAND BUS RECEIPTS (Decoupled HostClient):");
+                        print_to_frame(
+                            frame,
+                            2,
+                            receipts_start_y,
+                            "COMMAND BUS RECEIPTS (Decoupled HostClient):",
+                        );
                         if self.receipts.is_empty() {
-                            print_to_frame(frame, 4, 10, "  (No mutating commands submitted yet)");
+                            print_to_frame(
+                                frame,
+                                4,
+                                receipts_start_y + 2,
+                                "  (No mutating commands submitted yet)",
+                            );
                         } else {
                             for (idx, r) in self.receipts.iter().rev().take(6).enumerate() {
-                                let row = 10u16 + idx as u16;
+                                let row = receipts_start_y + 2 + idx as u16;
                                 if row + 2 >= height {
                                     break;
                                 }
@@ -1199,6 +1371,15 @@ impl Model for FrankenTuiModel {
                             7,
                             "  Brain Architecture: Pluggable Evaluator (MLP / DWRAON / Neuro)",
                         );
+                        if height > 12 {
+                            self.brain_grid.render_ftui(
+                                frame,
+                                2,
+                                9,
+                                width.saturating_sub(4),
+                                height.saturating_sub(11),
+                            );
+                        }
                     }
                 }
                 ShellRoute::Lineages => {
