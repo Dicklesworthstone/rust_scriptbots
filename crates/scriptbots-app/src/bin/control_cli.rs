@@ -1621,7 +1621,7 @@ async fn narrative_command(
                 let db_path = db_path.clone();
                 std::thread::Builder::new()
                     .name("control-cli-narrative-around".into())
-                    .stack_size(8 * 1024 * 1024)
+                    .stack_size(64 * 1024 * 1024)
                     .spawn(move || {
                         execute_narrative_around(
                             Some(db_path.as_path()),
