@@ -75,6 +75,7 @@ pub use command_palette::{
 };
 pub mod export;
 pub mod frankentui_shell;
+pub mod science_screens;
 
 // `paint.rs` is deliberately NOT declared (bd-c1z8). It is a second, complete
 // sub-cell painter engine, shipped by the same task that produced `subcell`, and
@@ -3724,8 +3725,45 @@ impl<'a> TerminalApp<'a> {
                 self.frankentui.route = frankentui_shell::ShellRoute::Inspector;
                 self.push_toast("View: Agent Inspector");
             }
+            CommandPaletteAction::NavigateLineages => {
+                self.frankentui.route = frankentui_shell::ShellRoute::Lineages;
+                self.push_toast("View: Lineages & Phylogeny");
+            }
+            CommandPaletteAction::NavigateBrainArena => {
+                self.frankentui.route = frankentui_shell::ShellRoute::BrainArena;
+                self.push_toast("View: Brain Arena");
+            }
+            CommandPaletteAction::NavigateExperiments => {
+                self.frankentui.route = frankentui_shell::ShellRoute::Experiments;
+                self.push_toast("View: Experiments");
+            }
+            CommandPaletteAction::NavigateReplay => {
+                self.frankentui.route = frankentui_shell::ShellRoute::Replay;
+                self.push_toast("View: Replay & Checkpoints");
+            }
+            CommandPaletteAction::NavigateEnvironment => {
+                self.frankentui.route = frankentui_shell::ShellRoute::Environment;
+                self.push_toast("View: Environment & Biomes");
+            }
+            CommandPaletteAction::NavigateDiagnostics => {
+                self.frankentui.route = frankentui_shell::ShellRoute::Diagnostics;
+                self.push_toast("View: Diagnostics");
+            }
+            CommandPaletteAction::BranchCheckpoint => {
+                self.push_toast("Branch checkpoint requested");
+            }
+            CommandPaletteAction::CompareExperiments => {
+                self.push_toast("Experiment comparison requested");
+            }
+            CommandPaletteAction::ExportData => {
+                self.push_toast("Science data export requested");
+            }
             CommandPaletteAction::ToggleDiagnostics => {
-                self.frankentui.route = frankentui_shell::ShellRoute::Inspector;
+                if self.frankentui.route == frankentui_shell::ShellRoute::Diagnostics {
+                    self.frankentui.route = frankentui_shell::ShellRoute::Dashboard;
+                } else {
+                    self.frankentui.route = frankentui_shell::ShellRoute::Diagnostics;
+                }
                 self.push_toast("Diagnostics toggled");
             }
             CommandPaletteAction::CycleTheme => {

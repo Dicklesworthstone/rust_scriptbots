@@ -36,12 +36,21 @@ pub enum CommandPaletteAction {
 
     // Checkpoint & Export
     CreateCheckpoint,
+    BranchCheckpoint,
+    CompareExperiments,
     ExportAsciiScreenshot,
+    ExportData,
 
     // Screen Navigation
     NavigateDashboard,
     NavigateWorld,
     NavigateInspector,
+    NavigateLineages,
+    NavigateBrainArena,
+    NavigateExperiments,
+    NavigateReplay,
+    NavigateEnvironment,
+    NavigateDiagnostics,
     ToggleArchipelago,
     ToggleRail,
 
@@ -120,11 +129,13 @@ impl CommandPaletteAction {
             }
             Self::ResetWorld => Some(ControlCommand::UpdateConfig(Box::default())),
             Self::ReloadConfig => Some(ControlCommand::UpdateConfig(Box::default())),
-            Self::CreateCheckpoint => Some(ControlCommand::UpdateSimulation(SimulationCommand {
-                paused: Some(true),
-                speed_multiplier: None,
-                step_once: false,
-            })),
+            Self::CreateCheckpoint | Self::BranchCheckpoint => {
+                Some(ControlCommand::UpdateSimulation(SimulationCommand {
+                    paused: Some(true),
+                    speed_multiplier: None,
+                    step_once: false,
+                }))
+            }
             Self::Quit => Some(ControlCommand::Shutdown),
             _ => None,
         }
@@ -151,6 +162,7 @@ impl CommandPaletteAction {
                 | Self::ResetWorld
                 | Self::ReloadConfig
                 | Self::CreateCheckpoint
+                | Self::BranchCheckpoint
                 | Self::Quit
         )
     }
@@ -277,33 +289,89 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             action: CommandPaletteAction::CreateCheckpoint,
         },
         CommandPaletteItem {
+            id: "export.branch_checkpoint",
+            label: "Branch Simulation from Checkpoint",
+            keybind_hint: "N",
+            category: "Export",
+            action: CommandPaletteAction::BranchCheckpoint,
+        },
+        CommandPaletteItem {
             id: "export.ascii_screenshot",
             label: "Save ASCII / ANSI Frame Export",
             keybind_hint: "Shift+S",
             category: "Export",
             action: CommandPaletteAction::ExportAsciiScreenshot,
         },
+        CommandPaletteItem {
+            id: "export.data_bundle",
+            label: "Export Science Data / Replay Bundle",
+            keybind_hint: "X",
+            category: "Export",
+            action: CommandPaletteAction::ExportData,
+        },
         // Navigation
         CommandPaletteItem {
             id: "nav.dashboard",
             label: "Navigate to Dashboard Screen",
-            keybind_hint: "F1",
+            keybind_hint: "1 / D",
             category: "Navigation",
             action: CommandPaletteAction::NavigateDashboard,
         },
         CommandPaletteItem {
             id: "nav.world_canvas",
             label: "Navigate to World Canvas View",
-            keybind_hint: "F2",
+            keybind_hint: "2 / W",
             category: "Navigation",
             action: CommandPaletteAction::NavigateWorld,
         },
         CommandPaletteItem {
             id: "nav.inspector",
             label: "Navigate to Agent Brain Inspector",
-            keybind_hint: "F3",
+            keybind_hint: "3 / I",
             category: "Navigation",
             action: CommandPaletteAction::NavigateInspector,
+        },
+        CommandPaletteItem {
+            id: "nav.lineages",
+            label: "Navigate to Lineages & Phylogeny Screen",
+            keybind_hint: "4 / L",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateLineages,
+        },
+        CommandPaletteItem {
+            id: "nav.brain_arena",
+            label: "Navigate to Brain Arena & Cohorts Screen",
+            keybind_hint: "5 / B",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateBrainArena,
+        },
+        CommandPaletteItem {
+            id: "nav.experiments",
+            label: "Navigate to Experiments & Interventions Screen",
+            keybind_hint: "6 / E",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateExperiments,
+        },
+        CommandPaletteItem {
+            id: "nav.replay",
+            label: "Navigate to Replay & Checkpoints Screen",
+            keybind_hint: "7 / R",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateReplay,
+        },
+        CommandPaletteItem {
+            id: "nav.environment",
+            label: "Navigate to Environment & Biomes Screen",
+            keybind_hint: "8 / V",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateEnvironment,
+        },
+        CommandPaletteItem {
+            id: "nav.diagnostics",
+            label: "Navigate to System Diagnostics Screen",
+            keybind_hint: "9 / X",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateDiagnostics,
         },
         CommandPaletteItem {
             id: "nav.toggle_archipelago",
@@ -318,6 +386,14 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "r",
             category: "View",
             action: CommandPaletteAction::ToggleRail,
+        },
+        // Science Workflows
+        CommandPaletteItem {
+            id: "science.compare_experiments",
+            label: "Compare Experiment Arms (Hedges' g)",
+            keybind_hint: "C",
+            category: "Science",
+            action: CommandPaletteAction::CompareExperiments,
         },
         // Diagnostics & Science
         CommandPaletteItem {

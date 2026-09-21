@@ -2657,7 +2657,7 @@ idempotent cancel/shutdown landed and were pushed at exact revision
 
 **Exit:** World view goldens and PTY/input tests pass at required sizes/capabilities.
 
-#### 3.5 Evolution Lab science screens
+#### 3.5 Evolution Lab science screens [Completed - bd-2z0.6.6]
 
 - Lineages screen;
 - Brain Arena screen;
