@@ -70,12 +70,20 @@ pub mod canvas_inspector;
 pub mod canvas_ramps;
 pub mod command_palette;
 pub use command_palette::{
+    all_command_palette_items, fuzzy_match_command_palette, fuzzy_match_command_palette_rich,
     CommandPalette, CommandPaletteAction, CommandPaletteEntry, CommandPaletteItem,
-    all_command_palette_items, fuzzy_match_command_palette,
+    ScoredPaletteMatch,
 };
 pub mod export;
 pub mod frankentui_shell;
+pub mod pointer;
 pub mod science_screens;
+pub use pointer::{
+    calculate_splitter_pct, clamp_splitter_pct, cursor_centered_zoom, cycle_stacked_agents,
+    drag_pan, DragTarget, HeaderHitTarget, HitRegion, HitRegionMap, HoverStabilizer,
+    PointerClickEvent, PointerGestureState, RichHoverTooltip, SidebarPanelKind, SplitterKind,
+    DEFAULT_MAP_SPLIT_PCT, HOVER_STABILIZATION_DURATION, MAX_MAP_SPLIT_PCT, MIN_MAP_SPLIT_PCT,
+};
 
 // `paint.rs` is deliberately NOT declared (bd-c1z8). It is a second, complete
 // sub-cell painter engine, shipped by the same task that produced `subcell`, and
@@ -650,6 +658,20 @@ struct TerminalApp<'a> {
     /// Whether the tiled archipelago view is active instead of the single-world terrain map (bd-16g.5.5.4).
     archipelago_view: bool,
     pub frankentui: frankentui_shell::FrankenTuiModel,
+    /// Cached layout hit regions for O(1) hit testing and picking (bd-2z0.14.2.5).
+    pub hit_regions: HitRegionMap,
+    /// Explicit pointer gesture state machine (bd-2z0.14.2.5).
+    pub pointer_gesture: PointerGestureState,
+    /// 150 ms hover probe stabilization tracking (bd-2z0.14.2.5).
+    pub hover_stabilizer: HoverStabilizer,
+    /// Clamped percentage width for the world map canvas column (bd-2z0.14.2.5).
+    pub map_split_pct: u16,
+    /// Currently focused sidebar panel (bd-2z0.14.2.5).
+    pub focused_panel: Option<SidebarPanelKind>,
+    /// Recent command palette actions for MRU ranking and recency pinning (bd-2z0.14.2.5).
+    pub palette_recent_actions: Vec<CommandPaletteAction>,
+    /// Last acknowledged control command receipt summary for palette footer (bd-2z0.14.2.5).
+    pub last_command_receipt_summary: Option<String>,
 }
 
 impl<'a> TerminalApp<'a> {
@@ -788,6 +810,13 @@ impl<'a> TerminalApp<'a> {
             sub_step: 0,
             archipelago_view: false,
             frankentui: frankentui_shell::FrankenTuiModel::new(),
+            hit_regions: HitRegionMap::default(),
+            pointer_gesture: PointerGestureState::default(),
+            hover_stabilizer: HoverStabilizer::new(),
+            map_split_pct: DEFAULT_MAP_SPLIT_PCT,
+            focused_panel: None,
+            palette_recent_actions: Vec::new(),
+            last_command_receipt_summary: None,
         };
         app.refresh_snapshot();
         app
@@ -1358,6 +1387,57 @@ impl<'a> TerminalApp<'a> {
 
         let layout = self.frame_layout(frame.area());
 
+        // Cache layout hit regions for O(1) hit testing and picking (bd-2z0.14.2.5)
+        self.hit_regions.map_rect = Some(layout.map);
+        self.hit_regions.header_rect = Some(layout.header);
+        self.hit_regions.rail_rect = layout.rail;
+        self.hit_regions.probe_rect = layout.probe;
+        self.hit_regions.splitter_rect = Some(Rect::new(
+            layout.map.x.saturating_add(layout.map.width),
+            layout.map.y,
+            1,
+            layout.map.height,
+        ));
+        self.hit_regions.sidebar_panels = vec![
+            (SidebarPanelKind::Stats, layout.stats),
+            (SidebarPanelKind::Trends, layout.trends),
+            (SidebarPanelKind::Leaderboard, layout.leaderboard),
+            (SidebarPanelKind::Oldest, layout.oldest),
+            (SidebarPanelKind::Insights, layout.insights),
+            (SidebarPanelKind::Brains, layout.brains),
+            (SidebarPanelKind::Events, layout.events),
+        ];
+        if let Some(mortality) = layout.mortality {
+            self.hit_regions
+                .sidebar_panels
+                .push((SidebarPanelKind::Mortality, mortality));
+        }
+        self.hit_regions.header_targets = vec![
+            (
+                HeaderHitTarget::PauseToggle,
+                Rect::new(
+                    layout.header.x.saturating_add(layout.header.width.saturating_sub(25)),
+                    layout.header.y,
+                    9,
+                    1,
+                ),
+            ),
+            (
+                HeaderHitTarget::PaletteCycle,
+                Rect::new(
+                    layout.header.x.saturating_add(layout.header.width.saturating_sub(15)),
+                    layout.header.y,
+                    14,
+                    1,
+                ),
+            ),
+        ];
+        self.hit_regions.help_rect = if self.help_visible {
+            Some(frame.area())
+        } else {
+            None
+        };
+
         self.draw_header(frame, layout.header, &self.snapshot);
         if let Some(rail) = layout.rail {
             self.draw_rail(frame, rail, &self.snapshot);
@@ -1436,7 +1516,13 @@ impl<'a> TerminalApp<'a> {
     /// the value that frame was laid out with and the inspector hashes the same
     /// rectangles the widgets painted into.
     fn frame_layout(&self, area: Rect) -> FrameLayout {
-        FrameLayout::compute(area, self.rail_visible, self.expanded, self.probe_enabled)
+        FrameLayout::compute_with_split(
+            area,
+            self.rail_visible,
+            self.expanded,
+            self.probe_enabled,
+            Some(self.map_split_pct),
+        )
     }
 
     fn maybe_refresh_analytics(&mut self) {
@@ -5829,11 +5915,18 @@ const AUTO_EXPAND_MIN_WIDTH: u16 = 120;
 
 impl FrameLayout {
     /// Split `area` exactly the way [`TerminalApp::draw`] does.
-    ///
-    /// `expanded` is taken already-resolved rather than re-derived here: the user
-    /// override in `draw` is part of that decision, and duplicating the override
-    /// rule is how the two copies start disagreeing.
     fn compute(area: Rect, rail_visible: bool, expanded: bool, probe_enabled: bool) -> Self {
+        Self::compute_with_split(area, rail_visible, expanded, probe_enabled, None)
+    }
+
+    /// Split `area` with optional custom splitter percentage between map canvas and sidebar (bd-2z0.14.2.5).
+    fn compute_with_split(
+        area: Rect,
+        rail_visible: bool,
+        expanded: bool,
+        probe_enabled: bool,
+        custom_split_pct: Option<u16>,
+    ) -> Self {
         let outer = if rail_visible {
             Layout::default()
                 .direction(Direction::Vertical)
@@ -5857,13 +5950,21 @@ impl FrameLayout {
             (None, outer[1])
         };
 
+        let horizontal_constraints = if let Some(custom) = custom_split_pct {
+            let split = clamp_splitter_pct(custom);
+            [
+                Constraint::Percentage(split),
+                Constraint::Percentage(100 - split),
+            ]
+        } else if expanded {
+            [Constraint::Percentage(58), Constraint::Percentage(42)]
+        } else {
+            [Constraint::Percentage(62), Constraint::Percentage(38)]
+        };
+
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(if expanded {
-                [Constraint::Percentage(58), Constraint::Percentage(42)]
-            } else {
-                [Constraint::Percentage(62), Constraint::Percentage(38)]
-            })
+            .constraints(horizontal_constraints)
             .split(body_anchor);
 
         let (map, probe) = if probe_enabled {
@@ -6386,9 +6487,11 @@ pub struct MouseHoverTooltip {
     /// reusable arena handle, so the tooltip and the brain panel showed two
     /// different numbers for one agent.
     pub agent_uid: Option<u64>,
+    pub diet: f32,
     pub energy: f32,
     pub health: f32,
     pub age: u32,
+    pub brain_key: Option<u64>,
 }
 
 /// Deterministic motion clock (bd-2z0.14.2.4).

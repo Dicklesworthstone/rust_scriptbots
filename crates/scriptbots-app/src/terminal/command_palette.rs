@@ -457,17 +457,50 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
 
 /// Pure fuzzy match against command palette items.
 ///
-/// Matches against label, id, category, and keybind hint with prefix boost.
+/// Scored match result containing character indices for highlighting and recency status.
+#[derive(Debug, Clone)]
+pub struct ScoredPaletteMatch<'a> {
+    pub item: &'a CommandPaletteItem,
+    pub score: i32,
+    pub matched_label_indices: Vec<usize>,
+    pub matched_cat_indices: Vec<usize>,
+    pub is_recent: bool,
+}
+
+/// Rich scored fuzzy match returning character positions for UI highlighting and recency boosts.
 #[must_use]
-pub fn fuzzy_match_command_palette<'a>(
+pub fn fuzzy_match_command_palette_rich<'a>(
     items: &'a [CommandPaletteItem],
     query: &str,
-) -> Vec<&'a CommandPaletteItem> {
-    if query.trim().is_empty() {
-        return items.iter().collect();
+    recent_actions: &[CommandPaletteAction],
+) -> Vec<ScoredPaletteMatch<'a>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        let mut results: Vec<ScoredPaletteMatch<'a>> = items
+            .iter()
+            .map(|item| {
+                let recent_pos = recent_actions.iter().position(|&a| a == item.action);
+                let (score, is_recent) = if let Some(pos) = recent_pos {
+                    (1000 - pos as i32, true)
+                } else {
+                    (0, false)
+                };
+                ScoredPaletteMatch {
+                    item,
+                    score,
+                    matched_label_indices: Vec::new(),
+                    matched_cat_indices: Vec::new(),
+                    is_recent,
+                }
+            })
+            .collect();
+        // Recent pinned first, then original order
+        results.sort_by(|a, b| b.score.cmp(&a.score));
+        return results;
     }
-    let query_lower = query.to_lowercase();
-    let mut matched: Vec<(&'a CommandPaletteItem, usize)> = items
+
+    let query_lower = trimmed.to_lowercase();
+    let mut matches: Vec<ScoredPaletteMatch<'a>> = items
         .iter()
         .filter_map(|item| {
             let label_lower = item.label.to_lowercase();
@@ -475,32 +508,101 @@ pub fn fuzzy_match_command_palette<'a>(
             let cat_lower = item.category.to_lowercase();
             let hint_lower = item.keybind_hint.to_lowercase();
 
-            let matched = label_lower.contains(&query_lower)
-                || id_lower.contains(&query_lower)
-                || cat_lower.contains(&query_lower)
-                || hint_lower.contains(&query_lower);
+            let is_recent = recent_actions.contains(&item.action);
 
-            if matched {
-                let score = if label_lower.starts_with(&query_lower)
-                    || id_lower.starts_with(&query_lower)
+            let mut matched_label_indices = Vec::new();
+            let mut matched_cat_indices = Vec::new();
+            let mut score = 0i32;
+
+            // 1. Label match
+            if let Some(pos) = label_lower.find(&query_lower) {
+                for i in pos..(pos + query_lower.len()) {
+                    matched_label_indices.push(i);
+                }
+                if pos == 0 {
+                    score += 500; // Prefix match
+                } else if label_lower
+                    .as_bytes()
+                    .get(pos.saturating_sub(1))
+                    .is_some_and(|&b| b == b' ' || b == b'-' || b == b'_')
                 {
-                    0
-                } else if label_lower.contains(&query_lower) {
-                    1
-                } else if cat_lower.starts_with(&query_lower) {
-                    2
+                    score += 300; // Word boundary match
                 } else {
-                    3
-                };
-                Some((item, score))
+                    score += 150; // Substring match
+                }
+            } else {
+                // Try subsequence match on label
+                let mut label_chars = label_lower.char_indices();
+                let mut matched_all = true;
+                let mut indices = Vec::new();
+                for qc in query_lower.chars() {
+                    let mut found = false;
+                    for (idx, lc) in label_chars.by_ref() {
+                        if qc == lc {
+                            indices.push(idx);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        matched_all = false;
+                        break;
+                    }
+                }
+                if matched_all && !indices.is_empty() {
+                    score += 80;
+                    matched_label_indices = indices;
+                }
+            }
+
+            // 2. Category match
+            if let Some(pos) = cat_lower.find(&query_lower) {
+                for i in pos..(pos + query_lower.len()) {
+                    matched_cat_indices.push(i);
+                }
+                score += 50;
+            }
+
+            // 3. ID and keybind match
+            if id_lower.contains(&query_lower) {
+                score += 40;
+            }
+            if hint_lower.contains(&query_lower) {
+                score += 60;
+            }
+
+            if is_recent {
+                score += 200; // Recency boost
+            }
+
+            if score > 0 {
+                Some(ScoredPaletteMatch {
+                    item,
+                    score,
+                    matched_label_indices,
+                    matched_cat_indices,
+                    is_recent,
+                })
             } else {
                 None
             }
         })
         .collect();
 
-    matched.sort_by_key(|(_, score)| *score);
-    matched.into_iter().map(|(item, _)| item).collect()
+    matches.sort_by(|a, b| b.score.cmp(&a.score));
+    matches
+}
+
+/// Matches against label, id, category, and keybind hint with prefix boost.
+#[must_use]
+pub fn fuzzy_match_command_palette<'a>(
+    items: &'a [CommandPaletteItem],
+    query: &str,
+) -> Vec<&'a CommandPaletteItem> {
+    fuzzy_match_command_palette_rich(items, query, &[])
+        .into_iter()
+        .map(|m| m.item)
+        .collect()
 }
 
 /// Searchable command palette UI state and navigation model.
@@ -510,6 +612,8 @@ pub struct CommandPalette {
     pub selected_index: usize,
     pub visible: bool,
     pub items: Vec<CommandPaletteItem>,
+    pub recent_actions: Vec<CommandPaletteAction>,
+    pub last_receipt_summary: Option<String>,
 }
 
 impl Default for CommandPalette {
@@ -526,7 +630,21 @@ impl CommandPalette {
             selected_index: 0,
             visible: false,
             items: all_command_palette_items(),
+            recent_actions: Vec::new(),
+            last_receipt_summary: None,
         }
+    }
+
+    /// Record that an action was executed to rank it in recent history.
+    pub fn record_action(&mut self, action: CommandPaletteAction) {
+        self.recent_actions.retain(|&a| a != action);
+        self.recent_actions.insert(0, action);
+        self.recent_actions.truncate(5);
+    }
+
+    /// Record the latest acknowledged command receipt summary for the footer.
+    pub fn set_receipt_summary(&mut self, summary: impl Into<String>) {
+        self.last_receipt_summary = Some(summary.into());
     }
 
     #[must_use]
@@ -748,5 +866,60 @@ mod tests {
         assert!(palette.visible);
         palette.toggle();
         assert!(!palette.visible);
+    }
+
+    #[test]
+    fn test_fuzzy_match_rich_ranking_and_highlighting() {
+        let items = all_command_palette_items();
+
+        // 1. Prefix vs substring ranking
+        let matches = fuzzy_match_command_palette_rich(&items, "pause", &[]);
+        assert!(!matches.is_empty());
+        // Toggle Pause or Pause should be top
+        assert!(
+            matches[0].item.action == CommandPaletteAction::Pause
+                || matches[0].item.action == CommandPaletteAction::TogglePause
+        );
+        // Matching characters must be identified
+        assert!(!matches[0].matched_label_indices.is_empty());
+
+        // 2. Character highlighting indices are accurate
+        let query = "spawn";
+        let spawn_matches = fuzzy_match_command_palette_rich(&items, query, &[]);
+        assert!(!spawn_matches.is_empty());
+        for m in &spawn_matches {
+            if m.item.label.to_lowercase().contains(query) {
+                assert_eq!(m.matched_label_indices.len(), query.len());
+                let label_chars: Vec<char> = m.item.label.to_lowercase().chars().collect();
+                let matched_str: String = m
+                    .matched_label_indices
+                    .iter()
+                    .map(|&idx| label_chars[idx])
+                    .collect();
+                assert_eq!(matched_str, query);
+            }
+        }
+    }
+
+    #[test]
+    fn test_recent_pinning_and_ordering() {
+        let items = all_command_palette_items();
+        let mut palette = CommandPalette::new();
+
+        palette.record_action(CommandPaletteAction::TriggerDrought);
+        palette.record_action(CommandPaletteAction::SpawnCarnivore);
+
+        assert_eq!(palette.recent_actions.len(), 2);
+        assert_eq!(palette.recent_actions[0], CommandPaletteAction::SpawnCarnivore);
+        assert_eq!(palette.recent_actions[1], CommandPaletteAction::TriggerDrought);
+
+        // Empty query matches all, with recent pinned at top
+        let matches = fuzzy_match_command_palette_rich(&items, "", &palette.recent_actions);
+        assert!(matches.len() >= 2);
+        assert!(matches[0].is_recent);
+        assert_eq!(matches[0].item.action, CommandPaletteAction::SpawnCarnivore);
+        assert!(matches[1].is_recent);
+        assert_eq!(matches[1].item.action, CommandPaletteAction::TriggerDrought);
+        assert!(!matches[2].is_recent);
     }
 }
