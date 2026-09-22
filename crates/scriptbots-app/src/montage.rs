@@ -117,7 +117,7 @@ pub fn encode_montage(
         bail!("mp4 format requires ffmpeg on PATH; ascii and gif are available natively");
     }
 
-    let clips = select_clips(events, last_tick, &options.selection);
+    let clips = select_clips(events, last_tick, &options.selection)?;
     if clips.is_empty() {
         info!(target: "scriptbots::reel::render", "no events scored above threshold for reel");
         return Ok(MontageSummary {
