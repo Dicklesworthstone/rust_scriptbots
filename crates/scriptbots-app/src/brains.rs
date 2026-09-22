@@ -16,7 +16,8 @@ use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 #[cfg(feature = "neuro")]
 use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig};
 use scriptbots_core::{
-    BrainProtocolError, BrainRegistryHereditySnapshotV1, ScriptBotsConfig, WorldState,
+    BrainProtocolError, BrainRegistry, BrainRegistryHereditySnapshotV1, ScriptBotsConfig,
+    WorldState,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -256,3 +257,73 @@ pub fn install_brains(world: &mut WorldState, preset: BrainPreset) -> Result<Ins
 
     Ok(installed)
 }
+
+/// Construct a [`BrainRegistry`] containing the registered versioned brain family adapters for the preset.
+///
+/// # Errors
+///
+/// Returns an error if adapter registration fails or if a requested non-default feature is missing.
+pub fn create_brain_registry(preset: BrainPreset) -> Result<BrainRegistry> {
+    let mut registry = BrainRegistry::new();
+    match preset {
+        BrainPreset::Mixed => {
+            registry
+                .register_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+                .context("failed to register versioned MLP brain family")?;
+            registry
+                .register_family(
+                    DwraonBrain::KIND.as_str(),
+                    Box::new(DwraonFamilyAdapter::default()),
+                )
+                .context("failed to register versioned DWRAON brain family")?;
+            let assembly = AssemblyFamilyAdapter::new()
+                .context("failed to construct versioned Assembly brain family")?;
+            registry
+                .register_family(AssemblyBrain::KIND.as_str(), Box::new(assembly))
+                .context("failed to register versioned Assembly brain family")?;
+            #[cfg(feature = "brain-ft")]
+            {
+                registry
+                    .register_family(FT_BRAIN_KIND, Box::new(FtBrainFamily::default()))
+                    .context("failed to register versioned Frankentorch brain family")?;
+            }
+        }
+        BrainPreset::Mlp => {
+            registry
+                .register_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+                .context("failed to register versioned MLP brain family")?;
+        }
+        BrainPreset::Dwraon => {
+            registry
+                .register_family(
+                    DwraonBrain::KIND.as_str(),
+                    Box::new(DwraonFamilyAdapter::default()),
+                )
+                .context("failed to register versioned DWRAON brain family")?;
+        }
+        BrainPreset::Assembly => {
+            let assembly = AssemblyFamilyAdapter::new()
+                .context("failed to construct versioned Assembly brain family")?;
+            registry
+                .register_family(AssemblyBrain::KIND.as_str(), Box::new(assembly))
+                .context("failed to register versioned Assembly brain family")?;
+        }
+        BrainPreset::Ft => {
+            #[cfg(feature = "brain-ft")]
+            {
+                registry
+                    .register_family(FT_BRAIN_KIND, Box::new(FtBrainFamily::default()))
+                    .context("failed to register versioned Frankentorch brain family")?;
+            }
+            #[cfg(not(feature = "brain-ft"))]
+            bail!(
+                "brain preset `ft` requires a scriptbots-app build with the non-default `brain-ft` feature"
+            );
+        }
+        BrainPreset::Neuro => {
+            bail!("brain preset `neuro` is a legacy runner without versioned registry adapter");
+        }
+    }
+    Ok(registry)
+}
+

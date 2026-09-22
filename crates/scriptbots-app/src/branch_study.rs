@@ -33,13 +33,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::{Rng, SeedableRng};
-use scriptbots_brain::{
-    assembly::{AssemblyBrain, AssemblyFamilyAdapter},
-    dwraon::{DwraonBrain, DwraonFamilyAdapter},
-    mlp::{MlpBrain, MlpBrainFamily},
-};
-#[cfg(feature = "brain-ft")]
-use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
 use scriptbots_core::{
     BrainRegistry, ControlCommand, Intervention, Region, ScriptBotsConfig, WorldCheckpointError,
     WorldDigestV1, WorldState, WorldStateError, apply_control_command,
@@ -620,69 +613,8 @@ pub enum BranchStudyError {
 ///
 /// Returns [`BranchStudyError::Registry`] if any family adapter cannot be registered.
 pub fn create_brain_registry(preset: BrainPreset) -> Result<BrainRegistry, BranchStudyError> {
-    let mut registry = BrainRegistry::new();
-    match preset {
-        BrainPreset::Mlp => {
-            registry
-                .register_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
-                .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-        }
-        BrainPreset::Dwraon => {
-            registry
-                .register_family(
-                    DwraonBrain::KIND.as_str(),
-                    Box::new(DwraonFamilyAdapter::default()),
-                )
-                .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-        }
-        BrainPreset::Assembly => {
-            let adapter = AssemblyFamilyAdapter::new()
-                .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-            registry
-                .register_family(AssemblyBrain::KIND.as_str(), Box::new(adapter))
-                .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-        }
-        BrainPreset::Mixed => {
-            registry
-                .register_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
-                .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-            registry
-                .register_family(
-                    DwraonBrain::KIND.as_str(),
-                    Box::new(DwraonFamilyAdapter::default()),
-                )
-                .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-            let adapter = AssemblyFamilyAdapter::new()
-                .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-            registry
-                .register_family(AssemblyBrain::KIND.as_str(), Box::new(adapter))
-                .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-            #[cfg(feature = "brain-ft")]
-            {
-                registry
-                    .register_family(FT_BRAIN_KIND, Box::new(FtBrainFamily::default()))
-                    .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-            }
-        }
-        BrainPreset::Ft => {
-            #[cfg(feature = "brain-ft")]
-            {
-                registry
-                    .register_family(FT_BRAIN_KIND, Box::new(FtBrainFamily::default()))
-                    .map_err(|e| BranchStudyError::Registry(e.to_string()))?;
-            }
-            #[cfg(not(feature = "brain-ft"))]
-            return Err(BranchStudyError::Registry(
-                "brain-ft feature not enabled in build".to_string(),
-            ));
-        }
-        BrainPreset::Neuro => {
-            return Err(BranchStudyError::Registry(
-                "Neuro preset checkpoint restoration not supported".to_string(),
-            ));
-        }
-    }
-    Ok(registry)
+    crate::brains::create_brain_registry(preset)
+        .map_err(|e| BranchStudyError::Registry(e.to_string()))
 }
 
 /// Compare two world digests and return the first differing pipeline stage and lane values.
