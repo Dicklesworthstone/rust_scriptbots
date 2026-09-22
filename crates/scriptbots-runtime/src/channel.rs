@@ -446,7 +446,7 @@ impl ChannelHostPort {
         self.read_owner(|reply| IngressMessage::WorldDigests { reply })
     }
 
-    /// Capture a full typed WorldCheckpointV1 from the world owner thread.
+    /// Capture a full typed `WorldCheckpointV1` from the world owner thread.
     pub fn capture_checkpoint_v1(
         &self,
     ) -> Result<scriptbots_core::WorldCheckpointV1, HostAccessError> {
@@ -1211,6 +1211,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn owner_inspections_preserve_source_fields_and_scientific_digest() {
         let (ready, receive) = std::sync::mpsc::sync_channel(1);
         let owner = std::thread::spawn(move || {
@@ -1297,6 +1298,13 @@ mod tests {
             port.world_digests().expect("atomic owner digests"),
             expected_digests
         );
+        let checkpoint = port.capture_checkpoint_v1().expect("checkpoint from owner");
+        assert_eq!(checkpoint.tick().0, 0);
+        let encoded = checkpoint.encode().expect("encode checkpoint");
+        let decoded =
+            scriptbots_core::WorldCheckpointV1::decode(&encoded).expect("decode checkpoint");
+        assert_eq!(decoded.tick().0, 0);
+        assert_eq!(decoded.source_digest(), checkpoint.source_digest());
         let step_id = CommandId::new(1);
         port.submit(CommandEnvelope::new(step_id, HostCommand::Step))
             .expect("step admission");

@@ -1586,6 +1586,13 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             "blake3 checksum verification failed"
         );
 
+        let decoded_cp = scriptbots_core::WorldCheckpointV1::decode(&dl_bytes)
+            .expect("downloaded artifact must decode as a valid WorldCheckpointV1");
+        assert_eq!(
+            decoded_cp.tick().0,
+            chk_json["tick"].as_u64().expect("checkpoint tick")
+        );
+
         // --- 6. Shutdown and Cleanup Verification ---
         let (shut_code, _) = http(rest_addr, "POST", "/api/control/shutdown")?;
         assert_eq!(shut_code, 200);

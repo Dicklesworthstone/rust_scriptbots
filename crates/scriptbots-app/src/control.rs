@@ -22,6 +22,7 @@ use scriptbots_runtime::{
     ApplicationState, CommandEnvelope, CommandId, HostCommand, HostPort, JournalState,
     RenderSnapshot, channel::ChannelHostPort,
 };
+use scriptbots_storage::{Connection, RowExt};
 use smallvec::SmallVec;
 
 /// Snapshot of configuration state returned to external clients.
@@ -1279,6 +1280,13 @@ impl ControlHandle {
         })
     }
 
+    /// Capture a typed WorldCheckpointV1 directly from the scientific world owner.
+    pub fn capture_checkpoint_v1(
+        &self,
+    ) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
+        Ok(self.host.capture_checkpoint_v1()?)
+    }
+
     /// Create a simulation checkpoint and register it as an artifact.
     pub fn create_checkpoint(
         &self,
@@ -1309,10 +1317,29 @@ impl ControlHandle {
             }
         }
 
-        let snapshot = self.read_snapshot()?;
-        let encoded_bytes = postcard::to_stdvec(&snapshot)
-            .or_else(|_| serde_json::to_vec(&snapshot))
-            .map_err(|e| ControlError::Serialization(e.to_string()))?;
+        let (encoded_bytes, tick, schema) = match self.capture_checkpoint_v1() {
+            Ok(checkpoint) => {
+                let encoded = checkpoint
+                    .encode()
+                    .map_err(|e| ControlError::Serialization(e.to_string()))?;
+                (
+                    encoded,
+                    checkpoint.tick().0,
+                    scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA.to_string(),
+                )
+            }
+            Err(_) => {
+                let snapshot = self.read_snapshot()?;
+                let encoded = postcard::to_stdvec(&snapshot)
+                    .or_else(|_| serde_json::to_vec(&snapshot))
+                    .map_err(|e| ControlError::Serialization(e.to_string()))?;
+                (
+                    encoded,
+                    snapshot.world.tick,
+                    "scriptbots.world-checkpoint.v1.3".to_string(),
+                )
+            }
+        };
 
         let blake3_hex = compute_blake3(&encoded_bytes);
         let sha256_hex = compute_sha256(&encoded_bytes);
@@ -1324,15 +1351,15 @@ impl ControlHandle {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let checkpoint_id = format!("ckpt-{secs}{nanos:04}-t{}", snapshot.world.tick);
+        let checkpoint_id = format!("ckpt-{secs}{nanos:04}-t{tick}");
 
         let meta = CheckpointMetadataDto {
             checkpoint_id: checkpoint_id.clone(),
-            tick: snapshot.world.tick,
+            tick,
             byte_size: encoded_bytes.len() as u64,
             checksum_blake3: blake3_hex.clone(),
             checksum_sha256: sha256_hex.clone(),
-            schema: "scriptbots.world-checkpoint.v1.3".into(),
+            schema,
             created_at_utc: format!("{secs}"),
             description: request.description.clone(),
         };
@@ -1343,7 +1370,7 @@ impl ControlHandle {
             filename: filename.clone(),
             content_type: "application/octet-stream".into(),
             byte_size: encoded_bytes.len() as u64,
-            checksum_blake3: blake3_hex,
+            checksum_blake3: blake3_hex.clone(),
             checksum_sha256: sha256_hex,
             created_at_utc: format!("{secs}"),
             relative_path: filename.clone(),
@@ -1357,10 +1384,48 @@ impl ControlHandle {
             lock.insert(checkpoint_id.clone(), meta.clone());
         }
         if let Ok(mut lock) = self.data_services.checkpoint_data.lock() {
-            lock.insert(checkpoint_id.clone(), encoded_bytes);
+            lock.insert(checkpoint_id.clone(), encoded_bytes.clone());
         }
         if let Ok(mut lock) = self.data_services.artifacts.lock() {
-            lock.insert(checkpoint_id, art_meta);
+            lock.insert(checkpoint_id.clone(), art_meta);
+        }
+
+        if let Some(db_path) = self.database_path.as_deref()
+            && let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref())
+        {
+            let run_id = conn
+                .query_row("SELECT run_id FROM runs LIMIT 1")
+                .ok()
+                .and_then(|row| row.get_typed::<String>(0).ok())
+                .unwrap_or_else(|| "default_run".into());
+            let payload_hex = encoded_bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let payload_digest = format!("blake3:{}", blake3_hex);
+            let format_str = format!(
+                "{}+postcard_hex",
+                scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+            );
+            let ordinal: i64 = conn
+                .query_row("SELECT COALESCE(MAX(checkpoint_ordinal) + 1, 0) FROM checkpoints")
+                .ok()
+                .and_then(|row| row.get_typed::<i64>(0).ok())
+                .unwrap_or(0);
+            let _ = conn.execute_with_params(
+                "INSERT INTO checkpoints (run_id, checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    run_id.into(),
+                    checkpoint_id.clone().into(),
+                    (tick as i64).into(),
+                    ordinal.into(),
+                    format_str.into(),
+                    payload_hex.into(),
+                    payload_digest.into(),
+                    "{}".into(),
+                ],
+            );
         }
 
         if let Some(ref key) = request.idempotency_key {
