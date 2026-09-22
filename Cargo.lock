@@ -11204,6 +11204,7 @@ dependencies = [
  "scriptbots-render",
  "scriptbots-runtime",
  "scriptbots-storage",
+ "scriptbots-web",
  "scriptbots-world-gfx",
  "serde",
  "serde_json",
