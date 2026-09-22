@@ -163,6 +163,9 @@ enum IngressMessage {
     WorldDigests {
         reply: Sender<Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError>>,
     },
+    CaptureCheckpoint {
+        reply: Sender<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>>,
+    },
     /// A command envelope plus the one-shot admission reply lane.
     Command {
         /// Exact client envelope forwarded untouched to host admission.
@@ -441,6 +444,13 @@ impl ChannelHostPort {
         &self,
     ) -> Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError> {
         self.read_owner(|reply| IngressMessage::WorldDigests { reply })
+    }
+
+    /// Capture a full typed WorldCheckpointV1 from the world owner thread.
+    pub fn capture_checkpoint_v1(
+        &self,
+    ) -> Result<scriptbots_core::WorldCheckpointV1, HostAccessError> {
+        self.read_owner(|reply| IngressMessage::CaptureCheckpoint { reply })
     }
 
     fn protocol_violation(message: impl Into<String>) -> HostAccessError {
@@ -834,6 +844,15 @@ impl ChannelHostDriver {
                             .world_digest_v1()
                             .map(|scientific| (physical, scientific))
                     })
+                    .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
+                let _ = reply.send(result);
+            }
+            IngressMessage::CaptureCheckpoint { reply } => {
+                let result = self
+                    .host
+                    .core()
+                    .world()
+                    .checkpoint_v1()
                     .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
                 let _ = reply.send(result);
             }
@@ -2335,6 +2354,7 @@ mod tests {
             | IngressMessage::DebugAgents { .. }
             | IngressMessage::RequestReplayDigest { .. }
             | IngressMessage::WorldDigests { .. }
+            | IngressMessage::CaptureCheckpoint { .. }
             | IngressMessage::ScientificDigest { .. } => {
                 panic!("expected command submission")
             }
@@ -2440,6 +2460,7 @@ mod tests {
             | IngressMessage::DebugAgents { .. }
             | IngressMessage::RequestReplayDigest { .. }
             | IngressMessage::WorldDigests { .. }
+            | IngressMessage::CaptureCheckpoint { .. }
             | IngressMessage::ScientificDigest { .. } => {
                 panic!("expected command-status lookup")
             }
