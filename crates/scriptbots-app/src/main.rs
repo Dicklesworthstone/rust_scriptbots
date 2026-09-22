@@ -3439,7 +3439,11 @@ struct AppCli {
     #[arg(long = "tick-limit", value_name = "TICKS", requires = "replay_db")]
     tick_limit: Option<u64>,
     /// Resume headless deterministic replay from the latest recorded checkpoint rather than tick zero.
-    #[arg(long = "checkpoint-start", alias = "from-checkpoint", requires = "replay_db")]
+    #[arg(
+        long = "checkpoint-start",
+        alias = "from-checkpoint",
+        requires = "replay_db"
+    )]
     checkpoint_start: bool,
     /// Path to a run database from which to create a portable deterministic run bundle.
     #[arg(long = "create-bundle", value_name = "RUN_DB")]
@@ -4401,8 +4405,13 @@ fn run_replay_cli(
             "Resuming deterministic replay from validated checkpoint"
         );
         persisted_events.retain(|e| e.tick > cp_tick && e.tick <= tick_limit);
-        let run =
-            run_headless_simulation_from_checkpoint(&cp, tick_limit, cli.brain, interventions)?;
+        let run = run_headless_simulation_from_checkpoint(
+            &cp,
+            config,
+            tick_limit,
+            cli.brain,
+            interventions,
+        )?;
         (run, cp_tick)
     } else {
         if let Some(ref cp) = latest_checkpoint {
@@ -4480,7 +4489,10 @@ fn run_replay_cli(
             persisted_events.len()
         )
     } else {
-        format!("{tick_limit} ticks ({} recorded events)", persisted_events.len())
+        format!(
+            "{tick_limit} ticks ({} recorded events)",
+            persisted_events.len()
+        )
     };
     println!(
         "{} Replaying {} against {} (seed {})",
@@ -4846,8 +4858,15 @@ fn run_headless_simulation(
     interventions: &[ScenarioInterventionV1],
 ) -> Result<ReplayRun> {
     let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
+    let mut run_config = config.clone();
+    if run_config.persistence_interval == 0 {
+        run_config.persistence_interval = 1;
+    }
+    if run_config.replay_event_tick_cap == 0 {
+        run_config.replay_event_tick_cap = 65536;
+    }
     let (mut world, mut persistence) =
-        WorldState::with_persistence(config.clone(), Box::new(collector))?;
+        WorldState::with_persistence(run_config, Box::new(collector))?;
     let brain_keys = install_brains(&mut world, brain_preset)?.population;
     seed_agents(&mut world, &brain_keys)?;
 
@@ -4906,6 +4925,7 @@ fn run_headless_simulation(
 
 fn run_headless_simulation_from_checkpoint(
     checkpoint: &WorldCheckpointV1,
+    config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
     interventions: &[ScenarioInterventionV1],
@@ -4924,8 +4944,22 @@ fn run_headless_simulation_from_checkpoint(
         .context("failed to create brain registry for checkpoint restore")?;
     let mut world = WorldState::restore_checkpoint_v1(checkpoint, registry)
         .context("failed to restore world state from checkpoint")?;
+    let persistence_interval = if config.persistence_interval == 0 {
+        1
+    } else {
+        config.persistence_interval
+    };
+    let replay_event_tick_cap = if config.replay_event_tick_cap == 0 {
+        checkpoint.config().replay_event_tick_cap.max(65536)
+    } else {
+        config.replay_event_tick_cap
+    };
     let mut persistence = world
-        .bind_persistence(Box::new(collector))
+        .bind_continuation_persistence(
+            Box::new(collector),
+            persistence_interval,
+            replay_event_tick_cap,
+        )
         .context("failed to bind replay collector persistence to restored world")?;
 
     emit_sense_startup_contract();
@@ -8599,8 +8633,14 @@ activation = "Sigmoid"
         assert!(checkpoint.agent_count() > 0);
 
         // 3. Resume from tick 10 up to tick 20.
-        let resumed = run_headless_simulation_from_checkpoint(&checkpoint, 20, BrainPreset::Mlp, &[])
-            .expect("resumed simulation from checkpoint should succeed");
+        let resumed = run_headless_simulation_from_checkpoint(
+            &checkpoint,
+            &config,
+            20,
+            BrainPreset::Mlp,
+            &[],
+        )
+        .expect("resumed simulation from checkpoint should succeed");
         assert_eq!(resumed.simulated_ticks, 10);
         assert_eq!(
             resumed.final_digest, uninterrupted.final_digest,
@@ -8615,7 +8655,12 @@ activation = "Sigmoid"
             .cloned()
             .collect();
         assert_eq!(resumed.events.len(), expected_events.len());
-        for (i, (res, exp)) in resumed.events.iter().zip(expected_events.iter()).enumerate() {
+        for (i, (res, exp)) in resumed
+            .events
+            .iter()
+            .zip(expected_events.iter())
+            .enumerate()
+        {
             assert_eq!(res.tick, exp.tick, "tick mismatch at event {i}");
             assert_eq!(res.seq, exp.seq, "seq mismatch at event {i}");
             assert_eq!(res.event.kind, exp.event.kind, "kind mismatch at event {i}");
@@ -8623,7 +8668,13 @@ activation = "Sigmoid"
 
         // Negative controls:
         // A. Attempting to resume when checkpoint is already at tick_limit must fail.
-        let err_equal = run_headless_simulation_from_checkpoint(&checkpoint, 10, BrainPreset::Mlp, &[]);
+        let err_equal = run_headless_simulation_from_checkpoint(
+            &checkpoint,
+            &config,
+            10,
+            BrainPreset::Mlp,
+            &[],
+        );
         assert!(err_equal.is_err());
         assert!(
             err_equal
@@ -8633,14 +8684,15 @@ activation = "Sigmoid"
         );
 
         // B. Attempting to resume when checkpoint is past tick_limit must fail.
-        let err_past = run_headless_simulation_from_checkpoint(&checkpoint, 5, BrainPreset::Mlp, &[]);
+        let err_past =
+            run_headless_simulation_from_checkpoint(&checkpoint, &config, 5, BrainPreset::Mlp, &[]);
         assert!(err_past.is_err());
     }
 
     #[test]
     fn run_replay_cli_with_checkpoint_start_and_missing_checkpoint_negative() {
-        use tempfile::tempdir;
         use scriptbots_storage::Storage;
+        use tempfile::tempdir;
 
         let temp_dir = tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("replay_test.sqlite");
@@ -8656,8 +8708,9 @@ activation = "Sigmoid"
         };
 
         // Create a real storage run without any checkpoint.
-        let storage = Storage::create_unattributed_file_with_thresholds(&db_display, 64, 4096, 1024, 1024)
-            .expect("create storage");
+        let storage =
+            Storage::create_unattributed_file_with_thresholds(&db_display, 64, 4096, 1024, 1024)
+                .expect("create storage");
         storage.close().expect("close storage");
 
         let cli = AppCli::try_parse_from([
@@ -8674,7 +8727,9 @@ activation = "Sigmoid"
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("--checkpoint-start requested, but database contains no valid checkpoint"),
+            err_msg.contains(
+                "--checkpoint-start requested, but database contains no valid checkpoint"
+            ),
             "expected refusal on missing checkpoint, got: {err_msg}"
         );
     }

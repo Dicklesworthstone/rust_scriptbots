@@ -8735,6 +8735,9 @@ pub enum PersistenceSessionError {
     /// A session was presented with a different world's opaque binding.
     #[error("persistence admission session belongs to a different world")]
     WrongWorld,
+    /// Attempted to enable continuation persistence with interval zero.
+    #[error("continuation persistence requires a non-zero persistence interval")]
+    ZeroPersistenceInterval,
     /// Persistence-enabled stepping requires the world's bound external session.
     #[error("persistence-enabled tick {tick} requires the bound admission session")]
     SessionRequired {
@@ -19945,6 +19948,31 @@ impl WorldState {
             last_admitted_tick: None,
             binding: Arc::clone(&self.persistence_binding),
         })
+    }
+
+    /// Attach an external persistence session to a restored world with an explicit cadence and replay cap.
+    ///
+    /// Checkpoints are captured with disabled persistence (`persistence_interval == 0`). To resume
+    /// replay or continuation from a restored checkpoint, this method sets the active persistence
+    /// interval and replay event cap, clears any disabled-boundary discard marker, and binds the sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PersistenceSessionError::ZeroPersistenceInterval` if `persistence_interval` is 0,
+    /// or `PersistenceSessionError::AlreadyBound` if persistence is already bound.
+    pub fn bind_continuation_persistence(
+        &mut self,
+        sink: Box<dyn WorldPersistence>,
+        persistence_interval: u32,
+        replay_event_tick_cap: usize,
+    ) -> Result<PersistenceAdmissionSession, PersistenceSessionError> {
+        if persistence_interval == 0 {
+            return Err(PersistenceSessionError::ZeroPersistenceInterval);
+        }
+        self.config.persistence_interval = persistence_interval;
+        self.config.replay_event_tick_cap = replay_event_tick_cap;
+        self.persistence_discarded_records_at = None;
+        self.bind_persistence(sink)
     }
 
     fn resource_amounts(&self) -> ResourceAmounts {

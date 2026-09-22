@@ -323,30 +323,33 @@ fn mock_free_checkpoint_start_replay_e2e() {
     // 2. Step a matching world headlessly to tick 12 and capture a valid WorldCheckpointV1.
     let config = scriptbots_core::ScriptBotsConfig {
         rng_seed: Some(SEED),
-        persistence_interval: 1,
+        persistence_interval: 0,
         replay_event_tick_cap: 65536,
+        history_capacity: 600,
         ..scriptbots_core::ScriptBotsConfig::default()
     };
-    let (mut world, mut persistence) = scriptbots_core::WorldState::with_persistence(
-        config,
-        Box::new(scriptbots_core::NullPersistence),
-    )
-    .expect("build world with persistence");
+    let mut world = scriptbots_core::WorldState::new(config).expect("build world");
     let brain_keys = scriptbots_app::install_brains(&mut world, scriptbots_app::BrainPreset::Mixed)
         .expect("install brains")
         .population;
     scriptbots_app::seed_founding_population(&mut world, &brain_keys).expect("seed founders");
     for _ in 0..12 {
-        persistence.step(&mut world).expect("step world");
+        world.step().expect("step world");
     }
     let checkpoint = world.checkpoint_v1().expect("capture tick 12 checkpoint");
     assert_eq!(checkpoint.tick().0, 12);
 
     // 3. Persist the checkpoint into the existing SQLite database using Connection.
     let encoded = checkpoint.encode().expect("encode checkpoint");
-    let payload = encoded.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let payload = encoded
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let payload_digest = format!("blake3:{}", blake3::hash(&encoded).to_hex());
-    let schema_format = format!("{}+postcard_hex", scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA);
+    let schema_format = format!(
+        "{}+postcard_hex",
+        scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+    );
 
     let connection = Connection::open(&db_str).expect("open connection");
     let run_id: String = connection
@@ -386,9 +389,16 @@ fn mock_free_checkpoint_start_replay_e2e() {
         .arg("--set")
         .arg("replay_event_tick_cap=65536");
     let full_out = verify_full.output().expect("run full replay");
-    let full_text = strip_ansi(&format!("{}{}", stdout_text(&full_out), stderr_text(&full_out)));
+    let full_text = strip_ansi(&format!(
+        "{}{}",
+        stdout_text(&full_out),
+        stderr_text(&full_out)
+    ));
     assert!(full_out.status.success(), "full replay failed: {full_text}");
-    assert!(full_text.contains("Replay matched"), "full replay must match: {full_text}");
+    assert!(
+        full_text.contains("Replay matched"),
+        "full replay must match: {full_text}"
+    );
 
     // 5. Verify replay WITH --checkpoint-start: resumes from tick 12.
     let mut verify_cp = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
@@ -406,9 +416,18 @@ fn mock_free_checkpoint_start_replay_e2e() {
         .arg("replay_event_tick_cap=65536");
     let cp_out = verify_cp.output().expect("run checkpoint-start replay");
     let cp_text = strip_ansi(&format!("{}{}", stdout_text(&cp_out), stderr_text(&cp_out)));
-    assert!(cp_out.status.success(), "checkpoint replay failed: {cp_text}");
-    assert!(cp_text.contains("from tick 12"), "checkpoint replay must state starting tick 12: {cp_text}");
-    assert!(cp_text.contains("Replay matched"), "checkpoint replay must match: {cp_text}");
+    assert!(
+        cp_out.status.success(),
+        "checkpoint replay failed: {cp_text}"
+    );
+    assert!(
+        cp_text.contains("from tick 12"),
+        "checkpoint replay must state starting tick 12: {cp_text}"
+    );
+    assert!(
+        cp_text.contains("Replay matched"),
+        "checkpoint replay must match: {cp_text}"
+    );
 
     // 6. Negative control: corrupt the checkpoint payload in the database.
     // Replay WITH --checkpoint-start must fail closed rather than falling back to tick zero.
@@ -431,14 +450,23 @@ fn mock_free_checkpoint_start_replay_e2e() {
         .arg("persistence_interval=1")
         .arg("--set")
         .arg("replay_event_tick_cap=65536");
-    let corrupt_out = verify_corrupt.output().expect("run corrupt checkpoint replay");
-    let corrupt_text = strip_ansi(&format!("{}{}", stdout_text(&corrupt_out), stderr_text(&corrupt_out)));
+    let corrupt_out = verify_corrupt
+        .output()
+        .expect("run corrupt checkpoint replay");
+    let corrupt_text = strip_ansi(&format!(
+        "{}{}",
+        stdout_text(&corrupt_out),
+        stderr_text(&corrupt_out)
+    ));
     assert!(
         !corrupt_out.status.success(),
         "corrupt checkpoint must fail closed, but succeeded: {corrupt_text}"
     );
     assert!(
-        corrupt_text.contains("corrupt") || corrupt_text.contains("payload") || corrupt_text.contains("failed") || corrupt_text.contains("error"),
+        corrupt_text.contains("corrupt")
+            || corrupt_text.contains("payload")
+            || corrupt_text.contains("failed")
+            || corrupt_text.contains("error"),
         "expected corruption diagnostic, got: {corrupt_text}"
     );
 }

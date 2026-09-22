@@ -347,16 +347,16 @@ pub fn create_brain_registry_for_config(
             scriptbots_brain_neuro::NeuroflowBrain::KIND.as_str(),
             scriptbots_core::BrainHeredityExclusionV1::NoVersionedGenomeProtocol,
             move |rng| {
-                scriptbots_brain_neuro::NeuroflowBrain::runner((*neuro_cfg).clone(), rng)
-                    .map_err(|source| {
+                scriptbots_brain_neuro::NeuroflowBrain::runner((*neuro_cfg).clone(), rng).map_err(
+                    |source| {
                         scriptbots_core::BrainSpawnError::new(
                             scriptbots_brain_neuro::NeuroflowBrain::KIND.as_str(),
                             source,
                         )
-                    })
+                    },
+                )
             },
         );
     }
     Ok(registry)
 }
-
