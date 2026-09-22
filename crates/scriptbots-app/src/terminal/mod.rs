@@ -6033,6 +6033,8 @@ struct TerrainView {
     /// Per-tile normalized water depth (0.0 = shallowest margin, 1.0 = deepest basin),
     /// parallel to `kinds`.
     water_depth: Vec<f32>,
+    /// Per-tile normalized temperature channel, parallel to `kinds`.
+    temperature: Vec<f32>,
 }
 
 impl TerrainView {
@@ -6066,6 +6068,11 @@ impl TerrainView {
                 .map(|tile| tile.fertility_bias)
                 .collect(),
             water_depth,
+            temperature: terrain
+                .tiles
+                .iter()
+                .map(|tile| tile.temperature_bias)
+                .collect(),
         }
     }
 
@@ -6103,6 +6110,7 @@ impl TerrainView {
             moisture: tiles.iter().map(|tile| tile.moisture).collect(),
             fertility: tiles.iter().map(|tile| tile.fertility_bias).collect(),
             water_depth,
+            temperature: tiles.iter().map(|tile| tile.temperature_bias).collect(),
         }
     }
 
@@ -6123,6 +6131,21 @@ impl TerrainView {
             (Some(&moisture), Some(&fertility)) => visual::terrain_lushness(moisture, fertility),
             _ => 0.5,
         }
+    }
+
+    /// Normalized temperature for a normalized world point in `0.0..=1.0`.
+    ///
+    /// Falls back to 0.5 when the parallel array is short or missing.
+    fn temperature(&self, u: f32, v: f32) -> f32 {
+        if self.temperature.len() == self.kinds.len()
+            && let Some((x, y)) = self.tile_coords(u, v)
+        {
+            let idx = (y as usize).saturating_mul(self.width as usize) + x as usize;
+            if let Some(&temp) = self.temperature.get(idx) {
+                return temp.clamp(0.0, 1.0);
+            }
+        }
+        0.5
     }
 
     /// Normalized water depth for a normalized world point: how deep the water is
@@ -8355,6 +8378,22 @@ impl Palette {
         ]
     }
 
+    /// Terrain base for the canvas, tinted by lushness and temperature (bd-2z0.14.1.2.4).
+    fn terrain_canvas_rgb_tinted(
+        &self,
+        kind: TerrainKind,
+        lushness: f32,
+        temperature: f32,
+    ) -> [f32; 3] {
+        let rgb = self.terrain_canvas_rgb_lush(kind, lushness);
+        let tint = scriptbots_core::visual::terrain_temperature_tint(temperature);
+        [
+            (rgb[0] * tint[0]).clamp(0.0, 1.0),
+            (rgb[1] * tint[1]).clamp(0.0, 1.0),
+            (rgb[2] * tint[2]).clamp(0.0, 1.0),
+        ]
+    }
+
     /// Water base color for the canvas, ramped from the shallow to the deep end
     /// of the biome band by normalized depth (bd-sk55).
     ///
@@ -9203,8 +9242,11 @@ impl MapWidget<'_> {
                     ctx.palette
                         .terrain_canvas_rgb_water(kind, ctx.terrain.water_depth(u, v))
                 } else {
-                    ctx.palette
-                        .terrain_canvas_rgb_lush(kind, ctx.terrain.lushness(u, v))
+                    ctx.palette.terrain_canvas_rgb_tinted(
+                        kind,
+                        ctx.terrain.lushness(u, v),
+                        ctx.terrain.temperature(u, v),
+                    )
                 };
 
                 // Hillshade: the shared normal-light term keyed on terrain kind, so
@@ -9573,6 +9615,7 @@ mod tests {
             moisture: vec![0.5],
             fertility: vec![0.0],
             water_depth: Vec::new(),
+            temperature: vec![0.5],
         }
     }
 
@@ -10009,6 +10052,7 @@ mod tests {
             moisture: vec![0.5; 3],
             fertility: vec![0.0; 3],
             water_depth: Vec::new(),
+            temperature: vec![0.5; 3],
         };
         let sloped = TerrainView {
             width: 3,
@@ -10018,6 +10062,7 @@ mod tests {
             moisture: vec![0.5; 3],
             fertility: vec![0.0; 3],
             water_depth: Vec::new(),
+            temperature: vec![0.5; 3],
         };
         let snapshot = Snapshot::default();
         let sample = |terrain: &TerrainView| {
@@ -10046,6 +10091,7 @@ mod tests {
             moisture: vec![0.5],
             fertility: vec![0.0],
             water_depth: Vec::new(),
+            temperature: vec![0.5],
         };
         let frame_at = |tick: u64| {
             let snapshot = Snapshot {
@@ -10094,6 +10140,7 @@ mod tests {
             moisture: vec![0.5],
             fertility: vec![0.0],
             water_depth: Vec::new(),
+            temperature: vec![0.5],
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
             let snapshot = Snapshot {
@@ -10137,6 +10184,7 @@ mod tests {
             moisture: vec![0.5],
             fertility: vec![1.0],
             water_depth: Vec::new(),
+            temperature: vec![0.5],
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
             let snapshot = Snapshot {
@@ -10266,6 +10314,7 @@ mod tests {
             moisture: vec![0.5],
             fertility: vec![0.0],
             water_depth: Vec::new(),
+            temperature: vec![0.5],
         };
         let frame_at = |tick: u64, motion: MotionPolicy| {
             let snapshot = Snapshot {
@@ -16321,6 +16370,7 @@ mod tests {
             moisture: vec![moisture],
             fertility: vec![fertility],
             water_depth: Vec::new(),
+            temperature: vec![0.5],
         };
         let snapshot = Snapshot::default();
         let background = |terrain: &TerrainView| {
@@ -16339,6 +16389,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn temperature_tints_terminal_canvas_terrain() {
+        let make = |temperature: f32| TerrainView {
+            width: 1,
+            height: 1,
+            kinds: vec![TerrainKind::Grass],
+            elevations: vec![0.5],
+            moisture: vec![0.5],
+            fertility: vec![0.5],
+            water_depth: Vec::new(),
+            temperature: vec![temperature],
+        };
+        let snapshot = Snapshot::default();
+        let background = |terrain: &TerrainView| {
+            let buf = render_canvas_frame(&snapshot, terrain, (4, 2), canvas_test_day_night());
+            cell_bg(&buf, 1, 1)
+        };
+        let cold = background(&make(0.0));
+        let hot = background(&make(1.0));
+        assert_ne!(
+            cold, hot,
+            "temperature must change how a tile reads in the terminal canvas"
+        );
+    }
+
     /// A short or mismatched moisture array must tint uniformly rather than
     /// striping the map, so a truncated view degrades quietly instead of drawing
     /// bands that look like real terrain features.
@@ -16352,6 +16427,7 @@ mod tests {
             moisture: vec![1.0], // short on purpose
             fertility: vec![0.0, 0.0],
             water_depth: Vec::new(),
+            temperature: vec![0.5, 0.5],
         };
         assert!(
             (ragged.lushness(0.25, 0.5) - ragged.lushness(0.75, 0.5)).abs() < f32::EPSILON,
@@ -16374,6 +16450,7 @@ mod tests {
             moisture: vec![1.0],
             fertility: vec![0.0],
             water_depth: vec![depth],
+            temperature: vec![0.5],
         };
         let make_deep = |depth: f32| TerrainView {
             width: 1,
@@ -16383,6 +16460,7 @@ mod tests {
             moisture: vec![1.0],
             fertility: vec![0.0],
             water_depth: vec![depth],
+            temperature: vec![0.5],
         };
         let snapshot = Snapshot::default();
         let background = |terrain: &TerrainView| {
@@ -16427,6 +16505,7 @@ mod tests {
             moisture: vec![1.0, 1.0],
             fertility: vec![0.0, 0.0],
             water_depth: vec![0.8], // short on purpose
+            temperature: vec![0.5, 0.5],
         };
         assert_eq!(
             ragged.water_depth(0.25, 0.5),
@@ -16684,6 +16763,7 @@ mod tests {
             moisture: vec![0.5; 64],
             fertility: vec![0.0; 64],
             water_depth: Vec::new(),
+            temperature: vec![0.5; 64],
         };
         let snapshot = Snapshot::default();
         let frame_at = |zoom: f32| {

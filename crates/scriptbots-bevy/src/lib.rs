@@ -2084,7 +2084,7 @@ impl TerrainHeightSnapshot {
             accent: self.accent[idx],
             water_depth: self.water_depth[idx],
             _fertility: self.fertility[idx],
-            _temperature: self.temperature[idx],
+            temperature: self.temperature[idx],
         }
     }
 }
@@ -2097,7 +2097,7 @@ struct TerrainTileSample {
     accent: f32,
     water_depth: f32,
     _fertility: f32,
-    _temperature: f32,
+    temperature: f32,
 }
 
 #[derive(Default, Resource)]
@@ -7843,6 +7843,8 @@ fn terrain_tile_surface_srgb(
         elevation: sample.elevation,
         slope,
         water_depth: sample.water_depth,
+        moisture: sample.moisture,
+        temperature: sample.temperature,
     });
     visual::terrain_surface_srgb(&TerrainSurfaceInput {
         splat_weights: weights,
@@ -7852,6 +7854,7 @@ fn terrain_tile_surface_srgb(
         accent: sample.accent,
         daylight: terrain.daylight,
         accessibility: palette.accessibility(),
+        temperature: sample.temperature,
     })
 }
 
@@ -8342,6 +8345,8 @@ mod terrain_tests {
             elevation: sample.elevation,
             slope: expected_slope,
             water_depth: sample.water_depth,
+            moisture: sample.moisture,
+            temperature: sample.temperature,
         });
         for palette in [
             ColorPaletteMode::Natural,
@@ -8358,6 +8363,7 @@ mod terrain_tests {
                 accent: sample.accent,
                 daylight: terrain.daylight,
                 accessibility: palette.accessibility(),
+                temperature: sample.temperature,
             });
             let expected_linear =
                 Color::srgb(expected_srgb[0], expected_srgb[1], expected_srgb[2]).to_linear();
@@ -8438,6 +8444,8 @@ mod terrain_tests {
                     elevation: sample.elevation,
                     slope,
                     water_depth: sample.water_depth,
+                    moisture: sample.moisture,
+                    temperature: sample.temperature,
                 });
                 for palette in [
                     ColorPaletteMode::Natural,
@@ -8454,6 +8462,7 @@ mod terrain_tests {
                         accent: sample.accent,
                         daylight: terrain.daylight,
                         accessibility: palette.accessibility(),
+                        temperature: sample.temperature,
                     });
                     let actual_srgb = terrain_tile_surface_srgb(terrain, x, z, palette);
                     assert_eq!(
@@ -8463,6 +8472,59 @@ mod terrain_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bevy_terrain_derivation_is_sensitive_to_temperature_and_moisture() {
+        let mut snapshot_cold = backend_agreement_snapshot();
+        snapshot_cold.terrain_height.temperature = vec![0.05; 9];
+        snapshot_cold.terrain_height.moisture = vec![0.2; 9];
+
+        let mut snapshot_hot = backend_agreement_snapshot();
+        snapshot_hot.terrain_height.temperature = vec![0.95; 9];
+        snapshot_hot.terrain_height.moisture = vec![0.2; 9];
+
+        let mut snapshot_lush = backend_agreement_snapshot();
+        snapshot_lush.terrain_height.temperature = vec![0.5; 9];
+        snapshot_lush.terrain_height.moisture = vec![0.95; 9];
+
+        let mut snapshot_arid = backend_agreement_snapshot();
+        snapshot_arid.terrain_height.temperature = vec![0.5; 9];
+        snapshot_arid.terrain_height.moisture = vec![0.05; 9];
+
+        let color_cold = terrain_tile_surface_srgb(
+            &snapshot_cold.terrain_height,
+            1,
+            1,
+            ColorPaletteMode::Natural,
+        );
+        let color_hot = terrain_tile_surface_srgb(
+            &snapshot_hot.terrain_height,
+            1,
+            1,
+            ColorPaletteMode::Natural,
+        );
+        let color_lush = terrain_tile_surface_srgb(
+            &snapshot_lush.terrain_height,
+            1,
+            1,
+            ColorPaletteMode::Natural,
+        );
+        let color_arid = terrain_tile_surface_srgb(
+            &snapshot_arid.terrain_height,
+            1,
+            1,
+            ColorPaletteMode::Natural,
+        );
+
+        assert_ne!(
+            color_cold, color_hot,
+            "Bevy terrain color must distinguish cold vs hot"
+        );
+        assert_ne!(
+            color_lush, color_arid,
+            "Bevy terrain color must distinguish lush vs arid"
+        );
     }
 
     #[test]

@@ -1234,6 +1234,7 @@ mod wgpu_capture_test {
                         slope: 0.0,
                         accent: 0.0,
                         daylight: scriptbots_core::visual::DAYLIGHT_STATIC,
+                        temperature: 0.5,
                     },
                 );
                 [rgb[0], rgb[1], rgb[2], 1.0]
@@ -14105,6 +14106,7 @@ struct TerrainTileVisual {
     slope: f32,
     water_depth: f32,
     elevation_gradient: [f32; 2],
+    temperature: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14780,6 +14782,7 @@ fn build_terrain_frame(layer: &TerrainLayer, water_depth: Option<&[f32]>) -> Ter
                     .copied()
                     .unwrap_or(0.0),
                 elevation_gradient: [gradient_x, gradient_y],
+                temperature: tile.temperature_bias,
             });
         }
     }
@@ -16352,6 +16355,8 @@ fn terrain_surface_color(
         elevation: tile.elevation,
         slope: tile.slope,
         water_depth: tile.water_depth,
+        moisture: tile.moisture,
+        temperature: tile.temperature,
     });
     let srgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
         splat_weights: weights,
@@ -16361,6 +16366,7 @@ fn terrain_surface_color(
         accent: tile.accent,
         daylight,
         accessibility: accessibility_palette(palette),
+        temperature: tile.temperature,
     });
     rgba_from_triplet_with_alpha(srgb, 1.0)
 }
@@ -16497,6 +16503,7 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
     let mut accent = Vec::with_capacity(expected_tiles);
     let mut gradients = Vec::with_capacity(expected_tiles);
     let mut splats = Vec::with_capacity(expected_tiles);
+    let mut temperatures = Vec::with_capacity(expected_tiles);
     for tile in frame.terrain.tiles.iter().take(expected_tiles) {
         kinds.push(tile.kind);
         moisture.push(tile.moisture);
@@ -16506,11 +16513,14 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
         water_depth.push(tile.water_depth);
         accent.push(tile.accent);
         gradients.push(tile.elevation_gradient);
+        temperatures.push(tile.temperature);
         splats.push(visual::splat_weights(&SplatInput {
             kind: tile.kind,
             elevation: tile.elevation,
             slope: tile.slope,
             water_depth: tile.water_depth,
+            moisture: tile.moisture,
+            temperature: tile.temperature,
         }));
     }
 
@@ -16523,6 +16533,7 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
         elevation: &elevation,
         slope: &slope,
         water_depth: &water_depth,
+        temperature: &temperatures,
     };
     let mut bgra = Vec::with_capacity(
         (raster_width as usize)
@@ -16542,6 +16553,7 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
             let sampled_slope = blend_scalar(&slope, &corners);
             let sampled_accent = blend_scalar(&accent, &corners);
             let _sampled_gradient = blend_channels(&gradients, &corners);
+            let sampled_temperature = blend_scalar(&temperatures, &corners);
 
             let display_rgb = visual::terrain_surface_srgb(&TerrainSurfaceInput {
                 splat_weights: weights,
@@ -16551,6 +16563,7 @@ fn rasterize_world_fields(frame: &RenderFrame, daylight: f32) -> Option<WorldRas
                 accent: sampled_accent,
                 daylight,
                 accessibility: accessibility_palette(frame.palette),
+                temperature: sampled_temperature,
             });
 
             let to_byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -16658,6 +16671,7 @@ mod continuous_world_raster_tests {
             slope: 0.0,
             water_depth: 0.0,
             elevation_gradient: [0.0, 0.0],
+            temperature: 0.5,
         }
     }
 
@@ -16718,12 +16732,14 @@ mod continuous_world_raster_tests {
         grass.accent = 0.63;
         grass.slope = 0.82;
         grass.water_depth = 1.5;
+        grass.temperature = 0.45;
 
         let mut sand = tile(TerrainKind::Sand);
         sand.elevation = 0.08;
         sand.moisture = 0.14;
         sand.accent = 0.77;
         sand.slope = 0.18;
+        sand.temperature = 0.85;
 
         let mut frame = frame((2, 1), 10, vec![grass, sand], (1, 1), 20, vec![0.0]);
         frame.tick = 137;
@@ -16748,6 +16764,8 @@ mod continuous_world_raster_tests {
                         elevation: tile.elevation,
                         slope: tile.slope,
                         water_depth: tile.water_depth,
+                        moisture: tile.moisture,
+                        temperature: tile.temperature,
                     }),
                     moisture: tile.moisture,
                     elevation: tile.elevation,
@@ -16755,6 +16773,7 @@ mod continuous_world_raster_tests {
                     accent: tile.accent,
                     daylight,
                     accessibility: accessibility_palette(palette),
+                    temperature: tile.temperature,
                 });
                 assert_eq!(
                     actual.map(f32::to_bits),
@@ -16763,6 +16782,39 @@ mod continuous_world_raster_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn gpui_terrain_derivation_is_sensitive_to_temperature_and_moisture() {
+        let mut cold = tile(TerrainKind::Grass);
+        cold.temperature = 0.05;
+        cold.moisture = 0.2;
+
+        let mut hot = tile(TerrainKind::Grass);
+        hot.temperature = 0.95;
+        hot.moisture = 0.2;
+
+        let mut lush = tile(TerrainKind::Grass);
+        lush.temperature = 0.5;
+        lush.moisture = 0.95;
+
+        let mut arid = tile(TerrainKind::Grass);
+        arid.temperature = 0.5;
+        arid.moisture = 0.05;
+
+        let color_cold = terrain_surface_color(cold, 0.5, ColorPaletteMode::Natural);
+        let color_hot = terrain_surface_color(hot, 0.5, ColorPaletteMode::Natural);
+        let color_lush = terrain_surface_color(lush, 0.5, ColorPaletteMode::Natural);
+        let color_arid = terrain_surface_color(arid, 0.5, ColorPaletteMode::Natural);
+
+        assert_ne!(
+            color_cold, color_hot,
+            "GPUI terrain color must distinguish cold vs hot"
+        );
+        assert_ne!(
+            color_lush, color_arid,
+            "GPUI terrain color must distinguish lush vs arid"
+        );
     }
 
     #[test]

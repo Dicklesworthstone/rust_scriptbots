@@ -2337,6 +2337,8 @@ mod tests {
             elevation: 0.91,
             slope: 0.82,
             water_depth: 1.5,
+            moisture: 0.37,
+            temperature: 0.5,
         });
         for accessibility in [
             AccessibilityPalette::Natural,
@@ -2353,6 +2355,7 @@ mod tests {
                 accent: 0.63,
                 daylight: 0.35,
                 accessibility,
+                temperature: 0.5,
             });
             let actual =
                 super::semantic_srgba_to_linear([semantic[0], semantic[1], semantic[2], 1.0]);
@@ -2368,6 +2371,50 @@ mod tests {
                 "{accessibility:?} terrain color must not be reinterpreted by world-gfx"
             );
         }
+    }
+
+    #[test]
+    fn world_gfx_terrain_derivation_is_sensitive_to_temperature_and_moisture() {
+        let input_cold = TerrainSurfaceInput {
+            splat_weights: visual::splat_weights(&SplatInput {
+                kind: TerrainKind::Grass,
+                elevation: 0.5,
+                slope: 0.1,
+                water_depth: 0.0,
+                moisture: 0.2,
+                temperature: 0.05,
+            }),
+            moisture: 0.2,
+            elevation: 0.5,
+            slope: 0.1,
+            accent: 0.5,
+            daylight: 1.0,
+            accessibility: AccessibilityPalette::Natural,
+            temperature: 0.05,
+        };
+        let input_hot = TerrainSurfaceInput {
+            splat_weights: visual::splat_weights(&SplatInput {
+                kind: TerrainKind::Grass,
+                elevation: 0.5,
+                slope: 0.1,
+                water_depth: 0.0,
+                moisture: 0.2,
+                temperature: 0.95,
+            }),
+            moisture: 0.2,
+            elevation: 0.5,
+            slope: 0.1,
+            accent: 0.5,
+            daylight: 1.0,
+            accessibility: AccessibilityPalette::Natural,
+            temperature: 0.95,
+        };
+        let color_cold = visual::terrain_surface_srgb(&input_cold);
+        let color_hot = visual::terrain_surface_srgb(&input_hot);
+        assert_ne!(
+            color_cold, color_hot,
+            "world-gfx color input must distinguish cold vs hot"
+        );
     }
 
     #[test]

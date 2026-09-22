@@ -2689,4 +2689,69 @@ mod tests {
             "error message must name the unknown knob: {err}"
         );
     }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn web_terrain_surface_srgb_derives_full_field_colors() {
+        let cold = evaluate_terrain_surface_srgb(3, 0.5, 0.2, 0.05, 0.1, 0.0, 0.5, 1.0);
+        let hot = evaluate_terrain_surface_srgb(3, 0.5, 0.2, 0.95, 0.1, 0.0, 0.5, 1.0);
+        let lush = evaluate_terrain_surface_srgb(3, 0.5, 0.95, 0.5, 0.1, 0.0, 0.5, 1.0);
+        let arid = evaluate_terrain_surface_srgb(3, 0.5, 0.05, 0.5, 0.1, 0.0, 0.5, 1.0);
+
+        assert_eq!(cold.len(), 3);
+        assert_eq!(hot.len(), 3);
+        assert_ne!(
+            cold, hot,
+            "web terrain evaluation must distinguish cold vs hot"
+        );
+        assert_ne!(
+            lush, arid,
+            "web terrain evaluation must distinguish lush vs arid"
+        );
+    }
 }
+
+/// Evaluate full-field terrain surface sRGB in the WASM target (bd-2z0.14.1.2.4).
+#[wasm_bindgen]
+pub fn evaluate_terrain_surface_srgb(
+    kind: u8,
+    elevation: f32,
+    moisture: f32,
+    temperature: f32,
+    slope: f32,
+    water_depth: f32,
+    accent: f32,
+    daylight: f32,
+) -> Vec<f32> {
+    let terrain_kind = match kind {
+        0 => scriptbots_core::TerrainKind::DeepWater,
+        1 => scriptbots_core::TerrainKind::ShallowWater,
+        2 => scriptbots_core::TerrainKind::Sand,
+        3 => scriptbots_core::TerrainKind::Grass,
+        4 => scriptbots_core::TerrainKind::Bloom,
+        _ => scriptbots_core::TerrainKind::Rock,
+    };
+    let input = scriptbots_core::visual::SplatInput::new(
+        terrain_kind,
+        elevation,
+        moisture,
+        temperature,
+        slope,
+        water_depth,
+    );
+    let splat = scriptbots_core::visual::splat_tile(&input);
+    let srgb = scriptbots_core::visual::terrain_surface_srgb(
+        &scriptbots_core::visual::TerrainSurfaceInput {
+            splat_weights: splat.weights,
+            moisture,
+            elevation,
+            slope,
+            accent,
+            daylight,
+            accessibility: scriptbots_core::AccessibilityPalette::Natural,
+            temperature,
+        },
+    );
+    srgb.to_vec()
+}
+

@@ -20,6 +20,7 @@ scriptbots-runtime = { path = "../scriptbots-runtime", default-features = false 
 postcard = { workspace = true }
 js-sys = "0.3.73"
 tracing = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Browser builds intentionally use core's scalar, single-thread path.
