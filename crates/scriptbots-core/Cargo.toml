@@ -31,8 +31,6 @@ toml = "0.8"
 wide = { version = "1.5.0", default-features = false, optional = true }
 miniz_oxide = { workspace = true }
 kira = { workspace = true, optional = true }
-
-[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 tracing = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

@@ -946,6 +946,30 @@ pub struct TerrainShadeInput {
     pub accent: f32,
     /// Daylight level from [`daylight_factor`].
     pub daylight: f32,
+    /// Normalized temperature channel in `[0, 1]`.
+    pub temperature: f32,
+}
+
+/// Temperature color tint multiplier in display-referred sRGB `[r, g, b]`.
+///
+/// Bounded, continuous, and monotonic across temperature in `[0, 1]`:
+/// - `temperature == 0.5`: neutral identity `[1.0, 1.0, 1.0]`.
+/// - `temperature < 0.5`: cool cyan/frost tint (slight blue boost, slight red reduction).
+/// - `temperature > 0.5`: warm amber tint (slight red boost, slight blue reduction).
+#[must_use]
+pub const fn terrain_temperature_tint(temperature: f32) -> [f32; 3] {
+    let t = if temperature.is_finite() {
+        clamp01(temperature)
+    } else {
+        0.5
+    };
+    if t < 0.5 {
+        let cold = (0.5 - t) * 2.0; // in [0, 1]
+        [1.0 - cold * 0.12, 1.0 - cold * 0.04, 1.0 + cold * 0.14]
+    } else {
+        let warm = (t - 0.5) * 2.0; // in [0, 1]
+        [1.0 + warm * 0.14, 1.0 + warm * 0.04, 1.0 - warm * 0.10]
+    }
 }
 
 /// Shaded terrain color for one tile (natural palette).
@@ -953,7 +977,7 @@ pub struct TerrainShadeInput {
 /// Exact legacy composition: per-kind brightness window, then a second-stage
 /// moisture/accent/slope factor for the living biomes, clamped to `[0, 1]`.
 /// `elevation`, `slope`, `accent`, and `daylight` are clamped defensively;
-/// `moisture` likewise.
+/// `moisture` and `temperature` likewise.
 #[must_use]
 pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
     let moisture = clamp01(input.moisture);
@@ -961,6 +985,7 @@ pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
     let slope = clamp01(input.slope);
     let accent = clamp01(input.accent);
     let daylight = clamp01(input.daylight);
+    let temperature = clamp01(input.temperature);
 
     let base = terrain_kind_base_color(input.kind);
     let brightness = match input.kind {
@@ -997,6 +1022,9 @@ pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
     if factor != 1.0 {
         rgb = [rgb[0] * factor, rgb[1] * factor, rgb[2] * factor];
     }
+
+    let tint = terrain_temperature_tint(temperature);
+    rgb = [rgb[0] * tint[0], rgb[1] * tint[1], rgb[2] * tint[2]];
 
     [
         rgb[0].clamp(0.0, 1.0),
@@ -1463,8 +1491,8 @@ pub const SPLAT_WATERLINE_ELEVATION: f32 = 0.22;
 /// Above this elevation, living biomes blend toward rock (alpine rule).
 pub const SPLAT_ALPINE_ELEVATION: f32 = 0.85;
 
-/// Inputs for the splat-weight rules of one tile.
-#[derive(Debug, Clone, Copy)]
+/// Inputs for the full-field splat-weight and tint rules of one tile (bd-2z0.14.1.2.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplatInput {
     /// Tile kind (the dominant biome).
     pub kind: TerrainKind,
@@ -1474,6 +1502,56 @@ pub struct SplatInput {
     pub slope: f32,
     /// Hydrology water depth above the tile (world units, >= 0).
     pub water_depth: f32,
+    /// Combined moisture/fertility channel in `[0, 1]`.
+    pub moisture: f32,
+    /// Normalized temperature channel in `[0, 1]`.
+    pub temperature: f32,
+}
+
+impl SplatInput {
+    /// Construct a full-field splat input.
+    #[must_use]
+    pub const fn new(
+        kind: TerrainKind,
+        elevation: f32,
+        moisture: f32,
+        temperature: f32,
+        slope: f32,
+        water_depth: f32,
+    ) -> Self {
+        Self {
+            kind,
+            elevation,
+            slope,
+            water_depth,
+            moisture,
+            temperature,
+        }
+    }
+}
+
+/// Documented tint factors derived from the full terrain field (bd-2z0.14.1.2.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplatTintFactors {
+    /// Moisture/fertility lushness factor in `[0.6, 1.4]`.
+    pub lushness: f32,
+    /// Temperature warmth/cool tint multiplier in sRGB `[r, g, b]`.
+    pub temperature_tint: [f32; 3],
+    /// Elevation atmospheric factor in `[0.85, 1.15]`.
+    pub elevation_factor: f32,
+    /// Slope shade multiplier in `[0.70, 1.30]`.
+    pub slope_factor: f32,
+    /// Water depth attenuation in `[0.25, 1.0]`.
+    pub water_attenuation: f32,
+}
+
+/// Canonical result of full-field splat-weight and tint computation (bd-2z0.14.1.2.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplatResult {
+    /// Normalized biome blend weights over [`TERRAIN_BASE_COLORS`] order, summing to 1.0.
+    pub weights: [f32; SPLAT_LAYERS],
+    /// Documented tint factors for the sample.
+    pub tints: SplatTintFactors,
 }
 
 /// Final renderer-neutral terrain-color inputs for one sample.
@@ -1498,6 +1576,8 @@ pub struct TerrainSurfaceInput {
     pub daylight: f32,
     /// Final display accessibility transform.
     pub accessibility: AccessibilityPalette,
+    /// Normalized temperature channel in `[0, 1]`.
+    pub temperature: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1532,6 +1612,8 @@ pub struct TerrainFieldView<'a> {
     pub slope: &'a [f32],
     /// Per-cell hydrology water depth in world units, `>= 0`.
     pub water_depth: &'a [f32],
+    /// Per-cell normalized temperature in `[0, 1]`.
+    pub temperature: &'a [f32],
 }
 
 /// The four cells surrounding a sample point, with their bilinear weights (bd-grbc).
@@ -1660,6 +1742,7 @@ impl TerrainFieldView<'_> {
             slope: Self::blend(self.slope, &corners),
             accent,
             daylight,
+            temperature: Self::blend(self.temperature, &corners),
         }
     }
 
@@ -1690,28 +1773,61 @@ impl TerrainFieldView<'_> {
             elevation: Self::blend(self.elevation, &corners),
             slope: Self::blend(self.slope, &corners),
             water_depth: Self::blend(self.water_depth, &corners),
+            moisture: Self::blend(self.moisture, &corners),
+            temperature: Self::blend(self.temperature, &corners),
         }
     }
 }
 
-/// Per-tile splat weights over the six biome layers, normalized to sum 1.
+/// Compute full-field splat weights and tint factors for a tile (bd-2z0.14.1.2.4).
 ///
 /// Rule order (later rules blend into the result of earlier ones):
 /// 1. One-hot on the tile kind.
 /// 2. Waterline: below [`SPLAT_WATERLINE_ELEVATION`], land biomes blend
 ///    toward sand proportionally to how far below the line they are.
-/// 3. Steep slopes: above [`SPLAT_SLOPE_ROCK_THRESHOLD`], living biomes
+/// 3. Moisture rules:
+///    - Aridity (moisture < 0.20): land biomes blend toward sand.
+///    - Lushness (moisture > 0.80, grass): grass blends toward bloom.
+/// 4. Temperature rules:
+///    - Cold / Frost (temperature < 0.20): living biomes blend toward rock.
+///    - Scorching Heat (temperature > 0.80 and moisture < 0.35): dry land blends toward sand.
+/// 5. Steep slopes: above [`SPLAT_SLOPE_ROCK_THRESHOLD`], living biomes
 ///    (grass/bloom/sand) blend toward rock with slope overhang.
-/// 4. Alpine: above [`SPLAT_ALPINE_ELEVATION`], living biomes blend toward
+/// 6. Alpine: above [`SPLAT_ALPINE_ELEVATION`], living biomes blend toward
 ///    rock with elevation overhang.
-/// 5. Flooded: any positive water depth blends dry land toward the matching
-///    water layer (deep vs shallow by depth), capped at full replacement.
+/// 7. Flooded: positive water depth replaces dry land with the depth-matched water layer.
 ///
-/// Water kinds short-circuit rules 2-4 (a lakebed does not become sandy
-/// cliffs), and rule 5 never applies to them. Output is always finite and
+/// Water kinds short-circuit rules 2-6 (a lakebed does not become sandy
+/// cliffs), and rule 7 never applies to them. Output is always finite and
 /// sums to `1 +/- 1e-5`.
 #[must_use]
-pub fn splat_weights(input: &SplatInput) -> [f32; SPLAT_LAYERS] {
+pub fn splat_tile(input: &SplatInput) -> SplatResult {
+    let elevation = if input.elevation.is_finite() {
+        clamp01(input.elevation)
+    } else {
+        0.5
+    };
+    let slope = if input.slope.is_finite() {
+        clamp01(input.slope)
+    } else {
+        0.0
+    };
+    let moisture = if input.moisture.is_finite() {
+        clamp01(input.moisture)
+    } else {
+        0.5
+    };
+    let temperature = if input.temperature.is_finite() {
+        clamp01(input.temperature)
+    } else {
+        0.5
+    };
+    let water_depth = if input.water_depth.is_finite() && input.water_depth > 0.0 {
+        input.water_depth
+    } else {
+        0.0
+    };
+
     let kind_index = match input.kind {
         TerrainKind::DeepWater => 0,
         TerrainKind::ShallowWater => 1,
@@ -1728,29 +1844,43 @@ pub fn splat_weights(input: &SplatInput) -> [f32; SPLAT_LAYERS] {
         TerrainKind::DeepWater | TerrainKind::ShallowWater
     );
     if !is_water {
-        let elevation = clamp01(input.elevation);
-        let slope = clamp01(input.slope);
-
         // Rule 2: waterline sand.
         if elevation < SPLAT_WATERLINE_ELEVATION {
             let t = (SPLAT_WATERLINE_ELEVATION - elevation) / SPLAT_WATERLINE_ELEVATION;
             blend_toward(&mut w, 2, t * 0.8);
         }
-        // Rule 3: steep-slope rock (only for living biomes; bare sand already reads dry).
+        // Rule 3: moisture rules.
+        if moisture < 0.20 {
+            let t = (0.20 - moisture) / 0.20;
+            blend_toward(&mut w, 2, t * 0.65);
+        } else if moisture > 0.80 && input.kind == TerrainKind::Grass {
+            let t = (moisture - 0.80) / 0.20;
+            blend_toward(&mut w, 4, t * 0.50);
+        }
+        // Rule 4: thermal rules.
+        if temperature < 0.20 {
+            let t = (0.20 - temperature) / 0.20;
+            blend_toward(&mut w, 5, t * 0.70);
+        } else if temperature > 0.80 && moisture < 0.35 {
+            let t_temp = (temperature - 0.80) / 0.20;
+            let t_arid = (0.35 - moisture) / 0.35;
+            blend_toward(&mut w, 2, t_temp * t_arid * 0.70);
+        }
+        // Rule 5: steep-slope rock.
         if slope > SPLAT_SLOPE_ROCK_THRESHOLD {
             let t = (slope - SPLAT_SLOPE_ROCK_THRESHOLD) / (1.0 - SPLAT_SLOPE_ROCK_THRESHOLD);
             blend_toward(&mut w, 5, t * 0.85);
         }
-        // Rule 4: alpine rock.
+        // Rule 6: alpine rock.
         if elevation > SPLAT_ALPINE_ELEVATION {
             let t = (elevation - SPLAT_ALPINE_ELEVATION) / (1.0 - SPLAT_ALPINE_ELEVATION);
             blend_toward(&mut w, 5, t * 0.7);
         }
-        // Rule 5: flooding replaces dry land with the depth-matched water layer.
-        if input.water_depth.is_finite() && input.water_depth > 0.0 {
-            let deep = input.water_depth >= 3.0;
+        // Rule 7: flooding replaces dry land with the depth-matched water layer.
+        if water_depth > 0.0 {
+            let deep = water_depth >= 3.0;
             let layer = usize::from(!deep); // 0 = deep, 1 = shallow
-            let t = (input.water_depth / 3.0).clamp(0.0, 1.0);
+            let t = (water_depth / 3.0).clamp(0.0, 1.0);
             blend_toward(&mut w, layer, t);
         }
     }
@@ -1765,7 +1895,33 @@ pub fn splat_weights(input: &SplatInput) -> [f32; SPLAT_LAYERS] {
         w = [0.0; SPLAT_LAYERS];
         w[kind_index] = 1.0;
     }
-    w
+
+    let lushness = f32::mul_add(moisture, 0.4, 0.9).clamp(0.6, 1.4);
+    let temperature_tint = terrain_temperature_tint(temperature);
+    let elevation_factor = f32::mul_add(elevation, 0.30, 0.85);
+    let slope_factor = f32::mul_add(slope, 0.30, 0.85);
+    let water_attenuation = if water_depth <= 0.0 {
+        1.0
+    } else {
+        1.0 - (water_depth / 4.0).clamp(0.0, 0.75)
+    };
+
+    SplatResult {
+        weights: w,
+        tints: SplatTintFactors {
+            lushness,
+            temperature_tint,
+            elevation_factor,
+            slope_factor,
+            water_attenuation,
+        },
+    }
+}
+
+/// Per-tile splat weights over the six biome layers, normalized to sum 1.
+#[must_use]
+pub fn splat_weights(input: &SplatInput) -> [f32; SPLAT_LAYERS] {
+    splat_tile(input).weights
 }
 
 /// Compose the final semantic terrain color in display-referred sRGB.
@@ -1797,6 +1953,7 @@ pub fn terrain_surface_srgb(input: &TerrainSurfaceInput) -> [f32; 3] {
             slope: input.slope,
             accent: input.accent,
             daylight: input.daylight,
+            temperature: input.temperature,
         });
         rgb[0] += shaded[0] * weight;
         rgb[1] += shaded[1] * weight;
@@ -2002,6 +2159,97 @@ pub fn bake_biome_atlas(seed: u64, size: u32) -> Vec<u8> {
         }
     }
     atlas
+}
+
+/// Canonical atlas seed pinned by the deterministic fixture contract (bd-2z0.14.1.2.4).
+pub const CANONICAL_BIOME_ATLAS_SEED: u64 = 42;
+/// Canonical atlas tile width and height in pixels.
+pub const CANONICAL_BIOME_ATLAS_TILE_SIZE: u32 = 64;
+/// Six biome layers laid out horizontally side-by-side.
+#[allow(clippy::cast_possible_truncation)]
+pub const CANONICAL_BIOME_ATLAS_WIDTH: u32 =
+    CANONICAL_BIOME_ATLAS_TILE_SIZE * (SPLAT_LAYERS as u32);
+/// Canonical atlas height in pixels.
+pub const CANONICAL_BIOME_ATLAS_HEIGHT: u32 = CANONICAL_BIOME_ATLAS_TILE_SIZE;
+/// Total RGBA8 byte length of the canonical six-layer atlas.
+pub const CANONICAL_BIOME_ATLAS_BYTE_LEN: usize =
+    (CANONICAL_BIOME_ATLAS_WIDTH as usize) * (CANONICAL_BIOME_ATLAS_HEIGHT as usize) * 4;
+
+/// Canonical BLAKE3 digest of the baked biome atlas fixture.
+pub const CANONICAL_BIOME_ATLAS_DIGEST: &str =
+    "bf2a0ef5fdc3cb1b503a4c6f42bab90054809855ce8e5d31661117eb61451b5a";
+
+/// Diagnostic verification error for canonical biome atlas conformance (bd-2z0.14.1.2.4).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AtlasVerificationError {
+    /// The atlas byte length does not match [`CANONICAL_BIOME_ATLAS_BYTE_LEN`].
+    #[error("atlas byte length mismatch: expected {expected}, got {actual}")]
+    LengthMismatch {
+        /// Expected byte length.
+        expected: usize,
+        /// Actual observed byte length.
+        actual: usize,
+    },
+    /// The atlas digest does not match [`CANONICAL_BIOME_ATLAS_DIGEST`].
+    #[error(
+        "atlas digest mismatch: expected {expected}, got {actual} (first mismatch at byte {first_mismatch_offset}, layer {mismatch_layer:?})"
+    )]
+    DigestMismatch {
+        /// Expected BLAKE3 digest in lowercase hex.
+        expected: String,
+        /// Actual computed BLAKE3 digest in lowercase hex.
+        actual: String,
+        /// Byte offset of the first mismatching byte.
+        first_mismatch_offset: usize,
+        /// `TerrainKind` layer index corresponding to the first mismatching byte.
+        mismatch_layer: TerrainKind,
+    },
+}
+
+/// Bake the canonical 6-layer biome atlas.
+#[must_use]
+pub fn bake_canonical_biome_atlas() -> Vec<u8> {
+    bake_biome_atlas(CANONICAL_BIOME_ATLAS_SEED, CANONICAL_BIOME_ATLAS_TILE_SIZE)
+}
+
+/// Verify an atlas against the canonical fixture parameters and digest.
+pub fn verify_biome_atlas(atlas: &[u8]) -> Result<(), AtlasVerificationError> {
+    const KINDS: [TerrainKind; 6] = [
+        TerrainKind::DeepWater,
+        TerrainKind::ShallowWater,
+        TerrainKind::Sand,
+        TerrainKind::Grass,
+        TerrainKind::Bloom,
+        TerrainKind::Rock,
+    ];
+
+    if atlas.len() != CANONICAL_BIOME_ATLAS_BYTE_LEN {
+        return Err(AtlasVerificationError::LengthMismatch {
+            expected: CANONICAL_BIOME_ATLAS_BYTE_LEN,
+            actual: atlas.len(),
+        });
+    }
+    let actual_digest = blake3::hash(atlas).to_hex().to_string();
+    if actual_digest != CANONICAL_BIOME_ATLAS_DIGEST {
+        let reference = bake_canonical_biome_atlas();
+        let mut mismatch_offset = 0;
+        for (i, (&a, &b)) in atlas.iter().zip(reference.iter()).enumerate() {
+            if a != b {
+                mismatch_offset = i;
+                break;
+            }
+        }
+        let pixel_index = mismatch_offset / 4;
+        let x_pixel = pixel_index % (CANONICAL_BIOME_ATLAS_WIDTH as usize);
+        let layer_index = (x_pixel / (CANONICAL_BIOME_ATLAS_TILE_SIZE as usize)).min(5);
+        return Err(AtlasVerificationError::DigestMismatch {
+            expected: CANONICAL_BIOME_ATLAS_DIGEST.to_string(),
+            actual: actual_digest,
+            first_mismatch_offset: mismatch_offset,
+            mismatch_layer: KINDS[layer_index],
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2334,6 +2582,8 @@ mod tests {
                 elevation: 0.5,
                 slope: 0.1,
                 water_depth: 0.0,
+                moisture: 0.5,
+                temperature: 0.5,
             });
             let dominant = weights
                 .iter()
@@ -2668,6 +2918,7 @@ mod tests {
                     slope: 0.4,
                     accent: 0.7,
                     daylight,
+                    temperature: 0.5,
                 });
                 for c in color {
                     assert!(c.is_finite() && (0.0..=1.0).contains(&c));
@@ -2679,6 +2930,7 @@ mod tests {
                     slope: 0.4,
                     accent: 0.7,
                     daylight: 0.0,
+                    temperature: 0.5,
                 });
                 let noon = terrain_shaded_color(&TerrainShadeInput {
                     kind,
@@ -2687,6 +2939,7 @@ mod tests {
                     slope: 0.4,
                     accent: 0.7,
                     daylight: 1.0,
+                    temperature: 0.5,
                 });
                 let night_lum: f32 = night.iter().sum();
                 let noon_lum: f32 = noon.iter().sum();
@@ -2791,6 +3044,7 @@ mod tests {
                                         slope,
                                         accent,
                                         daylight,
+                                        temperature: 0.5,
                                     }),
                                 ));
                             }
@@ -2858,6 +3112,8 @@ mod tests {
                     elevation,
                     slope,
                     water_depth: depth,
+                    moisture: 0.5,
+                    temperature: 0.5,
                 });
                 let sum: f32 = w.iter().sum();
                 assert!(
@@ -2878,6 +3134,8 @@ mod tests {
             elevation: 0.5,
             slope: 0.1,
             water_depth: 0.0,
+            moisture: 0.5,
+            temperature: 0.5,
         });
         assert!((w[3] - 1.0).abs() < EPS, "flat midland grass is pure grass");
         let w = splat_weights(&SplatInput {
@@ -2885,6 +3143,8 @@ mod tests {
             elevation: 0.0,
             slope: 0.9,
             water_depth: 0.0,
+            moisture: 0.5,
+            temperature: 0.5,
         });
         assert!((w[0] - 1.0).abs() < EPS, "water kinds ignore land rules");
     }
@@ -2896,6 +3156,8 @@ mod tests {
             elevation: 0.02,
             slope: 0.1,
             water_depth: 0.0,
+            moisture: 0.5,
+            temperature: 0.5,
         });
         assert!(
             w[2] > 0.5,
@@ -2906,6 +3168,8 @@ mod tests {
             elevation: 0.9,
             slope: 0.1,
             water_depth: 0.0,
+            moisture: 0.5,
+            temperature: 0.5,
         });
         assert!(w_high[2] < 0.01, "highland grass has no sand: {w_high:?}");
     }
@@ -2917,6 +3181,8 @@ mod tests {
             elevation: 0.5,
             slope: 0.95,
             water_depth: 0.0,
+            moisture: 0.5,
+            temperature: 0.5,
         });
         assert!(w[5] > 0.6, "steep grass gives way to rock: {w:?}");
         let gentle = splat_weights(&SplatInput {
@@ -2924,6 +3190,8 @@ mod tests {
             elevation: 0.5,
             slope: 0.2,
             water_depth: 0.0,
+            moisture: 0.5,
+            temperature: 0.5,
         });
         assert!(gentle[5] < 0.01, "gentle grass keeps no rock: {gentle:?}");
     }
@@ -2935,6 +3203,8 @@ mod tests {
             elevation: 0.1,
             slope: 0.05,
             water_depth: 1.0,
+            moisture: 0.5,
+            temperature: 0.5,
         });
         assert!(
             shallow[1] > 0.2,
@@ -2945,6 +3215,8 @@ mod tests {
             elevation: 0.1,
             slope: 0.05,
             water_depth: 10.0,
+            moisture: 0.5,
+            temperature: 0.5,
         });
         assert!(
             deep[0] > 0.8,
@@ -3180,7 +3452,14 @@ mod tests {
         assert!((p.spike_tip_offset[1] - 3.0).abs() < 1e-5);
     }
 
-    type RampFields = (Vec<TerrainKind>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+    type RampFields = (
+        Vec<TerrainKind>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+    );
 
     fn ramp_fields() -> RampFields {
         let kinds = vec![TerrainKind::Grass; 16];
@@ -3191,13 +3470,20 @@ mod tests {
                 elevation[usize::from(y) * 4 + usize::from(x)] = f32::from(x) / 3.0;
             }
         }
-        (kinds, moisture, elevation, vec![0.25; 16], vec![0.0; 16])
+        (
+            kinds,
+            moisture,
+            elevation,
+            vec![0.25; 16],
+            vec![0.0; 16],
+            vec![0.5; 16],
+        )
     }
 
     /// Sampling exactly at a cell centre returns that cell rather than a blend of neighbours.
     #[test]
     fn sampling_a_cell_centre_returns_that_cell() {
-        let (kinds, moisture, elevation, slope, water) = ramp_fields();
+        let (kinds, moisture, elevation, slope, water, temp) = ramp_fields();
         let view = TerrainFieldView {
             width: 4,
             height: 4,
@@ -3207,6 +3493,7 @@ mod tests {
             elevation: &elevation,
             slope: &slope,
             water_depth: &water,
+            temperature: &temp,
         };
         // Centre of cell (2, 1) is world (25, 15).
         let corners = view.sample_corners(25.0, 15.0);
@@ -3228,7 +3515,7 @@ mod tests {
     /// codebase getting minimum-image arithmetic wrong at exactly such sites.
     #[test]
     fn sampling_wraps_across_the_toroidal_seam() {
-        let (kinds, moisture, elevation, slope, water) = ramp_fields();
+        let (kinds, moisture, elevation, slope, water, temp) = ramp_fields();
         let view = TerrainFieldView {
             width: 4,
             height: 4,
@@ -3238,6 +3525,7 @@ mod tests {
             elevation: &elevation,
             slope: &slope,
             water_depth: &water,
+            temperature: &temp,
         };
 
         // Just past the right edge must blend column 3 with column 0, not clamp.
@@ -3271,7 +3559,7 @@ mod tests {
     /// an enum discriminant would be meaningless. `splat_weights` is the smooth-transition path.
     #[test]
     fn terrain_kind_is_nearest_not_interpolated() {
-        let (mut kinds, moisture, elevation, slope, water) = ramp_fields();
+        let (mut kinds, moisture, elevation, slope, water, temp) = ramp_fields();
         kinds[0] = TerrainKind::Rock;
         let view = TerrainFieldView {
             width: 4,
@@ -3282,11 +3570,246 @@ mod tests {
             elevation: &elevation,
             slope: &slope,
             water_depth: &water,
+            temperature: &temp,
         };
         assert_eq!(
             view.shade_input_at(5.0, 5.0, 1.0, 0.0).kind,
             TerrainKind::Rock
         );
         assert_eq!(view.splat_input_at(5.0, 5.0).kind, TerrainKind::Rock);
+    }
+
+    #[test]
+    fn canonical_biome_atlas_matches_pinned_digest() {
+        let atlas = bake_canonical_biome_atlas();
+        assert_eq!(atlas.len(), CANONICAL_BIOME_ATLAS_BYTE_LEN);
+        let digest = blake3::hash(&atlas).to_hex().to_string();
+        assert_eq!(digest, CANONICAL_BIOME_ATLAS_DIGEST);
+        verify_biome_atlas(&atlas).expect("canonical atlas must verify");
+    }
+
+    #[test]
+    fn canonical_biome_atlas_detects_corrupted_byte_with_layer_diagnostic() {
+        let mut atlas = bake_canonical_biome_atlas();
+        // Layer 3 is Grass (index 3, x in [3*64, 4*64) = [192, 256)).
+        // Byte for x=200, y=0, channel 0 is (0 * 384 + 200) * 4 = 800.
+        let target_byte = 800;
+        atlas[target_byte] ^= 0xFF;
+        let err = verify_biome_atlas(&atlas).expect_err("tampered atlas must fail verification");
+        match err {
+            AtlasVerificationError::DigestMismatch {
+                expected,
+                actual,
+                first_mismatch_offset,
+                mismatch_layer,
+            } => {
+                assert_eq!(expected, CANONICAL_BIOME_ATLAS_DIGEST);
+                assert_ne!(actual, CANONICAL_BIOME_ATLAS_DIGEST);
+                assert_eq!(first_mismatch_offset, target_byte);
+                assert_eq!(mismatch_layer, TerrainKind::Grass);
+            }
+            other @ AtlasVerificationError::LengthMismatch { .. } => {
+                panic!("expected DigestMismatch, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_biome_atlas_detects_length_mismatch() {
+        let atlas = vec![0u8; 100];
+        let err = verify_biome_atlas(&atlas).expect_err("truncated atlas must fail");
+        assert_eq!(
+            err,
+            AtlasVerificationError::LengthMismatch {
+                expected: CANONICAL_BIOME_ATLAS_BYTE_LEN,
+                actual: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn splat_tile_cartesian_domain_sweep_invariants() {
+        let kinds = [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ];
+        let elevations = [0.0f32, 0.1, 0.2, 0.4, 0.5, 0.7, 0.85, 0.9, 0.95, 1.0];
+        let moistures = [0.0f32, 0.15, 0.3, 0.5, 0.65, 0.8, 0.95, 1.0];
+        let temperatures = [0.0f32, 0.15, 0.3, 0.5, 0.65, 0.8, 0.95, 1.0];
+        let slopes = [0.0f32, 0.1, 0.3, 0.5, 0.6, 0.75, 0.9, 1.0];
+        let depths = [0.0f32, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0];
+
+        let mut count = 0usize;
+        for &kind in &kinds {
+            for &elevation in &elevations {
+                for &moisture in &moistures {
+                    for &temperature in &temperatures {
+                        for &slope in &slopes {
+                            for &water_depth in &depths {
+                                let input = SplatInput::new(
+                                    kind,
+                                    elevation,
+                                    moisture,
+                                    temperature,
+                                    slope,
+                                    water_depth,
+                                );
+                                let result = splat_tile(&input);
+
+                                // Invariant 1: Weights partition of unity (sum to 1.0 +/- 1e-4)
+                                let sum: f32 = result.weights.iter().sum();
+                                assert!(
+                                    (sum - 1.0).abs() < 1e-4,
+                                    "Partition of unity violated: sum={sum} for {input:?}"
+                                );
+
+                                // Invariant 2: Each weight in [0.0, 1.0] and finite
+                                for (layer, &w) in result.weights.iter().enumerate() {
+                                    assert!(
+                                        w.is_finite() && (0.0..=1.0).contains(&w),
+                                        "Weight[{layer}] out of range: {w} for {input:?}"
+                                    );
+                                }
+
+                                // Invariant 3: Tint factors are non-negative and finite
+                                assert!(
+                                    result.tints.lushness.is_finite()
+                                        && result.tints.lushness >= 0.0
+                                );
+                                for c in result.tints.temperature_tint {
+                                    assert!(c.is_finite() && c > 0.0);
+                                }
+                                assert!(
+                                    result.tints.elevation_factor.is_finite()
+                                        && result.tints.elevation_factor >= 0.0
+                                );
+                                assert!(
+                                    result.tints.slope_factor.is_finite()
+                                        && result.tints.slope_factor >= 0.0
+                                );
+                                assert!(
+                                    result.tints.water_attenuation.is_finite()
+                                        && result.tints.water_attenuation >= 0.0
+                                );
+
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 6 * 10 * 8 * 8 * 8 * 7);
+    }
+
+    #[test]
+    fn splat_tile_nan_inf_boundary_handling() {
+        let bad_inputs = [
+            (f32::NAN, 0.5, 0.5, 0.0, 0.0),
+            (0.5, f32::NAN, 0.5, 0.0, 0.0),
+            (0.5, 0.5, f32::NAN, 0.0, 0.0),
+            (0.5, 0.5, 0.5, f32::NAN, 0.0),
+            (0.5, 0.5, 0.5, 0.0, f32::NAN),
+            (f32::INFINITY, 0.5, 0.5, 0.0, 0.0),
+            (0.5, -1.0, 0.5, f32::NEG_INFINITY, 0.0),
+            (-10.0, -2.0, 2.0, 5.0, -2.0),
+        ];
+
+        for (elev, moist, temp, slope, depth) in bad_inputs {
+            let input = SplatInput::new(TerrainKind::Grass, elev, moist, temp, slope, depth);
+            let result = splat_tile(&input);
+            let sum: f32 = result.weights.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-4,
+                "Robustness failed for invalid inputs: sum={sum}"
+            );
+            for w in result.weights {
+                assert!(w.is_finite() && (0.0..=1.0).contains(&w));
+            }
+        }
+    }
+
+    #[test]
+    fn splat_tile_precedence_rules() {
+        // 1. Water kinds short-circuit land rules
+        let water = SplatInput::new(TerrainKind::DeepWater, 0.9, 0.0, 0.0, 0.9, 0.0);
+        let water_res = splat_tile(&water);
+        assert!((water_res.weights[0] - 1.0).abs() < EPS);
+
+        // 2. Flooding overrides land kinds
+        let flooded = SplatInput::new(TerrainKind::Grass, 0.5, 0.5, 0.5, 0.1, 10.0);
+        let flood_res = splat_tile(&flooded);
+        assert!(
+            flood_res.weights[0] > 0.8,
+            "Deep flood must yield dominant deep water: {flood_res:?}"
+        );
+
+        // 3. Steep rock overrides gentle vegetation
+        let steep = SplatInput::new(TerrainKind::Grass, 0.5, 0.9, 0.5, 0.95, 0.0);
+        let steep_res = splat_tile(&steep);
+        assert!(
+            steep_res.weights[5] > 0.6,
+            "Steep slope forces rock even with high moisture: {steep_res:?}"
+        );
+
+        // 4. Alpine rock overrides vegetation
+        let alpine = SplatInput::new(TerrainKind::Grass, 0.98, 0.9, 0.5, 0.1, 0.0);
+        let alpine_res = splat_tile(&alpine);
+        assert!(
+            alpine_res.weights[5] > 0.6,
+            "Alpine elevation forces rock even with high moisture: {alpine_res:?}"
+        );
+    }
+
+    #[test]
+    fn splat_tile_injected_dropped_field_and_order_negatives() {
+        // Temperature discriminator
+        let hot = SplatInput::new(TerrainKind::Grass, 0.5, 0.2, 0.95, 0.1, 0.0);
+        let cold = SplatInput::new(TerrainKind::Grass, 0.5, 0.2, 0.05, 0.1, 0.0);
+        let neutral = SplatInput::new(TerrainKind::Grass, 0.5, 0.2, 0.5, 0.1, 0.0);
+
+        let hot_res = splat_tile(&hot);
+        let cold_res = splat_tile(&cold);
+        let neutral_res = splat_tile(&neutral);
+
+        // Cold shifts toward rock (frost)
+        assert!(
+            cold_res.weights[5] > neutral_res.weights[5],
+            "Cold input must increase rock/frost weight"
+        );
+        // Hot shifts toward sand (scorching aridity)
+        assert!(
+            hot_res.weights[2] > neutral_res.weights[2],
+            "Scorching heat must increase sand weight"
+        );
+        // Temperature tint factor must distinguish all 3
+        assert_ne!(
+            hot_res.tints.temperature_tint,
+            cold_res.tints.temperature_tint
+        );
+        assert_ne!(
+            hot_res.tints.temperature_tint,
+            neutral_res.tints.temperature_tint
+        );
+
+        // Moisture discriminator
+        let arid = SplatInput::new(TerrainKind::Grass, 0.5, 0.05, 0.5, 0.1, 0.0);
+        let lush = SplatInput::new(TerrainKind::Grass, 0.5, 0.95, 0.5, 0.1, 0.0);
+        let arid_res = splat_tile(&arid);
+        let lush_res = splat_tile(&lush);
+
+        assert!(
+            arid_res.weights[2] > neutral_res.weights[2],
+            "Arid input must increase sand weight"
+        );
+        assert!(
+            lush_res.weights[4] > neutral_res.weights[4],
+            "Lush input must increase bloom weight"
+        );
+        assert!(lush_res.tints.lushness > arid_res.tints.lushness);
     }
 }
