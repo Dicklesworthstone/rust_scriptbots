@@ -357,6 +357,7 @@ fn registry_lists_builtin_reports_with_descriptions() {
             "lineage-structure",
             "dynasty-communities",
             "interaction-centrality",
+            "narrative-validate",
         ]
     );
     assert!(listed.iter().all(|(_, d)| !d.is_empty()));
