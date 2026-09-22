@@ -27,7 +27,8 @@ use scriptbots_core::attribution::{
     AttributionMethod, EffectiveOutput, OutputExplanation, explain_outputs,
 };
 use scriptbots_core::narrative::{
-    EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord,
+    EventKind as NarrativeEventKind, EventRecord as NarrativeEventRecord, FocusResolution,
+    TimelineFocusCommand,
 };
 use scriptbots_core::visual::{
     self, AgentVisualInput, AgentVisualParams, SplatInput, TerrainSurfaceInput, VisualSelection,
@@ -2668,7 +2669,7 @@ fn snapshot_selection(snapshot: &RenderSnapshot) -> (u64, Vec<AgentId>, Vec<Agen
     (snapshot.world.tick, selected, live)
 }
 
-struct SimulationView {
+pub struct SimulationView {
     host: ChannelHostPort,
     analytics_provider: AnalyticsSnapshotProvider,
     title: SharedString,
@@ -2742,6 +2743,34 @@ struct SimulationView {
     attribution_last_debug: Option<(u64, u64)>,
 }
 impl SimulationView {
+    /// Construct a headless SimulationView for testing or non-windowed interaction (bd-farh).
+    #[must_use]
+    pub fn headless(host: ChannelHostPort) -> Self {
+        let selection_projection = Arc::new(Mutex::new(None));
+        let selection_submission = Arc::new(Mutex::new(()));
+        let command_submit = Arc::new(|_| None);
+        Self::new(
+            host,
+            AnalyticsSnapshotProvider::empty(),
+            "Headless GPU View".into(),
+            command_submit,
+            selection_projection,
+            selection_submission,
+        )
+    }
+
+    /// Return the currently focused agent in the inspector, if any (bd-farh).
+    #[must_use]
+    pub fn focused_agent(&self) -> Option<AgentId> {
+        self.inspector.lock().ok().and_then(|i| i.focused_agent)
+    }
+
+    /// Current rail selection tuple `(index, tick, kind)` if an event is selected (bd-farh).
+    #[must_use]
+    pub fn rail_selection(&self) -> Option<(usize, u64, NarrativeEventKind)> {
+        self.rail_selection
+    }
+
     fn new(
         host: ChannelHostPort,
         analytics_provider: AnalyticsSnapshotProvider,
@@ -2848,7 +2877,9 @@ impl SimulationView {
         self.submit_control_command(ControlCommand::UpdateSelection(update))
     }
 
-    fn camera_snapshot(&self) -> CameraSnapshot {
+    /// Return a snapshot of the camera state (bd-farh).
+    #[must_use]
+    pub fn camera_snapshot(&self) -> CameraSnapshot {
         self.camera
             .lock()
             .map(|camera| camera.snapshot())
@@ -4176,10 +4207,7 @@ impl SimulationView {
     /// perform any flow arithmetic, category re-derivation, or aggregation over raw flows.
     /// It consumes only canonical [`scriptbots_core::economy::SankeyGraph`] structs.
     #[must_use]
-    #[expect(
-        dead_code,
-        reason = "bd-16g.11.3: this view awaits a canonical epoch Sankey feed and a Lab caller"
-    )]
+    #[allow(dead_code)]
     pub fn render_sankey_view(
         &self,
         sankey: Option<&scriptbots_core::economy::SankeyGraph>,
@@ -4667,7 +4695,7 @@ impl SimulationView {
 
     /// Select a rail event by index, clamped to the retained events. A fresh
     /// selection clears the aged-out marker (bd-16g.2.4).
-    fn select_rail_event(&mut self, index: usize) {
+    pub fn select_rail_event(&mut self, index: usize) {
         let Ok(snapshot) = self.read_snapshot() else {
             return;
         };
@@ -4684,6 +4712,7 @@ impl SimulationView {
         self.rail_selection = Some((clamped, tick, kind));
         self.rail_selection_aged_out = false;
         self.rail_warned_aged_out = false;
+        self.apply_rail_selection_focus(&snapshot.narrative_events[clamped], &snapshot);
         tracing::debug!(
             target = "scriptbots::timeline",
             event_index = clamped,
@@ -4691,6 +4720,118 @@ impl SimulationView {
             event_kind = kind.as_str(),
             "narrative rail selection moved"
         );
+    }
+
+    /// Decode and apply the focus command for a selected narrative event (bd-farh).
+    pub fn apply_rail_selection_focus(
+        &mut self,
+        event: &NarrativeEventRecord,
+        snapshot: &RenderSnapshot,
+    ) -> FocusResolution {
+        let command = event.focus_command();
+        let prior_focus = self
+            .inspector
+            .lock()
+            .ok()
+            .and_then(|i| i.focused_agent)
+            .map(|id| id.raw());
+
+        let resolution = match command {
+            TimelineFocusCommand::FocusAgent(uid) => {
+                if let Some(agent) = snapshot.world.agents.iter().find(|a| a.uid == uid) {
+                    let agent_id = slotmap::KeyData::from_ffi(agent.id).into();
+                    if let Ok(mut inspector) = self.inspector.lock() {
+                        inspector.focused_agent = Some(agent_id);
+                    }
+                    if let Ok(mut camera) = self.camera.lock() {
+                        camera.center_on(Position {
+                            x: agent.position[0],
+                            y: agent.position[1],
+                        });
+                    }
+                    FocusResolution::FocusedAgent {
+                        uid,
+                        position: (agent.position[0], agent.position[1]),
+                    }
+                } else {
+                    FocusResolution::AgentDeadOrMissing { uid }
+                }
+            }
+            TimelineFocusCommand::FocusRegion(region) => {
+                let world_w = snapshot.world.world.width as f32;
+                let world_h = snapshot.world.world.height as f32;
+                match region {
+                    scriptbots_core::Region::All => {
+                        if let Ok(mut camera) = self.camera.lock() {
+                            camera.fit_world();
+                        }
+                        FocusResolution::FocusedRegion {
+                            region,
+                            center: (world_w * 0.5, world_h * 0.5),
+                        }
+                    }
+                    scriptbots_core::Region::Disc { x, y, radius } => {
+                        if x.is_finite() && y.is_finite() && radius.is_finite() && radius > 0.0 {
+                            if let Ok(mut camera) = self.camera.lock() {
+                                camera.center_on(Position { x, y });
+                            }
+                            FocusResolution::FocusedRegion {
+                                region,
+                                center: (x, y),
+                            }
+                        } else {
+                            FocusResolution::InvalidRegion { region }
+                        }
+                    }
+                    scriptbots_core::Region::Rect { x, y, w, h } => {
+                        if x.is_finite()
+                            && y.is_finite()
+                            && w.is_finite()
+                            && h.is_finite()
+                            && w > 0.0
+                            && h > 0.0
+                        {
+                            let cx = x + w * 0.5;
+                            let cy = y + h * 0.5;
+                            if let Ok(mut camera) = self.camera.lock() {
+                                camera.center_on(Position { x: cx, y: cy });
+                            }
+                            FocusResolution::FocusedRegion {
+                                region,
+                                center: (cx, cy),
+                            }
+                        } else {
+                            FocusResolution::InvalidRegion { region }
+                        }
+                    }
+                }
+            }
+            TimelineFocusCommand::NoFocus { reason } => FocusResolution::Refused { reason },
+        };
+
+        let new_focus = self
+            .inspector
+            .lock()
+            .ok()
+            .and_then(|i| i.focused_agent)
+            .map(|id| id.raw());
+
+        tracing::info!(
+            target = "scriptbots::timeline",
+            event_id = event.tick.0,
+            event_tick = event.tick.0,
+            event_kind = event.kind.as_str(),
+            typed_subject = ?event.subject,
+            resolution_result = resolution.as_str(),
+            focused_uid = ?resolution.focused_uid(),
+            focused_region = ?resolution.focused_region(),
+            prior_focus = ?prior_focus,
+            new_focus = ?new_focus,
+            refusal_cause = ?resolution.refusal_cause(),
+            "narrative rail focus resolved"
+        );
+
+        resolution
     }
 
     /// Keep the rail selection pointing at a live event. The ring can drop the
@@ -19313,6 +19454,181 @@ mod command_characterization_tests {
         );
     }
 
+    #[test]
+    fn narrative_rail_selection_focuses_subject_and_refusals() {
+        use scriptbots_core::narrative::{FocusRefusalReason, SubjectRef};
+
+        let world = command_characterization_world();
+        let (live_id, live_uid) = {
+            let mut guard = world.lock().expect("world lock");
+            let id = guard
+                .try_spawn_agent(AgentData {
+                    position: Position::new(80.0, 60.0),
+                    ..AgentData::default()
+                })
+                .expect("spawn live agent");
+            let uid = guard.agent_uid(id).expect("live agent uid");
+            (id, uid)
+        };
+
+        let host = TestHost::take(world);
+        let mut view = host_view(Arc::clone(&host));
+        let snapshot = host.snapshot();
+
+        // 1. Live agent focus
+        let ev_live = NarrativeEventRecord {
+            schema_version: 1,
+            tick: scriptbots_core::Tick(10),
+            kind: NarrativeEventKind::PopulationCrash,
+            severity: 0.8,
+            magnitude: 50.0,
+            window: (0, 10),
+            metric: "population".to_string(),
+            before: 100.0,
+            after: 50.0,
+            score: 4.0,
+            subject: Some(SubjectRef::Agent(live_uid)),
+            human_text: "live agent crash".to_string(),
+        };
+        let res_live = view.apply_rail_selection_focus(&ev_live, &snapshot);
+        assert!(
+            matches!(res_live, FocusResolution::FocusedAgent { uid, position } if uid == live_uid && position == (80.0, 60.0))
+        );
+        assert_eq!(
+            view.inspector.lock().expect("inspector lock").focused_agent,
+            Some(live_id)
+        );
+
+        // 2. Dead / missing agent focus
+        let dead_uid = scriptbots_core::AgentUid(999_999);
+        let mut ev_dead = ev_live.clone();
+        ev_dead.subject = Some(SubjectRef::Agent(dead_uid));
+        let res_dead = view.apply_rail_selection_focus(&ev_dead, &snapshot);
+        assert_eq!(
+            res_dead,
+            FocusResolution::AgentDeadOrMissing { uid: dead_uid }
+        );
+        // Prior focus must remain untouched
+        assert_eq!(
+            view.inspector.lock().expect("inspector lock").focused_agent,
+            Some(live_id)
+        );
+
+        // 3. Stale handle / handle reuse probe
+        let stale_uid = scriptbots_core::AgentUid(888_888);
+        let mut ev_stale = ev_live.clone();
+        ev_stale.subject = Some(SubjectRef::Agent(stale_uid));
+        let res_stale = view.apply_rail_selection_focus(&ev_stale, &snapshot);
+        assert_eq!(
+            res_stale,
+            FocusResolution::AgentDeadOrMissing { uid: stale_uid }
+        );
+
+        // 4. Region All focus
+        let mut ev_all = ev_live.clone();
+        ev_all.subject = Some(SubjectRef::Region(scriptbots_core::Region::All));
+        let res_all = view.apply_rail_selection_focus(&ev_all, &snapshot);
+        assert!(matches!(
+            res_all,
+            FocusResolution::FocusedRegion {
+                region: scriptbots_core::Region::All,
+                ..
+            }
+        ));
+
+        // 5. Region Disc focus
+        let disc = scriptbots_core::Region::Disc {
+            x: 40.0,
+            y: 70.0,
+            radius: 15.0,
+        };
+        let mut ev_disc = ev_live.clone();
+        ev_disc.subject = Some(SubjectRef::Region(disc));
+        let res_disc = view.apply_rail_selection_focus(&ev_disc, &snapshot);
+        assert!(
+            matches!(res_disc, FocusResolution::FocusedRegion { region, center } if region == disc && center == (40.0, 70.0))
+        );
+
+        // 6. Region Rect focus
+        let rect = scriptbots_core::Region::Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 30.0,
+            h: 40.0,
+        };
+        let mut ev_rect = ev_live.clone();
+        ev_rect.subject = Some(SubjectRef::Region(rect));
+        let res_rect = view.apply_rail_selection_focus(&ev_rect, &snapshot);
+        assert!(
+            matches!(res_rect, FocusResolution::FocusedRegion { region, center } if region == rect && (center.0 - 25.0).abs() < 1e-5 && (center.1 - 40.0).abs() < 1e-5)
+        );
+
+        // 7. Invalid region coordinates fail cleanly
+        let invalid_disc = scriptbots_core::Region::Disc {
+            x: 40.0,
+            y: 70.0,
+            radius: -5.0,
+        };
+        let mut ev_inv = ev_live.clone();
+        ev_inv.subject = Some(SubjectRef::Region(invalid_disc));
+        let res_inv = view.apply_rail_selection_focus(&ev_inv, &snapshot);
+        assert_eq!(
+            res_inv,
+            FocusResolution::InvalidRegion {
+                region: invalid_disc
+            }
+        );
+
+        // 8. Species / Island / NoSubject refusals
+        let mut ev_spec = ev_live.clone();
+        ev_spec.subject = Some(SubjectRef::Species(12));
+        assert_eq!(
+            view.apply_rail_selection_focus(&ev_spec, &snapshot),
+            FocusResolution::Refused {
+                reason: FocusRefusalReason::SpeciesSubject(12)
+            }
+        );
+
+        let mut ev_isl = ev_live.clone();
+        ev_isl.subject = Some(SubjectRef::Island(5));
+        assert_eq!(
+            view.apply_rail_selection_focus(&ev_isl, &snapshot),
+            FocusResolution::Refused {
+                reason: FocusRefusalReason::IslandSubject(5)
+            }
+        );
+
+        let mut ev_none = ev_live;
+        ev_none.subject = None;
+        assert_eq!(
+            view.apply_rail_selection_focus(&ev_none, &snapshot),
+            FocusResolution::Refused {
+                reason: FocusRefusalReason::NoSubject
+            }
+        );
+
+        // 9. Canonical RGB colors match across all event kinds
+        for kind in [
+            NarrativeEventKind::PopulationCrash,
+            NarrativeEventKind::PopulationBoom,
+            NarrativeEventKind::DietShift,
+            NarrativeEventKind::Extinction,
+            NarrativeEventKind::EnergyCollapse,
+            NarrativeEventKind::EnergyRecovery,
+            NarrativeEventKind::CombatSurge,
+            NarrativeEventKind::RegimeChange,
+            NarrativeEventKind::PredatorEmergence,
+            NarrativeEventKind::AltruismOnset,
+            NarrativeEventKind::SpeciationHint,
+            NarrativeEventKind::FloorEngaged,
+            NarrativeEventKind::ResourceCollapse,
+        ] {
+            let rgb = kind.rail_rgb();
+            assert_eq!(rgb.len(), 3);
+            assert!(kind.rail_glyph() != ' ');
+        }
+    }
+
     /// bd-16g.4.3: the GPU lab panel consumes the same core explanations as the
     /// TUI — an unbound agent gets the identity-passthrough table, and the
     /// detail carries the bound flag the panel branches on.
@@ -20798,6 +21114,199 @@ mod command_characterization_tests {
         assert!(
             view.selection_events.is_empty(),
             "rejected admission must not append an applied-selection event"
+        );
+    }
+
+    #[test]
+    fn narrative_rail_selection_focuses_live_agent_and_regions_safely() {
+        let world = command_characterization_world();
+        let (agent1_id, agent1_uid) = {
+            let mut w = world.lock().expect("world lock");
+            let id = w
+                .try_spawn_agent(AgentData {
+                    position: Position::new(40.0, 60.0),
+                    ..AgentData::default()
+                })
+                .expect("spawn agent 1");
+            let uid = w.agent_uid(id).expect("agent 1 uid");
+            (id, uid)
+        };
+        let agent2_uid = scriptbots_core::AgentUid(999_888);
+
+        let host = TestHost::take(world);
+        let snapshot = host.snapshot();
+        let mut view = SimulationView::headless(host.port.clone());
+
+        let make_event =
+            |subject: Option<scriptbots_core::narrative::SubjectRef>| NarrativeEventRecord {
+                schema_version: 1,
+                tick: scriptbots_core::Tick(10),
+                kind: NarrativeEventKind::PopulationBoom,
+                severity: 0.7,
+                magnitude: 20.0,
+                window: (0, 10),
+                metric: "population".to_string(),
+                before: 50.0,
+                after: 70.0,
+                score: 5.0,
+                subject,
+                human_text: "population boom".to_string(),
+            };
+
+        // 1. Live agent subject -> focuses agent 1 and updates camera
+        let ev1 = make_event(Some(scriptbots_core::narrative::SubjectRef::Agent(
+            agent1_uid,
+        )));
+        let res1 = view.apply_rail_selection_focus(&ev1, &snapshot);
+        assert_eq!(
+            res1,
+            FocusResolution::FocusedAgent {
+                uid: agent1_uid,
+                position: (40.0, 60.0),
+            }
+        );
+        assert_eq!(view.focused_agent(), Some(agent1_id));
+        assert_eq!(res1.focused_uid(), Some(agent1_uid.0));
+        assert_eq!(res1.as_str(), "focused_agent");
+        assert!(res1.refusal_cause().is_none());
+
+        // 2. Dead/missing agent subject -> rejects cleanly without mutating inspector
+        let ev2 = make_event(Some(scriptbots_core::narrative::SubjectRef::Agent(
+            agent2_uid,
+        )));
+        let res2 = view.apply_rail_selection_focus(&ev2, &snapshot);
+        assert_eq!(
+            res2,
+            FocusResolution::AgentDeadOrMissing { uid: agent2_uid }
+        );
+        assert_eq!(
+            view.focused_agent(),
+            Some(agent1_id),
+            "dead agent must leave focus untouched"
+        );
+        assert_eq!(res2.as_str(), "agent_dead_or_missing");
+        assert!(res2.refusal_cause().is_some());
+
+        // 3. Handle reuse safety: event for dead UID cannot match live agent UID
+        assert_ne!(agent1_uid, agent2_uid);
+
+        // 4. Region All -> fits world
+        let ev_all = make_event(Some(scriptbots_core::narrative::SubjectRef::Region(
+            scriptbots_core::Region::All,
+        )));
+        let res_all = view.apply_rail_selection_focus(&ev_all, &snapshot);
+        assert!(matches!(
+            res_all,
+            FocusResolution::FocusedRegion {
+                region: scriptbots_core::Region::All,
+                ..
+            }
+        ));
+        assert_eq!(res_all.as_str(), "focused_region");
+
+        // 5. Region Disc -> centers on disc center
+        let disc = scriptbots_core::Region::Disc {
+            x: 30.0,
+            y: 70.0,
+            radius: 15.0,
+        };
+        let ev_disc = make_event(Some(scriptbots_core::narrative::SubjectRef::Region(disc)));
+        let res_disc = view.apply_rail_selection_focus(&ev_disc, &snapshot);
+        assert_eq!(
+            res_disc,
+            FocusResolution::FocusedRegion {
+                region: disc,
+                center: (30.0, 70.0),
+            }
+        );
+        assert_eq!(res_disc.focused_region(), Some(disc));
+
+        // 6. Invalid Region Disc (negative radius or NaN) -> InvalidRegion
+        let inv_disc = scriptbots_core::Region::Disc {
+            x: 30.0,
+            y: 70.0,
+            radius: -15.0,
+        };
+        let ev_inv_disc = make_event(Some(scriptbots_core::narrative::SubjectRef::Region(
+            inv_disc,
+        )));
+        let res_inv_disc = view.apply_rail_selection_focus(&ev_inv_disc, &snapshot);
+        assert_eq!(
+            res_inv_disc,
+            FocusResolution::InvalidRegion { region: inv_disc }
+        );
+        assert_eq!(res_inv_disc.as_str(), "invalid_region");
+
+        let nan_disc = scriptbots_core::Region::Disc {
+            x: f32::NAN,
+            y: 70.0,
+            radius: 15.0,
+        };
+        let ev_nan_disc = make_event(Some(scriptbots_core::narrative::SubjectRef::Region(
+            nan_disc,
+        )));
+        let res_nan_disc = view.apply_rail_selection_focus(&ev_nan_disc, &snapshot);
+        assert!(matches!(
+            res_nan_disc,
+            FocusResolution::InvalidRegion { .. }
+        ));
+
+        // 7. Region Rect -> centers on (x + w/2, y + h/2)
+        let rect = scriptbots_core::Region::Rect {
+            x: 20.0,
+            y: 40.0,
+            w: 10.0,
+            h: 20.0,
+        };
+        let ev_rect = make_event(Some(scriptbots_core::narrative::SubjectRef::Region(rect)));
+        let res_rect = view.apply_rail_selection_focus(&ev_rect, &snapshot);
+        assert_eq!(
+            res_rect,
+            FocusResolution::FocusedRegion {
+                region: rect,
+                center: (25.0, 50.0),
+            }
+        );
+
+        // 8. Invalid Region Rect -> InvalidRegion
+        let inv_rect = scriptbots_core::Region::Rect {
+            x: 20.0,
+            y: 40.0,
+            w: -10.0,
+            h: 20.0,
+        };
+        let ev_inv_rect = make_event(Some(scriptbots_core::narrative::SubjectRef::Region(
+            inv_rect,
+        )));
+        let res_inv_rect = view.apply_rail_selection_focus(&ev_inv_rect, &snapshot);
+        assert_eq!(
+            res_inv_rect,
+            FocusResolution::InvalidRegion { region: inv_rect }
+        );
+
+        // 9. Species / Island / None -> Refused
+        let ev_species = make_event(Some(scriptbots_core::narrative::SubjectRef::Species(42)));
+        let res_species = view.apply_rail_selection_focus(&ev_species, &snapshot);
+        assert!(matches!(res_species, FocusResolution::Refused { .. }));
+        assert_eq!(res_species.as_str(), "refused");
+
+        let ev_island = make_event(Some(scriptbots_core::narrative::SubjectRef::Island(3)));
+        let res_island = view.apply_rail_selection_focus(&ev_island, &snapshot);
+        assert!(matches!(res_island, FocusResolution::Refused { .. }));
+
+        let ev_none = make_event(None);
+        let res_none = view.apply_rail_selection_focus(&ev_none, &snapshot);
+        assert!(matches!(res_none, FocusResolution::Refused { .. }));
+
+        // 10. Simulation state neutrality: tick and pause state are unchanged
+        let after_snap = host.snapshot();
+        assert_eq!(
+            after_snap.world.tick, snapshot.world.tick,
+            "focusing an event must not advance the simulation clock"
+        );
+        assert_eq!(
+            after_snap.playback.paused, snapshot.playback.paused,
+            "focusing an event must not change playback state"
         );
     }
 

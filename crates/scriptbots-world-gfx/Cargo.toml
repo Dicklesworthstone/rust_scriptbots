@@ -18,6 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
+naga = { version = "27", features = ["termcolor"] }
 
 [features]
 default = []
@@ -48,6 +49,5 @@ scriptbots-index = { path = "../scriptbots-index" }
 # ship as source and are compiled by wgpu at pipeline creation, so this buys a
 # compile-time gate without adding anything to the shipped binary. Same version
 # as scriptbots-render already uses, so no new lock entry.
-naga = { version = "27" }
 wgpu = { version = "27", default-features = false, features = ["noop"] }
 tracing-subscriber = { workspace = true }

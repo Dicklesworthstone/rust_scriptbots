@@ -5146,7 +5146,58 @@ pub enum Region {
     },
 }
 
+impl Eq for Region {}
+
+impl std::hash::Hash for Region {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match *self {
+            Self::All => {}
+            Self::Disc { x, y, radius } => {
+                x.to_bits().hash(state);
+                y.to_bits().hash(state);
+                radius.to_bits().hash(state);
+            }
+            Self::Rect { x, y, w, h } => {
+                x.to_bits().hash(state);
+                y.to_bits().hash(state);
+                w.to_bits().hash(state);
+                h.to_bits().hash(state);
+            }
+        }
+    }
+}
+
 impl Region {
+    /// Whether coordinates and dimensions are finite and valid.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        match *self {
+            Self::All => true,
+            Self::Disc { x, y, radius } => {
+                x.is_finite() && y.is_finite() && radius.is_finite() && radius > 0.0
+            }
+            Self::Rect { x, y, w, h } => {
+                x.is_finite()
+                    && y.is_finite()
+                    && w.is_finite()
+                    && h.is_finite()
+                    && w > 0.0
+                    && h > 0.0
+            }
+        }
+    }
+
+    /// Center point of the region on the world plane.
+    #[must_use]
+    pub fn center(&self, world_w: f32, world_h: f32) -> (f32, f32) {
+        match *self {
+            Self::All => (world_w * 0.5, world_h * 0.5),
+            Self::Disc { x, y, .. } => (x, y),
+            Self::Rect { x, y, w, h } => (f32::mul_add(w, 0.5, x), f32::mul_add(h, 0.5, y)),
+        }
+    }
+
     /// Whether a point lies inside this region on the torus.
     #[must_use]
     pub fn contains(&self, px: f32, py: f32, world_width: f32, world_height: f32) -> bool {
@@ -5256,7 +5307,7 @@ pub enum CohortSource {
 }
 
 /// How cohort positions are sampled without consuming world RNG.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "placement", rename_all = "snake_case")]
 pub enum Placement {
     /// Uniform sampling inside the region, driven by the carried seed. The seed IS the
@@ -5635,7 +5686,7 @@ pub struct ActiveEffect {
 /// surfaces (TUI, REST, MCP) read the ring and emit the
 /// `scriptbots::intervention` logs. Observational history like the narrative
 /// ring: never part of the characterization digest or checkpoints.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedInterventionRecord {
     /// Monotonic sequence within the run, starting at 1; surfaces watermark on it.
     pub seq: u64,
@@ -15017,10 +15068,9 @@ pub mod narrative {
         ZeroHistoryCapacity,
     }
 
-    /// Stable UID (agent/species/island) for narrative events.
+    /// Stable UID (agent/species/island) or spatial region for narrative events.
     /// Never a slotmap key (slotmap keys are reused after death, corrupting ancestry).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case", tag = "type", content = "id")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum SubjectRef {
         /// Agent identity.
         Agent(crate::AgentUid),
@@ -15028,6 +15078,90 @@ pub mod narrative {
         Species(u64),
         /// Island/archipelago identity.
         Island(u64),
+        /// Spatial region identity or bounds.
+        Region(crate::Region),
+    }
+
+    impl Serialize for SubjectRef {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(2))?;
+            match self {
+                Self::Agent(uid) => {
+                    map.serialize_entry("type", "agent")?;
+                    map.serialize_entry("id", &uid.0)?;
+                }
+                Self::Species(id) => {
+                    map.serialize_entry("type", "species")?;
+                    map.serialize_entry("id", id)?;
+                }
+                Self::Island(id) => {
+                    map.serialize_entry("type", "island")?;
+                    map.serialize_entry("id", id)?;
+                }
+                Self::Region(region) => {
+                    map.serialize_entry("type", "region")?;
+                    map.serialize_entry("region", region)?;
+                }
+            }
+            map.end()
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SubjectRef {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawSubject {
+                #[serde(rename = "type")]
+                kind: String,
+                id: Option<u64>,
+                region: Option<crate::Region>,
+                x: Option<f32>,
+                y: Option<f32>,
+                radius: Option<f32>,
+                w: Option<f32>,
+                h: Option<f32>,
+            }
+
+            let raw = RawSubject::deserialize(deserializer)?;
+            match raw.kind.as_str() {
+                "agent" => raw
+                    .id
+                    .map(|id| Self::Agent(crate::AgentUid(id)))
+                    .ok_or_else(|| serde::de::Error::missing_field("id")),
+                "species" => raw
+                    .id
+                    .map(Self::Species)
+                    .ok_or_else(|| serde::de::Error::missing_field("id")),
+                "island" => raw
+                    .id
+                    .map(Self::Island)
+                    .ok_or_else(|| serde::de::Error::missing_field("id")),
+                "region" => {
+                    if let Some(reg) = raw.region {
+                        Ok(Self::Region(reg))
+                    } else if let (Some(x), Some(y), Some(radius)) = (raw.x, raw.y, raw.radius) {
+                        Ok(Self::Region(crate::Region::Disc { x, y, radius }))
+                    } else if let (Some(x), Some(y), Some(w), Some(h)) =
+                        (raw.x, raw.y, raw.w, raw.h)
+                    {
+                        Ok(Self::Region(crate::Region::Rect { x, y, w, h }))
+                    } else {
+                        Ok(Self::Region(crate::Region::All))
+                    }
+                }
+                other => Err(serde::de::Error::unknown_variant(
+                    other,
+                    &["agent", "species", "island", "region"],
+                )),
+            }
+        }
     }
 
     impl SubjectRef {
@@ -15038,14 +15172,21 @@ pub mod narrative {
                 Self::Agent(uid) => format!("agent:{}", uid.0),
                 Self::Species(id) => format!("species:{id}"),
                 Self::Island(id) => format!("island:{id}"),
+                Self::Region(crate::Region::All) => "region:all".to_string(),
+                Self::Region(crate::Region::Disc { x, y, radius }) => {
+                    format!("region:disc:{x}:{y}:{radius}")
+                }
+                Self::Region(crate::Region::Rect { x, y, w, h }) => {
+                    format!("region:rect:{x}:{y}:{w}:{h}")
+                }
             }
         }
 
         /// Decode `SubjectRef` from database string.
-        pub fn from_db_string(s: &str) -> Result<Self, String> {
-            let (kind, id_str) = s
+        pub fn from_db_string(raw: &str) -> Result<Self, String> {
+            let (kind, id_str) = raw
                 .split_once(':')
-                .ok_or_else(|| format!("invalid subject_ref format: '{s}'"))?;
+                .ok_or_else(|| format!("invalid subject_ref format: '{raw}'"))?;
             match kind {
                 "agent" => id_str
                     .parse::<u64>()
@@ -15059,6 +15200,49 @@ pub mod narrative {
                     .parse::<u64>()
                     .map(Self::Island)
                     .map_err(|e| format!("invalid island id '{id_str}': {e}")),
+                "region" => {
+                    let parts: Vec<&str> = id_str.split(':').collect();
+                    match parts.as_slice() {
+                        ["all"] => Ok(Self::Region(crate::Region::All)),
+                        ["disc", dx, dy, dr] => {
+                            let disc_x = dx
+                                .parse::<f32>()
+                                .map_err(|e| format!("invalid disc x: {e}"))?;
+                            let disc_y = dy
+                                .parse::<f32>()
+                                .map_err(|e| format!("invalid disc y: {e}"))?;
+                            let radius = dr
+                                .parse::<f32>()
+                                .map_err(|e| format!("invalid disc r: {e}"))?;
+                            Ok(Self::Region(crate::Region::Disc {
+                                x: disc_x,
+                                y: disc_y,
+                                radius,
+                            }))
+                        }
+                        ["rect", rx, ry, rw, rh] => {
+                            let rect_x = rx
+                                .parse::<f32>()
+                                .map_err(|e| format!("invalid rect x: {e}"))?;
+                            let rect_y = ry
+                                .parse::<f32>()
+                                .map_err(|e| format!("invalid rect y: {e}"))?;
+                            let rect_w = rw
+                                .parse::<f32>()
+                                .map_err(|e| format!("invalid rect w: {e}"))?;
+                            let rect_h = rh
+                                .parse::<f32>()
+                                .map_err(|e| format!("invalid rect h: {e}"))?;
+                            Ok(Self::Region(crate::Region::Rect {
+                                x: rect_x,
+                                y: rect_y,
+                                w: rect_w,
+                                h: rect_h,
+                            }))
+                        }
+                        _ => Err(format!("invalid region format: '{id_str}'")),
+                    }
+                }
                 other => Err(format!("unknown subject_ref type '{other}'")),
             }
         }
@@ -15095,6 +15279,153 @@ pub mod narrative {
         pub subject: Option<SubjectRef>,
         /// Deterministic, templated prose. Never model-generated.
         pub human_text: String,
+    }
+
+    /// Typed renderer-neutral focus command decoded from an `EventRecord`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum TimelineFocusCommand {
+        /// Focus on a specific agent by stable UID.
+        FocusAgent(crate::AgentUid),
+        /// Focus on a specific spatial region.
+        FocusRegion(crate::Region),
+        /// The event has no focusable spatial subject.
+        NoFocus {
+            /// Reason why the event has no spatial focus.
+            reason: FocusRefusalReason,
+        },
+    }
+
+    /// Why an event's subject cannot be focused spatially.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub enum FocusRefusalReason {
+        /// The event has no subject field (`subject: None`).
+        NoSubject,
+        /// Subject is a species (non-spatial aggregate subject).
+        SpeciesSubject(u64),
+        /// Subject is an island (macro / archipelago subject).
+        IslandSubject(u64),
+        /// Unrecognized or invalid subject format.
+        InvalidSubject,
+    }
+
+    impl std::fmt::Display for FocusRefusalReason {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NoSubject => write!(f, "event has no subject"),
+                Self::SpeciesSubject(id) => write!(f, "species {id} has no spatial focus"),
+                Self::IslandSubject(id) => write!(f, "island {id} has no local spatial focus"),
+                Self::InvalidSubject => write!(f, "invalid subject"),
+            }
+        }
+    }
+
+    impl TimelineFocusCommand {
+        /// Decode an optional `SubjectRef` into a typed focus command.
+        #[must_use]
+        pub const fn from_subject(subject: Option<SubjectRef>) -> Self {
+            match subject {
+                Some(SubjectRef::Agent(uid)) => Self::FocusAgent(uid),
+                Some(SubjectRef::Region(region)) => Self::FocusRegion(region),
+                Some(SubjectRef::Species(id)) => Self::NoFocus {
+                    reason: FocusRefusalReason::SpeciesSubject(id),
+                },
+                Some(SubjectRef::Island(id)) => Self::NoFocus {
+                    reason: FocusRefusalReason::IslandSubject(id),
+                },
+                None => Self::NoFocus {
+                    reason: FocusRefusalReason::NoSubject,
+                },
+            }
+        }
+    }
+
+    impl EventRecord {
+        /// Decode `self.subject` into a typed renderer-neutral focus command without reparsing prose.
+        #[must_use]
+        pub const fn focus_command(&self) -> TimelineFocusCommand {
+            TimelineFocusCommand::from_subject(self.subject)
+        }
+    }
+
+    /// Result of attempting to resolve a `TimelineFocusCommand` against live simulation state.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum FocusResolution {
+        /// Successfully focused a live agent.
+        FocusedAgent {
+            /// Focused agent stable UID.
+            uid: crate::AgentUid,
+            /// Resolved position of the agent on the world plane.
+            position: (f32, f32),
+        },
+        /// Successfully focused a region.
+        FocusedRegion {
+            /// Focused region.
+            region: crate::Region,
+            /// Center point of the focused region.
+            center: (f32, f32),
+        },
+        /// Agent was not found in the live population (e.g. dead or missing).
+        AgentDeadOrMissing {
+            /// Agent UID that could not be found.
+            uid: crate::AgentUid,
+        },
+        /// Region coordinates are non-finite or invalid.
+        InvalidRegion {
+            /// Invalid region.
+            region: crate::Region,
+        },
+        /// Subject cannot be focused (e.g. non-spatial subject or no subject).
+        Refused {
+            /// Refusal reason.
+            reason: FocusRefusalReason,
+        },
+    }
+
+    impl FocusResolution {
+        /// Machine-readable resolution result tag.
+        #[must_use]
+        pub const fn as_str(&self) -> &'static str {
+            match self {
+                Self::FocusedAgent { .. } => "focused_agent",
+                Self::FocusedRegion { .. } => "focused_region",
+                Self::AgentDeadOrMissing { .. } => "agent_dead_or_missing",
+                Self::InvalidRegion { .. } => "invalid_region",
+                Self::Refused { .. } => "refused",
+            }
+        }
+
+        /// Focused agent UID if successfully resolved.
+        #[must_use]
+        pub const fn focused_uid(&self) -> Option<u64> {
+            match self {
+                Self::FocusedAgent { uid, .. } => Some(uid.0),
+                _ => None,
+            }
+        }
+
+        /// Focused region if successfully resolved.
+        #[must_use]
+        pub const fn focused_region(&self) -> Option<crate::Region> {
+            match self {
+                Self::FocusedRegion { region, .. } => Some(*region),
+                _ => None,
+            }
+        }
+
+        /// Refusal cause explanation if unresolved or refused.
+        #[must_use]
+        pub fn refusal_cause(&self) -> Option<String> {
+            match self {
+                Self::AgentDeadOrMissing { uid } => {
+                    Some(format!("agent {} dead or missing", uid.0))
+                }
+                Self::InvalidRegion { .. } => {
+                    Some("invalid region bounds or coordinates".to_string())
+                }
+                Self::Refused { reason } => Some(reason.to_string()),
+                Self::FocusedAgent { .. } | Self::FocusedRegion { .. } => None,
+            }
+        }
     }
 
     /// Metric name the narrative vocabulary treats as the population series.
@@ -34250,6 +34581,118 @@ mod tests {
             assert!(kind.rail_glyph() != ' ');
             assert_ne!(kind.as_str(), "");
         }
+    }
+
+    #[test]
+    fn subject_ref_db_string_and_serde_roundtrip_all_variants() {
+        use narrative::SubjectRef;
+        let subjects = vec![
+            SubjectRef::Agent(crate::AgentUid(42)),
+            SubjectRef::Species(101),
+            SubjectRef::Island(7),
+            SubjectRef::Region(Region::All),
+            SubjectRef::Region(Region::Disc {
+                x: 15.5,
+                y: 25.5,
+                radius: 10.0,
+            }),
+            SubjectRef::Region(Region::Rect {
+                x: 5.0,
+                y: 10.0,
+                w: 20.0,
+                h: 30.0,
+            }),
+        ];
+
+        for subject in subjects {
+            // DB string round-trip
+            let db_str = subject.to_db_string();
+            let parsed = SubjectRef::from_db_string(&db_str).expect("parse valid db string");
+            assert_eq!(parsed, subject, "db string roundtrip failed for {db_str}");
+
+            // JSON serde round-trip
+            let json = serde_json::to_string(&subject).expect("serialize subject");
+            let decoded: SubjectRef =
+                serde_json::from_str(&json).expect("deserialize subject from json");
+            assert_eq!(decoded, subject, "json serde roundtrip failed for {json}");
+        }
+
+        // Malformed DB strings fail closed
+        assert!(SubjectRef::from_db_string("").is_err());
+        assert!(SubjectRef::from_db_string("unknown:123").is_err());
+        assert!(SubjectRef::from_db_string("agent:not_a_num").is_err());
+        assert!(SubjectRef::from_db_string("species:not_a_num").is_err());
+        assert!(SubjectRef::from_db_string("island:not_a_num").is_err());
+        assert!(SubjectRef::from_db_string("region:disc:invalid").is_err());
+        assert!(SubjectRef::from_db_string("region:rect:1:2:3:invalid").is_err());
+    }
+
+    #[test]
+    fn timeline_focus_command_decoding_and_refusal() {
+        use narrative::{
+            EventKind, EventRecord, FocusRefusalReason, SubjectRef, TimelineFocusCommand,
+        };
+
+        let make_event = |subject: Option<SubjectRef>| EventRecord {
+            schema_version: 1,
+            tick: Tick(100),
+            kind: EventKind::PopulationCrash,
+            severity: 0.8,
+            magnitude: 50.0,
+            window: (90, 100),
+            metric: "population".to_string(),
+            before: 100.0,
+            after: 50.0,
+            score: 4.5,
+            subject,
+            human_text: "population fell 50%".to_string(),
+        };
+
+        // 1. Agent subject
+        let ev_agent = make_event(Some(SubjectRef::Agent(crate::AgentUid(999))));
+        assert_eq!(
+            ev_agent.focus_command(),
+            TimelineFocusCommand::FocusAgent(crate::AgentUid(999))
+        );
+
+        // 2. Region subject
+        let disc = Region::Disc {
+            x: 50.0,
+            y: 60.0,
+            radius: 20.0,
+        };
+        let ev_region = make_event(Some(SubjectRef::Region(disc)));
+        assert_eq!(
+            ev_region.focus_command(),
+            TimelineFocusCommand::FocusRegion(disc)
+        );
+
+        // 3. Species subject (non-spatial)
+        let ev_species = make_event(Some(SubjectRef::Species(42)));
+        assert_eq!(
+            ev_species.focus_command(),
+            TimelineFocusCommand::NoFocus {
+                reason: FocusRefusalReason::SpeciesSubject(42),
+            }
+        );
+
+        // 4. Island subject (non-local)
+        let ev_island = make_event(Some(SubjectRef::Island(3)));
+        assert_eq!(
+            ev_island.focus_command(),
+            TimelineFocusCommand::NoFocus {
+                reason: FocusRefusalReason::IslandSubject(3),
+            }
+        );
+
+        // 5. No subject
+        let ev_none = make_event(None);
+        assert_eq!(
+            ev_none.focus_command(),
+            TimelineFocusCommand::NoFocus {
+                reason: FocusRefusalReason::NoSubject,
+            }
+        );
     }
 
     #[test]
