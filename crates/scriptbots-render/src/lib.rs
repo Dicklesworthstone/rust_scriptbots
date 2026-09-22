@@ -2741,6 +2741,8 @@ pub struct SimulationView {
     attribution_warned: std::collections::HashSet<(u64, &'static str)>,
     /// The last (agent, tick) the panel's probed-tick debug line was emitted for.
     attribution_last_debug: Option<(u64, u64)>,
+    /// Presentation-only VFX ring tracking live multi-tick events (bd-bufm).
+    vfx_projection: vfx::VfxProjection,
 }
 impl SimulationView {
     /// Construct a headless SimulationView for testing or non-windowed interaction (bd-farh).
@@ -2842,6 +2844,7 @@ impl SimulationView {
             rail_warned_aged_out: false,
             attribution_warned: std::collections::HashSet::new(),
             attribution_last_debug: None,
+            vfx_projection: vfx::VfxProjection::default(),
         }
     }
 
@@ -3323,7 +3326,19 @@ impl SimulationView {
             snapshot.narrative = published.narrative_events.as_ref().clone();
             snapshot.narrative_dropped = published.narrative_dropped_events;
             snapshot.narrative_capacity = config.narrative_capacity;
-            snapshot.render_frame = RenderFrame::from_snapshot(&published, accessibility.palette);
+            self.vfx_projection.ingest(
+                published.world.tick,
+                published
+                    .visual_events
+                    .iter()
+                    .map(vfx::LocatedVfx::from_located_world_event),
+            );
+            let vfx_frame = self.vfx_projection.frame_at(published.world.tick);
+            snapshot.render_frame = RenderFrame::from_snapshot_with_vfx(
+                &published,
+                accessibility.palette,
+                Some(vfx_frame),
+            );
             if let Some(frame) = snapshot.render_frame.as_mut() {
                 for agent in &mut frame.agents {
                     agent.selection = if selection_projection
@@ -11696,6 +11711,7 @@ impl FollowMode {
 struct SimulationControls {
     draw_agents: bool,
     draw_food: bool,
+    draw_vfx: bool,
     follow_mode: FollowMode,
     agent_outline: bool,
 }
@@ -11705,6 +11721,7 @@ impl Default for SimulationControls {
         Self {
             draw_agents: true,
             draw_food: true,
+            draw_vfx: true,
             follow_mode: FollowMode::Off,
             agent_outline: false,
         }
@@ -11717,6 +11734,7 @@ impl SimulationControls {
             paused,
             draw_agents: self.draw_agents,
             draw_food: self.draw_food,
+            draw_vfx: self.draw_vfx,
             speed_multiplier,
             follow_mode: self.follow_mode,
             agent_outline: self.agent_outline,
@@ -11724,14 +11742,29 @@ impl SimulationControls {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct ControlsSnapshot {
     paused: bool,
     draw_agents: bool,
     draw_food: bool,
+    draw_vfx: bool,
     speed_multiplier: f32,
     follow_mode: FollowMode,
     agent_outline: bool,
+}
+
+impl Default for ControlsSnapshot {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            draw_agents: true,
+            draw_food: true,
+            draw_vfx: true,
+            speed_multiplier: 1.0,
+            follow_mode: FollowMode::Off,
+            agent_outline: false,
+        }
+    }
 }
 
 fn sparkline_from_history<F>(history: &[HudHistoryEntry], map: F) -> Option<SparklineSeries>
@@ -14032,6 +14065,7 @@ struct RenderFrame {
     sense_radius: f32,
     post_stack: PostProcessStack,
     palette: ColorPaletteMode,
+    vfx: vfx::VfxFrame,
 }
 
 #[derive(Clone)]
@@ -14356,6 +14390,14 @@ struct CanvasState {
 
 impl RenderFrame {
     fn from_snapshot(snapshot: &RenderSnapshot, palette: ColorPaletteMode) -> Option<Self> {
+        Self::from_snapshot_with_vfx(snapshot, palette, None)
+    }
+
+    fn from_snapshot_with_vfx(
+        snapshot: &RenderSnapshot,
+        palette: ColorPaletteMode,
+        vfx: Option<vfx::VfxFrame>,
+    ) -> Option<Self> {
         let food = &snapshot.layers.food;
         if food.width == 0 || food.height == 0 || !snapshot.agent_visuals_complete() {
             return None;
@@ -14434,6 +14476,17 @@ impl RenderFrame {
                 .map(|layer| layer.water_depth.as_slice()),
         );
         let (day_night_cycle_ticks, day_night_start_phase) = config.render.resolved_day_night();
+        let vfx = vfx.unwrap_or_else(|| {
+            let mut projection = vfx::VfxProjection::default();
+            projection.ingest(
+                snapshot.world.tick,
+                snapshot
+                    .visual_events
+                    .iter()
+                    .map(vfx::LocatedVfx::from_located_world_event),
+            );
+            projection.frame_at(snapshot.world.tick)
+        });
         Some(Self {
             tick: snapshot.world.tick,
             tonemap_mode: config.render.tonemap_mode,
@@ -14458,6 +14511,7 @@ impl RenderFrame {
                 palette,
             ),
             palette,
+            vfx,
         })
     }
 
@@ -14601,6 +14655,15 @@ impl RenderFrame {
                 .map(scriptbots_core::HydrologyState::water_depth),
         );
         let (day_night_cycle_ticks, day_night_start_phase) = config.render.resolved_day_night();
+        let mut projection = vfx::VfxProjection::default();
+        projection.ingest(
+            world.tick().0,
+            world
+                .visual_events()
+                .iter()
+                .map(vfx::LocatedVfx::from_located_world_event),
+        );
+        let vfx = projection.frame_at(world.tick().0);
 
         Some(Self {
             tick: world.tick().0,
@@ -14619,6 +14682,7 @@ impl RenderFrame {
             sense_radius: config.sense_radius,
             post_stack: build_post_process_stack(world, palette),
             palette,
+            vfx,
         })
     }
 }
@@ -16611,6 +16675,7 @@ mod continuous_world_raster_tests {
             sense_radius: 1.0,
             post_stack: PostProcessStack { passes: Vec::new() },
             palette: ColorPaletteMode::Natural,
+            vfx: vfx::VfxFrame::empty(17),
         }
     }
 
@@ -17860,6 +17925,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
         }
     }
 
+    if controls.draw_vfx {
+        let _ = vfx::paint_underlay(&frame.vfx, &camera_snapshot, frame.palette, window);
+    }
+
     if controls.draw_agents {
         if very_low_fps {
             paint_agent_lod_batches(
@@ -18033,6 +18102,10 @@ fn paint_frame(state: &CanvasState, bounds: Bounds<Pixels>, window: &mut Window)
                 );
             }
         }
+    }
+
+    if controls.draw_vfx {
+        let _ = vfx::paint_overlay(&frame.vfx, &camera_snapshot, frame.palette, window);
     }
 
     if controls.draw_agents {
@@ -22906,6 +22979,7 @@ mod backend_agreement_tests {
             agent_base_radius: 12.0,
             sense_radius: 50.0,
             post_stack: PostProcessStack { passes: Vec::new() },
+            vfx: vfx::VfxFrame::empty(100),
             palette: ColorPaletteMode::Natural,
         };
 

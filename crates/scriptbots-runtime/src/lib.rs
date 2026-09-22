@@ -660,6 +660,12 @@ pub struct RenderSnapshot {
     pub narrative_events: Arc<Vec<scriptbots_core::narrative::EventRecord>>,
     /// Number of narrative records evicted before the retained ring.
     pub narrative_dropped_events: u64,
+    /// Located visual events from this completed world boundary for rendering and visual effects.
+    #[serde(with = "serde_arc", default)]
+    pub visual_events: Arc<Vec<scriptbots_core::LocatedWorldVisualEvent>>,
+    /// Number of visual events dropped this boundary due to buffer limits.
+    #[serde(default)]
+    pub visual_dropped_events: u64,
     /// Living agents with two parents, counted from actual runtime rows.
     pub hybrid_count: usize,
     /// Configuration in effect at this boundary.
@@ -5655,6 +5661,8 @@ mod tests {
             scheduled_patches: Arc::new(Vec::new()),
             narrative_events: Arc::new(Vec::new()),
             narrative_dropped_events: 0,
+            visual_events: Arc::new(Vec::new()),
+            visual_dropped_events: 0,
             hybrid_count: 0,
             config: Arc::new(ScriptBotsConfig::default()),
             config_audit: Arc::new(Vec::new()),
@@ -6382,6 +6390,8 @@ mod tests {
                 charts_flushed: false,
                 epoch_rolled: false,
                 food_respawned: None,
+                visual_events: Vec::new(),
+                visual_dropped_events: 0,
             },
             projection_summary(tick),
             Vec::new(),
@@ -6502,6 +6512,8 @@ mod tests {
                     charts_flushed: false,
                     epoch_rolled: false,
                     food_respawned: None,
+                    visual_events: Vec::new(),
+                    visual_dropped_events: 0,
                 },
                 projection_summary(1),
                 vec![birth],
@@ -7598,6 +7610,8 @@ mod tests {
                 scheduled_patches: Arc::new(Vec::new()),
                 narrative_events: Arc::new(Vec::new()),
                 narrative_dropped_events: 0,
+                visual_events: Arc::new(Vec::new()),
+                visual_dropped_events: 0,
                 hybrid_count: 0,
                 config: Arc::new(ScriptBotsConfig::default()),
                 config_audit: Arc::new(Vec::new()),

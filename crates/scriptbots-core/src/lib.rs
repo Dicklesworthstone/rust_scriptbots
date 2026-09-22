@@ -97,6 +97,7 @@ pub mod sense_fixed;
 pub use sense_fixed::{SenseProvider, SenseProviderError};
 pub mod species;
 pub mod visual;
+pub use visual::{LocatedWorldVisualEvent, WorldVisualEvent};
 
 pub use map_elites as qd;
 pub use map_elites::{
@@ -7893,7 +7894,7 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 /// Events emitted after processing a world tick.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TickEvents {
     /// Completed tick.
     pub tick: Tick,
@@ -7903,6 +7904,12 @@ pub struct TickEvents {
     pub epoch_rolled: bool,
     /// Respawned food cell coordinates, if a respawn occurred.
     pub food_respawned: Option<(u32, u32)>,
+    /// Located visual events emitted during this tick for rendering and telemetry.
+    #[serde(default)]
+    pub visual_events: Vec<visual::LocatedWorldVisualEvent>,
+    /// Number of visual events dropped this tick due to buffer capacity limit.
+    #[serde(default)]
+    pub visual_dropped_events: u64,
 }
 
 /// Summary emitted to persistence hooks each tick.
@@ -19355,6 +19362,9 @@ pub struct WorldState {
     novelty_state: Option<NoveltyState>,
     consecutive_zero_novelty_samples: u32,
     sense_provider: Option<Box<dyn SenseProvider>>,
+    visual_events: Vec<visual::LocatedWorldVisualEvent>,
+    visual_dropped_events_this_tick: u64,
+    visual_dropped_events_total: u64,
 }
 
 // bd-tqpj: intentional curated summary — a full-field Debug would dump entire world
@@ -20079,6 +20089,55 @@ fn project_persistence_batch(drain: BoundaryDrain) -> PersistenceProjection {
 // `suboptimal_flops` rationale. A new cast or reassociation candidate anywhere else therefore
 // fails lint instead of disappearing inside an 8,500-line blanket exemption.
 impl WorldState {
+    /// Maximum number of visual events retained within a single simulation tick.
+    pub const MAX_TICK_VISUAL_EVENTS: usize = 1024;
+
+    /// Push a located visual event for the current tick, capping at [`Self::MAX_TICK_VISUAL_EVENTS`].
+    pub fn push_visual_event(
+        &mut self,
+        tick: Tick,
+        source: Option<AgentUid>,
+        target: Option<AgentUid>,
+        position: Position,
+        direction: [f32; 2],
+        event: visual::WorldVisualEvent,
+    ) {
+        if self.visual_events.len() < Self::MAX_TICK_VISUAL_EVENTS {
+            let ordinal = u32::try_from(self.visual_events.len()).unwrap_or(u32::MAX);
+            self.visual_events.push(visual::LocatedWorldVisualEvent {
+                tick,
+                ordinal,
+                source,
+                target,
+                position,
+                direction,
+                event,
+            });
+        } else {
+            self.visual_dropped_events_this_tick =
+                self.visual_dropped_events_this_tick.saturating_add(1);
+            self.visual_dropped_events_total = self.visual_dropped_events_total.saturating_add(1);
+        }
+    }
+
+    /// Read the visual events emitted during the current/most recently completed tick.
+    #[must_use]
+    pub fn visual_events(&self) -> &[visual::LocatedWorldVisualEvent] {
+        &self.visual_events
+    }
+
+    /// Read the number of visual events dropped during the current/most recently completed tick.
+    #[must_use]
+    pub const fn visual_dropped_events_this_tick(&self) -> u64 {
+        self.visual_dropped_events_this_tick
+    }
+
+    /// Read the total number of visual events dropped since world creation due to buffer limits.
+    #[must_use]
+    pub const fn visual_dropped_events_total(&self) -> u64 {
+        self.visual_dropped_events_total
+    }
+
     /// Instantiate a new world using the supplied configuration.
     pub fn new(config: ScriptBotsConfig) -> Result<Self, WorldStateError> {
         Self::build(config)
@@ -20259,6 +20318,9 @@ impl WorldState {
             novelty_state: None,
             consecutive_zero_novelty_samples: 0,
             sense_provider: None,
+            visual_events: Vec::with_capacity(64),
+            visual_dropped_events_this_tick: 0,
+            visual_dropped_events_total: 0,
         })
     }
 
@@ -22552,13 +22614,65 @@ impl WorldState {
             }
         }
 
+        let mut visual_boosts_and_spikes = Vec::new();
         for (idx, agent_id) in handles.iter().enumerate() {
             if let Some(runtime) = self.runtime.get_mut(*agent_id) {
                 runtime.energy = results[idx].energy;
                 runtime.sound_output = results[idx].sound_level;
                 runtime.sound_multiplier = results[idx].sound_level;
                 runtime.give_intent = results[idx].give_intent;
+
+                let is_boost = runtime.outputs.boost_engaged();
+                let boost_magnitude = if is_boost {
+                    Some(runtime.outputs.peak_wheel_output().clamp(0.0, 1.0))
+                } else {
+                    None
+                };
+                let spike_target = runtime.outputs.channel_clamped(OutputChannel::SpikeTarget);
+                let is_spike =
+                    spike_target > 0.2 && results[idx].spike_length > spike_lengths_snapshot[idx];
+                if (is_boost || is_spike)
+                    && let Some(uid) = self.identities.get(*agent_id).map(|id| id.uid)
+                {
+                    visual_boosts_and_spikes.push((idx, uid, boost_magnitude, is_spike));
+                }
             }
+        }
+
+        let visual_events_to_push: Vec<_> = {
+            let columns = self.agents.columns();
+            let positions = columns.positions();
+            let headings = columns.headings();
+            let mut events = Vec::new();
+            for (idx, uid, boost_magnitude, is_spike) in visual_boosts_and_spikes {
+                let pos = positions[idx];
+                let heading = headings[idx];
+                let heading_dir = [heading.cos(), heading.sin()];
+                if let Some(magnitude) = boost_magnitude {
+                    events.push((
+                        Some(uid),
+                        None,
+                        pos,
+                        heading_dir,
+                        visual::WorldVisualEvent::Boost { magnitude },
+                    ));
+                }
+                if is_spike {
+                    events.push((
+                        Some(uid),
+                        None,
+                        pos,
+                        heading_dir,
+                        visual::WorldVisualEvent::SpikeExtend,
+                    ));
+                }
+            }
+            events
+        };
+
+        let tick = self.tick.next();
+        for (source, target, pos, dir, event) in visual_events_to_push {
+            self.push_visual_event(tick, source, target, pos, dir, event);
         }
     }
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
@@ -24032,11 +24146,9 @@ impl WorldState {
         self.work_positions.clear();
         self.work_positions
             .extend_from_slice(self.agents.columns().positions());
-        let positions = &self.work_positions;
 
         self.work_handles.clear();
         self.work_handles.extend(self.agents.iter_handles());
-        let handles = &self.work_handles;
 
         let mut sharers: Vec<usize> = Vec::new();
         let food_width = self.food.width() as usize;
@@ -24048,62 +24160,67 @@ impl WorldState {
         let waste_rate = self.config.food_waste_rate.max(0.0);
         let reproduction_bonus = self.config.reproduction_food_bonus.max(0.0);
         let fertility_bonus_scale = self.config.reproduction_fertility_bonus.max(0.0);
-        let healths = self.agents.columns().health();
-        let velocities = self.agents.columns().velocities();
-        for (idx, agent_id) in handles.iter().enumerate() {
-            let pos = positions[idx];
-            // Computed before the mutable runtime borrow: the embargo scale
-            // reads active effects (immutable) and must not alias the agent.
-            let embargo_scale = self.intake_scale_for_position(pos.x, pos.y);
-            if let Some(runtime) = self.runtime.get_mut(*agent_id) {
-                // legacy C++ gate: a full agent neither eats nor wastes cell food
-                #[cfg(feature = "economy-faults")]
-                let health_gate =
-                    if ledger_fault == Some(LedgerFault::CreditIntakeWithoutHealthGate) {
-                        // THE FAULT (bd-16g.11.2): full agents drain cells forever.
-                        true
+        let mut visual_eats = Vec::new();
+        {
+            let positions = &self.work_positions;
+            let handles = &self.work_handles;
+            let healths = self.agents.columns().health();
+            let velocities = self.agents.columns().velocities();
+            let headings = self.agents.columns().headings();
+            for (idx, agent_id) in handles.iter().enumerate() {
+                let pos = positions[idx];
+                // Computed before the mutable runtime borrow: the embargo scale
+                // reads active effects (immutable) and must not alias the agent.
+                let embargo_scale = self.intake_scale_for_position(pos.x, pos.y);
+                if let Some(runtime) = self.runtime.get_mut(*agent_id) {
+                    // legacy C++ gate: a full agent neither eats nor wastes cell food
+                    #[cfg(feature = "economy-faults")]
+                    let health_gate =
+                        if ledger_fault == Some(LedgerFault::CreditIntakeWithoutHealthGate) {
+                            // THE FAULT (bd-16g.11.2): full agents drain cells forever.
+                            true
+                        } else {
+                            healths[idx] < 2.0
+                        };
+                    #[cfg(not(feature = "economy-faults"))]
+                    let health_gate = healths[idx] < 2.0;
+                    let stillness_gate = if self.config.food_requires_stillness {
+                        let v = velocities[idx];
+                        let speed = v.vx.hypot(v.vy);
+                        speed <= self.config.stillness_speed_threshold
                     } else {
-                        healths[idx] < 2.0
+                        true
                     };
-                #[cfg(not(feature = "economy-faults"))]
-                let health_gate = healths[idx] < 2.0;
-                let stillness_gate = if self.config.food_requires_stillness {
-                    let v = velocities[idx];
-                    let speed = v.vx.hypot(v.vy);
-                    speed <= self.config.stillness_speed_threshold
-                } else {
-                    true
-                };
-                if (intake_rate > 0.0 || waste_rate > 0.0) && health_gate && stillness_gate {
-                    // bd-9zq2: positions are wrapped into [0, extent) by the toroidal
-                    // geometry before this stage, so the value floored here is non-negative
-                    // and in range. NOTE: unlike the two sense paths, this one relies on that
-                    // invariant instead of `rem_euclid` — a negative x would saturate to 0
-                    // rather than wrap. Recorded on bd-9zq2 as a divergence worth converging.
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
-                    let profile_index = (cell_y as usize) * food_width + cell_x as usize;
-                    let profile =
-                        self.food_profiles
-                            .get(profile_index)
-                            .copied()
-                            .unwrap_or(FoodCellProfile {
+                    if (intake_rate > 0.0 || waste_rate > 0.0) && health_gate && stillness_gate {
+                        // bd-9zq2: positions are wrapped into [0, extent) by the toroidal
+                        // geometry before this stage, so the value floored here is non-negative
+                        // and in range. NOTE: unlike the two sense paths, this one relies on that
+                        // invariant instead of `rem_euclid` — a negative x would saturate to 0
+                        // rather than wrap. Recorded on bd-9zq2 as a divergence worth converging.
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let cell_x = (pos.x / cell_size).floor() as u32 % self.food.width();
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let cell_y = (pos.y / cell_size).floor() as u32 % self.food.height();
+                        let profile_index = (cell_y as usize) * food_width + cell_x as usize;
+                        let profile = self.food_profiles.get(profile_index).copied().unwrap_or(
+                            FoodCellProfile {
                                 capacity: self.config.food_max,
                                 growth_multiplier: 1.0,
                                 decay_multiplier: 1.0,
                                 fertility: 0.0,
                                 nutrient_density: 0.3,
-                            });
-                    if let Some(cell) = self.food.get_mut(cell_x, cell_y) {
-                        let available = *cell;
-                        if available > 0.0 {
-                            let base_intake = available.min(intake_rate);
-                            let waste = available.min(waste_rate);
-                            let herbivore = clamp01(runtime.herbivore_tendency);
-                            let intake =
-                                if herbivore > 0.0 && base_intake > 0.0 && embargo_scale > 0.0 {
+                            },
+                        );
+                        if let Some(cell) = self.food.get_mut(cell_x, cell_y) {
+                            let available = *cell;
+                            if available > 0.0 {
+                                let base_intake = available.min(intake_rate);
+                                let waste = available.min(waste_rate);
+                                let herbivore = clamp01(runtime.herbivore_tendency);
+                                let intake = if herbivore > 0.0
+                                    && base_intake > 0.0
+                                    && embargo_scale > 0.0
+                                {
                                     let left =
                                         runtime.outputs.channel_clamped(OutputChannel::WheelLeft);
                                     let right =
@@ -24115,37 +24232,63 @@ impl WorldState {
                                 } else {
                                     0.0
                                 };
-                            if waste > 0.0 {
-                                *cell = (available - waste).max(0.0);
-                            }
-                            if intake > 0.0 {
-                                let nutrient = profile.nutrient_density;
-                                let energy_gain = intake * (0.5 + nutrient * 0.5);
-                                let energy_before = runtime.energy;
-                                runtime.energy = (runtime.energy + energy_gain).min(2.0);
-                                activity.rejected_energy += f64::from(
-                                    (energy_gain - (runtime.energy - energy_before)).max(0.0),
-                                );
-                                runtime.food_delta += energy_gain;
-                                if reproduction_bonus > 0.0 {
-                                    let fertility_multiplier =
-                                        1.0 + profile.fertility * fertility_bonus_scale;
-                                    runtime.reproduction_counter +=
-                                        intake * reproduction_bonus * fertility_multiplier;
+                                if waste > 0.0 {
+                                    *cell = (available - waste).max(0.0);
+                                }
+                                if intake > 0.0 {
+                                    let nutrient = profile.nutrient_density;
+                                    let energy_gain = intake * (0.5 + nutrient * 0.5);
+                                    let energy_before = runtime.energy;
+                                    runtime.energy = (runtime.energy + energy_gain).min(2.0);
+                                    activity.rejected_energy += f64::from(
+                                        (energy_gain - (runtime.energy - energy_before)).max(0.0),
+                                    );
+                                    runtime.food_delta += energy_gain;
+                                    if reproduction_bonus > 0.0 {
+                                        let fertility_multiplier =
+                                            1.0 + profile.fertility * fertility_bonus_scale;
+                                        runtime.reproduction_counter +=
+                                            intake * reproduction_bonus * fertility_multiplier;
+                                    }
+                                    if let Some(uid) =
+                                        self.identities.get(*agent_id).map(|id| id.uid)
+                                    {
+                                        let heading = headings[idx];
+                                        visual_eats.push((
+                                            uid,
+                                            pos,
+                                            [heading.cos(), heading.sin()],
+                                            intake,
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                if runtime.give_intent > 0.5 {
-                    sharers.push(idx);
+                    if runtime.give_intent > 0.5 {
+                        sharers.push(idx);
+                    }
                 }
             }
+        }
+
+        for (uid, pos, dir, intake) in visual_eats {
+            self.push_visual_event(
+                replay_tick,
+                Some(uid),
+                None,
+                pos,
+                dir,
+                visual::WorldVisualEvent::Eat { amount: intake },
+            );
         }
 
         if sharers.is_empty() {
             return activity;
         }
+
+        let positions = &self.work_positions;
+        let handles = &self.work_handles;
 
         let transfer_rate = self.config.food_transfer_rate;
         if transfer_rate <= 0.0 {
@@ -25077,6 +25220,7 @@ impl WorldState {
                 envelope: genome.clone(),
             });
         }
+        let parent_uid = runtime.lineage[0];
         let id = self.agents.insert(data);
         self.identities.insert(id, identity);
         self.agent_rng_counters.insert(id, rng_counters);
@@ -25085,6 +25229,17 @@ impl WorldState {
             self.pending_lifecycle_birth_metrics.push(record.clone());
         }
         self.pending_birth_records.push(record);
+        if record_tick > Tick::zero() {
+            let heading_dir = [data.heading.cos(), data.heading.sin()];
+            self.push_visual_event(
+                record_tick,
+                Some(identity.uid),
+                parent_uid,
+                data.position,
+                heading_dir,
+                visual::WorldVisualEvent::Birth { origin },
+            );
+        }
         id
     }
 
@@ -25371,6 +25526,7 @@ impl WorldState {
             result
         });
 
+        let mut visual_combat_hits = Vec::new();
         let mut interaction_events = Vec::with_capacity(interaction_slots.min(64));
         let mut interaction_events_dropped = 0usize;
         for (attacker_idx, result) in results.iter().enumerate() {
@@ -25383,10 +25539,6 @@ impl WorldState {
                 continue;
             };
             for hit in &result.hits {
-                if interaction_events.len() >= interaction_slots {
-                    interaction_events_dropped = interaction_events_dropped.saturating_add(1);
-                    continue;
-                }
                 let Some(target_id) = handles.get(hit.target_idx).copied() else {
                     continue;
                 };
@@ -25394,6 +25546,18 @@ impl WorldState {
                 else {
                     continue;
                 };
+                let heading = headings[attacker_idx];
+                visual_combat_hits.push((
+                    attacker,
+                    target,
+                    positions[hit.target_idx],
+                    [heading.cos(), heading.sin()],
+                    hit.damage,
+                ));
+                if interaction_events.len() >= interaction_slots {
+                    interaction_events_dropped = interaction_events_dropped.saturating_add(1);
+                    continue;
+                }
                 interaction_events.push(PendingReplayInteraction {
                     actor: attacker,
                     actor_position: positions[attacker_idx],
@@ -25504,6 +25668,16 @@ impl WorldState {
             interaction_events,
             interaction_events_dropped,
         );
+        for (attacker, target, pos, dir, damage) in visual_combat_hits {
+            self.push_visual_event(
+                replay_tick,
+                Some(attacker),
+                Some(target),
+                pos,
+                dir,
+                visual::WorldVisualEvent::CombatHit { damage },
+            );
+        }
     }
 
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
@@ -25818,6 +25992,27 @@ impl WorldState {
                 .collect()
         };
         if !death_records.is_empty() {
+            let visual_deaths: Vec<_> = {
+                let columns = self.agents.columns();
+                dead.iter()
+                    .zip(death_records.iter())
+                    .map(|((idx, _), record)| {
+                        let data = columns.snapshot(*idx);
+                        let heading_dir = [data.heading.cos(), data.heading.sin()];
+                        (record.agent_uid, data.position, heading_dir, record.cause)
+                    })
+                    .collect()
+            };
+            for (uid, pos, heading_dir, cause) in visual_deaths {
+                self.push_visual_event(
+                    tick,
+                    Some(uid),
+                    None,
+                    pos,
+                    heading_dir,
+                    visual::WorldVisualEvent::Death { cause },
+                );
+            }
             self.pending_lifecycle_death_metrics
                 .extend(death_records.iter().cloned());
             self.pending_death_records.extend(death_records);
@@ -26301,6 +26496,23 @@ impl WorldState {
                 && let Some(stats) = self.agent_stats.get_mut(&identity.uid)
             {
                 stats.record_offspring();
+            }
+            let partner_uid = order
+                .partner_id
+                .and_then(|id| self.identities.get(id).map(|i| i.uid));
+            if let Some(parent_idx) = self.agents.index_of(order.parent_id) {
+                let columns = self.agents.columns();
+                let parent_pos = columns.positions()[parent_idx];
+                let parent_heading = columns.headings()[parent_idx];
+                let heading_dir = [parent_heading.cos(), parent_heading.sin()];
+                self.push_visual_event(
+                    tick,
+                    Some(order.parent_uid),
+                    partner_uid,
+                    parent_pos,
+                    heading_dir,
+                    visual::WorldVisualEvent::Reproduce,
+                );
             }
             let SpawnOrder {
                 parent_uid: _,
@@ -27442,6 +27654,8 @@ impl WorldState {
             .into());
         }
 
+        self.visual_events.clear();
+        self.visual_dropped_events_this_tick = 0;
         self.validate_live_agent_companions()?;
         self.canonicalize_agent_execution_order()?;
         let next_tick = self.tick.next();
@@ -27707,6 +27921,8 @@ impl WorldState {
             charts_flushed: self.cadence.should_emit_chart_event(next_tick),
             epoch_rolled: false,
             food_respawned,
+            visual_events: self.visual_events.clone(),
+            visual_dropped_events: self.visual_dropped_events_this_tick,
         };
 
         observed_stage!(WorldStepStage::Finalize, {

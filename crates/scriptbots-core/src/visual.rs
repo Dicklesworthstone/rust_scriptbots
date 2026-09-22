@@ -29,7 +29,9 @@
 // accidental exact comparison is a lint error rather than an invisible one.
 #![allow(clippy::too_many_lines)]
 
-use crate::{AccessibilityPalette, BirthOrigin, DeathCause, TerrainKind};
+use serde::{Deserialize, Serialize};
+
+use crate::{AccessibilityPalette, AgentUid, BirthOrigin, DeathCause, Position, TerrainKind, Tick};
 
 // ---------------------------------------------------------------------------
 // Art direction (bd-9pqz / bd-l4gu).
@@ -1220,7 +1222,8 @@ pub fn shimmer(tick: u64, cell_x: u32, cell_y: u32) -> f32 {
 /// events (today: tick deltas + persistence records; later: the typed
 /// `EventRecord` stream from bd-16g.2.2) is a separate concern owned by the
 /// frontend/projection beads.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorldVisualEvent {
     /// An agent arrived. Color follows the origin.
     Birth {
@@ -1257,6 +1260,25 @@ pub enum WorldVisualEvent {
         /// Engaged drive magnitude in `[0, 1]`; scales trail length and brightness.
         magnitude: f32,
     },
+}
+
+/// Positioned world visual event with spatial metadata for rendering and telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LocatedWorldVisualEvent {
+    /// Completed simulation tick when this event occurred.
+    pub tick: Tick,
+    /// Accepted ordinal within the tick boundary.
+    pub ordinal: u32,
+    /// Primary actor or source agent identity, if applicable.
+    pub source: Option<AgentUid>,
+    /// Target or secondary agent identity (e.g. combat victim, reproduction partner), if applicable.
+    pub target: Option<AgentUid>,
+    /// World position where the effect originates.
+    pub position: Position,
+    /// Heading or travel unit direction in world coordinates, or `[0.0, 0.0]` for omnidirectional effects.
+    pub direction: [f32; 2],
+    /// Specific typed visual event payload.
+    pub event: WorldVisualEvent,
 }
 
 /// Cue families the two renderers know how to draw.

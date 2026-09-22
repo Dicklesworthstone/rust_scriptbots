@@ -109,6 +109,22 @@ impl LocatedVfx {
         )
     }
 
+    /// Convert from core's [`scriptbots_core::LocatedWorldVisualEvent`].
+    #[must_use]
+    pub(crate) fn from_located_world_event(
+        event: &scriptbots_core::LocatedWorldVisualEvent,
+    ) -> Self {
+        Self::from_world_event(
+            event.tick.0,
+            event.ordinal,
+            event.source,
+            event.target,
+            event.position,
+            event.direction,
+            &event.event,
+        )
+    }
+
     /// Construct a located cue while containing malformed direction input.
     fn from_cue(
         started_tick: u64,
@@ -167,7 +183,7 @@ impl LocatedVfx {
 ///
 /// Keeping the tick beside the events prevents a caller from repainting an
 /// old snapshot with a newer effect age.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct VfxFrame {
     tick: u64,
     events: Arc<[LocatedVfx]>,

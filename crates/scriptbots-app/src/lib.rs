@@ -1682,7 +1682,7 @@ impl RunManifestV3 {
 }
 
 /// One boundary captured in a V2 characterization trace.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TracePointV0 {
     pub tick: u64,
     pub digest: CharacterizationDigestV0,

@@ -4448,6 +4448,8 @@ mod tests {
                 charts_flushed: false,
                 epoch_rolled: false,
                 food_respawned: None,
+                visual_events: Vec::new(),
+                visual_dropped_events: 0,
             },
             TickSummary {
                 tick: Tick(1),
