@@ -3386,6 +3386,80 @@ mod tests {
         assert_eq!(digests.len(), 4, "islands must evolve distinct science");
     }
 
+    /// DSR long lane: 8-island ring archipelago, 5k ticks, migration every 250 (bd-t3ge).
+    /// Asserts per barrier that migration runs, records moves, completes 20 barriers
+    /// without latching, and all 8 islands evolve distinct science digests.
+    #[test]
+    #[ignore = "DSR long lane: 8-island ring archipelago, 5k ticks, migration every 250"]
+    fn dsr_eight_island_ring_archipelago_five_thousand_ticks() {
+        let island_specs: Vec<IslandSpec> = (0..8)
+            .map(|id| {
+                let growth =
+                    0.015f32.mul_add(f32::from(u16::try_from(id).expect("small id")), 0.02);
+                let overlay = serde_json::json!({
+                    "food_growth_rate": growth,
+                });
+                IslandSpec::with_overlay(
+                    IslandId(id),
+                    format!("ring-island-{id}"),
+                    &populated_config(None),
+                    &overlay,
+                )
+                .expect("valid overlay")
+            })
+            .collect();
+        let arch_config = migrating_config(island_specs, 250, EmigrantSelectionRule::Fittest, 2);
+        let mut archipelago =
+            populated_archipelago(arch_config).expect("8-island ring archipelago");
+
+        let mut total_moves = 0;
+        let mut barrier_moves = Vec::with_capacity(20);
+
+        for epoch in 1..=20 {
+            let report = archipelago.step_to_barrier().expect("step to barrier");
+            assert_eq!(archipelago.epoch(), epoch);
+            assert!(archipelago.latched().is_none());
+
+            let migration = report
+                .migration
+                .as_ref()
+                .expect("migration enabled at every barrier");
+            let moves = migration.moves.len();
+            assert!(moves > 0, "epoch {epoch}: migration must produce moves");
+            total_moves += moves;
+            barrier_moves.push((epoch, archipelago.barrier_tick().0, moves));
+        }
+
+        assert_eq!(archipelago.barrier_tick(), Tick(5_000));
+        assert!(total_moves >= 20);
+        assert_eq!(barrier_moves.len(), 20);
+
+        let mut digests = Vec::new();
+        for id in 0..8_u32 {
+            let snapshot = archipelago
+                .island_snapshot(IslandId(id))
+                .expect("committed snapshot");
+            assert_eq!(snapshot.world.tick, 5_000, "island {id} tick count");
+            assert!(
+                snapshot.world.summary.agent_count > 0,
+                "island {id} must remain populated"
+            );
+            digests.push(
+                archipelago
+                    .island_digest(IslandId(id))
+                    .expect("island digest")
+                    .overall,
+            );
+        }
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(
+            digests.len(),
+            8,
+            "all 8 islands must evolve distinct science"
+        );
+    }
+
     #[test]
     fn test_island_spec_with_overlay_and_archipelago_config_from_base_and_overlays() {
         let base = populated_config(None);

@@ -2756,6 +2756,17 @@ impl HostCore {
         self.world.world_digest_v1()
     }
 
+    /// Capture a full typed `WorldCheckpointV1` from the owned world at a quiescent boundary.
+    pub fn capture_checkpoint_v1(
+        &self,
+    ) -> Result<scriptbots_core::WorldCheckpointV1, HostAccessError> {
+        self.world.capture_checkpoint_quiescent().map_err(|error| {
+            HostAccessError::ProtocolViolation {
+                message: error.to_string(),
+            }
+        })
+    }
+
     /// Capture focused inspector data without sharing the world or its evaluator.
     pub fn inspect_agent(
         &self,

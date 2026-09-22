@@ -868,6 +868,37 @@ impl WorldState {
                 found: self.persistence_boundary,
             });
         }
+        self.capture_checkpoint_inner(self.config.clone())
+    }
+
+    /// Capture a V1 checkpoint from a quiescent world whose persistence boundary is resolved.
+    ///
+    /// Unlike [`Self::checkpoint_v1`], which strictly requires `self.config.persistence_interval == 0`,
+    /// this method allows capturing a checkpoint from a live world whose persistence boundary
+    /// is quiescent ([`PersistenceBoundaryStatus::Open`] or [`PersistenceBoundaryStatus::Sealed`]).
+    /// The captured checkpoint envelope contractually normalizes `config.persistence_interval` to 0
+    /// so that restored worlds can be independently bound to a new persistence session via
+    /// [`Self::bind_continuation_persistence`].
+    pub fn capture_checkpoint_quiescent(&self) -> Result<WorldCheckpointV1, WorldCheckpointError> {
+        let expected_boundary_open = PersistenceBoundaryStatus::Open { tick: self.tick };
+        let expected_boundary_sealed = PersistenceBoundaryStatus::Sealed { tick: self.tick };
+        if self.persistence_boundary != expected_boundary_open
+            && self.persistence_boundary != expected_boundary_sealed
+        {
+            return Err(WorldCheckpointError::PersistenceBoundary {
+                tick: self.tick.0,
+                found: self.persistence_boundary,
+            });
+        }
+        let mut config = self.config.clone();
+        config.persistence_interval = 0;
+        self.capture_checkpoint_inner(config)
+    }
+
+    fn capture_checkpoint_inner(
+        &self,
+        config: ScriptBotsConfig,
+    ) -> Result<WorldCheckpointV1, WorldCheckpointError> {
         self.ensure_checkpoint_has_no_deferred_host_output()?;
         let source_digest = self.world_digest_v1()?;
 
@@ -892,7 +923,7 @@ impl WorldState {
             .collect::<Result<Vec<_>, _>>()?;
         let state = WorldCheckpointStateV1 {
             source_digest,
-            config: self.config.clone(),
+            config,
             tick: self.tick,
             epoch: self.epoch,
             random_streams: self.rng.checkpoint(),
@@ -3939,5 +3970,32 @@ mod tests {
                 field: "pending_interventions"
             })
         ));
+    }
+
+    #[test]
+    fn capture_checkpoint_quiescent_succeeds_on_persistence_enabled_world_and_restores_cleanly() {
+        let (mut original, _family_key) = world_with_checkpoint_family();
+        // Enable persistence interval
+        original.config.persistence_interval = 60;
+        let checkpoint = original
+            .capture_checkpoint_quiescent()
+            .expect("capture_checkpoint_quiescent on persistence-enabled world");
+        assert_eq!(checkpoint.config().persistence_interval, 0);
+        assert_eq!(checkpoint.tick().0, 0);
+
+        let registry = prepared_checkpoint_registry();
+        let mut restored = WorldState::restore_checkpoint_v1(&checkpoint, registry)
+            .expect("restore from quiescent capture");
+        assert_eq!(restored.config.persistence_interval, 0);
+        assert_eq!(
+            restored.world_digest_v1().expect("restored digest"),
+            original.world_digest_v1().expect("original digest")
+        );
+
+        // Continuation persistence can be bound on restored world
+        let _session = restored
+            .bind_continuation_persistence(Box::new(crate::NullPersistence), 60, 1024)
+            .expect("bind continuation persistence");
+        assert_eq!(restored.config.persistence_interval, 60);
     }
 }

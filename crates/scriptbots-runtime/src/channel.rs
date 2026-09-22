@@ -848,13 +848,7 @@ impl ChannelHostDriver {
                 let _ = reply.send(result);
             }
             IngressMessage::CaptureCheckpoint { reply } => {
-                let result = self
-                    .host
-                    .core()
-                    .world()
-                    .checkpoint_v1()
-                    .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
-                let _ = reply.send(result);
+                let _ = reply.send(self.host.core().capture_checkpoint_v1());
             }
             IngressMessage::Command { envelope, reply } => {
                 let result = self.host.submit(envelope);
