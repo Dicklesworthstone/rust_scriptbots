@@ -14440,6 +14440,7 @@ mod tests {
                             values: vec![0.5],
                         }],
                         connections: Vec::new(),
+                        output_slots: Vec::new(),
                         truncated: false,
                     },
                     1,
@@ -17337,6 +17338,7 @@ mod tests {
                     values,
                 }],
                 connections: Vec::new(),
+                output_slots: Vec::new(),
                 truncated: false,
             };
             scriptbots_core::bound_brain_inspection("terminal.panel", activations, 0, limits)

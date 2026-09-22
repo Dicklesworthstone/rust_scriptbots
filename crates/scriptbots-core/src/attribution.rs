@@ -57,6 +57,12 @@ pub enum AttributionUnavailable {
     IdentityPassthrough,
     /// The snapshot's topology matches no supported attribution method.
     UnsupportedTopology,
+    /// The snapshot topology was truncated by inspection limits; attribution refused.
+    TruncatedTopology,
+    /// Dynamic self-modifying program; static edge attribution unavailable.
+    DynamicSelfModifyingProgram,
+    /// Placeholder brain with no model loaded.
+    PlaceholderNoModel,
 }
 
 impl AttributionUnavailable {
@@ -72,6 +78,13 @@ impl AttributionUnavailable {
                 "unbound brain: outputs are an identity copy of sensors 0..8"
             }
             Self::UnsupportedTopology => "topology not supported by any attribution method",
+            Self::TruncatedTopology => {
+                "topology truncated by inspection limits; attribution refused"
+            }
+            Self::DynamicSelfModifyingProgram => {
+                "dynamic self-modifying program; static edge attribution unavailable"
+            }
+            Self::PlaceholderNoModel => "placeholder brain with no model loaded",
         }
     }
 }
@@ -229,7 +242,11 @@ pub fn explain_outputs(
         |act| {
             (0..crate::OUTPUT_SIZE)
                 .map(|output| {
-                    attribute_output(act, output, k).expect("output index bounded by OUTPUT_SIZE")
+                    let mut exp = attribute_output(act, output, k)
+                        .expect("output index bounded by OUTPUT_SIZE");
+                    exp.raw_value = outputs[output];
+                    exp.effective = effective_for(OutputChannel::ALL[output], outputs[output]);
+                    exp
                 })
                 .collect()
         },
@@ -245,6 +262,60 @@ pub fn explain_outputs(
 ///
 /// Returns [`AttributionError::OutputOutOfRange`] when `output` is not a valid
 /// actuator slot.
+fn collect_one_hop_attributions(
+    act: &BrainActivations,
+    target_node: usize,
+) -> (Vec<InputAttribution>, bool, u32) {
+    let mut non_finite_skipped = 0_u32;
+    let final_layer = act.layers.last().expect("non-empty layers checked above");
+    let mut one_hop: Vec<InputAttribution> = Vec::new();
+    let mut has_internal_edges = false;
+
+    for edge in &act.connections {
+        if edge.to != target_node {
+            continue;
+        }
+        has_internal_edges |= edge.from >= INPUT_SIZE;
+        if edge.from >= INPUT_SIZE {
+            continue;
+        }
+        if !edge.weight.is_finite() {
+            non_finite_skipped += 1;
+            continue;
+        }
+        let Some(&activation) = final_layer.values.get(edge.from) else {
+            non_finite_skipped += 1;
+            continue;
+        };
+        if !activation.is_finite() {
+            non_finite_skipped += 1;
+            continue;
+        }
+        one_hop.push(InputAttribution {
+            input_index: edge.from,
+            sensor_name: SENSOR_LAYOUT[edge.from].name,
+            contribution: edge.weight * activation,
+            weight: edge.weight,
+            activation,
+        });
+    }
+
+    let mut merged_one_hop: Vec<InputAttribution> = Vec::new();
+    for attr in one_hop {
+        if let Some(existing) = merged_one_hop
+            .iter_mut()
+            .find(|e| e.input_index == attr.input_index)
+        {
+            existing.contribution += attr.contribution;
+            existing.weight += attr.weight;
+        } else {
+            merged_one_hop.push(attr);
+        }
+    }
+
+    (merged_one_hop, has_internal_edges, non_finite_skipped)
+}
+
 ///
 /// # Panics
 ///
@@ -275,78 +346,45 @@ pub fn attribute_output(
     if act.layers.is_empty() {
         return Ok(unavailable(act, AttributionUnavailable::NoActivations));
     }
+    if act.truncated {
+        return Ok(unavailable(act, AttributionUnavailable::TruncatedTopology));
+    }
     if act.connections.is_empty() {
         return Ok(unavailable(act, AttributionUnavailable::NoConnections));
     }
 
-    // One hop: direct sensor→output edges.
-    let mut non_finite_skipped = 0_u32;
-    let final_layer = act.layers.last().expect("non-empty layers checked above");
-    let node_activation = |index: usize| -> Option<f32> {
-        // Sensor slots take the sensor value carried in the FINAL layer's flat
-        // vector when present (the convention documented in the module docs);
-        // anything outside the layer is not an activation we can use.
-        final_layer.values.get(index).copied()
-    };
+    let target_node = act.output_slots.get(output).copied().unwrap_or(output);
 
-    let mut one_hop: Vec<InputAttribution> = Vec::new();
-    let mut has_internal_edges = false;
-    for edge in &act.connections {
-        if edge.to != output {
-            continue;
-        }
-        has_internal_edges |= edge.from >= INPUT_SIZE;
-        if edge.from >= INPUT_SIZE {
-            continue;
-        }
-        if !edge.weight.is_finite() {
-            non_finite_skipped += 1;
-            continue;
-        }
-        let Some(activation) = node_activation(edge.from) else {
-            non_finite_skipped += 1;
-            continue;
-        };
-        if !activation.is_finite() {
-            non_finite_skipped += 1;
-            continue;
-        }
-        one_hop.push(InputAttribution {
-            input_index: edge.from,
-            sensor_name: SENSOR_LAYOUT[edge.from].name,
-            contribution: edge.weight * activation,
-            weight: edge.weight,
-            activation,
-        });
-    }
+    let (one_hop, has_internal_edges, mut non_finite_skipped) =
+        collect_one_hop_attributions(act, target_node);
 
-    let method;
-    let mut inputs = one_hop;
-    if !inputs.is_empty() {
-        method = AttributionMethod::OneHopWeightActivation;
+    let (method, mut inputs) = if !one_hop.is_empty() && !has_internal_edges {
+        (AttributionMethod::OneHopWeightActivation, one_hop)
     } else if has_internal_edges {
-        // Depth-bounded path product: expand internal edges backwards until a
-        // sensor is reached or the documented cap runs out.
-        let (path_inputs, path_skipped) = path_product(act, output, PATH_PRODUCT_DEPTH_CAP);
+        let (path_inputs, path_skipped) = path_product(act, target_node, PATH_PRODUCT_DEPTH_CAP);
         non_finite_skipped += path_skipped;
         if path_inputs.is_empty() {
-            return Ok(unavailable(
-                act,
-                AttributionUnavailable::UnsupportedTopology,
-            ));
+            if one_hop.is_empty() {
+                return Ok(unavailable(
+                    act,
+                    AttributionUnavailable::UnsupportedTopology,
+                ));
+            }
+            (AttributionMethod::OneHopWeightActivation, one_hop)
+        } else {
+            (
+                AttributionMethod::PathProduct {
+                    depth: PATH_PRODUCT_DEPTH_CAP,
+                },
+                path_inputs,
+            )
         }
-        method = AttributionMethod::PathProduct {
-            depth: PATH_PRODUCT_DEPTH_CAP,
-        };
-        inputs = path_inputs;
     } else {
-        // Edges exist but none touch this output at all: that is a topology the
-        // method cannot speak about, not "nothing drives this output".
         return Ok(unavailable(
             act,
             AttributionUnavailable::UnsupportedTopology,
         ));
-    }
+    };
 
     // Explicit total order: |contribution| descending, input_index ascending.
     // total_cmp keeps NaN out of the comparison path (NaN was filtered above).
@@ -370,14 +408,15 @@ pub fn attribute_output(
     })
 }
 
-/// The output's raw value: node `output` of the final layer, or 0.0 when the
+/// The output's raw value: node `target_node` of the final layer, or 0.0 when the
 /// snapshot carries no such slot (the Unavailable paths still owe the panel a
 /// value to display; runtime.outputs is the authoritative source at the
 /// surface).
 fn raw_output_value(act: &BrainActivations, output: usize) -> f32 {
+    let target_node = act.output_slots.get(output).copied().unwrap_or(output);
     act.layers
         .last()
-        .and_then(|layer| layer.values.get(output))
+        .and_then(|layer| layer.values.get(target_node))
         .copied()
         .unwrap_or(0.0)
 }
@@ -463,6 +502,7 @@ mod tests {
         BrainActivations {
             layers,
             connections,
+            output_slots: Vec::new(),
             truncated: false,
         }
     }
@@ -741,5 +781,66 @@ mod tests {
         assert_eq!(OutputChannel::ALL[3].name(), "color_green");
         assert_eq!(OutputChannel::ALL[0].name(), "wheel_left");
         assert_eq!(OutputChannel::ALL[8].name(), "give_intent");
+    }
+
+    #[test]
+    fn output_slots_maps_output_to_arbitrary_neuron() {
+        // Test reverse output mapping: output 0 (wheel_left) maps to neuron 199.
+        let mut values = vec![0.0_f32; 200];
+        values[1] = 0.5; // eye0_red
+        values[199] = 0.85; // activation of neuron 199
+        let mut output_slots = vec![0; crate::OUTPUT_SIZE];
+        output_slots[0] = 199;
+        let act = BrainActivations {
+            layers: vec![fixture_layer(&values)],
+            connections: vec![edge(1, 199, 2.0)],
+            output_slots,
+            truncated: false,
+        };
+
+        let explanation = attribute_output(&act, 0, 3).expect("attribution");
+        assert_eq!(
+            explanation.method,
+            AttributionMethod::OneHopWeightActivation
+        );
+        assert_eq!(explanation.raw_value, 0.85);
+        assert_eq!(explanation.inputs.len(), 1);
+        assert_eq!(explanation.inputs[0].input_index, 1);
+        assert_eq!(explanation.inputs[0].contribution, 1.0);
+    }
+
+    #[test]
+    fn truncated_topology_refuses_partial_attribution() {
+        let act = BrainActivations {
+            layers: vec![fixture_layer(&[0.5; 32])],
+            connections: vec![edge(1, 0, 1.0)],
+            output_slots: Vec::new(),
+            truncated: true,
+        };
+        let explanation = attribute_output(&act, 0, 3).expect("attribution");
+        assert_eq!(
+            explanation.method,
+            AttributionMethod::Unavailable(AttributionUnavailable::TruncatedTopology)
+        );
+        assert_eq!(explanation.inputs.len(), 0);
+    }
+
+    #[test]
+    fn one_hop_coalesces_duplicate_edges_from_same_sensor() {
+        let mut values = vec![0.0_f32; 32];
+        values[1] = 0.5; // eye0_red
+        let act = fixture(
+            vec![fixture_layer(&values)],
+            vec![edge(1, 0, 2.0), edge(1, 0, 1.5)],
+        );
+        let explanation = attribute_output(&act, 0, 3).expect("attribution");
+        assert_eq!(
+            explanation.method,
+            AttributionMethod::OneHopWeightActivation
+        );
+        assert_eq!(explanation.inputs.len(), 1);
+        assert_eq!(explanation.inputs[0].input_index, 1);
+        assert_eq!(explanation.inputs[0].weight, 3.5);
+        assert_eq!(explanation.inputs[0].contribution, 1.75);
     }
 }

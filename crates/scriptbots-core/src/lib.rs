@@ -171,6 +171,10 @@ pub struct BrainActivations {
     /// Weighted edges between layers.
     #[serde(default)]
     pub connections: Vec<ActivationEdge>,
+    /// Mapping from output channel index `0..OUTPUT_SIZE` to neuron index in the final activation layer.
+    /// If empty, output `i` maps to neuron index `i`.
+    #[serde(default)]
+    pub output_slots: Vec<usize>,
     /// Set when the snapshot was clipped to fit [`ACTIVATION_VALUE_BUDGET`].
     ///
     /// An inspector showing a truncated view must say so. Silently dropping
@@ -857,6 +861,7 @@ fn activation_payload_bytes(activations: &BrainActivations) -> usize {
         &activations.layers,
         activations.layers.capacity(),
         activations.connections.capacity(),
+        activations.output_slots.capacity(),
     )
 }
 
@@ -864,6 +869,7 @@ fn activation_payload_bytes_parts(
     layers: &[ActivationLayer],
     layer_capacity: usize,
     connection_capacity: usize,
+    output_slots_capacity: usize,
 ) -> usize {
     layer_capacity
         .saturating_mul(std::mem::size_of::<ActivationLayer>())
@@ -881,6 +887,7 @@ fn activation_payload_bytes_parts(
                 .fold(0usize, usize::saturating_add),
         )
         .saturating_add(connection_capacity.saturating_mul(std::mem::size_of::<ActivationEdge>()))
+        .saturating_add(output_slots_capacity.saturating_mul(std::mem::size_of::<usize>()))
 }
 
 /// Apply the complete structural and retained-byte contract to a family payload.
@@ -953,7 +960,7 @@ pub fn bound_brain_inspection(
         retained_values = retained_values.saturating_add(candidate.values.len());
         layers.push(candidate);
 
-        if activation_payload_bytes_parts(&layers, layers.len(), 0) > limits.max_payload_bytes {
+        if activation_payload_bytes_parts(&layers, layers.len(), 0, 0) > limits.max_payload_bytes {
             let _removed = layers.pop();
             truncated = true;
             break;
@@ -961,12 +968,12 @@ pub fn bound_brain_inspection(
     }
 
     let mut connections = Vec::new();
+    let max_cells = layers
+        .iter()
+        .filter_map(|layer| layer.width.checked_mul(layer.height))
+        .max()
+        .unwrap_or_default();
     if !truncated {
-        let max_cells = layers
-            .iter()
-            .filter_map(|layer| layer.width.checked_mul(layer.height))
-            .max()
-            .unwrap_or_default();
         connections = Vec::with_capacity(source_edges.min(limits.max_edges));
         for edge in activations.connections {
             if connections.len() == limits.max_edges
@@ -978,7 +985,7 @@ pub fn bound_brain_inspection(
                 break;
             }
             connections.push(edge);
-            if activation_payload_bytes_parts(&layers, layers.len(), connections.len())
+            if activation_payload_bytes_parts(&layers, layers.len(), connections.len(), 0)
                 > limits.max_payload_bytes
             {
                 connections.pop();
@@ -988,15 +995,35 @@ pub fn bound_brain_inspection(
         }
     }
 
+    let mut output_slots = activations.output_slots;
+    if truncated {
+        output_slots.clear();
+    } else {
+        output_slots.truncate(OUTPUT_SIZE);
+        if output_slots.iter().any(|&slot| slot >= max_cells)
+            || activation_payload_bytes_parts(
+                &layers,
+                layers.len(),
+                connections.len(),
+                output_slots.len(),
+            ) > limits.max_payload_bytes
+        {
+            truncated = true;
+            output_slots.clear();
+        }
+    }
+
     let mut activations = BrainActivations {
         layers: layers.into_boxed_slice().into_vec(),
         connections: connections.into_boxed_slice().into_vec(),
+        output_slots: output_slots.into_boxed_slice().into_vec(),
         truncated,
     };
     let retained_payload_bytes = activation_payload_bytes(&activations);
     if retained_payload_bytes > limits.max_payload_bytes {
         activations.layers = Vec::new();
         activations.connections = Vec::new();
+        activations.output_slots = Vec::new();
         activations.truncated = true;
     }
     let retained_payload_bytes = activation_payload_bytes(&activations);
@@ -39064,6 +39091,7 @@ mod tests {
                     weight: f32::INFINITY,
                 },
             ],
+            output_slots: Vec::new(),
             truncated: true,
         };
 
@@ -39099,6 +39127,7 @@ mod tests {
             BrainActivations {
                 layers: vec![unit_layer(), unit_layer(), unit_layer()],
                 connections: Vec::new(),
+                output_slots: Vec::new(),
                 truncated: false,
             },
             3,
@@ -39122,6 +39151,7 @@ mod tests {
                     },
                 ],
                 connections: Vec::new(),
+                output_slots: Vec::new(),
                 truncated: false,
             },
             2,
@@ -39149,6 +39179,7 @@ mod tests {
                     },
                 ],
                 connections: Vec::new(),
+                output_slots: Vec::new(),
                 truncated: false,
             },
             5,
@@ -39174,6 +39205,7 @@ mod tests {
                         weight: 0.5,
                     })
                     .collect(),
+                output_slots: Vec::new(),
                 truncated: false,
             },
             4,
@@ -39190,6 +39222,7 @@ mod tests {
             BrainActivations {
                 layers: vec![unit_layer(), unit_layer()],
                 connections: Vec::new(),
+                output_slots: Vec::new(),
                 truncated: false,
             },
             2,
@@ -39216,6 +39249,7 @@ mod tests {
             BrainActivations {
                 layers: oversized_layers,
                 connections: Vec::with_capacity(10_000),
+                output_slots: Vec::new(),
                 truncated: false,
             },
             1,
@@ -39235,6 +39269,7 @@ mod tests {
             BrainActivations {
                 layers: Vec::new(),
                 connections: Vec::new(),
+                output_slots: Vec::new(),
                 truncated: false,
             },
             33,
@@ -39280,6 +39315,7 @@ mod tests {
                             values: vec![0.5],
                         }],
                         connections: Vec::new(),
+                        output_slots: Vec::new(),
                         truncated: false,
                     },
                     1,
@@ -39530,6 +39566,7 @@ mod tests {
                             values,
                         }],
                         connections,
+                        output_slots: Vec::new(),
                         truncated: false,
                     },
                     ACTIVATION_VALUE_BUDGET,

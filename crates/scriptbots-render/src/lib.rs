@@ -19820,6 +19820,7 @@ mod command_characterization_tests {
                             values: vec![0.5],
                         }],
                         connections: Vec::new(),
+                        output_slots: Vec::new(),
                         truncated: false,
                     },
                     1,

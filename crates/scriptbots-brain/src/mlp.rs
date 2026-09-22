@@ -14,7 +14,9 @@ use std::any::Any;
 #[cfg(test)]
 use scriptbots_core::BrainProvenance;
 
-use scriptbots_core::{ActivationLayer, BrainActivations, BrainRunner, INPUT_SIZE, OUTPUT_SIZE};
+use scriptbots_core::{
+    ActivationEdge, ActivationLayer, BrainActivations, BrainRunner, INPUT_SIZE, OUTPUT_SIZE,
+};
 
 use crate::{Brain, BrainKind, into_runner};
 
@@ -250,9 +252,12 @@ impl MlpBrain {
         limits: BrainInspectionLimits,
     ) -> Result<BrainInspectionSnapshot, BrainInspectionError> {
         let source_values = self.state.len();
+        let source_edges = (BRAIN_SIZE - INPUT_SIZE) * CONNECTIONS;
         let source_payload_bytes = std::mem::size_of::<ActivationLayer>()
             .saturating_add(ACTIVATION_LAYER_NAME.len())
-            .saturating_add(source_values.saturating_mul(std::mem::size_of::<f32>()));
+            .saturating_add(source_values.saturating_mul(std::mem::size_of::<f32>()))
+            .saturating_add(source_edges.saturating_mul(std::mem::size_of::<ActivationEdge>()))
+            .saturating_add(OUTPUT_SIZE.saturating_mul(std::mem::size_of::<usize>()));
         let retain_layer = limits.max_layers() >= 1
             && limits.max_name_bytes() >= ACTIVATION_LAYER_NAME.len()
             && limits.max_values() >= source_values
@@ -268,15 +273,30 @@ impl MlpBrain {
                 height: ACTIVATION_LAYER_HEIGHT,
                 values,
             }];
+            let mut connections = Vec::with_capacity(source_edges);
+            for (idx, params) in self.nodes.iter().enumerate().skip(INPUT_SIZE) {
+                for conn in 0..CONNECTIONS {
+                    let from = params.targets[conn];
+                    let to = idx;
+                    let weight = match params.kinds[conn] {
+                        SynapseKind::Regular => params.weights[conn] * params.gain,
+                        SynapseKind::ChangeSensitive => params.weights[conn] * params.gain * 10.0,
+                    };
+                    connections.push(ActivationEdge { from, to, weight });
+                }
+            }
+            let output_slots = (0..OUTPUT_SIZE).map(|o| BRAIN_SIZE - 1 - o).collect();
             BrainActivations {
                 layers,
-                connections: Vec::new(),
+                connections,
+                output_slots,
                 truncated: false,
             }
         } else {
             BrainActivations {
                 layers: Vec::new(),
                 connections: Vec::new(),
+                output_slots: Vec::new(),
                 truncated: true,
             }
         };
@@ -286,7 +306,7 @@ impl MlpBrain {
         snapshot.build.source_layers = 1;
         snapshot.build.source_name_bytes = ACTIVATION_LAYER_NAME.len();
         snapshot.build.source_values = source_values;
-        snapshot.build.source_edges = 0;
+        snapshot.build.source_edges = if retain_layer { source_edges } else { 0 };
         Ok(snapshot)
     }
 }

@@ -2,12 +2,12 @@
 
 use rand::Rng;
 use scriptbots_core::{
-    ActivationLayer, BrainActivations, BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator,
-    BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope,
-    BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainInspection, BrainInspectionError,
-    BrainInspectionLimits, BrainInspectionSnapshot, BrainLocusSchemaIdentityV1,
-    BrainMutationTrialGroupV1, BrainProtocolError, MutationRates, OffspringStatePolicy,
-    RandomStream, bound_brain_inspection,
+    ActivationEdge, ActivationLayer, BrainActivations, BrainAdapterIdentityV1, BrainEnvelopeKind,
+    BrainEvaluator, BrainEvaluatorStateEnvelope, BrainFamilyCodec, BrainFamilyId,
+    BrainGenomeEnvelope, BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainInspection,
+    BrainInspectionError, BrainInspectionLimits, BrainInspectionSnapshot,
+    BrainLocusSchemaIdentityV1, BrainMutationTrialGroupV1, BrainProtocolError, MutationRates,
+    OffspringStatePolicy, RandomStream, bound_brain_inspection,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -206,9 +206,12 @@ impl DwraonBrain {
         limits: BrainInspectionLimits,
     ) -> Result<BrainInspectionSnapshot, BrainInspectionError> {
         let source_values = self.state.len();
+        let source_edges = (BRAIN_SIZE - INPUT_SIZE) * CONNECTIONS;
         let source_payload_bytes = std::mem::size_of::<ActivationLayer>()
             .saturating_add(ACTIVATION_LAYER_NAME.len())
-            .saturating_add(source_values.saturating_mul(std::mem::size_of::<f32>()));
+            .saturating_add(source_values.saturating_mul(std::mem::size_of::<f32>()))
+            .saturating_add(source_edges.saturating_mul(std::mem::size_of::<ActivationEdge>()))
+            .saturating_add(OUTPUT_SIZE.saturating_mul(std::mem::size_of::<usize>()));
         let retain_layer = limits.max_layers() >= 1
             && limits.max_name_bytes() >= ACTIVATION_LAYER_NAME.len()
             && limits.max_values() >= source_values
@@ -224,15 +227,56 @@ impl DwraonBrain {
                 height: ACTIVATION_LAYER_HEIGHT,
                 values,
             }];
+            let mut connections = Vec::with_capacity(source_edges);
+            for (idx, params) in self.nodes.iter().enumerate().skip(INPUT_SIZE) {
+                let damping = params.damping.clamp(0.01, 1.0);
+                match params.kind {
+                    NodeKind::Or => {
+                        for conn in 0..CONNECTIONS {
+                            let from = params.sources[conn];
+                            let to = idx;
+                            let sign = if params.inverted[conn] { -1.0 } else { 1.0 };
+                            let weight = sign * params.weights[conn] * damping;
+                            connections.push(ActivationEdge { from, to, weight });
+                        }
+                    }
+                    NodeKind::And => {
+                        let mut inputs = [0.0; CONNECTIONS];
+                        for conn in 0..CONNECTIONS {
+                            let mut val = self.source_output(params.sources[conn]);
+                            if params.inverted[conn] {
+                                val = 1.0 - val;
+                            }
+                            inputs[conn] = val.clamp(0.0, 1.0);
+                        }
+                        for conn in 0..CONNECTIONS {
+                            let from = params.sources[conn];
+                            let to = idx;
+                            let mut other_prod = 1.0_f32;
+                            for (other, &other_val) in inputs.iter().enumerate().take(CONNECTIONS) {
+                                if other != conn {
+                                    other_prod *= other_val;
+                                }
+                            }
+                            let sign = if params.inverted[conn] { -1.0 } else { 1.0 };
+                            let weight = sign * other_prod * params.bias * damping;
+                            connections.push(ActivationEdge { from, to, weight });
+                        }
+                    }
+                }
+            }
+            let output_slots = (0..OUTPUT_SIZE).map(|o| BRAIN_SIZE - 1 - o).collect();
             BrainActivations {
                 layers,
-                connections: Vec::new(),
+                connections,
+                output_slots,
                 truncated: false,
             }
         } else {
             BrainActivations {
                 layers: Vec::new(),
                 connections: Vec::new(),
+                output_slots: Vec::new(),
                 truncated: true,
             }
         };
@@ -242,7 +286,7 @@ impl DwraonBrain {
         snapshot.build.source_layers = 1;
         snapshot.build.source_name_bytes = ACTIVATION_LAYER_NAME.len();
         snapshot.build.source_values = source_values;
-        snapshot.build.source_edges = 0;
+        snapshot.build.source_edges = if retain_layer { source_edges } else { 0 };
         Ok(snapshot)
     }
 }

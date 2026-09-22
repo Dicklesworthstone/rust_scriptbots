@@ -878,6 +878,7 @@ impl NeuroflowBrain {
         let activations = BrainActivations {
             layers: layers.into_boxed_slice().into_vec(),
             connections: Vec::new(),
+            output_slots: Vec::new(),
             truncated: retained_layers < source_layers.len(),
         };
         let mut snapshot = bound_brain_inspection(

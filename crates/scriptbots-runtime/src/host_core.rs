@@ -6432,6 +6432,7 @@ mod tests {
                         values: vec![0.25, 0.75],
                     }],
                     connections: Vec::new(),
+                    output_slots: Vec::new(),
                     truncated: false,
                 },
                 2,
