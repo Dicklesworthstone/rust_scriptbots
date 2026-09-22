@@ -5,7 +5,7 @@
 //! replay/digest behavior with zero mocks: baseline verification must succeed and a
 //! perturbed candidate must report its first divergence.
 
-use scriptbots_storage::StorageReader;
+use scriptbots_storage::{Connection, RowExt, StorageReader};
 use std::{
     env,
     ffi::OsString,
@@ -303,5 +303,137 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
     assert!(
         compare_out.contains("mismatch") || compare_out.contains("divergence"),
         "comparison must report the first divergence: {compare_out}"
+    );
+}
+
+#[test]
+fn mock_free_checkpoint_start_replay_e2e() {
+    let temp_dir = tempdir().expect("temp run directory");
+    let database = temp_dir.path().join("checkpoint_run.sqlite");
+    let db_str = database.display().to_string();
+
+    // 1. Produce a real file-backed baseline run.
+    let produced = produce_run(&database, &[]);
+    assert!(
+        produced.status.success(),
+        "baseline terminal run failed: {}",
+        stderr_text(&produced)
+    );
+
+    // 2. Step a matching world headlessly to tick 12 and capture a valid WorldCheckpointV1.
+    let config = scriptbots_core::ScriptBotsConfig {
+        rng_seed: Some(SEED),
+        persistence_interval: 0,
+        ..scriptbots_core::ScriptBotsConfig::default()
+    };
+    let mut world = scriptbots_core::WorldState::new(config).expect("build world");
+    let brain_keys = scriptbots_app::install_brains(&mut world, scriptbots_app::BrainPreset::Mixed)
+        .expect("install brains")
+        .population;
+    scriptbots_app::seed_founding_population(&mut world, &brain_keys).expect("seed founders");
+    for _ in 0..12 {
+        world.step().expect("step world");
+    }
+    let checkpoint = world.checkpoint_v1().expect("capture tick 12 checkpoint");
+    assert_eq!(checkpoint.tick().0, 12);
+
+    // 3. Persist the checkpoint into the existing SQLite database using Connection.
+    let encoded = checkpoint.encode().expect("encode checkpoint");
+    let payload = encoded.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let payload_digest = format!("blake3:{}", blake3::hash(&encoded).to_hex());
+    let schema_format = format!("{}+postcard_hex", scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA);
+
+    let connection = Connection::open(&db_str).expect("open connection");
+    let run_id: String = connection
+        .query_row("SELECT run_id FROM runs LIMIT 1")
+        .expect("query run_id")
+        .get_typed(0)
+        .expect("get run_id");
+    connection
+        .execute_with_params(
+            "INSERT INTO checkpoints (run_id, checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                run_id.into(),
+                "cp-tick-12".into(),
+                12i64.into(),
+                0i64.into(),
+                schema_format.into(),
+                payload.into(),
+                payload_digest.into(),
+                "{}".into(),
+            ],
+        )
+        .expect("insert checkpoint");
+    connection.close().expect("close connection");
+
+    // 4. Verify replay WITHOUT --checkpoint-start: runs from tick 0.
+    let mut verify_full = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    verify_full
+        .arg("--replay-db")
+        .arg(&database)
+        .arg("--threads")
+        .arg("1")
+        .arg("--set")
+        .arg(format!("rng_seed={SEED}"))
+        .arg("--set")
+        .arg("persistence_interval=1")
+        .arg("--set")
+        .arg("replay_event_tick_cap=65536");
+    let full_out = verify_full.output().expect("run full replay");
+    let full_text = strip_ansi(&format!("{}{}", stdout_text(&full_out), stderr_text(&full_out)));
+    assert!(full_out.status.success(), "full replay failed: {full_text}");
+    assert!(full_text.contains("Replay matched"), "full replay must match: {full_text}");
+
+    // 5. Verify replay WITH --checkpoint-start: resumes from tick 12.
+    let mut verify_cp = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    verify_cp
+        .arg("--replay-db")
+        .arg(&database)
+        .arg("--checkpoint-start")
+        .arg("--threads")
+        .arg("1")
+        .arg("--set")
+        .arg(format!("rng_seed={SEED}"))
+        .arg("--set")
+        .arg("persistence_interval=1")
+        .arg("--set")
+        .arg("replay_event_tick_cap=65536");
+    let cp_out = verify_cp.output().expect("run checkpoint-start replay");
+    let cp_text = strip_ansi(&format!("{}{}", stdout_text(&cp_out), stderr_text(&cp_out)));
+    assert!(cp_out.status.success(), "checkpoint replay failed: {cp_text}");
+    assert!(cp_text.contains("from tick 12"), "checkpoint replay must state starting tick 12: {cp_text}");
+    assert!(cp_text.contains("Replay matched"), "checkpoint replay must match: {cp_text}");
+
+    // 6. Negative control: corrupt the checkpoint payload in the database.
+    // Replay WITH --checkpoint-start must fail closed rather than falling back to tick zero.
+    let connection = Connection::open(&db_str).expect("open connection for corruption");
+    connection
+        .execute("UPDATE checkpoints SET payload = 'aabbccdd'")
+        .expect("corrupt payload");
+    connection.close().expect("close connection");
+
+    let mut verify_corrupt = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    verify_corrupt
+        .arg("--replay-db")
+        .arg(&database)
+        .arg("--checkpoint-start")
+        .arg("--threads")
+        .arg("1")
+        .arg("--set")
+        .arg(format!("rng_seed={SEED}"))
+        .arg("--set")
+        .arg("persistence_interval=1")
+        .arg("--set")
+        .arg("replay_event_tick_cap=65536");
+    let corrupt_out = verify_corrupt.output().expect("run corrupt checkpoint replay");
+    let corrupt_text = strip_ansi(&format!("{}{}", stdout_text(&corrupt_out), stderr_text(&corrupt_out)));
+    assert!(
+        !corrupt_out.status.success(),
+        "corrupt checkpoint must fail closed, but succeeded: {corrupt_text}"
+    );
+    assert!(
+        corrupt_text.contains("corrupt") || corrupt_text.contains("payload") || corrupt_text.contains("failed") || corrupt_text.contains("error"),
+        "expected corruption diagnostic, got: {corrupt_text}"
     );
 }
