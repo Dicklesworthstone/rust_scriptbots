@@ -323,16 +323,21 @@ fn mock_free_checkpoint_start_replay_e2e() {
     // 2. Step a matching world headlessly to tick 12 and capture a valid WorldCheckpointV1.
     let config = scriptbots_core::ScriptBotsConfig {
         rng_seed: Some(SEED),
-        persistence_interval: 0,
+        persistence_interval: 1,
+        replay_event_tick_cap: 65536,
         ..scriptbots_core::ScriptBotsConfig::default()
     };
-    let mut world = scriptbots_core::WorldState::new(config).expect("build world");
+    let (mut world, mut persistence) = scriptbots_core::WorldState::with_persistence(
+        config,
+        Box::new(scriptbots_core::NullPersistence),
+    )
+    .expect("build world with persistence");
     let brain_keys = scriptbots_app::install_brains(&mut world, scriptbots_app::BrainPreset::Mixed)
         .expect("install brains")
         .population;
     scriptbots_app::seed_founding_population(&mut world, &brain_keys).expect("seed founders");
     for _ in 0..12 {
-        world.step().expect("step world");
+        persistence.step(&mut world).expect("step world");
     }
     let checkpoint = world.checkpoint_v1().expect("capture tick 12 checkpoint");
     assert_eq!(checkpoint.tick().0, 12);

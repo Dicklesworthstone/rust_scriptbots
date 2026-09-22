@@ -14,7 +14,7 @@ use scriptbots_app::{
     BootstrapEvidenceV0, BrainPreset, CharacterizationTraceV2, ControlServerConfig,
     ControlServerReservation, RunIdentityV1, RunManifestV3, ScenarioDocumentV1, ScenarioIdentityV0,
     ScenarioInterventionV1, SharedAnalytics, ThreadPolicyV0, apply_scenario_interventions,
-    create_brain_registry, create_brain_registry_for_config, install_brains,
+    create_brain_registry_for_config, install_brains,
     precedence::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
