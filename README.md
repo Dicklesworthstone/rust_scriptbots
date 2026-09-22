@@ -125,8 +125,11 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - **`scriptbots-index`**: Production uniform-grid neighborhood index. Alternate backends are not advertised until they have real implementations and conformance coverage.
 - **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
 - **`scriptbots-render`**: GPUI UI layer with a tiled World + Lab shell, canvas renderer for agents/food, selection highlights, tabbed inspection/analytics, and scrollable diagnostics.
+- **`scriptbots-world-gfx`**: Low-level wgpu custom world renderer with WGSL shaders and offscreen readback.
+- **`scriptbots-bevy`**: Bevy ECS alternative rendering backend, 3D world visualization, camera systems, and adaptive quality governor.
 - **`scriptbots-app`**: Binary shell. Wires tracing/logging, config/env and storage, installs brains, seeds agents, starts the sole-owner `HostThread`, and connects the selected renderer and REST/MCP servers to its ports.
 - **`scriptbots-web`**: WebAssembly harness exposing bindings to init/tick/reset and snapshot the simulation; consumes `scriptbots-core` with `default-features = false` (sequential fallback; Rayon disabled on wasm).
+- **`scriptbots-analytics`**: Offline analysis, statistical rigor (bootstrap, permutation tests, effect sizes, Jarque-Bera normality), and report generators (`sb-analyze`).
 
 ## Current status
 - Workspace scaffolding, shared lints, and profiles are in place.
