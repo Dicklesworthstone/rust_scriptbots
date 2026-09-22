@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 default = ["batch-brains", "parallel", "simd_wide"]
+audio = ["dep:kira"]
 batch-brains = []
 economy-faults = []
 parallel = ["dep:rayon"]
@@ -29,6 +30,7 @@ blake3 = { workspace = true }
 toml = "0.8"
 wide = { version = "1.5.0", default-features = false, optional = true }
 miniz_oxide = { workspace = true }
+kira = { workspace = true, optional = true }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 tracing = { workspace = true }

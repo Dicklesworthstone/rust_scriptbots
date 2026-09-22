@@ -59,9 +59,7 @@ use std::{
 
 #[cfg(feature = "audio")]
 use kira::{
-    DefaultBackend,
-    frame::Frame,
-    manager::{AudioManager, AudioManagerSettings},
+    AudioManager, AudioManagerSettings, DefaultBackend, Frame,
     sound::static_sound::{StaticSoundData, StaticSoundSettings},
 };
 
@@ -5639,7 +5637,7 @@ impl SimulationView {
         info!(open = self.settings_panel.open, "Settings panel toggled");
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
+            audio.play_toggle();
         }
         cx.notify();
     }
@@ -6205,7 +6203,7 @@ impl SimulationView {
 
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
+            audio.play_toggle();
         }
         cx.notify();
     }
@@ -6225,7 +6223,7 @@ impl SimulationView {
         }
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
+            audio.play_toggle();
         }
         cx.notify();
     }
@@ -6245,7 +6243,7 @@ impl SimulationView {
         info!(paused, "Simulation pause command enqueued");
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
+            audio.play_toggle();
         }
         cx.notify();
     }
@@ -6267,7 +6265,7 @@ impl SimulationView {
         info!(draw_agents = enabled, "Agent rendering toggled");
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
+            audio.play_toggle();
         }
         cx.notify();
     }
@@ -6280,7 +6278,7 @@ impl SimulationView {
         info!(draw_food = enabled, "Food overlay toggled");
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
+            audio.play_toggle();
         }
         cx.notify();
     }
@@ -6293,7 +6291,7 @@ impl SimulationView {
         info!(agent_outline = enabled, "Agent outline toggled");
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
+            audio.play_toggle();
         }
         cx.notify();
     }
@@ -6312,7 +6310,7 @@ impl SimulationView {
             info!(speed, "Simulation speed command enqueued");
             #[cfg(feature = "audio")]
             if let Some(audio) = self.audio.as_mut() {
-                audio.play(&audio.toggle_sound);
+                audio.play_toggle();
             }
             cx.notify();
         }
@@ -6409,7 +6407,7 @@ impl SimulationView {
         }
         #[cfg(feature = "audio")]
         if let Some(audio) = self.audio.as_mut() {
-            audio.play(&audio.toggle_sound);
+            audio.play_toggle();
         }
         cx.notify();
     }
@@ -6465,18 +6463,18 @@ impl SimulationView {
             return;
         }
 
-        if let Some(summary) = snapshot.summary.as_ref() {
-            if summary.tick != audio.last_tick {
-                if summary.births > audio.last_births {
-                    audio.play(&audio.birth_sound);
-                }
-                if summary.deaths > audio.last_deaths {
-                    audio.play(&audio.death_sound);
-                }
-                audio.last_births = summary.births;
-                audio.last_deaths = summary.deaths;
-                audio.last_tick = summary.tick;
+        if let Some(summary) = snapshot.summary.as_ref()
+            && summary.tick != audio.last_tick
+        {
+            if summary.births > audio.last_births {
+                audio.play_birth();
             }
+            if summary.deaths > audio.last_deaths {
+                audio.play_death();
+            }
+            audio.last_births = summary.births;
+            audio.last_deaths = summary.deaths;
+            audio.last_tick = summary.tick;
         }
 
         if let Some(frame) = snapshot.render_frame.as_ref() {
@@ -6486,7 +6484,7 @@ impl SimulationView {
                 .filter(|agent| agent.spike_victim)
                 .count();
             if spiked > audio.last_spike_count {
-                audio.play(&audio.spike_sound);
+                audio.play_spike();
             }
             audio.last_spike_count = spiked;
         }
@@ -13265,6 +13263,26 @@ impl AudioState {
         if let Err(err) = self.manager.play(sound.clone()) {
             error!(?err, "failed to play audio cue");
         }
+    }
+
+    fn play_toggle(&mut self) {
+        let sound = self.toggle_sound.clone();
+        self.play(&sound);
+    }
+
+    fn play_birth(&mut self) {
+        let sound = self.birth_sound.clone();
+        self.play(&sound);
+    }
+
+    fn play_death(&mut self) {
+        let sound = self.death_sound.clone();
+        self.play(&sound);
+    }
+
+    fn play_spike(&mut self) {
+        let sound = self.spike_sound.clone();
+        self.play(&sound);
     }
 }
 
