@@ -327,3 +327,36 @@ pub fn create_brain_registry(preset: BrainPreset) -> Result<BrainRegistry> {
     Ok(registry)
 }
 
+/// Construct a [`BrainRegistry`] containing registered versioned brain family adapters
+/// and any configured legacy runners (such as NeuroFlow) matching `config`.
+///
+/// # Errors
+///
+/// Returns an error if adapter registration fails or if a requested non-default feature is missing.
+pub fn create_brain_registry_for_config(
+    preset: BrainPreset,
+    config: &ScriptBotsConfig,
+) -> Result<BrainRegistry> {
+    let mut registry = create_brain_registry(preset)?;
+    #[cfg(feature = "neuro")]
+    if preset == BrainPreset::Mixed
+        && let Some(neuro_cfg) = validated_neuroflow_config(config)?
+    {
+        let neuro_cfg = std::sync::Arc::new(neuro_cfg);
+        registry.register_with_heredity_exclusion(
+            scriptbots_brain_neuro::NeuroflowBrain::KIND.as_str(),
+            scriptbots_core::BrainHeredityExclusionV1::NoVersionedGenomeProtocol,
+            move |rng| {
+                scriptbots_brain_neuro::NeuroflowBrain::runner((*neuro_cfg).clone(), rng)
+                    .map_err(|source| {
+                        scriptbots_core::BrainSpawnError::new(
+                            scriptbots_brain_neuro::NeuroflowBrain::KIND.as_str(),
+                            source,
+                        )
+                    })
+            },
+        );
+    }
+    Ok(registry)
+}
+

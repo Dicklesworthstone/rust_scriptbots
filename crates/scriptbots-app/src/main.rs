@@ -14,7 +14,7 @@ use scriptbots_app::{
     BootstrapEvidenceV0, BrainPreset, CharacterizationTraceV2, ControlServerConfig,
     ControlServerReservation, RunIdentityV1, RunManifestV3, ScenarioDocumentV1, ScenarioIdentityV0,
     ScenarioInterventionV1, SharedAnalytics, ThreadPolicyV0, apply_scenario_interventions,
-    install_brains, create_brain_registry,
+    create_brain_registry, create_brain_registry_for_config, install_brains,
     precedence::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
@@ -4920,7 +4920,7 @@ fn run_headless_simulation_from_checkpoint(
     }
     let remaining_ticks = tick_limit - start_tick;
     let (collector, handle) = ReplayCollector::with_capacity(remaining_ticks as usize);
-    let registry = create_brain_registry(brain_preset)
+    let registry = create_brain_registry_for_config(brain_preset, checkpoint.config())
         .context("failed to create brain registry for checkpoint restore")?;
     let mut world = WorldState::restore_checkpoint_v1(checkpoint, registry)
         .context("failed to restore world state from checkpoint")?;

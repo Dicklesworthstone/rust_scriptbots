@@ -42,7 +42,10 @@ pub use branch_study::{
 
 #[cfg(feature = "neuro")]
 pub use brains::validated_neuroflow_config;
-pub use brains::{BrainPreset, InstalledBrains, create_brain_registry, install_brains};
+pub use brains::{
+    BrainPreset, InstalledBrains, create_brain_registry, create_brain_registry_for_config,
+    install_brains,
+};
 
 // The manifest schema tags are defined once, in `scriptbots-storage`, and re-exported here
 // (`bd-k0wj`). Each crate previously declared its own copy, and they diverged: `ff937dec6`
