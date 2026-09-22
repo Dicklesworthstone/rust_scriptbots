@@ -341,6 +341,7 @@ rust_scriptbots/
 ├── Cargo.toml                              # Workspace root
 ├── crates/
 │   ├── scriptbots-core/                    # World simulation, agents, evolution, spatial indexing
+│   ├── scriptbots-runtime/                 # Sole-owner HostCore, protocol, fixed-deadline lifecycle
 │   ├── scriptbots-brain/                   # Brain trait + impls (MLP, DWRAON, Assembly)
 │   ├── scriptbots-brain-ml/                # ML dependency probes; inference placeholder
 │   ├── scriptbots-brain-neuro/             # Neuroflow brain backend
@@ -350,6 +351,7 @@ rust_scriptbots/
 │   ├── scriptbots-world-gfx/              # wgpu custom world renderer
 │   ├── scriptbots-bevy/                    # Bevy ECS rendering backend
 │   ├── scriptbots-app/                     # CLI, HTTP API, TUI, MCP server, main binary
+│   ├── scriptbots-analytics/               # Offline analysis, statistical metrics, lineage graphs
 │   └── scriptbots-web/                     # WASM/browser target
 ├── original_scriptbots_code_for_reference/ # Original C++ source
 ├── docs/                                   # Performance data, rendering references, WASM docs
@@ -364,6 +366,7 @@ rust_scriptbots/
 | `scriptbots-core` | `src/lib.rs` | `WorldState`, `AgentData`, `AgentArena`, `AgentId`, `FoodGrid`, `TerrainLayer`, `ScriptBotsConfig`, `BrainRegistry`, evolution, tick loop |
 | `scriptbots-core` | `tests/world_integration.rs` | World simulation integration tests |
 | `scriptbots-core` | `benches/world_bench.rs` | Tick performance benchmarks |
+| `scriptbots-runtime` | `src/lib.rs` | `HostCore`, client/server simulation protocol, `ChannelHostPort`, island migrations |
 | `scriptbots-brain` | `src/lib.rs` | `Brain` trait, `BrainKind`, `BrainTelemetry` |
 | `scriptbots-brain` | `src/mlp.rs` | `MlpBrain` — multi-layer perceptron implementation |
 | `scriptbots-brain` | `src/dwraon.rs` | `DwraonBrain` — DWRAON network implementation |
@@ -379,6 +382,7 @@ rust_scriptbots/
 | `scriptbots-app` | `src/servers.rs` | Axum HTTP API, MCP server, Swagger/OpenAPI |
 | `scriptbots-app` | `src/control.rs` | Simulation control commands, config management |
 | `scriptbots-app` | `src/terminal/` | Ratatui TUI implementation |
+| `scriptbots-analytics` | `src/lib.rs` | Statistical metrics, lineage graphs, experiment comparison, certification |
 | `scriptbots-web` | `src/lib.rs` | WASM bindings, browser-side simulation interface |
 
 ### Core Types Quick Reference

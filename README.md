@@ -42,10 +42,13 @@ rust_scriptbots/
 │   ├── scriptbots-index      # Uniform-grid index; alternate backends are not implemented
 │   ├── scriptbots-storage    # FrankenSQLite persistence worker & analytics snapshots
 │   ├── scriptbots-render     # GPUI integration and visual layer (World + tabbed Lab)
+│   ├── scriptbots-world-gfx  # wgpu rendering pipeline, WGSL shaders, offscreen readback
+│   ├── scriptbots-bevy       # Bevy ECS 3D rendering backend and entity simulation
 │   ├── scriptbots-app        # Binary crate wiring everything together
+│   ├── scriptbots-analytics  # Offline analysis, statistical aggregations, and experiment metrics
 │   └── scriptbots-web        # Sibling WebAssembly harness (wasm-bindgen bindings; experimental)
-└── docs/
-    └── wasm/                 # ADRs, browser matrix, multithreading notes, rendering spikes
+├── docs/
+│   └── wasm/                 # ADRs, browser matrix, multithreading notes, rendering spikes
 └── original_scriptbots_code_for_reference/  # Upstream C++ snapshot for parity
 ```
 
