@@ -31,6 +31,7 @@ anyhow = "1.0.103"
 arc-swap = "1.9.2"
 asupersync = { version = "=0.5.0", default-features = false }
 blake3 = "1.8.5"
+gif = "=0.14.2"
 libc = "0.2.186"
 libm = "0.2.16"
 rayon = "1.12.0"

@@ -463,6 +463,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(AppSubcommand::Reel(ref reel_args)) = cli.subcommand {
+        run_reel_subcommand(reel_args)?;
+        return Ok(());
+    }
+
     if let Some(ref db_path) = cli.report_archipelago {
         let report_args = ReportArchipelagoArgs {
             db: db_path.clone(),
@@ -3062,6 +3067,36 @@ enum AppSubcommand {
     Tournament(scriptbots_app::tournament::TournamentArgs),
     /// Replay an intervention journal or scripted experiment and verify against world characterization digest.
     Replay(ReplayArgs),
+    /// Headless highlight reel montage exporter (ASCII/GIF) (bd-16g.9.2).
+    Reel(ReelArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+pub struct ReelArgs {
+    /// Path to the FrankenSQLite run database.
+    #[arg(long)]
+    pub db: PathBuf,
+    /// Export format (ascii, gif, mp4).
+    #[arg(long, default_value = "ascii")]
+    pub format: String,
+    /// Destination file path.
+    #[arg(long, short = 'o')]
+    pub out: Option<PathBuf>,
+    /// Number of top highlight clips to include.
+    #[arg(long, default_value_t = 6)]
+    pub top: usize,
+    /// Stride between rendered ticks.
+    #[arg(long, default_value_t = 5)]
+    pub stride: u64,
+    /// Maximum clips per event kind.
+    #[arg(long, default_value_t = 2)]
+    pub max_per_kind: usize,
+    /// Pre-window ticks before event.
+    #[arg(long, default_value_t = 50)]
+    pub pre_window: u64,
+    /// Post-window ticks after event.
+    #[arg(long, default_value_t = 100)]
+    pub post_window: u64,
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]
@@ -3204,6 +3239,51 @@ fn run_map_apply(args: &MapApplyArgs) -> Result<()> {
         artifact.terrain().cell_size(),
         artifact.metadata().tileset_id,
         artifact.scientific_content_hash()
+    );
+    Ok(())
+}
+
+fn run_reel_subcommand(args: &ReelArgs) -> Result<()> {
+    let format = args
+        .format
+        .parse::<scriptbots_app::montage::ReelFormat>()
+        .map_err(|e| anyhow!("{e}"))?;
+    let default_ext = match format {
+        scriptbots_app::montage::ReelFormat::Ascii => "cast",
+        scriptbots_app::montage::ReelFormat::Gif => "gif",
+        scriptbots_app::montage::ReelFormat::Mp4 => "mp4",
+    };
+    let output_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("reel.{default_ext}")));
+
+    let storage = StorageReader::open(args.db.to_str().context("invalid utf-8 in db path")?)
+        .context("failed to open run database for reel export")?;
+
+    let options = scriptbots_app::montage::MontageOptions {
+        format,
+        output_path,
+        stride: args.stride,
+        selection: scriptbots_core::reel::SelectionConfig {
+            top_k: args.top,
+            max_per_kind: args.max_per_kind,
+            pre_window_ticks: args.pre_window,
+            post_window_ticks: args.post_window,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let summary = scriptbots_app::montage::encode_montage_from_storage(&storage, &options)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    println!(
+        "Reel export complete: {} clips, {} frames, {} bytes written to {}",
+        summary.clips_count,
+        summary.total_frames,
+        summary.bytes_written,
+        summary.output_path.display()
     );
     Ok(())
 }

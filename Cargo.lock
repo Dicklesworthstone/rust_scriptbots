@@ -11185,6 +11185,7 @@ dependencies = [
  "fsqlite",
  "ftui",
  "futures-util",
+ "gif",
  "libc",
  "mimalloc",
  "owo-colors",

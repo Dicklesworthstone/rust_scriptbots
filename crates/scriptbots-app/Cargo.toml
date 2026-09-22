@@ -48,6 +48,7 @@ postcard = { workspace = true }
 serde_path_to_error = "0.1"
 smallvec = "1.13"
 futures-util = "0.3.31"
+gif = { workspace = true }
 tokio-stream = "0.1.16"
 slotmap = { workspace = true }
 supports-color = "3.0.2"
