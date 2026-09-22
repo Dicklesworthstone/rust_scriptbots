@@ -26,9 +26,39 @@
 #![allow(clippy::float_cmp)]
 
 use crate::stats::StatsError;
+use serde::{Deserialize, Serialize};
 
-/// Shape summary of a sample: its first four moments and a normality test.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Candidate distribution family fit with Kolmogorov-Smirnov goodness-of-fit statistics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateFit {
+    /// Family name: "normal", "lognormal", or "uniform".
+    pub distribution: String,
+    /// Parameters of the fitted distribution:
+    /// - normal: mean, `std_dev`
+    /// - lognormal: `log_mean`, `log_std_dev`
+    /// - uniform: min, max
+    pub parameters: Vec<(String, f64)>,
+    /// Kolmogorov-Smirnov test statistic D = sup |`F_n(x)` - F(x)|.
+    pub ks_statistic: f64,
+    /// Stephens (1970) asymptotic p-value for the KS test.
+    pub ks_p_value: f64,
+}
+
+/// Bimodality assessment cross-checked against the online detector in `scriptbots-core::detect`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BimodalityAssessment {
+    /// Between-cluster variance ratio in [0, 1].
+    pub score: f64,
+    /// Cluster separation in pooled standard deviations.
+    pub separation: f64,
+    /// Upper/lower cluster population ratio.
+    pub cluster_ratio: f64,
+    /// Whether the detector's bimodality criterion was met.
+    pub is_bimodal: bool,
+}
+
+/// Shape summary of a sample: its first four moments, candidate distribution fits, and bimodality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DistributionSummary {
     /// Number of observations included in the summary.
     pub n: usize,
@@ -55,6 +85,12 @@ pub struct DistributionSummary {
     /// rather than `NaN`. A reader must not interpret zero `skewness` and zero
     /// `excess_kurtosis` as "looks normal" when it actually means "there is nothing here".
     pub degenerate: bool,
+    /// Fitted candidate distributions (Normal, Lognormal, Uniform) ordered by KS statistic ascending (best fit first).
+    pub candidate_fits: Vec<CandidateFit>,
+    /// The best-fitting candidate distribution, if any could be fit.
+    pub best_fit: Option<CandidateFit>,
+    /// Bimodality cross-check against `scriptbots-core::detect`.
+    pub bimodality: BimodalityAssessment,
 }
 
 impl DistributionSummary {
@@ -119,6 +155,9 @@ pub fn summarize(sample: &[f64]) -> Result<DistributionSummary, StatsError> {
             jarque_bera: 0.0,
             jb_p_value: 1.0,
             degenerate: true,
+            candidate_fits: Vec::new(),
+            best_fit: None,
+            bimodality: evaluate_bimodality(sample),
         });
     }
 
@@ -128,6 +167,12 @@ pub fn summarize(sample: &[f64]) -> Result<DistributionSummary, StatsError> {
         (n / 6.0) * excess_kurtosis.mul_add(excess_kurtosis / 4.0, skewness * skewness);
     // Chi-square(2) survival function: exact, closed form, no special function.
     let jb_p_value = (-jarque_bera / 2.0).exp();
+
+    let mut sorted = sample.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let candidate_fits = fit_candidate_distributions(&sorted);
+    let best_fit = candidate_fits.first().cloned();
+    let bimodality = evaluate_bimodality(sample);
 
     Ok(DistributionSummary {
         n: sample.len(),
@@ -139,7 +184,176 @@ pub fn summarize(sample: &[f64]) -> Result<DistributionSummary, StatsError> {
         jarque_bera,
         jb_p_value,
         degenerate: false,
+        candidate_fits,
+        best_fit,
+        bimodality,
     })
+}
+
+/// Cumulative distribution function for a Gaussian (normal) distribution.
+#[must_use]
+pub fn normal_cdf(x: f64, mean: f64, std_dev: f64) -> f64 {
+    if std_dev <= 0.0 {
+        if x < mean { 0.0 } else { 1.0 }
+    } else {
+        let z = (x - mean) / (std_dev * std::f64::consts::SQRT_2);
+        f64::midpoint(1.0, libm::erf(z))
+    }
+}
+
+/// One-sample Kolmogorov-Smirnov goodness-of-fit test against a continuous CDF.
+///
+/// Computes the supremum distance D = sup |`F_n(x)` - F(x)| between the empirical CDF
+/// and the theoretical CDF, along with the Stephens (1970) continuity-corrected asymptotic
+/// p-value from the Kolmogorov distribution.
+#[must_use]
+pub fn kolmogorov_smirnov_test<F>(sorted_sample: &[f64], cdf: F) -> (f64, f64)
+where
+    F: Fn(f64) -> f64,
+{
+    let n = sorted_sample.len();
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let n_f64 = n as f64;
+    let mut d_max = 0.0f64;
+
+    for (i, &x) in sorted_sample.iter().enumerate() {
+        let f_x = cdf(x).clamp(0.0, 1.0);
+        let d_plus = ((i + 1) as f64 / n_f64) - f_x;
+        let d_minus = f_x - (i as f64 / n_f64);
+        if d_plus > d_max {
+            d_max = d_plus;
+        }
+        if d_minus > d_max {
+            d_max = d_minus;
+        }
+    }
+
+    // Stephens (1970) modified Kolmogorov statistic:
+    let sqrt_n = n_f64.sqrt();
+    let z = (sqrt_n + 0.12 + 0.11 / sqrt_n) * d_max;
+
+    // Asymptotic p-value: P(K > z) = 2 * sum_{k=1..inf} (-1)^(k-1) * exp(-2 * k^2 * z^2)
+    let p_value = if z <= 0.0 {
+        1.0
+    } else {
+        let mut sum = 0.0;
+        let z2 = -2.0 * z * z;
+        for k in 1..=100 {
+            let k_f64 = f64::from(k);
+            let term = (k_f64 * k_f64 * z2).exp();
+            if term < 1e-15 {
+                break;
+            }
+            if k % 2 == 1 {
+                sum += term;
+            } else {
+                sum -= term;
+            }
+        }
+        (2.0 * sum).clamp(0.0, 1.0)
+    };
+
+    (d_max, p_value)
+}
+
+/// Fit candidate distributions (Normal, Lognormal, Uniform) and rank them by Kolmogorov-Smirnov statistic.
+#[must_use]
+pub fn fit_candidate_distributions(sorted_sample: &[f64]) -> Vec<CandidateFit> {
+    if sorted_sample.len() < 4 {
+        return Vec::new();
+    }
+    let n = sorted_sample.len() as f64;
+    let mean = sorted_sample.iter().sum::<f64>() / n;
+    let var = sorted_sample
+        .iter()
+        .map(|&x| (x - mean) * (x - mean))
+        .sum::<f64>()
+        / n;
+    let sd = var.sqrt();
+
+    let mut fits = Vec::new();
+
+    // 1. Normal
+    if sd > 0.0 {
+        let (ks, p) = kolmogorov_smirnov_test(sorted_sample, |x| normal_cdf(x, mean, sd));
+        fits.push(CandidateFit {
+            distribution: "normal".to_string(),
+            parameters: vec![("mean".to_string(), mean), ("std_dev".to_string(), sd)],
+            ks_statistic: ks,
+            ks_p_value: p,
+        });
+    }
+
+    // 2. Lognormal (only when all observations are strictly positive)
+    if sorted_sample.iter().all(|&x| x > 0.0) {
+        let log_values: Vec<f64> = sorted_sample.iter().map(|&x| x.ln()).collect();
+        let log_mean = log_values.iter().sum::<f64>() / n;
+        let log_var = log_values
+            .iter()
+            .map(|&y| (y - log_mean) * (y - log_mean))
+            .sum::<f64>()
+            / n;
+        let log_sd = log_var.sqrt();
+        if log_sd > 0.0 {
+            let (ks, p) =
+                kolmogorov_smirnov_test(sorted_sample, |x| normal_cdf(x.ln(), log_mean, log_sd));
+            fits.push(CandidateFit {
+                distribution: "lognormal".to_string(),
+                parameters: vec![
+                    ("log_mean".to_string(), log_mean),
+                    ("log_std_dev".to_string(), log_sd),
+                ],
+                ks_statistic: ks,
+                ks_p_value: p,
+            });
+        }
+    }
+
+    // 3. Uniform
+    let min = sorted_sample[0];
+    let max = sorted_sample[sorted_sample.len() - 1];
+    if max > min {
+        let span = max - min;
+        let (ks, p) = kolmogorov_smirnov_test(sorted_sample, |x| (x - min) / span);
+        fits.push(CandidateFit {
+            distribution: "uniform".to_string(),
+            parameters: vec![("min".to_string(), min), ("max".to_string(), max)],
+            ks_statistic: ks,
+            ks_p_value: p,
+        });
+    }
+
+    fits.sort_by(|a, b| a.ks_statistic.total_cmp(&b.ks_statistic));
+    fits
+}
+
+/// Evaluate bimodality of a sample against the online detector algorithm in `scriptbots-core::detect`.
+#[must_use]
+pub fn evaluate_bimodality(sample: &[f64]) -> BimodalityAssessment {
+    let params = scriptbots_core::detect::BimodalityParams::default();
+    scriptbots_core::detect::bimodality(sample, params).map_or(
+        BimodalityAssessment {
+            score: 0.0,
+            separation: 0.0,
+            cluster_ratio: 0.0,
+            is_bimodal: false,
+        },
+        |score| {
+            let ratio = if score.lower_count > 0 {
+                score.upper_count as f64 / score.lower_count as f64
+            } else {
+                0.0
+            };
+            BimodalityAssessment {
+                score: score.score,
+                separation: score.separation,
+                cluster_ratio: ratio,
+                is_bimodal: score.is_bimodal,
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -319,5 +533,79 @@ mod tests {
     fn the_summary_is_deterministic() {
         let sample = [1.0, 3.0, 3.0, 7.0, 2.0, 9.0, 4.0, 1.0];
         assert_eq!(summarize(&sample), summarize(&sample));
+    }
+
+    #[test]
+    fn test_kolmogorov_smirnov_normal_and_uniform() {
+        let mut draws = Normal::new(12345);
+        let mut normal_sample: Vec<f64> = (0..1000).map(|_| draws.normal()).collect();
+        normal_sample.sort_by(f64::total_cmp);
+
+        // KS test against true standard normal CDF:
+        let (ks, p) = kolmogorov_smirnov_test(&normal_sample, |x| normal_cdf(x, 0.0, 1.0));
+        assert!(
+            ks < 0.08,
+            "true standard normal sample has small KS; got {ks}"
+        );
+        assert!(
+            p > 0.01,
+            "true standard normal p-value must not reject at alpha=0.01; got {p}"
+        );
+
+        // KS test against wrong uniform distribution:
+        let (bad_ks, bad_p) = kolmogorov_smirnov_test(&normal_sample, |x| (x + 3.0) / 6.0);
+        assert!(bad_ks > ks, "mismatched CDF has higher KS distance");
+        assert!(bad_p < 0.01, "mismatched CDF rejected by KS");
+    }
+
+    #[test]
+    fn test_candidate_fits_identifies_best_fitting_family() {
+        let mut draws = Normal::new(777);
+        // 1. Normal sample
+        let normal_sample: Vec<f64> = (0..500)
+            .map(|_| draws.normal().mul_add(2.0, 10.0))
+            .collect();
+        let s_norm = summarize(&normal_sample).unwrap();
+        assert!(s_norm.best_fit.is_some());
+        assert_eq!(s_norm.best_fit.as_ref().unwrap().distribution, "normal");
+
+        // 2. Lognormal sample: exp(N(0, 0.5))
+        let lognormal_sample: Vec<f64> = (0..500).map(|_| (draws.normal() * 0.5).exp()).collect();
+        let s_logn = summarize(&lognormal_sample).unwrap();
+        assert!(s_logn.best_fit.is_some());
+        assert_eq!(s_logn.best_fit.as_ref().unwrap().distribution, "lognormal");
+
+        // 3. Uniform sample: U(0, 100)
+        let uniform_sample: Vec<f64> = (0..500).map(|_| draws.unit() * 100.0).collect();
+        let s_unif = summarize(&uniform_sample).unwrap();
+        assert!(s_unif.best_fit.is_some());
+        assert_eq!(s_unif.best_fit.as_ref().unwrap().distribution, "uniform");
+    }
+
+    #[test]
+    fn test_bimodality_cross_check_flags_two_clusters() {
+        let mut draws = Normal::new(999);
+        // Two well-separated clusters: cluster 1 at 0.0, cluster 2 at 10.0
+        let mut split: Vec<f64> = (0..200).map(|_| draws.normal() * 0.5).collect();
+        split.extend((0..200).map(|_| draws.normal().mul_add(0.5, 10.0)));
+
+        let s_split = summarize(&split).unwrap();
+        assert!(
+            s_split.bimodality.is_bimodal,
+            "split population should be flagged bimodal"
+        );
+        assert!(
+            s_split.bimodality.score > 0.8,
+            "Otsu score must exceed 0.8; got {}",
+            s_split.bimodality.score
+        );
+
+        // Unimodal sample
+        let unimodal: Vec<f64> = (0..400).map(|_| draws.normal()).collect();
+        let s_uni = summarize(&unimodal).unwrap();
+        assert!(
+            !s_uni.bimodality.is_bimodal,
+            "unimodal sample should not be flagged bimodal"
+        );
     }
 }

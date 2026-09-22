@@ -86,6 +86,10 @@ pub use dataframe::*;
 pub mod graphs;
 pub use graphs::*;
 
+/// Statistical certification of narrative events (bd-2z0.11.6).
+pub mod narrative_validate;
+pub use narrative_validate::*;
+
 pub use lineage::{
     EvolutionaryChangeExplanation, FounderLineageRecord, GenerationMetricRow,
     LINEAGE_FITNESS_SCHEMA_ID_V1, LineageFitness, LineageFitnessMachine, LineageLifespanSummary,
@@ -1573,6 +1577,7 @@ impl Registry {
                 Box::new(graphs::LineageStructure),
                 Box::new(graphs::DynastyCommunities),
                 Box::new(graphs::InteractionCentrality),
+                Box::new(narrative_validate::NarrativeValidate),
             ],
         }
     }
@@ -2283,6 +2288,16 @@ struct MetricDistributionRow {
     degenerate: bool,
     /// Jarque-Bera rejects normality at `alpha`. Never true for a degenerate metric.
     non_normal: bool,
+    /// Best fitting continuous candidate distribution (Normal, Lognormal, Uniform).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_fit: Option<String>,
+    /// Kolmogorov-Smirnov goodness-of-fit p-value for the best-fitting distribution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ks_p_value: Option<f64>,
+    /// Continuous bimodality score in [0, 1] from `scriptbots-core::detect`.
+    bimodality_score: f64,
+    /// Whether the detector's bimodality criterion was met.
+    is_bimodal: bool,
 }
 
 fn summarize_metric_distributions(
@@ -2301,6 +2316,9 @@ fn summarize_metric_distributions(
         }
         let summary =
             distribution::summarize(&values).map_err(|error| metric_stats_error(&error))?;
+        let (best_fit, ks_p_value) = summary.best_fit.as_ref().map_or((None, None), |fit| {
+            (Some(fit.distribution.clone()), Some(fit.ks_p_value))
+        });
         rows.push(MetricDistributionRow {
             name,
             n: summary.n,
@@ -2312,6 +2330,10 @@ fn summarize_metric_distributions(
             jb_p_value: summary.jb_p_value,
             degenerate: summary.degenerate,
             non_normal: summary.rejects_normality(alpha),
+            best_fit,
+            ks_p_value,
+            bimodality_score: summary.bimodality.score,
+            is_bimodal: summary.bimodality.is_bimodal,
         });
     }
     Ok(rows)
@@ -2339,9 +2361,9 @@ fn render_metric_distribution_markdown(machine: &MetricDistributionMachine) -> S
 
     let _ = writeln!(
         md,
-        "| metric | n | mean | sd | skew | ex.kurt | JB | p | normal? |"
+        "| metric | n | mean | sd | skew | ex.kurt | JB | p | normal? | best fit | bimodal? |"
     );
-    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|---|");
     for row in &machine.metrics {
         let verdict = if row.degenerate {
             "constant"
@@ -2350,9 +2372,19 @@ fn render_metric_distribution_markdown(machine: &MetricDistributionMachine) -> S
         } else {
             "yes"
         };
+        let fit_str = match (&row.best_fit, row.ks_p_value) {
+            (Some(dist), Some(p)) => format!("{dist} (p={p:.3})"),
+            (Some(dist), None) => dist.clone(),
+            _ => "-".to_string(),
+        };
+        let bimodal_str = if row.is_bimodal {
+            format!("yes ({:.2})", row.bimodality_score)
+        } else {
+            format!("no ({:.2})", row.bimodality_score)
+        };
         let _ = writeln!(
             md,
-            "| {} | {} | {:.4} | {:.4} | {:+.3} | {:+.3} | {:.2} | {:.4} | {} |",
+            "| {} | {} | {:.4} | {:.4} | {:+.3} | {:+.3} | {:.2} | {:.4} | {} | {} | {} |",
             row.name,
             row.n,
             row.mean,
@@ -2362,6 +2394,8 @@ fn render_metric_distribution_markdown(machine: &MetricDistributionMachine) -> S
             row.jarque_bera,
             row.jb_p_value,
             verdict,
+            fit_str,
+            bimodal_str,
         );
     }
     md
