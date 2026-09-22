@@ -468,6 +468,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(AppSubcommand::RenderAudio(ref render_args)) = cli.subcommand {
+        scriptbots_app::render_audio::run_render_audio_subcommand(render_args)?;
+        return Ok(());
+    }
+
     if let Some(ref db_path) = cli.report_archipelago {
         let report_args = ReportArchipelagoArgs {
             db: db_path.clone(),
@@ -3069,6 +3074,8 @@ enum AppSubcommand {
     Replay(ReplayArgs),
     /// Headless highlight reel montage exporter (ASCII/GIF) (bd-16g.9.2).
     Reel(ReelArgs),
+    /// Deterministic offline soundtrack render for reels + tick-rate impact gate (bd-16g.14.2).
+    RenderAudio(scriptbots_app::render_audio::RenderAudioArgs),
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq)]

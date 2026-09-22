@@ -1,6 +1,8 @@
 //! Pure, lock-free audio engine, frame mapper, and offline PCM renderer (`bd-16g.14.1`, `bd-16g.14.2`, `bd-16g.14.3`).
 
 use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -472,11 +474,15 @@ pub fn map_frame_bounded(
 ) -> (AudioParams, VoicePlan) {
     let mut next_params = *prev;
 
-    // Smooth drone density based on population
-    let target_density = u16::try_from(frame.population).map_or(1.0, |population| {
-        (f32::from(population) / 500.0).clamp(0.0, 1.0)
-    });
-    next_params.drone_density += (target_density - next_params.drone_density) * 0.1;
+    // Smooth drone density based on population; if population is zero, silence immediately
+    if frame.population == 0 {
+        next_params.drone_density = 0.0;
+    } else {
+        let target_density = u16::try_from(frame.population).map_or(1.0, |population| {
+            (f32::from(population) / 500.0).clamp(0.0, 1.0)
+        });
+        next_params.drone_density += (target_density - next_params.drone_density) * 0.1;
+    }
 
     // Smooth dissonance based on diet ratio: carnivore-heavy -> higher dissonance
     let target_dissonance = (1.0 - frame.herbivore_share).clamp(0.0, 1.0);
@@ -1130,6 +1136,564 @@ impl<D: AudioDevice> Sonifier<D> {
     }
 }
 
+/// Size of the compile-time precomputed sine wavetable.
+pub const WAVETABLE_SIZE: usize = 4096;
+
+/// Compile-time polynomial sine evaluation for the wavetable generator.
+///
+/// Computes a degree-13 Taylor expansion around 0 after normalizing `x` to `[-PI, PI]`.
+/// Guaranteed to be bit-exact across compilation targets.
+#[must_use]
+#[expect(clippy::while_float, reason = "const fn range reduction")]
+pub const fn const_sin(mut x: f32) -> f32 {
+    let two_pi = 2.0 * std::f32::consts::PI;
+    while x < 0.0 {
+        x += two_pi;
+    }
+    while x >= two_pi {
+        x -= two_pi;
+    }
+    if x > std::f32::consts::PI {
+        x -= two_pi;
+    }
+    let x2 = x * x;
+    let x3 = x * x2;
+    let x5 = x3 * x2;
+    let x7 = x5 * x2;
+    let x9 = x7 * x2;
+    let x11 = x9 * x2;
+    let x13 = x11 * x2;
+    x - (x3 / 6.0) + (x5 / 120.0) - (x7 / 5040.0) + (x9 / 362_880.0) - (x11 / 39_916_800.0)
+        + (x13 / 6_227_020_800.0)
+}
+
+/// Precomputed 4096-entry sine wavetable for platform-independent, transcendental-free DSP.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "WAVETABLE_SIZE is 4096, well within 23-bit f32 mantissa"
+)]
+pub const fn generate_sine_table() -> [f32; WAVETABLE_SIZE] {
+    let mut table = [0.0; WAVETABLE_SIZE];
+    let mut i = 0;
+    while i < WAVETABLE_SIZE {
+        let frac = (i as f32) / (WAVETABLE_SIZE as f32);
+        let angle = frac * 2.0 * std::f32::consts::PI;
+        table[i] = const_sin(angle);
+        i += 1;
+    }
+    table
+}
+
+/// Static lookup table of sine values across a full `[0, 2*PI)` cycle.
+pub static SINE_TABLE: [f32; WAVETABLE_SIZE] = generate_sine_table();
+
+/// Deterministic, platform-independent sine evaluation using the static wavetable
+/// with linear interpolation and a 32-bit integer phase accumulator.
+#[inline]
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "wavetable interpolation uses standard f32 linear blending"
+)]
+pub fn deterministic_sin(phase: u32) -> f32 {
+    const TABLE_BITS: usize = 12;
+    let idx = (phase >> (32 - TABLE_BITS)) as usize;
+    let next_idx = (idx + 1) & (WAVETABLE_SIZE - 1);
+    let frac = ((phase >> (32 - TABLE_BITS - 16)) & 0xFFFF) as f32 / 65536.0;
+    let s0 = SINE_TABLE[idx];
+    let s1 = SINE_TABLE[next_idx];
+    s0 + frac * (s1 - s0)
+}
+
+/// Rational, integer sample-clock mapping from simulation tick to sample index.
+///
+/// Computes `round(T * sample_rate / ticks_per_second)` using exact integer arithmetic:
+/// `(2 * T * sample_rate + ticks_per_second) / (2 * ticks_per_second)`.
+///
+/// Guarantees at most 1 sample onset error and exactly zero cumulative A/V drift across
+/// arbitrary durations.
+#[inline]
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "audio timeline samples fit in u64"
+)]
+pub const fn tick_to_sample(tick: u64, sample_rate: u32, ticks_per_second: u64) -> u64 {
+    if ticks_per_second == 0 {
+        return 0;
+    }
+    let t = tick as u128;
+    let sr = sample_rate as u128;
+    let tps = ticks_per_second as u128;
+    ((2 * t * sr + tps) / (2 * tps)) as u64
+}
+
+/// Compute SHA-256 digest over an arbitrary byte slice.
+#[must_use]
+#[expect(
+    clippy::many_single_char_names,
+    clippy::too_many_lines,
+    reason = "standard NIST SHA-256 hash implementation"
+)]
+pub fn compute_sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let mut h: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let k: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0x00);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, item) in w.iter_mut().take(16).enumerate() {
+            *item = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut h_val = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h_val
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h_val = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(h_val);
+    }
+
+    let mut digest = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        digest[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+/// Hexadecimal representation of a 32-byte SHA-256 digest.
+#[must_use]
+pub fn sha256_to_hex(digest: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
+
+/// Compute SHA-256 digest covering PCM sample payload only (excluding headers).
+#[must_use]
+pub fn compute_pcm_sha256(samples: &[f32]) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    for &sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    compute_sha256_bytes(&bytes)
+}
+
+/// Canonical 48-kHz 32-bit float mono WAV writer.
+///
+/// Writes an exact 44-byte RIFF/WAVE header followed by little-endian 32-bit float samples.
+/// Metadata is strictly timestamp-free.
+///
+/// # Errors
+/// Returns an I/O error if creating or writing to `path` fails, or sample count overflows u32.
+pub fn write_canonical_wav(path: &Path, samples: &[f32], sample_rate: u32) -> io::Result<[u8; 32]> {
+    let data_bytes_len = u64::try_from(samples.len())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+        * 4;
+    let riff_chunk_size = u32::try_from(36 + data_bytes_len)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let data_chunk_size = u32::try_from(data_bytes_len)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    let mut file = std::fs::File::create(path)?;
+
+    // 44-byte canonical RIFF/WAVE header
+    let mut header = [0u8; 44];
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&riff_chunk_size.to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    header[20..22].copy_from_slice(&3u16.to_le_bytes()); // 3 = IEEE Float
+    header[22..24].copy_from_slice(&1u16.to_le_bytes()); // 1 channel
+    header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    header[28..32].copy_from_slice(&(sample_rate * 4).to_le_bytes());
+    header[32..34].copy_from_slice(&4u16.to_le_bytes()); // block align
+    header[34..36].copy_from_slice(&32u16.to_le_bytes()); // 32 bits per sample
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_chunk_size.to_le_bytes());
+
+    file.write_all(&header)?;
+
+    let mut raw_data = Vec::with_capacity(samples.len() * 4);
+    for &sample in samples {
+        raw_data.extend_from_slice(&sample.to_le_bytes());
+    }
+    file.write_all(&raw_data)?;
+    file.flush()?;
+
+    Ok(compute_sha256_bytes(&raw_data))
+}
+
+/// Parsed canonical WAV audio file data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedWav {
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Channel count.
+    pub channels: u16,
+    /// Bit depth.
+    pub bits_per_sample: u16,
+    /// 32-bit float audio samples.
+    pub samples: Vec<f32>,
+    /// SHA-256 digest covering the PCM data chunk only.
+    pub pcm_data_sha256: [u8; 32],
+}
+
+/// Errors encountered when parsing a canonical WAV file.
+#[derive(Debug, thiserror::Error)]
+pub enum WavParseError {
+    /// Underlying file I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    /// File smaller than the canonical header length.
+    #[error("file size too small ({0} bytes) to contain a valid WAV header")]
+    TooSmall(usize),
+    /// Missing 'RIFF' signature.
+    #[error("missing 'RIFF' chunk ID")]
+    InvalidRiff,
+    /// Missing 'WAVE' signature.
+    #[error("missing 'WAVE' format")]
+    InvalidWave,
+    /// Missing 'fmt ' chunk.
+    #[error("missing 'fmt ' subchunk")]
+    InvalidFmt,
+    /// Audio format other than IEEE float (3) or PCM (1).
+    #[error("unsupported audio format {0}; expected 3 (IEEE float) or 1 (PCM)")]
+    UnsupportedFormat(u16),
+    /// Channel count other than mono (1).
+    #[error("invalid channel count {0}; expected 1 (mono)")]
+    InvalidChannels(u16),
+    /// Missing or malformed 'data' chunk.
+    #[error("data chunk missing or corrupt")]
+    InvalidData,
+}
+
+/// Read and validate a canonical WAV file, extracting IEEE float samples and data chunk digest.
+///
+/// # Errors
+/// Returns a typed error if reading fails or headers are malformed.
+pub fn read_canonical_wav(path: &Path) -> Result<ParsedWav, WavParseError> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < 44 {
+        return Err(WavParseError::TooSmall(bytes.len()));
+    }
+    if &bytes[0..4] != b"RIFF" {
+        return Err(WavParseError::InvalidRiff);
+    }
+    if &bytes[8..12] != b"WAVE" {
+        return Err(WavParseError::InvalidWave);
+    }
+    if &bytes[12..16] != b"fmt " {
+        return Err(WavParseError::InvalidFmt);
+    }
+    let format_tag = u16::from_le_bytes([bytes[20], bytes[21]]);
+    if format_tag != 3 && format_tag != 1 {
+        return Err(WavParseError::UnsupportedFormat(format_tag));
+    }
+    let channels = u16::from_le_bytes([bytes[22], bytes[23]]);
+    if channels != 1 {
+        return Err(WavParseError::InvalidChannels(channels));
+    }
+    let sample_rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    let bits_per_sample = u16::from_le_bytes([bytes[34], bytes[35]]);
+
+    // Locate 'data' chunk
+    let mut pos = 36;
+    let mut data_start = None;
+    let mut data_len = 0;
+    while pos + 8 <= bytes.len() {
+        let chunk_id = &bytes[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        if chunk_id == b"data" {
+            data_start = Some(pos + 8);
+            data_len = chunk_size.min(bytes.len().saturating_sub(pos + 8));
+            break;
+        }
+        pos += 8 + chunk_size;
+    }
+
+    let start = data_start.ok_or(WavParseError::InvalidData)?;
+    let data_bytes = &bytes[start..start + data_len];
+    let pcm_data_sha256 = compute_sha256_bytes(data_bytes);
+
+    let samples_count = data_len / 4;
+    let mut samples = Vec::with_capacity(samples_count);
+    for chunk in data_bytes.as_chunks::<4>().0 {
+        let s = f32::from_le_bytes(*chunk);
+        samples.push(s);
+    }
+
+    Ok(ParsedWav {
+        sample_rate,
+        channels,
+        bits_per_sample,
+        samples,
+        pcm_data_sha256,
+    })
+}
+
+/// Write per-second telemetry records to a companion CSV file.
+///
+/// # Errors
+/// Returns an I/O error if writing fails.
+pub fn write_telemetry_csv(path: &Path, telemetry: &[LimiterTelemetry]) -> io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    writeln!(
+        file,
+        "second,tick,voices_active,one_shots_emitted,one_shots_dropped,frames_dropped,peak_dbfs,rms_dbfs,limiter_engaged_pct,max_attenuation_db,drone_density,dissonance,master_gain"
+    )?;
+    for (sec_idx, t) in telemetry.iter().enumerate() {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.4},{:.4},{:.2}",
+            sec_idx + 1,
+            t.total_samples,
+            t.voices_active,
+            t.one_shots_emitted,
+            t.one_shots_dropped,
+            t.frames_dropped,
+            t.peak_dbfs,
+            t.rms_dbfs,
+            t.limiter_engaged_pct,
+            t.max_attenuation_db,
+            t.drone_density,
+            t.dissonance,
+            t.master_gain,
+        )?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// Detect and count transient onsets in rendered PCM audio samples.
+///
+/// Computes short-term RMS energy across moving 128-sample windows with a 240-sample
+/// refractory holdoff. An onset is counted whenever energy jumps by more than `threshold_jump_db`
+/// above the previous window.
+#[must_use]
+#[expect(clippy::cast_precision_loss, reason = "DSP sample conversions")]
+pub fn count_pcm_onsets(samples: &[f32], _sample_rate: u32, threshold_jump_db: f32) -> u64 {
+    const WINDOW_SIZE: usize = 128;
+    const REFRACTORY_SAMPLES: usize = 240;
+
+    if samples.len() < WINDOW_SIZE {
+        return 0;
+    }
+
+    let mut onsets = 0;
+    let mut prev_rms_db = -96.0_f32;
+    let mut refractory_counter: usize = 0;
+
+    for chunk in samples.chunks(WINDOW_SIZE) {
+        if refractory_counter > 0 {
+            refractory_counter = refractory_counter.saturating_sub(chunk.len());
+            continue;
+        }
+        let sum_sq: f32 = chunk.iter().map(|&s| s * s).sum();
+        let rms = (sum_sq / chunk.len() as f32).sqrt();
+        let rms_db = if rms > 1e-6 {
+            20.0 * rms.log10()
+        } else {
+            -96.0
+        };
+
+        if rms_db > -50.0 && (rms_db - prev_rms_db) >= threshold_jump_db {
+            onsets += 1;
+            refractory_counter = REFRACTORY_SAMPLES;
+        }
+        prev_rms_db = rms_db;
+    }
+    onsets
+}
+
+/// Active voice state for deterministic offline rendering.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeterministicVoice {
+    /// Sound classification.
+    pub kind: CueKind,
+    /// Current integer phase.
+    pub phase: u32,
+    /// Integer phase step per sample.
+    pub phase_step: u32,
+    /// Amplitude gain.
+    pub gain: f32,
+    /// Current envelope gain.
+    pub current_env: f32,
+    /// Multiplicative decay factor per sample.
+    pub decay_factor: f32,
+    /// Elapsed samples since onset.
+    pub age_samples: usize,
+    /// Total duration in samples.
+    pub total_samples: usize,
+}
+
+/// Comprehensive synthesis report from deterministic offline audio rendering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OfflineRenderReport {
+    /// Rendered 32-bit floating-point PCM audio samples.
+    pub samples: Vec<f32>,
+    /// 32-byte SHA-256 digest covering the PCM data chunk only.
+    pub pcm_data_sha256: [u8; 32],
+    /// Hexadecimal string representation of `pcm_data_sha256`.
+    pub pcm_data_sha256_hex: String,
+    /// Total synthesized sample count.
+    pub total_samples: usize,
+    /// Total audio duration in seconds.
+    pub duration_seconds: f64,
+    /// Peak linear amplitude across the entire render.
+    pub peak_amplitude: f32,
+    /// Peak amplitude in dBFS.
+    pub peak_dbfs: f32,
+    /// Root-mean-square linear amplitude across the entire render.
+    pub rms_amplitude: f32,
+    /// Root-mean-square amplitude in dBFS.
+    pub rms_dbfs: f32,
+    /// Percentage of samples where the limiter actively attenuated.
+    pub limiter_engaged_pct: f32,
+    /// Total transient onsets detected in the PCM waveform.
+    pub total_onsets: u64,
+    /// Per-second telemetry snapshots for companion CSV export.
+    pub telemetry_by_second: Vec<LimiterTelemetry>,
+}
+
 /// A PCM buffer whose size cannot be represented or allocated on this target.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioRenderError {
@@ -1175,31 +1739,76 @@ fn pcm_sample_count(frames: usize, samples_per_tick: u64) -> Result<usize, Audio
     Ok(samples)
 }
 
-/// Render a sequence of `AudioFrame` values to deterministic mono 32-bit float PCM samples.
+/// Synthesize an exact, deterministic, platform-independent mono 32-bit float PCM soundtrack
+/// from a sequence of `AudioFrame` values, with optional jitter injection for negative testing.
+///
+/// Features:
+/// - Integer rational sample clock: `tick_to_sample`, zero cumulative drift.
+/// - Precomputed static sine wavetable: zero transcendental `sin()` or `cos()` calls in sample loop.
+/// - Multiplicative geometric envelope: zero transcendental `exp()` calls in sample loop.
+/// - Fresh DSP state constructed per render: zero state leakage or reverb tail residue.
+/// - Instant silence: empty world (`population == 0`) produces bit-zero `0.0_f32` PCM.
+/// - Fault injection parameter `inject_jitter_for_testing` to prove negative determinism tests fail.
 ///
 /// # Errors
 /// Returns a typed error if the sample count or allocation byte size overflows,
-/// or the allocator refuses the buffer. Empty input and a zero tick rate produce
-/// an empty buffer.
+/// or the allocator refuses the buffer.
 #[expect(
     clippy::cast_precision_loss,
     clippy::suboptimal_flops,
-    reason = "the deterministic PCM synthesis contract uses f32 sample coordinates and separately rounded oscillator products and sums"
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "deterministic offline synthesis uses integer phase accumulators, rational clocks, and standard f32 audio calculations"
 )]
-pub fn render_offline_pcm(
+pub fn render_deterministic_offline_with_jitter(
     frames: &[AudioFrame],
     config: &AudioConfig,
     ticks_per_second: u64,
-) -> Result<Vec<f32>, AudioRenderError> {
+    inject_jitter_for_testing: bool,
+) -> Result<OfflineRenderReport, AudioRenderError> {
     if frames.is_empty() || ticks_per_second == 0 {
-        return Ok(Vec::new());
+        let empty_digest = compute_sha256_bytes(&[]);
+        return Ok(OfflineRenderReport {
+            samples: Vec::new(),
+            pcm_data_sha256: empty_digest,
+            pcm_data_sha256_hex: sha256_to_hex(&empty_digest),
+            total_samples: 0,
+            duration_seconds: 0.0,
+            peak_amplitude: 0.0,
+            peak_dbfs: -96.0,
+            rms_amplitude: 0.0,
+            rms_dbfs: -96.0,
+            limiter_engaged_pct: 0.0,
+            total_onsets: 0,
+            telemetry_by_second: Vec::new(),
+        });
     }
 
-    // A tick rate wider than the u32 sample rate necessarily yields zero samples.
     let samples_per_tick = u32::try_from(ticks_per_second).map_or(0, |tick_rate| {
         config.sample_rate as usize / tick_rate as usize
     });
-    let total_samples = pcm_sample_count(frames.len(), samples_per_tick as u64)?;
+    if samples_per_tick == 0 {
+        let empty_digest = compute_sha256_bytes(&[]);
+        return Ok(OfflineRenderReport {
+            samples: Vec::new(),
+            pcm_data_sha256: empty_digest,
+            pcm_data_sha256_hex: sha256_to_hex(&empty_digest),
+            total_samples: 0,
+            duration_seconds: 0.0,
+            peak_amplitude: 0.0,
+            peak_dbfs: -96.0,
+            rms_amplitude: 0.0,
+            rms_dbfs: -96.0,
+            limiter_engaged_pct: 0.0,
+            total_onsets: 0,
+            telemetry_by_second: Vec::new(),
+        });
+    }
+    let _ = pcm_sample_count(frames.len(), samples_per_tick as u64)?;
+
+    let total_samples =
+        tick_to_sample(frames.len() as u64, config.sample_rate, ticks_per_second) as usize;
     let mut pcm = Vec::new();
     pcm.try_reserve_exact(total_samples)
         .map_err(|source| AudioRenderError::AllocationFailed {
@@ -1208,50 +1817,310 @@ pub fn render_offline_pcm(
         })?;
     pcm.resize(total_samples, 0.0_f32);
 
-    if config.is_muted || config.master_gain <= 0.0 {
-        return Ok(pcm);
-    }
-
     let mut current_params = AudioParams {
         master_gain: config.master_gain,
         layer_gains: config.layer_gains,
         is_muted: config.is_muted,
         tokens: config.token_bucket_capacity,
+        drone_density: if frames.first().is_some_and(|f| f.population == 0) {
+            0.0
+        } else {
+            0.2
+        },
         ..AudioParams::default()
     };
-    let dt = 1.0 / config.sample_rate as f32;
+
+    let mut active_voices: [Option<DeterministicVoice>; MAX_VOICES] = [None; MAX_VOICES];
+    let mut drone_phase: u32 = 0;
+    let mut telemetry_by_second = Vec::new();
+
+    let mut window_samples: u64 = 0;
+    let mut window_limiter_engaged: u64 = 0;
+    let mut window_sum_sq: f32 = 0.0;
+    let mut window_peak: f32 = 0.0;
+    let mut window_max_atten_db: f32 = 0.0;
+    let mut window_emitted: u64 = 0;
+    let mut window_dropped: u64 = 0;
+
+    let mut overall_peak: f32 = 0.0;
+    let mut overall_sum_sq: f64 = 0.0;
+    let mut overall_limiter_engaged: u64 = 0;
+
+    let mut jitter_state = config.run_seed;
 
     for (tick_idx, frame) in frames.iter().enumerate() {
-        let (next_params, plan) = map_frame(&current_params, frame, config);
+        let active_count = active_voices.iter().filter(|v| v.is_some()).count();
+        let (next_params, plan) = map_frame_bounded(&current_params, frame, config, active_count);
         current_params = next_params;
 
-        let start_sample = tick_idx * samples_per_tick;
-        let end_sample = (start_sample + samples_per_tick).min(total_samples);
+        window_emitted += plan.len() as u64;
+        window_dropped += plan.dropped;
 
-        for (sample_offset, s_idx) in (start_sample..end_sample).enumerate() {
-            let t = (tick_idx * samples_per_tick + sample_offset) as f32 * dt;
-            // Synthesize drone oscillator
-            let freq = 110.0 + current_params.dissonance * 20.0;
-            let drone = (2.0 * std::f32::consts::PI * freq * t).sin()
-                * 0.1
-                * current_params.drone_density
-                * config.layer_gains.drone;
-
-            // Add oneshot transient contributions
-            let mut oneshot_sum = 0.0f32;
-            for shot in plan.one_shots() {
-                let shot_freq = shot.kind.base_frequency_hz();
-                let env = (-20.0 * (sample_offset as f32 * dt)).exp();
-                oneshot_sum += (2.0 * std::f32::consts::PI * shot_freq * t).sin() * shot.gain * env;
+        // Admit scheduled one-shots into active voice slots
+        for shot in plan.one_shots() {
+            let base_freq = shot.kind.base_frequency_hz();
+            let mut detune = shot.detune_cents;
+            if inject_jitter_for_testing {
+                // Negative test fault-injection: linear congruential unseeded jitter
+                jitter_state = jitter_state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let jitter_cents = ((jitter_state >> 32) as f32 / 4_294_967_296.0) * 100.0 - 50.0;
+                detune += jitter_cents;
             }
+            let freq = base_freq * (detune / 1200.0).exp2();
+            let phase_step =
+                ((f64::from(freq) / f64::from(config.sample_rate)) * 4_294_967_296.0) as u32;
+            let total_v_samples =
+                (shot.kind.duration_seconds() * config.sample_rate as f32) as usize;
+            let decay_factor = (-20.0 / config.sample_rate as f32).exp();
 
-            let raw_sample = (drone + oneshot_sum) * current_params.master_gain;
-            let (limited, _, _) = soft_knee_limiter(raw_sample);
-            pcm[s_idx] = limited;
+            for slot in &mut active_voices {
+                if slot.is_none() {
+                    *slot = Some(DeterministicVoice {
+                        kind: shot.kind,
+                        phase: 0,
+                        phase_step,
+                        gain: shot.gain,
+                        current_env: 1.0,
+                        decay_factor,
+                        age_samples: 0,
+                        total_samples: total_v_samples,
+                    });
+                    break;
+                }
+            }
+        }
+
+        let start_sample =
+            tick_to_sample(tick_idx as u64, config.sample_rate, ticks_per_second) as usize;
+        let end_sample =
+            (tick_to_sample((tick_idx + 1) as u64, config.sample_rate, ticks_per_second) as usize)
+                .min(total_samples);
+
+        for sample_slot in &mut pcm[start_sample..end_sample] {
+            let sample_val =
+                if config.is_muted || current_params.is_muted || config.master_gain <= 0.0 {
+                    // Mute contract: exact bit-zero
+                    for slot in &mut active_voices {
+                        if let Some(voice) = slot {
+                            voice.phase = voice.phase.wrapping_add(voice.phase_step);
+                            voice.current_env *= voice.decay_factor;
+                            voice.age_samples += 1;
+                            if voice.age_samples >= voice.total_samples {
+                                *slot = None;
+                            }
+                        }
+                    }
+                    0.0_f32
+                } else if frame.population == 0 && active_voices.iter().all(Option::is_none) {
+                    // Silence-in silence-out contract: exact bit-zero
+                    0.0_f32
+                } else {
+                    // Synthesize drone
+                    let drone = if current_params.drone_density > 1e-6 {
+                        let freq = 110.0 + current_params.dissonance * 20.0;
+                        let step = ((f64::from(freq) / f64::from(config.sample_rate))
+                            * 4_294_967_296.0) as u32;
+                        drone_phase = drone_phase.wrapping_add(step);
+                        deterministic_sin(drone_phase)
+                            * 0.1
+                            * current_params.drone_density
+                            * config.layer_gains.drone
+                    } else {
+                        0.0
+                    };
+
+                    // Synthesize active voices
+                    let mut voice_sum = 0.0_f32;
+                    for slot in &mut active_voices {
+                        if let Some(voice) = slot {
+                            let s =
+                                deterministic_sin(voice.phase) * (voice.gain * voice.current_env);
+                            voice.phase = voice.phase.wrapping_add(voice.phase_step);
+                            voice.current_env *= voice.decay_factor;
+                            voice.age_samples += 1;
+                            voice_sum += s;
+                            if voice.age_samples >= voice.total_samples {
+                                *slot = None;
+                            }
+                        }
+                    }
+
+                    let raw = (drone + voice_sum) * config.master_gain;
+                    let (limited, engaged, atten_db) = soft_knee_limiter(raw);
+
+                    if engaged {
+                        window_limiter_engaged += 1;
+                        overall_limiter_engaged += 1;
+                        if atten_db > window_max_atten_db {
+                            window_max_atten_db = atten_db;
+                        }
+                    }
+
+                    limited
+                };
+
+            *sample_slot = sample_val;
+
+            let abs_s = sample_val.abs();
+            if abs_s > window_peak {
+                window_peak = abs_s;
+            }
+            if abs_s > overall_peak {
+                overall_peak = abs_s;
+            }
+            window_sum_sq += sample_val * sample_val;
+            overall_sum_sq += f64::from(sample_val) * f64::from(sample_val);
+            window_samples += 1;
+
+            if window_samples >= u64::from(config.sample_rate) {
+                let total = window_samples.max(1);
+                let rms = (window_sum_sq / total as f32).sqrt();
+                let peak_dbfs = if window_peak > 1e-6 {
+                    20.0 * window_peak.log10()
+                } else {
+                    -96.0
+                };
+                let rms_dbfs = if rms > 1e-6 {
+                    20.0 * rms.log10()
+                } else {
+                    -96.0
+                };
+                let engaged_pct = (window_limiter_engaged as f32 / total as f32) * 100.0;
+
+                let telemetry = LimiterTelemetry {
+                    limiter_engaged_samples: window_limiter_engaged,
+                    total_samples: total,
+                    limiter_engaged_pct: engaged_pct,
+                    max_attenuation_db: window_max_atten_db,
+                    peak_amplitude: window_peak,
+                    peak_dbfs,
+                    rms_amplitude: rms,
+                    rms_dbfs,
+                    voices_active: active_voices.iter().filter(|v| v.is_some()).count(),
+                    one_shots_emitted: window_emitted,
+                    one_shots_dropped: window_dropped,
+                    frames_dropped: 0,
+                    drone_density: current_params.drone_density,
+                    dissonance: current_params.dissonance,
+                    master_gain: config.master_gain,
+                };
+                telemetry_by_second.push(telemetry);
+
+                window_samples = 0;
+                window_limiter_engaged = 0;
+                window_sum_sq = 0.0;
+                window_peak = 0.0;
+                window_max_atten_db = 0.0;
+                window_emitted = 0;
+                window_dropped = 0;
+            }
         }
     }
 
-    Ok(pcm)
+    // Flush any trailing sub-second telemetry window
+    if window_samples > 0 {
+        let total = window_samples.max(1);
+        let rms = (window_sum_sq / total as f32).sqrt();
+        let peak_dbfs = if window_peak > 1e-6 {
+            20.0 * window_peak.log10()
+        } else {
+            -96.0
+        };
+        let rms_dbfs = if rms > 1e-6 {
+            20.0 * rms.log10()
+        } else {
+            -96.0
+        };
+        let engaged_pct = (window_limiter_engaged as f32 / total as f32) * 100.0;
+
+        let telemetry = LimiterTelemetry {
+            limiter_engaged_samples: window_limiter_engaged,
+            total_samples: total,
+            limiter_engaged_pct: engaged_pct,
+            max_attenuation_db: window_max_atten_db,
+            peak_amplitude: window_peak,
+            peak_dbfs,
+            rms_amplitude: rms,
+            rms_dbfs,
+            voices_active: active_voices.iter().filter(|v| v.is_some()).count(),
+            one_shots_emitted: window_emitted,
+            one_shots_dropped: window_dropped,
+            frames_dropped: 0,
+            drone_density: current_params.drone_density,
+            dissonance: current_params.dissonance,
+            master_gain: config.master_gain,
+        };
+        telemetry_by_second.push(telemetry);
+    }
+
+    let pcm_digest = compute_pcm_sha256(&pcm);
+    let duration_seconds = total_samples as f64 / f64::from(config.sample_rate);
+    let overall_rms = if total_samples > 0 {
+        ((overall_sum_sq / total_samples as f64) as f32).sqrt()
+    } else {
+        0.0
+    };
+    let peak_dbfs = if overall_peak > 1e-6 {
+        20.0 * overall_peak.log10()
+    } else {
+        -96.0
+    };
+    let rms_dbfs = if overall_rms > 1e-6 {
+        20.0 * overall_rms.log10()
+    } else {
+        -96.0
+    };
+    let overall_limiter_pct = if total_samples > 0 {
+        (overall_limiter_engaged as f32 / total_samples as f32) * 100.0
+    } else {
+        0.0
+    };
+    let total_onsets = count_pcm_onsets(&pcm, config.sample_rate, 6.0);
+
+    Ok(OfflineRenderReport {
+        samples: pcm,
+        pcm_data_sha256: pcm_digest,
+        pcm_data_sha256_hex: sha256_to_hex(&pcm_digest),
+        total_samples,
+        duration_seconds,
+        peak_amplitude: overall_peak,
+        peak_dbfs,
+        rms_amplitude: overall_rms,
+        rms_dbfs,
+        limiter_engaged_pct: overall_limiter_pct,
+        total_onsets,
+        telemetry_by_second,
+    })
+}
+
+/// Synthesize an exact, deterministic, platform-independent mono 32-bit float PCM soundtrack
+/// without fault injection.
+///
+/// # Errors
+/// Returns an error if sample count or buffer allocation overflows.
+pub fn render_deterministic_offline(
+    frames: &[AudioFrame],
+    config: &AudioConfig,
+    ticks_per_second: u64,
+) -> Result<OfflineRenderReport, AudioRenderError> {
+    render_deterministic_offline_with_jitter(frames, config, ticks_per_second, false)
+}
+
+/// Render a sequence of `AudioFrame` values to deterministic mono 32-bit float PCM samples.
+///
+/// # Errors
+/// Returns a typed error if the sample count or allocation byte size overflows,
+/// or the allocator refuses the buffer. Empty input and a zero tick rate produce
+/// an empty buffer.
+pub fn render_offline_pcm(
+    frames: &[AudioFrame],
+    config: &AudioConfig,
+    ticks_per_second: u64,
+) -> Result<Vec<f32>, AudioRenderError> {
+    render_deterministic_offline_with_jitter(frames, config, ticks_per_second, false)
+        .map(|report| report.samples)
 }
 
 #[cfg(test)]
@@ -1798,5 +2667,273 @@ mod tests {
                 assert_eq!(sonifier.telemetry().frames_dropped, 0);
             }
         }
+    }
+
+    #[test]
+    #[expect(clippy::cast_precision_loss, reason = "test frequency scaling")]
+    fn test_deterministic_offline_wav_roundtrip() {
+        let wav_path =
+            std::env::temp_dir().join(format!("test_roundtrip_{}.wav", std::process::id()));
+
+        let samples: Vec<f32> = (0..960).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let written_digest =
+            write_canonical_wav(&wav_path, &samples, 48_000).expect("write canonical wav");
+
+        let parsed = read_canonical_wav(&wav_path).expect("read canonical wav");
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 1);
+        assert_eq!(parsed.bits_per_sample, 32);
+        assert_eq!(parsed.samples.len(), samples.len());
+        assert_eq!(parsed.pcm_data_sha256, written_digest);
+        for (a, b) in samples.iter().zip(parsed.samples.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
+    fn test_state_reset_between_renders() {
+        let config = AudioConfig {
+            run_seed: 98765,
+            ..AudioConfig::default()
+        };
+        let frames: Vec<AudioFrame> = (0..2000)
+            .map(|tick| AudioFrame {
+                tick,
+                population: u32::try_from(50 + (tick % 200)).unwrap_or(u32::MAX),
+                births: (tick % 5) as u32,
+                deaths: (tick % 7) as u32,
+                spike_hits: (tick % 11) as u32,
+                herbivore_share: 0.6,
+                mean_energy: 1.2,
+                mean_health: 1.0,
+                ..AudioFrame::default()
+            })
+            .collect();
+
+        // Render 1
+        let report1 = render_deterministic_offline(&frames, &config, 60).expect("render 1");
+        // Render 2 in the same process
+        let report2 = render_deterministic_offline(&frames, &config, 60).expect("render 2");
+
+        assert_eq!(report1.total_samples, report2.total_samples);
+        assert_eq!(report1.pcm_data_sha256, report2.pcm_data_sha256);
+        assert_eq!(report1.pcm_data_sha256_hex, report2.pcm_data_sha256_hex);
+        assert_eq!(report1.samples.len(), report2.samples.len());
+        for (i, (&s1, &s2)) in report1
+            .samples
+            .iter()
+            .zip(report2.samples.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                s1.to_bits(),
+                s2.to_bits(),
+                "sample mismatch at index {i}: {s1} vs {s2}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_av_alignment_onset() {
+        let config = AudioConfig {
+            run_seed: 42,
+            ..AudioConfig::default()
+        };
+        let mut frames: Vec<AudioFrame> = (0..600)
+            .map(|tick| AudioFrame {
+                tick,
+                population: 0,
+                births: 0,
+                deaths: 0,
+                spike_hits: 0,
+                ..AudioFrame::default()
+            })
+            .collect();
+
+        // Exactly at tick 500: single spike event
+        frames[500].spike_hits = 1;
+
+        let report = render_deterministic_offline(&frames, &config, 60).expect("render");
+        let expected_onset_sample =
+            usize::try_from(tick_to_sample(500, 48_000, 60)).expect("fit usize");
+
+        // Before sample 400_000, world was completely silent
+        for (i, &s) in report
+            .samples
+            .iter()
+            .enumerate()
+            .take(expected_onset_sample)
+        {
+            assert_eq!(
+                s.to_bits(),
+                0u32,
+                "sample at {i} must be zero before onset at {expected_onset_sample}"
+            );
+        }
+
+        // At onset sample, the transient is triggered and produces a non-zero sample
+        let mut non_zero_detected = false;
+        for &s in report.samples.iter().skip(expected_onset_sample).take(5) {
+            if s.abs() > 1e-6 {
+                non_zero_detected = true;
+                break;
+            }
+        }
+        assert!(
+            non_zero_detected,
+            "transient onset must appear within 1-5 samples of expected sample {expected_onset_sample}"
+        );
+    }
+
+    #[test]
+    fn test_silence_in_silence_out() {
+        let config = AudioConfig::default();
+        let frames: Vec<AudioFrame> = (0..100)
+            .map(|tick| AudioFrame {
+                tick,
+                population: 0,
+                births: 0,
+                deaths: 0,
+                spike_hits: 0,
+                ..AudioFrame::default()
+            })
+            .collect();
+
+        let report = render_deterministic_offline(&frames, &config, 60).expect("render silence");
+        assert_ne!(report.total_samples, 0);
+        for (i, &sample) in report.samples.iter().enumerate() {
+            assert_eq!(
+                sample.to_bits(),
+                0u32,
+                "sample at {i} must be bit-zero for empty world"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test reference rational clock verification"
+    )]
+    fn test_rational_clock_zero_cumulative_drift() {
+        let sample_rate = 48_000;
+        let tps = 59; // Not an even factor of 48,000
+
+        for tick in [0, 1, 59, 1000, 10_000, 100_000] {
+            let sample = tick_to_sample(tick, sample_rate, tps);
+            let expected = ((2 * u128::from(tick) * u128::from(sample_rate) + u128::from(tps))
+                / (2 * u128::from(tps))) as u64;
+            assert_eq!(sample, expected);
+        }
+
+        // Across 100,000 ticks at 60 TPS, sample must be exactly 80,000,000
+        assert_eq!(tick_to_sample(100_000, 48_000, 60), 80_000_000);
+    }
+
+    #[test]
+    fn test_negative_jitter_breaks_determinism() {
+        let config = AudioConfig {
+            run_seed: 5555,
+            ..AudioConfig::default()
+        };
+        let frames: Vec<AudioFrame> = (0..50)
+            .map(|tick| AudioFrame {
+                tick,
+                population: 100,
+                births: 2,
+                deaths: 1,
+                spike_hits: 1,
+                ..AudioFrame::default()
+            })
+            .collect();
+
+        let clean1 =
+            render_deterministic_offline_with_jitter(&frames, &config, 60, false).expect("clean 1");
+        let clean2 =
+            render_deterministic_offline_with_jitter(&frames, &config, 60, false).expect("clean 2");
+        assert_eq!(clean1.pcm_data_sha256, clean2.pcm_data_sha256);
+
+        // Injected jitter must produce a DIFFERENT digest, proving determinism verification is not a false green
+        let jittered =
+            render_deterministic_offline_with_jitter(&frames, &config, 60, true).expect("jittered");
+        assert_ne!(
+            clean1.pcm_data_sha256, jittered.pcm_data_sha256,
+            "injected jitter must break the PCM digest"
+        );
+    }
+
+    #[test]
+    fn test_machine_gun_at_wav_level() {
+        let config = AudioConfig {
+            token_refill_rate: 2.0,
+            max_oneshots_per_tick: 8,
+            sample_rate: 48_000,
+            ..AudioConfig::default()
+        };
+        // 60 ticks = 1 second of simulation under 300 births per tick
+        let frames: Vec<AudioFrame> = (0..60)
+            .map(|tick| AudioFrame {
+                tick,
+                population: 5000,
+                births: 300,
+                deaths: 0,
+                spike_hits: 0,
+                ..AudioFrame::default()
+            })
+            .collect();
+
+        let report = render_deterministic_offline(&frames, &config, 60).expect("render");
+        assert_eq!(report.total_samples, 48_000);
+
+        // Every sample must be strictly bounded in [-1.0, 1.0] without NaN
+        for &s in &report.samples {
+            assert!(!s.is_nan());
+            assert!(s.abs() <= 1.0);
+        }
+
+        // Onsets must be capped by token bucket rate limiter (8 initial + 59 * 2 = 126 max)
+        assert!(
+            report.total_onsets <= 150,
+            "detected onsets {} exceeds rate-limiting ceiling",
+            report.total_onsets
+        );
+
+        // Limiter engagement must not be pegged continuously (should stay reasonable)
+        assert!(
+            report.limiter_engaged_pct <= 50.0,
+            "limiter engaged pct {} is too high",
+            report.limiter_engaged_pct
+        );
+    }
+
+    #[test]
+    fn test_telemetry_csv_output() {
+        let csv_path = std::env::temp_dir().join(format!("telemetry_{}.csv", std::process::id()));
+
+        let config = AudioConfig {
+            sample_rate: 48_000,
+            ..AudioConfig::default()
+        };
+        let frames: Vec<AudioFrame> = (0..120) // 2 seconds at 60 TPS
+            .map(|tick| AudioFrame {
+                tick,
+                population: 200,
+                births: 1,
+                deaths: 1,
+                spike_hits: 0,
+                ..AudioFrame::default()
+            })
+            .collect();
+
+        let report = render_deterministic_offline(&frames, &config, 60).expect("render");
+        assert_eq!(report.telemetry_by_second.len(), 2);
+
+        write_telemetry_csv(&csv_path, &report.telemetry_by_second).expect("write csv");
+        let content = std::fs::read_to_string(&csv_path).expect("read csv");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3); // header + 2 rows
+        assert!(lines[0].starts_with("second,tick,voices_active"));
+        assert!(lines[1].starts_with("1,"));
+        assert!(lines[2].starts_with("2,"));
     }
 }

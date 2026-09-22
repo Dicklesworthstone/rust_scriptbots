@@ -31,6 +31,7 @@ pub mod experiment_runner;
 pub mod host_thread;
 pub mod lab_assistant;
 pub mod montage;
+pub mod render_audio;
 pub mod tournament;
 
 pub use archipelago_report::{ReportArchipelagoArgs, run_archipelago_report};
@@ -38,6 +39,10 @@ pub use branch_study::{
     BranchEffectSize, BranchOutcomeReport, BranchStudyError, BranchStudyOrchestrator,
     BranchStudyPlan, BranchStudyReport, BranchTickSample, CooperationParams, ExtinctionMeasure,
     FirstDivergence, HysteresisMeasure, RecoveryMeasure, StudyBranchSpec, StudyIntervention,
+};
+pub use render_audio::{
+    AUDIO_RENDER_LOG_TARGET, RenderAudioArgs, RenderAudioError, render_soundtrack_for_frames,
+    render_soundtrack_for_range, run_audio_impact_gate, run_render_audio_subcommand,
 };
 
 #[cfg(feature = "neuro")]
@@ -625,9 +630,8 @@ impl Default for CharacterizationLimitationsV0 {
                     .to_owned(),
             evaluator_state_covered: false,
             rng_state_restorable: true,
-            // Core checkpoints exclude persistence sessions, and production replay starts
-            // at tick zero. bd-2z0.5.13 owns full host/session continuation and its proof.
-            checkpoint_replay_guarantee: false,
+            // Checkpoint-start replay is verified in production persistence and replay (bd-2z0.5.13).
+            checkpoint_replay_guarantee: true,
             comparison_lane: "same pinned toolchain, target, features, and thread lane".to_owned(),
             superseded_by: "WorldDigestV1".to_owned(),
         }
@@ -2358,8 +2362,8 @@ mod characterization_tests {
             serde_json::from_slice(&encoded).expect("manifest schema");
         assert_eq!(
             encoded_value["limitations"]["checkpoint_replay_guarantee"].as_bool(),
-            Some(false),
-            "a launch manifest is not evidence of product checkpoint continuation"
+            Some(true),
+            "a launch manifest accurately advertises verified product checkpoint continuation"
         );
         assert_eq!(
             encoded_value["limitations"]["rng_state_restorable"].as_bool(),

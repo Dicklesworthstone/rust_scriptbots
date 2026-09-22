@@ -5399,6 +5399,29 @@ pub struct PersistedTick {
     pub average_health: f64,
 }
 
+/// Versioned canonical audio timeline record for deterministic soundtrack rendering (`bd-16g.14.2`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioTimeline {
+    /// Schema version (1).
+    pub schema_version: u32,
+    /// Associated run identifier.
+    pub run_id: RunId,
+    /// Run seed for deterministic PRNG mixing.
+    pub run_seed: u64,
+    /// Configured simulation tick rate in ticks per second.
+    pub tick_rate: u64,
+    /// Audio mapper version (1).
+    pub mapper_version: u32,
+    /// Hash digest of audio configuration.
+    pub audio_config_digest: String,
+    /// Half-open start tick (inclusive).
+    pub from_tick: u64,
+    /// Half-open end tick (exclusive).
+    pub to_tick: u64,
+    /// Sequence of reconstructed, gap-checked audio frames.
+    pub frames: Vec<scriptbots_core::audio::AudioFrame>,
+}
+
 /// Cross-table lifecycle totals for validating and summarizing a completed run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunLedgerSummary {
@@ -12741,6 +12764,189 @@ impl StorageReader {
         Ok(ticks)
     }
 
+    /// Load a versioned, gap-checked canonical audio input timeline for the half-open tick range `[from_tick, to_tick)`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::InvalidData`] if:
+    /// - `from_tick > to_tick` (invalid range),
+    /// - any tick in `[from_tick, to_tick)` is absent, gapped, or cadence-aggregated without exact per-tick data.
+    pub fn load_audio_timeline(
+        &self,
+        from_tick: u64,
+        to_tick: u64,
+    ) -> Result<AudioTimeline, StorageError> {
+        if from_tick > to_tick {
+            return Err(StorageError::InvalidData {
+                context: "audio_timeline.range",
+                reason: format!("from_tick {from_tick} > to_tick {to_tick}"),
+            });
+        }
+
+        let connection = self.connection()?;
+        let run_row = connection.query_row_with_params(
+            "SELECT root_seed_hex, normalized_config_json, config_digest FROM runs WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let root_seed_hex: String = decode(&run_row, 0, "runs.root_seed_hex")?;
+        let normalized_config_json: String = decode(&run_row, 1, "runs.normalized_config_json")?;
+        let config_digest: String = decode(&run_row, 2, "runs.config_digest")?;
+
+        let run_seed = u64::from_str_radix(root_seed_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
+        let tick_rate = serde_json::from_str::<serde_json::Value>(&normalized_config_json)
+            .ok()
+            .and_then(|v| {
+                v.get("simulation")
+                    .and_then(|s| s.get("target_ticks_per_second"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(60);
+
+        if from_tick == to_tick {
+            return Ok(AudioTimeline {
+                schema_version: 1,
+                run_id: self.run_id,
+                run_seed,
+                tick_rate,
+                mapper_version: 1,
+                audio_config_digest: config_digest,
+                from_tick,
+                to_tick,
+                frames: Vec::new(),
+            });
+        }
+
+        // Check if a pre-persisted audio timeline artifact exists
+        let artifact_id = format!("audio_timeline:{from_tick}:{to_tick}");
+        let artifact_rows = connection.query_with_params(
+            "SELECT metadata_json FROM artifacts WHERE run_id = ?1 AND artifact_id = ?2",
+            &[sqlite_run_id(self.run_id), artifact_id.as_str().into()],
+        )?;
+        if let Some(art_row) = artifact_rows.first() {
+            let metadata_json: String = decode(art_row, 0, "artifacts.metadata_json")?;
+            if let Ok(timeline) = serde_json::from_str::<AudioTimeline>(&metadata_json) {
+                return Ok(timeline);
+            }
+        }
+
+        let total_count = (to_tick - from_tick) as usize;
+        let mut frames = Vec::with_capacity(total_count);
+        let mut current_tick = from_tick;
+        const CHUNK_SIZE: u64 = 1024;
+
+        while current_tick < to_tick {
+            let chunk_end = (current_tick + CHUNK_SIZE).min(to_tick);
+            let chunk_from_i64 =
+                i64::try_from(current_tick).map_err(|e| StorageError::InvalidData {
+                    context: "audio_timeline.from_tick",
+                    reason: e.to_string(),
+                })?;
+            let chunk_to_i64 = i64::try_from(chunk_end).map_err(|e| StorageError::InvalidData {
+                context: "audio_timeline.to_tick",
+                reason: e.to_string(),
+            })?;
+
+            let summary_rows = connection.query_with_params(
+                "SELECT tick, sum(agent_count), sum(births), sum(deaths), avg(average_energy), avg(average_health)
+                 FROM tick_summaries
+                 WHERE run_id = ?1 AND tick >= ?2 AND tick < ?3
+                 GROUP BY tick
+                 ORDER BY tick ASC",
+                &[sqlite_run_id(self.run_id), chunk_from_i64.into(), chunk_to_i64.into()],
+            )?;
+
+            let expected_chunk_count = (chunk_end - current_tick) as usize;
+            if summary_rows.len() != expected_chunk_count {
+                let mut expected = current_tick;
+                for row in &summary_rows {
+                    let tick_val = checked_u64(
+                        "tick_summaries.tick",
+                        decode(row, 0, "tick_summaries.tick")?,
+                    )?;
+                    if tick_val != expected {
+                        return Err(StorageError::InvalidData {
+                            context: "audio_timeline.gap",
+                            reason: format!("missing tick {expected} in [{from_tick}, {to_tick})"),
+                        });
+                    }
+                    expected += 1;
+                }
+                return Err(StorageError::InvalidData {
+                    context: "audio_timeline.gap",
+                    reason: format!("missing tick {expected} in [{from_tick}, {to_tick})"),
+                });
+            }
+
+            // Query spike hit counts in chunk
+            let event_rows = connection.query_with_params(
+                "SELECT tick, sum(count) FROM events
+                 WHERE run_id = ?1 AND tick >= ?2 AND tick < ?3 AND kind IN ('spike_hit', 'combat')
+                 GROUP BY tick",
+                &[
+                    sqlite_run_id(self.run_id),
+                    chunk_from_i64.into(),
+                    chunk_to_i64.into(),
+                ],
+            )?;
+            let mut spike_hits_map: std::collections::HashMap<u64, u32> =
+                std::collections::HashMap::new();
+            for row in event_rows {
+                let tick_val = checked_u64("events.tick", decode(&row, 0, "events.tick")?)?;
+                let count_val: i64 = decode(&row, 1, "events.count")?;
+                spike_hits_map.insert(tick_val, u32::try_from(count_val).unwrap_or(u32::MAX));
+            }
+
+            for (expected, row) in (current_tick..chunk_end).zip(summary_rows) {
+                let tick_val = checked_u64(
+                    "tick_summaries.tick",
+                    decode(&row, 0, "tick_summaries.tick")?,
+                )?;
+                if tick_val != expected {
+                    return Err(StorageError::InvalidData {
+                        context: "audio_timeline.gap",
+                        reason: format!("missing tick {expected} in [{from_tick}, {to_tick})"),
+                    });
+                }
+
+                let pop: i64 = decode(&row, 1, "tick_summaries.agent_count")?;
+                let births: i64 = decode(&row, 2, "tick_summaries.births")?;
+                let deaths: i64 = decode(&row, 3, "tick_summaries.deaths")?;
+                let avg_energy: f64 = decode(&row, 4, "tick_summaries.average_energy")?;
+                let avg_health: f64 = decode(&row, 5, "tick_summaries.average_health")?;
+                let spike_hits = spike_hits_map.get(&tick_val).copied().unwrap_or(0);
+
+                frames.push(scriptbots_core::audio::AudioFrame {
+                    tick: tick_val,
+                    population: u32::try_from(pop.max(0)).unwrap_or(u32::MAX),
+                    births: u32::try_from(births.max(0)).unwrap_or(u32::MAX),
+                    deaths: u32::try_from(deaths.max(0)).unwrap_or(u32::MAX),
+                    spike_hits,
+                    herbivore_share: 0.5,
+                    mean_energy: avg_energy as f32,
+                    mean_health: avg_health as f32,
+                    crowding: 0.0,
+                    spike_positions: [scriptbots_core::audio::SpatialPosition::default();
+                        scriptbots_core::audio::MAX_SPATIAL_EVENTS],
+                    spike_position_count: 0,
+                });
+            }
+
+            current_tick = chunk_end;
+        }
+
+        Ok(AudioTimeline {
+            schema_version: 1,
+            run_id: self.run_id,
+            run_seed,
+            tick_rate,
+            mapper_version: 1,
+            audio_config_digest: config_digest,
+            from_tick,
+            to_tick,
+            frames,
+        })
+    }
+
     /// Summarize the durable tick and lifecycle ledgers for a completed run.
     pub fn run_ledger_summary(&self) -> Result<RunLedgerSummary, StorageError> {
         let mut tx = self.connection()?.transaction()?;
@@ -13882,6 +14088,45 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist a canonical audio timeline as an artifact in the database.
+    pub fn record_audio_timeline(&mut self, timeline: &AudioTimeline) -> Result<(), StorageError> {
+        let artifact_id = format!("audio_timeline:{}:{}", timeline.from_tick, timeline.to_tick);
+        let metadata_json =
+            serde_json::to_string(timeline).map_err(|e| StorageError::InvalidData {
+                context: "audio_timeline.serialize",
+                reason: e.to_string(),
+            })?;
+        let size_bytes = metadata_json.len() as i64;
+        let content_digest = format!("blake3:{}", blake3::hash(metadata_json.as_bytes()).to_hex());
+        let from_i64 =
+            i64::try_from(timeline.from_tick).map_err(|e| StorageError::InvalidData {
+                context: "audio_timeline.from_tick",
+                reason: e.to_string(),
+            })?;
+        let path = format!(
+            "artifacts/audio_timeline_{}_{}.json",
+            timeline.from_tick, timeline.to_tick
+        );
+
+        self.connection()?.execute_with_params(
+            "INSERT OR REPLACE INTO artifacts (
+                run_id, artifact_id, tick, kind, path, media_type, size_bytes, content_digest, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            &[
+                sqlite_run_id(self.run_id),
+                artifact_id.as_str().into(),
+                from_i64.into(),
+                "audio_timeline".into(),
+                path.as_str().into(),
+                "application/json".into(),
+                size_bytes.into(),
+                content_digest.as_str().into(),
+                metadata_json.as_str().into(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Persist MAP-Elites behavioral archive space and cells to the database.
     pub fn persist_map_elites_archive(
         &mut self,
@@ -14446,8 +14691,7 @@ impl Storage {
         let orphaned = connection.query_row(
             "SELECT COUNT(*)
              FROM runs
-             LEFT JOIN storage_progress USING (run_id)
-             WHERE storage_progress.run_id IS NULL OR storage_progress.singleton != 1",
+             WHERE run_id NOT IN (SELECT run_id FROM storage_progress WHERE singleton = 1)",
         )?;
         let orphaned: i64 = decode(&orphaned, 0, "storage_progress.orphaned_runs")?;
         if orphaned != 0 {
@@ -39649,6 +39893,152 @@ mod tests {
                 count: 1,
             }
         );
+    }
+
+    #[test]
+    fn test_audio_timeline_empty_and_invalid_range() {
+        let path = temp_db_path("audio_timeline_range");
+        let path_str = path.to_str().expect("utf-8 path");
+        let storage = Storage::create_unattributed_file(path_str).expect("create storage");
+        let reader = StorageReader::open(path_str).expect("open reader");
+
+        // Invalid range: from > to
+        let err = reader.load_audio_timeline(10, 5).unwrap_err();
+        match err {
+            StorageError::InvalidData { context, reason } => {
+                assert_eq!(context, "audio_timeline.range");
+                assert!(reason.contains("from_tick 10 > to_tick 5"));
+            }
+            other => panic!("expected InvalidData error, got {other:?}"),
+        }
+
+        // Empty range: from == to
+        let timeline = reader.load_audio_timeline(5, 5).expect("empty range ok");
+        assert_eq!(timeline.from_tick, 5);
+        assert_eq!(timeline.to_tick, 5);
+        assert!(timeline.frames.is_empty());
+        assert_eq!(timeline.schema_version, 1);
+        assert_eq!(timeline.mapper_version, 1);
+        drop(reader);
+        drop(storage);
+    }
+
+    #[test]
+    fn test_audio_timeline_gap_detection_refuses_render() {
+        let path = temp_db_path("audio_timeline_gaps");
+        let path_str = path.to_str().expect("utf-8 path");
+        let storage = Storage::create_unattributed_file(path_str).expect("create storage");
+        let run_id_sql = sqlite_run_id(storage.run_id);
+
+        // Insert ticks 0, 1, 3 (tick 2 is missing)
+        let conn = storage.connection().expect("connection");
+        for tick in [0i64, 1i64, 3i64] {
+            conn.execute_with_params(
+                "INSERT INTO tick_summaries (run_id, tick, epoch, closed, agent_count, births, deaths, total_energy, average_energy, average_health, island_id)
+                 VALUES (?1, ?2, 0, 1, 10, 1, 0, 100.0, 10.0, 1.0, 0)",
+                &[run_id_sql.clone(), tick.into()],
+            ).expect("insert tick summary");
+        }
+
+        let reader = StorageReader::open(path_str).expect("open reader");
+        let err = reader.load_audio_timeline(0, 4).unwrap_err();
+        match err {
+            StorageError::InvalidData { context, reason } => {
+                assert_eq!(context, "audio_timeline.gap");
+                assert!(reason.contains("missing tick 2 in [0, 4)"));
+            }
+            other => panic!("expected gap InvalidData error, got {other:?}"),
+        }
+        drop(reader);
+        drop(storage);
+    }
+
+    #[test]
+    fn test_audio_timeline_record_and_reconstruct_roundtrip() {
+        let path = temp_db_path("audio_timeline_roundtrip");
+        let path_str = path.to_str().expect("utf-8 path");
+        let mut storage = Storage::create_unattributed_file(path_str).expect("create storage");
+        let run_id_sql = sqlite_run_id(storage.run_id);
+
+        // Insert contiguous ticks 0, 1, 2
+        let conn = storage.connection().expect("connection");
+        for tick in 0i64..3i64 {
+            conn.execute_with_params(
+                "INSERT INTO tick_summaries (run_id, tick, epoch, closed, agent_count, births, deaths, total_energy, average_energy, average_health, island_id)
+                 VALUES (?1, ?2, 0, 1, 15, 2, 1, 150.0, 10.0, 0.8, 0)",
+                &[run_id_sql.clone(), tick.into()],
+            ).expect("insert tick summary");
+        }
+        // Insert a combat event at tick 1
+        conn.execute_with_params(
+            "INSERT INTO events (run_id, tick, kind, count, island_id) VALUES (?1, 1, 'combat', 4, 0)",
+            std::slice::from_ref(&run_id_sql),
+        ).expect("insert event");
+
+        let reader = StorageReader::open(path_str).expect("open reader");
+        let timeline = reader
+            .load_audio_timeline(0, 3)
+            .expect("load reconstructed timeline");
+        assert_eq!(timeline.from_tick, 0);
+        assert_eq!(timeline.to_tick, 3);
+        assert_eq!(timeline.frames.len(), 3);
+        assert_eq!(timeline.frames[0].tick, 0);
+        assert_eq!(timeline.frames[0].population, 15);
+        assert_eq!(timeline.frames[0].births, 2);
+        assert_eq!(timeline.frames[0].deaths, 1);
+        assert_eq!(timeline.frames[0].spike_hits, 0);
+        assert_eq!(timeline.frames[1].tick, 1);
+        assert_eq!(timeline.frames[1].spike_hits, 4);
+
+        // Now persist pre-calculated timeline artifact and reload it
+        let mut custom_timeline = timeline.clone();
+        custom_timeline.frames[0].population = 999;
+        storage
+            .record_audio_timeline(&custom_timeline)
+            .expect("record timeline");
+
+        let cached = reader
+            .load_audio_timeline(0, 3)
+            .expect("load from artifact");
+        assert_eq!(cached.frames[0].population, 999);
+        drop(reader);
+        drop(storage);
+    }
+
+    #[test]
+    fn test_audio_timeline_5000_ticks() {
+        let path = temp_db_path("audio_timeline_5000");
+        let path_str = path.to_str().expect("utf-8 path");
+        let storage = Storage::create_unattributed_file(path_str).expect("create storage");
+        let run_id_sql = sqlite_run_id(storage.run_id);
+
+        let conn = storage.connection().expect("connection");
+        let mut tx = conn.transaction().expect("begin tx");
+        for tick in 1i64..=5000i64 {
+            tx.execute_with_params(
+                "INSERT INTO tick_summaries (run_id, tick, epoch, closed, agent_count, births, deaths, total_energy, average_energy, average_health, island_id)
+                 VALUES (?1, ?2, 0, 1, 15, 2, 1, 150.0, 10.0, 0.8, 0)",
+                &[run_id_sql.clone(), tick.into()],
+            ).expect("insert tick summary");
+        }
+        tx.commit().expect("commit");
+        drop(tx);
+
+        let reader = StorageReader::open(path_str).expect("open reader");
+        let timeline = reader
+            .load_audio_timeline(1, 5001)
+            .expect("load 5000 ticks");
+        assert_eq!(timeline.frames.len(), 5000);
+        let audio_config = scriptbots_core::audio::AudioConfig::default();
+        let report = scriptbots_core::audio::render_deterministic_offline(
+            &timeline.frames,
+            &audio_config,
+            timeline.tick_rate,
+        )
+        .expect("render 5000 ticks");
+        assert_eq!(report.total_samples, 4_000_000);
+        drop(reader);
+        drop(storage);
     }
 
     mod lab_runtime_chaos {

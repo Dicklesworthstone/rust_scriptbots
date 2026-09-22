@@ -120,7 +120,7 @@ fn manifest_digest_for_test(manifest: &RunManifestV3) -> String {
 }
 
 #[test]
-fn persisted_manifests_do_not_claim_unimplemented_checkpoint_continuation() {
+fn persisted_manifests_advertise_verified_checkpoint_continuation() {
     let mut previous_roster = None;
     for brain in ["mlp", "mixed"] {
         let dir = run_dir(&format!("checkpoint_guarantee_{brain}"));
@@ -155,8 +155,8 @@ fn persisted_manifests_do_not_claim_unimplemented_checkpoint_continuation() {
             // Missing/null/string values must not pass either.
             assert_eq!(
                 manifest["limitations"]["checkpoint_replay_guarantee"].as_bool(),
-                Some(false),
-                "{location} must not advertise checkpoint-start replay: {manifest}"
+                Some(true),
+                "{location} must advertise checkpoint-start replay: {manifest}"
             );
             assert_eq!(
                 manifest["limitations"]["rng_state_restorable"].as_bool(),
