@@ -6,7 +6,7 @@ use scriptbots_app::brains::{BrainPreset, install_brains};
 use scriptbots_app::seed_founding_population;
 use scriptbots_core::audio::{compute_pcm_sha256, read_canonical_wav};
 use scriptbots_core::{ScriptBotsConfig, WorldState};
-use scriptbots_storage::{Connection, StoragePipeline};
+use scriptbots_storage::{Connection, Storage, StoragePipeline};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -60,8 +60,10 @@ fn test_mock_free_e2e_5000_ticks_and_dual_cli_determinism() {
     seed_founding_population(&mut world, &installed.population).expect("seed founding agents");
 
     let storage = Storage::create_unattributed_file(db_str).expect("create file-backed storage");
-    let run_id_str = storage.run_id.to_string();
-    let conn = storage.connection().expect("storage connection");
+    let run_id_str = storage.run_id().to_string();
+    drop(storage);
+
+    let conn = Connection::open(db_str).expect("storage connection");
     let mut tx = conn.transaction().expect("begin transaction");
 
     // Record tick 0 state
@@ -75,40 +77,45 @@ fn test_mock_free_e2e_5000_ticks_and_dual_cli_determinism() {
     ).expect("insert tick 0 summary");
 
     for tick in 1..=TOTAL_TICKS {
-        let events = world.step().expect("step real world simulation");
+        world.step().expect("step real world simulation");
+        let summary = world.history().next_back().expect("history available");
         let tick_i64 = tick as i64;
-        let pop = world.agent_count() as i64;
-        let births = events.births.len() as i64;
-        let deaths = events.deaths.len() as i64;
+        let pop = summary.agent_count as i64;
+        let births = summary.births as i64;
+        let deaths = summary.deaths as i64;
 
         tx.execute_with_params(
             "INSERT INTO tick_summaries (run_id, tick, epoch, closed, agent_count, births, deaths, total_energy, average_energy, average_health, island_id)
-             VALUES (?1, ?2, 0, 1, ?3, ?4, ?5, 100.0, 10.0, 1.0, 0)",
+             VALUES (?1, ?2, 0, 1, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
             &[
                 run_id_str.as_str().into(),
                 tick_i64.into(),
                 pop.into(),
                 births.into(),
                 deaths.into(),
+                (summary.total_energy as f64).into(),
+                (summary.average_energy as f64).into(),
+                (summary.average_health as f64).into(),
             ],
         ).expect("insert tick summary");
 
-        if events.spike_hits > 0 {
+        if summary.spike_hits > 0 {
             tx.execute_with_params(
                 "INSERT INTO events (run_id, tick, kind, count, island_id)
                  VALUES (?1, ?2, 'combat', ?3, 0)",
                 &[
                     run_id_str.as_str().into(),
                     tick_i64.into(),
-                    (events.spike_hits as i64).into(),
+                    (summary.spike_hits as i64).into(),
                 ],
-            ).expect("insert event");
+            )
+            .expect("insert event");
         }
     }
 
     tx.commit().expect("commit transaction");
     drop(tx);
-    drop(storage);
+    drop(conn);
 
     assert!(db_path.exists(), "database file must exist");
 
