@@ -22802,6 +22802,117 @@ mod command_characterization_tests {
         detail.selected_eye = None;
         let _div_all = render_sense_attribution(&detail);
     }
+
+    #[test]
+    fn simulation_controls_vfx_toggle_and_defaults() {
+        let controls = SimulationControls::default();
+        assert!(
+            controls.draw_vfx,
+            "SimulationControls::default must have draw_vfx enabled by default"
+        );
+        let snapshot = controls.snapshot(false, 1.0);
+        assert!(
+            snapshot.draw_vfx,
+            "ControlsSnapshot must inherit draw_vfx enabled from controls"
+        );
+
+        let mut toggled = controls;
+        toggled.draw_vfx = false;
+        let toggled_snapshot = toggled.snapshot(false, 1.0);
+        assert!(
+            !toggled_snapshot.draw_vfx,
+            "ControlsSnapshot must reflect draw_vfx = false when toggled"
+        );
+    }
+
+    #[test]
+    fn render_frame_vfx_attachment_from_snapshot_and_events() {
+        let world = command_characterization_world();
+        let host = TestHost::take(world);
+        let mut snapshot = (*host.port.snapshot_hub().latest()).clone();
+
+        let event = scriptbots_core::LocatedWorldVisualEvent {
+            tick: scriptbots_core::Tick(5),
+            ordinal: 0,
+            source: None,
+            target: None,
+            position: Position::new(50.0, 50.0),
+            direction: [1.0, 0.0],
+            event: scriptbots_core::visual::WorldVisualEvent::CombatHit { damage: 0.5 },
+        };
+        snapshot.visual_events = Arc::new(vec![event]);
+        snapshot.visual_dropped_events = 0;
+
+        let frame = RenderFrame::from_snapshot(&snapshot, ColorPaletteMode::Natural)
+            .expect("RenderFrame from snapshot with visual events");
+        assert_eq!(
+            frame.vfx.tick(),
+            snapshot.world.tick,
+            "RenderFrame must attach VfxFrame matching the snapshot tick"
+        );
+
+        // Explicit VfxFrame attachment:
+        let custom_vfx = vfx::VfxFrame::empty(99);
+        let frame_custom = RenderFrame::from_snapshot_with_vfx(
+            &snapshot,
+            ColorPaletteMode::Natural,
+            Some(custom_vfx.clone()),
+        )
+        .expect("RenderFrame with explicit VfxFrame");
+        assert_eq!(
+            frame_custom.vfx, custom_vfx,
+            "RenderFrame must preserve explicit VfxFrame passed to from_snapshot_with_vfx"
+        );
+    }
+
+    #[test]
+    fn simulation_view_vfx_projection_ingestion_and_retention() {
+        let world = command_characterization_world();
+        let host = TestHost::take(world);
+        let mut view = host_view(Arc::clone(&host));
+
+        // Initial snapshot has empty events
+        let initial_snapshot = view.snapshot();
+        assert!(
+            initial_snapshot.render_frame.is_some(),
+            "SimulationView must produce a render frame"
+        );
+        let vfx_frame = view.vfx_projection.frame_at(0);
+        assert_eq!(vfx_frame.len(), 0);
+
+        // Ingest visual events directly into view's projection and assert lifetime retention
+        let death_event = scriptbots_core::LocatedWorldVisualEvent {
+            tick: scriptbots_core::Tick(10),
+            ordinal: 0,
+            source: None,
+            target: None,
+            position: Position::new(25.0, 25.0),
+            direction: [0.0, 1.0],
+            event: scriptbots_core::visual::WorldVisualEvent::Death {
+                cause: scriptbots_core::DeathCause::Starvation,
+            },
+        };
+        view.vfx_projection.ingest(
+            10,
+            std::iter::once(vfx::LocatedVfx::from_located_world_event(&death_event)),
+        );
+
+        // Death effect has a multi-tick duration (36 ticks)
+        let frame_at_10 = view.vfx_projection.frame_at(10);
+        assert_eq!(frame_at_10.len(), 1);
+        let frame_at_25 = view.vfx_projection.frame_at(25);
+        assert_eq!(
+            frame_at_25.len(),
+            1,
+            "death effect must remain alive across intermediate ticks"
+        );
+        let frame_at_50 = view.vfx_projection.frame_at(50);
+        assert_eq!(
+            frame_at_50.len(),
+            0,
+            "death effect must expire after duration has elapsed"
+        );
+    }
 }
 
 #[cfg(test)]

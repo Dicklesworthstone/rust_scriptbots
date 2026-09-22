@@ -199,6 +199,11 @@ impl VfxFrame {
     }
 
     #[must_use]
+    pub(crate) const fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.events.len()
     }
