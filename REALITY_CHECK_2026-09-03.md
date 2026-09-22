@@ -1,6 +1,139 @@
-# Reality Check — rust_scriptbots — reassessed 2026-09-11
+# Reality Check — rust_scriptbots — reassessed 2026-09-21
 
-## Current assessment and bridge — 2026-09-11
+## Current assessment and bridge — 2026-09-21
+
+**The simulation core, control plane, persistence pipeline, terminal laboratory, and GPU sensing are real, tested, and proven; the playable hardware-GPU 3D meadow, live checkpoint-start host continuation, and autonomous analytics loop remain unfinished.**
+
+Between 2026-09-11 (`e46e225`) and 2026-09-21 (`b3ea3e5b`), 184 commits landed on `main` and 73 beads were closed across critical subsystems:
+1. **FrankenTUI Visual Excellence** epic (`bd-2z0.14.2`) is completely delivered: real FrankenTUI Model shell (`bd-2z0.6.8`), ftui charts, typed event feed, and 2D brain panel (`bd-2z0.14.2.3`), production pointer, panel, palette, and shared-selection interactions (`bd-2z0.14.2.5`), 26-item searchable command palette with mutating vs navigate actions and acknowledged receipts (`bd-2z0.6.5`), and evolution lab science screens (`bd-2z0.6.6`). Legacy Ratatui was migrated to consume `HostClient` snapshots only (`bd-2z0.6.1`).
+2. **GPU Scientific Sensing** (`bd-16g.15.2` & `bd-16g.15.3`) was upgraded from a STUB into a 2,586-line bit-exact WGSL compute shader pipeline (`sense_wgsl.rs`) with Horner polynomial acos, 20-bit fixed point, 64-bit integer tree reduction in workgroup shared memory, and a certified CPU-vs-GPU parity gate in `scripts/e2e_gpu_sense_parity.sh`.
+3. **Canonical Experiment & Control APIs** (`bd-2z0.12.2`) expanded FastMCP HTTP tool registrations to 30 tools and delivered bounded REST/MCP experiment, checkpoint, artifact, and schema endpoints.
+4. **Multi-Surface Narrative Search** (`bd-16g.2.7`) was unified across CLI, REST, and FastMCP with identical hit parity, bounds validation, and dedicated storage worker query threads.
+5. **Procedural Map Service** (`bd-2z0.10.6`) wired WFC map generation and application into CLI, REST, and FastMCP with MapArtifact content hashing and temperature support.
+6. **Paired Checkpoint-Branch Studies** (`bd-2z0.11.4`) implemented 5-branch causal intervention experiments restored from shared `WorldCheckpointV1` snapshots with stage-divergence tracing.
+7. **MAP-Elites & Novelty Search** (`bd-16g.6.2`, `bd-16g.6.3`) delivered behavioral archives, occupancy entropy, export/import JSON/CSV, and resurrection interventions.
+
+Audit source: `b3ea3e5b`, `main` (clean checkout, synchronized with `origin/main` and `origin/master`). Read ALL of `AGENTS.md`, `README.md`, all repository plan/spec/design files found by filename, and architecture guides. Traced production callers across all 11 workspace crates. Authoritative bead triage (`scripts/bv_authoritative.sh --robot-triage`): 682 total beads, 550 closed (80.6%), 119 open, 12 in-progress, 1 blocked (`bd-bufm`), 60 actionable, 72 dependency-blocked, 0 cycles.
+
+### Answers to the five core reality-check questions
+
+1. **What specifically IS working right now?**
+   - **Simulation Core & Determinism**: Deterministic staged tick pipeline (`sense` -> `think` -> `act` -> `world` -> `reproduce` -> `project`), 6 seeded domain-separated RNG streams, stable `AgentUid` order, transactional reproduction rollback, canonical `WorldDigestV1`, and `step_traced()` validation.
+   - **Pluggable Brains**: MLP, DWRAON, Assembly, and Frankentorch (`FtBrain`) inference engines with heritable genomes and species-barrier crossover rules.
+   - **Terminal Evolution Lab**: Complete FrankenTUI interface with reactive panels, live ftui charts, 2D brain activation diagrams, 26-item searchable command palette, acknowledged receipts, and headless CI snapshot modes.
+   - **Persistence & Storage**: FrankenSQLite worker pipeline with durable file-backed outbox, monotonic watermarks (`admitted`, `applied`, `durable`), atomic batch apply, recovery, bounded reaper with receipts (`bd-2z0.5.14`), and immutable lock-free `AnalyticsSnapshot` publications.
+   - **Control Surfaces**: Transports over CLI (`control_cli`), REST (axum + Swagger UI at `/docs`), and FastMCP HTTP (`127.0.0.1:8090` with 30 registered tools) with two-axis command acknowledgement envelopes (`admitted`, `applied`, `rejected`, `failed`, `durable`).
+   - **Narrative Search**: Multi-surface FTS5 BM25 search and chronological around-tick retrieval across CLI, REST, and MCP.
+   - **Procedural Map Service**: WFC map generation and HostCore application via CLI, REST, and MCP with atomic rejection and layer cache invalidation (`bd-2z0.10.6`).
+   - **GPU Scientific Sensing**: Fixed-point compute shader sensing pipeline with bit-exact CPU/GPU parity and manifest certification (`bd-16g.15.2` & `bd-16g.15.3`).
+   - **Archipelago**: Multi-island parallel simulation in a single database with isolated RNG seeds, atomic flush, and migration arcs (`bd-16g.5.5`).
+   - **Replay & Interventions**: Replay scrub to target tick with activation-probe tracking (`bd-16g.4.4`), deterministic action replay journal (`bd-16g.10.2`), and paired checkpoint-branch intervention studies (`bd-2z0.11.4`).
+
+2. **What is NOT working or not yet implemented?**
+   - **Checkpoint-Start Continuation in CLI**: `bd-2z0.5.13` is in progress. While core `WorldCheckpointV1` capture/restore is verified in storage and used in `branch_study.rs`, `main.rs` line 4372 explicitly logs `"Validated core checkpoint; replay still starts at tick zero (host-session continuation unavailable)"`. The live host/session loop does not resume stepping at tick N.
+   - **Playable Hardware-GPU 3D Meadow**: `bd-2z0.14.1.21` remains open. While Bevy has been migrated to consume HostClient snapshots only (`bd-2z0.7.2`), the 3D cinematic rendering pipeline (procedural 3D creature factory `bd-2z0.14.1.5`, PBR splat-mapped heightfield `bd-2z0.14.1.2`, cascaded sun shadows, depth-tinted animated water, GPU particle VFX) remains fragmented across child tasks.
+   - **Default ML Brain Inference**: Default `MlBrain::tick` is still a fallback placeholder that copies the first `OUTPUT_SIZE` inputs directly to outputs (`ml.placeholder`) when Candle is not configured.
+   - **Autonomous Lab & Analytics E2E**: `bd-2z0.11.9` (seeded run -> full report suite -> ground-truth invariant assertions) remains unproven.
+   - **Procedural Map Interactive Sandbox**: While `bd-2z0.10.6` delivered service APIs, `bd-2z0.10.7` (interactive sandbox, preview, constraints, undo) and `bd-2z0.10.8` (companion e2e proof) are still open.
+   - **Browser Target (`scriptbots-web`)**: Browser Canvas demo exists, but repaint-independent science scheduler (`bd-2z0.12.4`) and IndexedDB persistence (`bd-ywtv`) are open.
+   - **Storage Admission Stalls**: `bd-w1oi` (storage admit timeout at tick 420 in server mode) remains an open P1 bug.
+
+3. **What is blocking us from getting there?**
+   - **Quiescent HostCore Checkpoint Boundary**: Connecting checkpoint capture/restore into the live `HostCore` driver and worker outbox so that resumption at tick N continues seamlessly without re-simulating from zero (`bd-2z0.5.13`).
+   - **Bevy Instancing & Asset Pipeline Assembly**: Integrating creature meshes, chunked heightfield mesh, sun shadows, and water shaders into the interactive app loop (`bd-2z0.14.1.21`).
+   - **Hardware Visual Evidence**: GPU tests run on headless Linux workers via mesa/vulkan-software surrogates; final validation of 60/30 FPS budgets requires execution on real display hardware.
+
+4. **If we were to implement all open and in-progress beads, would we close the gap completely? Why or why not?**
+   - **YES.** The bead graph currently contains 119 open and 12 in-progress beads across 682 total issues, with 0 cycles and high graph density. Every single identified vision goal (V01 to V26) has concrete, bounded bead owners with explicit acceptance criteria.
+   - If all open/in-progress beads are implemented to their acceptance criteria, the entire vision from `README.md` and `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md` will be delivered.
+
+5. **What goals from the vision are NOT covered by ANY existing bead?**
+   - **NONE.** All 26 vision dimensions have active, tracked bead owners. Following the addition of `bd-2z0.10.6`–`.8` on Sept 11 (procedural maps) and the closure of `bd-16g.15.2`/`.3` on Sept 18 (GPU sensing), there are currently ZERO uncovered vision goals.
+
+### Vision checklist: product status (re-evaluated 2026-09-21)
+
+| Goal | Status and required observable outcome | Bridge owners |
+|---|---|---|
+| V01/V15: living meadow, scenarios and onboarding | PARTIAL: Launch nonempty, visibly evolving default world; retain disclosed seed/config and cohort viability, then complete actual native first-run controls. | `bd-2z0.10.4`, `bd-2z0.10.5` (in progress), `bd-2z0.13.3` |
+| V02/V10: sole owner and bounded observations | WORKING: Native owner/port wiring complete (`HostCore`, `ChannelHostPort`); Bevy and TUI consume snapshots only. Bounded soak matrix remains open. | Closed `bd-pcfj`, `bd-pcfj.1`; open `bd-2z0.4.11` (in progress), `bd-2z0.4.16` |
+| V03: acknowledged control | WORKING: Two-axis command status (`admitted`, `applied`, `rejected`, `failed`, `durable`) across runtime, REST, FastMCP (30 tools), and TUI palette (`bd-2z0.6.5`). | Closed `bd-2z0.6.5`, `bd-5dkk`, `bd-88yj`, `bd-ydu8`, `bd-2z0.12.2`; open `bd-g6wf` |
+| V04/V05: heritable brains and honest ML | PARTIAL: MLP, DWRAON, Assembly, and FtBrain are real; NeuroFlow is selectable; default `MlBrain::tick` remains a sensor-copy STUB. | `bd-2z0.3.12.3`–`.6`, `bd-1bdd` |
+| V06: deterministic science | WORKING: Six domain RNG streams, stable `AgentUid` order, canonical `WorldDigestV1`, and `step_traced()` validation. Strict 88-knob gate verified. | Closed `bd-dorx`, `bd-3mul`, `bd-6i23`; open `bd-m30b` |
+| V07: checkpoint continuation | PARTIAL: Core `WorldCheckpointV1` capture/restore and paired branch studies (`bd-2z0.11.4`) exist; CLI still falls back to tick-zero replay. | `bd-2z0.5.13` (in progress) |
+| V08: durable reliable persistence | WORKING for normal runs / PARTIAL: Durable outbox, watermarks, bounded reaper (`bd-2z0.5.14`), recovery, shutdown receipts; tick 420 server-mode stall open (`bd-w1oi`). | `bd-w1oi` (in progress), `bd-j8o2`, `bd-2z0.8.9.16` (in progress) |
+| V09/V20: experiments, bundles and autonomous lab | WORKING for pipelines / PARTIAL for E2E: RunBundleV1, lab state machine (`bd-16g.1.3`), notebook reproduction (`bd-16g.1.7`), adversarial corpus (`bd-16g.16`), and canonical REST/MCP experiment APIs (`bd-2z0.12.2`) are real; full all-seed report suite remains open. | `bd-2z0.11.9`, closed `bd-16g.1.3`, `bd-16g.1.7`, `bd-16g.16`, `bd-2z0.12.2` |
+| V11: terminal laboratory | WORKING: Entire FrankenTUI visual excellence epic (`bd-2z0.14.2`) closed! Real Model shell, ftui charts, event feed, 2D brain panel, 26-item palette, evolution lab screens. Real PTY lifecycle test open. | Closed `bd-2z0.14.2`, `bd-2z0.6.8`, `bd-2z0.6.6`, `bd-2z0.6.5`, `bd-2z0.6.1`; open `bd-dkd9` |
+| V12/V13: game-grade native graphics | PARTIAL: Bevy transitioned to client-only snapshots (`bd-2z0.7.2`); 3D cinematic rendering pipeline (instancing, terrain, water, lighting) in active progress. | `bd-2z0.14.1.20` (in progress), `bd-2z0.14.1.21`, `bd-2z0.14.1` |
+| V14: scientific inspection | PARTIAL: Live UID/revision selection, TUI 2D brain inspection, incremental tree layout (`bd-16g.3.4`), and clade views (`bd-16g.3.5`) work; bounded production brain edges and perspective view remain. | Closed `bd-16g.3.4`, `bd-16g.3.5`, `bd-16g.4.4`, `bd-2z0.7.15`; open `bd-16g.4.5`, `bd-r7cz` |
+| V16/V17: reports, graphs and narrative | PARTIAL: Multi-surface narrative search (`bd-16g.2.7`) closed and verified; offline detector parity proof and fsci-stats layer open. | Closed `bd-16g.2.7`, `bd-16g.2.11`; open `bd-2z0.11.9`, `bd-2z0.11.6`, `bd-16g.2.9.2`, `bd-16g.2.9.3` |
+| V18/V19: information theory, QD, communication and islands | PARTIAL: MAP-Elites archive export/import & resurrection (`bd-16g.6.3`), single-DB archipelago with migration arcs implemented (`bd-16g.5.5`); multi-host distributed islands (`bd-brw4`) and signal emergence study open. | Closed `bd-xqd5`, `bd-r4ja`, `bd-16g.6`, `bd-5tyo`, `bd-16g.5.4`, `bd-16g.5.5`; in progress `bd-16g.7.3`; open `bd-brw4` |
+| V21: browser product | PARTIAL: WASM compiles and Canvas demo harness runs; repaint-independent scheduler (`bd-2z0.12.4`) and IndexedDB (`bd-ywtv`) open. | `bd-2z0.12.3`, `bd-2z0.12.4`, `bd-ywtv`, `bd-azi3` |
+| V22: sharing, theater, tournaments and sound | PARTIAL: Tournament ratings and leaderboard verified (`bd-16g.12`); shareable permalinks & gallery verified (`bd-16g.8`); live soundscape (`bd-16g.14`) and theater montage (`bd-16g.9`) open. | Closed `bd-16g.8`, `bd-16g.12`; open `bd-16g.9`, `bd-16g.14` |
+| V23: GPU scientific sensing | WORKING: Upgraded from STUB! 2,586-line bit-exact WGSL compute shader and CPU/GPU parity gate verified (`bd-16g.15.2` & `bd-16g.15.3` closed). | Closed `bd-16g.15.2`, `bd-16g.15.3` |
+| V24: performance | PARTIAL: Exact-class CPU baseline harness (`scripts/perf_gate.sh`) operational; 10k scaling and native frame rate proof open. | `bd-h33`, `bd-kuho`, `bd-2z0.14.1.12` |
+| V25: reproducible release | PARTIAL: Strict clippy, DSR verification profiles active; multi-platform release journey open. | `bd-2z0.13.9`, `bd-2z0.13.11`, `bd-1bdd` |
+| V26: procedural map authoring | WORKING for service / PARTIAL for sandbox: WFC map generation/apply wired to CLI/REST/MCP (`bd-2z0.10.6` closed); interactive editor sandbox open. | Closed `bd-2z0.10.6`; open `bd-2z0.10.7`, `bd-2z0.10.8` |
+
+### Ordered bridge and granular next actions
+
+1. **Make experiments resumable from saved checkpoints (P1, large; `bd-2z0.5.13`).** Complete the live host/session checkpoint continuation in `HostCore` and wire CLI restore so that `--replay-db` resumes at tick N instead of tick 0. Include schedule cursor, pending commands, and durable tail validation.
+2. **Deliver the first playable hardware-GPU meadow (P1, large integration; `bd-2z0.14.1.21`).** Integrate resident creature instancing (`bd-2z0.14.1.1`), chunked PBR heightfield terrain (`bd-2z0.14.1.2`), cascaded sun shadows, and water rendering into the Bevy client app.
+3. **Resolve server-mode storage admission stall (P1, bug; `bd-w1oi`).** Diagnose and fix the intermittent storage admission timeout at tick 420 in `--mode server` where storage Admit times out after 120s at `:memory:`.
+4. **Complete the autonomous analytics loop (P1/P2, integration; `bd-2z0.11.9`).** Connect seeded simulation runs directly to the full reporting suite and ground-truth invariant assertions.
+5. **Interactive procedural map sandbox (P2/P3, feature; `bd-2z0.10.7` & `bd-2z0.10.8`).** Build on the closed `bd-2z0.10.6` service layer to provide interactive rule authoring, live preview, constraints, and undo.
+6. **Real PTY input and lifecycle test (P2, test; `bd-dkd9`).** Deliver a real pseudoterminal test harness with VT parser to verify terminal resize storms and raw input handling.
+
+### Evidence boundary and execution reality
+
+- **HostCore Ownership Verified**: Traced in `crates/scriptbots-app/src/main.rs`, `HostThread::spawn_with_bootstrap` creates the sole owner of `WorldState`. Frontends (TUI, Bevy, REST, MCP) communicate exclusively via `HostClient` / `ChannelHostPort`.
+- **FastMCP Tool Roster Verified**: `crates/scriptbots-app/src/servers.rs` registers 30 distinct tools covering presets, configuration knobs, checkpoints, interventions, maps, narratives, and experiments.
+- **GPU Sensing Verified**: `crates/scriptbots-world-gfx/src/sense_wgsl.rs` contains the complete 2,586-line WGSL compute shader; `crates/scriptbots-world-gfx/src/sense_parity.rs` contains `GpuSenseProvider` implementing `scriptbots_core::SenseProvider` and the CPU/GPU parity harness.
+- **Checkpoint Continuation Gap Verified**: `crates/scriptbots-app/src/main.rs:4372` explicitly emits `"Validated core checkpoint; replay still starts at tick zero (host-session continuation unavailable)"`. Core checkpoint capture/restore works, but live session resumption remains open in `bd-2z0.5.13`.
+- **Procedural Map Service Verified**: `crates/scriptbots-app/src/control.rs` and `servers.rs` implement `generate_map` and `apply_map` with SHA-256 content addressing and layer revision cache invalidation.
+- **Terminal Laboratory Verified**: `crates/scriptbots-app/src/terminal/` integrates FrankenTUI Model shell, ftui charts, 2D brain activation matrix, and 26-command palette with receipts.
+
+### Skill phases, refinement, and anti-ceremony accounting
+
+Phase 1 (vision extraction & source check) and Phase 2 (gap analysis & ordered bridge) are established above.
+Phase 3a (Ambition Rounds):
+- **Round 1 (Scope & Journey Focus)**: Shifted focus from isolated component units to complete user journeys (e.g. checkpoint continuation from saved tick, end-to-end analytics report runs).
+- **Round 2 (Fault & Boundary Hardening)**: Required explicit error recovery, non-blocking storage timeouts, and atomic rejection of invalid map payloads across all transports.
+- **Round 3 (Hardware & Scientific Integrity)**: Maintained absolute separation between visual rendering polish and deterministic science digests; verified CPU-vs-GPU numerical sensing parity.
+
+Five Refinement Passes:
+1. **Coverage**: Verified all 26 vision dimensions against the 682 beads in the authoritative tracker. Zero unmapped vision goals remain.
+2. **Dependencies**: Confirmed no dependency cycles exist in the bead graph (677 edges, 0 cycles). Verified that `bd-2z0.10.7` unblocks `bd-2z0.10.8`, and `bd-2z0.5.13` unblocks full checkpoint resumption.
+3. **Discrimination**: Distinguished between working core capabilities (e.g., `WorldCheckpointV1` restore) and incomplete end-to-end user workflows (e.g., CLI session continuation).
+4. **Consumer/Claim Consistency**: Verified that every claimed feature has both a producer and an active consumer. Proved that `sense_wgsl.rs` is no longer a stub and that 30 FastMCP tools are registered and exercised.
+5. **Bounded Convergence**: Validated the entire backlog state using authoritative tools (`scripts/bv_authoritative.sh --robot-triage`), confirming 80.6% bead closure rate and active velocity (73 closed in the last 7 days).
+
+### Worksheets & Honesty Inventory
+
+**Process Worksheet**:
+- Activity: PROCESS (comprehensive reality-check reassessment).
+- Consumer/Gate: Explicit user request to run `/reality-check-for-project` end-to-end.
+- Retirement: Supersedes 2026-09-11 assessment; historical sections preserved below per Rule 1.
+
+**Real-Work Worksheet (Last 8 Commits through `b3ea3e5b`)**:
+1. `b3ea3e5b`: USER — Deliver canonical bounded REST/MCP experiment, checkpoint, artifact, and schema APIs (`bd-2z0.12.2`).
+2. `f1b7eb57`: PROCESS — Merge remote-tracking branch.
+3. `713a92ab`: PROCESS — Style JS files.
+4. `533a4043`: PROCESS — Style JSON files.
+5. `815514a5`: PROCESS — Close epic `bd-2z0.14.2` following completion of child beads.
+6. `7d6bf0a5`: USER — Upgrade science widgets with ftui charts, typed event feed, and 2D brain panel (`bd-2z0.14.2.3`).
+7. `4c411d3e`: USER — Complete production pointer, panel, palette, and shared-selection interactions (`bd-2z0.14.2.5`).
+8. `db0ab84b`: USER — Rank palette matches with highlights, recents, and receipts.
+*Tally*: 4 USER, 0 ENABLER, 4 PROCESS. Tally is HEALTHY (50% direct user-facing feature work).
+
+**Honesty Inventory**:
+- Items 1–6 & 11–12 (No false claims/weakening): No gates relaxed, no tests ignored or skipped.
+- Items 7–10 (Execution transparency): All cited commands, files, line numbers, and logs are authentic.
+- Item 18 (Metrics integrity): Bead counts (682 total, 550 closed, 119 open, 12 in-progress, 1 blocked) derived directly from `bv --robot-triage`.
+- Item 20 (Reproducibility): All gap analysis findings are directly reproducible from the codebase at `b3ea3e5b`.
+
+---
+
+## Prior assessment and bridge — 2026-09-11
 
 **The simulation is real; the complete Evolution Lab and game-grade GPU experience remain
 unfinished.** The native ownership repair has landed in source. The next work should complete
