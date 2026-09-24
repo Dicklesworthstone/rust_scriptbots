@@ -1068,7 +1068,57 @@ fn test_experiments_checkpoints_and_artifacts_lifecycle() {
         serde_json::from_str(mcp_exp_text).expect("parse mcp experiment status");
     assert_eq!(mcp_exp_json["experiment_id"], exp_id);
 
-    // Cancel experiment via REST
+    // The batch really executes: wait for every run to reach a terminal state
+    // with a verified final digest and a bundle on disk (bd-2z0.12.2).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let finished_json = loop {
+        let (st, body) = http_request(
+            fixture.rest_addr,
+            "GET",
+            &format!("/api/v1/experiments/{exp_id}"),
+            &[],
+            None,
+        )
+        .expect("GET experiment while executing");
+        assert_eq!(st, 200, "status response: {body}");
+        let json: Value = serde_json::from_str(&body).expect("parse experiment status");
+        let status = json["status"].as_str().unwrap_or_default().to_string();
+        assert!(
+            ["pending", "running", "completed"].contains(&status.as_str()),
+            "unexpected experiment status {status}: {json}"
+        );
+        if status == "completed" {
+            break json;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "experiment did not complete within 300s: {json}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(finished_json["completed_runs"], 2, "{finished_json}");
+    assert_eq!(finished_json["failed_runs"], 0, "{finished_json}");
+    let finished_runs = finished_json["runs"].as_array().expect("runs array");
+    assert_eq!(finished_runs.len(), 2);
+    let mut digests = Vec::new();
+    for run in finished_runs {
+        assert_eq!(run["state"], "completed", "{run}");
+        assert_eq!(run["total_ticks"], 5, "{run}");
+        let digest = run["final_digest"].as_str().expect("final digest");
+        assert!(!digest.is_empty());
+        digests.push(digest.to_string());
+        let bundle = run["bundle_path"].as_str().expect("bundle path");
+        assert!(
+            std::path::Path::new(bundle).exists(),
+            "bundle {bundle} missing on disk"
+        );
+    }
+    assert_ne!(
+        digests[0], digests[1],
+        "distinct seeds must yield distinct final worlds"
+    );
+
+    // Cancelling a finished batch is idempotent and reports the terminal state.
     let (st_cancel, body_cancel) = http_request(
         fixture.rest_addr,
         "POST",
@@ -1079,9 +1129,9 @@ fn test_experiments_checkpoints_and_artifacts_lifecycle() {
     .expect("POST cancel experiment");
     assert_eq!(st_cancel, 200);
     let cancel_json: Value = serde_json::from_str(&body_cancel).expect("parse cancel");
-    assert_eq!(cancel_json["status"], "cancelled");
+    assert_eq!(cancel_json["status"], "completed");
 
-    // Resume experiment via MCP
+    // Resuming a batch with no pending runs is refused over MCP.
     let (mcp_resume_st, mcp_resume_call) = mcp_json_rpc(
         fixture.mcp_addr,
         Some(103),
@@ -1093,11 +1143,16 @@ fn test_experiments_checkpoints_and_artifacts_lifecycle() {
     )
     .expect("mcp call experiment_resume");
     assert_eq!(mcp_resume_st, 200);
-    let mcp_resume_text = mcp_resume_call["result"]["content"][0]["text"]
-        .as_str()
-        .expect("mcp text");
-    let mcp_resume_json: Value = serde_json::from_str(mcp_resume_text).expect("parse resume");
-    assert_eq!(mcp_resume_json["status"], "running");
+    assert_eq!(
+        mcp_resume_call["result"]["isError"], true,
+        "resume of a finished batch must be refused: {mcp_resume_call}"
+    );
+    assert!(
+        mcp_resume_call["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("no pending runs")),
+        "refusal must name the reason: {mcp_resume_call}"
+    );
 
     // List experiments via REST and MCP with pagination bounds
     let (st_exp_list, body_exp_list) = http_request(
