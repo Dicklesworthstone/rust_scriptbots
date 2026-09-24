@@ -60,6 +60,21 @@ pub struct Connection {
     inner: AsyncConnection,
 }
 
+/// Drive one fsqlite future to completion on the calling thread, with its file I/O inline.
+///
+/// fsqlite's unix VFS routes every read, write and sync through
+/// `asupersync::runtime::spawn_blocking_io`. With no ambient `Cx` that falls back to
+/// spawning a brand-new OS thread per operation, which under host load made single
+/// statements take ~0.5 s and commits ~0.8 s and let journal commits run past their
+/// 120 s acknowledgement deadline (bd-w1oi, bd-kgob). Every caller of this wrapper is
+/// already a blocking context (the storage worker, synchronous readers, CLI tools), so
+/// an ambient `Cx` with no spawn capability is installed: `spawn_blocking` then runs the
+/// operation inline on this thread (0.6-4 ms per statement/commit under the same load).
+fn block_on_inline<T>(future: impl std::future::Future<Output = T>) -> T {
+    let _inline_io = asupersync::Cx::detached_cancel_context().set_current_restricted();
+    futures_lite::future::block_on(future)
+}
+
 impl Connection {
     pub fn new(inner: AsyncConnection) -> Self {
         Self { inner }
@@ -74,12 +89,12 @@ impl Connection {
     }
 
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
-        let conn = futures_lite::future::block_on(Box::pin(AsyncConnection::open(path)))?;
+        let conn = block_on_inline(Box::pin(AsyncConnection::open(path)))?;
         Ok(Self { inner: conn })
     }
 
     pub fn open_existing(path: impl Into<String>) -> Result<Self, FrankenError> {
-        let conn = futures_lite::future::block_on(Box::pin(AsyncConnection::open_existing(path)))?;
+        let conn = block_on_inline(Box::pin(AsyncConnection::open_existing(path)))?;
         Ok(Self { inner: conn })
     }
 
@@ -87,22 +102,20 @@ impl Connection {
         path: impl Into<String>,
         expected_identity: FileIdentity,
     ) -> Result<Self, FrankenError> {
-        let conn = futures_lite::future::block_on(Box::pin(
+        let conn = block_on_inline(Box::pin(
             AsyncConnection::open_existing_with_expected_identity(path, expected_identity),
         ))?;
         Ok(Self { inner: conn })
     }
 
     pub fn open_strict_multi_process(path: impl Into<String>) -> Result<Self, FrankenError> {
-        let conn = futures_lite::future::block_on(Box::pin(
-            AsyncConnection::open_strict_multi_process(path),
-        ))?;
+        let conn = block_on_inline(Box::pin(AsyncConnection::open_strict_multi_process(path)))?;
         Ok(Self { inner: conn })
     }
 
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
         let fut = self.inner.execute(sql);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn execute_with_params(
@@ -111,17 +124,17 @@ impl Connection {
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
         let fut = self.inner.execute_with_params(sql, params);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
         let fut = self.inner.execute_batch(sql);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
         let fut = self.inner.query(sql);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn query_with_params(
@@ -130,12 +143,12 @@ impl Connection {
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
         let fut = self.inner.query_with_params(sql, params);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
         let fut = self.inner.query_row(sql);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn query_row_with_params(
@@ -144,7 +157,7 @@ impl Connection {
         params: &[SqliteValue],
     ) -> Result<Row, FrankenError> {
         let fut = self.inner.query_row_with_params(sql, params);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -153,43 +166,43 @@ impl Connection {
 
     pub fn begin_transaction(&self) -> Result<(), FrankenError> {
         let fut = self.inner.begin_transaction();
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn commit_transaction(&self) -> Result<(), FrankenError> {
         let fut = self.inner.commit_transaction();
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn rollback_transaction(&self) -> Result<(), FrankenError> {
         let fut = self.inner.rollback_transaction();
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn transaction(&self) -> Result<Transaction<'_>, FrankenError> {
         let fut = self.inner.transaction();
-        let tx = futures_lite::future::block_on(Box::pin(fut))?;
+        let tx = block_on_inline(Box::pin(fut))?;
         Ok(Transaction { inner: tx })
     }
 
     pub fn file_identity(&self) -> Result<Option<FileIdentity>, FrankenError> {
         let fut = self.inner.file_identity();
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn close(self) -> Result<(), FrankenError> {
         let fut = self.inner.close();
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn close_best_effort_in_place(&mut self) {
         let fut = self.inner.close_best_effort_in_place();
-        futures_lite::future::block_on(Box::pin(fut));
+        block_on_inline(Box::pin(fut));
     }
 
     pub fn close_without_checkpoint(self) -> Result<(), FrankenError> {
         let fut = self.inner.close_without_checkpoint();
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 }
 
@@ -200,17 +213,17 @@ pub struct Transaction<'a> {
 impl<'a> Transaction<'a> {
     pub fn commit(&mut self) -> Result<(), FrankenError> {
         let fut = self.inner.commit();
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn rollback(&mut self) -> Result<(), FrankenError> {
         let fut = self.inner.rollback();
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
         let fut = self.inner.execute(sql);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn execute_with_params(
@@ -219,17 +232,17 @@ impl<'a> Transaction<'a> {
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
         let fut = self.inner.execute_with_params(sql, params);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
         let fut = self.inner.execute_batch(sql);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
         let fut = self.inner.query(sql);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn query_with_params(
@@ -238,12 +251,12 @@ impl<'a> Transaction<'a> {
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
         let fut = self.inner.query_with_params(sql, params);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
         let fut = self.inner.query_row(sql);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 
     pub fn query_row_with_params(
@@ -252,7 +265,7 @@ impl<'a> Transaction<'a> {
         params: &[SqliteValue],
     ) -> Result<Row, FrankenError> {
         let fut = self.inner.query_row_with_params(sql, params);
-        futures_lite::future::block_on(Box::pin(fut))
+        block_on_inline(Box::pin(fut))
     }
 }
 
@@ -406,7 +419,7 @@ pub fn open_with_flags<P: AsRef<std::path::Path>>(
     flags: OpenFlags,
 ) -> Result<Connection, FrankenError> {
     let path_str = path.as_ref().to_string_lossy();
-    let conn = futures_lite::future::block_on(Box::pin(async_open_with_flags(&path_str, flags)))?;
+    let conn = block_on_inline(Box::pin(async_open_with_flags(&path_str, flags)))?;
     Ok(Connection::new(conn))
 }
 use journal::{

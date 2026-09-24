@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 arc-swap = { workspace = true }
+# Only for `Cx::detached_cancel_context`, which keeps fsqlite's file I/O inline on the
+# blocking storage threads (see `block_on_inline`); fsqlite already depends on it.
+asupersync = { workspace = true }
 blake3 = { workspace = true }
 fsqlite = { workspace = true }
 libc = { workspace = true }
