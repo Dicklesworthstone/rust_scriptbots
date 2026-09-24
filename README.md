@@ -166,7 +166,7 @@ cargo run -p scriptbots-app
 ```
 ### Recommended defaults for performance
 
-- Storage: `--storage memory` is only suitable for short runs. With the pinned FrankenSQLite, an in-memory commit costs time proportional to the whole database (measured 2026-09-24: 0.5 ms at 100 journal rows, 18.6 ms at 1,600), and the host journal commits once per batch, so a long `--mode server --storage memory` run slows to under one tick per second and eventually hits the 120 s admission deadline (`bd-kgob`, `bd-w1oi`). The default `--storage file` did not show that growth in the same microbenchmark, but long server runs in file mode currently stall on a parked storage worker (`bd-w1oi`), so neither mode is yet fit for unattended long runs.
+- Storage: `--storage memory` is only suitable for short runs. With the pinned FrankenSQLite, an in-memory commit costs time proportional to the whole database (measured 2026-09-24: 0.5 ms at 100 journal rows, 18.6 ms at 1,600), and the host journal commits once per batch, so a long `--mode server --storage memory` run slows to under one tick per second and eventually hits the 120 s admission deadline (`bd-kgob`, `bd-w1oi`). The default `--storage file` does not show that growth. File-mode runs used to stall because FrankenSQLite spawned one OS thread per file I/O when driven without an asupersync context; the storage crate now runs that I/O inline on its blocking threads (measured under heavy host load: ~0.6–4 ms per statement/commit instead of ~0.5–0.9 s), so file-backed servers make steady progress. Server throughput is still bounded by one host-journal commit per tick (`bd-w1oi`).
 - Threads: By default, the core auto-budgets worker threads conservatively. Our profiling shows best throughput at 8 threads on a 32-core CPU for this workload. To match that:
 
 ```bash
@@ -439,6 +439,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
   - `bevy`: require the Bevy frontend and fail clearly unless built with the `bevy_render` application feature.
   - `terminal`: force emoji TUI.
 - `--bootstrap-ticks N`: explicitly run `N` science ticks after seeding and before frontend launch (default `0`, so ordinary startup launches at tick zero).
+ - `--checkpoint-interval TICKS`: record a `WorldCheckpointV1` plus a replay digest into the run database every TICKS ticks of an interactive run (default 1000; `0` disables; env `SCRIPTBOTS_CHECKPOINT_INTERVAL`). `--replay-db FILE --checkpoint-start` later verifies the run from the latest one.
  - `--dump-png <FILE>` (GUI builds): write an offscreen PNG and exit (no UI). Pair with `--png-size WxH`.
  - `--png-size WxH` (GUI builds): snapshot size for `--dump-png` (e.g., `1280x720`).
  - `--debug-watermark`: overlay a tiny diagnostics watermark in the render canvas.
@@ -1002,7 +1003,7 @@ MCP quickstart:
   - ✅ Mock-free positive and perturbed-candidate event-replay test implementation in `crates/scriptbots-app/tests/replay_e2e.rs`; this is separate from checkpoint-start replay.
   - ✅ Persistence-disabled core science checkpoint with strict restore and next-transition proof; production resume remains planned.
 - **Planned**
-  - ✅ Checkpoint-start replay: `--checkpoint-start` restores the latest valid checkpoint in the run database and continues from its tick (`bd-2z0.5.13`). Checkpoints enter the run database through the storage worker when created over REST (`POST /api/v1/checkpoints`) or MCP (`checkpoint_create`); ordinary runs do not yet record them automatically.
+  - ✅ Checkpoint-start replay: `--checkpoint-start` restores the latest valid checkpoint before the replay limit and verifies the run from its tick (`bd-2z0.5.13`). Interactive runs record one automatically every `--checkpoint-interval` ticks (default 1000, `0` disables, env `SCRIPTBOTS_CHECKPOINT_INTERVAL`) together with a canonical world digest, so interactive and server runs can be replay-verified; REST (`POST /api/v1/checkpoints`) and MCP (`checkpoint_create`) add checkpoints on demand. All go through the storage worker (`bd-1dvs`).
   - ❌ Full host/session restore (storage ownership, analytics history, UI state) from a checkpoint.
   - ❌ Branch/diff workflows comparing Rust vs. Rust PR builds vs. the legacy C++ baseline.
   - ❌ FrankenSQLite-backed analysis views for quick triage of regressions and experiment outcomes.
