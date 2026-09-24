@@ -55,7 +55,7 @@ use scriptbots_world_gfx::wgpu;
 use serde_json::{self, Value as JsonValue};
 use std::process::{Command, Stdio};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     env, fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -69,6 +69,7 @@ use tracing::{debug, info, warn};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const DEFAULT_BOOTSTRAP_TICKS: u64 = 0;
+const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1_000;
 const LIVE_RUN_POLICY: &str = "operator-controlled-until-stop-v1";
 
 #[cfg(test)]
@@ -971,6 +972,12 @@ fn main() -> Result<()> {
             renderer = renderer.name(),
             "Starting ScriptBots simulation shell"
         );
+        // Stopped and joined when this closure returns, before storage teardown.
+        let _checkpoints = CheckpointRecorder::spawn(
+            host_port.clone(),
+            storage_pipeline.checkpoint_writer(),
+            cli.checkpoint_interval,
+        );
         let context = RendererContext {
             host: host_port.clone(),
             analytics: analytics.clone(),
@@ -988,6 +995,98 @@ fn main() -> Result<()> {
         Some(resolved_sense.policy),
     );
     teardown.finish(runtime_result)
+}
+
+/// Records a core science checkpoint into the run database every `interval` ticks, so an
+/// ordinary run can later be continued with `--replay-db FILE --checkpoint-start`.
+///
+/// Capture happens on the world owner at a quiescent boundary and the row is written by
+/// the storage worker. A refused capture (for example while a persistence batch is in
+/// flight) is retried on the next poll; a paused world is not recorded twice.
+struct CheckpointRecorder {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CheckpointRecorder {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+    fn spawn(
+        host: scriptbots_runtime::channel::ChannelHostPort,
+        writer: scriptbots_storage::StorageCheckpointWriter,
+        interval: u64,
+    ) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if interval == 0 {
+            return None;
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let spawned = std::thread::Builder::new()
+            .name("scriptbots-checkpoints".to_owned())
+            .spawn(move || {
+                let mut last_recorded: Option<u64> = None;
+                while !thread_stop.load(Ordering::Acquire) {
+                    let tick = host.snapshot_hub().latest().world.tick;
+                    let due = last_recorded.map_or(tick >= interval, |last| {
+                        tick >= (last / interval).saturating_add(1).saturating_mul(interval)
+                    });
+                    if due {
+                        match host.capture_checkpoint_v1() {
+                            Ok(checkpoint) => {
+                                let captured = checkpoint.tick().0;
+                                if last_recorded.is_none_or(|last| captured > last) {
+                                    let metadata =
+                                        serde_json::json!({"source": "interval", "interval": interval});
+                                    match writer.record(
+                                        &format!("auto-t{captured}"),
+                                        &checkpoint,
+                                        &metadata,
+                                    ) {
+                                        Ok(ordinal) => {
+                                            info!(tick = captured, ordinal, "recorded interval checkpoint");
+                                            last_recorded = Some(captured);
+                                            // Give the window after this checkpoint a canonical
+                                            // digest so `--checkpoint-start` replay is non-vacuous.
+                                            if let Err(error) = host.request_replay_world_digest() {
+                                                warn!(tick = captured, %error, "replay digest request refused");
+                                            }
+                                        }
+                                        Err(error) => {
+                                            warn!(tick = captured, %error, "interval checkpoint was not recorded");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                debug!(tick, %error, "interval checkpoint capture deferred");
+                            }
+                        }
+                    }
+                    std::thread::park_timeout(Self::POLL);
+                }
+            });
+        match spawned {
+            Ok(handle) => Some(Self {
+                stop,
+                handle: Some(handle),
+            }),
+            Err(error) => {
+                warn!(%error, "interval checkpoint recorder could not start; continuing without it");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for CheckpointRecorder {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
 }
 
 struct RuntimeTeardown {
@@ -1533,7 +1632,7 @@ fn run_det_child(
     brain_preset: BrainPreset,
     interventions: &[ScenarioInterventionV1],
 ) -> Result<()> {
-    let run = run_headless_simulation(config, tick_limit, brain_preset, interventions)?;
+    let run = run_headless_simulation(config, tick_limit, brain_preset, interventions, None)?;
     #[derive(serde::Serialize)]
     struct DetOut {
         events: usize,
@@ -3510,6 +3609,16 @@ struct AppCli {
     /// provenance, not one flag with two spellings.
     #[arg(long = "rng-seed", value_name = "SEED")]
     rng_seed: Option<u64>,
+    /// Record a core science checkpoint into the run database every TICKS ticks of an
+    /// interactive run, so `--replay-db FILE --checkpoint-start` can continue from it
+    /// (0 disables).
+    #[arg(
+        long = "checkpoint-interval",
+        value_name = "TICKS",
+        env = "SCRIPTBOTS_CHECKPOINT_INTERVAL",
+        default_value_t = DEFAULT_CHECKPOINT_INTERVAL
+    )]
+    checkpoint_interval: u64,
     /// Explicit number of simulation ticks to run before launching the selected frontend.
     #[arg(
         long = "bootstrap-ticks",
@@ -4459,13 +4568,21 @@ fn run_replay_cli(
     canonicalize_replay_event_order(&mut persisted_events)
         .context("recorded replay stream contains an invalid or duplicate identity")?;
     let recorded_counts = storage.replay_event_counts()?;
-    let latest_checkpoint = storage.load_latest_checkpoint()?;
+    // Ordered by tick; interval recording usually leaves one at the final tick, which
+    // would leave nothing to verify, so resume from the latest one before the limit.
+    let checkpoints = storage.load_checkpoints()?;
     storage.close()?;
 
     let events_max_tick = persisted_events.iter().map(|e| e.tick).max().unwrap_or(0);
     let tick_limit = cli
         .tick_limit
         .unwrap_or(recorded_max_tick.max(events_max_tick));
+    let latest_checkpoint = checkpoints
+        .iter()
+        .rev()
+        .find(|record| record.tick < tick_limit)
+        .or_else(|| checkpoints.last())
+        .cloned();
 
     if config.rng_seed.is_none() {
         warn!(
@@ -4494,12 +4611,14 @@ fn run_replay_cli(
             "Resuming deterministic replay from validated checkpoint"
         );
         persisted_events.retain(|e| e.tick > cp_tick && e.tick <= tick_limit);
+        let digest_ticks = recorded_digest_ticks(&persisted_events, tick_limit);
         let run = run_headless_simulation_from_checkpoint(
             &cp,
             config,
             tick_limit,
             cli.brain,
             interventions,
+            (!digest_ticks.is_empty()).then_some(&digest_ticks),
         )?;
         (run, cp_tick)
     } else {
@@ -4511,7 +4630,14 @@ fn run_replay_cli(
                 "Validated core checkpoint; replay starts at tick zero (--checkpoint-start not requested)"
             );
         }
-        let run = run_headless_simulation(config, tick_limit, cli.brain, interventions)?;
+        let digest_ticks = recorded_digest_ticks(&persisted_events, tick_limit);
+        let run = run_headless_simulation(
+            config,
+            tick_limit,
+            cli.brain,
+            interventions,
+            (!digest_ticks.is_empty()).then_some(&digest_ticks),
+        )?;
         (run, 0)
     };
 
@@ -4945,6 +5071,7 @@ fn run_headless_simulation(
     tick_limit: u64,
     brain_preset: BrainPreset,
     interventions: &[ScenarioInterventionV1],
+    digest_ticks: Option<&BTreeSet<u64>>,
 ) -> Result<ReplayRun> {
     let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
     let mut run_config = config.clone();
@@ -4962,12 +5089,11 @@ fn run_headless_simulation(
     emit_sense_startup_contract();
     let mut current_config = serde_json::to_value(world.config())?;
     let simulation_result = (|| -> Result<WorldDigestV1> {
-        for index in 0..tick_limit {
+        for _ in 0..tick_limit {
             let tick = world.tick().0;
             apply_scenario_interventions(&mut world, &mut current_config, interventions, tick)?;
-            // The final tick's batch carries the canonical world digest so the simulated
-            // stream stays structurally aligned with a recorded one.
-            if index + 1 == tick_limit {
+            // Digest-carrying batches mirror the recorded stream (final tick by default).
+            if digest_due(digest_ticks, tick + 1, tick_limit) {
                 world.request_replay_world_digest();
             }
             persistence.step(&mut world)?;
@@ -5012,12 +5138,36 @@ fn run_headless_simulation(
     })
 }
 
+/// Ticks at which a recorded replay stream carries a canonical world digest, up to `tick_limit`.
+fn recorded_digest_ticks(events: &[PersistedReplayEvent], tick_limit: u64) -> BTreeSet<u64> {
+    events
+        .iter()
+        .filter(|entry| {
+            entry.tick <= tick_limit
+                && matches!(entry.event.kind, ReplayEventKind::WorldDigest { .. })
+        })
+        .map(|entry| entry.tick)
+        .collect()
+}
+
+/// Whether the batch completing `completed_tick` must carry a canonical world digest.
+///
+/// `None` keeps the headless default of one digest on the final tick. A replay passes the
+/// exact ticks at which the recording carries digests, so an interactive run (which records
+/// them at checkpoint cadence rather than at an end it could not know) stays aligned.
+fn digest_due(digest_ticks: Option<&BTreeSet<u64>>, completed_tick: u64, final_tick: u64) -> bool {
+    digest_ticks.map_or(completed_tick == final_tick, |ticks| {
+        ticks.contains(&completed_tick)
+    })
+}
+
 fn run_headless_simulation_from_checkpoint(
     checkpoint: &WorldCheckpointV1,
     config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
     interventions: &[ScenarioInterventionV1],
+    digest_ticks: Option<&BTreeSet<u64>>,
 ) -> Result<ReplayRun> {
     let start_tick = checkpoint.tick().0;
     if start_tick >= tick_limit {
@@ -5054,12 +5204,11 @@ fn run_headless_simulation_from_checkpoint(
     emit_sense_startup_contract();
     let mut current_config = serde_json::to_value(world.config())?;
     let simulation_result = (|| -> Result<WorldDigestV1> {
-        for index in 0..remaining_ticks {
+        for _ in 0..remaining_ticks {
             let tick = world.tick().0;
             apply_scenario_interventions(&mut world, &mut current_config, interventions, tick)?;
-            // The final tick's batch carries the canonical world digest so the simulated
-            // stream stays structurally aligned with a recorded one.
-            if index + 1 == remaining_ticks {
+            // Digest-carrying batches mirror the recorded stream (final tick by default).
+            if digest_due(digest_ticks, tick + 1, tick_limit) {
                 world.request_replay_world_digest();
             }
             persistence.step(&mut world)?;
@@ -6499,6 +6648,7 @@ mod tests {
             2,
             BrainPreset::Ft,
             &[],
+            None,
         )
         .expect("headless Ft run");
 
@@ -7816,7 +7966,7 @@ activation = "Sigmoid"
             .expect("durable replay rows must have unique canonical identities");
         assert_eq!(max_tick, 16, "fixture must persist its partial final tail");
 
-        let replay = run_headless_simulation(&config, max_tick, BrainPreset::Mixed, &[])
+        let replay = run_headless_simulation(&config, max_tick, BrainPreset::Mixed, &[], None)
             .expect("replay run");
         assert_eq!(replay.simulated_ticks, max_tick);
         assert_eq!(
@@ -8702,7 +8852,7 @@ activation = "Sigmoid"
         };
 
         // 1. Run uninterrupted simulation for 20 ticks.
-        let uninterrupted = run_headless_simulation(&config, 20, BrainPreset::Mlp, &[])
+        let uninterrupted = run_headless_simulation(&config, 20, BrainPreset::Mlp, &[], None)
             .expect("uninterrupted simulation should succeed");
         assert_eq!(uninterrupted.simulated_ticks, 20);
 
@@ -8728,6 +8878,7 @@ activation = "Sigmoid"
             20,
             BrainPreset::Mlp,
             &[],
+            None,
         )
         .expect("resumed simulation from checkpoint should succeed");
         assert_eq!(resumed.simulated_ticks, 10);
@@ -8763,6 +8914,7 @@ activation = "Sigmoid"
             10,
             BrainPreset::Mlp,
             &[],
+            None,
         );
         assert!(err_equal.is_err());
         assert!(
@@ -8773,8 +8925,14 @@ activation = "Sigmoid"
         );
 
         // B. Attempting to resume when checkpoint is past tick_limit must fail.
-        let err_past =
-            run_headless_simulation_from_checkpoint(&checkpoint, &config, 5, BrainPreset::Mlp, &[]);
+        let err_past = run_headless_simulation_from_checkpoint(
+            &checkpoint,
+            &config,
+            5,
+            BrainPreset::Mlp,
+            &[],
+            None,
+        );
         assert!(err_past.is_err());
     }
 

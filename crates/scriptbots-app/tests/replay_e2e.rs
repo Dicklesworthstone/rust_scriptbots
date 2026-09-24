@@ -306,6 +306,92 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
     );
 }
 
+/// The production interval recorder (not a planted row) supplies the checkpoint and the
+/// canonical digest that `--checkpoint-start` replay verifies against.
+#[test]
+fn interval_checkpoints_recorded_by_a_real_run_support_checkpoint_start_replay() {
+    let temp_dir = tempdir().expect("temp run directory");
+    let database = temp_dir.path().join("interval_checkpoint_run.sqlite");
+
+    let mut cmd = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    // Bootstrap ticks run without per-step command round trips, so the recorder finds a
+    // due tick as soon as the frontend starts; the few rendered frames give it time to
+    // capture and to place its digest before the final-frame digest.
+    cmd.env("SCRIPTBOTS_TERMINAL_HEADLESS", "1")
+        .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", "8")
+        .env("SCRIPTBOTS_STORAGE_PATH", &database)
+        .args([
+            "--storage",
+            "file",
+            "--threads",
+            "1",
+            "--bootstrap-ticks",
+            "40",
+            "--checkpoint-interval",
+            "20",
+        ])
+        .arg("--set")
+        .arg(format!("rng_seed={SEED}"))
+        .args([
+            "--set",
+            "persistence_interval=1",
+            "--set",
+            "replay_event_tick_cap=65536",
+        ]);
+    let produced = cmd.output().expect("run headless terminal");
+    assert!(
+        produced.status.success(),
+        "recorded run failed: {}",
+        stderr_text(&produced)
+    );
+
+    let reader = StorageReader::open(&database.display().to_string()).expect("open run");
+    let checkpoints = reader.load_checkpoints().expect("load checkpoints");
+    reader.close().expect("close reader");
+    assert!(
+        !checkpoints.is_empty(),
+        "the interval recorder stored no checkpoint in a 48-tick run at interval 20: {}",
+        stderr_text(&produced)
+    );
+    // The recorder captures whatever quiescent tick it reaches once one is due.
+    for record in &checkpoints {
+        assert!(
+            record.checkpoint_id == format!("auto-t{}", record.tick) && record.tick >= 20,
+            "unexpected interval checkpoint {} at tick {}",
+            record.checkpoint_id,
+            record.tick
+        );
+        record
+            .world_checkpoint()
+            .expect("stored checkpoint decodes");
+    }
+
+    let mut verify = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    verify
+        .arg("--replay-db")
+        .arg(&database)
+        .arg("--checkpoint-start")
+        .args(["--threads", "1"])
+        .arg("--set")
+        .arg(format!("rng_seed={SEED}"))
+        .args([
+            "--set",
+            "persistence_interval=1",
+            "--set",
+            "replay_event_tick_cap=65536",
+        ]);
+    let out = verify.output().expect("run checkpoint-start replay");
+    let text = strip_ansi(&format!("{}{}", stdout_text(&out), stderr_text(&out)));
+    assert!(
+        out.status.success(),
+        "checkpoint-start replay failed: {text}"
+    );
+    assert!(
+        text.contains("Replay matched"),
+        "replay from a recorded interval checkpoint must match: {text}"
+    );
+}
+
 #[test]
 fn mock_free_checkpoint_start_replay_e2e() {
     let temp_dir = tempdir().expect("temp run directory");
