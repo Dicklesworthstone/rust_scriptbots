@@ -17,7 +17,17 @@ Audit source: `main` @ `19e5e9ef` (clean). Method: full read of `AGENTS.md` and 
 | `POST /api/v1/experiments` | 200 with `status: "pending"`; still `pending` minutes later. Nothing executes it (see C3). |
 | `POST /api/v1/checkpoints` (memory storage) | Real `scriptbots.world-checkpoint.v1.3` envelope written to `$TMPDIR/scriptbots_artifacts/` (shared across all runs). |
 | `/api/screenshot/png` default build | HTTP 400 "requires gui feature". `/api/screenshot/ascii` in server mode: 409 by design. |
-| `cargo clippy --workspace …` and `cargo test -p scriptbots-core --features economy-faults` via RCH | **Not executed**: repeated RCH exit 103 (`no admissible workers: critical_pressure=5, insufficient_total_slots=2`). Infrastructure refusal, not a test result. |
+| `cargo build -p scriptbots-app --bins` at HEAD via RCH | **Did not complete**: worker `vmi1293453` hit RCH's 1,800 s wall-clock wrap and was SIGKILLed (exit 137) while still compiling dependencies. HEAD compilation is therefore unverified this session. |
+| `cargo clippy --workspace …` and `cargo test -p scriptbots-core --features economy-faults` via RCH | **Not executed**: 13 consecutive RCH exit 103 refusals over ~13 min (`no admissible workers: critical_pressure=5–6, insufficient_total_slots, active_project_exclusion`). Infrastructure refusals, not test results. `bd-vlp7` separately records 421 strict-Clippy diagnostics in core as of 09-15. |
+
+### Follow-through the same day (working tree, not yet committed)
+
+- **C3 fixed in code:** REST/MCP experiments now drive `MatchedSeedExperimentRunner` on a background worker (cooperative cancel between waves, resume of pending runs). Live: 4/4 runs completed with distinct digests; `--verify-bundle` passed on a produced bundle. Conformance lane re-run pending (`bd-2z0.12.2` stays open).
+- **C5 fixed in code:** API checkpoints go through a new storage-worker `RecordCheckpoint` command; no raw connection, no swallowed errors, no snapshot mislabelled as a checkpoint (`bd-mhn5`). Its new test could not start: file pipeline startup timed out under host load ~99.
+- **Terminal palette:** the six actions that could not do what they claimed were removed, with a guard test (`bd-vri3`).
+- **C1 root cause narrowed:** FrankenSQLite `:memory:` COMMIT cost is linear in database size (microbench 0.5 → 18.6 ms from 100 → 1,600 rows); file-backed commits did not grow. Separately, file-mode server runs on this host stall with the storage worker parked in `futures_lite::block_on` while fsqlite's unix VFS spawns one OS thread per I/O via asupersync's no-runtime fallback (`bd-kgob`, `bd-w1oi`; measured under load ~90–100, so magnitude may be load-amplified).
+- **Retracted:** the `--dump-*-png` "silently ignored" finding was wrong (`bd-xchr` closed invalid).
+- **Blocked:** the mandated commit path (`scripts/shared_tree_commit.py`) needs MCP Agent Mail, whose database has been unwritable for ~6 days.
 
 ### Critical findings (verified at source)
 
@@ -34,7 +44,7 @@ Audit source: `main` @ `19e5e9ef` (clean). Method: full read of `AGENTS.md` and 
 - **`--checkpoint-start` has no production producer.** `Storage::record_checkpoint` is called only from tests and `bundle.rs:650`; `tests/replay_e2e.rs:342-373` inserts the checkpoint row with raw SQL. On an ordinary run DB the flag fails "no valid checkpoint" unless the C5 side channel happened to write one.
 - **Hydrology is computed but not consumed by the tick** (readers: digest, checkpoint, accessor, `/api/hydrology`).
 - **Terminal command palette lies.** `ResetWorld` and `ReloadConfig` both submit `UpdateConfig(Box::default())` — they replace the live config with defaults (`terminal/mod.rs:4342-4348`). `CreateCheckpoint` only toasts "Checkpoint snapshot recorded" while recording nothing; Branch/Compare/Export are toast-only.
-- **Bevy 3D:** live creatures are primitive capsule/torus/cone meshes; `creature_meshes.rs` (1.3k lines) and `particles.rs` (2.3k lines) are declared but unreferenced; no water surface; FXAA is a stub in world-gfx; GPUI `vfx` has no production caller. `--dump-semantic-png`/`--dump-scene-png` are silently ignored (interactive launch proceeds) in builds without `bevy_render`. Blessed scene goldens come from an Apple M4; `hydrology_flood` has only `.candidate.png` files committed.
+- **Bevy 3D:** live creatures are primitive capsule/torus/cone meshes; `creature_meshes.rs` (1.3k lines) and `particles.rs` (2.3k lines) are declared but unreferenced; no water surface; FXAA is a stub in world-gfx; GPUI `vfx` has no production caller. (Correction: an earlier draft said `--dump-semantic-png`/`--dump-scene-png` are silently ignored without `bevy_render`; that was wrong — the fields are feature-gated and clap rejects them as unknown arguments, verified on a default build.) Blessed scene goldens come from an Apple M4; `hydrology_flood` has only `.candidate.png` files committed.
 - **ML backends:** `ml.placeholder` is a sensor-copy stub (unreachable from the app — acceptable); Tract and tch are Cargo features with zero code; Candle is real but unreachable from any app feature; `scriptbots-brain-ml` runs **0 tests** under default features.
 - **CLI `map-apply` only validates a file** (`main.rs:3226-3251`); the REST/MCP map apply path is real and wired to `HostCore`.
 - **V8 domain-event tables are write-only in production** (readers exist only in tests).
