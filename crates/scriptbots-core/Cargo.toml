@@ -18,6 +18,7 @@ slotmap = { workspace = true }
 rand = { workspace = true }
 wfc = { workspace = true }
 direction = { workspace = true }
+grid_2d = "0.15"
 rand08 = { workspace = true }
 scriptbots-index = { path = "../scriptbots-index" }
 rayon = { workspace = true, optional = true }
