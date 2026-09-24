@@ -4339,17 +4339,6 @@ impl<'a> TerminalApp<'a> {
                     self.push_toast("Drought intervention submitted");
                 }
             }
-            CommandPaletteAction::ReloadConfig => {
-                self.submit_simulation_command(ControlCommand::UpdateConfig(Box::default()));
-                self.push_toast("Reload config submitted");
-            }
-            CommandPaletteAction::ResetWorld => {
-                self.submit_simulation_command(ControlCommand::UpdateConfig(Box::default()));
-                self.push_toast("Reset world submitted");
-            }
-            CommandPaletteAction::CreateCheckpoint => {
-                self.push_toast("Checkpoint snapshot recorded");
-            }
             CommandPaletteAction::ExportAsciiScreenshot => {
                 self.export_requested = true;
                 self.push_toast("Export requested");
@@ -4389,15 +4378,6 @@ impl<'a> TerminalApp<'a> {
             CommandPaletteAction::NavigateDiagnostics => {
                 self.frankentui.route = frankentui_shell::ShellRoute::Diagnostics;
                 self.push_toast("View: Diagnostics");
-            }
-            CommandPaletteAction::BranchCheckpoint => {
-                self.push_toast("Branch checkpoint requested");
-            }
-            CommandPaletteAction::CompareExperiments => {
-                self.push_toast("Experiment comparison requested");
-            }
-            CommandPaletteAction::ExportData => {
-                self.push_toast("Science data export requested");
             }
             CommandPaletteAction::ToggleDiagnostics => {
                 if self.frankentui.route == frankentui_shell::ShellRoute::Diagnostics {

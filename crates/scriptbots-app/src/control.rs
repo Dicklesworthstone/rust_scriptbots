@@ -22,7 +22,6 @@ use scriptbots_runtime::{
     ApplicationState, CommandEnvelope, CommandId, HostCommand, HostPort, JournalState,
     RenderSnapshot, channel::ChannelHostPort,
 };
-use scriptbots_storage::{Connection, RowExt};
 use smallvec::SmallVec;
 
 /// Snapshot of configuration state returned to external clients.
@@ -491,6 +490,8 @@ pub struct ExperimentBatchStatusDto {
     pub completed_runs: usize,
     pub failed_runs: usize,
     pub runs: Vec<ExperimentRunRecordDto>,
+    /// Batch-level failure (plan, status-file, or bundle verification), if any.
+    pub error_reason: Option<String>,
     pub created_at_utc: String,
     pub updated_at_utc: String,
 }
@@ -743,10 +744,174 @@ pub fn compute_blake3(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
+/// A REST/MCP-created matched-seed batch executing on a background runner thread.
+///
+/// The runner's atomically written status file is the only source of run
+/// progress; this job adds only the process-local execution state (whether a
+/// worker is live, whether cancellation was requested, and a batch-level error).
+struct ExperimentJob {
+    runner: std::sync::Arc<crate::experiment_runner::MatchedSeedExperimentRunner>,
+    state_file: PathBuf,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_error: std::sync::Arc<Mutex<Option<String>>>,
+    created_at_utc: String,
+}
+
+impl std::fmt::Debug for ExperimentJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExperimentJob")
+            .field("experiment_id", &self.runner.experiment_id)
+            .field("state_file", &self.state_file)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExperimentJob {
+    /// Start (or restart) the batch worker. `running` is raised before the
+    /// thread exists so a status read can never observe a false idle gap.
+    fn start(&self) {
+        use std::sync::atomic::Ordering;
+        self.running.store(true, Ordering::Release);
+        let runner = std::sync::Arc::clone(&self.runner);
+        let state_file = self.state_file.clone();
+        let cancel = std::sync::Arc::clone(&self.cancel);
+        let running = std::sync::Arc::clone(&self.running);
+        let last_error = std::sync::Arc::clone(&self.last_error);
+        let spawned = std::thread::Builder::new()
+            .name(format!("experiment-{}", runner.experiment_id))
+            .spawn(move || {
+                let outcome = runner.execute_batch_until_cancelled(&state_file, &cancel);
+                if let Err(error) = outcome {
+                    tracing::error!(
+                        experiment_id = %runner.experiment_id,
+                        %error,
+                        "experiment batch stopped with an error"
+                    );
+                    if let Ok(mut slot) = last_error.lock() {
+                        *slot = Some(error.to_string());
+                    }
+                }
+                running.store(false, Ordering::Release);
+            });
+        if let Err(error) = spawned {
+            if let Ok(mut slot) = self.last_error.lock() {
+                *slot = Some(format!("cannot spawn experiment worker: {error}"));
+            }
+            self.running.store(false, Ordering::Release);
+        }
+    }
+
+    fn status_dto(&self, experiment_id: &str) -> Result<ExperimentBatchStatusDto, ControlError> {
+        use crate::experiment_runner::{ExperimentBatchStatus, RunState};
+        use std::sync::atomic::Ordering;
+        let running = self.running.load(Ordering::Acquire);
+        let cancel_requested = self.cancel.load(Ordering::Acquire);
+        let error_reason = self.last_error.lock().ok().and_then(|slot| slot.clone());
+        let (status, updated_at_utc) = match fs::read(&self.state_file) {
+            Ok(bytes) => {
+                let status: ExperimentBatchStatus =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        ControlError::Serialization(format!(
+                            "experiment status {} is unreadable: {error}",
+                            self.state_file.display()
+                        ))
+                    })?;
+                let modified = fs::metadata(&self.state_file)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or_else(|| self.created_at_utc.clone(), |d| d.as_secs().to_string());
+                (status, modified)
+            }
+            // The worker has not written its first status yet: the plan is the status.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let runs = self
+                    .runner
+                    .plan_batch()
+                    .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+                (
+                    ExperimentBatchStatus {
+                        schema_version: 2,
+                        generation: 0,
+                        plan_digest: String::new(),
+                        experiment_id: experiment_id.to_string(),
+                        total_runs: runs.len(),
+                        completed_runs: 0,
+                        failed_runs: 0,
+                        runs,
+                    },
+                    self.created_at_utc.clone(),
+                )
+            }
+            Err(error) => {
+                return Err(ControlError::Serialization(format!(
+                    "experiment status {} is unreadable: {error}",
+                    self.state_file.display()
+                )));
+            }
+        };
+        let finished = status.is_finished();
+        let any_started = status.runs.iter().any(|run| run.state != RunState::Pending);
+        let label = if running && cancel_requested {
+            "cancelling"
+        } else if running {
+            if any_started { "running" } else { "pending" }
+        } else if finished {
+            if status.failed_runs > 0 {
+                "failed"
+            } else {
+                "completed"
+            }
+        } else if error_reason.is_some() {
+            "failed"
+        } else if cancel_requested {
+            "cancelled"
+        } else {
+            "stopped"
+        };
+        let runs = status
+            .runs
+            .into_iter()
+            .map(|run| ExperimentRunRecordDto {
+                run_id: run.run_id,
+                variant_id: run.variant_id,
+                brain_family: run.brain_family,
+                seed: run.seed,
+                state: match run.state {
+                    RunState::Pending => "pending",
+                    RunState::Running => "running",
+                    RunState::Completed => "completed",
+                    RunState::Failed => "failed",
+                }
+                .to_string(),
+                total_ticks: run.total_ticks,
+                final_digest: run.final_digest,
+                bundle_path: run.bundle_path,
+                error_reason: run.error_reason,
+            })
+            .collect();
+        Ok(ExperimentBatchStatusDto {
+            schema_version: status.schema_version,
+            generation: status.generation,
+            plan_digest: status.plan_digest,
+            experiment_id: status.experiment_id,
+            status: label.to_string(),
+            total_runs: status.total_runs,
+            completed_runs: status.completed_runs,
+            failed_runs: status.failed_runs,
+            runs,
+            error_reason,
+            created_at_utc: self.created_at_utc.clone(),
+            updated_at_utc,
+        })
+    }
+}
+
 /// Canonical in-process data services managing experiments, checkpoints, and artifacts.
 #[derive(Debug)]
 pub struct DataServices {
-    experiments: Mutex<BTreeMap<String, ExperimentBatchStatusDto>>,
+    experiments: Mutex<BTreeMap<String, ExperimentJob>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
     checkpoint_data: Mutex<BTreeMap<String, Vec<u8>>>,
     artifacts: Mutex<BTreeMap<String, ArtifactMetadataDto>>,
@@ -812,6 +977,7 @@ pub struct ControlHandle {
     command_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     command_namespace: u64,
     database_path: Option<std::path::PathBuf>,
+    checkpoint_writer: Option<scriptbots_storage::StorageCheckpointWriter>,
     data_services: std::sync::Arc<DataServices>,
 }
 
@@ -824,6 +990,7 @@ impl ControlHandle {
             command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             command_namespace: NEXT_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             database_path: None,
+            checkpoint_writer: None,
             data_services: std::sync::Arc::new(DataServices::default()),
         }
     }
@@ -847,6 +1014,16 @@ impl ControlHandle {
     /// Attach a FrankenSQLite database path for offline storage queries.
     pub fn with_database(mut self, path: Option<std::path::PathBuf>) -> Self {
         self.database_path = path;
+        self
+    }
+
+    /// Attach the run's storage-worker checkpoint writer.
+    #[must_use]
+    pub fn with_checkpoint_writer(
+        mut self,
+        writer: Option<scriptbots_storage::StorageCheckpointWriter>,
+    ) -> Self {
+        self.checkpoint_writer = writer;
         self
     }
 
@@ -1044,7 +1221,7 @@ impl ControlHandle {
                     if let Ok(dto) =
                         serde_json::from_value::<ExperimentBatchStatusDto>(cached_val.clone())
                     {
-                        return Ok(dto);
+                        return self.get_experiment(&dto.experiment_id);
                     }
                 } else {
                     return Err(ControlError::Conflict(
@@ -1091,44 +1268,77 @@ impl ControlHandle {
             format!("exp-{secs}{nanos:04}")
         };
 
-        let mut runs = Vec::with_capacity(total_runs);
+        let mut variants = Vec::with_capacity(request.variants.len());
         for v in &request.variants {
-            for &s in &request.seeds {
-                let run_id = format!("{}_{}_s{}", experiment_id, v.variant_id, s);
-                runs.push(ExperimentRunRecordDto {
-                    run_id,
-                    variant_id: v.variant_id.clone(),
-                    brain_family: v.brain_family.clone(),
-                    seed: s,
-                    state: "pending".into(),
-                    total_ticks: ticks_per_run,
-                    final_digest: None,
-                    bundle_path: None,
-                    error_reason: None,
-                });
-            }
+            let config_overrides = match &v.config_overrides {
+                None | Some(Value::Null) => BTreeMap::new(),
+                Some(Value::Object(map)) => map.clone().into_iter().collect(),
+                Some(_) => {
+                    return Err(ControlError::BadRequest(format!(
+                        "variant '{}': config_overrides must be an object of dotted config paths",
+                        v.variant_id
+                    )));
+                }
+            };
+            variants.push(crate::experiment_runner::ScenarioVariant {
+                variant_id: v.variant_id.trim().to_string(),
+                brain_family: v.brain_family.trim().to_lowercase(),
+                config_overrides,
+            });
         }
-
-        let plan_digest = compute_blake3(
-            format!("{}:{}:{}", experiment_id, runs.len(), ticks_per_run).as_bytes(),
+        let default_concurrency = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .clamp(1, 4);
+        let output_dir = self
+            .data_services
+            .artifacts_dir()
+            .join("experiments")
+            .join(&experiment_id);
+        let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
+            experiment_id.clone(),
+            crate::experiment_runner::MatchedSeedCohort {
+                cohort_id: experiment_id.clone(),
+                seeds: request.seeds.clone(),
+            },
+            variants,
+            ticks_per_run,
+            request.max_concurrency.unwrap_or(default_concurrency),
+            &output_dir,
         );
-        let status_dto = ExperimentBatchStatusDto {
-            schema_version: 2,
-            generation: 1,
-            plan_digest,
-            experiment_id: experiment_id.clone(),
-            status: "pending".into(),
-            total_runs: runs.len(),
-            completed_runs: 0,
-            failed_runs: 0,
-            runs,
-            created_at_utc: format!("{secs}"),
-            updated_at_utc: format!("{secs}"),
-        };
+        // Refuse an invalid plan synchronously, before any thread or file exists.
+        runner
+            .plan_batch()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        fs::create_dir_all(&output_dir).map_err(|error| {
+            ControlError::Serialization(format!(
+                "cannot create experiment directory {}: {error}",
+                output_dir.display()
+            ))
+        })?;
 
-        if let Ok(mut lock) = self.data_services.experiments.lock() {
-            lock.insert(experiment_id, status_dto.clone());
+        let job = ExperimentJob {
+            runner: std::sync::Arc::new(runner),
+            state_file: output_dir.join("status.json"),
+            cancel: std::sync::Arc::default(),
+            running: std::sync::Arc::default(),
+            last_error: std::sync::Arc::default(),
+            created_at_utc: format!("{secs}"),
+        };
+        {
+            let mut lock = self
+                .data_services
+                .experiments
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            if lock.contains_key(&experiment_id) {
+                return Err(ControlError::Conflict(format!(
+                    "experiment_id '{experiment_id}' already exists"
+                )));
+            }
+            job.start();
+            lock.insert(experiment_id.clone(), job);
         }
+        let status_dto = self.get_experiment(&experiment_id)?;
 
         if let Some(ref key) = request.idempotency_key {
             let payload_hash = compute_blake3(
@@ -1156,75 +1366,70 @@ impl ControlHandle {
             .experiments
             .lock()
             .map_err(|_| ControlError::Lock)?;
-        lock.get(experiment_id).cloned().ok_or_else(|| {
+        let job = lock.get(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
-        })
+        })?;
+        job.status_dto(experiment_id)
     }
 
-    /// Cancel a running or pending experiment.
+    /// Request cooperative cancellation. The wave already executing finishes;
+    /// unadmitted runs stay pending and can be resumed.
     pub fn cancel_experiment(
         &self,
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
-        let mut lock = self
+        let lock = self
             .data_services
             .experiments
             .lock()
             .map_err(|_| ControlError::Lock)?;
-        let exp = lock.get_mut(experiment_id).ok_or_else(|| {
+        let job = lock.get(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
-        if exp.status == "completed" || exp.status == "failed" || exp.status == "cancelled" {
-            return Ok(exp.clone());
-        }
-        exp.status = "cancelled".into();
-        exp.generation += 1;
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        exp.updated_at_utc = format!("{secs}");
-        for run in &mut exp.runs {
-            if run.state == "pending" || run.state == "running" {
-                run.state = "cancelled".into();
-            }
-        }
-        Ok(exp.clone())
+        job.cancel.store(true, std::sync::atomic::Ordering::Release);
+        job.status_dto(experiment_id)
     }
 
-    /// Resume a cancelled experiment.
+    /// Resume a stopped experiment whose batch still has pending runs.
     pub fn resume_experiment(
         &self,
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
-        let mut lock = self
+        let lock = self
             .data_services
             .experiments
             .lock()
             .map_err(|_| ControlError::Lock)?;
-        let exp = lock.get_mut(experiment_id).ok_or_else(|| {
+        let job = lock.get(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
-        if exp.status == "completed" {
+        let current = job.status_dto(experiment_id)?;
+        match current.status.as_str() {
+            "running" | "pending" => {
+                return Err(ControlError::Conflict(format!(
+                    "experiment '{experiment_id}' is already executing"
+                )));
+            }
+            "cancelling" => {
+                return Err(ControlError::Conflict(format!(
+                    "experiment '{experiment_id}' is still finishing its current wave; retry after it reports cancelled"
+                )));
+            }
+            _ => {}
+        }
+        if current.completed_runs + current.failed_runs == current.total_runs {
             return Err(ControlError::Conflict(format!(
-                "cannot resume completed experiment '{experiment_id}'"
+                "experiment '{experiment_id}' has no pending runs to resume (status {})",
+                current.status
             )));
         }
-        if exp.status == "cancelled" {
-            exp.status = "running".into();
-            exp.generation += 1;
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            exp.updated_at_utc = format!("{secs}");
-            for run in &mut exp.runs {
-                if run.state == "cancelled" {
-                    run.state = "pending".into();
-                }
-            }
+        job.cancel
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(mut error) = job.last_error.lock() {
+            *error = None;
         }
-        Ok(exp.clone())
+        job.start();
+        job.status_dto(experiment_id)
     }
 
     /// List experiments with bounded pagination.
@@ -1249,19 +1454,21 @@ impl ControlHandle {
             .map_err(|_| ControlError::Lock)?;
         let total = lock.len();
         let items: Vec<ExperimentSummaryDto> = lock
-            .values()
+            .iter()
             .skip(offset)
             .take(limit)
-            .map(|e| ExperimentSummaryDto {
-                experiment_id: e.experiment_id.clone(),
-                status: e.status.clone(),
-                total_runs: e.total_runs,
-                completed_runs: e.completed_runs,
-                failed_runs: e.failed_runs,
-                created_at_utc: e.created_at_utc.clone(),
-                updated_at_utc: e.updated_at_utc.clone(),
+            .map(|(id, job)| {
+                job.status_dto(id).map(|e| ExperimentSummaryDto {
+                    experiment_id: e.experiment_id,
+                    status: e.status,
+                    total_runs: e.total_runs,
+                    completed_runs: e.completed_runs,
+                    failed_runs: e.failed_runs,
+                    created_at_utc: e.created_at_utc,
+                    updated_at_utc: e.updated_at_utc,
+                })
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let has_more = offset + items.len() < total;
         let next_cursor = if has_more {
@@ -1317,29 +1524,13 @@ impl ControlHandle {
             }
         }
 
-        let (encoded_bytes, tick, schema) = match self.capture_checkpoint_v1() {
-            Ok(checkpoint) => {
-                let encoded = checkpoint
-                    .encode()
-                    .map_err(|e| ControlError::Serialization(e.to_string()))?;
-                (
-                    encoded,
-                    checkpoint.tick().0,
-                    scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA.to_string(),
-                )
-            }
-            Err(_) => {
-                let snapshot = self.read_snapshot()?;
-                let encoded = postcard::to_stdvec(&snapshot)
-                    .or_else(|_| serde_json::to_vec(&snapshot))
-                    .map_err(|e| ControlError::Serialization(e.to_string()))?;
-                (
-                    encoded,
-                    snapshot.world.tick,
-                    "scriptbots.world-checkpoint.v1.3".to_string(),
-                )
-            }
-        };
+        // Only a real core checkpoint is ever labelled as one; a capture refusal is the answer.
+        let checkpoint = self.capture_checkpoint_v1()?;
+        let encoded_bytes = checkpoint
+            .encode()
+            .map_err(|e| ControlError::Serialization(e.to_string()))?;
+        let tick = checkpoint.tick().0;
+        let schema = scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA.to_string();
 
         let blake3_hex = compute_blake3(&encoded_bytes);
         let sha256_hex = compute_sha256(&encoded_bytes);
@@ -1378,7 +1569,26 @@ impl ControlHandle {
 
         let dir = self.data_services.artifacts_dir();
         let file_path = dir.join(&filename);
-        let _ = fs::write(&file_path, &encoded_bytes);
+        fs::write(&file_path, &encoded_bytes).map_err(|error| {
+            ControlError::Serialization(format!(
+                "cannot write checkpoint artifact {}: {error}",
+                file_path.display()
+            ))
+        })?;
+        // The run database row goes through the connection-owning storage worker.
+        if let Some(writer) = &self.checkpoint_writer {
+            let metadata = serde_json::json!({
+                "source": "control_api",
+                "description": request.description,
+            });
+            writer
+                .record(&checkpoint_id, &checkpoint, &metadata)
+                .map_err(|error| {
+                    ControlError::Serialization(format!(
+                        "checkpoint {checkpoint_id} was not recorded in the run database: {error}"
+                    ))
+                })?;
+        }
 
         if let Ok(mut lock) = self.data_services.checkpoints.lock() {
             lock.insert(checkpoint_id.clone(), meta.clone());
@@ -1388,44 +1598,6 @@ impl ControlHandle {
         }
         if let Ok(mut lock) = self.data_services.artifacts.lock() {
             lock.insert(checkpoint_id.clone(), art_meta);
-        }
-
-        if let Some(db_path) = self.database_path.as_deref()
-            && let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref())
-        {
-            let run_id = conn
-                .query_row("SELECT run_id FROM runs LIMIT 1")
-                .ok()
-                .and_then(|row| row.get_typed::<String>(0).ok())
-                .unwrap_or_else(|| "default_run".into());
-            let payload_hex = encoded_bytes
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            let payload_digest = format!("blake3:{}", blake3_hex);
-            let format_str = format!(
-                "{}+postcard_hex",
-                scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
-            );
-            let ordinal: i64 = conn
-                .query_row("SELECT COALESCE(MAX(checkpoint_ordinal) + 1, 0) FROM checkpoints")
-                .ok()
-                .and_then(|row| row.get_typed::<i64>(0).ok())
-                .unwrap_or(0);
-            let _ = conn.execute_with_params(
-                "INSERT INTO checkpoints (run_id, checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                &[
-                    run_id.into(),
-                    checkpoint_id.clone().into(),
-                    (tick as i64).into(),
-                    ordinal.into(),
-                    format_str.into(),
-                    payload_hex.into(),
-                    payload_digest.into(),
-                    "{}".into(),
-                ],
-            );
         }
 
         if let Some(ref key) = request.idempotency_key {

@@ -31,15 +31,9 @@ pub enum CommandPaletteAction {
     SpawnHerbivore,
     SpawnCarnivore,
     TriggerDrought,
-    ResetWorld,
-    ReloadConfig,
 
-    // Checkpoint & Export
-    CreateCheckpoint,
-    BranchCheckpoint,
-    CompareExperiments,
+    // Export
     ExportAsciiScreenshot,
-    ExportData,
 
     // Screen Navigation
     NavigateDashboard,
@@ -130,15 +124,6 @@ impl CommandPaletteAction {
                     None
                 }
             }
-            Self::ResetWorld => Some(ControlCommand::UpdateConfig(Box::default())),
-            Self::ReloadConfig => Some(ControlCommand::UpdateConfig(Box::default())),
-            Self::CreateCheckpoint | Self::BranchCheckpoint => {
-                Some(ControlCommand::UpdateSimulation(SimulationCommand {
-                    paused: Some(true),
-                    speed_multiplier: None,
-                    step_once: false,
-                }))
-            }
             Self::Quit => Some(ControlCommand::Shutdown),
             _ => None,
         }
@@ -162,10 +147,6 @@ impl CommandPaletteAction {
                 | Self::SpawnHerbivore
                 | Self::SpawnCarnivore
                 | Self::TriggerDrought
-                | Self::ResetWorld
-                | Self::ReloadConfig
-                | Self::CreateCheckpoint
-                | Self::BranchCheckpoint
                 | Self::Quit
         )
     }
@@ -269,48 +250,13 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             category: "Scenario",
             action: CommandPaletteAction::TriggerDrought,
         },
-        CommandPaletteItem {
-            id: "scenario.reload_config",
-            label: "Reload Default Simulation Configuration",
-            keybind_hint: "R",
-            category: "Scenario",
-            action: CommandPaletteAction::ReloadConfig,
-        },
-        CommandPaletteItem {
-            id: "scenario.reset_world",
-            label: "Reset World Simulation State",
-            keybind_hint: "",
-            category: "Scenario",
-            action: CommandPaletteAction::ResetWorld,
-        },
-        // Checkpoint & Export
-        CommandPaletteItem {
-            id: "export.checkpoint",
-            label: "Create Simulation Checkpoint (Snapshot)",
-            keybind_hint: "K",
-            category: "Export",
-            action: CommandPaletteAction::CreateCheckpoint,
-        },
-        CommandPaletteItem {
-            id: "export.branch_checkpoint",
-            label: "Branch Simulation from Checkpoint",
-            keybind_hint: "N",
-            category: "Export",
-            action: CommandPaletteAction::BranchCheckpoint,
-        },
+        // Export
         CommandPaletteItem {
             id: "export.ascii_screenshot",
             label: "Save ASCII / ANSI Frame Export",
             keybind_hint: "Shift+S",
             category: "Export",
             action: CommandPaletteAction::ExportAsciiScreenshot,
-        },
-        CommandPaletteItem {
-            id: "export.data_bundle",
-            label: "Export Science Data / Replay Bundle",
-            keybind_hint: "X",
-            category: "Export",
-            action: CommandPaletteAction::ExportData,
         },
         // Navigation
         CommandPaletteItem {
@@ -389,14 +335,6 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "r",
             category: "View",
             action: CommandPaletteAction::ToggleRail,
-        },
-        // Science Workflows
-        CommandPaletteItem {
-            id: "science.compare_experiments",
-            label: "Compare Experiment Arms (Hedges' g)",
-            keybind_hint: "C",
-            category: "Science",
-            action: CommandPaletteAction::CompareExperiments,
         },
         // Diagnostics & Science
         CommandPaletteItem {
@@ -847,6 +785,19 @@ mod tests {
             CommandPaletteAction::Quit.to_control_command(speed, paused),
             Some(ControlCommand::Shutdown)
         ));
+
+        // No palette action may replace the live scientific config wholesale: the former
+        // Reset/Reload entries submitted `UpdateConfig(default)` and silently clobbered it.
+        for item in all_command_palette_items() {
+            assert!(
+                !matches!(
+                    item.action.to_control_command(speed, paused),
+                    Some(ControlCommand::UpdateConfig(_))
+                ),
+                "palette item {} would overwrite the live configuration",
+                item.id
+            );
+        }
 
         // Non-mutating actions must return None
         assert!(

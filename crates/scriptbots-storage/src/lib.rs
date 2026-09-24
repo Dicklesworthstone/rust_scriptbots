@@ -14088,6 +14088,26 @@ impl Storage {
         Ok(())
     }
 
+    /// Store a checkpoint at this run's next checkpoint ordinal and return that ordinal.
+    pub fn record_next_checkpoint(
+        &mut self,
+        checkpoint_id: &str,
+        checkpoint: &scriptbots_core::WorldCheckpointV1,
+        metadata: &Value,
+    ) -> Result<u64, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT COALESCE(MAX(checkpoint_ordinal) + 1, 0) FROM checkpoints WHERE run_id = ?1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let next: i64 = match rows.first() {
+            Some(row) => decode(row, 0, "checkpoints.next_ordinal")?,
+            None => 0,
+        };
+        let ordinal = checked_u64("checkpoints.next_ordinal", next)?;
+        self.record_checkpoint(checkpoint_id, ordinal, checkpoint, metadata)?;
+        Ok(ordinal)
+    }
+
     /// Persist a canonical audio timeline as an artifact in the database.
     pub fn record_audio_timeline(&mut self, timeline: &AudioTimeline) -> Result<(), StorageError> {
         let artifact_id = format!("audio_timeline:{}:{}", timeline.from_tick, timeline.to_tick);
@@ -21698,6 +21718,12 @@ enum StorageCommand {
     Flush {
         reply: xchan::Sender<Result<FlushReceipt, StorageWorkerError>>,
     },
+    RecordCheckpoint {
+        checkpoint_id: String,
+        checkpoint: Box<scriptbots_core::WorldCheckpointV1>,
+        metadata: Value,
+        reply: xchan::Sender<Result<u64, String>>,
+    },
     Shutdown {
         reply: xchan::Sender<Result<ShutdownReceipt, StorageWorkerError>>,
     },
@@ -21903,6 +21929,73 @@ struct AdmissionState {
 }
 
 /// Cloneable persistence sink that never owns or transports a database connection.
+/// Clonable handle that stores a core science checkpoint through the storage worker, so the
+/// control plane never opens a second connection to the run database.
+#[derive(Clone)]
+pub struct StorageCheckpointWriter {
+    tx: xchan::Sender<StorageCommand>,
+    enqueue: Duration,
+    reply: Duration,
+}
+
+impl std::fmt::Debug for StorageCheckpointWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageCheckpointWriter")
+            .finish_non_exhaustive()
+    }
+}
+
+impl StorageCheckpointWriter {
+    /// Record `checkpoint` at the run's next checkpoint ordinal and return that ordinal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the worker's refusal, or a typed timeout/closed error when the worker
+    /// cannot accept or acknowledge the request within the storage deadlines.
+    pub fn record(
+        &self,
+        checkpoint_id: &str,
+        checkpoint: &scriptbots_core::WorldCheckpointV1,
+        metadata: &Value,
+    ) -> Result<u64, StorageError> {
+        let (reply_tx, reply_rx) = xchan::bounded(1);
+        let command = StorageCommand::RecordCheckpoint {
+            checkpoint_id: checkpoint_id.to_owned(),
+            checkpoint: Box::new(checkpoint.clone()),
+            metadata: metadata.clone(),
+            reply: reply_tx,
+        };
+        match self.tx.send_timeout(command, self.enqueue) {
+            Ok(()) => {}
+            Err(xchan::SendTimeoutError::Timeout(_)) => {
+                return Err(StorageError::InvalidData {
+                    context: "checkpoints.enqueue",
+                    reason: format!(
+                        "storage worker did not accept the checkpoint within {:?}",
+                        self.enqueue
+                    ),
+                });
+            }
+            Err(xchan::SendTimeoutError::Disconnected(_)) => return Err(StorageError::Closed),
+        }
+        match reply_rx.recv_timeout(self.reply) {
+            Ok(Ok(ordinal)) => Ok(ordinal),
+            Ok(Err(reason)) => Err(StorageError::InvalidData {
+                context: "checkpoints.record",
+                reason,
+            }),
+            Err(xchan::RecvTimeoutError::Timeout) => Err(StorageError::InvalidData {
+                context: "checkpoints.acknowledgement",
+                reason: format!(
+                    "storage worker did not acknowledge the checkpoint within {:?}; its outcome is unknown",
+                    self.reply
+                ),
+            }),
+            Err(xchan::RecvTimeoutError::Disconnected) => Err(StorageError::Closed),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StorageSink {
     run_id: RunId,
@@ -23582,6 +23675,16 @@ impl StoragePipeline {
         self.sink.clone()
     }
 
+    /// Return a clonable handle that records checkpoints through the connection-owning worker.
+    #[must_use]
+    pub fn checkpoint_writer(&self) -> StorageCheckpointWriter {
+        StorageCheckpointWriter {
+            tx: self.sink.tx.clone(),
+            enqueue: self.sink.deadlines.command_enqueue,
+            reply: self.sink.deadlines.flush_ack,
+        }
+    }
+
     /// Register one host session and return its bounded nonblocking journal adapter.
     ///
     /// Registration performs only bounded metadata work on the storage owner thread. Journal
@@ -24705,6 +24808,22 @@ fn storage_worker(
                         return Some(worker_error);
                     }
                 }
+            }
+            StorageCommand::RecordCheckpoint {
+                checkpoint_id,
+                checkpoint,
+                metadata,
+                reply,
+            } => {
+                // A single-row insert: a refusal is reported to the requester and
+                // does not poison the scientific persistence lane.
+                let result = storage
+                    .record_next_checkpoint(&checkpoint_id, &checkpoint, &metadata)
+                    .map_err(|error| error.to_string());
+                if let Err(error) = &result {
+                    warn!(checkpoint_id = %checkpoint_id, %error, "checkpoint record refused");
+                }
+                let _ = reply.send(result);
             }
             StorageCommand::Shutdown { reply } => {
                 let result = shutdown_worker_storage(storage, &mut state, &analytics);
@@ -36760,6 +36879,51 @@ mod tests {
                 "scope": "core science save/load/restore; no host-session continuation",
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_writer_records_through_the_worker_at_successive_ordinals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            rng_seed: Some(77),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })?;
+        let checkpoint = world.checkpoint_v1()?;
+        let path = temp_db_path("storage-checkpoint-writer");
+        let path_string = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::create_unattributed_file(&path_string)?;
+        let writer = pipeline.checkpoint_writer();
+        // A clone is an independent handle to the same worker.
+        let second_writer = writer.clone();
+        assert_eq!(writer.record("api-1", &checkpoint, &json!({"n": 1}))?, 0);
+        assert_eq!(
+            second_writer.record("api-2", &checkpoint, &json!({"n": 2}))?,
+            1
+        );
+        // A duplicate identity is refused by the worker and reported, not swallowed.
+        assert!(writer.record("api-1", &checkpoint, &json!({})).is_err());
+        pipeline.shutdown()?;
+        // After shutdown the handle reports the closed worker instead of hanging.
+        assert!(writer.record("api-3", &checkpoint, &json!({})).is_err());
+
+        let reader = StorageReader::open(&path_string)?;
+        let checkpoints = reader.load_checkpoints()?;
+        assert_eq!(
+            checkpoints
+                .iter()
+                .map(|record| (record.checkpoint_id.as_str(), record.checkpoint_ordinal))
+                .collect::<Vec<_>>(),
+            vec![("api-1", 0), ("api-2", 1)]
+        );
+        assert_eq!(
+            checkpoints[1].world_checkpoint()?.encode()?,
+            checkpoint.encode()?
+        );
+        reader.close()?;
         Ok(())
     }
 

@@ -127,6 +127,8 @@ pub struct ControlServerConfig {
     pub presented_frame: SharedPresentedFrame,
     /// Optional FrankenSQLite database path for offline storage queries (narrative search).
     pub database_path: Option<PathBuf>,
+    /// Records API-created checkpoints through the run's storage worker.
+    pub checkpoint_writer: Option<scriptbots_storage::StorageCheckpointWriter>,
 }
 
 impl Default for ControlServerConfig {
@@ -142,6 +144,7 @@ impl Default for ControlServerConfig {
             environment_errors: Vec::new(),
             presented_frame: empty_presented_frame(),
             database_path: None,
+            checkpoint_writer: None,
         }
     }
 }
@@ -360,6 +363,16 @@ pub struct ControlServerReservation {
 }
 
 impl ControlServerReservation {
+    /// Attach the run's storage checkpoint writer once storage exists (after socket reservation).
+    #[must_use]
+    pub fn with_checkpoint_writer(
+        mut self,
+        writer: scriptbots_storage::StorageCheckpointWriter,
+    ) -> Self {
+        self.config.checkpoint_writer = Some(writer);
+        self
+    }
+
     /// Validate configuration and reserve every enabled control socket.
     pub fn prepare(config: ControlServerConfig) -> Result<Self> {
         config.validate_environment()?;
@@ -460,8 +473,9 @@ impl ControlRuntime {
         reservation: ControlServerReservation,
         startup_timeout: Duration,
     ) -> Result<(Self, CommandSubmit)> {
-        let handle =
-            ControlHandle::new(host).with_database(reservation.config.database_path.clone());
+        let handle = ControlHandle::new(host)
+            .with_database(reservation.config.database_path.clone())
+            .with_checkpoint_writer(reservation.config.checkpoint_writer.clone());
         let submit_handle = handle.clone();
         let command_submit: CommandSubmit = Arc::new(move |command| {
             match submit_handle.submit_command(command, None) {

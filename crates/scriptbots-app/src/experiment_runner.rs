@@ -585,6 +585,23 @@ impl MatchedSeedExperimentRunner {
         &self,
         state_file: &Path,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        self.execute_batch_until_cancelled(state_file, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// [`Self::execute_batch`] with cooperative cancellation between execution waves.
+    ///
+    /// `cancel` is checked before each wave is admitted. A wave already running
+    /// finishes, so no record is left `Running`; the returned status keeps the
+    /// unadmitted runs `Pending`, and a later call on the same state file resumes them.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::execute_batch`].
+    pub fn execute_batch_until_cancelled(
+        &self,
+        state_file: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
         let plan = self.validated_plan()?;
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         let mut status = self.load_or_create_status_locked(state_file, &plan)?;
@@ -622,6 +639,13 @@ impl MatchedSeedExperimentRunner {
             .collect::<Vec<_>>();
 
         for chunk in pending.chunks(self.max_concurrency) {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                info!(
+                    experiment_id = %self.experiment_id,
+                    "matched-seed batch cancelled before admitting the next wave"
+                );
+                break;
+            }
             for &index in chunk {
                 status.runs[index].state = RunState::Running;
                 info!(
@@ -2085,6 +2109,54 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn cancellation_before_a_wave_leaves_runs_pending_and_resume_completes_them() {
+        let temp_dir = tempfile::tempdir().expect("temporary status directory");
+        let state_file = temp_dir.path().join("status.json");
+        let runner = MatchedSeedExperimentRunner::new(
+            "exp-cancel",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![3, 4],
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+            }],
+            3,
+            1,
+            temp_dir.path().join("bundles"),
+        );
+
+        let cancelled = runner
+            .execute_batch_until_cancelled(&state_file, &std::sync::atomic::AtomicBool::new(true))
+            .expect("a pre-cancelled batch stops cleanly");
+        assert_eq!(cancelled.completed_runs, 0);
+        assert!(!cancelled.is_finished());
+        assert!(
+            cancelled
+                .runs
+                .iter()
+                .all(|run| run.state == RunState::Pending)
+        );
+
+        let resumed = runner
+            .execute_batch(&state_file)
+            .expect("the same state file resumes the pending runs");
+        assert!(resumed.is_finished());
+        assert_eq!(resumed.completed_runs, 2);
+        assert_eq!(resumed.failed_runs, 0);
+        assert!(
+            resumed
+                .runs
+                .iter()
+                .all(|run| run.state == RunState::Completed
+                    && run.total_ticks == 3
+                    && run.final_digest.is_some())
+        );
     }
 
     #[test]

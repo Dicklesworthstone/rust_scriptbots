@@ -952,9 +952,11 @@ fn main() -> Result<()> {
         let (active_mode, renderer) = resolved_renderer.ok_or_else(|| {
             anyhow::anyhow!("interactive renderer was not resolved before startup")
         })?;
-        let control_reservation = control_reservation.ok_or_else(|| {
-            anyhow::anyhow!("control listeners were not reserved before runtime startup")
-        })?;
+        let control_reservation = control_reservation
+            .ok_or_else(|| {
+                anyhow::anyhow!("control listeners were not reserved before runtime startup")
+            })?
+            .with_checkpoint_writer(storage_pipeline.checkpoint_writer());
         let (control_runtime, command_submit) = control_reservation.launch(host_port.clone())?;
         // Retain teardown ownership even if initial resume or renderer startup fails.
         let control_runtime = control_to_close.insert(control_runtime);
