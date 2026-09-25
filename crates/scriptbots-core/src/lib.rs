@@ -16542,9 +16542,11 @@ mod map_sandbox {
         #[error("sample grid dimensions must be non-zero")]
         InvalidSampleDimensions,
         /// The pattern size exceeds sample dimensions or is invalid.
-        #[error("pattern size {pattern_size} exceeds sample dimensions {sample_width}x{sample_height}")]
+        #[error(
+            "pattern size {pattern_size} exceeds sample dimensions {sample_width}x{sample_height}"
+        )]
         PatternSizeExceedsSample {
-            /// Requested pattern dimension (NxN).
+            /// Requested pattern dimension (`NxN`).
             pattern_size: u32,
             /// Exemplar sample width.
             sample_width: u32,
@@ -17167,6 +17169,7 @@ mod map_sandbox {
         /// tileset hash, and generator identity, while explicitly excluding
         /// `generated_at_epoch_ms` so identical inputs reproduce the exact same hash.
         #[must_use]
+        #[allow(clippy::too_many_lines)]
         pub fn scientific_content_hash(&self) -> u64 {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(b"map-artifact-scientific-v1");
@@ -18222,7 +18225,7 @@ mod map_sandbox {
     /// Specification for sample-based (overlapping pattern) procedural map generation.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SamplePatternSpec {
-        /// Versioned stable identifier of the sample (e.g., "archipelago_sample_v1").
+        /// Versioned stable identifier of the sample (e.g., `archipelago_sample_v1`).
         pub sample_id: String,
         /// Width of the exemplar sample grid in cells.
         pub sample_width: u32,
@@ -18230,7 +18233,8 @@ mod map_sandbox {
         pub sample_height: u32,
         /// Pattern extraction kernel size N x N (typically 2 or 3).
         pub pattern_size: u32,
-        /// Flat row-major grid of terrain kinds in the sample. Length must equal sample_width * sample_height.
+        /// Flat row-major grid of terrain kinds in the sample. Length must equal
+        /// `sample_width * sample_height`.
         pub sample_tiles: Vec<TerrainKind>,
         /// Whether to extract patterns under all 8 rotations and reflections.
         #[serde(default = "default_all_orientations")]
@@ -18244,7 +18248,9 @@ mod map_sandbox {
         /// Validate the sample specification parameters and dimension invariants.
         pub fn validate(&self) -> Result<(), MapGenerationError> {
             if self.sample_id.is_empty() {
-                return Err(MapGenerationError::DraftError("sample_id must not be empty".into()));
+                return Err(MapGenerationError::DraftError(
+                    "sample_id must not be empty".into(),
+                ));
             }
             if self.sample_width == 0 || self.sample_height == 0 {
                 return Err(MapGenerationError::InvalidSampleDimensions);
@@ -18354,17 +18360,20 @@ mod map_sandbox {
             let grid = Grid::new_fn(
                 Size::new(self.spec.sample_width, self.spec.sample_height),
                 |coord| {
+                    // grid_2d only yields in-bounds, non-negative coordinates of the sample.
+                    #[allow(clippy::cast_sign_loss)]
                     let idx = (coord.y as usize) * (sample_w as usize) + (coord.x as usize);
                     self.spec.sample_tiles[idx]
                 },
             );
 
-            let pattern_size_nz = NonZeroU32::new(self.spec.pattern_size)
-                .ok_or(MapGenerationError::PatternSizeExceedsSample {
+            let pattern_size_nz = NonZeroU32::new(self.spec.pattern_size).ok_or(
+                MapGenerationError::PatternSizeExceedsSample {
                     pattern_size: self.spec.pattern_size,
                     sample_width: self.spec.sample_width,
                     sample_height: self.spec.sample_height,
-                })?;
+                },
+            )?;
 
             let patterns = if self.spec.all_orientations {
                 OverlappingPatterns::new_all_orientations(grid, pattern_size_nz)
@@ -18378,17 +18387,19 @@ mod map_sandbox {
 
             let budget = self.retry_budget;
             let mut retry = retry::NumTimes(budget);
-            let wave = match retry.retry(runner, &mut rng) {
-                Ok(wave) => wave,
-                Err(_) => {
-                    return Err(MapGenerationError::ContradictionWithDiagnostics {
-                        attempts: budget + 1,
-                        diagnostics: format!(
-                            "sample `{}` (hash: 0x{:016x}, pattern_size: {}) exhausted retry budget ({}) generating {}x{} map; consider adjusting pattern_size or adding transition tiles in exemplar sample",
-                            self.spec.sample_id, self.sample_hash, self.spec.pattern_size, budget, width, height
-                        ),
-                    });
-                }
+            let Ok(wave) = retry.retry(runner, &mut rng) else {
+                return Err(MapGenerationError::ContradictionWithDiagnostics {
+                    attempts: budget + 1,
+                    diagnostics: format!(
+                        "sample `{}` (hash: 0x{:016x}, pattern_size: {}) exhausted retry budget ({}) generating {}x{} map; consider adjusting pattern_size or adding transition tiles in exemplar sample",
+                        self.spec.sample_id,
+                        self.sample_hash,
+                        self.spec.pattern_size,
+                        budget,
+                        width,
+                        height
+                    ),
+                });
             };
 
             let attempts_spent = budget - retry.0;
@@ -18400,15 +18411,15 @@ mod map_sandbox {
             let mut hydrology_tiles = Vec::with_capacity(tile_capacity);
 
             for (coord, cell) in wave.grid().enumerate() {
-                let pattern_id = cell
-                    .chosen_pattern_id()
-                    .map_err(|_| MapGenerationError::ContradictionWithDiagnostics {
+                let pattern_id = cell.chosen_pattern_id().map_err(|_| {
+                    MapGenerationError::ContradictionWithDiagnostics {
                         attempts: success_attempt,
                         diagnostics: format!(
                             "cell at ({}, {}) in wave uncollapsed on attempt {}",
                             coord.x, coord.y, success_attempt
                         ),
-                    })?;
+                    }
+                })?;
                 let kind = *patterns.pattern_top_left_value(pattern_id);
                 let accent_noise = coordinate_noise(seed, coord);
                 let accent = (0.5 + accent_noise * 0.35).clamp(0.0, 1.0);
@@ -18529,12 +18540,12 @@ mod map_sandbox {
                 ("channel_priority", self.channel_priority),
                 ("swim_cost", self.swim_cost),
             ] {
-                if let Some(v) = val {
-                    if !v.is_finite() {
-                        return Err(MapGenerationError::DraftError(format!(
-                            "constraint field `{field}` must be finite, got {v}"
-                        )));
-                    }
+                if let Some(v) = val
+                    && !v.is_finite()
+                {
+                    return Err(MapGenerationError::DraftError(format!(
+                        "constraint field `{field}` must be finite, got {v}"
+                    )));
                 }
             }
             Ok(())
@@ -18560,7 +18571,8 @@ mod map_sandbox {
         /// Paint or overwrite a constraint at its specified coordinates.
         pub fn paint(&mut self, constraint: PaintedConstraint) -> Result<(), MapGenerationError> {
             constraint.validate()?;
-            self.constraints.insert((constraint.x, constraint.y), constraint);
+            self.constraints
+                .insert((constraint.x, constraint.y), constraint);
             Ok(())
         }
 
@@ -18679,8 +18691,10 @@ mod map_sandbox {
                 }
             }
 
-            let new_terrain = TerrainLayer::from_tiles(width, height, cell_size, tiles)
-                .map_err(|e| MapGenerationError::DraftError(format!("terrain rebuild error: {e}")))?;
+            let new_terrain =
+                TerrainLayer::from_tiles(width, height, cell_size, tiles).map_err(|e| {
+                    MapGenerationError::DraftError(format!("terrain rebuild error: {e}"))
+                })?;
 
             let new_fertility = fertility
                 .map(|f| ScalarField::new(width, height, f))
@@ -18691,7 +18705,8 @@ mod map_sandbox {
 
             let (new_hydro_tiles, new_hydro_field) = if let Some(ht) = hydrology_tiles {
                 let hydro_layer = HydrologyTileLayer::new(width, height, ht)?;
-                let hydro_field = compute_hydrology_field(width, height, &new_terrain, &hydro_layer)?;
+                let hydro_field =
+                    compute_hydrology_field(width, height, &new_terrain, &hydro_layer)?;
                 (Some(hydro_layer), Some(hydro_field))
             } else {
                 (None, None)
@@ -18759,7 +18774,7 @@ mod map_sandbox {
     /// Interactive map editor draft with bounded undo/redo history.
     ///
     /// Edits and undo/redo operations on a draft mutate only the draft session.
-    /// They NEVER mutate WorldState or advance simulation science.
+    /// They NEVER mutate `WorldState` or advance simulation science.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct MapEditorDraft {
         /// Unique identifier for this draft session.
@@ -18914,13 +18929,13 @@ mod map_sandbox {
 
         /// Whether an undo operation is currently available.
         #[must_use]
-        pub fn can_undo(&self) -> bool {
+        pub const fn can_undo(&self) -> bool {
             !self.undo_stack.is_empty()
         }
 
         /// Whether a redo operation is currently available.
         #[must_use]
-        pub fn can_redo(&self) -> bool {
+        pub const fn can_redo(&self) -> bool {
             !self.redo_stack.is_empty()
         }
 
@@ -18949,9 +18964,7 @@ mod map_sandbox {
                     )?
                 }
             };
-            self.state
-                .constraints
-                .apply_to_artifact(&mut artifact)?;
+            self.state.constraints.apply_to_artifact(&mut artifact)?;
             Ok(artifact)
         }
 
@@ -19826,17 +19839,23 @@ mod map_sandbox {
         #[test]
         fn sample_pattern_spec_validation_and_deterministic_hash() {
             let sample = SamplePatternSpec {
-                id: "sample_spec_1".into(),
-                width: 3,
-                height: 3,
+                sample_id: "sample_spec_1".into(),
+                sample_width: 3,
+                sample_height: 3,
                 pattern_size: 2,
-                periodic: true,
-                tiles: vec![
-                    TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Dirt,
-                    TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Dirt,
-                    TerrainKind::Dirt,  TerrainKind::Dirt,  TerrainKind::Rock,
+                sample_tiles: vec![
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Sand,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Sand,
+                    TerrainKind::Sand,
+                    TerrainKind::Sand,
+                    TerrainKind::Rock,
                 ],
-                palette: None,
+                all_orientations: false,
+                periodic: true,
             };
             sample.validate().expect("valid sample");
             let hash1 = compute_sample_hash(&sample);
@@ -19845,7 +19864,7 @@ mod map_sandbox {
 
             // Invalid dimensions
             let mut bad_dim = sample.clone();
-            bad_dim.width = 0;
+            bad_dim.sample_width = 0;
             assert!(matches!(
                 bad_dim.validate().unwrap_err(),
                 MapGenerationError::InvalidSampleDimensions
@@ -19860,8 +19879,8 @@ mod map_sandbox {
             ));
 
             // Tile count mismatch
-            let mut bad_count = sample.clone();
-            bad_count.tiles.pop();
+            let mut bad_count = sample;
+            bad_count.sample_tiles.pop();
             assert!(matches!(
                 bad_count.validate().unwrap_err(),
                 MapGenerationError::SampleTileCountMismatch { .. }
@@ -19871,22 +19890,38 @@ mod map_sandbox {
         #[test]
         fn sample_based_map_generator_generates_and_reproduces() {
             let sample = SamplePatternSpec {
-                id: "sample_spec_2".into(),
-                width: 4,
-                height: 4,
+                sample_id: "sample_spec_2".into(),
+                sample_width: 4,
+                sample_height: 4,
                 pattern_size: 2,
-                periodic: true,
-                tiles: vec![
-                    TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Dirt, TerrainKind::Dirt,
-                    TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Dirt, TerrainKind::Dirt,
-                    TerrainKind::Dirt,  TerrainKind::Dirt,  TerrainKind::Rock, TerrainKind::Rock,
-                    TerrainKind::Dirt,  TerrainKind::Dirt,  TerrainKind::Rock, TerrainKind::Rock,
+                sample_tiles: vec![
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Sand,
+                    TerrainKind::Sand,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Sand,
+                    TerrainKind::Sand,
+                    TerrainKind::Sand,
+                    TerrainKind::Sand,
+                    TerrainKind::Rock,
+                    TerrainKind::Rock,
+                    TerrainKind::Sand,
+                    TerrainKind::Sand,
+                    TerrainKind::Rock,
+                    TerrainKind::Rock,
                 ],
-                palette: None,
+                all_orientations: false,
+                periodic: true,
             };
             let generator = SampleBasedMapGenerator::new(sample).expect("compile sample generator");
-            let artifact1 = generator.generate(8, 8, 16, 42).expect("generate sample map 1");
-            let artifact2 = generator.generate(8, 8, 16, 42).expect("generate sample map 2 (same seed)");
+            let artifact1 = generator
+                .generate(8, 8, 16, 42)
+                .expect("generate sample map 1");
+            let artifact2 = generator
+                .generate(8, 8, 16, 42)
+                .expect("generate sample map 2 (same seed)");
             assert_eq!(
                 artifact1.scientific_content_hash(),
                 artifact2.scientific_content_hash(),
@@ -19899,21 +19934,35 @@ mod map_sandbox {
         #[test]
         fn constraint_layer_painting_and_application() {
             let sample = SamplePatternSpec {
-                id: "sample_spec_paint".into(),
-                width: 4,
-                height: 4,
+                sample_id: "sample_spec_paint".into(),
+                sample_width: 4,
+                sample_height: 4,
                 pattern_size: 2,
+                all_orientations: false,
                 periodic: true,
-                tiles: vec![
-                    TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Grass,
-                    TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Grass,
-                    TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Grass,
-                    TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Grass,
+                sample_tiles: vec![
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
+                    TerrainKind::Grass,
                 ],
-                palette: None,
             };
             let generator = SampleBasedMapGenerator::new(sample).expect("compile generator");
-            let mut artifact = generator.generate(8, 8, 16, 100).expect("generate artifact");
+            let mut artifact = generator
+                .generate(8, 8, 16, 100)
+                .expect("generate artifact");
 
             let mut layer = ConstraintLayer::new();
             let paint = PaintedConstraint {
@@ -19934,7 +19983,9 @@ mod map_sandbox {
             layer.paint(paint).expect("valid paint");
             assert_eq!(layer.constraints.len(), 1);
 
-            layer.apply_to_artifact(&mut artifact).expect("apply constraints");
+            layer
+                .apply_to_artifact(&mut artifact)
+                .expect("apply constraints");
 
             let tile = artifact.terrain().tile(2, 3).expect("tile (2, 3)");
             assert_eq!(tile.kind, TerrainKind::DeepWater);
@@ -19942,24 +19993,31 @@ mod map_sandbox {
             assert_eq!(tile.moisture, 0.95);
 
             // Bounds validation
-            layer.paint(PaintedConstraint {
-                x: 20,
-                y: 3,
-                terrain_kind: None,
-                elevation: None,
-                moisture: None,
-                fertility_bias: None,
-                temperature_bias: None,
-                permeability: None,
-                runoff_bias: None,
-                basin_rank: None,
-                channel_priority: None,
-                swim_cost: None,
-                hazard: None,
-            }).expect("paint bounds");
+            layer
+                .paint(PaintedConstraint {
+                    x: 20,
+                    y: 3,
+                    terrain_kind: None,
+                    elevation: None,
+                    moisture: None,
+                    fertility_bias: None,
+                    temperature_bias: None,
+                    permeability: None,
+                    runoff_bias: None,
+                    basin_rank: None,
+                    channel_priority: None,
+                    swim_cost: None,
+                    hazard: None,
+                })
+                .expect("paint bounds");
             assert!(matches!(
                 layer.validate_bounds(8, 8).unwrap_err(),
-                MapGenerationError::ConstraintOutOfBounds { x: 20, y: 3, width: 8, height: 8 }
+                MapGenerationError::ConstraintOutOfBounds {
+                    x: 20,
+                    y: 3,
+                    width: 8,
+                    height: 8
+                }
             ));
         }
 
@@ -19979,41 +20037,45 @@ mod map_sandbox {
             assert!(!draft.can_redo());
 
             // Edit 1: paint constraint at (1, 1)
-            draft.paint_constraint(PaintedConstraint {
-                x: 1,
-                y: 1,
-                terrain_kind: Some(TerrainKind::Sand),
-                elevation: None,
-                moisture: None,
-                fertility_bias: None,
-                temperature_bias: None,
-                permeability: None,
-                runoff_bias: None,
-                basin_rank: None,
-                channel_priority: None,
-                swim_cost: None,
-                hazard: None,
-            }).expect("paint (1, 1)");
+            draft
+                .paint_constraint(PaintedConstraint {
+                    x: 1,
+                    y: 1,
+                    terrain_kind: Some(TerrainKind::Sand),
+                    elevation: None,
+                    moisture: None,
+                    fertility_bias: None,
+                    temperature_bias: None,
+                    permeability: None,
+                    runoff_bias: None,
+                    basin_rank: None,
+                    channel_priority: None,
+                    swim_cost: None,
+                    hazard: None,
+                })
+                .expect("paint (1, 1)");
             assert!(draft.can_undo());
             assert!(!draft.can_redo());
             assert_eq!(draft.state.constraints.constraints.len(), 1);
 
             // Edit 2: paint constraint at (2, 2)
-            draft.paint_constraint(PaintedConstraint {
-                x: 2,
-                y: 2,
-                terrain_kind: Some(TerrainKind::Rock),
-                elevation: None,
-                moisture: None,
-                fertility_bias: None,
-                temperature_bias: None,
-                permeability: None,
-                runoff_bias: None,
-                basin_rank: None,
-                channel_priority: None,
-                swim_cost: None,
-                hazard: None,
-            }).expect("paint (2, 2)");
+            draft
+                .paint_constraint(PaintedConstraint {
+                    x: 2,
+                    y: 2,
+                    terrain_kind: Some(TerrainKind::Rock),
+                    elevation: None,
+                    moisture: None,
+                    fertility_bias: None,
+                    temperature_bias: None,
+                    permeability: None,
+                    runoff_bias: None,
+                    basin_rank: None,
+                    channel_priority: None,
+                    swim_cost: None,
+                    hazard: None,
+                })
+                .expect("paint (2, 2)");
             assert_eq!(draft.state.constraints.constraints.len(), 2);
 
             // Edit 3: change seed (exceeds max_history=2, pushing out Edit 1 from undo stack)
@@ -20037,9 +20099,17 @@ mod map_sandbox {
             assert_eq!(draft.state.constraints.constraints.len(), 2);
 
             // Generate artifact from draft
-            let artifact = draft.generate_artifact().expect("generate artifact from draft");
-            assert_eq!(artifact.terrain().tile(1, 1).unwrap().kind, TerrainKind::Sand);
-            assert_eq!(artifact.terrain().tile(2, 2).unwrap().kind, TerrainKind::Rock);
+            let artifact = draft
+                .generate_artifact()
+                .expect("generate artifact from draft");
+            assert_eq!(
+                artifact.terrain().tile(1, 1).unwrap().kind,
+                TerrainKind::Sand
+            );
+            assert_eq!(
+                artifact.terrain().tile(2, 2).unwrap().kind,
+                TerrainKind::Rock
+            );
         }
 
         #[test]
@@ -20058,26 +20128,30 @@ mod map_sandbox {
         fn existing_agent_policy_application() {
             let spec = default_tileset_spec();
             let generator = RuleBasedMapGenerator::new(spec).expect("compile tileset");
-            let mut artifact = generator.generate(8, 8, 16, 123).expect("generate map artifact");
+            let mut artifact = generator
+                .generate(8, 8, 16, 123)
+                .expect("generate map artifact");
 
             // Paint deep water across row y=1
             for x in 0..8 {
                 let mut layer = ConstraintLayer::new();
-                layer.paint(PaintedConstraint {
-                    x,
-                    y: 1,
-                    terrain_kind: Some(TerrainKind::DeepWater),
-                    elevation: Some(0.0),
-                    moisture: Some(1.0),
-                    fertility_bias: None,
-                    temperature_bias: None,
-                    permeability: None,
-                    runoff_bias: None,
-                    basin_rank: None,
-                    channel_priority: None,
-                    swim_cost: None,
-                    hazard: None,
-                }).expect("paint");
+                layer
+                    .paint(PaintedConstraint {
+                        x,
+                        y: 1,
+                        terrain_kind: Some(TerrainKind::DeepWater),
+                        elevation: Some(0.0),
+                        moisture: Some(1.0),
+                        fertility_bias: None,
+                        temperature_bias: None,
+                        permeability: None,
+                        runoff_bias: None,
+                        basin_rank: None,
+                        channel_priority: None,
+                        swim_cost: None,
+                        hazard: None,
+                    })
+                    .expect("paint");
                 layer.apply_to_artifact(&mut artifact).expect("apply");
             }
 
@@ -20090,7 +20164,8 @@ mod map_sandbox {
                 population_minimum: 0,
                 population_spawn_interval: 0,
                 ..super::super::ScriptBotsConfig::default()
-            }).expect("world");
+            })
+            .expect("world");
 
             let agent_data = super::super::AgentData {
                 position: super::super::Position::new(24.0, 24.0),
@@ -20103,31 +20178,51 @@ mod map_sandbox {
                 age: 0,
                 generation: super::super::Generation(1),
             };
-            let agent_id = world.try_spawn_agent(agent_data).expect("spawn agent on cell 1,1");
+            let agent_id = world
+                .try_spawn_agent(agent_data)
+                .expect("spawn agent on cell 1,1");
             assert_eq!(world.agents().len(), 1);
 
             // Test 1: Retain policy keeps agent at (24, 24)
-            world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::Retain).expect("apply Retain");
+            world
+                .apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::Retain)
+                .expect("apply Retain");
             assert_eq!(world.agents().len(), 1);
-            let agent = world.agents().get(agent_id).expect("agent exists");
+            let agent = world.agents().snapshot(agent_id).expect("agent exists");
             assert_eq!(agent.position.x, 24.0);
             assert_eq!(agent.position.y, 24.0);
 
             // Test 2: RepositionToSafeTile moves agent off deep water to safe tile
-            world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::RepositionToSafeTile).expect("apply Reposition");
+            world
+                .apply_map_artifact_with_policy(
+                    &artifact,
+                    ExistingAgentPolicy::RepositionToSafeTile,
+                )
+                .expect("apply Reposition");
             assert_eq!(world.agents().len(), 1);
-            let agent = world.agents().get(agent_id).expect("agent exists");
-            let cell_y = (agent.position.y / 16.0) as u32;
-            assert_ne!(cell_y, 1, "agent must have been moved off deep water row y=1");
+            let agent = world.agents().snapshot(agent_id).expect("agent exists");
+            assert!(
+                !(16.0..32.0).contains(&agent.position.y),
+                "agent must have been moved off deep water row y=1, now at y={}",
+                agent.position.y
+            );
 
             // Test 3: CullIncompatible culls agent if they are on deep water
             // First move agent back to deep water (24.0, 24.0)
-            if let Some(agent_mut) = world.agents_mut().get_mut(agent_id) {
-                agent_mut.position.x = 24.0;
-                agent_mut.position.y = 24.0;
-            }
-            world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible).expect("apply Cull");
-            assert_eq!(world.agents().len(), 0, "agent on deep water must be culled under CullIncompatible");
+            let index = world
+                .agents
+                .index_of(agent_id)
+                .expect("agent still present");
+            world.agents.columns_mut().positions_mut()[index] =
+                super::super::Position::new(24.0, 24.0);
+            world
+                .apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible)
+                .expect("apply Cull");
+            assert_eq!(
+                world.agents().len(),
+                0,
+                "agent on deep water must be culled under CullIncompatible"
+            );
         }
     }
 }
@@ -31309,6 +31404,12 @@ impl WorldState {
         let world_w = self.config.world_width as f32;
         let world_h = self.config.world_height as f32;
         let cell_sz = self.config.food_cell_size as f32;
+        // Callers pass rem_euclid-normalised coordinates in [0, world), so the floored
+        // quotient is non-negative; it is clamped to the last cell of the axis.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cell_of = |coord: f32, cells: u32| {
+            ((coord / cell_sz).floor() as u32).min(cells.saturating_sub(1))
+        };
 
         match policy {
             ExistingAgentPolicy::Retain => {
@@ -31323,34 +31424,35 @@ impl WorldState {
                 for pos in columns.positions_mut() {
                     pos.x = pos.x.rem_euclid(world_w);
                     pos.y = pos.y.rem_euclid(world_h);
-                    let cell_x = ((pos.x / cell_sz).floor() as u32)
-                        .min(candidate_terrain.width().saturating_sub(1));
-                    let cell_y = ((pos.y / cell_sz).floor() as u32)
-                        .min(candidate_terrain.height().saturating_sub(1));
-                    if let Some(tile) = candidate_terrain.tile(cell_x, cell_y) {
-                        if tile.kind == TerrainKind::DeepWater {
-                            let mut best_dist_sq = f32::MAX;
-                            let mut best_target = *pos;
-                            for ty in 0..candidate_terrain.height() {
-                                for tx in 0..candidate_terrain.width() {
-                                    if let Some(target_tile) = candidate_terrain.tile(tx, ty) {
-                                        if target_tile.kind != TerrainKind::DeepWater {
-                                            let center_x = (tx as f32 + 0.5) * cell_sz;
-                                            let center_y = (ty as f32 + 0.5) * cell_sz;
-                                            let dx = center_x - pos.x;
-                                            let dy = center_y - pos.y;
-                                            let dist_sq = dx * dx + dy * dy;
-                                            if dist_sq < best_dist_sq {
-                                                best_dist_sq = dist_sq;
-                                                best_target = Position::new(center_x, center_y);
-                                            }
-                                        }
+                    let cell_x = cell_of(pos.x, candidate_terrain.width());
+                    let cell_y = cell_of(pos.y, candidate_terrain.height());
+                    if let Some(tile) = candidate_terrain.tile(cell_x, cell_y)
+                        && tile.kind == TerrainKind::DeepWater
+                    {
+                        let mut best_dist_sq = f32::MAX;
+                        let mut best_target = *pos;
+                        for ty in 0..candidate_terrain.height() {
+                            for tx in 0..candidate_terrain.width() {
+                                if let Some(target_tile) = candidate_terrain.tile(tx, ty)
+                                    && target_tile.kind != TerrainKind::DeepWater
+                                {
+                                    let center_x = (tx as f32 + 0.5) * cell_sz;
+                                    let center_y = (ty as f32 + 0.5) * cell_sz;
+                                    let dx = center_x - pos.x;
+                                    let dy = center_y - pos.y;
+                                    // Keep the separate multiply-add: mul_add would change
+                                    // the scientific result of which tile is nearest.
+                                    #[allow(clippy::suboptimal_flops)]
+                                    let dist_sq = dx * dx + dy * dy;
+                                    if dist_sq < best_dist_sq {
+                                        best_dist_sq = dist_sq;
+                                        best_target = Position::new(center_x, center_y);
                                     }
                                 }
                             }
-                            if best_dist_sq < f32::MAX {
-                                *pos = best_target;
-                            }
+                        }
+                        if best_dist_sq < f32::MAX {
+                            *pos = best_target;
                         }
                     }
                 }
@@ -31360,14 +31462,12 @@ impl WorldState {
                 let positions = self.agents.columns().positions().to_vec();
                 let mut dead_ids = std::collections::HashSet::new();
                 for (id, pos) in handles.into_iter().zip(positions) {
-                    let cell_x = ((pos.x.rem_euclid(world_w) / cell_sz).floor() as u32)
-                        .min(candidate_terrain.width().saturating_sub(1));
-                    let cell_y = ((pos.y.rem_euclid(world_h) / cell_sz).floor() as u32)
-                        .min(candidate_terrain.height().saturating_sub(1));
-                    if let Some(tile) = candidate_terrain.tile(cell_x, cell_y) {
-                        if tile.kind == TerrainKind::DeepWater {
-                            dead_ids.insert(id);
-                        }
+                    let cell_x = cell_of(pos.x.rem_euclid(world_w), candidate_terrain.width());
+                    let cell_y = cell_of(pos.y.rem_euclid(world_h), candidate_terrain.height());
+                    if let Some(tile) = candidate_terrain.tile(cell_x, cell_y)
+                        && tile.kind == TerrainKind::DeepWater
+                    {
+                        dead_ids.insert(id);
                     }
                 }
                 if !dead_ids.is_empty() {
