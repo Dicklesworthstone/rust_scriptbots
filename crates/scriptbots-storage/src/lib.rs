@@ -16551,7 +16551,11 @@ impl Storage {
             .transpose()
     }
 
-    fn validate_new_birth_identities(&self, prepared: &StorageBuffer) -> Result<(), StorageError> {
+    fn validate_new_birth_identities(
+        &self,
+        reader: &impl RowReader,
+        prepared: &StorageBuffer,
+    ) -> Result<(), StorageError> {
         if prepared.births.is_empty() {
             return Ok(());
         }
@@ -16609,7 +16613,7 @@ impl Storage {
                 });
             }
 
-            let existing = self.connection()?.query_with_params(
+            let existing = reader.read_rows(
                 "SELECT agent_uid, spawn_ordinal, birth_ordinal
                  FROM births
                  WHERE run_id = ?1
@@ -16683,7 +16687,11 @@ impl Storage {
         Ok(())
     }
 
-    fn validate_new_death_uids(&self, prepared: &StorageBuffer) -> Result<(), StorageError> {
+    fn validate_new_death_uids(
+        &self,
+        reader: &impl RowReader,
+        prepared: &StorageBuffer,
+    ) -> Result<(), StorageError> {
         if prepared.deaths.is_empty() {
             return Ok(());
         }
@@ -16704,7 +16712,7 @@ impl Storage {
                     ),
                 });
             }
-            let existing = self.connection()?.query_with_params(
+            let existing = reader.read_rows(
                 "SELECT agent_uid, tick
                  FROM deaths
                  WHERE run_id = ?1 AND island_id = ?2 AND agent_uid = ?3
@@ -16744,6 +16752,7 @@ impl Storage {
 
     fn validate_new_ancestry_relationships(
         &self,
+        reader: &impl RowReader,
         prepared: &StorageBuffer,
     ) -> Result<(), StorageError> {
         if prepared.births.is_empty() && prepared.deaths.is_empty() {
@@ -16816,7 +16825,7 @@ impl Storage {
             else {
                 continue;
             };
-            let existing = self.connection()?.query_with_params(
+            let existing = reader.read_rows(
                 "SELECT agent_uid, tick
                  FROM births
                  WHERE run_id = ?1 AND island_id = ?2 AND agent_uid = ?3
@@ -16901,17 +16910,25 @@ impl Storage {
         Ok(())
     }
 
-    fn validate_new_lifecycle_identities(
-        &self,
-        prepared: &StorageBuffer,
-    ) -> Result<(), StorageError> {
-        self.validate_new_birth_identities(prepared)?;
-        self.validate_new_death_uids(prepared)?;
-        self.validate_new_ancestry_relationships(prepared)
+    /// Lifecycle and run-event identity checks for a batch about to be admitted.
+    ///
+    /// They issue one lookup per birth, death, referenced parent and run event. Each runs on
+    /// a single transaction snapshot that is rolled back afterwards, so the batch pays one
+    /// committed-state refresh instead of one per lookup (see `RowReader`, bd-w1oi).
+    fn validate_new_batch_identities(&self, prepared: &StorageBuffer) -> Result<(), StorageError> {
+        let mut snapshot = self.connection()?.transaction()?;
+        let result = self
+            .validate_new_birth_identities(&snapshot, prepared)
+            .and_then(|()| self.validate_new_death_uids(&snapshot, prepared))
+            .and_then(|()| self.validate_new_ancestry_relationships(&snapshot, prepared))
+            .and_then(|()| self.validate_new_run_event_identities(&snapshot, prepared));
+        snapshot.rollback()?;
+        result
     }
 
     fn validate_new_run_event_identities(
         &self,
+        reader: &impl RowReader,
         prepared: &StorageBuffer,
     ) -> Result<(), StorageError> {
         if prepared.run_events.is_empty() {
@@ -16924,7 +16941,7 @@ impl Storage {
                 return Err(run_event_identity_collision(identity, existing, &candidate));
             }
 
-            let rows = self.connection()?.query_with_params(
+            let rows = reader.read_rows(
                 "SELECT tick, kind, severity, magnitude, window_start, window_end,
                         metric, before_value, after_value, score, subject_ref, human_text,
                         schema_version, island_id
@@ -19563,8 +19580,7 @@ impl Storage {
         }
 
         let batch_id = PersistenceBatchId::new(self.next_batch_id)?;
-        self.validate_new_lifecycle_identities(prepared)?;
-        self.validate_new_run_event_identities(prepared)?;
+        self.validate_new_batch_identities(prepared)?;
         self.validate_new_narrative_input_identities(prepared, batch_id, tick)?;
         let expected_previous = batch_id.as_i64() - 1;
         if before.admitted_raw() != expected_previous {
@@ -19753,8 +19769,7 @@ impl Storage {
                 batch.storage.ticks.last().map(|row| row.tick as u64),
                 Some(batch.tick)
             );
-            self.validate_new_lifecycle_identities(&batch.storage)?;
-            self.validate_new_run_event_identities(&batch.storage)?;
+            self.validate_new_batch_identities(&batch.storage)?;
             self.validate_new_narrative_input_identities(
                 &batch.storage,
                 batch.batch_id,
