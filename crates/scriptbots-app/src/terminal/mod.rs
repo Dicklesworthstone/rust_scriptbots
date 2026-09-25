@@ -1021,35 +1021,20 @@ impl<'a> TerminalApp<'a> {
         terminal_runtime_finished(&snapshot, || self.ensure_control_runtime_running())
     }
 
+    /// Submit one simulation command to the owner exactly once.
+    ///
+    /// `command_submit` is itself a complete host submission (the control runtime's
+    /// `ControlHandle`). A second `HostClient` envelope used to follow it, so every
+    /// palette spawn, speed change or pause reached the owner twice.
     fn submit_simulation_command(&mut self, command: ControlCommand) {
-        if (self.command_submit.as_ref())(command.clone()).is_none() {
-            warn!("terminal renderer failed to enqueue simulation command");
-            if let Ok(Some(snapshot)) = self.client.latest_snapshot() {
-                self.paused = snapshot.playback.paused;
-                self.speed_multiplier = snapshot.playback.speed_multiplier;
-            }
-            return;
-        }
-
-        let Ok(envelope) = self.prepare_envelope(command, None) else {
-            warn!("terminal renderer failed to prepare envelope for simulation command");
-            return;
-        };
-        let command_id = envelope.command_id;
-        match self.submit_envelope(envelope) {
-            Ok(status)
-                if matches!(
-                    status.application(),
-                    ApplicationState::Admitted | ApplicationState::Applied(_)
-                ) =>
-            {
-                debug!(%command_id, "simulation command enqueued via HostClient");
-            }
-            Ok(status) => {
-                warn!(%command_id, status = ?status.application(), "terminal simulation command was not admitted");
-            }
-            Err(error) => {
-                warn!(%command_id, %error, "terminal failed to submit simulation command via HostClient");
+        match (self.command_submit.as_ref())(command) {
+            Some(receipt) => debug!(%receipt, "simulation command submitted to the owner"),
+            None => {
+                warn!("terminal renderer failed to enqueue simulation command");
+                if let Ok(Some(snapshot)) = self.client.latest_snapshot() {
+                    self.paused = snapshot.playback.paused;
+                    self.speed_multiplier = snapshot.playback.speed_multiplier;
+                }
             }
         }
     }
@@ -1066,28 +1051,12 @@ impl<'a> TerminalApp<'a> {
             }),
             step_once: false,
         });
-        if (self.command_submit.as_ref())(command.clone()).is_none() {
+        // One submission only; see `submit_simulation_command`.
+        if let Some(receipt) = (self.command_submit.as_ref())(command) {
+            debug!(%receipt, "playback request submitted to the owner");
+            self.push_toast(format!("{action} request submitted"));
+        } else {
             self.push_toast(format!("{action} request not submitted"));
-            return;
-        }
-        let Ok(envelope) = self.prepare_envelope(command, None) else {
-            self.push_toast(format!("{action} request not submitted"));
-            return;
-        };
-        let command_id = envelope.command_id;
-        match self.submit_envelope(envelope) {
-            Ok(status)
-                if matches!(
-                    status.application(),
-                    ApplicationState::Admitted | ApplicationState::Applied(_)
-                ) =>
-            {
-                debug!(%command_id, "playback request enqueued via HostClient");
-                self.push_toast(format!("{action} request submitted"));
-            }
-            _ => {
-                self.push_toast(format!("{action} request not submitted"));
-            }
         }
     }
 
@@ -18512,6 +18481,36 @@ mod tests {
         assert!(
             matched_cat.len() >= 3,
             "category query 'science' must match science items"
+        );
+    }
+
+    #[test]
+    fn palette_spawn_reaches_the_owner_exactly_once() {
+        // An empty world with automatic spawning off, so the owner's population
+        // counts only what the palette action submitted.
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let world = WorldState::new(config).expect("world");
+        let world = Arc::new(std::sync::Mutex::new(world));
+        let host = TerminalTestHost::take(world);
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let ctx = host.context(&runtime);
+        let mut app = TerminalApp::new(&renderer, ctx);
+        assert_eq!(app.host.snapshot_hub().latest().world.agents.len(), 0);
+
+        app.execute_palette_action(CommandPaletteAction::SpawnHerbivore);
+        // Commands apply in admission order, so the barrier step observes the spawn.
+        app.submit_and_wait(ControlCommand::Step)
+            .expect("step real host");
+        app.refresh_snapshot();
+        assert_eq!(
+            app.host.snapshot_hub().latest().world.agents.len(),
+            1,
+            "one palette spawn must add exactly one agent"
         );
     }
 
