@@ -535,6 +535,11 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 9. History and persistence projection (batched to the bounded FrankenSQLite worker)
 10. Preserve the final persistence tail and reset transient runtime flags
 
+### Legacy parity (what matches the C++ original and what does not)
+- **Transcribed from the C++:** the exact two-rotation locomotion (the default model), the 25-input sensor layout (four eyes, smell, sound, hearing, blood, clocks, temperature), carcass sharing (spiked kills only, maturity multiplier, `numaround^1.25` split) and the temperature-discomfort formula.
+- **Deliberately different:** combat runs every tick with reach `spike radius + spike length`, multiplicative damage bonuses and partial spike retraction, where the C++ checks every second tick for `d < 2r` within π/8 and snaps the spike to zero; health and energy are separate budgets; reproduction may take a partner (with probability `partner_chance`, the oldest other agent) and yields one child, where the C++ is asexual with `BABIES=2`; the population floor defaults to `population_minimum = 0` instead of topping up to `NUMBOTS=70`.
+- There is no C++ oracle harness yet, so parity beyond the transcribed pieces is not measured.
+
 ### Design principles & determinism
 - **No undefined behavior**: workspace lints flag `unsafe`; the remaining platform/environment boundary blocks are explicit and reviewable.
 - **Explicit order of effects**: floating-point reductions and removals are staged. Before each successful tick, the dense SoA is normalized to ascending stable `AgentUid`; stable compaction and monotonic insertion preserve that order through death and spawn commits. Physical slot allocation therefore cannot choose reduction, neighbor, parent, or child priority.
