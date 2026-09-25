@@ -269,6 +269,53 @@ impl<'a> Transaction<'a> {
     }
 }
 
+/// Parameterized row reads from either an autocommit connection or an open transaction.
+///
+/// An autocommit read makes fsqlite refresh its committed pager state first, including a
+/// BLAKE3 digest over the WAL frames; a read inside an open transaction reuses that
+/// transaction's snapshot. Measured on this host in file mode: 0.39-0.44 ms against
+/// 0.015-0.023 ms per point read (bd-w1oi). Journal precondition reads therefore run inside
+/// the transaction whose writes depend on them.
+trait RowReader {
+    fn read_rows(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, FrankenError>;
+}
+
+impl RowReader for Connection {
+    fn read_rows(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, FrankenError> {
+        self.query_with_params(sql, params)
+    }
+}
+
+impl RowReader for Transaction<'_> {
+    fn read_rows(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, FrankenError> {
+        self.query_with_params(sql, params)
+    }
+}
+
+/// The rowid of the single row `sql` selects, or `None` when it selects none.
+///
+/// fsqlite 0.4.0 executes an UPDATE whose WHERE names a composite primary key as a full
+/// table scan, while a SELECT with the same WHERE uses the key index. Measured on this host
+/// in file mode with small rows: 1.4 ms at 1,600 rows and 13.7 ms at 19,200, against a flat
+/// 0.4-1.1 ms when the row is first resolved to its rowid (bd-w1oi). The per-tick ledger
+/// tables gain a row every tick, so their UPDATEs resolve the rowid here and then keep the
+/// full key and guard predicates next to `rowid = ?`, matching exactly the rows they did.
+/// A `None` rowid binds NULL, which matches nothing, as the keyed UPDATE would have.
+fn rowid_of(
+    reader: &impl RowReader,
+    sql: &str,
+    params: &[SqliteValue],
+) -> Result<Option<i64>, FrankenError> {
+    match reader.read_rows(sql, params)?.as_slice() {
+        [] => Ok(None),
+        [row] => row.get_typed::<i64>(0).map(Some),
+        rows => Err(FrankenError::Internal(format!(
+            "rowid lookup matched {} rows; a primary-key lookup matches at most one",
+            rows.len()
+        ))),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MigrationRunner {
     inner: AsyncMigrationRunner,
@@ -17469,10 +17516,11 @@ impl Storage {
     }
 
     fn load_host_journal_progress(
-        &self,
+        reader: &impl RowReader,
+        run_id: RunId,
         session_id: HostSessionId,
     ) -> Result<Option<HostJournalProgress>, StorageError> {
-        let rows = self.connection()?.query_with_params(
+        let rows = reader.read_rows(
             "SELECT admitted_journal_prefix, applied_journal_prefix,
                     committed_volatile_journal_prefix, durable_journal_prefix,
                     admitted_event_prefix, applied_event_prefix,
@@ -17481,7 +17529,7 @@ impl Storage {
              FROM host_journal_progress
              WHERE run_id = ?1 AND host_session_id = ?2",
             &[
-                sqlite_run_id(self.run_id),
+                sqlite_run_id(run_id),
                 encode_journal_u64(session_id.get()).as_str().into(),
             ],
         )?;
@@ -17492,7 +17540,7 @@ impl Storage {
                 context: "host_journal_progress.host_session_id",
                 reason: format!(
                     "run {} session {} has {} progress rows",
-                    self.run_id,
+                    run_id,
                     session_id.get(),
                     rows.len()
                 ),
@@ -17501,7 +17549,9 @@ impl Storage {
     }
 
     fn register_host_journal_session(&self, session_id: HostSessionId) -> Result<(), StorageError> {
-        if let Some(progress) = self.load_host_journal_progress(session_id)? {
+        if let Some(progress) =
+            Self::load_host_journal_progress(self.connection()?, self.run_id, session_id)?
+        {
             if progress.admitted_journal == 0
                 && progress.applied_journal == 0
                 && progress.committed_volatile_journal == 0
@@ -17971,11 +18021,12 @@ impl Storage {
         }
 
         let progress =
-            self.load_host_journal_progress(session_id)?
-                .ok_or(StorageError::InvalidData {
+            Self::load_host_journal_progress(self.connection()?, self.run_id, session_id)?.ok_or(
+                StorageError::InvalidData {
                     context: "host_journal_progress.host_session_id",
                     reason: format!("host session {} was not registered", session_id.get()),
-                })?;
+                },
+            )?;
         let previous_sequence = sequence - 1;
         if progress.admitted_journal != previous_sequence {
             return Err(StorageError::InvalidData {
@@ -18094,7 +18145,7 @@ impl Storage {
         let session = encode_journal_u64(batch_id.session_id().get());
         let sequence = encode_journal_u64(batch_id.sequence());
         let rows = self.connection()?.query_with_params(
-            "SELECT persistence_batch_id
+            "SELECT persistence_batch_id, rowid
              FROM host_journal_batch_ledger
              WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
             &[
@@ -18123,16 +18174,19 @@ impl Storage {
                 ),
             });
         }
+        let rowid: i64 = decode(row, 1, "host_journal_batch_ledger.rowid")?;
+        // Addressed by rowid as well as key: see `rowid_of`.
         let updated = self.connection()?.execute_with_params(
             "UPDATE host_journal_batch_ledger
              SET persistence_batch_id = ?1
-             WHERE run_id = ?2 AND host_session_id = ?3 AND journal_sequence = ?4
+             WHERE rowid = ?5 AND run_id = ?2 AND host_session_id = ?3 AND journal_sequence = ?4
                AND persistence_batch_id IS NULL",
             &[
                 persistence_batch_id.as_i64().into(),
                 sqlite_run_id(self.run_id),
                 session.as_str().into(),
                 sequence.as_str().into(),
+                rowid.into(),
             ],
         )?;
         if updated != 1 {
@@ -18145,14 +18199,15 @@ impl Storage {
     }
 
     fn host_journal_state(
-        &self,
+        reader: &impl RowReader,
+        run_id: RunId,
         batch_id: JournalBatchId,
     ) -> Result<HostJournalState, StorageError> {
-        let rows = self.connection()?.query_with_params(
+        let rows = reader.read_rows(
             "SELECT state FROM host_journal_batch_ledger
              WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
             &[
-                sqlite_run_id(self.run_id),
+                sqlite_run_id(run_id),
                 encode_journal_u64(batch_id.session_id().get())
                     .as_str()
                     .into(),
@@ -18240,7 +18295,7 @@ impl Storage {
     }
 
     fn validate_domain_event_projection_for_connection(
-        connection: &Connection,
+        connection: &impl RowReader,
         run_id: RunId,
         batch_id: JournalBatchId,
         event_sequence: Option<EventSequence>,
@@ -18268,7 +18323,7 @@ impl Storage {
         }
         let session = encode_journal_u64(batch_id.session_id().get());
         let journal = encode_journal_u64(batch_id.sequence());
-        let rows = connection.query_with_params(
+        let rows = connection.read_rows(
             "SELECT scientific_event_sequence, tick, event_count, archive_payload_digest
              FROM host_domain_event_batches
              WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
@@ -18343,7 +18398,7 @@ impl Storage {
             });
         }
 
-        let event_rows = connection.query_with_params(
+        let event_rows = connection.read_rows(
             "SELECT event_ordinal, journal_sequence, tick, kind, actor_agent_uid,
                     payload_json, archive_payload_digest
              FROM host_domain_events
@@ -18637,7 +18692,7 @@ impl Storage {
         reason = "one fail-closed validator compares every normalized command field and both ordered transition axes with its canonical archive"
     )]
     fn validate_command_projection_for_connection(
-        connection: &Connection,
+        connection: &impl RowReader,
         run_id: RunId,
         batch_id: JournalBatchId,
         state: HostJournalState,
@@ -18652,7 +18707,7 @@ impl Storage {
         }
         let session = encode_journal_u64(batch_id.session_id().get());
         let journal = encode_journal_u64(batch_id.sequence());
-        let record_rows = connection.query_with_params(
+        let record_rows = connection.read_rows(
             "SELECT command_id, source_client_namespace, client_sequence,
                     admission_sequence, lifecycle_schema_version,
                     expected_control_revision, expected_scientific_revision,
@@ -18670,7 +18725,7 @@ impl Storage {
                 journal.as_str().into(),
             ],
         )?;
-        let application_rows = connection.query_with_params(
+        let application_rows = connection.read_rows(
             "SELECT command_id, transition_ordinal, boundary_tick,
                     boundary_control_revision, boundary_scientific_revision,
                     boundary_config_revision, application_state, application_postcard_hex,
@@ -18684,7 +18739,7 @@ impl Storage {
                 journal.as_str().into(),
             ],
         )?;
-        let storage_rows = connection.query_with_params(
+        let storage_rows = connection.read_rows(
             "SELECT command_id, transition_ordinal, storage_state, archive_payload_digest
              FROM host_command_storage_transitions
              WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
@@ -18990,81 +19045,89 @@ impl Storage {
             HostJournalState::CommittedVolatile => HostJournalState::Applied,
             HostJournalState::Durable => HostJournalState::CommittedVolatile,
         };
-        let current = self.host_journal_state(batch_id)?;
-        Self::validate_domain_event_projection_for_connection(
-            self.connection()?,
-            self.run_id,
-            batch_id,
-            event_sequence,
-            current,
-            domain_events,
-        )?;
-        Self::validate_command_projection_for_connection(
-            self.connection()?,
-            self.run_id,
-            batch_id,
-            current,
-            command,
-        )?;
-        if current >= target {
-            return Ok(());
-        }
-        if current != previous {
-            return Err(StorageError::InvalidData {
-                context: "host_journal_batch_ledger.state",
-                reason: format!(
-                    "journal batch {batch_id:?} cannot transition from {} to {}",
-                    current.as_str(),
-                    target.as_str()
-                ),
-            });
-        }
-        let progress = self
-            .load_host_journal_progress(batch_id.session_id())?
-            .ok_or(StorageError::InvalidData {
-                context: "host_journal_progress.host_session_id",
-                reason: "journal ledger has no progress parent".to_owned(),
-            })?;
-        let (target_journal, target_event) = progress.prefixes(target);
-        let previous_journal =
-            batch_id
-                .sequence()
-                .checked_sub(1)
-                .ok_or(StorageError::InvalidData {
-                    context: "host_journal_batch_ledger.journal_sequence",
-                    reason: "zero journal sequence cannot advance a prefix".to_owned(),
-                })?;
-        if target_journal != previous_journal {
-            return Err(StorageError::InvalidData {
-                context: "host_journal_progress.journal_prefix",
-                reason: format!(
-                    "{} journal prefix is {target_journal}, expected {previous_journal}",
-                    target.as_str()
-                ),
-            });
-        }
-        let event = event_sequence.map(EventSequence::get);
-        if let Some(event) = event {
-            let previous_event = event.checked_sub(1).ok_or(StorageError::InvalidData {
-                context: "host_journal_batch_ledger.scientific_event_sequence",
-                reason: "zero scientific-event sequence cannot advance a prefix".to_owned(),
-            })?;
-            if target_event != previous_event {
-                return Err(StorageError::InvalidData {
-                    context: "host_journal_progress.event_prefix",
-                    reason: format!(
-                        "{} event prefix is {target_event}, expected {previous_event}",
-                        target.as_str()
-                    ),
-                });
-            }
-        }
+        // The precondition reads run inside the transaction whose writes depend on them, so
+        // the check and the transition see one snapshot, and they avoid the per-read
+        // committed-state refresh an autocommit read pays (see `RowReader`). `None` means
+        // the batch already reached `target`.
+        let preconditions =
+            |reader: &Transaction<'_>| -> Result<Option<(String, String)>, StorageError> {
+                let current = Self::host_journal_state(reader, self.run_id, batch_id)?;
+                Self::validate_domain_event_projection_for_connection(
+                    reader,
+                    self.run_id,
+                    batch_id,
+                    event_sequence,
+                    current,
+                    domain_events,
+                )?;
+                Self::validate_command_projection_for_connection(
+                    reader,
+                    self.run_id,
+                    batch_id,
+                    current,
+                    command,
+                )?;
+                if current >= target {
+                    return Ok(None);
+                }
+                if current != previous {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_batch_ledger.state",
+                        reason: format!(
+                            "journal batch {batch_id:?} cannot transition from {} to {}",
+                            current.as_str(),
+                            target.as_str()
+                        ),
+                    });
+                }
+                let progress =
+                    Self::load_host_journal_progress(reader, self.run_id, batch_id.session_id())?
+                        .ok_or(StorageError::InvalidData {
+                        context: "host_journal_progress.host_session_id",
+                        reason: "journal ledger has no progress parent".to_owned(),
+                    })?;
+                let (target_journal, target_event) = progress.prefixes(target);
+                let previous_journal =
+                    batch_id
+                        .sequence()
+                        .checked_sub(1)
+                        .ok_or(StorageError::InvalidData {
+                            context: "host_journal_batch_ledger.journal_sequence",
+                            reason: "zero journal sequence cannot advance a prefix".to_owned(),
+                        })?;
+                if target_journal != previous_journal {
+                    return Err(StorageError::InvalidData {
+                        context: "host_journal_progress.journal_prefix",
+                        reason: format!(
+                            "{} journal prefix is {target_journal}, expected {previous_journal}",
+                            target.as_str()
+                        ),
+                    });
+                }
+                if let Some(event) = event_sequence.map(EventSequence::get) {
+                    let previous_event = event.checked_sub(1).ok_or(StorageError::InvalidData {
+                        context: "host_journal_batch_ledger.scientific_event_sequence",
+                        reason: "zero scientific-event sequence cannot advance a prefix".to_owned(),
+                    })?;
+                    if target_event != previous_event {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_progress.event_prefix",
+                            reason: format!(
+                                "{} event prefix is {target_event}, expected {previous_event}",
+                                target.as_str()
+                            ),
+                        });
+                    }
+                }
+                Ok(Some((
+                    encode_journal_u64(previous_journal),
+                    encode_journal_u64(target_event),
+                )))
+            };
 
         let session = encode_journal_u64(batch_id.session_id().get());
         let journal = encode_journal_u64(batch_id.sequence());
-        let prior_journal = encode_journal_u64(previous_journal);
-        let event = event.map(encode_journal_u64);
-        let prior_event = encode_journal_u64(target_event);
+        let event = event_sequence.map(|sequence| encode_journal_u64(sequence.get()));
         let progress_sql = match target {
             HostJournalState::Admitted => {
                 return Err(StorageError::InvalidData {
@@ -19098,7 +19161,21 @@ impl Storage {
                    AND (?2 IS NULL OR durable_event_prefix = ?6)"
             }
         };
-        execute_transaction_with_retry(self.connection()?, |transaction| {
+        let mut refusal = None;
+        let mut advanced = false;
+        let outcome = execute_transaction_with_retry(self.connection()?, |transaction| {
+            refusal = None;
+            advanced = false;
+            let (prior_journal, prior_event) = match preconditions(transaction) {
+                Ok(Some(prefixes)) => prefixes,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    refusal = Some(error);
+                    return Err(FrankenError::Internal(
+                        "host-journal transition precondition refused".to_owned(),
+                    ));
+                }
+            };
             if target == HostJournalState::Applied {
                 match (event_sequence, domain_events) {
                     (Some(sequence), Some(projection))
@@ -19127,17 +19204,28 @@ impl Storage {
                     target,
                 )?;
             }
+            let ledger_rowid = rowid_of(
+                transaction,
+                "SELECT rowid FROM host_journal_batch_ledger
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                &[
+                    sqlite_run_id(self.run_id),
+                    session.as_str().into(),
+                    journal.as_str().into(),
+                ],
+            )?;
             let ledger_rows = transaction.execute_with_params(
                 "UPDATE host_journal_batch_ledger
                  SET state = ?1
-                 WHERE run_id = ?2 AND host_session_id = ?3 AND journal_sequence = ?4
-                   AND state = ?5",
+                 WHERE rowid = ?6 AND run_id = ?2 AND host_session_id = ?3
+                   AND journal_sequence = ?4 AND state = ?5",
                 &[
                     target.as_str().into(),
                     sqlite_run_id(self.run_id),
                     session.as_str().into(),
                     journal.as_str().into(),
                     previous.as_str().into(),
+                    sqlite_optional_i64(ledger_rowid),
                 ],
             )?;
             let progress_rows = transaction.execute_with_params(
@@ -19157,8 +19245,27 @@ impl Storage {
                     target.as_str()
                 )));
             }
+            advanced = true;
             Ok(())
-        })?;
+        });
+        if let Err(error) = outcome {
+            // A refused precondition wrote nothing; once it has rolled back cleanly the
+            // caller gets the typed refusal rather than the transaction wrapper around it.
+            return Err(match (refusal, &error) {
+                (
+                    Some(refusal),
+                    StorageError::Transaction {
+                        commit_state: FailureCommitState::RolledBack,
+                        ..
+                    },
+                ) => refusal,
+                _ => error,
+            });
+        }
+        if !advanced {
+            return Ok(());
+        }
+        // Post-commit read-back of the committed rows, unchanged.
         Self::validate_domain_event_projection_for_connection(
             self.connection()?,
             self.run_id,
@@ -20846,7 +20953,7 @@ impl Storage {
                 }
                 for batch_id in outbox_ids {
                     let ledger = tx.query_row_with_params(
-                        "SELECT state FROM storage_batch_ledger
+                        "SELECT state, rowid FROM storage_batch_ledger
                          WHERE run_id = ?1 AND batch_id = ?2",
                         &[sqlite_run_id(run_id), batch_id.as_i64().into()],
                     )?;
@@ -20859,11 +20966,19 @@ impl Storage {
                             batch_id.get()
                         )));
                     }
+                    let rowid = ledger
+                        .get_typed::<i64>(1)
+                        .map_err(|error| FrankenError::Internal(error.to_string()))?;
+                    // Addressed by rowid as well as key: see `rowid_of`.
                     let updated = tx.execute_with_params(
                         "UPDATE storage_batch_ledger
                          SET state = 'applied'
-                         WHERE run_id = ?1 AND batch_id = ?2",
-                        &[sqlite_run_id(run_id), batch_id.as_i64().into()],
+                         WHERE rowid = ?3 AND run_id = ?1 AND batch_id = ?2",
+                        &[
+                            sqlite_run_id(run_id),
+                            batch_id.as_i64().into(),
+                            rowid.into(),
+                        ],
                     )?;
                     if updated != 1 {
                         return Err(FrankenError::Internal(format!(
@@ -21113,7 +21228,7 @@ impl Storage {
         execute_transaction_with_retry(self.connection()?, |transaction| {
             if file_backed && target > durable_before {
                 let rows = transaction.query_with_params(
-                    "SELECT batch_id, state
+                    "SELECT batch_id, state, rowid
                      FROM storage_batch_ledger
                      WHERE run_id = ?1 AND batch_id > ?2 AND batch_id <= ?3
                      ORDER BY batch_id ASC",
@@ -21129,6 +21244,7 @@ impl Storage {
                         durable_before + 1
                     )));
                 }
+                let mut rowids = Vec::with_capacity(rows.len());
                 for row in rows {
                     let batch_id = row
                         .get_typed::<i64>(0)
@@ -21141,18 +21257,27 @@ impl Storage {
                             "batch {batch_id} cannot become durable from state {state:?}"
                         )));
                     }
+                    rowids.push(
+                        row.get_typed::<i64>(2)
+                            .map_err(|error| FrankenError::Internal(error.to_string()))?,
+                    );
                 }
                 let expected = usize::try_from(target - durable_before).unwrap_or(usize::MAX);
-                let ledger_rows = transaction.execute_with_params(
-                    "UPDATE storage_batch_ledger
-                     SET state = 'durable'
-                     WHERE run_id = ?1 AND batch_id > ?2 AND batch_id <= ?3",
-                    &[
-                        sqlite_run_id(self.run_id),
-                        durable_before.into(),
-                        target.into(),
-                    ],
-                )?;
+                // Addressed by rowid as well as the key range: see `rowid_of`.
+                let mut ledger_rows = 0;
+                for rowid in rowids {
+                    ledger_rows += transaction.execute_with_params(
+                        "UPDATE storage_batch_ledger
+                         SET state = 'durable'
+                         WHERE rowid = ?4 AND run_id = ?1 AND batch_id > ?2 AND batch_id <= ?3",
+                        &[
+                            sqlite_run_id(self.run_id),
+                            durable_before.into(),
+                            target.into(),
+                            rowid.into(),
+                        ],
+                    )?;
+                }
                 if ledger_rows != expected {
                     return Err(FrankenError::Internal(format!(
                         "durability updated {ledger_rows} ledger rows; expected {expected}"
@@ -26490,6 +26615,64 @@ mod tests {
             timestamp
         ));
         path
+    }
+
+    #[test]
+    fn rowid_addressed_keyed_update_matches_exactly_what_the_keyed_update_did()
+    -> Result<(), FrankenError> {
+        let connection = Connection::open(":memory:")?;
+        connection.execute(
+            "CREATE TABLE ledger (run_id TEXT NOT NULL, seq TEXT NOT NULL, state TEXT NOT NULL,
+             PRIMARY KEY (run_id, seq))",
+        )?;
+        connection
+            .execute("INSERT INTO ledger VALUES ('r', 'a', 'admitted'), ('r', 'b', 'admitted')")?;
+        let lookup = "SELECT rowid FROM ledger WHERE run_id = ?1 AND seq = ?2";
+        let update = "UPDATE ledger SET state = 'applied'
+                      WHERE rowid = ?3 AND run_id = ?1 AND seq = ?2 AND state = 'admitted'";
+
+        let present = rowid_of(&connection, lookup, &["r".into(), "b".into()])?;
+        assert!(present.is_some());
+        let params = |seq: &str, rowid| ["r".into(), seq.into(), sqlite_optional_i64(rowid)];
+        assert_eq!(
+            connection.execute_with_params(update, &params("b", present))?,
+            1
+        );
+        // The guard still applies: a second transition from 'admitted' matches nothing.
+        assert_eq!(
+            connection.execute_with_params(update, &params("b", present))?,
+            0
+        );
+        // A key naming a different row than the rowid matches nothing.
+        assert_eq!(
+            connection.execute_with_params(update, &params("a", present))?,
+            0
+        );
+
+        let absent = rowid_of(&connection, lookup, &["r".into(), "missing".into()])?;
+        assert_eq!(absent, None);
+        assert_eq!(
+            connection.execute_with_params(update, &params("missing", absent))?,
+            0
+        );
+
+        let states = connection.query("SELECT seq, state FROM ledger ORDER BY seq")?;
+        let states = states
+            .iter()
+            .map(|row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)))
+            .collect::<Result<Vec<_>, FrankenError>>()?;
+        assert_eq!(
+            states,
+            [
+                ("a".to_owned(), "admitted".to_owned()),
+                ("b".to_owned(), "applied".to_owned())
+            ]
+        );
+
+        let error = rowid_of(&connection, "SELECT rowid FROM ledger", &[])
+            .expect_err("a lookup selecting two rows must refuse");
+        assert!(error.to_string().contains("matched 2 rows"), "{error}");
+        Ok(())
     }
 
     fn journal_fault_world_with_interval(persistence_interval: u32) -> WorldState {
@@ -39751,11 +39934,6 @@ mod tests {
         /// schema revisions) and disclaim wider immunity from bd-0oro rules on signals outrunning
         /// their evidence.
         const EXEMPT_SCHEMA_TABLES: &[(&str, &str, &str)] = &[
-            (
-                "artifacts",
-                "bd-0oro",
-                "legacy V6 table superseded by run-scoped artifacts; retained in frozen DDL for schema migration compatibility (outside the UNWRITTEN-TABLE capability form: not exempt from wider bd-0oro signals-outrunning-evidence rules)",
-            ),
             (
                 "command_status_transitions",
                 "bd-0oro",
