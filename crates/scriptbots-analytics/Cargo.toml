@@ -30,6 +30,7 @@ fnx-readwrite = "0.2.0"
 
 [dev-dependencies]
 libc = { workspace = true }
+scriptbots-brain = { path = "../scriptbots-brain" }
 tempfile = "3.27.0"
 
 [lints]

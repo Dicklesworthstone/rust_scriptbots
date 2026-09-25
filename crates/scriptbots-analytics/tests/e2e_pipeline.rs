@@ -1,11 +1,12 @@
 //! End-to-end analytics pipeline integration test (`bd-2z0.11.9`).
 //!
 //! Validates the complete scientific analysis journey:
-//! 1. Seeded simulation with planted regime change (population crash) & stationary null control.
+//! 1. A hand-built seeded fixture with a planted regime change (population crash) and a
+//!    stationary null control, so statistical reports have a known ground truth.
 //! 2. Execution of the complete report suite (all 12 built-in reports via CLI & Registry).
 //! 3. Ground-truth invariant assertions across reports (significance under FDR, false-positive control,
 //!    lineage component conservation, descendant birth accounting).
-//! 4. `FrankenPandas` Parquet export with exact SQL row count equality & round-trip verification.
+//! 4. Parquet export (Apache `parquet` writer) with exact SQL row count equality & round-trip verification.
 //! 5. Graph export verification (lineage, dynasty, interaction in `GraphML` and Edge-List).
 //! 6. FTS5 narrative event search verification.
 //! 7. Structured MANIFEST.json artifact emission.
@@ -864,5 +865,134 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     println!(
         "MANIFEST successfully written to {}",
         manifest_path.display()
+    );
+}
+
+/// Run a real seeded simulation into a run database, returning the database path and the
+/// simulation's own ground truth: (ticks, born births, deaths, per-tick populations).
+fn run_real_simulation(dir: &Path, name: &str, seed: u64) -> (String, u64, u64, u64, Vec<usize>) {
+    use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
+    use scriptbots_core::{ScriptBotsConfig, WorldState};
+    use scriptbots_storage::StoragePipeline;
+
+    const TICKS: u64 = 400;
+    let run_path = dir.join(name).display().to_string();
+    let mut pipeline = StoragePipeline::create_unattributed_file(&run_path).expect("create run db");
+    let config = ScriptBotsConfig {
+        rng_seed: Some(seed),
+        persistence_interval: 1,
+        reproduction_cooldown: 60,
+        reproduction_attempt_chance: 0.2,
+        ..ScriptBotsConfig::default()
+    };
+    let (width, height) = (config.world_width, config.world_height);
+    let (mut world, mut session) =
+        WorldState::with_persistence(config, Box::new(pipeline.sink())).expect("world");
+    let brain = world
+        .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
+        .expect("register mlp");
+    for index in 0..40_u16 {
+        let mut agent = AgentData::default();
+        agent.position = Position::new(
+            f32::from(index % 8).mul_add(f32::from(u16::try_from(width / 8).expect("fit")), 17.0),
+            f32::from(index / 8).mul_add(f32::from(u16::try_from(height / 5).expect("fit")), 23.0),
+        );
+        let id = world.try_spawn_agent(agent).expect("spawn founder");
+        assert!(world.bind_agent_brain(id, brain).expect("bind brain"));
+    }
+
+    let (mut born, mut deaths) = (0_u64, 0_u64);
+    let mut populations = Vec::new();
+    for _ in 0..TICKS {
+        let completion = session.step_outcome(&mut world).expect("step");
+        let outcome = &completion.outcome;
+        born += outcome
+            .births
+            .iter()
+            .filter(|birth| birth.origin == BirthOrigin::Born)
+            .count() as u64;
+        deaths += outcome.deaths.len() as u64;
+        populations.push(outcome.summary.agent_count);
+        session.admit_pending(&mut world).expect("admit tick");
+    }
+    session.finalize(&mut world).expect("finalize persistence");
+    drop(world);
+    pipeline.shutdown().expect("storage shutdown");
+    (run_path, TICKS, born, deaths, populations)
+}
+
+/// bd-2z0.11.9: the report suite on the output of an actual `WorldState` run (the test above
+/// uses a hand-built fixture), with invariants checked against the simulation's own record.
+#[test]
+fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (run_db, ticks, born, deaths, populations) =
+        run_real_simulation(temp_dir.path(), "real.sqlite", 7);
+    let (treatment_db, ..) = run_real_simulation(temp_dir.path(), "real_treatment.sqlite", 8);
+    assert!(
+        born > 0,
+        "the seeded run must produce natural births to be non-vacuous"
+    );
+    assert!(
+        deaths > 0,
+        "the seeded run must produce deaths to be non-vacuous"
+    );
+
+    let cx = ReaderCtx::open(&run_db).expect("open real run");
+    let registry = Registry::builtin();
+    let mut summary = None;
+    for (name, _) in registry.list() {
+        let params = match name {
+            "compare-runs" => ReportParams::from_pairs([format!("treatment_db={treatment_db}")])
+                .expect("compare params"),
+            "narrative-validate" => ReportParams::from_pairs([
+                "window=30".to_string(),
+                "resamples=50".to_string(),
+                "permutations=50".to_string(),
+            ])
+            .expect("narrative params"),
+            _ => ReportParams::default(),
+        };
+        let output = registry
+            .run(name, &cx, &params)
+            .unwrap_or_else(|error| panic!("report '{name}' failed on a real run: {error}"));
+        assert_eq!(
+            output.latest_tick,
+            Some(ticks),
+            "report '{name}' latest tick"
+        );
+        if name == "run-summary" {
+            summary = Some(output.machine);
+        }
+    }
+
+    let summary = summary.expect("run-summary is a built-in report");
+    let as_u64 = |key: &str| {
+        summary[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{key}: {summary}"))
+    };
+    assert_eq!(as_u64("tick_count"), ticks);
+    assert_eq!(as_u64("birth_records"), born, "born births: {summary}");
+    assert_eq!(as_u64("death_records"), deaths, "deaths: {summary}");
+    assert_eq!(as_u64("population_first"), populations[0] as u64);
+    assert_eq!(
+        as_u64("population_last"),
+        *populations.last().expect("ticks ran") as u64
+    );
+    assert_eq!(
+        as_u64("population_min"),
+        *populations.iter().min().expect("ticks ran") as u64
+    );
+    assert_eq!(
+        as_u64("population_max"),
+        *populations.iter().max().expect("ticks ran") as u64
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let mean = populations.iter().sum::<usize>() as f64 / populations.len() as f64;
+    let reported_mean = summary["population_mean"].as_f64().expect("mean");
+    assert!(
+        (reported_mean - mean).abs() < 1e-9,
+        "population mean {reported_mean} vs simulation {mean}"
     );
 }

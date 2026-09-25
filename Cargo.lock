@@ -11157,6 +11157,7 @@ dependencies = [
  "libc",
  "libm",
  "parquet",
+ "scriptbots-brain",
  "scriptbots-core",
  "scriptbots-runtime",
  "scriptbots-storage",
