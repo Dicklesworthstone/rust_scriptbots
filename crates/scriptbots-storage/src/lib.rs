@@ -17917,21 +17917,19 @@ impl Storage {
         }
         let session = encode_journal_u64(session_id.get());
         let journal_sequence = encode_journal_u64(sequence);
+        let identity = [
+            sqlite_run_id(self.run_id),
+            session.as_str().into(),
+            journal_sequence.as_str().into(),
+        ];
+        // Two primary-key lookups rather than one LEFT JOIN: the pinned FrankenSQLite
+        // scans the whole archive for the join form even when both sides are keyed by
+        // the full primary key, which made every admission cost grow with run length.
         let existing = self.connection()?.query_with_params(
-            "SELECT archive.payload_version, archive.payload_digest, archive.payload_json,
-                    ledger.state
-             FROM host_journal_archive AS archive
-             LEFT JOIN host_journal_batch_ledger AS ledger
-               ON ledger.run_id = archive.run_id
-              AND ledger.host_session_id = archive.host_session_id
-              AND ledger.journal_sequence = archive.journal_sequence
-             WHERE archive.run_id = ?1 AND archive.host_session_id = ?2
-               AND archive.journal_sequence = ?3",
-            &[
-                sqlite_run_id(self.run_id),
-                session.as_str().into(),
-                journal_sequence.as_str().into(),
-            ],
+            "SELECT payload_version, payload_digest, payload_json
+             FROM host_journal_archive
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            &identity,
         )?;
         if let Some(row) = existing.first() {
             if existing.len() != 1 {
@@ -17943,7 +17941,15 @@ impl Storage {
             let payload_version: i64 = decode(row, 0, "host_journal_archive.payload_version")?;
             let payload_digest: String = decode(row, 1, "host_journal_archive.payload_digest")?;
             let payload_json: String = decode(row, 2, "host_journal_archive.payload_json")?;
-            let state: Option<String> = decode(row, 3, "host_journal_batch_ledger.state")?;
+            let ledger = self.connection()?.query_with_params(
+                "SELECT state FROM host_journal_batch_ledger
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                &identity,
+            )?;
+            let state: Option<String> = match ledger.first() {
+                Some(row) => Some(decode(row, 0, "host_journal_batch_ledger.state")?),
+                None => None,
+            };
             if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION)
                 || payload_digest != prepared.payload_digest
                 || payload_json != prepared.payload_json
