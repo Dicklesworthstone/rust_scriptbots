@@ -407,11 +407,18 @@ fn mock_free_checkpoint_start_replay_e2e() {
     );
 
     // 2. Step a matching world headlessly to tick 12 and capture a valid WorldCheckpointV1.
+    // The binary ran without a scenario document, so it used the app launch ecology
+    // (compose_config_with_scenario); this world must use the same science fields.
     let config = scriptbots_core::ScriptBotsConfig {
         rng_seed: Some(SEED),
         persistence_interval: 0,
         replay_event_tick_cap: 65536,
         history_capacity: 600,
+        reproduction_rate_herbivore: 0.0001,
+        reproduction_rate_carnivore: 0.0001,
+        reproduction_cooldown: 7,
+        food_growth_rate: 0.0005,
+        population_minimum: 20,
         ..scriptbots_core::ScriptBotsConfig::default()
     };
     let mut world = scriptbots_core::WorldState::new(config).expect("build world");

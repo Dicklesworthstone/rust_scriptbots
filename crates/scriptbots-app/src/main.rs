@@ -2608,22 +2608,44 @@ fn compose_config_with_scenario(
     ScenarioIdentityV0,
     Vec<ConfigFieldOverride>,
 )> {
-    let defaults = ScriptBotsConfig {
+    let scenario_document = match &cli.scenario {
+        Some(path) => Some(load_scenario_document(path)?),
+        None => None,
+    };
+    let base = ScriptBotsConfig {
         persistence_interval: 60,
         history_capacity: 600,
         ..ScriptBotsConfig::default()
     };
-    let scenario_document = match &cli.scenario {
-        Some(path) => Some(load_scenario_document(path)?),
-        None => None,
+    // A scenario document is a self-contained experiment on the core defaults. A launch
+    // without one runs the app's own ecology (bd-vgsx). Under the core defaults, the
+    // reproduction counter advances every tick and each birth hands the child full energy
+    // at no cost to the parent, so lineages multiply without eating: three seeds passed
+    // 3,000 agents by tick ~6,000-8,000. As in the C++ (repcounter falls only by 3 * intake
+    // and carcass share, REPRATE = 7), reproduction here is paid for by food. Validation
+    // requires positive per-tick rates, so they are set small enough that the time path
+    // needs 70,000 ticks to reach the cooldown, against ~1,000 through eating. (1e-6 was
+    // measured too, but its exponent form does not survive the run manifest's JSON
+    // round trip: bd-vgsx.) Regrowth is lowered so that food bounds the population.
+    let defaults = if scenario_document.is_none() {
+        ScriptBotsConfig {
+            reproduction_rate_herbivore: 0.0001,
+            reproduction_rate_carnivore: 0.0001,
+            reproduction_cooldown: 7,
+            food_growth_rate: 0.0005,
+            population_minimum: 20,
+            ..base
+        }
+    } else {
+        base
     };
     let mut scenario = match &scenario_document {
         Some((document, _bytes)) => document.to_identity(),
         None => {
             let scenario_id = if cli.config_layers.is_empty() {
-                "scriptbots-app-default-v1"
+                "scriptbots-app-default-v2"
             } else {
-                "scriptbots-app-layered-v1"
+                "scriptbots-app-layered-v2"
             };
             ScenarioIdentityV0::caller_seeded(scenario_id)
         }
@@ -7602,12 +7624,18 @@ activation = "Sigmoid"
             let (config, scenario, overrides) =
                 compose_config_with_scenario(&cli).expect("compose scenario provenance");
 
-            let mut expected = ScenarioIdentityV0::caller_seeded("scriptbots-app-layered-v1");
+            let mut expected = ScenarioIdentityV0::caller_seeded("scriptbots-app-layered-v2");
             expected.population_recipe =
                 "fixed-4x4-registered-brain-grid-v1;brain=mixed".to_owned();
+            // No scenario document, so the defaults layer is the app launch ecology.
             let defaults_value = serde_json::to_value(ScriptBotsConfig {
                 persistence_interval: 60,
                 history_capacity: 600,
+                reproduction_rate_herbivore: 0.0001,
+                reproduction_rate_carnivore: 0.0001,
+                reproduction_cooldown: 7,
+                food_growth_rate: 0.0005,
+                population_minimum: 20,
                 ..ScriptBotsConfig::default()
             })
             .expect("serialize composed defaults");
