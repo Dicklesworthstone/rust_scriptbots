@@ -1525,6 +1525,8 @@ impl ControlHandle {
         }
 
         // Only a real core checkpoint is ever labelled as one; a capture refusal is the answer.
+        // The owner answers at the next quiescent boundary when deferred persistence output is
+        // still queued, so this does not fail merely for landing between persistence batches.
         let checkpoint = self.capture_checkpoint_v1()?;
         let encoded_bytes = checkpoint
             .encode()

@@ -1287,8 +1287,13 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
     let run_dir = tempdir()?;
     let jsonl_log_path = run_dir.path().join("e2e_events.jsonl");
 
+    // A checkpoint is captured at a quiescent persistence boundary: the owner parks the
+    // request until the next batch drains. With the default 60-tick cadence that can take
+    // longer than the client deadline in a debug build on a loaded host, so this lifecycle
+    // test persists every tick.
     let mut child = Command::new(binary())
         .args(["--mode", "server", "--storage", "file"])
+        .args(["--set", "persistence_interval=1"])
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_CONTROL_MCP", "http")
@@ -1503,7 +1508,40 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         )?;
         assert_eq!(cancel_code, 200);
         let cancel_json: serde_json::Value = serde_json::from_str(&cancel_resp)?;
-        assert_eq!(cancel_json["status"], "cancelled");
+        // Cancellation is observed by the runner between waves, so a job that is still
+        // executing reports "cancelling". A 2-seed x 5-tick job may already have finished,
+        // so the terminal state is "cancelled" or "completed" -- never still running.
+        let cancel_status = cancel_json["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            matches!(
+                cancel_status.as_str(),
+                "cancelling" | "cancelled" | "completed"
+            ),
+            "unexpected status after cancel: {cancel_json}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let terminal = loop {
+            let (code, body) = http(rest_addr, "GET", &format!("/api/v1/experiments/{exp_id}"))?;
+            assert_eq!(code, 200);
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            let label = status["status"].as_str().unwrap_or_default().to_owned();
+            if label == "cancelled" || label == "completed" {
+                break label;
+            }
+            assert!(
+                matches!(label.as_str(), "cancelling" | "running" | "pending"),
+                "experiment left the cancel path through {label}: {status}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "experiment still {label} 60 s after cancel"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(terminal == "cancelled" || terminal == "completed");
 
         // Resume experiment via MCP
         let mcp_res_payload = serde_json::json!({

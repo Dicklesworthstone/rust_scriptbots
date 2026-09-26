@@ -719,7 +719,12 @@ pub struct ChannelHostDriver {
     journal_retry_at: Option<ManualInstant>,
     controller_disconnected: bool,
     shutdown_requested: bool,
+    /// Checkpoint requests that arrived while the world still held deferred
+    /// persistence output; each is answered at the next quiescent boundary.
+    parked_captures: Vec<CaptureReply>,
 }
+
+type CaptureReply = Sender<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>>;
 
 impl ChannelHostDriver {
     /// Pair one owner-side driver with its first cross-thread client port.
@@ -762,8 +767,48 @@ impl ChannelHostDriver {
             journal_retry_at: None,
             controller_disconnected: false,
             shutdown_requested: false,
+            parked_captures: Vec::new(),
         };
         Ok((driver, port))
+    }
+
+    /// Capture a checkpoint now, or `None` when the world is not yet quiescent.
+    ///
+    /// With a persistence interval above one, deaths, births and replay events queue
+    /// between persistence batches, and the core refuses a capture that would drop
+    /// them. That refusal means "not yet", not "never": the world is quiescent again
+    /// right after the next batch drains. Every other refusal is returned as before.
+    fn try_capture_checkpoint(
+        &self,
+    ) -> Option<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>> {
+        match self.host.core().world().capture_checkpoint_quiescent() {
+            Ok(checkpoint) => Some(Ok(checkpoint)),
+            Err(
+                scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
+                | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. },
+            ) => None,
+            Err(error) => Some(Err(ChannelHostPort::protocol_violation(error.to_string()))),
+        }
+    }
+
+    fn capture_or_park(&mut self, reply: CaptureReply) {
+        match self.try_capture_checkpoint() {
+            Some(result) => {
+                let _ = reply.send(result);
+            }
+            None => self.parked_captures.push(reply),
+        }
+    }
+
+    /// Answer parked checkpoint requests once the world is quiescent.
+    fn service_parked_captures(&mut self) {
+        if self.parked_captures.is_empty() {
+            return;
+        }
+        let parked = std::mem::take(&mut self.parked_captures);
+        for reply in parked {
+            self.capture_or_park(reply);
+        }
     }
 
     fn mirror_one(&mut self, command_id: CommandId) {
@@ -847,9 +892,7 @@ impl ChannelHostDriver {
                     .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
                 let _ = reply.send(result);
             }
-            IngressMessage::CaptureCheckpoint { reply } => {
-                let _ = reply.send(self.host.core().capture_checkpoint_v1());
-            }
+            IngressMessage::CaptureCheckpoint { reply } => self.capture_or_park(reply),
             IngressMessage::Command { envelope, reply } => {
                 let result = self.host.submit(envelope);
                 if let Ok(status) = &result
@@ -1034,6 +1077,9 @@ impl ChannelHostDriver {
         self.drain_ingress();
         self.update_journal_retry_deadline(now)?;
         let drove = self.drive_due_boundary(now)?;
+        // A batch acknowledgement can seal the boundary outside a science drive, so
+        // parked captures are retried on every step, not only after a tick.
+        self.service_parked_captures();
         if self.controller_disconnected && !self.shutdown_requested {
             match self.host.request_shutdown() {
                 Ok(_) => self.shutdown_requested = true,
