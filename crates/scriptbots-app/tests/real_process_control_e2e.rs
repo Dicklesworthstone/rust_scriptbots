@@ -1287,10 +1287,8 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
     let run_dir = tempdir()?;
     let jsonl_log_path = run_dir.path().join("e2e_events.jsonl");
 
-    // A checkpoint is captured at a quiescent persistence boundary: the owner parks the
-    // request until the next batch drains. With the default 60-tick cadence that can take
-    // longer than the client deadline in a debug build on a loaded host, so this lifecycle
-    // test persists every tick.
+    // Every tick is a persistence boundary here, so the world is paused exactly at a
+    // sealed boundary once its journal drains and the checkpoint below captures it.
     let mut child = Command::new(binary())
         .args(["--mode", "server", "--storage", "file"])
         .args(["--set", "persistence_interval=1"])
@@ -1567,6 +1565,33 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         assert_eq!(exp_list_code, 200);
 
         // --- 5. Checkpoint and Artifact Lifecycle ---
+        // A checkpoint is a real core capture: the owner answers it only at a quiescent
+        // persistence boundary, after the latest batch has been acknowledged. A debug build
+        // on a loaded host can run with its journal permanently full, which is never
+        // quiescent, so pause the world and let the journal drain first -- the way an
+        // operator snapshots a busy run.
+        let (pause_code, pause_body) = http(rest_addr, "POST", "/api/control/pause")?;
+        assert_eq!(pause_code, 200, "pause before checkpoint: {pause_body}");
+        let pause_id = json_str(&pause_body, "command_id")
+            .ok_or_else(|| anyhow!("pause response carried no command_id: {pause_body}"))?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{pause_id}"))?;
+            if code == 200 && json_str(&body, "application_state").as_deref() == Some("applied") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pause never applied: {body}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        loop {
+            let (code, body) = http(rest_addr, "GET", "/api/status")?;
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            if code == 200 && status["health"]["state"] == "healthy" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "journal never drained: {body}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let chk_payload = serde_json::json!({
             "description": "real process checkpoint",
             "idempotency_key": "real-proc-chk-001"

@@ -772,32 +772,45 @@ impl ChannelHostDriver {
         Ok((driver, port))
     }
 
-    /// Capture a checkpoint now, or `None` when the world is not yet quiescent.
+    /// Answer a checkpoint request now, or park it until the next quiescent boundary.
     ///
     /// With a persistence interval above one, deaths, births and replay events queue
     /// between persistence batches, and the core refuses a capture that would drop
-    /// them. That refusal means "not yet", not "never": the world is quiescent again
-    /// right after the next batch drains. Every other refusal is returned as before.
-    fn try_capture_checkpoint(
-        &self,
-    ) -> Option<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>> {
-        match self.host.core().world().capture_checkpoint_quiescent() {
-            Ok(checkpoint) => Some(Ok(checkpoint)),
-            Err(
-                scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
-                | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. },
-            ) => None,
-            Err(error) => Some(Err(ChannelHostPort::protocol_violation(error.to_string()))),
-        }
-    }
-
+    /// them. While the host is still advancing that refusal means "not yet": the world
+    /// is quiescent again right after the next batch drains, so the request is parked.
+    /// A paused, stopped or faulted host will not reach another boundary by itself, so
+    /// the refusal is returned at once instead of timing out. Every other refusal is
+    /// returned unchanged.
     fn capture_or_park(&mut self, reply: CaptureReply) {
-        match self.try_capture_checkpoint() {
-            Some(result) => {
-                let _ = reply.send(result);
+        let error = match self.host.core().world().capture_checkpoint_quiescent() {
+            Ok(checkpoint) => {
+                let _ = reply.send(Ok(checkpoint));
+                return;
             }
-            None => self.parked_captures.push(reply),
+            Err(error) => error,
+        };
+        let not_yet = matches!(
+            error,
+            scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
+                | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
+        );
+        let advancing = matches!(
+            self.host.drive_interest(),
+            HostDriveInterest::ReadyNow | HostDriveInterest::Deadline | HostDriveInterest::Draining
+        );
+        if not_yet && advancing {
+            self.parked_captures.push(reply);
+            return;
         }
+        let message = if not_yet {
+            format!(
+                "{error}; the host is not advancing, so no persistence boundary will follow \
+                 -- resume the run (or checkpoint at a persistence tick) and retry"
+            )
+        } else {
+            error.to_string()
+        };
+        let _ = reply.send(Err(ChannelHostPort::protocol_violation(message)));
     }
 
     /// Answer parked checkpoint requests once the world is quiescent.
