@@ -2626,7 +2626,10 @@ fn compose_config_with_scenario(
     // requires positive per-tick rates, so they are set small enough that the time path
     // needs 70,000 ticks to reach the cooldown, against ~1,000 through eating. (1e-6 was
     // measured too, but its exponent form does not survive the run manifest's JSON
-    // round trip: bd-vgsx.) Regrowth is lowered so that food bounds the population.
+    // round trip: bd-vhqk.) Regrowth is lowered so that food bounds the population.
+    // Measured with the app founders, seeds 11/42/137: 180-288 agents at tick 30,000 with
+    // 42-73 births per 1,000 ticks. A 60,000-tick run (rate 1e-6) reached 449-575 and was
+    // still growing slowly, so no plateau has been observed yet.
     let defaults = if scenario_document.is_none() {
         ScriptBotsConfig {
             reproduction_rate_herbivore: 0.0001,
