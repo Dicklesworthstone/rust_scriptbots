@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::StorageError;
 
-const FSQLITE_PINNED_VERSION: &str = "=0.4.0";
-const FSQLITE_PINNED_REVISION: &str = "a855a15399a1994943c81e15f284bed780b4f86b";
+const FSQLITE_PINNED_VERSION: &str = "=0.4.6";
+const FSQLITE_PINNED_REVISION: &str = "ad3f23ca94c0f1d38e3d6cbb919b0d095de0b4ee";
 
 /// Uninhabited marker for the unavailable hard-bounded async SQL lane.
 ///

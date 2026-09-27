@@ -54,7 +54,7 @@ direct dep; `planned` = admission bead exists, not yet in tree.
 
 | Component | Door | Source / pin | License | wasm32 | Notes |
 |---|---|---|---|---|---|
-| `fsqlite` (frankensqlite) 0.4.0 | direct | git rev `a855a15399a1994943c81e15f284bed780b4f86b` — guarded by `ci/check_fsqlite_pin.sh` | MIT + Rider (verified) | experimental upstream (`fsqlite-wasm`, not used here) | Sole embedded DB; migration native/DSR validation pending. Original license decision remains bd-2z0.8.9.1. |
+| `fsqlite` (frankensqlite) 0.4.6 | direct | git rev `ad3f23ca94c0f1d38e3d6cbb919b0d095de0b4ee` — guarded by `ci/check_fsqlite_pin.sh` | MIT + Rider (verified) | experimental upstream (`fsqlite-wasm`, not used here) | Sole embedded DB; migration native/DSR validation pending. Original license decision remains bd-2z0.8.9.1. |
 | `asupersync` 0.5.0 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite/FastMCP | crates.io exact `=0.5.0` | MIT + Rider (verified) | yes (browser profiles) | Coordinated dependency migration; native/DSR validation pending. Single-universe guard: bd-2z0.8.17. |
 | `franken-kernel` / `franken-evidence` / `franken-decision` 0.5.0 | transitive (via fsqlite/asupersync) | crates.io | same family — **verify per-crate LICENSE at first direct use** | n/a | Same publisher; rider assumed identical; do not cite as verified until checked. |
 | `fastmcp-rust` 0.10.0 | direct (`scriptbots-app`) | crates.io exact `=0.10.0` | MIT + Rider (published archive LICENSE matches the family SHA above; verified 2026-09-13) | native control surface | Dependency migration preserves the existing HTTP protocol adapter; native validation pending. |

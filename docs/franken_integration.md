@@ -10,7 +10,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 
 | Library | Door | Pin | Feature gate | Status |
 |---|---|---|---|---|
-| `fsqlite` (frankensqlite) 0.4.0 | direct (`scriptbots-storage`) | git rev `a855a15399a1994943c81e15f284bed780b4f86b` — guard: `ci/check_fsqlite_pin.sh` | defaults disabled; `native,json,fts5,icu,misc,rtree` preserve previous implicit extensions | sole embedded DB; dependency migration native/DSR validation pending; existing V8/V9 proof debt remains |
+| `fsqlite` (frankensqlite) 0.4.6 | direct (`scriptbots-storage`) | git rev `ad3f23ca94c0f1d38e3d6cbb919b0d095de0b4ee` — guard: `ci/check_fsqlite_pin.sh` | defaults disabled; `native,json,fts5,icu,misc,rtree` preserve previous implicit extensions | sole embedded DB; dependency migration native/DSR validation pending; existing V8/V9 proof debt remains |
 | `asupersync` 0.5.0 | direct (`scriptbots-runtime`, `scriptbots-app`) and transitive via fsqlite/FastMCP | crates.io exact `=0.5.0` — guard: `ci/check_asupersync_universe.sh` | runtime: optional `native-asupersync`; app: direct | native ingress/lifecycle plus bounded legacy-app command ingress; migration validation pending |
 | `franken-kernel` / `-evidence` / `-decision` 0.5.0 | transitive | crates.io | n/a | in tree via fsqlite/asupersync |
 | `fastmcp-rust` 0.10.0 | direct (`scriptbots-app`) | crates.io exact `=0.10.0` | existing default features; custom MCP HTTP dispatch remains legacy 2024 | published family shares Asupersync 0.5; native protocol/lifecycle validation pending |
