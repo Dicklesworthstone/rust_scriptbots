@@ -936,6 +936,7 @@ pub struct RunManifestV3 {
     pub next_spawn_ordinal: u64,
     pub next_birth_ordinal: u64,
     pub scenario: ScenarioIdentityV0,
+    #[serde(deserialize_with = "deserialize_normalized_json")]
     pub normalized_config: serde_json::Value,
     pub config_digest: String,
     pub config_digest_encoding: String,
@@ -1913,8 +1914,32 @@ fn normalize_json_value(value: &mut serde_json::Value) {
                 map.insert(key, value);
             }
         }
+        serde_json::Value::Number(number) => {
+            // serde_json's `arbitrary_precision` feature (enabled through a dependency) keeps
+            // each number's source text and compares numbers by that text, so the same float
+            // written as `1e-6` and as `0.000001` compared unequal (bd-vhqk). Integers are
+            // exact already; floats are re-emitted in serde_json's shortest f64 form.
+            if !number.is_i64()
+                && !number.is_u64()
+                && let Some(float) = number.as_f64()
+                && let Some(canonical) = serde_json::Number::from_f64(float)
+            {
+                *number = canonical;
+            }
+        }
         _ => {}
     }
+}
+
+/// Deserialize a JSON value into the same canonical form [`normalize_json_value`] gives
+/// a freshly built one, so a manifest read back from storage compares equal to its source.
+fn deserialize_normalized_json<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    normalize_json_value(&mut value);
+    Ok(value)
 }
 
 fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
@@ -2265,6 +2290,34 @@ mod characterization_tests {
         let value: serde_json::Value =
             serde_json::from_slice(&encoded).expect("inspect brain telemetry");
         assert_eq!(value["agent"], 0xfeed_beef_u64);
+    }
+
+    #[test]
+    fn normalized_json_numbers_compare_by_value_not_source_text() {
+        // Same float, two source texts: equal only after normalization (bd-vhqk).
+        let mut exponent: serde_json::Value =
+            serde_json::from_str(r#"{"rate": 1e-6, "count": 7}"#).expect("parse exponent");
+        let mut decimal: serde_json::Value =
+            serde_json::from_str(r#"{"rate": 0.000001, "count": 7}"#).expect("parse decimal");
+        normalize_json_value(&mut exponent);
+        normalize_json_value(&mut decimal);
+        assert_eq!(exponent, decimal);
+        assert_eq!(exponent["count"], 7, "integers keep their exact value");
+
+        // A config holding an exponent-form f32 survives the manifest's text round trip.
+        let config = scriptbots_core::ScriptBotsConfig {
+            reproduction_rate_herbivore: 0.000_001,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        };
+        let built = normalized_config(&config).expect("normalize config");
+        let text = canonical_json_text(&built).expect("canonical text");
+        let reread: serde_json::Value = serde_json::from_str(&text).expect("reparse");
+        let mut renormalized = reread.clone();
+        normalize_json_value(&mut renormalized);
+        assert_eq!(renormalized, built);
+        let mut twice = built.clone();
+        normalize_json_value(&mut twice);
+        assert_eq!(twice, built, "normalization is idempotent");
     }
 
     #[test]
