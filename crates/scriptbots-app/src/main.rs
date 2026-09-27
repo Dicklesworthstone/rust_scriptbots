@@ -12,9 +12,9 @@ use scriptbots_app::host_thread::{
 use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
     BootstrapEvidenceV0, BrainPreset, CharacterizationTraceV2, ControlServerConfig,
-    ControlServerReservation, RunIdentityV1, RunManifestV3, ScenarioDocumentV1, ScenarioIdentityV0,
-    ScenarioInterventionV1, SharedAnalytics, ThreadPolicyV0, apply_scenario_interventions,
-    create_brain_registry_for_config, install_brains,
+    ControlServerReservation, FounderRecipe, RunIdentityV1, RunManifestV3, ScenarioDocumentV1,
+    ScenarioIdentityV0, ScenarioInterventionV1, SharedAnalytics, ThreadPolicyV0,
+    apply_scenario_interventions, create_brain_registry_for_config, install_brains,
     precedence::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
@@ -500,7 +500,13 @@ fn main() -> Result<()> {
         let ticks_env = env::var("SCRIPTBOTS_DET_TICKS").ok();
         let tick_limit = ticks_env.and_then(|s| s.parse::<u64>().ok()).unwrap_or(500);
         let (config, scenario, _) = compose_config_with_scenario(&cli)?;
-        run_det_child(&config, tick_limit, cli.brain, &scenario.interventions)?;
+        run_det_child(
+            &config,
+            tick_limit,
+            cli.brain,
+            founder_recipe_of(&scenario)?,
+            &scenario.interventions,
+        )?;
         return Ok(());
     }
     let (config, mut launch_scenario, config_overrides) = compose_config_with_scenario(&cli)?;
@@ -549,7 +555,12 @@ fn main() -> Result<()> {
     }
 
     if cli.replay_db.is_some() {
-        run_replay_cli(&cli, &config, &launch_scenario.interventions)?;
+        run_replay_cli(
+            &cli,
+            &config,
+            founder_recipe_of(&launch_scenario)?,
+            &launch_scenario.interventions,
+        )?;
         return Ok(());
     }
 
@@ -657,7 +668,12 @@ fn main() -> Result<()> {
         }
         .publish();
         if let Some(ticks) = cli.profile_steps {
-            profile_world_steps(&config, ticks, cli.brain)?;
+            profile_world_steps(
+                &config,
+                ticks,
+                cli.brain,
+                founder_recipe_of(&launch_scenario)?,
+            )?;
         }
         if let Some(ticks) = cli.profile_storage_steps {
             profile_world_steps_with_storage(
@@ -1577,7 +1593,7 @@ fn run_characterization_v0(
     let (mut world, mut persistence) =
         WorldState::with_persistence(config, Box::new(NullPersistence))?;
     let brain_keys = install_brains(&mut world, cli.brain)?.population;
-    seed_agents(&mut world, &brain_keys)?;
+    seed_agents(&mut world, &brain_keys, founder_recipe_of(&scenario)?)?;
 
     scenario.bootstrap_ticks = 0;
 
@@ -1630,9 +1646,17 @@ fn run_det_child(
     config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
+    founders: FounderRecipe,
     interventions: &[ScenarioInterventionV1],
 ) -> Result<()> {
-    let run = run_headless_simulation(config, tick_limit, brain_preset, interventions, None)?;
+    let run = run_headless_simulation(
+        config,
+        tick_limit,
+        brain_preset,
+        founders,
+        interventions,
+        None,
+    )?;
     #[derive(serde::Serialize)]
     struct DetOut {
         events: usize,
@@ -2456,7 +2480,7 @@ fn bootstrap_world(
         world.set_sense_provider(provider);
     }
     let brain_keys = install_brains(&mut world, brain_preset)?.population;
-    seed_agents(&mut world, &brain_keys)?;
+    seed_agents(&mut world, &brain_keys, founder_recipe_of(&scenario)?)?;
 
     let started_at_unix_ms = run_started_at_unix_ms()?;
     let identity = RunIdentityV1::new(
@@ -2653,10 +2677,14 @@ fn compose_config_with_scenario(
             ScenarioIdentityV0::caller_seeded(scenario_id)
         }
     };
-    scenario.population_recipe = format!(
-        "fixed-4x4-registered-brain-grid-v1;brain={}",
-        cli.brain.as_str()
-    );
+    // Founders follow the same rule as the ecology above: a scenario document keeps the
+    // corner grid its trajectories were built on, a launch without one spreads its founders.
+    let founders = if scenario_document.is_none() {
+        FounderRecipe::Spread
+    } else {
+        FounderRecipe::CornerGrid
+    };
+    scenario.population_recipe = format!("{};brain={}", founders.id(), cli.brain.as_str());
 
     let defaults_value =
         serde_json::to_value(&defaults).context("failed to serialize base config")?;
@@ -4578,6 +4606,7 @@ fn run_verify_bundle_cli(bundle_path: &Path) -> Result<()> {
 fn run_replay_cli(
     cli: &AppCli,
     config: &ScriptBotsConfig,
+    founders: FounderRecipe,
     interventions: &[ScenarioInterventionV1],
 ) -> Result<()> {
     let db_path = cli
@@ -4660,6 +4689,7 @@ fn run_replay_cli(
             config,
             tick_limit,
             cli.brain,
+            founders,
             interventions,
             (!digest_ticks.is_empty()).then_some(&digest_ticks),
         )?;
@@ -5095,6 +5125,7 @@ fn run_headless_simulation(
     config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
+    founders: FounderRecipe,
     interventions: &[ScenarioInterventionV1],
     digest_ticks: Option<&BTreeSet<u64>>,
 ) -> Result<ReplayRun> {
@@ -5109,7 +5140,7 @@ fn run_headless_simulation(
     let (mut world, mut persistence) =
         WorldState::with_persistence(run_config, Box::new(collector))?;
     let brain_keys = install_brains(&mut world, brain_preset)?.population;
-    seed_agents(&mut world, &brain_keys)?;
+    seed_agents(&mut world, &brain_keys, founders)?;
 
     emit_sense_startup_contract();
     let mut current_config = serde_json::to_value(world.config())?;
@@ -5282,12 +5313,13 @@ fn profile_world_steps(
     config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
+    founders: FounderRecipe,
 ) -> Result<()> {
     let (collector, _handle) = ReplayCollector::new();
     let (mut world, mut persistence) =
         WorldState::with_persistence(config.clone(), Box::new(collector))?;
     let brain_keys = install_brains(&mut world, brain_preset)?.population;
-    seed_agents(&mut world, &brain_keys)?;
+    seed_agents(&mut world, &brain_keys, founders)?;
 
     emit_sense_startup_contract();
     let start = Instant::now();
@@ -5345,7 +5377,7 @@ fn profile_world_steps_with_storage(
     let mut world = WorldState::new(run_config)
         .context("failed to construct storage profile before tick zero")?;
     let brain_keys = install_brains(&mut world, brain_preset)?.population;
-    seed_agents(&mut world, &brain_keys)?;
+    seed_agents(&mut world, &brain_keys, founder_recipe_of(&scenario)?)?;
 
     let started_at_unix_ms = run_started_at_unix_ms()?;
     let identity = RunIdentityV1::new(
@@ -5995,9 +6027,19 @@ fn parse_png_size(raw: &str) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-fn seed_agents(world: &mut WorldState, brain_keys: &[u64]) -> Result<()> {
-    scriptbots_app::seed_founding_population(world, brain_keys)
+fn seed_agents(world: &mut WorldState, brain_keys: &[u64], recipe: FounderRecipe) -> Result<()> {
+    scriptbots_app::seed_founders(world, brain_keys, recipe)
         .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// The founder recipe a composed scenario identity recorded in `population_recipe`.
+fn founder_recipe_of(scenario: &ScenarioIdentityV0) -> Result<FounderRecipe> {
+    FounderRecipe::from_population_recipe(&scenario.population_recipe).ok_or_else(|| {
+        anyhow::anyhow!(
+            "population recipe {:?} names no known founder recipe",
+            scenario.population_recipe
+        )
+    })
 }
 
 #[cfg(test)]
@@ -6672,6 +6714,7 @@ mod tests {
             },
             2,
             BrainPreset::Ft,
+            FounderRecipe::CornerGrid,
             &[],
             None,
         )
@@ -6734,7 +6777,8 @@ mod tests {
         .expect("world");
         let installed =
             install_brains(&mut world, BrainPreset::Mixed).expect("install seed brains");
-        seed_agents(&mut world, &installed.population).expect("seed founding population");
+        seed_agents(&mut world, &installed.population, FounderRecipe::CornerGrid)
+            .expect("seed founding population");
 
         persistence
             .step(&mut world)
@@ -6771,7 +6815,7 @@ mod tests {
                 compose_config_with_scenario(&cli).expect("compose FT scenario provenance");
             assert_eq!(
                 scenario.population_recipe,
-                "fixed-4x4-registered-brain-grid-v1;brain=ft"
+                "seeded-uniform-spread-20-registered-brain-v1;brain=ft"
             );
         });
     }
@@ -7528,7 +7572,8 @@ mod tests {
             rng_seed: None,
             ..ScriptBotsConfig::default()
         };
-        let scenario = ScenarioIdentityV0::caller_seeded("characterization-seed-test");
+        let mut scenario = ScenarioIdentityV0::caller_seeded("characterization-seed-test");
+        scenario.population_recipe = format!("{};brain=mixed", FounderRecipe::CornerGrid.id());
 
         run_characterization_v0(&cli, config, scenario, Vec::new(), 0)
             .expect("capture zero-tick characterization");
@@ -7629,7 +7674,7 @@ activation = "Sigmoid"
 
             let mut expected = ScenarioIdentityV0::caller_seeded("scriptbots-app-layered-v2");
             expected.population_recipe =
-                "fixed-4x4-registered-brain-grid-v1;brain=mixed".to_owned();
+                "seeded-uniform-spread-20-registered-brain-v1;brain=mixed".to_owned();
             // No scenario document, so the defaults layer is the app launch ecology.
             let defaults_value = serde_json::to_value(ScriptBotsConfig {
                 persistence_interval: 60,
@@ -7975,7 +8020,8 @@ activation = "Sigmoid"
                     .expect("world");
             let keys = install_brains(&mut world, BrainPreset::Mixed)
                 .expect("install replay-fixture brains");
-            seed_agents(&mut world, &keys.population).expect("seed replay-fixture brains");
+            seed_agents(&mut world, &keys.population, FounderRecipe::CornerGrid)
+                .expect("seed replay-fixture brains");
             for index in 0..16 {
                 if index + 1 == 16 {
                     world.request_replay_world_digest();
@@ -7997,8 +8043,15 @@ activation = "Sigmoid"
             .expect("durable replay rows must have unique canonical identities");
         assert_eq!(max_tick, 16, "fixture must persist its partial final tail");
 
-        let replay = run_headless_simulation(&config, max_tick, BrainPreset::Mixed, &[], None)
-            .expect("replay run");
+        let replay = run_headless_simulation(
+            &config,
+            max_tick,
+            BrainPreset::Mixed,
+            FounderRecipe::CornerGrid,
+            &[],
+            None,
+        )
+        .expect("replay run");
         assert_eq!(replay.simulated_ticks, max_tick);
         assert_eq!(
             replay
@@ -8883,8 +8936,15 @@ activation = "Sigmoid"
         };
 
         // 1. Run uninterrupted simulation for 20 ticks.
-        let uninterrupted = run_headless_simulation(&config, 20, BrainPreset::Mlp, &[], None)
-            .expect("uninterrupted simulation should succeed");
+        let uninterrupted = run_headless_simulation(
+            &config,
+            20,
+            BrainPreset::Mlp,
+            FounderRecipe::CornerGrid,
+            &[],
+            None,
+        )
+        .expect("uninterrupted simulation should succeed");
         assert_eq!(uninterrupted.simulated_ticks, 20);
 
         // 2. Run initial phase without persistence up to tick 10 and capture checkpoint.
@@ -8892,7 +8952,7 @@ activation = "Sigmoid"
         let brain_keys = install_brains(&mut seed_world, BrainPreset::Mlp)
             .expect("install brains")
             .population;
-        seed_agents(&mut seed_world, &brain_keys).expect("seed agents");
+        seed_agents(&mut seed_world, &brain_keys, FounderRecipe::CornerGrid).expect("seed agents");
         for _ in 0..10 {
             seed_world.step().expect("step seed world");
         }
@@ -9001,7 +9061,7 @@ activation = "Sigmoid"
         ])
         .expect("parse cli");
 
-        let result = run_replay_cli(&cli, &config, &[]);
+        let result = run_replay_cli(&cli, &config, FounderRecipe::Spread, &[]);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(

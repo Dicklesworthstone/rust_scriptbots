@@ -425,7 +425,13 @@ fn mock_free_checkpoint_start_replay_e2e() {
     let brain_keys = scriptbots_app::install_brains(&mut world, scriptbots_app::BrainPreset::Mixed)
         .expect("install brains")
         .population;
-    scriptbots_app::seed_founding_population(&mut world, &brain_keys).expect("seed founders");
+    // The binary ran without a scenario document, so it used the spread founder recipe.
+    scriptbots_app::seed_founders(
+        &mut world,
+        &brain_keys,
+        scriptbots_app::FounderRecipe::Spread,
+    )
+    .expect("seed founders");
     for _ in 0..12 {
         world.step().expect("step world");
     }

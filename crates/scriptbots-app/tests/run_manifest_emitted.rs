@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use scriptbots_app::{
     CHARACTERIZATION_TRACE_V2_SCHEMA, CharacterizationTraceV2, ManifestMaskError,
     NON_REPRODUCIBLE_MANIFEST_BLOCK, RUN_MANIFEST_V3_BOOTSTRAP_SCHEMA, RUN_MANIFEST_V3_SCHEMA,
-    RunManifestV3, canonical_json_value_bytes, mask_canonical_manifest_bytes,
+    RunManifestV3, SPREAD_FOUNDER_COUNT, canonical_json_value_bytes, mask_canonical_manifest_bytes,
 };
 use scriptbots_core::{Tick, rng_domains::AgentSubstreamProtocolV1, world_counters_digest_v1};
 use scriptbots_runtime::RunId;
@@ -374,8 +374,10 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
             .is_empty(),
         "the protocol must name the concrete target-independent random generator"
     );
-    assert_eq!(sidecar.next_agent_uid, 17);
-    assert_eq!(sidecar.next_spawn_ordinal, 16);
+    // A launch without a scenario document seeds the spread founder recipe.
+    let founders = SPREAD_FOUNDER_COUNT as u64;
+    assert_eq!(sidecar.next_agent_uid, founders + 1);
+    assert_eq!(sidecar.next_spawn_ordinal, founders);
     assert_eq!(sidecar.next_birth_ordinal, 0);
     let launch_agent_uids = sidecar
         .agent_rng_counters
@@ -384,7 +386,7 @@ fn a_real_run_writes_a_manifest_next_to_its_database() {
         .collect::<Vec<_>>();
     assert_eq!(
         launch_agent_uids,
-        (1_u64..=16).collect::<Vec<_>>(),
+        (1_u64..=founders).collect::<Vec<_>>(),
         "the launch continuation rows must be sorted by every founder's stable UID"
     );
     for state in &sidecar.agent_rng_counters {

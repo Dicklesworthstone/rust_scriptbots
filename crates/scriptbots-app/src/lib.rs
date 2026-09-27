@@ -668,9 +668,100 @@ pub enum ScenarioRunError {
     },
 }
 
-/// Seed the fixed 4x4 registered-brain founder grid — the app's founding recipe
-/// (`fixed-4x4-registered-brain-grid-v1`). Shared by the binary startup path and
-/// the scenario cohort-validation harness so both run the same founders.
+/// How a run places its founders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FounderRecipe {
+    /// The fixed 4x4 registered-brain grid in one corner. Scenario documents and every
+    /// harness that validates them use it, so their pinned trajectories stay put.
+    CornerGrid,
+    /// [`SPREAD_FOUNDER_COUNT`] founders at seeded uniform positions and headings across
+    /// the whole world, like the C++ original's random bots. Scenario-free launches use it.
+    Spread,
+}
+
+/// Number of founders placed by [`FounderRecipe::Spread`] (the launch population floor).
+pub const SPREAD_FOUNDER_COUNT: usize = 20;
+
+impl FounderRecipe {
+    /// Stable identifier recorded as the prefix of a manifest's `population_recipe`.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::CornerGrid => "fixed-4x4-registered-brain-grid-v1",
+            Self::Spread => "seeded-uniform-spread-20-registered-brain-v1",
+        }
+    }
+
+    /// The recipe named by a `population_recipe` string (`<id>;brain=<preset>`).
+    #[must_use]
+    pub fn from_population_recipe(population_recipe: &str) -> Option<Self> {
+        let id = population_recipe.split(';').next().unwrap_or_default();
+        [Self::CornerGrid, Self::Spread]
+            .into_iter()
+            .find(|recipe| recipe.id() == id)
+    }
+}
+
+/// Seed founders with `recipe`.
+pub fn seed_founders(
+    world: &mut WorldState,
+    brain_keys: &[u64],
+    recipe: FounderRecipe,
+) -> Result<(), ScenarioRunError> {
+    match recipe {
+        FounderRecipe::CornerGrid => seed_founding_population(world, brain_keys),
+        FounderRecipe::Spread => seed_spread_founders(world, brain_keys),
+    }
+}
+
+/// Place [`SPREAD_FOUNDER_COUNT`] founders uniformly across the world, deterministically
+/// per `rng_seed`. The generator is an explicit SplitMix64 rather than a `rand` type, so
+/// founder placement cannot move with a dependency upgrade. Brains rotate through the
+/// roster as in the grid recipe.
+fn seed_spread_founders(
+    world: &mut WorldState,
+    brain_keys: &[u64],
+) -> Result<(), ScenarioRunError> {
+    if brain_keys.is_empty() {
+        return Err(ScenarioRunError::EmptyBrainRoster);
+    }
+    let width = world.config().world_width as f32;
+    let height = world.config().world_height as f32;
+    let mut state = world.config().rng_seed.unwrap_or(0) ^ 0x5eed_f0d0_5b12_ead0;
+    let mut unit = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        // 24 high bits give an exactly representable f32 in [0, 1).
+        (z >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let mut agent = scriptbots_core::AgentData::default();
+    for index in 0..SPREAD_FOUNDER_COUNT {
+        agent.position.x = unit() * width;
+        agent.position.y = unit() * height;
+        agent.heading = unit().mul_add(std::f32::consts::TAU, -std::f32::consts::PI);
+        agent.spike_length = 10.0;
+        let id = world
+            .try_spawn_agent(agent)
+            .map_err(|error| ScenarioRunError::FounderNotFinite(error.to_string()))?;
+        let Some(&key) = brain_keys.get(index % brain_keys.len()) else {
+            return Err(ScenarioRunError::FounderSelectionInvariant(index as u64));
+        };
+        let bound = world
+            .bind_agent_brain(id, key)
+            .map_err(|error| ScenarioRunError::FounderNotFinite(error.to_string()))?;
+        if !bound {
+            return Err(ScenarioRunError::FounderBrainVanished { key });
+        }
+    }
+    Ok(())
+}
+
+/// Seed the fixed 4x4 registered-brain founder grid ([`FounderRecipe::CornerGrid`],
+/// `fixed-4x4-registered-brain-grid-v1`). Shared by scenario launches and the scenario
+/// cohort-validation harness so both run the same founders.
 pub fn seed_founding_population(
     world: &mut WorldState,
     brain_keys: &[u64],
@@ -2290,6 +2381,63 @@ mod characterization_tests {
         let value: serde_json::Value =
             serde_json::from_slice(&encoded).expect("inspect brain telemetry");
         assert_eq!(value["agent"], 0xfeed_beef_u64);
+    }
+
+    #[test]
+    fn spread_founders_are_seed_deterministic_and_cover_the_world() {
+        let place = |seed: u64| {
+            let mut world = WorldState::new(scriptbots_core::ScriptBotsConfig {
+                rng_seed: Some(seed),
+                persistence_interval: 0,
+                ..scriptbots_core::ScriptBotsConfig::default()
+            })
+            .expect("world");
+            let keys = install_brains(&mut world, BrainPreset::Mlp)
+                .expect("brains")
+                .population;
+            seed_founders(&mut world, &keys, FounderRecipe::Spread).expect("spread founders");
+            let (width, height) = (
+                world.config().world_width as f32,
+                world.config().world_height as f32,
+            );
+            let positions: Vec<(f32, f32)> = world
+                .agents()
+                .columns()
+                .positions()
+                .iter()
+                .map(|p| (p.x, p.y))
+                .collect();
+            (positions, width, height)
+        };
+        let (first, width, height) = place(11);
+        let (again, _, _) = place(11);
+        let (other, _, _) = place(12);
+        assert_eq!(first.len(), SPREAD_FOUNDER_COUNT);
+        assert_eq!(first, again, "same seed, same founders");
+        assert_ne!(first, other, "a different seed places founders differently");
+        let quadrants: std::collections::BTreeSet<(bool, bool)> = first
+            .iter()
+            .map(|&(x, y)| {
+                assert!((0.0..width).contains(&x) && (0.0..height).contains(&y));
+                (x < width / 2.0, y < height / 2.0)
+            })
+            .collect();
+        assert_eq!(
+            quadrants.len(),
+            4,
+            "founders reach every quadrant: {first:?}"
+        );
+        assert_eq!(
+            FounderRecipe::from_population_recipe(&format!(
+                "{};brain=mlp",
+                FounderRecipe::Spread.id()
+            )),
+            Some(FounderRecipe::Spread)
+        );
+        assert_eq!(
+            FounderRecipe::from_population_recipe("caller_seeded_world_v0"),
+            None
+        );
     }
 
     #[test]
