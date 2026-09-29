@@ -892,11 +892,15 @@ fn run_real_simulation(dir: &Path, name: &str, seed: u64) -> (String, u64, u64, 
         .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
         .expect("register mlp");
     for index in 0..40_u16 {
-        let mut agent = AgentData::default();
-        agent.position = Position::new(
-            f32::from(index % 8).mul_add(f32::from(u16::try_from(width / 8).expect("fit")), 17.0),
-            f32::from(index / 8).mul_add(f32::from(u16::try_from(height / 5).expect("fit")), 23.0),
-        );
+        let agent = AgentData {
+            position: Position::new(
+                f32::from(index % 8)
+                    .mul_add(f32::from(u16::try_from(width / 8).expect("fit")), 17.0),
+                f32::from(index / 8)
+                    .mul_add(f32::from(u16::try_from(height / 5).expect("fit")), 23.0),
+            ),
+            ..AgentData::default()
+        };
         let id = world.try_spawn_agent(agent).expect("spawn founder");
         assert!(world.bind_agent_brain(id, brain).expect("bind brain"));
     }

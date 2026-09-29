@@ -2712,6 +2712,10 @@ mod tests {
 }
 
 /// Evaluate full-field terrain surface sRGB in the WASM target (bd-2z0.14.1.2.4).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a wasm_bindgen export takes the terrain inputs as flat scalars so JavaScript can call it without constructing a struct"
+)]
 #[wasm_bindgen]
 pub fn evaluate_terrain_surface_srgb(
     kind: u8,
@@ -2754,4 +2758,3 @@ pub fn evaluate_terrain_surface_srgb(
     );
     srgb.to_vec()
 }
-
