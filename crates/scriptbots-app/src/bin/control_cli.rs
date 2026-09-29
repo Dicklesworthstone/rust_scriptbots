@@ -31,7 +31,7 @@ use scriptbots_app::{
         execute_narrative_around, execute_narrative_search, format_hits_table,
     },
 };
-use scriptbots_storage::StorageReader;
+use scriptbots_storage::{DomainEventPayload, StorageReader};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -93,7 +93,7 @@ enum Command {
         #[arg(long, default_value_t = 500)]
         interval_ms: u64,
     },
-    /// Export recent metrics or tick records to CSV from a FrankenSQLite run.
+    /// Export recent metrics, tick records or journal domain events to CSV from a FrankenSQLite run.
     Export {
         /// Kind of dataset to export.
         #[arg(value_enum)]
@@ -317,6 +317,9 @@ enum InterveneSubcommand {
 enum ExportKind {
     Metrics,
     Ticks,
+    /// Normalized birth, death and aggregate-combat events from the durable host journal.
+    /// Needs a finished run database: the reader validates every projection batch first.
+    DomainEvents,
 }
 
 #[tokio::main]
@@ -430,7 +433,11 @@ fn export_command(
             database.display()
         )
     })?;
-    let storage = StorageReader::open(database_path).with_context(|| {
+    let storage = match kind {
+        ExportKind::DomainEvents => StorageReader::open_finished(database_path),
+        ExportKind::Metrics | ExportKind::Ticks => StorageReader::open(database_path),
+    }
+    .with_context(|| {
         format!(
             "failed to open FrankenSQLite database {}",
             database.display()
@@ -445,6 +452,7 @@ fn export_command(
         let written = match kind {
             ExportKind::Metrics => export_metrics(&storage, &mut writer, last)?,
             ExportKind::Ticks => export_ticks(&storage, &mut writer, last)?,
+            ExportKind::DomainEvents => export_domain_events(&storage, &mut writer, last)?,
         };
 
         writer.flush().context("failed to flush CSV writer")?;
@@ -585,6 +593,82 @@ fn export_metrics<W: Write>(
     }
 
     Ok(records.len())
+}
+
+/// Records per domain-event page, the storage-wide row ceiling.
+const DOMAIN_EVENT_PAGE_RECORDS: usize = 4_096;
+/// Payload bytes per domain-event page.
+const DOMAIN_EVENT_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+fn export_domain_events<W: Write>(
+    storage: &StorageReader,
+    writer: &mut Writer<W>,
+    last: Option<usize>,
+) -> Result<usize> {
+    let limit = last.unwrap_or(4_096);
+    // Journal order (session, scientific sequence, ordinal) is chronological; keep the most
+    // recent `limit` rows across every session.
+    let mut rows = std::collections::VecDeque::with_capacity(limit.min(4_096));
+    for session in storage.host_journal_sessions()? {
+        let mut after = None;
+        loop {
+            let page = storage.domain_event_page(
+                session,
+                after,
+                DOMAIN_EVENT_PAGE_RECORDS,
+                DOMAIN_EVENT_PAGE_BYTES,
+            )?;
+            for event in &page.events {
+                let (kind, agent_uid, payload_json) = match &event.payload {
+                    DomainEventPayload::Birth(record) => (
+                        "birth",
+                        record.agent_uid.get().to_string(),
+                        serde_json::to_string(record)?,
+                    ),
+                    DomainEventPayload::Death(record) => (
+                        "death",
+                        record.agent_uid.get().to_string(),
+                        serde_json::to_string(record)?,
+                    ),
+                    DomainEventPayload::Combat(summary) => {
+                        ("combat", String::new(), serde_json::to_string(summary)?)
+                    }
+                };
+                rows.push_back([
+                    event.session_id.get().to_string(),
+                    event.scientific_event_sequence.get().to_string(),
+                    event.event_ordinal.to_string(),
+                    event.tick.0.to_string(),
+                    kind.to_owned(),
+                    agent_uid,
+                    payload_json,
+                ]);
+                if rows.len() > limit {
+                    rows.pop_front();
+                }
+            }
+            match page.next_after {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+    }
+
+    writer
+        .write_record([
+            "session_id",
+            "scientific_event_sequence",
+            "event_ordinal",
+            "tick",
+            "kind",
+            "agent_uid",
+            "payload_json",
+        ])
+        .context("failed to write domain-event header")?;
+    for row in &rows {
+        writer.write_record(row)?;
+    }
+    Ok(rows.len())
 }
 
 fn export_ticks<W: Write>(

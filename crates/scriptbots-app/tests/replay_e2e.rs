@@ -76,6 +76,122 @@ fn export_csv(database: &Path, kind: &str, out: &Path) -> Output {
     cmd.output().expect("failed to run control_cli export")
 }
 
+/// Export a run's journal domain events and check the CSV against the storage layer's own
+/// evidence: same row count, journal order, known kinds, JSON payloads. Returns the number of
+/// exported rows as (reproductive births with origin "born", all births, deaths, combat).
+fn verify_domain_event_export(database: &Path, out: &Path) -> (u64, u64, u64, u64) {
+    let export = export_csv(database, "domain-events", out);
+    assert!(
+        export.status.success(),
+        "domain-events export failed: {}",
+        stderr_text(&export)
+    );
+    let finished =
+        scriptbots_storage::StorageReader::open_finished(database.to_str().expect("utf-8 path"))
+            .expect("finished reader opens the run");
+    let mut durable_events = 0_u64;
+    for session in finished.host_journal_sessions().expect("journal sessions") {
+        durable_events += finished
+            .domain_event_evidence(
+                session,
+                scriptbots_storage::DomainEventExpectation::AllowEmpty,
+            )
+            .expect("domain-event evidence")
+            .domain_event_count;
+    }
+    finished.close().expect("finished reader closes");
+    let mut reader = csv::Reader::from_path(out).expect("read domain-events CSV");
+    assert_eq!(
+        reader.headers().expect("domain-events header"),
+        vec![
+            "session_id",
+            "scientific_event_sequence",
+            "event_ordinal",
+            "tick",
+            "kind",
+            "agent_uid",
+            "payload_json",
+        ],
+        "domain-events CSV header"
+    );
+    let (mut born, mut births, mut deaths, mut combat) = (0_u64, 0_u64, 0_u64, 0_u64);
+    let mut previous_key: Option<(u64, u64, u64)> = None;
+    for record in reader.records() {
+        let record = record.expect("domain-events CSV row");
+        let key: (u64, u64, u64) = (
+            record[0].parse().expect("session id"),
+            record[1].parse().expect("scientific sequence"),
+            record[2].parse().expect("event ordinal"),
+        );
+        if let Some(previous) = previous_key {
+            assert!(
+                key > previous,
+                "domain events must stay in journal order: {record:?}"
+            );
+        }
+        previous_key = Some(key);
+        record[3].parse::<u64>().expect("tick");
+        match &record[4] {
+            "birth" => births += 1,
+            "death" => deaths += 1,
+            "combat" => combat += 1,
+            other => panic!("unknown domain-event kind {other:?}: {record:?}"),
+        }
+        assert_eq!(
+            record[5].is_empty(),
+            &record[4] == "combat",
+            "only aggregate combat rows lack an agent uid: {record:?}"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&record[6]).expect("payload is JSON");
+        if &record[4] == "birth" && payload["origin"] == "born" {
+            born += 1;
+        }
+    }
+    assert_eq!(
+        births + deaths + combat,
+        durable_events,
+        "the export must carry exactly the durable domain events"
+    );
+    (born, births, deaths, combat)
+}
+
+#[test]
+fn domain_event_export_carries_a_meadow_runs_births() {
+    // The meadow scenario's checked-in envelope requires at least 5 reproductive births
+    // within 360 ticks on its declared seed 42, so this run cannot be vacuous.
+    let temp_dir = tempdir().expect("temp run directory");
+    let database = temp_dir.path().join("meadow.sqlite");
+    let scenario =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/meadow.scenario.toml");
+    let mut cmd = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    cmd.env("SCRIPTBOTS_TERMINAL_HEADLESS", "1")
+        .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", "2")
+        .env("SCRIPTBOTS_STORAGE_PATH", &database)
+        .arg("--storage")
+        .arg("file")
+        .arg("--threads")
+        .arg("1")
+        .arg("--scenario")
+        .arg(&scenario)
+        .arg("--bootstrap-ticks")
+        .arg("360")
+        .arg("--set")
+        .arg("rng_seed=42");
+    let produced = cmd.output().expect("run meadow");
+    assert!(
+        produced.status.success(),
+        "meadow run failed: {}",
+        stderr_text(&produced)
+    );
+    let (born, births, deaths, combat) =
+        verify_domain_event_export(&database, &temp_dir.path().join("meadow_events.csv"));
+    assert!(
+        born >= 5,
+        "meadow's envelope promises >= 5 reproductive births by tick 360; exported {born} \
+         (births {births}, deaths {deaths}, combat {combat})"
+    );
+}
+
 fn stderr_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -221,6 +337,11 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
         }
         previous_tick = Some(tick);
     }
+
+    // Domain events: a short launch-ecology run may have none yet, so this checks the export
+    // against the storage evidence; `domain_event_export_carries_a_meadow_runs_births` checks
+    // a run that is guaranteed to have some.
+    verify_domain_event_export(&baseline_db, &temp_dir.path().join("domain_events.csv"));
 
     // ------------------------------------------------------------------
     // Phase 4: replay verification succeeds for the exact baseline config.

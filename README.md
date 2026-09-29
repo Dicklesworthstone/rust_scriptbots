@@ -946,6 +946,8 @@ cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
 # `--out` must name a fresh path; export refuses every existing file, symlink, or database sidecar.
 RUN_DB='runs/scriptbots-1773264512345-4242.sqlite' # example shape; replace with the printed path
 cargo run -p scriptbots-app --bin control_cli -- export metrics --db "$RUN_DB" --last 1000 --out latest_metrics.csv
+# Births, deaths and aggregate combat from the durable host journal (a finished run; payload_json per row):
+cargo run -p scriptbots-app --bin control_cli -- export domain-events --db "$RUN_DB" --last 100000 --out domain_events.csv
 # New commands:
 cargo run -p scriptbots-app --bin control_cli -- presets
 cargo run -p scriptbots-app --bin control_cli -- apply-preset arctic

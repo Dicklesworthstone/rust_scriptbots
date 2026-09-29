@@ -10406,6 +10406,29 @@ impl StorageReader {
         })
     }
 
+    /// Host sessions this finished run recorded in its journal, in ascending id order.
+    ///
+    /// Each is a valid `session_id` for [`Self::domain_event_page`] and
+    /// [`Self::domain_event_evidence`].
+    pub fn host_journal_sessions(&self) -> Result<Vec<HostSessionId>, StorageError> {
+        let connection = self.finished_connection()?;
+        let rows = connection.query_with_params(
+            "SELECT host_session_id FROM host_journal_progress
+             WHERE run_id = ?1
+             ORDER BY host_session_id ASC",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let encoded: String = decode(row, 0, "host_journal_progress.host_session_id")?;
+                Ok(HostSessionId::new(decode_journal_u64(
+                    "host_journal_progress.host_session_id",
+                    &encoded,
+                )?))
+            })
+            .collect()
+    }
+
     /// Validate complete normalized-domain coverage and evaluate an explicit non-vacuity policy.
     ///
     /// A projection-batch row is required for every durable scientific sequence, including honest
