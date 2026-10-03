@@ -3072,7 +3072,8 @@ fn gather_cli_statements(
         let fields: JsonValue = toml::from_str(entry).with_context(|| {
             format!(
                 "failed to parse --set {entry} as TOML (expected PATH=VALUE; string values \
-                 use TOML quotes, e.g. --set 'label=\"dunes\"')"
+                 use TOML quotes, e.g. --set 'label=\"dunes\"'; TOML integers are signed \
+                 64-bit, so pass a printed run seed above 9223372036854775807 with --rng-seed)"
             )
         })?;
         if fields.as_object().is_none_or(serde_json::Map::is_empty) {
@@ -8691,6 +8692,28 @@ activation = "Sigmoid"
                 format!("{error:#}").contains("--set"),
                 "the error must name the flag: {error:#}"
             );
+        });
+    }
+
+    /// Half of all printed run seeds exceed TOML's signed 64-bit integers, so `--set` cannot
+    /// carry them; the refusal must name the flag that can, and that flag must accept them.
+    #[test]
+    #[serial]
+    fn set_override_points_unsigned_seeds_at_the_typed_seed_flag() {
+        const SEED: u64 = 17_341_985_196_503_452_816;
+        with_clean_config_env(|| {
+            let mut cli = default_cli();
+            cli.set_overrides = vec![format!("rng_seed={SEED}")];
+            let error = compose_config(&cli).expect_err("a u64 above i64::MAX is not TOML");
+            assert!(
+                format!("{error:#}").contains("--rng-seed"),
+                "the error must name the flag that accepts the seed: {error:#}"
+            );
+
+            let mut cli = default_cli();
+            cli.rng_seed = Some(SEED);
+            let config = compose_config(&cli).expect("--rng-seed takes the full u64 range");
+            assert_eq!(config.rng_seed, Some(SEED));
         });
     }
 
