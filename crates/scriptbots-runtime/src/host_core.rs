@@ -2650,6 +2650,35 @@ impl HostCore {
         }
     }
 
+    /// Admit a host-owned [`HostCommand::FlushPersistence`] (bd-2mpi).
+    ///
+    /// Used by the owner when a checkpoint is requested from a host that will not reach
+    /// another persistence boundary by itself. The identity comes from the same reserved
+    /// lifecycle namespace as shutdown, so it cannot collide with a client command.
+    pub fn request_persistence_flush(&mut self) -> Result<CommandStatus, HostAccessError> {
+        loop {
+            let sequence = self.next_lifecycle_command_sequence;
+            let candidate = CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
+            let result = self.shared.borrow_mut().submit(
+                CommandEnvelope::new(candidate, HostCommand::FlushPersistence),
+                false,
+            );
+            let advanced = sequence
+                .checked_add(1)
+                .ok_or_else(|| protocol_violation("lifecycle command sequence exhausted"))?;
+            match result {
+                Ok(status) => {
+                    self.next_lifecycle_command_sequence = advanced;
+                    return Ok(status);
+                }
+                Err(HostAccessError::CommandIdCollision { .. }) => {
+                    self.next_lifecycle_command_sequence = advanced;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Stable identity of the admitted ordered shutdown, when one exists.
     #[must_use]
     pub fn shutdown_command_id(&self) -> Option<CommandId> {
@@ -3809,6 +3838,9 @@ impl HostCore {
                 next_control,
             ),
             HostCommand::Step => self.apply_step_command(admission, &retry_envelope, next_control),
+            HostCommand::FlushPersistence => {
+                self.apply_flush_persistence_command(admission, &retry_envelope)
+            }
             HostCommand::Shutdown => {
                 self.apply_shutdown_command(admission, &retry_envelope, next_control)
             }
@@ -4254,6 +4286,44 @@ impl HostCore {
         self.complete_applied_with(envelope.command_id, admission, applied)?;
         let blocked = self.offer_journal(envelope, applied, None, persistence)?;
         self.synchronize_health()?;
+        Ok(ApplyResult::completed(blocked))
+    }
+
+    /// Stage and journal the partial persistence tail without advancing a tick (bd-2mpi).
+    ///
+    /// The batch is the same projection shutdown stages, and it travels through the same
+    /// journal admission, so the world reaches a sealed boundary only once the journal has
+    /// accepted the work. Unlike shutdown, the host keeps running and control state is
+    /// unchanged, so no control revision is consumed.
+    fn apply_flush_persistence_command(
+        &mut self,
+        admission: AdmissionSequence,
+        envelope: &CommandEnvelope,
+    ) -> Result<ApplyResult, HostAccessError> {
+        let persistence = match self.persistence.stage_final_batch(&mut self.world) {
+            Ok(persistence) => persistence,
+            Err(error) => {
+                let blocked = self.complete_failed(
+                    envelope.command_id,
+                    admission,
+                    "persistence_flush",
+                    error.to_string(),
+                )?;
+                // An earlier fault is the diagnosis; a flush failing because of it is not.
+                if self.latched_fault.is_none() {
+                    self.latched_fault = Some(HostFault::Scientific {
+                        tick: self.world.tick(),
+                        code: "persistence_flush".to_owned(),
+                        message: error.to_string(),
+                    });
+                }
+                self.synchronize_health()?;
+                return Ok(ApplyResult::completed(blocked));
+            }
+        };
+        let applied = self.applied_boundary();
+        self.complete_applied_with(envelope.command_id, admission, applied)?;
+        let blocked = self.offer_journal(envelope, applied, None, persistence)?;
         Ok(ApplyResult::completed(blocked))
     }
 
@@ -10454,6 +10524,100 @@ mod tests {
                 .last()
                 .expect("shutdown admission attempt")
         ));
+    }
+
+    /// bd-2mpi: a paused host between persistence ticks can be made quiescent on demand,
+    /// without stopping it and without perturbing the science that follows.
+    #[test]
+    fn persistence_flush_seals_a_paused_mid_cadence_world_without_perturbing_science() {
+        let journal_state = Rc::new(RefCell::new(FakeJournalState::default()));
+        let mut core = HostCore::with_journal(
+            HostSessionId::new(12),
+            world(3),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::clone(&journal_state),
+            }),
+        )
+        .expect("host with cadence journal");
+        let mut port = core.local_port();
+        submit(&mut port, 1, HostCommand::Step);
+        submit(&mut port, 2, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("two deferred persistence steps");
+        assert!(
+            core.world.capture_checkpoint_quiescent().is_err(),
+            "tick 2 of a 3-tick cadence must hold deferred output, or this test proves nothing"
+        );
+
+        submit(&mut port, 3, HostCommand::FlushPersistence);
+        let receipt = core
+            .drive(ManualInstant::from_nanos(1))
+            .expect("flush boundary");
+        assert!(matches!(receipt.blocker, Some(HostBlocker::PlaybackPaused)));
+        let flush = journal_state
+            .borrow()
+            .attempts
+            .last()
+            .cloned()
+            .expect("flush journal attempt");
+        assert!(
+            flush
+                .command()
+                .is_some_and(|command| matches!(&command.command, HostCommand::FlushPersistence))
+        );
+        assert!(flush.scientific().is_none());
+        assert_eq!(
+            flush
+                .persistence()
+                .expect("partial cadence persistence payload")
+                .summary
+                .tick,
+            Tick(2)
+        );
+        assert_eq!(applied(&status(&mut port, 3)).tick, Tick(2));
+        assert_eq!(core.lifecycle, HostLifecycle::Running);
+        core.world
+            .capture_checkpoint_quiescent()
+            .expect("a flushed world is quiescent");
+
+        // Flushing a sealed boundary again journals the lifecycle only.
+        submit(&mut port, 4, HostCommand::FlushPersistence);
+        core.drive(ManualInstant::from_nanos(2))
+            .expect("idempotent flush boundary");
+        let repeat = journal_state
+            .borrow()
+            .attempts
+            .last()
+            .cloned()
+            .expect("repeat flush journal attempt");
+        assert!(repeat.persistence().is_none());
+
+        // The science after a flush is the science without one.
+        submit(&mut port, 5, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(3))
+            .expect("step after flush");
+        let mut twin = HostCore::with_journal(
+            HostSessionId::new(13),
+            world(3),
+            options(true),
+            Box::new(FakeJournal {
+                state: Rc::new(RefCell::new(FakeJournalState::default())),
+            }),
+        )
+        .expect("unflushed twin");
+        let mut twin_port = twin.local_port();
+        for id in 1..=3 {
+            submit(&mut twin_port, id, HostCommand::Step);
+        }
+        twin.drive(ManualInstant::from_nanos(0))
+            .expect("three unflushed steps");
+        assert_eq!(core.world_tick(), Tick(3));
+        assert_eq!(twin.world_tick(), Tick(3));
+        assert_eq!(
+            core.scientific_digest_v1().expect("flushed digest"),
+            twin.scientific_digest_v1().expect("unflushed digest")
+        );
     }
 
     #[test]

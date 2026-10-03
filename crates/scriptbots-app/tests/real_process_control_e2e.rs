@@ -19,6 +19,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serial_test::serial;
 use tempfile::tempdir;
 
+/// A persistence cadence no test run reaches, so a paused world is always mid-cadence.
+const MID_CADENCE_INTERVAL: u32 = 1_000_000;
+
 /// The shipped binary, following the house convention.
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_scriptbots-app"))
@@ -1287,11 +1290,14 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
     let run_dir = tempdir()?;
     let jsonl_log_path = run_dir.path().join("e2e_events.jsonl");
 
-    // Every tick is a persistence boundary here, so the world is paused exactly at a
-    // sealed boundary once its journal drains and the checkpoint below captures it.
+    // The cadence is far longer than this run, so the paused world is always between
+    // persistence ticks: the checkpoint below must flush the partial tail itself (bd-2mpi).
     let mut child = Command::new(binary())
         .args(["--mode", "server", "--storage", "file"])
-        .args(["--set", "persistence_interval=1"])
+        .args([
+            "--set",
+            &format!("persistence_interval={MID_CADENCE_INTERVAL}"),
+        ])
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_CONTROL_MCP", "http")
@@ -1566,10 +1572,10 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
 
         // --- 5. Checkpoint and Artifact Lifecycle ---
         // A checkpoint is a real core capture: the owner answers it only at a quiescent
-        // persistence boundary, after the latest batch has been acknowledged. A debug build
-        // on a loaded host can run with its journal permanently full, which is never
-        // quiescent, so pause the world and let the journal drain first -- the way an
-        // operator snapshots a busy run.
+        // persistence boundary. A paused world between persistence ticks never reaches one
+        // by itself, so the owner flushes the partial tail and answers once it is journaled.
+        // A debug build on a loaded host can run with its journal permanently full, so pause
+        // and let the journal drain first -- the way an operator snapshots a busy run.
         let (pause_code, pause_body) = http(rest_addr, "POST", "/api/control/pause")?;
         assert_eq!(pause_code, 200, "pause before checkpoint: {pause_body}");
         let pause_id = json_str(&pause_body, "command_id")
@@ -1581,6 +1587,26 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
                 break;
             }
             assert!(Instant::now() < deadline, "pause never applied: {body}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // A debug build can pause before its first tick; one step puts the paused world
+        // strictly between persistence ticks however fast or slow this host is.
+        let (step_code, step_body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/control/step",
+            b"{\"count\":1}",
+            Some("application/json"),
+        )?;
+        assert_eq!(step_code, 200, "step before checkpoint: {step_body}");
+        let step_id = json_str(&step_body, "command_id")
+            .ok_or_else(|| anyhow!("step response carried no command_id: {step_body}"))?;
+        loop {
+            let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{step_id}"))?;
+            if code == 200 && json_str(&body, "application_state").as_deref() == Some("applied") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "step never applied: {body}");
             std::thread::sleep(Duration::from_millis(50));
         }
         loop {
@@ -1605,6 +1631,12 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         )?;
         assert_eq!(chk_code, 201, "chk response: {chk_resp}");
         let chk_json: serde_json::Value = serde_json::from_str(&chk_resp)?;
+        let chk_tick = chk_json["tick"].as_u64().expect("checkpoint tick");
+        assert!(
+            chk_tick > 0 && !chk_tick.is_multiple_of(u64::from(MID_CADENCE_INTERVAL)),
+            "checkpoint at tick {chk_tick} is not between persistence ticks, so it did not \
+             exercise the paused-flush path"
+        );
         let chk_id = chk_json["checkpoint_id"]
             .as_str()
             .expect("chk id")

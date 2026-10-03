@@ -197,6 +197,11 @@ impl FixedDeadlineHost {
         self.core.request_shutdown()
     }
 
+    /// Admit a host-owned persistence flush; see [`HostCore::request_persistence_flush`].
+    pub fn request_persistence_flush(&mut self) -> Result<CommandStatus, HostAccessError> {
+        self.core.request_persistence_flush()
+    }
+
     /// Retry the exact retained journal allocation after an explicit ready wake.
     pub fn retry_retained_journal(&mut self) -> Result<Option<JournalAdmission>, HostAccessError> {
         self.core.retry_retained_journal()

@@ -1869,6 +1869,15 @@ pub enum HostCommand {
     ApplyMap(Box<scriptbots_core::MapArtifact>),
     /// Apply an intervention command with canonical metadata and parameters.
     Intervention(Box<scriptbots_core::interventions::InterventionCommand>),
+    /// Persist the partial cadence tail now, without advancing a tick (bd-2mpi).
+    ///
+    /// Births, deaths and replay events queue between persistence ticks, and a
+    /// world checkpoint refuses to drop them. A running host reaches the next
+    /// cadence tick by itself; a paused one never does. This stages the same
+    /// partial batch that shutdown stages and journals it, leaving the world at a
+    /// sealed, quiescent boundary while the host keeps running. Already at a
+    /// sealed boundary, it journals only its lifecycle.
+    FlushPersistence,
 }
 
 impl HostCommand {
@@ -1956,6 +1965,7 @@ impl HostCommand {
             | Self::UpdateSimulation(_)
             | Self::ApplyMap(_)
             | Self::Intervention(_)
+            | Self::FlushPersistence
             | Self::Shutdown => true,
         }
     }
@@ -2569,6 +2579,18 @@ impl CommandLifecycleEvidence {
             && self.terminal().is_some_and(|transition| {
                 matches!(&transition.application, ApplicationState::Applied(_))
             })
+    }
+
+    /// Whether this is an applied command that may carry a partial persistence tail
+    /// without a scientific boundary: a shutdown or a persistence flush (bd-2mpi).
+    #[must_use]
+    pub fn is_applied_partial_persistence_tail(&self) -> bool {
+        matches!(
+            &self.envelope.command,
+            HostCommand::Shutdown | HostCommand::FlushPersistence
+        ) && self.terminal().is_some_and(|transition| {
+            matches!(&transition.application, ApplicationState::Applied(_))
+        })
     }
 
     /// Whether this terminal lifecycle is tracked by runtime journal receipts.
@@ -7481,7 +7503,7 @@ mod tests {
                             .checked_next()
                             .ok_or_else(|| protocol_violation("config revision exhausted"))?;
                     }
-                    HostCommand::UpdateSelection(_) => {}
+                    HostCommand::UpdateSelection(_) | HostCommand::FlushPersistence => {}
                     HostCommand::AdjustAgentMutationRates { .. }
                     | HostCommand::SpawnAgent { .. }
                     | HostCommand::SpawnCrossover { .. }

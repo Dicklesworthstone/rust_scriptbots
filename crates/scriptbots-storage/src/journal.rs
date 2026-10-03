@@ -738,6 +738,8 @@ enum HostCommandPostcardV1 {
     },
     ApplyMap(Box<MapArtifact>),
     Intervention(Box<scriptbots_core::interventions::InterventionCommand>),
+    // Appended (bd-2mpi); the discriminant order is durable.
+    FlushPersistence,
 }
 
 impl HostCommandPostcardV1 {
@@ -783,6 +785,7 @@ impl HostCommandPostcardV1 {
             },
             HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.clone()),
             HostCommand::Intervention(cmd) => Self::Intervention(cmd.clone()),
+            HostCommand::FlushPersistence => Self::FlushPersistence,
         }
     }
 
@@ -834,6 +837,7 @@ impl HostCommandPostcardV1 {
             },
             Self::ApplyMap(artifact) => HostCommand::ApplyMap(artifact),
             Self::Intervention(cmd) => HostCommand::Intervention(cmd),
+            Self::FlushPersistence => HostCommand::FlushPersistence,
         }
     }
 }
@@ -875,6 +879,7 @@ enum HostCommandPostcardRefV1<'a> {
     },
     ApplyMap(&'a MapArtifact),
     Intervention(&'a scriptbots_core::interventions::InterventionCommand),
+    FlushPersistence,
 }
 
 impl<'a> HostCommandPostcardRefV1<'a> {
@@ -920,6 +925,7 @@ impl<'a> HostCommandPostcardRefV1<'a> {
             },
             HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.as_ref()),
             HostCommand::Intervention(cmd) => Self::Intervention(cmd.as_ref()),
+            HostCommand::FlushPersistence => Self::FlushPersistence,
         }
     }
 }
@@ -1878,6 +1884,16 @@ fn validate_scientific_archive_boundary(
                                 .to_owned(),
                         });
                     }
+                    HostCommand::FlushPersistence
+                        if scientific.is_some() || event_sequence.is_some() =>
+                    {
+                        return Err(StorageError::InvalidData {
+                            context: "host_journal_archive.command_lifecycle",
+                            reason: "an applied persistence flush may carry only its partial \
+                                     persistence tail"
+                                .to_owned(),
+                        });
+                    }
                     _ => {}
                 },
                 ApplicationState::Rejected(_) | ApplicationState::Failed(_)
@@ -1901,11 +1917,13 @@ fn validate_scientific_archive_boundary(
     }
     if has_persistence
         && scientific.is_none()
-        && !command_lifecycle.is_some_and(CommandLifecycleEvidence::is_applied_shutdown)
+        && !command_lifecycle
+            .is_some_and(CommandLifecycleEvidence::is_applied_partial_persistence_tail)
     {
         return Err(StorageError::InvalidData {
             context: "host_journal_archive.persistence",
-            reason: "persistence without science is reserved for an applied shutdown's final tail"
+            reason: "persistence without science is reserved for the partial tail of an applied \
+                     shutdown or persistence flush"
                 .to_owned(),
         });
     }
@@ -5933,6 +5951,56 @@ mod tests {
             )
             .is_err()
         );
+
+        // bd-2mpi: an applied persistence flush carries the partial tail exactly like a
+        // shutdown, with or without rows, but never science, and only once applied.
+        let flush = applied_lifecycle(
+            CommandEnvelope::new(CommandId::new(12), HostCommand::FlushPersistence),
+            applied,
+        );
+        let rejected_flush = rejected_lifecycle(
+            CommandEnvelope::new(CommandId::new(13), HostCommand::FlushPersistence),
+            applied,
+        );
+        assert!(flush.is_applied_partial_persistence_tail());
+        assert!(!flush.is_applied_shutdown());
+        assert!(!rejected_flush.is_applied_partial_persistence_tail());
+        for has_persistence in [true, false] {
+            assert!(
+                validate_scientific_archive_boundary(
+                    1,
+                    None,
+                    applied,
+                    None,
+                    Some(&flush),
+                    has_persistence,
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                Some(EventSequence::new(1)),
+                applied,
+                Some(&scientific),
+                Some(&flush),
+                true,
+            )
+            .is_err(),
+            "a persistence flush never advances science"
+        );
+        assert!(
+            validate_scientific_archive_boundary(
+                1,
+                None,
+                applied,
+                None,
+                Some(&rejected_flush),
+                true,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -6019,6 +6087,24 @@ mod tests {
             decoded_artifact.scientific_content_hash(),
             artifact.scientific_content_hash()
         );
+    }
+
+    #[test]
+    fn persistence_flush_command_is_appended_after_every_existing_discriminant() {
+        let command = HostCommand::FlushPersistence;
+        let bytes = postcard::to_allocvec(&HostCommandPostcardV1::from_runtime(&command))
+            .expect("owned command bytes");
+        assert_eq!(
+            bytes,
+            postcard::to_allocvec(&HostCommandPostcardRefV1::from_runtime(&command))
+                .expect("borrowed command bytes")
+        );
+        // Fifteen variants precede it (Pause = 0 .. Intervention = 14); any other index
+        // would reinterpret an existing V1 archive.
+        assert_eq!(bytes, [15]);
+        let decoded: HostCommandPostcardV1 =
+            postcard::from_bytes(&bytes).expect("durable command readback");
+        assert_eq!(decoded.into_runtime(), HostCommand::FlushPersistence);
     }
 
     #[test]

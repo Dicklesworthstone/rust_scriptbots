@@ -722,9 +722,23 @@ pub struct ChannelHostDriver {
     /// Checkpoint requests that arrived while the world still held deferred
     /// persistence output; each is answered at the next quiescent boundary.
     parked_captures: Vec<CaptureReply>,
+    /// Persistence flush requested on behalf of parked captures (bd-2mpi).
+    capture_flush: CaptureFlush,
 }
 
 type CaptureReply = Sender<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>>;
+
+/// Progress of the persistence flush a paused host needs before it can be captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureFlush {
+    /// No flush requested for the current parked captures.
+    Idle,
+    /// Submission is waiting on the durable command-authority lookup; retried each pass.
+    Submitting,
+    /// The flush was admitted. If the world is still not quiescent once the host stops
+    /// advancing, the flush could not seal it and the refusal is reported.
+    Admitted,
+}
 
 impl ChannelHostDriver {
     /// Pair one owner-side driver with its first cross-thread client port.
@@ -768,6 +782,7 @@ impl ChannelHostDriver {
             controller_disconnected: false,
             shutdown_requested: false,
             parked_captures: Vec::new(),
+            capture_flush: CaptureFlush::Idle,
         };
         Ok((driver, port))
     }
@@ -778,9 +793,11 @@ impl ChannelHostDriver {
     /// between persistence batches, and the core refuses a capture that would drop
     /// them. While the host is still advancing that refusal means "not yet": the world
     /// is quiescent again right after the next batch drains, so the request is parked.
-    /// A paused, stopped or faulted host will not reach another boundary by itself, so
-    /// the refusal is returned at once instead of timing out. Every other refusal is
-    /// returned unchanged.
+    /// A paused host will not reach another boundary by itself, so the driver asks it to
+    /// flush the partial persistence tail ([`HostCommand::FlushPersistence`]) and parks
+    /// the request until that flush is journaled (bd-2mpi). Only when the flush cannot be
+    /// admitted, or did not leave the world quiescent (a stopped or faulted host), is the
+    /// refusal returned. Every other refusal is returned unchanged.
     fn capture_or_park(&mut self, reply: CaptureReply) {
         let error = match self.host.core().world().capture_checkpoint_quiescent() {
             Ok(checkpoint) => {
@@ -794,21 +811,53 @@ impl ChannelHostDriver {
             scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
                 | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
         );
-        let advancing = matches!(
-            self.host.drive_interest(),
-            HostDriveInterest::ReadyNow | HostDriveInterest::Deadline | HostDriveInterest::Draining
-        );
+        // A journal batch retained under backpressure reads as `WakeOnly` to the host, but
+        // this driver retries it on its maintenance cadence, so the boundary will still come.
+        let advancing = self.journal_retry_needed()
+            || matches!(
+                self.host.drive_interest(),
+                HostDriveInterest::ReadyNow
+                    | HostDriveInterest::Deadline
+                    | HostDriveInterest::Draining
+            );
         if not_yet && advancing {
             self.parked_captures.push(reply);
             return;
         }
-        let message = if not_yet {
-            format!(
-                "{error}; the host is not advancing, so no persistence boundary will follow \
-                 -- resume the run (or checkpoint at a persistence tick) and retry"
-            )
+        let flush_refusal = if not_yet && self.capture_flush != CaptureFlush::Admitted {
+            // Retrying reuses the same lifecycle identity until it is admitted.
+            match self.host.request_persistence_flush() {
+                Ok(_) => {
+                    self.capture_flush = CaptureFlush::Admitted;
+                    self.parked_captures.push(reply);
+                    return;
+                }
+                Err(HostAccessError::CommandAuthorityLookup {
+                    failure:
+                        crate::CommandAuthorityLookupFailure::Pending
+                        | crate::CommandAuthorityLookupFailure::Busy
+                        | crate::CommandAuthorityLookupFailure::Capacity { .. },
+                    ..
+                }) => {
+                    self.capture_flush = CaptureFlush::Submitting;
+                    self.parked_captures.push(reply);
+                    return;
+                }
+                Err(flush_error) => Some(flush_error),
+            }
         } else {
-            error.to_string()
+            None
+        };
+        let message = match (not_yet, flush_refusal) {
+            (true, Some(flush_error)) => format!(
+                "{error}; the host is not advancing and refused a persistence flush \
+                 ({flush_error}) -- resume the run (or checkpoint at a persistence tick) and retry"
+            ),
+            (true, None) => format!(
+                "{error}; a persistence flush did not leave the world quiescent and the host is \
+                 not advancing -- resume the run (or checkpoint at a persistence tick) and retry"
+            ),
+            (false, _) => error.to_string(),
         };
         let _ = reply.send(Err(ChannelHostPort::protocol_violation(message)));
     }
@@ -821,6 +870,9 @@ impl ChannelHostDriver {
         let parked = std::mem::take(&mut self.parked_captures);
         for reply in parked {
             self.capture_or_park(reply);
+        }
+        if self.parked_captures.is_empty() {
+            self.capture_flush = CaptureFlush::Idle;
         }
     }
 
@@ -1114,10 +1166,9 @@ impl ChannelHostDriver {
         } else {
             self.host.drive_interest()
         };
-        if self.controller_disconnected
-            && !self.shutdown_requested
-            && interest == HostDriveInterest::WakeOnly
-        {
+        let retrying_submission = (self.controller_disconnected && !self.shutdown_requested)
+            || self.capture_flush == CaptureFlush::Submitting;
+        if retrying_submission && interest == HostDriveInterest::WakeOnly {
             interest = HostDriveInterest::Draining;
         }
         let admission_after = self.host.core().admission_cursor();
