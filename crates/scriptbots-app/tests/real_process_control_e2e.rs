@@ -22,6 +22,9 @@ use tempfile::tempdir;
 /// A persistence cadence no test run reaches, so a paused world is always mid-cadence.
 const MID_CADENCE_INTERVAL: u32 = 1_000_000;
 
+/// Seed of the checkpoint run, so its database can be replay-verified afterwards.
+const CHECKPOINT_RUN_SEED: u64 = 0x5eed_2b91;
+
 /// The shipped binary, following the house convention.
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_scriptbots-app"))
@@ -1298,6 +1301,7 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             "--set",
             &format!("persistence_interval={MID_CADENCE_INTERVAL}"),
         ])
+        .args(["--rng-seed", &CHECKPOINT_RUN_SEED.to_string()])
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_CONTROL_MCP", "http")
@@ -1706,6 +1710,34 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             let _ = child.kill();
         }
         let _ = child.wait();
+        assert!(exited, "server did not finish its ordered shutdown");
+
+        // --- 7. The run, paused-checkpoint flush included, replays exactly ---
+        // The flush cut an off-cadence batch and replay ordinals are batch-relative, so this
+        // fails unless replay mirrors the recorded boundaries; the shutdown tail carries the
+        // final digest, so it is not vacuous either.
+        let db = std::fs::read_dir(run_dir.path().join("runs"))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
+            .ok_or_else(|| anyhow!("server run left no database under runs/"))?;
+        let replay = Command::new(binary())
+            .arg("--replay-db")
+            .arg(&db)
+            .args(["--rng-seed", &CHECKPOINT_RUN_SEED.to_string()])
+            .args([
+                "--set",
+                &format!("persistence_interval={MID_CADENCE_INTERVAL}"),
+            ])
+            .env("RUST_LOG", "warn")
+            .current_dir(run_dir.path())
+            .output()?;
+        let replay_stdout = String::from_utf8_lossy(&replay.stdout);
+        assert!(
+            replay.status.success() && replay_stdout.contains("Replay matched"),
+            "replay of the checkpointed server run failed: {}\n{replay_stdout}\n{}",
+            replay.status,
+            String::from_utf8_lossy(&replay.stderr)
+        );
 
         let commit =
             std::env::var("SCRIPTBOTS_GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string());

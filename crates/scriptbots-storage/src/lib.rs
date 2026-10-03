@@ -12798,6 +12798,27 @@ impl StorageReader {
         Ok(readings)
     }
 
+    /// Tick of every persisted batch summary, ascending.
+    ///
+    /// Each admitted persistence batch writes exactly one summary row, so this is the
+    /// recorded batch boundary sequence -- including off-cadence partial batches staged by
+    /// a persistence flush or shutdown -- which replay verification must mirror because
+    /// replay event ordinals are batch-relative.
+    pub fn summary_ticks(&self) -> Result<Vec<u64>, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT tick FROM tick_summaries WHERE run_id = ?1 ORDER BY tick ASC",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        rows.iter()
+            .map(|row| {
+                checked_u64(
+                    "tick_summaries.tick",
+                    decode(row, 0, "tick_summaries.tick")?,
+                )
+            })
+            .collect()
+    }
+
     /// Load a bounded page of the newest tick summaries in chronological order.
     pub fn recent_ticks(&self, limit: usize) -> Result<Vec<PersistedTick>, StorageError> {
         if limit == 0 {

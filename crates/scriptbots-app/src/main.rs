@@ -1656,6 +1656,7 @@ fn run_det_child(
         founders,
         interventions,
         None,
+        &BTreeSet::new(),
     )?;
     #[derive(serde::Serialize)]
     struct DetOut {
@@ -4623,6 +4624,7 @@ fn run_replay_cli(
     canonicalize_replay_event_order(&mut persisted_events)
         .context("recorded replay stream contains an invalid or duplicate identity")?;
     let recorded_counts = storage.replay_event_counts()?;
+    let recorded_batch_ticks = storage.summary_ticks()?;
     // Ordered by tick; interval recording usually leaves one at the final tick, which
     // would leave nothing to verify, so resume from the latest one before the limit.
     let checkpoints = storage.load_checkpoints()?;
@@ -4638,6 +4640,7 @@ fn run_replay_cli(
         .find(|record| record.tick < tick_limit)
         .or_else(|| checkpoints.last())
         .cloned();
+    let flush_ticks = recorded_flush_ticks(&recorded_batch_ticks, config, tick_limit);
 
     if config.rng_seed.is_none() {
         warn!(
@@ -4674,6 +4677,7 @@ fn run_replay_cli(
             cli.brain,
             interventions,
             (!digest_ticks.is_empty()).then_some(&digest_ticks),
+            &flush_ticks,
         )?;
         (run, cp_tick)
     } else {
@@ -4693,6 +4697,7 @@ fn run_replay_cli(
             founders,
             interventions,
             (!digest_ticks.is_empty()).then_some(&digest_ticks),
+            &flush_ticks,
         )?;
         (run, 0)
     };
@@ -5129,6 +5134,7 @@ fn run_headless_simulation(
     founders: FounderRecipe,
     interventions: &[ScenarioInterventionV1],
     digest_ticks: Option<&BTreeSet<u64>>,
+    flush_ticks: &BTreeSet<u64>,
 ) -> Result<ReplayRun> {
     let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
     let mut run_config = config.clone();
@@ -5154,6 +5160,7 @@ fn run_headless_simulation(
                 world.request_replay_world_digest();
             }
             persistence.step(&mut world)?;
+            mirror_recorded_flush(&mut world, &mut persistence, flush_ticks)?;
         }
         let final_digest = world
             .world_digest_v1()
@@ -5207,6 +5214,38 @@ fn recorded_digest_ticks(events: &[PersistedReplayEvent], tick_limit: u64) -> BT
         .collect()
 }
 
+/// Recorded batch boundaries that the cadence alone would not produce, before `tick_limit`.
+///
+/// A paused-server checkpoint flushes a partial batch between persistence ticks (bd-2mpi).
+/// Replay event ordinals are batch-relative, so verification must cut its batches at the
+/// same ticks; the final partial batch at `tick_limit` is the simulation's own finalize.
+fn recorded_flush_ticks(
+    batch_ticks: &[u64],
+    config: &ScriptBotsConfig,
+    tick_limit: u64,
+) -> BTreeSet<u64> {
+    let interval = u64::from(config.persistence_interval.max(1));
+    batch_ticks
+        .iter()
+        .copied()
+        .filter(|&tick| tick > 0 && tick < tick_limit && !tick.is_multiple_of(interval))
+        .collect()
+}
+
+/// Cut a partial batch where the recording had one; see [`recorded_flush_ticks`].
+fn mirror_recorded_flush(
+    world: &mut WorldState,
+    persistence: &mut PersistenceAdmissionSession,
+    flush_ticks: &BTreeSet<u64>,
+) -> Result<()> {
+    if flush_ticks.contains(&world.tick().0) {
+        persistence
+            .finalize(world)
+            .context("failed to mirror a recorded off-cadence persistence batch")?;
+    }
+    Ok(())
+}
+
 /// Whether the batch completing `completed_tick` must carry a canonical world digest.
 ///
 /// `None` keeps the headless default of one digest on the final tick. A replay passes the
@@ -5225,6 +5264,7 @@ fn run_headless_simulation_from_checkpoint(
     brain_preset: BrainPreset,
     interventions: &[ScenarioInterventionV1],
     digest_ticks: Option<&BTreeSet<u64>>,
+    flush_ticks: &BTreeSet<u64>,
 ) -> Result<ReplayRun> {
     let start_tick = checkpoint.tick().0;
     if start_tick >= tick_limit {
@@ -5269,6 +5309,7 @@ fn run_headless_simulation_from_checkpoint(
                 world.request_replay_world_digest();
             }
             persistence.step(&mut world)?;
+            mirror_recorded_flush(&mut world, &mut persistence, flush_ticks)?;
         }
         let final_digest = world
             .world_digest_v1()
@@ -6718,6 +6759,7 @@ mod tests {
             FounderRecipe::CornerGrid,
             &[],
             None,
+            &BTreeSet::new(),
         )
         .expect("headless Ft run");
 
@@ -8051,6 +8093,7 @@ activation = "Sigmoid"
             FounderRecipe::CornerGrid,
             &[],
             None,
+            &BTreeSet::new(),
         )
         .expect("replay run");
         assert_eq!(replay.simulated_ticks, max_tick);
@@ -8966,6 +9009,7 @@ activation = "Sigmoid"
             FounderRecipe::CornerGrid,
             &[],
             None,
+            &BTreeSet::new(),
         )
         .expect("uninterrupted simulation should succeed");
         assert_eq!(uninterrupted.simulated_ticks, 20);
@@ -8993,6 +9037,7 @@ activation = "Sigmoid"
             BrainPreset::Mlp,
             &[],
             None,
+            &BTreeSet::new(),
         )
         .expect("resumed simulation from checkpoint should succeed");
         assert_eq!(resumed.simulated_ticks, 10);
@@ -9029,6 +9074,7 @@ activation = "Sigmoid"
             BrainPreset::Mlp,
             &[],
             None,
+            &BTreeSet::new(),
         );
         assert!(err_equal.is_err());
         assert!(
@@ -9046,6 +9092,7 @@ activation = "Sigmoid"
             BrainPreset::Mlp,
             &[],
             None,
+            &BTreeSet::new(),
         );
         assert!(err_past.is_err());
     }

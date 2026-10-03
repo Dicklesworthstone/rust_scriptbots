@@ -4255,6 +4255,11 @@ impl HostCore {
             }
             shared.audit_gate_closed = true;
         }
+        // Every recorded run ends with the canonical world digest, whichever driver ran it,
+        // so replay verification has a final state to compare against. The request is a flag
+        // consumed by the next projection: a driver that already asked, or a final tick that
+        // was itself a cadence boundary, still yields exactly one digest.
+        self.world.request_replay_world_digest();
         let persistence = match self.persistence.stage_final_batch(&mut self.world) {
             Ok(persistence) => persistence,
             Err(error) => {
@@ -4300,6 +4305,10 @@ impl HostCore {
         admission: AdmissionSequence,
         envelope: &CommandEnvelope,
     ) -> Result<ApplyResult, HostAccessError> {
+        // The flushed boundary is the state a checkpoint captures, and a paused run may be
+        // shut down at this very tick, leaving shutdown nothing to project. Anchor the
+        // canonical digest here so replay verification still has a final state to compare.
+        self.world.request_replay_world_digest();
         let persistence = match self.persistence.stage_final_batch(&mut self.world) {
             Ok(persistence) => persistence,
             Err(error) => {
