@@ -3661,7 +3661,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" B        Toggle sub-cell map rendering"),
             Line::raw(" Ctrl+T   Cycle colour theme"),
             Line::raw(" : / ^P   Command palette (search every action)"),
-            Line::raw(" ? / h    Toggle this help  (? is Shift+/ on most keyboards)"),
+            Line::raw(" ? / h    Toggle this help (Esc also closes it; ? is Shift+/)"),
             Line::raw(""),
             Line::from(vec![Span::styled(
                 "Legend",
@@ -4771,6 +4771,14 @@ impl<'a> TerminalApp<'a> {
                     }
                 }
             }
+            return Ok(false);
+        }
+
+        // Esc on an open overlay dismisses it; it used to fall through to quit, so closing the
+        // help ended the whole run.
+        if self.help_visible && key.code == KeyCode::Esc {
+            self.help_visible = false;
+            self.push_event(self.snapshot.tick, EventKind::Info, "Help overlay closed");
             return Ok(false);
         }
 
@@ -18649,6 +18657,28 @@ mod tests {
             app.host.snapshot_hub().latest().world.agents.len(),
             1,
             "one palette spawn must add exactly one agent"
+        );
+    }
+
+    /// Esc used to fall straight through to quit, so dismissing the help ended the run.
+    #[test]
+    fn escape_closes_the_help_overlay_instead_of_quitting() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let host = TerminalTestHost::take(Arc::new(std::sync::Mutex::new(world)));
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.help_visible = true;
+        assert!(
+            !app.handle_key(esc).expect("esc handled"),
+            "Esc on the help overlay must not quit"
+        );
+        assert!(!app.help_visible, "Esc closes the help overlay");
+        assert!(
+            app.handle_key(esc).expect("esc handled"),
+            "with no overlay open, Esc still quits"
         );
     }
 
