@@ -2065,15 +2065,11 @@ impl<'a> TerminalApp<'a> {
             self.palette.speed_style(self.speed_multiplier),
         );
 
-        let mut line = Line::from(vec![Span::styled(status, self.palette.header_style())]);
-        line.spans.push(Span::raw("  "));
-        line.spans.push(paused_flag);
-        line.spans.push(mode_span);
-        // The help hint is the one thing a first-time user needs, so it sits before the
-        // secondary counters: the line is clipped at the right edge on narrower terminals.
-        line.spans.push(Span::raw("  "));
+        // The line is clipped at the right edge, and on an 80-column terminal everything after
+        // "Food" used to vanish: whether the run is going leads, the counters follow.
+        let mut line = Line::from(vec![paused_flag, mode_span, Span::raw(" ")]);
         line.spans
-            .push(Span::styled("Help: ?/h", self.palette.accent_style()));
+            .push(Span::styled(status, self.palette.header_style()));
         line.spans.push(Span::raw("  "));
         line.spans.push(Span::styled(
             format!(
@@ -2095,6 +2091,11 @@ impl<'a> TerminalApp<'a> {
                     "ScriptBots Terminal HUD — {} · bootstrap {}",
                     self.scenario.id, self.scenario.bootstrap_ticks
                 )))
+                // In the border, where no width of status line can push it off screen.
+                .title_top(
+                    Line::from(Span::styled(" Help: ?/h ", self.palette.accent_style()))
+                        .right_aligned(),
+                )
                 .borders(Borders::ALL),
         );
         frame.render_widget(paragraph, area);
@@ -3656,6 +3657,13 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" ← / →    Change focused agent (console view)"),
             Line::raw(" m/t/o    Focus mode: Manual / TopPredator / Oldest"),
             Line::raw(" i        Toggle sense probe (egocentric view of the focused agent)"),
+            Line::raw(" , / .    Sense probe: cycle one eye cone / all cones"),
+            Line::raw(" w        Cycle chart window (30 / 60 / 120 / 300 ticks)"),
+            Line::raw(" f        Cycle event filter;  Enter  focus the selected event's agent"),
+            Line::raw(" r        Toggle the timeline rail"),
+            Line::raw(" B        Toggle sub-cell map rendering"),
+            Line::raw(" Ctrl+T   Cycle colour theme"),
+            Line::raw(" : / ^P   Command palette (search every action)"),
             Line::raw(" ? / h    Toggle this help  (? is Shift+/ on most keyboards)"),
             Line::raw(""),
             Line::from(vec![Span::styled(
@@ -6870,32 +6878,7 @@ impl FrameLayout {
             (body[0], None)
         };
 
-        let sidebar = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if expanded {
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(7),
-                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                    Constraint::Length(7),
-                    Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
-                    // One row per cause, the total, and both borders.
-                    Constraint::Length(MortalityCause::all().len() as u16 + 3),
-                    Constraint::Min(3),
-                ]
-            } else {
-                vec![
-                    Constraint::Length(7),
-                    Constraint::Length(5),
-                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                    Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
-                    Constraint::Length(7),
-                    Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
-                    Constraint::Min(3),
-                ]
-            })
-            .split(body[1]);
+        let sidebar = sidebar_panels(body[1], expanded);
 
         let (mortality, events) = if expanded {
             (Some(sidebar[6]), sidebar[7])
@@ -6918,7 +6901,70 @@ impl FrameLayout {
             events,
         }
     }
+}
 
+/// Sidebar panel rectangles in display order: stats, trends, leaderboard, oldest, insights,
+/// brains, [mortality,] events.
+///
+/// A bordered panel needs three rows to show one line of content. When the column cannot give
+/// every panel that, squeezing all of them leaves a stack of empty boxes (an 80x24 terminal
+/// used to get eight border-only panels), so the most useful panels keep an equal share and
+/// the rest are absent by layout (zero height).
+fn sidebar_panels(area: Rect, expanded: bool) -> Vec<Rect> {
+    const MIN_PANEL_ROWS: u16 = 3;
+    let preferred = if expanded {
+        vec![
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+            Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+            Constraint::Length(7),
+            Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
+            // One row per cause, the total, and both borders.
+            Constraint::Length(MortalityCause::all().len() as u16 + 3),
+            Constraint::Min(3),
+        ]
+    } else {
+        vec![
+            Constraint::Length(7),
+            Constraint::Length(5),
+            Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+            Constraint::Length((LEADERBOARD_LIMIT as u16 + 3).min(12)),
+            Constraint::Length(7),
+            Constraint::Length((BRAINBOARD_LIMIT as u16 + 3).min(10)),
+            Constraint::Min(3),
+        ]
+    };
+    let panels = preferred.len();
+    if usize::from(area.height / MIN_PANEL_ROWS) >= panels {
+        return Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(preferred)
+            .split(area)
+            .to_vec();
+    }
+    // Display indexes by usefulness: vital stats, trends, brains, events, then the rest.
+    let priority: &[usize] = if expanded {
+        &[0, 1, 5, 7, 2, 4, 3, 6]
+    } else {
+        &[0, 1, 5, 6, 2, 4, 3]
+    };
+    let kept = usize::from(area.height / MIN_PANEL_ROWS);
+    let constraints = (0..panels).map(|index| {
+        if priority[..kept.min(panels)].contains(&index) {
+            Constraint::Fill(1)
+        } else {
+            Constraint::Length(0)
+        }
+    });
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area)
+        .to_vec()
+}
+
+impl FrameLayout {
     /// The regions to hash, paired with the marker each one must show when it has
     /// the room to draw itself.
     ///
@@ -15017,7 +15063,11 @@ mod tests {
             // (2 rows x 3 glyphs) and +8 styled (2 rows x 4 styled columns).
             // Only population and energy have data at this fixture's tick, which
             // is why it is two rows rather than four.
-            (2367, 1534, 0, 0, 0),
+            // Reviewed 2026-10-04 (bd-bacf): the header leads with RUNNING/speed and moves
+            // the help hint into its top-right border title, so 80 columns show both. The
+            // per-region evidence moves only `header` (non-blank 198 -> 195), and every
+            // other region's hash is unchanged in the 80x36 capability golden.
+            (2364, 1544, 0, 0, 0),
             "fixed-seed Ratatui TestBackend cell counts changed; inspect the rendered buffer before intentionally updating this reviewed evidence: {evidence:?}"
         );
         // Reviewed 2026-07-17 (bd-2z0.10.1): the header title now carries the scenario id
@@ -15039,8 +15089,9 @@ mod tests {
         // Reviewed 2026-10-04 (bd-bacf): the timeline rail title no longer shows a bead id
         // ("rewind not yet available"). INSPECTED: the counts pinned above are unchanged and
         // the region goldens at 80x36 move only the `rail` hash, so the digest is that text.
+        // Reviewed 2026-10-04 (bd-bacf): header reorder, as detailed on the counts above.
         assert_eq!(
-            evidence.full_cell_fnv1a64, "833db2b5bdc93ce8",
+            evidence.full_cell_fnv1a64, "ca7ea91ad19a62ed",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
         // SCHEMA CHANGE, bd-2z0.14.2.6: `semantic_regions` used to be the four
@@ -16164,11 +16215,42 @@ mod tests {
         );
     }
 
-    /// The 40x12 emergency tier must be ACCEPTED without becoming unfalsifiable.
+    /// An 80x24 terminal leaves the sidebar 16 rows for seven panels. Squeezing all of them
+    /// gave eight border-only boxes; every panel that is shown must have a content row.
+    #[test]
+    fn short_sidebars_show_fewer_panels_each_with_a_content_row() {
+        for expanded in [false, true] {
+            for height in 0..=60_u16 {
+                let panels = sidebar_panels(Rect::new(0, 0, 30, height), expanded);
+                for (index, panel) in panels.iter().enumerate() {
+                    assert!(
+                        panel.height == 0 || panel.height >= 3,
+                        "panel {index} at height {height} (expanded={expanded}) got {} rows",
+                        panel.height
+                    );
+                }
+            }
+            let short = sidebar_panels(Rect::new(0, 0, 30, 16), expanded);
+            for (name, index) in [("stats", 0), ("trends", 1), ("brains", 5)] {
+                assert!(
+                    short[index].height >= 3,
+                    "{name} is among the panels kept at 16 rows"
+                );
+            }
+        }
+        // Tall columns keep the preferred layout untouched.
+        let tall = sidebar_panels(Rect::new(0, 0, 30, 60), false);
+        assert_eq!(tall[0].height, 7);
+        assert_eq!(tall[1].height, 5);
+    }
+
+    /// The 40x10 emergency tier must be ACCEPTED without becoming unfalsifiable.
     ///
-    /// This is the exact frame the previous whole-frame contract rejected: panels
+    /// This is the kind of frame the previous whole-frame contract rejected: panels
     /// like "Vital Stats" legitimately do not fit, and requiring their titles
-    /// anywhere in the buffer failed a frame the renderer had drawn correctly. The
+    /// anywhere in the buffer failed a frame the renderer had drawn correctly.
+    /// (It was 40x12 until bd-bacf gave the top sidebar panel the rows that size has
+    /// instead of squeezing every panel to bare borders; at 40x10 none fit.) The
     /// fix must not swing to the opposite error — a contract that accepts a small
     /// frame no matter what it contains would look like coverage while asserting
     /// nothing, which is bd-0oro's shape in the evidence layer. So this asserts
@@ -16176,9 +16258,9 @@ mod tests {
     /// fails.
     #[test]
     fn the_emergency_tier_is_accepted_but_still_falsifiable() {
-        let (buffer, layout, tick) = matrix_frame_buffer(40, 12);
+        let (buffer, layout, tick) = matrix_frame_buffer(40, 10);
         let evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout).expect(
-            "a correctly drawn 40x12 emergency-tier frame must be accepted; \
+            "a correctly drawn 40x10 emergency-tier frame must be accepted; \
              rejecting it was the defect this contract replaced",
         );
 
@@ -16200,13 +16282,13 @@ mod tests {
                 .iter()
                 .filter(|region| region.has_room)
                 .all(|region| region.marker_present),
-            "every region with room at 40x12 must have shown its title"
+            "every region with room at 40x10 must have shown its title"
         );
-        // The tier is genuinely constrained: if every panel fit at 40x12 this test
+        // The tier is genuinely constrained: if every panel fit at 40x10 this test
         // would be exercising the 80x36 path under a smaller name.
         assert!(
             evidence.regions.iter().any(|region| !region.has_room),
-            "at 40x12 some panel is expected to be absent by layout; if all fit, \
+            "at 40x10 some panel is expected to be absent by layout; if all fit, \
              this test is not covering the emergency tier at all"
         );
 
@@ -16219,7 +16301,7 @@ mod tests {
         assert!(
             !whole_frame.contains("Vital Stats"),
             "the old whole-frame contract is only worth replacing if its needle is \
-             really missing at 40x12; if this fires, the emergency tier no longer \
+             really missing at 40x10; if this fires, the emergency tier no longer \
              reproduces the defect and this test needs a different size"
         );
 

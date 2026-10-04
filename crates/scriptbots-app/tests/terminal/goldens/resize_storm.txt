@@ -4,15 +4,15 @@
 # THIS FILE IS THE DOCUMENTATION OF VIEWPORT RESIZE STORM BEHAVIOUR.
 # Each row records one viewport step in the resize storm: requested dimensions,
 # drawn area, cell statistics (nonblank and styled), and full-cell FNV-1a64 buffer digest.
-storm step=01 viewport=20x8 area=x=0,y=0,w=20,h=8 nonblank=110 styled=36 hash=6e472abd1fd33fe1
-storm step=02 viewport=40x12 area=x=0,y=0,w=40,h=12 nonblank=351 styled=165 hash=3b5a988d88cbaa0b
-storm step=03 viewport=80x36 area=x=0,y=0,w=80,h=36 nonblank=2361 styled=1524 hash=bda2049d148b9ba2
-storm step=04 viewport=200x60 area=x=0,y=0,w=200,h=60 nonblank=8564 styled=6085 hash=76bda7d3b06e77db
-storm step=05 viewport=80x6 area=x=0,y=0,w=80,h=6 nonblank=352 styled=139 hash=a05db77b8b8a3c21
-storm step=06 viewport=24x60 area=x=0,y=0,w=24,h=60 nonblank=1157 styled=792 hash=450e32d0d92cae9b
-storm step=07 viewport=81x37 area=x=0,y=0,w=81,h=37 nonblank=2434 styled=1574 hash=e7881e3e83650554
+storm step=01 viewport=20x8 area=x=0,y=0,w=20,h=8 nonblank=111 styled=35 hash=d679c156ab061088
+storm step=02 viewport=40x12 area=x=0,y=0,w=40,h=12 nonblank=360 styled=167 hash=e64e9583f110ecb7
+storm step=03 viewport=80x36 area=x=0,y=0,w=80,h=36 nonblank=2359 styled=1534 hash=c050f2b154e87e8f
+storm step=04 viewport=200x60 area=x=0,y=0,w=200,h=60 nonblank=8553 styled=6087 hash=abbba6ce1d932ac5
+storm step=05 viewport=80x6 area=x=0,y=0,w=80,h=6 nonblank=350 styled=149 hash=346acfa1acf98f38
+storm step=06 viewport=24x60 area=x=0,y=0,w=24,h=60 nonblank=1159 styled=791 hash=28c48fe4a5bfa867
+storm step=07 viewport=81x37 area=x=0,y=0,w=81,h=37 nonblank=2431 styled=1584 hash=1072cb798cd167b0
 storm step=08 viewport=1x1 area=x=0,y=0,w=1,h=1 nonblank=1 styled=0 hash=7069061e2a191c44
 storm step=09 viewport=2x40 area=x=0,y=0,w=2,h=40 nonblank=80 styled=0 hash=6aaa5db5030182b7
-storm step=10 viewport=120x3 area=x=0,y=0,w=120,h=3 nonblank=345 styled=62 hash=25d82ad52a32e39c
-storm step=11 viewport=80x36 area=x=0,y=0,w=80,h=36 nonblank=2361 styled=1524 hash=bda2049d148b9ba2
-storm step=12 viewport=300x100 area=x=0,y=0,w=300,h=100 nonblank=19344 styled=15852 hash=ce58624291a2a519
+storm step=10 viewport=120x3 area=x=0,y=0,w=120,h=3 nonblank=342 styled=73 hash=493410117b0dc755
+storm step=11 viewport=80x36 area=x=0,y=0,w=80,h=36 nonblank=2359 styled=1534 hash=c050f2b154e87e8f
+storm step=12 viewport=300x100 area=x=0,y=0,w=300,h=100 nonblank=19333 styled=15854 hash=61b3362a4c666b57
