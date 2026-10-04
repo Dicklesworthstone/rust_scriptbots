@@ -1079,12 +1079,15 @@ impl<'a> TerminalApp<'a> {
     fn toggle_pause(&mut self) {
         let paused = !self.paused;
         let action = if paused { "Pause" } else { "Resume" };
+        // The paused flag alone stops science, so pausing leaves the speed alone and resuming
+        // continues at it. Pausing used to send 0.0, so a run at x2.5 (or x0.5) resumed at x1.0.
+        // A speed of zero (reached with `-`) resumes at x1.0.
         let command = ControlCommand::UpdateSimulation(SimulationCommand {
             paused: Some(paused),
-            speed_multiplier: Some(if paused {
-                0.0
+            speed_multiplier: (!paused).then_some(if self.speed_multiplier > 0.0 {
+                self.speed_multiplier
             } else {
-                self.speed_multiplier.max(1.0)
+                1.0
             }),
             step_once: false,
         });
@@ -2053,15 +2056,9 @@ impl<'a> TerminalApp<'a> {
             Span::styled(" RUNNING ", self.palette.running_style())
         };
 
+        // The speed the run goes (or will resume) at; PAUSED beside it says it is stopped.
         let mode_span = Span::styled(
-            format!(
-                " x{:.1} ",
-                if self.paused {
-                    0.0
-                } else {
-                    self.speed_multiplier
-                }
-            ),
+            format!(" x{:.1} ", self.speed_multiplier),
             self.palette.speed_style(self.speed_multiplier),
         );
 
@@ -4846,7 +4843,6 @@ impl<'a> TerminalApp<'a> {
             (KeyCode::Char('s'), _) => {
                 self.step_once();
                 self.paused = true;
-                self.speed_multiplier = 0.0;
                 self.push_toast("Single-step");
                 self.push_event(self.snapshot.tick, EventKind::Info, "Single-step executed");
             }
@@ -15090,8 +15086,10 @@ mod tests {
         // ("rewind not yet available"). INSPECTED: the counts pinned above are unchanged and
         // the region goldens at 80x36 move only the `rail` hash, so the digest is that text.
         // Reviewed 2026-10-04 (bd-bacf): header reorder, as detailed on the counts above.
+        // Reviewed 2026-10-04 (bd-bacf): this paused frame now shows the speed it resumes at
+        // ("x1.0", was "x0.0"); counts unchanged, only the `header` region hash moves.
         assert_eq!(
-            evidence.full_cell_fnv1a64, "ca7ea91ad19a62ed",
+            evidence.full_cell_fnv1a64, "81b067acc4e6c43a",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
         // SCHEMA CHANGE, bd-2z0.14.2.6: `semantic_regions` used to be the four
@@ -18652,6 +18650,51 @@ mod tests {
             1,
             "one palette spawn must add exactly one agent"
         );
+    }
+
+    /// Pausing at x2.5 and resuming used to come back at x1.0: the pause request sent speed
+    /// 0.0 and the resume fell back to max(1.0).
+    #[test]
+    fn pause_and_resume_keep_the_chosen_speed() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let host = TerminalTestHost::take(Arc::new(std::sync::Mutex::new(world)));
+        let (runtime, _) = crate::servers::ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&sent);
+        app.command_submit = Arc::new(move |command| {
+            record.lock().expect("record").push(command);
+            Some("recorded".to_owned())
+        });
+        let last_speed = |sent: &std::sync::Mutex<Vec<ControlCommand>>| match sent
+            .lock()
+            .expect("sent")
+            .last()
+        {
+            Some(ControlCommand::UpdateSimulation(update)) => {
+                (update.paused, update.speed_multiplier)
+            }
+            other => panic!("expected a playback update, got {other:?}"),
+        };
+
+        for (speed, resumes_at) in [(2.5_f32, 2.5_f32), (0.5, 0.5), (0.0, 1.0)] {
+            app.speed_multiplier = speed;
+            app.paused = false;
+            app.toggle_pause();
+            assert_eq!(
+                last_speed(&sent),
+                (Some(true), None),
+                "pausing at x{speed} leaves the speed alone"
+            );
+            app.paused = true;
+            app.toggle_pause();
+            assert_eq!(
+                last_speed(&sent),
+                (Some(false), Some(resumes_at)),
+                "resuming from x{speed}"
+            );
+        }
     }
 
     #[test]
