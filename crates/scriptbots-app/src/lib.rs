@@ -4041,7 +4041,48 @@ pub mod log_sink {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    static DIVERTED: Mutex<Option<(PathBuf, File)>> = Mutex::new(None);
+    /// Where escape-sequence parsing stands between writes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Escape {
+        None,
+        /// Saw ESC; the next byte decides the sequence.
+        Start,
+        /// Inside `ESC [ ...`, which ends at a byte in `0x40..=0x7E`.
+        Csi,
+    }
+
+    struct Diverted {
+        path: PathBuf,
+        file: File,
+        escape: Escape,
+    }
+
+    impl Diverted {
+        /// Append `buf` without terminal colour escapes. The formatter decided on colour once,
+        /// for the stderr TTY, so diverted lines arrive styled; a log file should be plain text.
+        /// The parse state persists across calls, so a sequence split between writes is still
+        /// removed whole.
+        fn write_plain(&mut self, buf: &[u8]) -> io::Result<()> {
+            let mut plain = Vec::with_capacity(buf.len());
+            for &byte in buf {
+                self.escape = match (self.escape, byte) {
+                    (Escape::None, 0x1b) => Escape::Start,
+                    (Escape::None, _) => {
+                        plain.push(byte);
+                        Escape::None
+                    }
+                    (Escape::Start, b'[') => Escape::Csi,
+                    // A two-byte escape (ESC + one byte): drop both.
+                    (Escape::Start, _) => Escape::None,
+                    (Escape::Csi, 0x40..=0x7e) => Escape::None,
+                    (Escape::Csi, _) => Escape::Csi,
+                };
+            }
+            self.file.write_all(&plain)
+        }
+    }
+
+    static DIVERTED: Mutex<Option<Diverted>> = Mutex::new(None);
 
     /// Writer handed to the tracing subscriber: the diversion file when one is set, else stderr.
     #[derive(Debug, Clone, Copy, Default)]
@@ -4053,7 +4094,7 @@ pub mod log_sink {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match diverted.as_mut() {
-                Some((_, file)) => file.write(buf),
+                Some(diverted) => diverted.write_plain(buf).map(|()| buf.len()),
                 None => io::stderr().write(buf),
             }
         }
@@ -4063,7 +4104,7 @@ pub mod log_sink {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match diverted.as_mut() {
-                Some((_, file)) => file.flush(),
+                Some(diverted) => diverted.file.flush(),
                 None => io::stderr().flush(),
             }
         }
@@ -4096,7 +4137,11 @@ pub mod log_sink {
             .open(path)?;
         *DIVERTED
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path.to_path_buf(), file));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Diverted {
+            path: path.to_path_buf(),
+            file,
+            escape: Escape::None,
+        });
         Ok(())
     }
 
@@ -4106,9 +4151,9 @@ pub mod log_sink {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
-            .map(|(path, mut file)| {
-                let _ = file.flush();
-                path
+            .map(|mut diverted| {
+                let _ = diverted.file.flush();
+                diverted.path
             })
     }
 
@@ -4124,9 +4169,12 @@ pub mod log_sink {
             assert_eq!(restore_stderr(), None, "nothing is diverted by default");
 
             divert_to_file(&path).expect("diversion file opens, parent created");
+            // A coloured line as the formatter emits it for a TTY, with one escape split across
+            // two writes, lands as plain text.
             LogSinkWriter
-                .write_all(b"first line\n")
+                .write_all(b"\x1b[2mfirst\x1b[0m line\x1b[")
                 .expect("diverted write");
+            LogSinkWriter.write_all(b"33m\n").expect("diverted write");
             assert_eq!(restore_stderr(), Some(path.clone()));
             LogSinkWriter
                 .write_all(b"")

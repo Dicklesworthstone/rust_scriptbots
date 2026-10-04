@@ -225,7 +225,20 @@ impl ScienceChartData {
     }
 
     /// Render time-series chart with axes, tick/value labels, units, and legend into lines of text.
-    pub fn render_lines(&self, width: u16, height: u16, _reduced_color: bool) -> Vec<String> {
+    ///
+    /// Every line is clipped to `width`: callers paint these lines unclipped, so a longer one
+    /// would spill into the neighbouring panel (the legend used to end mid-word there).
+    pub fn render_lines(&self, width: u16, height: u16, reduced_color: bool) -> Vec<String> {
+        let mut lines = self.compose_lines(width, height, reduced_color);
+        for line in &mut lines {
+            if let Some((cut, _)) = line.char_indices().nth(usize::from(width)) {
+                line.truncate(cut);
+            }
+        }
+        lines
+    }
+
+    fn compose_lines(&self, width: u16, height: u16, _reduced_color: bool) -> Vec<String> {
         let mut lines = Vec::new();
         if width < 12 || height < 3 {
             lines.push(format!(
@@ -276,6 +289,9 @@ impl ScienceChartData {
         // Compute printable plot rows: available height minus header, subhead, and X-axis
         let plot_rows = (height.saturating_sub(3)).max(1) as usize;
         let plot_cols = (width.saturating_sub(10)).max(1) as usize;
+        // When the window holds more samples than there are columns, the newest ones are what
+        // the chart is for; it used to draw the oldest and drop the rest.
+        let shown = &vis[vis.len().saturating_sub(plot_cols)..];
 
         // Sparkline unicode bars for pop & energy
         // The lowest level is a visible sliver: a blank cell read as missing data.
@@ -294,7 +310,7 @@ impl ScienceChartData {
         // Y-axis tick rows: each label names its series by glyph and shows that series' scale.
         let y_top = format!("■{:>5} ┼ ", p_max);
         let mut pop_spark = String::new();
-        for s in vis.iter().take(plot_cols) {
+        for s in shown {
             let norm = ((s.population.saturating_sub(p_min)) as f64 / p_range).clamp(0.0, 1.0);
             let idx = (norm * 7.0).round() as usize;
             pop_spark.push(BARS[idx.min(7)]);
@@ -304,7 +320,7 @@ impl ScienceChartData {
         if plot_rows > 1 {
             let y_mid = format!("▲{:>5.2} ┼ ", e_max);
             let mut energy_spark = String::new();
-            for s in vis.iter().take(plot_cols) {
+            for s in shown {
                 let norm = ((s.avg_energy - e_min) as f64 / e_range).clamp(0.0, 1.0);
                 let idx = (norm * 7.0).round() as usize;
                 energy_spark.push(BARS[idx.min(7)]);
@@ -314,18 +330,19 @@ impl ScienceChartData {
 
         // X-axis baseline, labelled with the population floor the top row is scaled from.
         let mut x_axis = format!("■{:>5} ┴─", p_min);
-        for _ in 0..vis.len().min(plot_cols) {
+        for _ in shown {
             x_axis.push('─');
         }
         lines.push(x_axis);
 
-        // X-axis tick bounds
-        if let (Some(first), Some(last)) = (vis.first(), vis.last()) {
+        // X-axis tick bounds: the first and last samples actually plotted, under the first and
+        // last bars (the bars start after the 9-column "■ value ┼ " label).
+        if let (Some(first), Some(last)) = (shown.first(), shown.last()) {
             let x_labels = format!(
-                "       t{:<8} {:>width$}",
+                "         t{:<8} {:>width$}",
                 first.tick,
                 format!("t{}", last.tick),
-                width = vis.len().min(plot_cols).saturating_sub(10)
+                width = shown.len().saturating_sub(10)
             );
             lines.push(x_labels);
         }
@@ -334,13 +351,6 @@ impl ScienceChartData {
             lines.push(format!("{:width$}", "", width = width as usize));
         }
         lines.truncate(height as usize);
-        // Callers paint these lines unclipped, so a line wider than the panel would spill into
-        // its neighbour (the legend used to end mid-word at the screen edge).
-        for line in &mut lines {
-            if let Some((cut, _)) = line.char_indices().nth(width as usize) {
-                line.truncate(cut);
-            }
-        }
         lines
     }
 
@@ -1190,6 +1200,43 @@ mod tests {
             3,
         );
         assert_eq!(chart.samples.len(), 1);
+    }
+
+    /// A 300-tick window in a 40-column panel has 30 plot columns: the newest 30 samples are
+    /// drawn and labelled, not the oldest; and the early-return EMPTY path is clipped too.
+    #[test]
+    fn narrow_panels_plot_the_newest_samples_and_clip_every_path() {
+        let mut chart = ScienceChartData::new(ChartRollingWindow::Ticks300);
+        for t in 1..=300_u64 {
+            chart.push_sample(
+                ChartSample {
+                    tick: t,
+                    population: 10,
+                    avg_energy: t as f32 / 300.0,
+                    births: 0,
+                    deaths: 0,
+                },
+                t,
+            );
+        }
+        let lines = chart.render_lines(40, 8, false);
+        let energy_row = lines
+            .iter()
+            .find(|line| line.starts_with('▲'))
+            .expect("energy row");
+        assert!(
+            energy_row.ends_with('█'),
+            "the newest (highest-energy) sample is the last bar drawn: {energy_row:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.trim_end().ends_with("t300")),
+            "the axis names the newest plotted tick: {lines:#?}"
+        );
+
+        let empty = ScienceChartData::new(ChartRollingWindow::Ticks60);
+        for line in empty.render_lines(20, 4, false) {
+            assert!(line.chars().count() <= 20, "EMPTY line spills: {line:?}");
+        }
     }
 
     #[test]
