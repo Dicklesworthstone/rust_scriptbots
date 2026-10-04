@@ -3631,8 +3631,14 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_help(&self, frame: &mut Frame<'_>) {
         let size = frame.area();
-        let help_width = (size.width as f32 * 0.6).round() as u16;
+        // 60% of a wide terminal, but never so narrow that the control descriptions are cut:
+        // at 80 columns 60% left 48, which clipped most of them.
+        let help_width =
+            ((size.width as f32 * 0.6).round() as u16).max(size.width.saturating_sub(4).min(74));
 
+        // The box is clipped at the bottom on short terminals (an 80x24 one shows about 20
+        // rows), so the controls a first-time user needs come first; the command palette
+        // finds every other action by name.
         let help_lines = vec![
             Line::from(vec![Span::styled(
                 "Controls",
@@ -3642,6 +3648,8 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" space    Toggle pause"),
             Line::raw(" + / -    Adjust speed"),
             Line::raw(" s        Single step"),
+            Line::raw(" ? / h    Toggle this help (Esc also closes it; ? is Shift+/)"),
+            Line::raw(" : / ^P   Command palette (search every action)"),
             Line::raw(" S        Save ASCII screenshot"),
             Line::raw(" e        Toggle emoji mode"),
             Line::raw(" n        Toggle narrow symbols (emoji-compatible alignment)"),
@@ -3656,12 +3664,11 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" i        Toggle sense probe (egocentric view of the focused agent)"),
             Line::raw(" , / .    Sense probe: cycle one eye cone / all cones"),
             Line::raw(" w        Cycle chart window (30 / 60 / 120 / 300 ticks)"),
-            Line::raw(" f        Cycle event filter;  Enter  focus the selected event's agent"),
+            Line::raw(" f        Cycle event filter"),
+            Line::raw(" Enter    Focus the selected event's agent"),
             Line::raw(" r        Toggle the timeline rail"),
             Line::raw(" B        Toggle sub-cell map rendering"),
             Line::raw(" Ctrl+T   Cycle colour theme"),
-            Line::raw(" : / ^P   Command palette (search every action)"),
-            Line::raw(" ? / h    Toggle this help (Esc also closes it; ? is Shift+/)"),
             Line::raw(""),
             Line::from(vec![Span::styled(
                 "Legend",
