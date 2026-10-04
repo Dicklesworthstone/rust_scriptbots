@@ -1784,9 +1784,19 @@ pub(crate) fn config_for_run(
         .ok_or_else(|| "default config did not serialize as an object".to_owned())?;
 
     for (path, value) in overrides {
-        if knob_range(path).is_none() {
+        let Some(range) = knob_range(path) else {
             return Err(format!(
                 "validated arm contains unknown or unsupported knob `{path}`"
+            ));
+        };
+        // Enforce the same bounds as a live config patch: `ScriptBotsConfig::validate`
+        // alone admits worlds large enough to exhaust memory when a run starts.
+        if let Some(number) = value.as_f64()
+            && (!number.is_finite() || number < range.min || number > range.max)
+        {
+            return Err(format!(
+                "knob `{path}` value {number} is outside its accepted range [{}, {}]",
+                range.min, range.max
             ));
         }
         insert_dotted_value(root, path, value.clone())?;
@@ -2305,5 +2315,17 @@ mod tests {
             runner.execute_batch(&state_file),
             Err(ExperimentRunnerError::Bundle { .. })
         ));
+    }
+
+    #[test]
+    fn arm_overrides_outside_knob_ranges_are_refused() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("world_width".to_owned(), serde_json::json!(16_777_216));
+        let err = config_for_run(&overrides, 1).expect_err("out-of-range world width");
+        assert!(err.contains("outside its accepted range"), "{err}");
+        let default_width = ScriptBotsConfig::default().world_width;
+        overrides.insert("world_width".to_owned(), serde_json::json!(default_width));
+        let accepted = config_for_run(&overrides, 1);
+        assert!(accepted.is_ok(), "{accepted:?}");
     }
 }

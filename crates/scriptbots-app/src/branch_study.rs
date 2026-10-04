@@ -821,6 +821,18 @@ impl BranchStudyOrchestrator {
                     "branch_id cannot be empty".to_string(),
                 ));
             }
+            // The id names an output directory that is replaced on rerun
+            // (`bundle_<branch_id>`), so it must not be able to escape `output_dir`.
+            if !branch
+                .branch_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            {
+                return Err(BranchStudyError::InvalidPlan(format!(
+                    "branch_id `{}` may contain only ASCII letters, digits, '_' and '-'",
+                    branch.branch_id
+                )));
+            }
             if !branch_ids.insert(&branch.branch_id) {
                 return Err(BranchStudyError::InvalidPlan(format!(
                     "duplicate branch_id `{}` in plan",

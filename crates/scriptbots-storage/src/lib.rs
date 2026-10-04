@@ -4742,6 +4742,14 @@ fn ensure_no_storage_sidecars(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn existing_database_refusal(path: &Path) -> StorageError {
+    StorageError::InvalidTarget {
+        path: path.display().to_string(),
+        reason: "refusing to reuse an existing database path; use the explicit append-run or recovery API"
+            .to_owned(),
+    }
+}
+
 fn reserve_new_file_with_hook(
     path: &str,
     after_reservation: impl FnOnce(&Path),
@@ -4758,6 +4766,12 @@ fn reserve_new_file_with_hook(
             source,
         })?;
     }
+    // An existing database is refused for that reason first: a cleanly closed run keeps its
+    // truncated `-wal` and `-shm` WAL-index (see `Storage::close`), and reporting those as
+    // a "stale sidecar" would make a clean close look like a crash.
+    if path_entry_exists(path)? {
+        return Err(existing_database_refusal(path));
+    }
     ensure_no_storage_sidecars(path)?;
     match fs::OpenOptions::new()
         .write(true)
@@ -4766,11 +4780,7 @@ fn reserve_new_file_with_hook(
     {
         Ok(file) => drop(file),
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(StorageError::InvalidTarget {
-                path: path.display().to_string(),
-                reason: "refusing to reuse an existing database path; use the explicit append-run or recovery API"
-                    .to_owned(),
-            });
+            return Err(existing_database_refusal(path));
         }
         Err(source) => {
             return Err(StorageError::Filesystem {
@@ -21466,7 +21476,13 @@ impl Storage {
         let connection = self.conn.take().ok_or(StorageError::Closed)?;
         Self::truncate_wal_before_close(&connection, &self.path);
         connection.close()?;
-        Self::remove_emptied_wal_sidecars_after_close(&self.path);
+        // The truncated `-wal` and the `-shm` WAL-index are deliberately left on disk.
+        // Another process's reader may still hold them open or mapped, and only the engine
+        // (holding exclusive ownership) can prove otherwise; removing their pathnames here
+        // would let a later opener create fresh inodes while that reader's marks and locks
+        // live in the old ones (GitHub #3). A new-run reservation refuses an existing
+        // database path before it inspects sidecars, so these leftovers never masquerade
+        // as a crash.
         Ok(())
     }
 
@@ -21511,53 +21527,6 @@ impl Storage {
                     error = %error,
                     "close could not checkpoint the write-ahead log before closing"
                 );
-            }
-        }
-    }
-
-    /// Remove the write-ahead sidecars that a successful truncating checkpoint has proven
-    /// carry nothing.
-    ///
-    /// `PRAGMA wal_checkpoint(TRUNCATE)` folds every frame into the database and empties the
-    /// log, but the files stay on disk: the `-wal` at exactly its 32-byte header and the
-    /// `-shm` at zero length — both measured, not assumed.
-    /// `ensure_no_storage_sidecars` refuses a path on sidecar *existence*, so those remnants
-    /// are still enough to make a cleanly closed run poison the next open.
-    ///
-    /// Each removal is gated on a proof rather than a heuristic:
-    ///
-    /// * a log of at most the header length holds zero frames by construction, since a frame
-    ///   is a 24-byte header plus a page, so nothing that small can contain one;
-    /// * a zero-length `-shm` is an empty shared-memory index, which is rebuilt on demand and
-    ///   is meaningless once its log is gone.
-    ///
-    /// Anything larger is left exactly as it is. That is either a checkpoint that reported
-    /// busy or an unclean shutdown, and both must keep their sidecars so recovery can replay
-    /// them — which is also why this runs only on the explicit close path and never on the
-    /// error paths.
-    fn remove_emptied_wal_sidecars_after_close(path: &str) {
-        /// A SQLite write-ahead log header is 32 bytes; frames follow it.
-        const WAL_HEADER_LEN: u64 = 32;
-        /// POSIX shared-memory WAL-index region is 32 KiB (WAL_INDEX_PGSZ).
-        const SHM_HEADER_REGION_LEN: u64 = 32768;
-
-        if path == ":memory:" {
-            return;
-        }
-        for (suffix, empty_len) in [("-wal", WAL_HEADER_LEN), ("-shm", SHM_HEADER_REGION_LEN)] {
-            let sidecar = PathBuf::from(format!("{path}{suffix}"));
-            match fs::metadata(&sidecar) {
-                Ok(meta) if meta.is_file() && meta.len() <= empty_len => {
-                    if let Err(error) = fs::remove_file(&sidecar) {
-                        warn!(
-                            path = %path,
-                            sidecar = %sidecar.display(),
-                            error = %error,
-                            "could not remove an emptied write-ahead sidecar after a clean close"
-                        );
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -34317,15 +34286,16 @@ mod tests {
         Ok(())
     }
 
-    /// `bd-jjxe`: a cleanly closed run must leave no sidecar, so that a sidecar's existence
-    /// unambiguously means the previous run did not close cleanly.
+    /// `bd-jjxe` / GitHub #3: a clean close folds the whole WAL into the database and leaves
+    /// no frames behind, and the leftover (truncated) sidecars never make that clean close
+    /// look like a crash to the next new-run open.
     ///
-    /// Before this, `Connection::close`'s passive checkpoint left the `-wal` in place, and
-    /// `ensure_no_storage_sidecars` then refused the same path for a new run — a clean
-    /// shutdown poisoned the next open. The guard is correct and deliberately cannot tell a
-    /// clean close from a crash, so the fix is that a clean close leaves nothing to find.
+    /// The application no longer removes the `-wal`/`-shm` pathnames itself: another
+    /// process's reader may still hold them, and only the engine can prove otherwise.
     #[test]
     fn a_clean_close_leaves_no_sidecar_to_refuse() -> Result<(), Box<dyn std::error::Error>> {
+        /// A SQLite write-ahead log header is 32 bytes; any frame makes the file longer.
+        const WAL_HEADER_LEN: u64 = 32;
         let path = temp_db_path("storage-clean-close-sidecars");
         let path_string = path.to_string_lossy().to_string();
 
@@ -34336,16 +34306,20 @@ mod tests {
         storage.flush()?;
         storage.close()?;
 
-        for suffix in ["-wal", "-shm", "-journal", "-wal-fec"] {
+        let wal = PathBuf::from(format!("{path_string}-wal"));
+        if let Ok(meta) = fs::metadata(&wal) {
+            assert!(
+                meta.len() <= WAL_HEADER_LEN,
+                "a clean close left {} bytes of WAL frames that were never checkpointed",
+                meta.len()
+            );
+        }
+        for suffix in ["-journal", "-wal-fec"] {
             let sidecar = PathBuf::from(format!("{path_string}{suffix}"));
-            // Report the length too: a zero-length remnant and a full-size one are very
-            // different failures. The first means the checkpoint worked and only the file
-            // survived; the second means the WAL was never folded in at all.
             let length = fs::metadata(&sidecar).map(|meta| meta.len());
             assert!(
                 !sidecar.exists(),
-                "a clean close left {} behind ({length:?} bytes), which a later new-run \
-                 open refuses",
+                "a clean close left {} behind ({length:?} bytes)",
                 sidecar.display()
             );
         }
@@ -34375,9 +34349,8 @@ mod tests {
             "expected the existing-database refusal, got {reason}"
         );
 
-        // The data survived the truncating checkpoint and the sidecar removal: recovery
-        // opens the same file and still sees every admitted batch. This is the safety half
-        // of the fix — emptying and deleting the log must never cost committed rows.
+        // The data survived the truncating checkpoint: recovery opens the same file and
+        // still sees every admitted batch. Emptying the log must never cost committed rows.
         let mut recovered = StoragePipeline::recover_existing(&path_string)?;
         let shutdown = recovered.shutdown()?;
         assert_eq!(
@@ -34393,7 +34366,10 @@ mod tests {
         );
         reader.close()?;
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&path);
+        for suffix in STORAGE_SIDECAR_SUFFIXES {
+            let _ = fs::remove_file(format!("{path_string}{suffix}"));
+        }
         Ok(())
     }
 

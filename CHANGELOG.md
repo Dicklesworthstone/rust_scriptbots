@@ -2,11 +2,48 @@
 
 All notable changes to **Rust ScriptBots** are documented in this file.
 
-This project has no tagged releases. History is organized into development
-phases derived from the commit record and grouped by capability area within
-each phase. Every entry links to the actual commit on GitHub.
+Tagged releases are listed first. Earlier history is organized into
+development phases derived from the commit record and grouped by capability
+area within each phase.
 
 Repository: <https://github.com/Dicklesworthstone/rust_scriptbots>
+
+---
+
+## [v0.2.0] - 2026-10-04
+
+Source release (GitHub Release notes, same venue as v0.1.1; no prebuilt binaries).
+1,700+ commits since v0.1.1. Highlights:
+
+### Added
+- **Experiment runner and lab**: matched-seed experiments over REST (`/api/v1/experiments`), MCP and the `scriptbots-app lab` subcommand; paired checkpoint-branch intervention studies; Bradley-Terry tournaments with confidence intervals.
+- **Archipelago worlds**: island-partitioned storage (schema V15-V18), deterministic migration at barriers, per-island telemetry, offline reconstruction and conservation reports.
+- **Checkpoints and replay**: `WorldCheckpointV1`, interval checkpoints and replay digests so interactive and server runs replay-verify; replay scrub to a tick; paused-server checkpoints.
+- **Quality-diversity and phylogeny**: MAP-Elites archive (export/import/diff/resurrect), novelty selection, speciation gating, interactive phylogeny views, genome browser and lineage locus tracing.
+- **Narrative search** (FTS) across CLI, REST and MCP; journal domain-event CSV export.
+- **Map sandbox**: generate and apply `MapArtifact` through REST, MCP and CLI.
+- **Frontends**: FrankenTUI terminal shell with ranked command palette, archipelago view and science widgets; GUI/TUI/Bevy all driven from the single-owner `ChannelHostPort`; temperature-shaded terrain; deterministic offline audio.
+- **Analytics**: FrankenPandas export layer, fnx lineage/interaction graph reports, narrative event certification.
+
+### Changed
+- FrankenSQLite pinned at `ad3f23ca` (async connection wrapped for sync callers); asupersync 0.5.0; fastmcp 0.10.0.
+- Dependencies refreshed to the latest semver-compatible releases (`cargo update`). Major-version upgrades (wgpu 30, bevy 0.19, candle 0.11, tch 0.26, arrow 60, utoipa 6, reqwest 0.13, rand 0.10) are deferred; `rand` stays pinned for determinism.
+- Existing run databases are migrated forward on recover/append; lossy or ambiguous upgrades are refused before any change.
+
+### Fixed (release hardening)
+- REST/MCP map-apply and intervene no longer abort the process on a non-ASCII hex string (byte-slice panic under `panic = "abort"`).
+- Map artifacts loaded from a path must be regular files of at most 64 MiB.
+- Raw-body REST endpoints (`/api/control/step`, `/api/step`, `/api/v1/map/generate`, `/api/v1/checkpoints`) now require `Content-Type: application/json` for a non-empty body (415 otherwise), so a web page cannot submit a *payload* with a CORS-simple `text/plain` POST. Body-less POSTs (pause, resume, shutdown, default step/checkpoint) stay reachable cross-origin until Origin validation lands (#5).
+- Step requests are capped at 100,000 steps, map generation at 4096x4096 cells (16,777,216; larger worlds must supply their map another way), knob paths at 32 segments / 512 bytes; experiment arm overrides now enforce the same knob ranges as live config patches. Lab bundles recorded earlier with an out-of-range arm value now fail closed on resume/reproduction.
+- Branch-study `branch_id` values are restricted to `[A-Za-z0-9_-]` because they name a directory that is replaced on rerun.
+- `Storage::close` still folds the whole WAL into the database (`wal_checkpoint(TRUNCATE)`) but no longer removes the `-wal`/`-shm` pathnames itself: another process's reader may still hold them, and removing them could split reader and writer coordination (#3). A cleanly closed database therefore keeps an empty `-wal` and its `-shm` beside it; a new run at an existing database path is refused for that reason, not for a "stale sidecar".
+
+### Known issues
+- The loopback REST/MCP servers do not validate `Host`/`Origin` headers (DNS rebinding); keep them on loopback and disable with `SCRIPTBOTS_CONTROL_REST_ENABLED=false` when not needed (#5).
+- `POST /api/v1/checkpoints` keeps every checkpoint in memory and on disk for the life of the process (#5).
+- Run bundles copy only the main database file; bundle a cleanly closed run (#5).
+- Four guard/golden tests are red on `main` independent of this release (bevy visual-authority guard x2, render CPU-surrogate golden, web native parity fixture), and `ci/check_asupersync_universe.sh` reports two ftui versions (#4).
+- Workspace member crates keep their own `0.1.0` package versions; the release version is the workspace version and tag.
 
 ---
 

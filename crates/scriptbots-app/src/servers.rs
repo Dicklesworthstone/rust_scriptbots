@@ -1296,6 +1296,34 @@ impl AppError {
     }
 }
 
+/// Refuse a non-empty raw request body unless it is declared as JSON.
+///
+/// Handlers that accept an optional body read raw bytes instead of `Json<T>`, which skips
+/// axum's `Content-Type` check. Without this, any web page could drive the loopback control
+/// server with a CORS-"simple" `text/plain` POST that needs no preflight.
+fn require_json_content_type(headers: &HeaderMap, bytes: &[u8]) -> Result<(), AppError> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| {
+            let mime = mime.trim().to_ascii_lowercase();
+            mime == "application/json"
+                || (mime.starts_with("application/") && mime.ends_with("+json"))
+        });
+    if is_json {
+        Ok(())
+    } else {
+        Err(AppError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: "request body must be sent with Content-Type: application/json".to_owned(),
+        })
+    }
+}
+
 impl From<ControlError> for AppError {
     fn from(err: ControlError) -> Self {
         match err {
@@ -2275,8 +2303,10 @@ async fn post_control_resume(
 )]
 async fn post_control_step(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     bytes: axum::body::Bytes,
 ) -> Result<Json<CommandStatusDto>, AppError> {
+    require_json_content_type(&headers, &bytes)?;
     let count = if bytes.iter().all(u8::is_ascii_whitespace) {
         1
     } else {
@@ -2365,8 +2395,10 @@ async fn post_pause(
 )]
 async fn post_map_generate(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     bytes: axum::body::Bytes,
 ) -> Result<Json<Value>, AppError> {
+    require_json_content_type(&headers, &bytes)?;
     let req: MapGenerateRequestBody = if bytes.iter().all(u8::is_ascii_whitespace) {
         MapGenerateRequestBody {
             width: None,
@@ -2508,8 +2540,10 @@ async fn post_resume(
 )]
 async fn post_step(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     bytes: axum::body::Bytes,
 ) -> Result<Json<CommandStatusDto>, AppError> {
+    require_json_content_type(&headers, &bytes)?;
     let count = if bytes.iter().all(u8::is_ascii_whitespace) {
         1
     } else {
@@ -2703,6 +2737,7 @@ async fn post_v1_checkpoints(
     headers: HeaderMap,
     bytes: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<CheckpointMetadataDto>), AppError> {
+    require_json_content_type(&headers, &bytes)?;
     let mut body: CheckpointCreateRequest =
         if bytes.is_empty() || bytes.iter().all(u8::is_ascii_whitespace) {
             CheckpointCreateRequest::default()
@@ -5541,5 +5576,29 @@ mod tests {
             1,
             "initial NDJSON poll must yield current summary line"
         );
+    }
+
+    #[test]
+    fn raw_body_handlers_require_a_json_content_type() {
+        use axum::http::{HeaderValue, header::CONTENT_TYPE};
+        let mut headers = HeaderMap::new();
+        // An empty or whitespace body keeps its documented default meaning.
+        assert!(require_json_content_type(&headers, b"").is_ok());
+        assert!(require_json_content_type(&headers, b" \n").is_ok());
+        // A body without a JSON content type is the CORS-simple cross-origin shape.
+        let refused = require_json_content_type(&headers, b"{\"count\":1}").unwrap_err();
+        assert_eq!(refused.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        assert!(require_json_content_type(&headers, b"{}").is_err());
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("Application/JSON; charset=utf-8"),
+        );
+        assert!(require_json_content_type(&headers, b"{}").is_ok());
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json"),
+        );
+        assert!(require_json_content_type(&headers, b"{}").is_ok());
     }
 }

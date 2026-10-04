@@ -299,15 +299,65 @@ pub struct MapApplyRequestBody {
     pub idempotency_key: Option<String>,
 }
 
+/// Largest step batch a single control request may submit.
+pub const MAX_STEP_BATCH: u64 = 100_000;
+/// Largest procedural map (in cells) a single generate request may build.
+pub const MAX_GENERATED_MAP_CELLS: u64 = 4096 * 4096;
+/// Deepest dotted knob path accepted from a request.
+const MAX_KNOB_PATH_SEGMENTS: usize = 32;
+/// Longest dotted knob path accepted from a request.
+const MAX_KNOB_PATH_BYTES: usize = 512;
+
+/// Upper bound on a map artifact read from a server-side file path.
+///
+/// The path arrives from a REST or MCP request, so an unbounded `fs::read` would let a caller
+/// point it at an endless or enormous file (`/dev/zero`, a multi-GB log) and exhaust memory.
+/// A real map artifact is far below this.
+const MAX_MAP_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>, ()> {
-    let s = s.trim();
+    let s = s.trim().as_bytes();
     if !s.len().is_multiple_of(2) {
         return Err(());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+    // Decode on bytes, not `&str` slices: a non-ASCII request string such as "a\u{e9}b" has
+    // an even byte length but a char boundary inside a pair, and slicing it would panic
+    // (and, with `panic = "abort"`, take the whole process down).
+    s.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[hi, lo]| {
+            let hi = char::from(hi).to_digit(16).ok_or(())?;
+            let lo = char::from(lo).to_digit(16).ok_or(())?;
+            u8::try_from(hi * 16 + lo).map_err(|_| ())
+        })
         .collect()
+}
+
+/// Read a map artifact file, refusing anything that is not a regular file or exceeds
+/// [`MAX_MAP_ARTIFACT_FILE_BYTES`].
+fn read_map_artifact_file(path: &Path) -> Result<Vec<u8>, ControlError> {
+    use std::io::Read as _;
+    // Stat before opening: opening a FIFO or device would block or stream forever.
+    let meta = fs::metadata(path)
+        .map_err(|e| ControlError::InvalidPatch(format!("failed to read map file: {e}")))?;
+    if !meta.is_file() {
+        return Err(ControlError::InvalidPatch(
+            "map artifact path is not a regular file".into(),
+        ));
+    }
+    let file = fs::File::open(path)
+        .map_err(|e| ControlError::InvalidPatch(format!("failed to read map file: {e}")))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_MAP_ARTIFACT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| ControlError::InvalidPatch(format!("failed to read map file: {e}")))?;
+    if bytes.len() as u64 > MAX_MAP_ARTIFACT_FILE_BYTES {
+        return Err(ControlError::InvalidPatch(format!(
+            "map artifact file exceeds {MAX_MAP_ARTIFACT_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Parse a `MapArtifact` from either a JSON object or string (file path, raw JSON, or hex-encoded postcard).
@@ -318,9 +368,7 @@ pub fn parse_map_artifact(value: &Value) -> Result<MapArtifact, ControlError> {
         Value::String(s) => {
             let path = Path::new(s);
             if path.exists() {
-                let bytes = fs::read(path).map_err(|e| {
-                    ControlError::InvalidPatch(format!("failed to read map file: {e}"))
-                })?;
+                let bytes = read_map_artifact_file(path)?;
                 if let Ok(artifact) = postcard::from_bytes::<MapArtifact>(&bytes) {
                     return Ok(artifact);
                 }
@@ -1890,6 +1938,14 @@ impl ControlHandle {
 
     /// Enqueue step commands for the simulation driver to advance `count` ticks.
     pub fn step_count(&self, count: u64) -> Result<CommandStatusDto, ControlError> {
+        // Each step is a separately journalled command submitted in a loop, so an
+        // unbounded request count (e.g. u64::MAX) would pin a worker thread forever and
+        // grow the command journal without limit.
+        if count > MAX_STEP_BATCH {
+            return Err(ControlError::InvalidPatch(format!(
+                "step count {count} exceeds the per-request limit of {MAX_STEP_BATCH}"
+            )));
+        }
         let iterations = count.max(1);
         let mut last_status = None;
         for _ in 0..iterations {
@@ -2377,6 +2433,12 @@ impl ControlHandle {
         seed: u64,
         tileset: Option<TilesetSpec>,
     ) -> Result<MapArtifact, ControlError> {
+        let cells = u64::from(width) * u64::from(height);
+        if cells > MAX_GENERATED_MAP_CELLS {
+            return Err(ControlError::InvalidPatch(format!(
+                "map of {width}x{height} cells exceeds the limit of {MAX_GENERATED_MAP_CELLS} cells"
+            )));
+        }
         let spec = tileset.unwrap_or_else(default_tileset_spec);
         let generator = RuleBasedMapGenerator::new(spec)
             .map_err(|e| ControlError::InvalidPatch(format!("tileset compile error: {e}")))?;
@@ -2508,6 +2570,13 @@ impl ControlHandle {
 }
 
 fn insert_path(map: &mut Map<String, Value>, path: &str, value: Value) -> Result<(), ControlError> {
+    // Bound the nesting depth: the patch is later walked recursively, so a request with
+    // tens of thousands of segments would overflow the stack and abort the process.
+    if path.len() > MAX_KNOB_PATH_BYTES || path.split('.').count() > MAX_KNOB_PATH_SEGMENTS {
+        return Err(ControlError::InvalidPatch(format!(
+            "knob path exceeds {MAX_KNOB_PATH_SEGMENTS} segments or {MAX_KNOB_PATH_BYTES} bytes"
+        )));
+    }
     let mut segments = path.split('.').filter(|s| !s.is_empty());
     let Some(mut seg) = segments.next() else {
         return Err(ControlError::InvalidPatch("empty knob path".into()));
@@ -4204,5 +4273,71 @@ pub(crate) mod tests {
             .expect("submit mismatched map");
         let observed_bad = host.wait_finished(&status_bad.command_id);
         assert_eq!(observed_bad.application_state, "failed");
+    }
+
+    #[test]
+    fn hex_decoder_rejects_non_ascii_without_panicking() {
+        // Even byte length with a char boundary inside the first pair: slicing `&str` here
+        // used to panic, which aborts the release binary (`panic = "abort"`).
+        assert_eq!(hex_to_bytes("a\u{e9}b"), Err(()));
+        assert_eq!(hex_to_bytes("\u{e9}\u{e9}"), Err(()));
+        assert_eq!(hex_to_bytes("+f"), Err(()));
+        assert_eq!(hex_to_bytes("0aFf"), Ok(vec![0x0a, 0xff]));
+        assert_eq!(hex_to_bytes(" 10 "), Ok(vec![0x10]));
+        assert_eq!(hex_to_bytes("abc"), Err(()));
+        assert!(
+            parse_map_artifact(&Value::String("a\u{e9}b".into())).is_err(),
+            "a non-ASCII map artifact string must be refused, not panic"
+        );
+    }
+
+    #[test]
+    fn map_artifact_file_reads_are_bounded_and_regular_files_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = read_map_artifact_file(dir.path()).expect_err("a directory is refused");
+        assert!(
+            err.to_string().contains("not a regular file")
+                || err.to_string().contains("failed to read")
+        );
+
+        let big = dir.path().join("big.bin");
+        let file = fs::File::create(&big).expect("create");
+        file.set_len(MAX_MAP_ARTIFACT_FILE_BYTES + 1)
+            .expect("set_len");
+        let err = read_map_artifact_file(&big).expect_err("oversized file is refused");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        let small = dir.path().join("small.bin");
+        fs::write(&small, b"not a map").expect("write");
+        assert_eq!(
+            read_map_artifact_file(&small).expect("small read"),
+            b"not a map"
+        );
+        assert!(parse_map_artifact(&Value::String(small.display().to_string())).is_err());
+    }
+
+    #[test]
+    fn oversized_knob_paths_are_refused_without_recursing() {
+        let mut map = Map::new();
+        let deep = vec!["a"; 50_000].join(".");
+        assert!(insert_path(&mut map, &deep, Value::from(1)).is_err());
+        assert!(
+            map.is_empty(),
+            "a refused path must not be partially inserted"
+        );
+        assert!(insert_path(&mut map, "world_width", Value::from(100)).is_ok());
+    }
+
+    #[test]
+    fn oversized_step_and_map_requests_are_refused_before_work() {
+        let (handle, _receiver) = handle();
+        let err = handle
+            .step_count(u64::MAX)
+            .expect_err("an unbounded step batch must be refused");
+        assert!(err.to_string().contains("per-request limit"), "{err}");
+        let err = handle
+            .generate_map(65_535, 65_535, Some(50), 1, None)
+            .expect_err("a map far beyond the cell limit must be refused");
+        assert!(err.to_string().contains("exceeds the limit"), "{err}");
     }
 }
