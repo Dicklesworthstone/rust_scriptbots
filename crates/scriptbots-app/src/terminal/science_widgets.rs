@@ -91,7 +91,6 @@ pub enum ChartDegradedState {
     Normal,
     Empty { message: String },
     Stale { lag: u64 },
-    Truncated { visible: usize, total: usize },
 }
 
 /// Time-series chart model containing rolling window samples and visibility flags.
@@ -127,8 +126,20 @@ impl ScienceChartData {
         }
     }
 
+    /// Record one observation. The HUD samples every frame and frames outpace ticks, so a
+    /// repeat of the newest tick replaces it rather than adding a duplicate point.
     pub fn push_sample(&mut self, sample: ChartSample, current_tick: u64) {
         self.last_snapshot_tick = current_tick;
+        if let Some(last) = self.samples.back_mut() {
+            if last.tick == sample.tick {
+                *last = sample;
+                return;
+            }
+            // Time went backwards (a restored or new world): the old history is another run's.
+            if sample.tick < last.tick {
+                self.samples.clear();
+            }
+        }
         if self.samples.len() >= self.max_capacity {
             self.samples.pop_front();
         }
@@ -139,11 +150,17 @@ impl ScienceChartData {
         self.window = self.window.next();
     }
 
+    /// Samples within the window's tick span ending at the newest sample, so a "60t" window
+    /// covers 60 ticks whether the HUD observed every tick or skipped some.
     pub fn visible_samples(&self) -> Vec<&ChartSample> {
-        let cap = self.window.capacity();
-        let total = self.samples.len();
-        let skip = total.saturating_sub(cap);
-        self.samples.iter().skip(skip).collect()
+        let Some(newest) = self.samples.back().map(|sample| sample.tick) else {
+            return Vec::new();
+        };
+        let span = self.window.capacity() as u64;
+        self.samples
+            .iter()
+            .filter(|sample| newest.saturating_sub(sample.tick) < span)
+            .collect()
     }
 
     pub fn degraded_state(&self, current_tick: u64) -> ChartDegradedState {
@@ -157,11 +174,7 @@ impl ScienceChartData {
         if lag > 15 {
             return ChartDegradedState::Stale { lag };
         }
-        let total = self.samples.len();
-        let visible = self.visible_samples().len();
-        if total > visible {
-            return ChartDegradedState::Truncated { visible, total };
-        }
+        // History older than the window is what a rolling window is for, not a degradation.
         ChartDegradedState::Normal
     }
 
@@ -223,11 +236,11 @@ impl ScienceChartData {
             return lines;
         }
 
-        // Header / Legend line: Pop ■, Energy ▲, Births ●, Deaths ◆, [Window: 60t]
-        let window_tag = format!("[Window: {}]", self.window.label());
+        // Legend: only the two series this chart draws, keyed by the glyph on each row's label.
+        // Births and deaths appear as the "Max Δ" range, not as a plotted row.
         let legend = format!(
-            "Pop ■ (ag) | Energy ▲ (⚡) | Births ● (Δ+) | Deaths ◆ (Δ-)  {}",
-            window_tag
+            "Pop ■ (ag) | Energy ▲ (⚡)  [Window: {}]",
+            self.window.label()
         );
         lines.push(format!("{:<width$}", legend, width = width as usize));
 
@@ -243,18 +256,12 @@ impl ScienceChartData {
             ChartDegradedState::Stale { lag } => {
                 lines.push(format!("  [STALE] Telemetry lagged by +{} ticks", lag));
             }
-            ChartDegradedState::Truncated { visible, total } => {
-                lines.push(format!(
-                    "  [TRUNCATED] Showing {} of {} rolling history points",
-                    visible, total
-                ));
-            }
             ChartDegradedState::Normal => {
                 let (p_min, p_max) = self.population_bounds();
                 let (e_min, e_max) = self.energy_bounds();
                 let (_, bd_max) = self.births_deaths_bounds();
                 let status_metrics = format!(
-                    "  Ranges: Pop [{}..{}] ag | Energy [{:.1}..{:.1}] ⚡ | Max Δ: {}",
+                    "  Ranges: Pop [{}..{}] ag | Energy [{:.2}..{:.2}] ⚡ | Max Δ: {}",
                     p_min, p_max, e_min, e_max, bd_max
                 );
                 lines.push(status_metrics);
@@ -271,7 +278,8 @@ impl ScienceChartData {
         let plot_cols = (width.saturating_sub(10)).max(1) as usize;
 
         // Sparkline unicode bars for pop & energy
-        const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        // The lowest level is a visible sliver: a blank cell read as missing data.
+        const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
         let (p_min, p_max) = self.population_bounds();
         let p_range = (p_max.saturating_sub(p_min)).max(1) as f64;
@@ -283,8 +291,8 @@ impl ScienceChartData {
             1.0
         };
 
-        // Y-axis tick rows
-        let y_top = format!("{:>6} ┼ ", p_max);
+        // Y-axis tick rows: each label names its series by glyph and shows that series' scale.
+        let y_top = format!("■{:>5} ┼ ", p_max);
         let mut pop_spark = String::new();
         for s in vis.iter().take(plot_cols) {
             let norm = ((s.population.saturating_sub(p_min)) as f64 / p_range).clamp(0.0, 1.0);
@@ -294,7 +302,7 @@ impl ScienceChartData {
         lines.push(format!("{}{}", y_top, pop_spark));
 
         if plot_rows > 1 {
-            let y_mid = format!("{:>6} ┼ ", (e_min + e_max) / 2.0);
+            let y_mid = format!("▲{:>5.2} ┼ ", e_max);
             let mut energy_spark = String::new();
             for s in vis.iter().take(plot_cols) {
                 let norm = ((s.avg_energy - e_min) as f64 / e_range).clamp(0.0, 1.0);
@@ -304,8 +312,8 @@ impl ScienceChartData {
             lines.push(format!("{}{}", y_mid, energy_spark));
         }
 
-        // X-axis baseline
-        let mut x_axis = format!("{:>6} ┴─", p_min);
+        // X-axis baseline, labelled with the population floor the top row is scaled from.
+        let mut x_axis = format!("■{:>5} ┴─", p_min);
         for _ in 0..vis.len().min(plot_cols) {
             x_axis.push('─');
         }
@@ -326,6 +334,13 @@ impl ScienceChartData {
             lines.push(format!("{:width$}", "", width = width as usize));
         }
         lines.truncate(height as usize);
+        // Callers paint these lines unclipped, so a line wider than the panel would spill into
+        // its neighbour (the legend used to end mid-word at the screen edge).
+        for line in &mut lines {
+            if let Some((cut, _)) = line.char_indices().nth(width as usize) {
+                line.truncate(cut);
+            }
+        }
         lines
     }
 
@@ -1109,6 +1124,72 @@ mod tests {
         let (p_min, p_max) = chart.population_bounds();
         assert_eq!(p_min, 50 + 11 * 2);
         assert_eq!(p_max, 50 + 40 * 2);
+    }
+
+    /// What a running HUD showed: history past the window, a long legend in a 67-column panel.
+    #[test]
+    fn full_rolling_window_renders_normally_within_the_panel() {
+        let mut chart = ScienceChartData::new(ChartRollingWindow::Ticks60);
+        for t in 1..=261 {
+            chart.push_sample(
+                ChartSample {
+                    tick: t,
+                    population: 21,
+                    avg_energy: 0.429_274_83,
+                    births: 0,
+                    deaths: 0,
+                },
+                t,
+            );
+        }
+        assert_eq!(chart.degraded_state(261), ChartDegradedState::Normal);
+
+        let width = 67;
+        let lines = chart.render_lines(width, 12, false);
+        for line in &lines {
+            assert!(
+                line.chars().count() <= usize::from(width),
+                "line wider than the panel: {line:?}"
+            );
+        }
+        assert!(
+            lines.iter().any(|line| line.contains("Ranges:")),
+            "a full window is not degraded, so the ranges line stays: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("▲ 0.43 ┼")),
+            "the energy row label is a two-decimal value: {lines:#?}"
+        );
+        assert!(
+            !lines[0].contains("Births") && !lines[0].contains("Deaths"),
+            "the legend names only the series that are drawn: {:?}",
+            lines[0]
+        );
+
+        // Frames outpace ticks: repeats of the newest tick do not add points.
+        let before = chart.samples.len();
+        for _ in 0..5 {
+            chart.push_sample(chart.samples.back().cloned().expect("newest sample"), 261);
+        }
+        assert_eq!(chart.samples.len(), before);
+        assert_eq!(
+            chart.visible_samples().len(),
+            60,
+            "a 60t window holds 60 ticks"
+        );
+
+        // A world whose tick goes backwards starts a fresh history instead of mixing runs.
+        chart.push_sample(
+            ChartSample {
+                tick: 3,
+                population: 5,
+                avg_energy: 0.5,
+                births: 0,
+                deaths: 0,
+            },
+            3,
+        );
+        assert_eq!(chart.samples.len(), 1);
     }
 
     #[test]

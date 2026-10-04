@@ -267,6 +267,43 @@ impl Renderer for TerminalRenderer {
             return Ok(());
         }
 
+        // Log lines on stderr would land on top of the HUD, so they go to a file while it is
+        // up. A file that cannot be opened is reported before the screen is taken over.
+        let log_path = terminal_session_log_path();
+        if let Err(error) = crate::log_sink::divert_to_file(&log_path) {
+            warn!(
+                path = %log_path.display(),
+                %error,
+                "could not open the terminal session log; log lines will overwrite the HUD"
+            );
+        }
+        let result = self.run_interactive(ctx);
+        if let Some(path) = crate::log_sink::restore_stderr() {
+            eprintln!("Terminal session log: {}", path.display());
+        }
+        result
+    }
+}
+
+/// Where the interactive HUD writes its logs: `SCRIPTBOTS_TERMINAL_LOG`, else a per-process
+/// file under `runs/` beside the run databases.
+fn terminal_session_log_path() -> PathBuf {
+    std::env::var_os("SCRIPTBOTS_TERMINAL_LOG").map_or_else(
+        || {
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis());
+            PathBuf::from("runs").join(format!(
+                "scriptbots-terminal-{started}-{}.log",
+                std::process::id()
+            ))
+        },
+        PathBuf::from,
+    )
+}
+
+impl TerminalRenderer {
+    fn run_interactive(&self, ctx: RendererContext<'_>) -> Result<()> {
         let mut stdout = io::stdout();
         // Establish the guard immediately after raw mode succeeds. If entering
         // the alternate screen fails, `begin_with` drops the partially armed
@@ -1464,7 +1501,7 @@ impl<'a> TerminalApp<'a> {
         // Refresh analytics opportunistically before drawing insights/brains
         self.maybe_refresh_analytics();
         self.draw_insights(frame, layout.insights, &self.snapshot);
-        self.draw_brains(frame, layout.brains, &self.snapshot);
+        self.draw_brains(frame, layout.brains);
         if let Some(mortality) = layout.mortality {
             self.draw_mortality(frame, mortality, &self.snapshot);
         }
@@ -1575,7 +1612,7 @@ impl<'a> TerminalApp<'a> {
     fn draw_rail(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Timeline — run history (select-only; rewind needs replay bd-2z0.5.3)");
+            .title("Timeline — run history (select-only; rewind not yet available)");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height < 2 || inner.width < 8 {
@@ -2032,6 +2069,11 @@ impl<'a> TerminalApp<'a> {
         line.spans.push(Span::raw("  "));
         line.spans.push(paused_flag);
         line.spans.push(mode_span);
+        // The help hint is the one thing a first-time user needs, so it sits before the
+        // secondary counters: the line is clipped at the right edge on narrower terminals.
+        line.spans.push(Span::raw("  "));
+        line.spans
+            .push(Span::styled("Help: ?/h", self.palette.accent_style()));
         line.spans.push(Span::raw("  "));
         line.spans.push(Span::styled(
             format!(
@@ -2046,11 +2088,6 @@ impl<'a> TerminalApp<'a> {
             self.palette.accent_style(),
         ));
         line.spans.push(Span::raw(" (c to cycle)"));
-
-        // Add a compact, persistent help hint
-        line.spans.push(Span::raw("  "));
-        line.spans
-            .push(Span::styled("Help: ?/h", self.palette.accent_style()));
 
         let paragraph = Paragraph::new(line).block(
             Block::default()
@@ -3103,15 +3140,33 @@ impl<'a> TerminalApp<'a> {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_brains(&self, frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+    fn draw_brains(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut items: Vec<ListItem> = Vec::new();
         if let Some(ana) = &self.analytics {
-            let total_agents = snapshot.agent_count.max(1) as f64;
+            // Shares come from one analytics snapshot, so they are taken of that snapshot's own
+            // total: dividing by the HUD's agent count (a different tick) summed past 100%.
+            let total_agents = ana
+                .brain_shares
+                .iter()
+                .map(|entry| entry.count)
+                .sum::<usize>()
+                .max(1) as f64;
+            // Pad to the longest family name shown so the counts form a column.
+            let label_width = ana
+                .brain_shares
+                .iter()
+                .take(BRAINBOARD_LIMIT)
+                .map(|entry| entry.label.chars().count())
+                .max()
+                .unwrap_or(0);
             let mut rows = 0usize;
             for entry in ana.brain_shares.iter().take(BRAINBOARD_LIMIT) {
                 let share = (entry.count as f64 / total_agents * 100.0).clamp(0.0, 100.0);
                 let spans = vec![
-                    Span::styled(format!("{:<10}", entry.label), self.palette.header_style()),
+                    Span::styled(
+                        format!("{:<label_width$}", entry.label),
+                        self.palette.header_style(),
+                    ),
                     Span::raw("  "),
                     Span::raw(format!(
                         "{:>4} {:>5.1}%  ⚡{:>4.2}",
@@ -14981,8 +15036,11 @@ mod tests {
         // counts above. Those counts moved by exactly the label arithmetic, which
         // is the evidence that the digest change is the labels and not a layout
         // regression riding along with them.
+        // Reviewed 2026-10-04 (bd-bacf): the timeline rail title no longer shows a bead id
+        // ("rewind not yet available"). INSPECTED: the counts pinned above are unchanged and
+        // the region goldens at 80x36 move only the `rail` hash, so the digest is that text.
         assert_eq!(
-            evidence.full_cell_fnv1a64, "4ab177bfc13b0371",
+            evidence.full_cell_fnv1a64, "833db2b5bdc93ce8",
             "fixed-seed Ratatui TestBackend full-cell golden changed; this hashes coordinates, grapheme symbols, fg/bg/underline colors, modifiers, and diff/width directives. Inspect the rendered buffer before intentionally updating this reviewed digest: {evidence:?}"
         );
         // SCHEMA CHANGE, bd-2z0.14.2.6: `semantic_regions` used to be the four
@@ -18738,7 +18796,7 @@ mod tests {
                 app.sub_step = sub;
                 terminal
                     .draw(|frame| {
-                        app.draw_brains(frame, area, &app.snapshot);
+                        app.draw_brains(frame, area);
                     })
                     .expect("draw brains");
                 let border_cell = &terminal.backend().buffer()[(0, 0)];
@@ -18757,7 +18815,7 @@ mod tests {
                 app.sub_step = sub;
                 terminal
                     .draw(|frame| {
-                        app.draw_brains(frame, area, &app.snapshot);
+                        app.draw_brains(frame, area);
                     })
                     .expect("draw brains reduced");
                 let border_cell = &terminal.backend().buffer()[(0, 0)];

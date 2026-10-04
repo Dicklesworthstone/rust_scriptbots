@@ -4029,6 +4029,119 @@ pub mod renderer {
     }
 }
 
+/// Process-wide destination for diagnostic logs.
+///
+/// Logs go to stderr until a full-screen terminal UI claims the terminal. Stderr is the same
+/// TTY the UI draws on, so any line written there while it is active lands on top of the
+/// frame and stays until the next full redraw. The UI diverts logs to a file for its lifetime
+/// and restores stderr when it hands the terminal back.
+pub mod log_sink {
+    use std::fs::File;
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static DIVERTED: Mutex<Option<(PathBuf, File)>> = Mutex::new(None);
+
+    /// Writer handed to the tracing subscriber: the diversion file when one is set, else stderr.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct LogSinkWriter;
+
+    impl Write for LogSinkWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut diverted = DIVERTED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match diverted.as_mut() {
+                Some((_, file)) => file.write(buf),
+                None => io::stderr().write(buf),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut diverted = DIVERTED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match diverted.as_mut() {
+                Some((_, file)) => file.flush(),
+                None => io::stderr().flush(),
+            }
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSinkWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            *self
+        }
+    }
+
+    /// Append every later log line to `path` instead of stderr.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the file or its parent directory cannot be created; logs then
+    /// keep going to stderr.
+    pub fn divert_to_file(path: &Path) -> io::Result<()> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        *DIVERTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path.to_path_buf(), file));
+        Ok(())
+    }
+
+    /// Send logs back to stderr, returning the file they were diverted to, if any.
+    pub fn restore_stderr() -> Option<PathBuf> {
+        DIVERTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map(|(path, mut file)| {
+                let _ = file.flush();
+                path
+            })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The only test touching the process-wide diversion, so no other test can observe it.
+        #[test]
+        fn diverted_lines_reach_the_file_and_restoring_ends_the_diversion() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("nested").join("session.log");
+            assert_eq!(restore_stderr(), None, "nothing is diverted by default");
+
+            divert_to_file(&path).expect("diversion file opens, parent created");
+            LogSinkWriter
+                .write_all(b"first line\n")
+                .expect("diverted write");
+            assert_eq!(restore_stderr(), Some(path.clone()));
+            LogSinkWriter
+                .write_all(b"")
+                .expect("an empty write after restoring goes to stderr");
+            assert_eq!(restore_stderr(), None, "restoring twice is a no-op");
+
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("session log"),
+                "first line\n",
+                "only the line written while diverted lands in the file"
+            );
+        }
+    }
+}
+
 pub use command::{
     CommandBusTelemetry, CommandDrain, CommandReceiver, CommandRecvError, CommandSendError,
     CommandSender, CommandSubmit, create_command_bus, drain_pending_commands, make_command_drain,
