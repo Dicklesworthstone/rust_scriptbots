@@ -3083,6 +3083,21 @@ impl HostCore {
         &mut self,
         message: &str,
     ) -> Result<(), HostAccessError> {
+        self.record_fatal_boundary("native_lifecycle_panic", message)
+    }
+
+    /// Seal admissions and publish a terminal fault after the owner's drive loop failed.
+    ///
+    /// Without this the owner thread ended and the snapshot hub kept serving the last
+    /// published snapshot: every client saw a healthy, running world that would never move
+    /// again (a 2,000-agent run whose first persistence batch was refused as too large showed
+    /// `running` over REST and RUNNING in the TUI indefinitely). An earlier latched fault is
+    /// kept, since it is the diagnosis and this failure its consequence.
+    pub(crate) fn record_fatal_boundary(
+        &mut self,
+        code: &str,
+        message: &str,
+    ) -> Result<(), HostAccessError> {
         self.events.cancel_publish_reservation();
         if self.indeterminate_journal_batch.is_none()
             && let Some(batch) = self.active_journal_batch.take()
@@ -3103,15 +3118,16 @@ impl HostCore {
             shared.admission_lifecycle = HostLifecycle::Stopping;
             shared.emit(HostEventKind::LifecycleChanged(HostLifecycle::Stopping))?;
         }
-        self.latched_fault = Some(HostFault::Protocol {
-            code: "native_lifecycle_panic".to_owned(),
-            message: message.to_owned(),
-        });
-        let changed = self.synchronize_health()?;
-        if changed {
-            self.publish_snapshot()?;
+        if self.latched_fault.is_none() {
+            self.latched_fault = Some(HostFault::Protocol {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            });
         }
-        Ok(())
+        // Publish whether or not health changed here: the owner can latch a fault internally
+        // without publishing, and this is the last chance for clients to see it.
+        self.synchronize_health()?;
+        self.publish_snapshot()
     }
 
     /// Explicitly retry the exact retained journal allocation once.

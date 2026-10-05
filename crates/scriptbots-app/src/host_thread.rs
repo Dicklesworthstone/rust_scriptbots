@@ -221,13 +221,27 @@ impl HostThread {
         // the driver only ever compares and orders these, so an arbitrary epoch
         // is fine as long as it never goes backwards.
         let epoch = Instant::now();
-        let run = driver
-            .run(|| {
-                ManualInstant::from_nanos(
-                    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                )
-            })
-            .context("host drive loop stopped")?;
+        let run = match driver.run(|| {
+            ManualInstant::from_nanos(u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        }) {
+            Ok(run) => run,
+            Err(error) => {
+                // This thread gives up on the host here. Publish that as a terminal fault first:
+                // otherwise every client keeps reading the last snapshot published before the
+                // failure -- a healthy, running world that will never move again.
+                let message = format!("host drive loop stopped: {error}");
+                let published = driver
+                    .host_mut()
+                    .record_fatal_boundary("host_drive_failed", &message);
+                let error = anyhow::Error::new(error).context("host drive loop stopped");
+                return Err(match published {
+                    Ok(()) => error,
+                    Err(publish) => error.context(format!(
+                        "its terminal fault could not be published: {publish}"
+                    )),
+                });
+            }
+        };
         let core = driver.host().core();
         let snapshot = core.latest_snapshot();
         let receipt = HostThreadReceipt {
@@ -943,6 +957,93 @@ mod tests {
             scriptbots_runtime::HostLifecycle::Stopped
         );
         assert!(receipt.run.drives > 0);
+    }
+
+    /// A sink that refuses every batch, as storage refuses one over its size budget.
+    struct RefusingPersistence;
+
+    impl scriptbots_core::WorldPersistence for RefusingPersistence {
+        fn on_tick(
+            &mut self,
+            payload: &scriptbots_core::PersistenceBatch,
+        ) -> Result<(), scriptbots_core::PersistenceAdmissionError> {
+            Err(scriptbots_core::PersistenceAdmissionError::new(
+                payload.summary.tick.0,
+                "batch is too large to admit",
+            ))
+        }
+    }
+
+    /// When the drive loop fails, the owner thread ends. It used to end silently: the snapshot
+    /// hub kept the last healthy snapshot, so REST reported `running` and the TUI showed
+    /// RUNNING for a world that would never move again.
+    #[test]
+    fn a_failed_drive_loop_publishes_a_terminal_fault_before_the_thread_ends() {
+        let (world, persistence) = WorldState::with_persistence(
+            ScriptBotsConfig {
+                rng_seed: Some(0x5eed_cafe),
+                persistence_interval: 1,
+                ..ScriptBotsConfig::default()
+            },
+            Box::new(RefusingPersistence),
+        )
+        .expect("deterministic test world");
+        let host = HostThread::spawn(
+            HostSessionId::new(5),
+            world,
+            persistence,
+            Box::new(VolatileJournal::default()),
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            ChannelHostOptions::default(),
+        )
+        .expect("host thread starts and publishes its port");
+        let mut port = host.port();
+        port.submit(CommandEnvelope::new(CommandId::new(3), HostCommand::Step))
+            .expect("step admission");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let fault = loop {
+            let snapshot = port
+                .snapshot_after(None)
+                .expect("snapshot access")
+                .expect("published snapshot");
+            if let Some(fault) = snapshot.health.fault() {
+                break fault.clone();
+            }
+            if Instant::now() >= deadline {
+                let health = snapshot.health.clone();
+                drop(port);
+                panic!(
+                    "the refused batch never surfaced as a fault: {health:?}; host thread: {:#}",
+                    host.join()
+                        .err()
+                        .map_or_else(String::new, |error| format!("{error:#}"))
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        // The core latches its own fault for the interrupted step first; the first fault wins,
+        // so the code may be the core's rather than `host_drive_failed`. What matters is that a
+        // fault is published at all, and that it names the real cause.
+        let scriptbots_runtime::HostFault::Protocol { message, .. } = fault else {
+            panic!("expected a protocol fault, got {fault:?}");
+        };
+        assert!(
+            message.contains("too large to admit"),
+            "the fault names the cause: {message}"
+        );
+
+        drop(port);
+        let error = host
+            .join()
+            .expect_err("a failed drive loop is a failed host");
+        assert!(format!("{error:#}").contains("host drive loop stopped"));
     }
 
     #[test]

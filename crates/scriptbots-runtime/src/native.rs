@@ -212,6 +212,20 @@ impl FixedDeadlineHost {
         self.core.record_panicked_boundary(message)
     }
 
+    /// Publish a terminal fault when the owner gives up after its drive loop failed, so
+    /// clients reading the snapshot hub see the fault instead of the last healthy snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error if the fault or its snapshot cannot be published.
+    pub fn record_fatal_boundary(
+        &mut self,
+        code: &str,
+        message: &str,
+    ) -> Result<(), HostAccessError> {
+        self.core.record_fatal_boundary(code, message)
+    }
+
     /// Current platform scheduling interest derived by the exact host.
     #[must_use]
     pub fn drive_interest(&self) -> HostDriveInterest {
