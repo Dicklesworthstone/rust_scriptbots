@@ -484,6 +484,72 @@ fn five_k_agent_interaction_window_fits_and_flushes_under_default_budget() {
     pipeline.shutdown().expect("shutdown");
 }
 
+/// `bd-vg58`: a `population_minimum` fill persists every founder's genome in ONE batch. With
+/// genome payloads charged as JSON number arrays and a 64 MiB cap, anything above about 1,000
+/// founders was refused and the run stopped at its first persistence tick. The stated scale
+/// target is 10,000 agents, so a 10k founder tick of real MLP genomes must be admitted and flush.
+#[test]
+fn a_ten_k_founder_burst_of_real_genomes_fits_and_flushes_under_default_budget() {
+    use scriptbots_brain::mlp::MlpBrainFamily;
+    use scriptbots_core::{BrainFamilyAdapter, BrainProvenance, PersistedGenome, SmallRngStream};
+
+    const FOUNDERS: u64 = 10_000;
+    let founder = MlpBrainFamily::new()
+        .random_genome(
+            BrainProvenance::default(),
+            &mut SmallRngStream::seed_from_u64(0x7e57),
+        )
+        .expect("a real MLP founder genome");
+    let mut burst = batch(1, 0);
+    burst.genomes = (1..=FOUNDERS)
+        .map(|uid| PersistedGenome {
+            agent_uid: AgentUid(uid),
+            created_at_tick: Tick(1),
+            envelope: founder.clone(),
+        })
+        .collect();
+
+    let default_budget = PayloadBudget::default();
+    let (estimated_bytes, estimated_events) = estimate_batch_size(&burst);
+    assert!(
+        estimated_bytes > 64 << 20,
+        "the burst must be one the former 64 MiB cap refused, or this proves nothing: \
+         {estimated_bytes} bytes"
+    );
+    assert!(
+        estimated_bytes <= default_budget.max_batch_bytes,
+        "a 10k founder burst exceeds the default byte budget: {estimated_bytes} > {}",
+        default_budget.max_batch_bytes
+    );
+
+    let proof_ack_deadline = Duration::from_secs(10 * 60);
+    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds_and_deadlines(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        StorageDeadlines {
+            flush_ack: proof_ack_deadline,
+            shutdown_ack: proof_ack_deadline,
+            ..StorageDeadlines::default()
+        },
+    )
+    .expect("memory pipeline");
+    pipeline.set_payload_budget(default_budget);
+    pipeline
+        .submit(&burst)
+        .expect("the 10k founder burst must be admitted");
+    pipeline
+        .flush_and_wait()
+        .expect("the 10k founder burst must flush");
+    eprintln!(
+        "bd-vg58 10k founders: payload_bytes={} estimated_bytes={estimated_bytes} \
+         estimated_events={estimated_events}",
+        founder.payload().len()
+    );
+    pipeline.shutdown().expect("shutdown");
+}
+
 #[test]
 fn long_dynamic_strings_and_nested_brain_outputs_cross_the_byte_cap() {
     let baseline = batch(1, 0);

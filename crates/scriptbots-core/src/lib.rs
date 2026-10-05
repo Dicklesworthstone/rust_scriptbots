@@ -9893,7 +9893,10 @@ pub struct BrainGenomeEnvelope {
     family_id: BrainFamilyId,
     schema_version: u32,
     codec_version: u16,
-    #[serde(deserialize_with = "deserialize_bounded_brain_genome_payload")]
+    #[serde(
+        serialize_with = "serialize_compact_payload",
+        deserialize_with = "deserialize_bounded_brain_genome_payload"
+    )]
     payload: Vec<u8>,
     material_hash: BrainGenomeHash,
     provenance: BrainProvenance,
@@ -10018,7 +10021,10 @@ pub struct BrainEvaluatorStateEnvelope {
     family_id: BrainFamilyId,
     schema_version: u32,
     codec_version: u16,
-    #[serde(deserialize_with = "deserialize_bounded_brain_evaluator_state_payload")]
+    #[serde(
+        serialize_with = "serialize_compact_payload",
+        deserialize_with = "deserialize_bounded_brain_evaluator_state_payload"
+    )]
     payload: Vec<u8>,
 }
 
@@ -10156,9 +10162,74 @@ where
             }
             Ok(bytes)
         }
+
+        fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if bytes.len() > LIMIT {
+                return Err(E::invalid_length(bytes.len(), &self));
+            }
+            Ok(bytes.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, bytes: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if bytes.len() > LIMIT {
+                return Err(E::invalid_length(bytes.len(), &self));
+            }
+            Ok(bytes)
+        }
+
+        fn visit_str<E>(self, encoded: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            use base64::Engine as _;
+            // Refuse on the encoded length, before decoding allocates anything.
+            // The estimate rounds up to a whole 3-byte group, hence the slack of two.
+            let estimate = base64::decoded_len_estimate(encoded.len());
+            if estimate > LIMIT.saturating_add(2) {
+                return Err(E::invalid_length(estimate, &self));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| E::custom(format!("{}: invalid base64: {error}", self.label)))?;
+            if bytes.len() > LIMIT {
+                return Err(E::invalid_length(bytes.len(), &self));
+            }
+            Ok(bytes)
+        }
     }
 
-    deserializer.deserialize_seq(BoundedBytesVisitor::<LIMIT> { label })
+    let visitor = BoundedBytesVisitor::<LIMIT> { label };
+    if deserializer.is_human_readable() {
+        deserializer.deserialize_str(visitor)
+    } else {
+        deserializer.deserialize_bytes(visitor)
+    }
+}
+
+/// Serialize an opaque brain payload compactly: base64 text for human-readable formats,
+/// native bytes for binary ones (`bd-vg58`).
+///
+/// The default `Vec<u8>` encoding is a JSON array of decimal numbers, about 3.6 bytes per
+/// payload byte. Genomes are persisted as JSON and then embedded again in the storage
+/// outbox, so a founder burst of 5,000 genomes overflowed the per-batch budget. Base64 is
+/// 1.33 bytes per byte and needs no JSON escaping. Postcard's byte encoding is identical to
+/// its `u8` sequence encoding, so binary wire bytes are unchanged.
+fn serialize_compact_payload<S>(payload: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if serializer.is_human_readable() {
+        use base64::Engine as _;
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(payload))
+    } else {
+        serializer.serialize_bytes(payload)
+    }
 }
 
 /// Which protocol envelope produced a validation failure.
@@ -42824,6 +42895,67 @@ mod tests {
         assert_eq!(
             reconstructed.evaluate(&sensors).expect("resumed output")[0],
             15.0
+        );
+    }
+
+    #[test]
+    fn brain_payloads_serialize_compactly_and_round_trip_in_text_and_binary() {
+        let family = FixtureBrainFamily::new("fixture-counter");
+        let payload: Vec<u8> = (0..=255).collect();
+        let genome = BrainGenomeEnvelope::new(
+            family.id.clone(),
+            FIXTURE_GENOME_SCHEMA,
+            FIXTURE_GENOME_CODEC,
+            payload.clone(),
+            fixture_provenance(),
+        )
+        .expect("valid genome");
+
+        // JSON carries the payload as one base64 string, not an array of numbers.
+        let json = serde_json::to_value(&genome).expect("encode genome as JSON");
+        let encoded = json["payload"]
+            .as_str()
+            .expect("payload is a base64 string");
+        assert_eq!(encoded.len(), payload.len().div_ceil(3) * 4);
+        let text = serde_json::to_string(&genome).expect("encode genome as JSON text");
+        assert_eq!(
+            serde_json::from_str::<BrainGenomeEnvelope>(&text).expect("decode JSON"),
+            genome
+        );
+
+        // Postcard bytes are exactly what the default `Vec<u8>` encoding produced.
+        let wire = postcard::to_allocvec(&genome).expect("encode genome as postcard");
+        let mut expected = postcard::to_allocvec(&genome.envelope_version).expect("version");
+        expected.extend(postcard::to_allocvec(&genome.family_id).expect("family"));
+        expected.extend(postcard::to_allocvec(&genome.schema_version).expect("schema"));
+        expected.extend(postcard::to_allocvec(&genome.codec_version).expect("codec"));
+        expected.extend(postcard::to_allocvec(&payload).expect("payload as a u8 sequence"));
+        expected.extend(postcard::to_allocvec(&genome.material_hash).expect("hash"));
+        expected.extend(postcard::to_allocvec(&genome.provenance).expect("provenance"));
+        assert_eq!(wire, expected);
+        assert_eq!(
+            postcard::from_bytes::<BrainGenomeEnvelope>(&wire).expect("decode postcard"),
+            genome
+        );
+
+        // The bound still applies to the text form, and malformed base64 is refused.
+        let mut oversized = json.clone();
+        oversized["payload"] = serde_json::Value::String({
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0_u8; MAX_BRAIN_GENOME_PAYLOAD_BYTES + 1])
+        });
+        assert!(serde_json::from_value::<BrainGenomeEnvelope>(oversized).is_err());
+        let mut malformed = json;
+        malformed["payload"] = serde_json::Value::String("not base64!".to_owned());
+        assert!(serde_json::from_value::<BrainGenomeEnvelope>(malformed).is_err());
+
+        let state = family.state(7);
+        let state_json = serde_json::to_value(&state).expect("encode state as JSON");
+        assert!(state_json["payload"].is_string());
+        assert_eq!(
+            serde_json::from_value::<BrainEvaluatorStateEnvelope>(state_json).expect("decode"),
+            state
         );
     }
 

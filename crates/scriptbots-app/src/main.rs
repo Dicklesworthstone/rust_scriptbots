@@ -5267,7 +5267,12 @@ fn recorded_operator_commands(
         let mut after = None;
         loop {
             let page = storage
-                .command_journal_page(session, after, 1024, 64 << 20)
+                .command_journal_page(
+                    session,
+                    after,
+                    1024,
+                    scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+                )
                 .with_context(|| {
                     format!(
                         "failed to read the commands of host session {}",

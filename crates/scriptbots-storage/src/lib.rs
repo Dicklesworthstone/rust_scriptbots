@@ -534,7 +534,10 @@ const MAX_STORAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_TRANSACTION_ATTEMPTS: u8 = 4;
 const MAX_STORAGE_QUERY_PAGE: usize = 4_096;
 const MAX_NARRATIVE_QUERY_BYTES: usize = 1_024;
-const MAX_HOST_JOURNAL_ARCHIVE_BYTES: usize = 256 << 20;
+/// Largest single host-journal archive, and so the largest page limit a journal reader may ask
+/// for. A command's archive carries its batch's whole persistence payload, so a reader that must
+/// accept every recorded command passes this rather than a smaller guess.
+pub const MAX_HOST_JOURNAL_ARCHIVE_BYTES: usize = 256 << 20;
 // A command is control-plane input, not a scientific snapshot. Keeping its canonical durable
 // claim below one MiB prevents one corrupt row or selection request from monopolizing the bounded
 // storage lane while leaving ample room for the complete configuration envelope.
@@ -6964,13 +6967,18 @@ pub struct PayloadBudget {
 impl Default for PayloadBudget {
     fn default() -> Self {
         Self {
-            // 64 MiB is generous for one tick and still bounded: a batch this
-            // large is pathological, and pathological is exactly what must be
-            // refused rather than allocated.
-            max_batch_bytes: 64 << 20,
+            // Sized to the stated 10,000-agent scale target, not to a typical window
+            // (`bd-vg58`). Founders are persisted with their genomes in the batch of the
+            // tick that injected them, so a `population_minimum` fill of N agents lands
+            // in ONE batch: about 120 MB estimated at N = 5,000 and about 230 MB at
+            // 10,000. 64 MiB refused anything above roughly 1,000 founders and stopped
+            // the run at its first persistence tick. A batch past this is still refused
+            // before a single row is allocated.
+            max_batch_bytes: 256 << 20,
             max_batch_events: 1_000_000,
-            // 256 MiB of buffered payload is the ceiling before back-pressure.
-            max_inflight_bytes: 256 << 20,
+            // Room for one maximum batch plus the ordinary windows queued behind it
+            // before back-pressure.
+            max_inflight_bytes: 512 << 20,
             // Narrative events are operational commentary. 16 MiB and 100,000 events
             // provide a generous finite budget that prevents memory exhaustion while
             // remaining independent of scientific admission.
@@ -7156,10 +7164,17 @@ where
             observer.checkpoint(PreparationStage::Measure, *progress)?;
         }
         let kind_bytes = genome.envelope.family_id().as_str().len();
-        let payload_bytes = genome.envelope.payload().len();
+        // The envelope serializes its payload as base64 (`bd-vg58`), whose alphabet needs no
+        // JSON escaping: `genome_json` owns one encoded copy and the outbox embeds another.
+        let encoded_payload_bytes = genome
+            .envelope
+            .payload()
+            .len()
+            .div_ceil(3)
+            .saturating_mul(4);
         bytes = bytes
             .saturating_add(kind_bytes.saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER))
-            .saturating_add(payload_bytes.saturating_mul(OWNED_STRING_AND_OUTBOX_MULTIPLIER));
+            .saturating_add(encoded_payload_bytes.saturating_mul(2));
         progress.scientific_bytes = bytes;
     }
     observer.checkpoint(PreparationStage::Measure, *progress)?;

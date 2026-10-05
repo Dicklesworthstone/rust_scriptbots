@@ -37,10 +37,12 @@ use std::{
 
 const DEFAULT_JOURNAL_CAPACITY: usize = DEFAULT_COMMAND_CAPACITY;
 const DEFAULT_JOURNAL_RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
-const DEFAULT_JOURNAL_BATCH_BYTES: usize = 64 << 20;
-const DEFAULT_JOURNAL_INFLIGHT_BYTES: usize = 256 << 20;
+// A journal batch archives the tick's whole persistence batch, so these track
+// `PayloadBudget::default` (`bd-vg58`): a 10,000-agent founder tick must fit in one.
+const DEFAULT_JOURNAL_BATCH_BYTES: usize = 256 << 20;
+const DEFAULT_JOURNAL_INFLIGHT_BYTES: usize = 512 << 20;
 const DEFAULT_JOURNAL_IDENTITY_CAPACITY: usize = 512;
-const DEFAULT_EVENT_PAGE_BYTES: usize = 64 << 20;
+const DEFAULT_EVENT_PAGE_BYTES: usize = 256 << 20;
 const MAX_JOURNAL_BYTES: usize = 1 << 30;
 pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 3;
 
