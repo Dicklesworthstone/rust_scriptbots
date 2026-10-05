@@ -10416,12 +10416,14 @@ impl StorageReader {
         })
     }
 
-    /// Host sessions this finished run recorded in its journal, in ascending id order.
+    /// Host sessions this run recorded in its journal, in ascending id order.
     ///
     /// Each is a valid `session_id` for [`Self::domain_event_page`] and
     /// [`Self::domain_event_evidence`].
     pub fn host_journal_sessions(&self) -> Result<Vec<HostSessionId>, StorageError> {
-        let connection = self.finished_connection()?;
+        // A plain read of session identities: replay asks this of an ordinary reader to decide
+        // whether a finished-run reader is needed for the command journal at all.
+        let connection = self.connection()?;
         let rows = connection.query_with_params(
             "SELECT host_session_id FROM host_journal_progress
              WHERE run_id = ?1

@@ -1593,6 +1593,24 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             assert!(Instant::now() < deadline, "pause never applied: {body}");
             std::thread::sleep(Duration::from_millis(50));
         }
+        // Operator commands that change science, applied while paused: replay from tick zero
+        // must re-apply both at this tick or diverge (bd-1leq). They apply before the step
+        // below, which the host processes in admission order.
+        for (path, body) in [
+            (
+                "/api/control/intervene",
+                &br#"{"intervention":{"kind":"bloom","region":{"shape":"all"},"amount":0.2}}"#[..],
+            ),
+            (
+                "/api/knobs/apply",
+                &br#"{"updates":[{"path":"food_growth_rate","value":0.002}]}"#[..],
+            ),
+        ] {
+            let (code, response) =
+                http_with_body(rest_addr, "POST", path, body, Some("application/json"))?;
+            assert!(matches!(code, 200 | 202), "{path} ({code}): {response}");
+        }
+
         // A debug build can pause before its first tick; one step puts the paused world
         // strictly between persistence ticks however fast or slow this host is.
         let (step_code, step_body) = http_with_body(

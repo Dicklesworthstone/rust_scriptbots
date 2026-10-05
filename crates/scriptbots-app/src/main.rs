@@ -55,7 +55,7 @@ use scriptbots_world_gfx::wgpu;
 use serde_json::{self, Value as JsonValue};
 use std::process::{Command, Stdio};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env, fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -1655,8 +1655,7 @@ fn run_det_child(
         brain_preset,
         founders,
         interventions,
-        None,
-        &BTreeSet::new(),
+        &ReplayMirror::default(),
     )?;
     #[derive(serde::Serialize)]
     struct DetOut {
@@ -4625,10 +4624,23 @@ fn run_replay_cli(
         .context("recorded replay stream contains an invalid or duplicate identity")?;
     let recorded_counts = storage.replay_event_counts()?;
     let recorded_batch_ticks = storage.summary_ticks()?;
+    let journaled = !storage.host_journal_sessions()?.is_empty();
     // Ordered by tick; interval recording usually leaves one at the final tick, which
     // would leave nothing to verify, so resume from the latest one before the limit.
     let checkpoints = storage.load_checkpoints()?;
     storage.close()?;
+    // A host-driven run journaled its operator commands; the journal is read through a
+    // finished-run reader, which takes the file's exclusive lease once the plain one is closed.
+    let operator_commands = if journaled {
+        let finished = StorageReader::open_finished(&db_display).with_context(|| {
+            format!("failed to open {db_display} as a finished run to read its command journal")
+        })?;
+        let commands = recorded_operator_commands(&finished)?;
+        finished.close()?;
+        commands
+    } else {
+        BTreeMap::new()
+    };
 
     let events_max_tick = persisted_events.iter().map(|e| e.tick).max().unwrap_or(0);
     let tick_limit = cli
@@ -4670,14 +4682,23 @@ fn run_replay_cli(
         );
         persisted_events.retain(|e| e.tick > cp_tick && e.tick <= tick_limit);
         let digest_ticks = recorded_digest_ticks(&persisted_events, tick_limit);
+        // Commands applied at or before the checkpoint tick are already in its state. One applied
+        // on that very tick after the capture cannot be told apart from one before it; if that
+        // happened, the replay diverges and says so rather than guessing.
+        let mut operator_commands = operator_commands;
+        operator_commands.retain(|&tick, _| tick > cp_tick);
+        let mirror = ReplayMirror {
+            digest_ticks: (!digest_ticks.is_empty()).then_some(digest_ticks),
+            flush_ticks,
+            operator_commands,
+        };
         let run = run_headless_simulation_from_checkpoint(
             &cp,
             config,
             tick_limit,
             cli.brain,
             interventions,
-            (!digest_ticks.is_empty()).then_some(&digest_ticks),
-            &flush_ticks,
+            &mirror,
         )?;
         (run, cp_tick)
     } else {
@@ -4690,14 +4711,18 @@ fn run_replay_cli(
             );
         }
         let digest_ticks = recorded_digest_ticks(&persisted_events, tick_limit);
+        let mirror = ReplayMirror {
+            digest_ticks: (!digest_ticks.is_empty()).then_some(digest_ticks),
+            flush_ticks,
+            operator_commands,
+        };
         let run = run_headless_simulation(
             config,
             tick_limit,
             cli.brain,
             founders,
             interventions,
-            (!digest_ticks.is_empty()).then_some(&digest_ticks),
-            &flush_ticks,
+            &mirror,
         )?;
         (run, 0)
     };
@@ -5133,8 +5158,7 @@ fn run_headless_simulation(
     brain_preset: BrainPreset,
     founders: FounderRecipe,
     interventions: &[ScenarioInterventionV1],
-    digest_ticks: Option<&BTreeSet<u64>>,
-    flush_ticks: &BTreeSet<u64>,
+    mirror: &ReplayMirror,
 ) -> Result<ReplayRun> {
     let (collector, handle) = ReplayCollector::with_capacity(tick_limit as usize);
     let mut run_config = config.clone();
@@ -5155,12 +5179,13 @@ fn run_headless_simulation(
         for _ in 0..tick_limit {
             let tick = world.tick().0;
             apply_scenario_interventions(&mut world, &mut current_config, interventions, tick)?;
+            apply_recorded_operator_commands(&mut world, &mut current_config, mirror, tick)?;
             // Digest-carrying batches mirror the recorded stream (final tick by default).
-            if digest_due(digest_ticks, tick + 1, tick_limit) {
+            if digest_due(mirror.digest_ticks.as_ref(), tick + 1, tick_limit) {
                 world.request_replay_world_digest();
             }
             persistence.step(&mut world)?;
-            mirror_recorded_flush(&mut world, &mut persistence, flush_ticks)?;
+            mirror_recorded_flush(&mut world, &mut persistence, &mirror.flush_ticks)?;
         }
         let final_digest = world
             .world_digest_v1()
@@ -5214,6 +5239,117 @@ fn recorded_digest_ticks(events: &[PersistedReplayEvent], tick_limit: u64) -> BT
         .collect()
 }
 
+/// What replay reproduces from the recording beyond the scenario itself.
+#[derive(Debug, Default)]
+struct ReplayMirror {
+    /// Ticks whose batch carries a canonical world digest (`None`: the final tick only).
+    digest_ticks: Option<BTreeSet<u64>>,
+    /// Off-cadence batch boundaries; see [`recorded_flush_ticks`].
+    flush_ticks: BTreeSet<u64>,
+    /// Operator commands the host applied, by the world tick it applied them at.
+    operator_commands: BTreeMap<u64, Vec<scriptbots_core::ControlCommand>>,
+}
+
+/// Every science-changing operator command a recorded host applied, by applied tick (bd-1leq).
+///
+/// A server or interactive run journals each command it applies. Replay from tick zero used to
+/// re-apply only the scenario's own interventions, so the first REST intervention, config patch
+/// or spawn made the replay diverge. Playback-only commands (pause, speed, steps, flushes,
+/// shutdown) change no science and are skipped; migrations need an archipelago and are refused.
+fn recorded_operator_commands(
+    storage: &StorageReader,
+) -> Result<BTreeMap<u64, Vec<scriptbots_core::ControlCommand>>> {
+    use scriptbots_core::ControlCommand;
+    use scriptbots_runtime::{ApplicationState, HostCommand};
+
+    let mut commands: BTreeMap<u64, Vec<ControlCommand>> = BTreeMap::new();
+    for session in storage.host_journal_sessions()? {
+        let mut after = None;
+        loop {
+            let page = storage
+                .command_journal_page(session, after, 1024, 64 << 20)
+                .with_context(|| {
+                    format!(
+                        "failed to read the commands of host session {}",
+                        session.get()
+                    )
+                })?;
+            for record in page.commands {
+                let applied = record.lifecycle.terminal().is_some_and(|transition| {
+                    matches!(transition.application(), ApplicationState::Applied(_))
+                });
+                if !applied {
+                    continue;
+                }
+                let command = match record.lifecycle.envelope().command.clone() {
+                    HostCommand::Intervention(command) => ControlCommand::Intervention(command),
+                    HostCommand::UpdateConfig(config) => ControlCommand::UpdateConfig(config),
+                    HostCommand::UpdateSelection(update) => ControlCommand::UpdateSelection(update),
+                    HostCommand::AdjustAgentMutationRates {
+                        agent_uid,
+                        delta_primary,
+                        delta_secondary,
+                    } => ControlCommand::AdjustAgentMutationRates {
+                        agent_uid,
+                        delta_primary,
+                        delta_secondary,
+                    },
+                    HostCommand::SpawnAgent { herbivore_tendency } => {
+                        ControlCommand::SpawnAgent { herbivore_tendency }
+                    }
+                    HostCommand::SpawnCrossover { parent_a, parent_b } => {
+                        ControlCommand::SpawnCrossover { parent_a, parent_b }
+                    }
+                    HostCommand::ApplyMap(artifact) => ControlCommand::ApplyMap(artifact),
+                    HostCommand::Emigrate { .. } | HostCommand::Immigrate { .. } => bail!(
+                        "the recording migrated agents between islands at tick {}; replaying an \
+                         archipelago run is not supported by --replay-db",
+                        record.terminal_boundary.tick.0
+                    ),
+                    HostCommand::Pause
+                    | HostCommand::Resume
+                    | HostCommand::SetSpeed(_)
+                    | HostCommand::Step
+                    | HostCommand::UpdateSimulation(_)
+                    | HostCommand::FlushPersistence
+                    | HostCommand::Shutdown => continue,
+                };
+                commands
+                    .entry(record.terminal_boundary.tick.0)
+                    .or_default()
+                    .push(command);
+            }
+            match page.next_after {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+    }
+    Ok(commands)
+}
+
+/// Re-apply the operator commands the host applied at `tick`, in journal order, through the
+/// same core entry point the host uses.
+fn apply_recorded_operator_commands(
+    world: &mut WorldState,
+    current_config: &mut serde_json::Value,
+    mirror: &ReplayMirror,
+    tick: u64,
+) -> Result<()> {
+    let Some(commands) = mirror.operator_commands.get(&tick) else {
+        return Ok(());
+    };
+    for command in commands {
+        scriptbots_core::apply_control_command(world, command.clone()).with_context(|| {
+            format!("failed to re-apply a recorded operator command at tick {tick}")
+        })?;
+    }
+    // Scenario patches are merged onto this snapshot; an operator config change must not be
+    // reverted by the next one.
+    *current_config = serde_json::to_value(world.config())?;
+    Ok(())
+}
+
 /// Recorded batch boundaries that the cadence alone would not produce, before `tick_limit`.
 ///
 /// A paused-server checkpoint flushes a partial batch between persistence ticks (bd-2mpi).
@@ -5263,8 +5399,7 @@ fn run_headless_simulation_from_checkpoint(
     tick_limit: u64,
     brain_preset: BrainPreset,
     interventions: &[ScenarioInterventionV1],
-    digest_ticks: Option<&BTreeSet<u64>>,
-    flush_ticks: &BTreeSet<u64>,
+    mirror: &ReplayMirror,
 ) -> Result<ReplayRun> {
     let start_tick = checkpoint.tick().0;
     if start_tick >= tick_limit {
@@ -5304,12 +5439,13 @@ fn run_headless_simulation_from_checkpoint(
         for _ in 0..remaining_ticks {
             let tick = world.tick().0;
             apply_scenario_interventions(&mut world, &mut current_config, interventions, tick)?;
+            apply_recorded_operator_commands(&mut world, &mut current_config, mirror, tick)?;
             // Digest-carrying batches mirror the recorded stream (final tick by default).
-            if digest_due(digest_ticks, tick + 1, tick_limit) {
+            if digest_due(mirror.digest_ticks.as_ref(), tick + 1, tick_limit) {
                 world.request_replay_world_digest();
             }
             persistence.step(&mut world)?;
-            mirror_recorded_flush(&mut world, &mut persistence, flush_ticks)?;
+            mirror_recorded_flush(&mut world, &mut persistence, &mirror.flush_ticks)?;
         }
         let final_digest = world
             .world_digest_v1()
@@ -6758,8 +6894,7 @@ mod tests {
             BrainPreset::Ft,
             FounderRecipe::CornerGrid,
             &[],
-            None,
-            &BTreeSet::new(),
+            &ReplayMirror::default(),
         )
         .expect("headless Ft run");
 
@@ -8092,8 +8227,7 @@ activation = "Sigmoid"
             BrainPreset::Mixed,
             FounderRecipe::CornerGrid,
             &[],
-            None,
-            &BTreeSet::new(),
+            &ReplayMirror::default(),
         )
         .expect("replay run");
         assert_eq!(replay.simulated_ticks, max_tick);
@@ -9008,8 +9142,7 @@ activation = "Sigmoid"
             BrainPreset::Mlp,
             FounderRecipe::CornerGrid,
             &[],
-            None,
-            &BTreeSet::new(),
+            &ReplayMirror::default(),
         )
         .expect("uninterrupted simulation should succeed");
         assert_eq!(uninterrupted.simulated_ticks, 20);
@@ -9036,8 +9169,7 @@ activation = "Sigmoid"
             20,
             BrainPreset::Mlp,
             &[],
-            None,
-            &BTreeSet::new(),
+            &ReplayMirror::default(),
         )
         .expect("resumed simulation from checkpoint should succeed");
         assert_eq!(resumed.simulated_ticks, 10);
@@ -9073,8 +9205,7 @@ activation = "Sigmoid"
             10,
             BrainPreset::Mlp,
             &[],
-            None,
-            &BTreeSet::new(),
+            &ReplayMirror::default(),
         );
         assert!(err_equal.is_err());
         assert!(
@@ -9091,8 +9222,7 @@ activation = "Sigmoid"
             5,
             BrainPreset::Mlp,
             &[],
-            None,
-            &BTreeSet::new(),
+            &ReplayMirror::default(),
         );
         assert!(err_past.is_err());
     }
