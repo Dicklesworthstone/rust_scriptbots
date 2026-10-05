@@ -737,7 +737,15 @@ enum HostCommandPostcardV1 {
         step_once: bool,
     },
     ApplyMap(Box<MapArtifact>),
-    Intervention(Box<scriptbots_core::interventions::InterventionCommand>),
+    /// An intervention as its canonical postcard parameter bytes. `Intervention` and `Region`
+    /// are internally tagged serde enums, which postcard can encode but can never decode
+    /// (`deserialize_any`), so embedding the command made every journaled intervention
+    /// unreadable: a file-backed server refused each one as a corrupt command authority.
+    Intervention {
+        params: Vec<u8>,
+        surface: scriptbots_core::interventions::InterventionSurface,
+        actor: String,
+    },
     // Appended (bd-2mpi); the discriminant order is durable.
     FlushPersistence,
 }
@@ -784,13 +792,17 @@ impl HostCommandPostcardV1 {
                 origin_uid: origin_uid.get(),
             },
             HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.clone()),
-            HostCommand::Intervention(cmd) => Self::Intervention(cmd.clone()),
+            HostCommand::Intervention(cmd) => Self::Intervention {
+                params: scriptbots_core::interventions::canonical_param_bytes(&cmd.intervention),
+                surface: cmd.surface,
+                actor: cmd.actor.clone(),
+            },
             HostCommand::FlushPersistence => Self::FlushPersistence,
         }
     }
 
-    fn into_runtime(self) -> HostCommand {
-        match self {
+    fn into_runtime(self, context: &'static str) -> Result<HostCommand, StorageError> {
+        Ok(match self {
             Self::UpdateSimulation {
                 paused,
                 speed_bits,
@@ -836,9 +848,25 @@ impl HostCommandPostcardV1 {
                 origin_uid: AgentUid(origin_uid),
             },
             Self::ApplyMap(artifact) => HostCommand::ApplyMap(artifact),
-            Self::Intervention(cmd) => HostCommand::Intervention(cmd),
+            Self::Intervention {
+                params,
+                surface,
+                actor,
+            } => HostCommand::Intervention(Box::new(
+                scriptbots_core::interventions::InterventionCommand {
+                    intervention: scriptbots_core::interventions::intervention_from_param_bytes(
+                        &params,
+                    )
+                    .map_err(|error| StorageError::InvalidData {
+                        context,
+                        reason: format!("intervention parameters: {error}"),
+                    })?,
+                    surface,
+                    actor,
+                },
+            )),
             Self::FlushPersistence => HostCommand::FlushPersistence,
-        }
+        })
     }
 }
 
@@ -878,7 +906,12 @@ enum HostCommandPostcardRefV1<'a> {
         step_once: bool,
     },
     ApplyMap(&'a MapArtifact),
-    Intervention(&'a scriptbots_core::interventions::InterventionCommand),
+    // Canonical parameter bytes, as in the owned enum; `&str` encodes as `String` does.
+    Intervention {
+        params: Vec<u8>,
+        surface: scriptbots_core::interventions::InterventionSurface,
+        actor: &'a str,
+    },
     FlushPersistence,
 }
 
@@ -924,7 +957,11 @@ impl<'a> HostCommandPostcardRefV1<'a> {
                 origin_uid: origin_uid.get(),
             },
             HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.as_ref()),
-            HostCommand::Intervention(cmd) => Self::Intervention(cmd.as_ref()),
+            HostCommand::Intervention(cmd) => Self::Intervention {
+                params: scriptbots_core::interventions::canonical_param_bytes(&cmd.intervention),
+                surface: cmd.surface,
+                actor: &cmd.actor,
+            },
             HostCommand::FlushPersistence => Self::FlushPersistence,
         }
     }
@@ -1030,16 +1067,16 @@ impl CommandEnvelopePostcardV1 {
         }
     }
 
-    fn into_runtime(self) -> CommandEnvelope {
-        CommandEnvelope {
+    fn into_runtime(self, context: &'static str) -> Result<CommandEnvelope, StorageError> {
+        Ok(CommandEnvelope {
             command_id: CommandId::new(self.command_id),
             expected_control_revision: self.expected_control_revision.map(ControlRevision::new),
             expected_scientific_revision: self
                 .expected_scientific_revision
                 .map(ScientificRevision::new),
             expected_config_revision: self.expected_config_revision.map(ConfigRevision::new),
-            command: self.command.into_runtime(),
-        }
+            command: self.command.into_runtime(context)?,
+        })
     }
 }
 
@@ -1321,7 +1358,7 @@ impl CommandLifecyclePostcardV1 {
                 ),
             });
         }
-        let envelope = self.envelope.into_runtime();
+        let envelope = self.envelope.into_runtime(context)?;
         if self.source_client_namespace != envelope.command_id.client_namespace() {
             return Err(StorageError::InvalidData {
                 context,
@@ -1507,8 +1544,7 @@ pub(super) fn decode_command_envelope_postcard_hex(
     context: &'static str,
     encoded: &str,
 ) -> Result<CommandEnvelope, StorageError> {
-    decode_postcard_hex::<CommandEnvelopePostcardV1>(context, encoded)
-        .map(CommandEnvelopePostcardV1::into_runtime)
+    decode_postcard_hex::<CommandEnvelopePostcardV1>(context, encoded)?.into_runtime(context)
 }
 
 pub(super) fn encode_host_command_postcard_hex(
@@ -1522,8 +1558,7 @@ pub(super) fn decode_host_command_postcard_hex(
     context: &'static str,
     encoded: &str,
 ) -> Result<HostCommand, StorageError> {
-    decode_postcard_hex::<HostCommandPostcardV1>(context, encoded)
-        .map(HostCommandPostcardV1::into_runtime)
+    decode_postcard_hex::<HostCommandPostcardV1>(context, encoded)?.into_runtime(context)
 }
 
 pub(super) fn encode_application_state_postcard_hex(
@@ -6021,7 +6056,9 @@ mod tests {
                 );
                 let decoded: HostCommandPostcardV1 =
                     postcard::from_bytes(&bytes).expect("durable command readback");
-                let HostCommand::UpdateSimulation(update) = decoded.into_runtime() else {
+                let HostCommand::UpdateSimulation(update) =
+                    decoded.into_runtime("test").expect("decodes")
+                else {
                     panic!("composite command discriminant changed");
                 };
                 assert_eq!(update.paused, Some(false));
@@ -6079,7 +6116,9 @@ mod tests {
         );
         let decoded: HostCommandPostcardV1 =
             postcard::from_bytes(&bytes).expect("durable command readback");
-        let HostCommand::ApplyMap(decoded_artifact) = decoded.into_runtime() else {
+        let HostCommand::ApplyMap(decoded_artifact) =
+            decoded.into_runtime("test").expect("decodes")
+        else {
             panic!("apply map command discriminant changed");
         };
         assert_eq!(decoded_artifact.as_ref(), &artifact);
@@ -6104,7 +6143,60 @@ mod tests {
         assert_eq!(bytes, [15]);
         let decoded: HostCommandPostcardV1 =
             postcard::from_bytes(&bytes).expect("durable command readback");
-        assert_eq!(decoded.into_runtime(), HostCommand::FlushPersistence);
+        assert_eq!(
+            decoded.into_runtime("test").expect("decodes"),
+            HostCommand::FlushPersistence
+        );
+    }
+
+    /// Every intervention kind and region shape must survive the durable command codec.
+    /// `Intervention` and `Region` are internally tagged serde enums, which postcard encodes but
+    /// cannot decode, so embedding them made every journaled intervention unreadable.
+    #[test]
+    fn interventions_round_trip_through_the_durable_command_codec() {
+        use scriptbots_core::interventions::{InterventionCommand, InterventionSurface};
+        let regions = [
+            scriptbots_core::Region::All,
+            scriptbots_core::Region::Disc {
+                x: 3000.0,
+                y: 1500.0,
+                radius: 400.0,
+            },
+        ];
+        for region in regions {
+            for intervention in [
+                scriptbots_core::Intervention::Bloom {
+                    region,
+                    amount: 0.2,
+                },
+                scriptbots_core::Intervention::Drought {
+                    region,
+                    ticks: 50,
+                    growth_scale: 0.0,
+                },
+                scriptbots_core::Intervention::Embargo { region, ticks: 9 },
+            ] {
+                let command = HostCommand::Intervention(Box::new(InterventionCommand {
+                    intervention,
+                    surface: InterventionSurface::Rest,
+                    actor: "rest_client".to_owned(),
+                }));
+                let bytes = postcard::to_allocvec(&HostCommandPostcardV1::from_runtime(&command))
+                    .expect("owned command bytes");
+                assert_eq!(
+                    bytes,
+                    postcard::to_allocvec(&HostCommandPostcardRefV1::from_runtime(&command))
+                        .expect("borrowed command bytes")
+                );
+                let decoded: HostCommandPostcardV1 =
+                    postcard::from_bytes(&bytes).expect("durable intervention readback");
+                assert_eq!(
+                    decoded.into_runtime("test").expect("decodes"),
+                    command,
+                    "an intervention must read back exactly"
+                );
+            }
+        }
     }
 
     #[test]
