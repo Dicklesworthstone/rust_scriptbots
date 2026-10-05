@@ -1,0 +1,13 @@
+# Committed negative fixture (bd-tdj0): one ftui-* member resolved twice from one git revision
+# is a split type universe for that member.
+version = 4
+
+[[package]]
+name = "ftui-core"
+version = "0.5.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=15cc6543f76b814394c590f9e7719dedd6684e4c#15cc6543f76b814394c590f9e7719dedd6684e4c"
+
+[[package]]
+name = "ftui-core"
+version = "0.5.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=15cc6543f76b814394c590f9e7719dedd6684e4c#15cc6543f76b814394c590f9e7719dedd6684e4c"

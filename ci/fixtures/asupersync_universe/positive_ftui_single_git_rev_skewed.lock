@@ -1,0 +1,18 @@
+# Committed positive fixture (bd-tdj0): every ftui-* member resolves from ONE git revision,
+# but upstream declares ftui-layout 0.5.1 beside 0.5.0 siblings. One commit is one release set.
+version = 4
+
+[[package]]
+name = "ftui"
+version = "0.5.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=15cc6543f76b814394c590f9e7719dedd6684e4c#15cc6543f76b814394c590f9e7719dedd6684e4c"
+
+[[package]]
+name = "ftui-core"
+version = "0.5.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=15cc6543f76b814394c590f9e7719dedd6684e4c#15cc6543f76b814394c590f9e7719dedd6684e4c"
+
+[[package]]
+name = "ftui-layout"
+version = "0.5.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=15cc6543f76b814394c590f9e7719dedd6684e4c#15cc6543f76b814394c590f9e7719dedd6684e4c"

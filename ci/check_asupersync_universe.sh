@@ -14,7 +14,8 @@
 # Failure directions caught:
 #   1. Split universe: >1 lock entry for the crate (different versions or split sources).
 #   2. Consumer requirement conflict: an enabled dependency edge has an incompatible semver range.
-#   3. Family discrepancy: members of a crate family (e.g. ftui-*) do not share one uniform release version.
+#   3. Family discrepancy: members of a crate family (e.g. ftui-*) do not come from one release
+#      set: one git revision, or else one source at one uniform version (bd-tdj0).
 #   4. Enumerates every consumer and declared requirement on both pass and fail for auditable forensics.
 #
 # Fix playbook (in order):
@@ -234,40 +235,66 @@ REMEDY
 }
 
 check_family_prefix() {
-  # For crate FAMILIES (e.g. ftui-*): every member must share one uniform version.
+  # For crate FAMILIES (e.g. ftui-*): every member must come from ONE release set.
+  #
+  # A release set is identified by where Cargo got it, not by the version strings members
+  # declare (bd-tdj0). Every member resolved from one git source revision was built from one
+  # commit, so it is one release set even when upstream bumped a single member's version
+  # string (frankentui 15cc6543 ships ftui-layout 0.5.1 beside 0.5.0 siblings). Otherwise
+  # (registry or path members) the members must share one version AND one source.
   local lock_file="$1" prefix="$2"
-  local pairs
-  pairs="$(awk -v pre="$prefix" '
+  local rows
+  rows="$(awk -v pre="$prefix" '
     function emit() {
       if (in_pkg && index(name, pre) == 1) {
-        print name "@" ver
+        if (src == "") src = "local"
+        print name "\t" ver "\t" src
       }
     }
-    $0 == "[[package]]" { emit(); in_pkg=1; name=""; ver=""; next }
+    $0 == "[[package]]" { emit(); in_pkg=1; name=""; ver=""; src=""; next }
     in_pkg && /^name = / { gsub(/name = |"/,""); name=$0 }
     in_pkg && /^version = / { gsub(/version = |"/,""); ver=$0 }
+    in_pkg && /^source = / { gsub(/source = |"/,""); src=$0 }
     END { emit() }
   ' "$lock_file")"
 
   echo "== family check: ${prefix}* =="
-  if [[ -z "$pairs" ]]; then
+  if [[ -z "$rows" ]]; then
     echo "  no ${prefix}* family members are present in the lock"
     return 0
   fi
 
-  local nvers
-  nvers="$(printf '%s\n' "$pairs" | sed -E 's/^.*@//' | sort -u | wc -l | tr -d ' ')"
   printf '  members:\n'
-  while IFS= read -r line; do
-    echo "    $line"
-  done <<< "$pairs"
+  while IFS=$'\t' read -r name ver src; do
+    echo "    ${name}@${ver} (${src})"
+  done <<< "$rows"
 
+  local duplicated
+  duplicated="$(printf '%s\n' "$rows" | cut -f1 | sort | uniq -d)"
+  if [[ -n "$duplicated" ]]; then
+    echo "::error::${prefix}* family member(s) resolve to more than one lock entry: $(echo $duplicated)"
+    return 1
+  fi
+
+  local nsrcs nvers only_src
+  nsrcs="$(printf '%s\n' "$rows" | cut -f3 | sort -u | wc -l | tr -d ' ')"
+  nvers="$(printf '%s\n' "$rows" | cut -f2 | sort -u | wc -l | tr -d ' ')"
+  only_src="$(printf '%s\n' "$rows" | cut -f3 | head -1)"
+
+  if (( nsrcs > 1 )); then
+    echo "::error::${prefix}* family spans $nsrcs distinct sources — must be one release set"
+    return 1
+  fi
+  if [[ "$only_src" == git+* ]]; then
+    echo "  OK: family is one git revision ($only_src); $nvers declared version string(s)"
+    return 0
+  fi
   if (( nvers > 1 )); then
     echo "::error::${prefix}* family spans $nvers distinct versions — must be one release set"
     return 1
   fi
   local uniform_ver
-  uniform_ver="$(printf '%s\n' "$pairs" | sed -E 's/^.*@//' | head -1)"
+  uniform_ver="$(printf '%s\n' "$rows" | cut -f2 | head -1)"
   echo "  OK: family uniform ($uniform_ver)"
   return 0
 }
@@ -313,6 +340,23 @@ self_test() {
     return 1
   fi
   echo "  PASS (correctly caught split family versions)"
+
+  echo "== self-test 5a: one git revision with skewed version strings must PASS =="
+  check_family_prefix "$FIXTURES_DIR/positive_ftui_single_git_rev_skewed.lock" "ftui" >/dev/null 2>&1 || {
+    echo "::error::self-test FAILED — single-revision ftui family rejected"
+    return 1
+  }
+  echo "  PASS"
+
+  local family_negative
+  for family_negative in negative_ftui_two_git_revs negative_ftui_mixed_sources negative_ftui_duplicate_member; do
+    echo "== self-test 5b: $family_negative must FAIL =="
+    if check_family_prefix "$FIXTURES_DIR/$family_negative.lock" "ftui" >/dev/null 2>&1; then
+      echo "::error::self-test FAILED — $family_negative was not rejected"
+      return 1
+    fi
+    echo "  PASS (correctly rejected)"
+  done
 
   echo "== self-test 6: valid consumer metadata requirements must PASS =="
   evaluate_consumer_requirements "asupersync" "0.3.9" "fixture:$FIXTURES_DIR/fixture_valid_metadata.json" >/dev/null 2>&1 || {
