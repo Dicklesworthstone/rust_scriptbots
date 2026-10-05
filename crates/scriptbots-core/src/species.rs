@@ -1873,7 +1873,6 @@ pub fn step_species_cadence(
     let samples = match adapt_phenotype_samples(inputs, adapter_config) {
         Ok(s) => s,
         Err(err) => {
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             tracing::warn!(
                 tick = tick.0,
                 error = ?err,
@@ -1888,7 +1887,6 @@ pub fn step_species_cadence(
     let report_digest = report.canonical_digest();
     let params_digest = params.canonical_digest();
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     tracing::info!(
         tick = tick.0,
         phenotype_schema = PHENOTYPE_FEATURE_SCHEMA_ID_V1,

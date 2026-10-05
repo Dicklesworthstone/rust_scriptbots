@@ -4,60 +4,32 @@
 // Target-neutral diagnostic facade (bd-7u5a)
 // ---------------------------------------------------------------------------
 //
-// `tracing` is declared only for non-wasm targets (see Cargo.toml's
-// `[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]`),
-// but production code logged unconditionally. That did not degrade quietly on wasm -- it was a
-// hard `E0433` build break reached through scriptbots-web's `default-features = false`
-// dependency on this crate, and it blocked both browser compilation and the native-vs-WASM
-// parity proof. It survived because it cannot manifest in any local build; only the wasm target
-// sees it.
+// These once forwarded to `tracing` off-wasm and expanded to NOTHING on wasm, because `tracing`
+// was then a non-wasm-only dependency and an unconditional log was a hard `E0433` break on the
+// browser target. `tracing` is now an unconditional dependency (economy.rs, species.rs and
+// map_elites.rs call it directly and build for wasm32), so the empty expansion bought nothing
+// and cost two things: values computed only for a log line became unused-variable warnings on
+// the one target nobody builds locally, and log arguments were evaluated on native but not on
+// wasm -- a behavioural divergence waiting for the first argument with a side effect.
 //
-// These wrappers forward to `tracing` off-wasm and expand to nothing on wasm, so every call site
-// keeps ONE shape and nobody has to remember the cfg. One site was previously hand-gated
-// individually; generalising it is what stops the next thirteen.
-//
-// IMPORTANT -- ARGUMENTS MUST STAY PURE. On wasm these expand to nothing, so their arguments are
-// NEVER EVALUATED. That matches `tracing`'s own behaviour for a disabled level, and it is safe
-// only because every current argument is a field read or a pure accessor (`Tick::next()` is a
-// `const fn` returning a new value, not an iterator advance). Adding an argument with a side
-// effect -- a mutation, an iterator advance, a counter bump -- would make wasm and native
-// diverge BEHAVIOURALLY rather than just in log output, and it would do so on the one target
-// nobody builds locally. Compute such a value into a local first, then log the local.
+// They now forward to `tracing` on every target, so arguments follow `tracing`'s one rule
+// (evaluated only when the level is enabled) everywhere, and the browser build logs through
+// whatever subscriber the page installs. Keep arguments pure all the same.
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 macro_rules! diag_error {
     ($($arg:tt)*) => { ::tracing::error!($($arg)*) };
 }
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-macro_rules! diag_error {
-    ($($arg:tt)*) => {};
-}
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 macro_rules! diag_warn {
     ($($arg:tt)*) => { ::tracing::warn!($($arg)*) };
 }
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-macro_rules! diag_warn {
-    ($($arg:tt)*) => {};
-}
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 macro_rules! diag_info {
     ($($arg:tt)*) => { ::tracing::info!($($arg)*) };
 }
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-macro_rules! diag_info {
-    ($($arg:tt)*) => {};
-}
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 macro_rules! diag_debug {
     ($($arg:tt)*) => { ::tracing::debug!($($arg)*) };
-}
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-macro_rules! diag_debug {
-    ($($arg:tt)*) => {};
 }
 
 pub mod ancestry;

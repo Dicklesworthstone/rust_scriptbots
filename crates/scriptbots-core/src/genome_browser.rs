@@ -363,7 +363,6 @@ impl GenomeBrowserViewModel {
 
         let build_duration_us = u64::try_from(start_time.elapsed().as_micros()).unwrap_or(u64::MAX);
 
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         tracing::debug!(
             target: "scriptbots::genome_browser",
             selected_agent = agent_uid.get(),
