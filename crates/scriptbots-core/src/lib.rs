@@ -8074,6 +8074,10 @@ impl PresetKind {
             Self::Arctic => {
                 config.temperature_gradient_exponent = 1.6;
                 config.food_max = 0.35;
+                // Respawn refills a cell to its maximum (the defaults are 0.5 and 0.5). Lowering
+                // only the maximum left respawn above it, which validation rejects, so this
+                // preset could never be applied to a default world.
+                config.food_respawn_amount = 0.35;
                 config.food_growth_rate = 0.03;
             }
             Self::BoomBust => {
@@ -8094,6 +8098,7 @@ impl PresetKind {
             Self::Arctic => serde_json::json!({
                 "temperature_gradient_exponent": 1.6,
                 "food_max": 0.35,
+                "food_respawn_amount": 0.35,
                 "food_growth_rate": 0.03
             }),
             Self::BoomBust => serde_json::json!({
@@ -50241,6 +50246,36 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// `arctic` lowered `food_max` below the default `food_respawn_amount`, so
+    /// `POST /api/presets/apply {"name":"arctic"}` was refused on every default world. Each
+    /// preset must validate on the defaults, and its JSON patch (the REST path) must produce
+    /// the same configuration as applying it directly.
+    #[test]
+    fn every_preset_applies_cleanly_to_the_default_configuration() {
+        for &preset in PresetKind::all() {
+            let mut direct = ScriptBotsConfig::default();
+            preset.apply_to_config(&mut direct);
+            if let Err(error) = direct.validate() {
+                panic!("{} on the default config: {error}", preset.as_str());
+            }
+
+            let mut patched = serde_json::to_value(ScriptBotsConfig::default())
+                .expect("default config serializes");
+            let patch = preset.patch();
+            for (key, value) in patch.as_object().expect("a preset patch is an object") {
+                patched[key] = value.clone();
+            }
+            let patched: ScriptBotsConfig =
+                serde_json::from_value(patched).expect("patched config deserializes");
+            assert_eq!(
+                serde_json::to_value(&patched).expect("serialize"),
+                serde_json::to_value(&direct).expect("serialize"),
+                "{}: its JSON patch and its direct application disagree",
+                preset.as_str()
+            );
+        }
     }
 
     #[test]
