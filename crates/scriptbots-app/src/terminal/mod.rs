@@ -18870,7 +18870,33 @@ mod tests {
     #[test]
     fn test_command_palette_and_help_parity() {
         let items = all_command_palette_items();
-        assert!(items.len() >= 25, "Command registry must cover all domains");
+        // Every domain is represented. (This was `items.len() >= 25`, a count that ten entries
+        // satisfied while doing nothing in the live HUD -- screens it never renders.)
+        let categories: std::collections::BTreeSet<&str> =
+            items.iter().map(|item| item.category).collect();
+        for domain in [
+            "Playback", "Scenario", "Export", "View", "Science", "System",
+        ] {
+            assert!(
+                categories.contains(domain),
+                "Command registry must cover the {domain} domain"
+            );
+        }
+        // A hint is a key the live HUD binds to the same action, or empty. Hints once named
+        // FrankenTUI shell keys (`1 / D`, `4 / L`, `F12`, ...) that do something else or
+        // nothing here. A new binding must be added both to `handle_key` and to this list.
+        const HUD_BINDINGS: [&str; 17] = [
+            "Space", "s", "+", "-", "Shift+S", "a", "r", "t", "o", "i", "w", "f", "Enter",
+            "Ctrl+T", "p / c", "?", "q / Esc",
+        ];
+        for item in &items {
+            assert!(
+                item.keybind_hint.is_empty() || HUD_BINDINGS.contains(&item.keybind_hint),
+                "{} advertises {:?}, which is not a live HUD binding",
+                item.id,
+                item.keybind_hint
+            );
+        }
 
         let mut ids = std::collections::HashSet::new();
         let mut labels = std::collections::HashSet::new();

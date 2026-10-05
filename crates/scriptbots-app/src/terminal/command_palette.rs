@@ -168,6 +168,11 @@ pub type CommandPaletteEntry = CommandPaletteItem;
 /// Canonical registry of all available command palette items.
 ///
 /// Drives palette search, help overlay, keyboard shortcuts, and mouse selection.
+///
+/// A `keybind_hint` names the key the live terminal HUD actually binds to the same action, or
+/// is empty for a palette-only action. Hints here once advertised the FrankenTUI shell's keys
+/// (`1 / D`, `4 / L`, ...), which in the HUD do something else or nothing; the shell's screen
+/// routes are not rendered in the live terminal (bd-2z0.6.8), so they are not listed.
 #[must_use]
 pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
     vec![
@@ -203,28 +208,28 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
         CommandPaletteItem {
             id: "playback.speed_1x",
             label: "Set Speed 1.0x (Normal)",
-            keybind_hint: "1",
+            keybind_hint: "",
             category: "Playback",
             action: CommandPaletteAction::SetSpeed1x,
         },
         CommandPaletteItem {
             id: "playback.speed_2x",
             label: "Set Speed 2.0x (Fast)",
-            keybind_hint: "2",
+            keybind_hint: "",
             category: "Playback",
             action: CommandPaletteAction::SetSpeed2x,
         },
         CommandPaletteItem {
             id: "playback.speed_4x",
             label: "Set Speed 4.0x (Very Fast)",
-            keybind_hint: "4",
+            keybind_hint: "",
             category: "Playback",
             action: CommandPaletteAction::SetSpeed4x,
         },
         CommandPaletteItem {
             id: "playback.speed_max",
             label: "Set Speed Maximum (8.0x)",
-            keybind_hint: "8",
+            keybind_hint: "",
             category: "Playback",
             action: CommandPaletteAction::SetSpeedMax,
         },
@@ -232,21 +237,21 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
         CommandPaletteItem {
             id: "scenario.spawn_herbivore",
             label: "Spawn Herbivore Agent (Plant Eater)",
-            keybind_hint: "H",
+            keybind_hint: "",
             category: "Scenario",
             action: CommandPaletteAction::SpawnHerbivore,
         },
         CommandPaletteItem {
             id: "scenario.spawn_carnivore",
             label: "Spawn Carnivore Agent (Predator)",
-            keybind_hint: "C",
+            keybind_hint: "",
             category: "Scenario",
             action: CommandPaletteAction::SpawnCarnivore,
         },
         CommandPaletteItem {
             id: "scenario.trigger_drought",
             label: "Trigger Drought Intervention (Food Suppression)",
-            keybind_hint: "D",
+            keybind_hint: "",
             category: "Scenario",
             action: CommandPaletteAction::TriggerDrought,
         },
@@ -257,70 +262,6 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "Shift+S",
             category: "Export",
             action: CommandPaletteAction::ExportAsciiScreenshot,
-        },
-        // Navigation
-        CommandPaletteItem {
-            id: "nav.dashboard",
-            label: "Navigate to Dashboard Screen",
-            keybind_hint: "1 / D",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateDashboard,
-        },
-        CommandPaletteItem {
-            id: "nav.world_canvas",
-            label: "Navigate to World Canvas View",
-            keybind_hint: "2 / W",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateWorld,
-        },
-        CommandPaletteItem {
-            id: "nav.inspector",
-            label: "Navigate to Agent Brain Inspector",
-            keybind_hint: "3 / I",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateInspector,
-        },
-        CommandPaletteItem {
-            id: "nav.lineages",
-            label: "Navigate to Lineages & Phylogeny Screen",
-            keybind_hint: "4 / L",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateLineages,
-        },
-        CommandPaletteItem {
-            id: "nav.brain_arena",
-            label: "Navigate to Brain Arena & Cohorts Screen",
-            keybind_hint: "5 / B",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateBrainArena,
-        },
-        CommandPaletteItem {
-            id: "nav.experiments",
-            label: "Navigate to Experiments & Interventions Screen",
-            keybind_hint: "6 / E",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateExperiments,
-        },
-        CommandPaletteItem {
-            id: "nav.replay",
-            label: "Navigate to Replay & Checkpoints Screen",
-            keybind_hint: "7 / R",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateReplay,
-        },
-        CommandPaletteItem {
-            id: "nav.environment",
-            label: "Navigate to Environment & Biomes Screen",
-            keybind_hint: "8 / V",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateEnvironment,
-        },
-        CommandPaletteItem {
-            id: "nav.diagnostics",
-            label: "Navigate to System Diagnostics Screen",
-            keybind_hint: "9 / X",
-            category: "Navigation",
-            action: CommandPaletteAction::NavigateDiagnostics,
         },
         CommandPaletteItem {
             id: "nav.toggle_archipelago",
@@ -354,7 +295,7 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
         CommandPaletteItem {
             id: "science.toggle_probe",
             label: "Toggle Senses Attribution Probe",
-            keybind_hint: "b",
+            keybind_hint: "i",
             category: "Science",
             action: CommandPaletteAction::ToggleProbe,
         },
@@ -378,13 +319,6 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "Enter",
             category: "Science",
             action: CommandPaletteAction::FocusEventSubject,
-        },
-        CommandPaletteItem {
-            id: "diag.toggle_diagnostics",
-            label: "Toggle System Diagnostics Overlay",
-            keybind_hint: "F12",
-            category: "Diagnostics",
-            action: CommandPaletteAction::ToggleDiagnostics,
         },
         CommandPaletteItem {
             id: "view.cycle_theme",
