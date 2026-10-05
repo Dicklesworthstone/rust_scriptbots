@@ -2,9 +2,9 @@
 
 use super::{
     AdmissionState, CommandAuthorityRequest, DEFAULT_COMMAND_CAPACITY, ExistingStorageLease,
-    InFlightPermit, MAX_COMMAND_ENVELOPE_BYTES, MAX_STORAGE_QUERY_PAGE, MAX_STORAGE_WAIT_TIMEOUT,
-    Storage, StorageBuffer, StorageCommand, StorageError, load_host_journal_index,
-    read_host_journal_events,
+    InFlightPermit, MAX_COMMAND_ENVELOPE_BYTES, MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+    MAX_STORAGE_QUERY_PAGE, MAX_STORAGE_WAIT_TIMEOUT, Storage, StorageBuffer, StorageCommand,
+    StorageError, load_host_journal_index, read_host_journal_events,
 };
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
@@ -44,7 +44,8 @@ const DEFAULT_JOURNAL_INFLIGHT_BYTES: usize = 512 << 20;
 const DEFAULT_JOURNAL_IDENTITY_CAPACITY: usize = 512;
 const DEFAULT_EVENT_PAGE_BYTES: usize = 256 << 20;
 const MAX_JOURNAL_BYTES: usize = 1 << 30;
-pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 3;
+// Version 4: `scientific` and `persistence` are deflated sections (`bd-nvqh`).
+pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 4;
 
 /// Bounded admission and catch-up limits for one HostCore journal adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1785,8 +1786,79 @@ struct HostJournalArchiveRef<'a> {
     command_lifecycle: Option<&'a EncodedCommandLifecycle>,
     scheduled_patch: Option<&'a ScheduledPatchEvidence>,
     applied: AppliedCommand,
+    #[serde(serialize_with = "archive_section::serialize_ref")]
     scientific: Option<&'a ScientificBoundary>,
+    #[serde(serialize_with = "archive_section::serialize_ref")]
     persistence: Option<&'a StorageBuffer>,
+}
+
+/// The two bulky archive sections, stored as deflated JSON in base64 (`bd-nvqh`).
+///
+/// The archive is the write-ahead copy of each batch: it commits first, the rows are applied
+/// after, and recovery re-applies `persistence` from here. A 5,000-agent run kept 398 MB of
+/// archive beside 912 MB of database, 307 MB of it in the ten persistence windows (about 30 MB
+/// of plain JSON each, mostly replay events) and most of the rest in the per-tick scientific
+/// boundary. Deflate level 1 shrinks a window about 4.5x. The output is deterministic, so
+/// `HostJournalArchive::decode`'s canonical re-encoding comparison still binds the stored bytes.
+mod archive_section {
+    use super::MAX_HOST_JOURNAL_ARCHIVE_BYTES;
+    use base64::Engine as _;
+    use serde::{Deserialize as _, Serialize};
+
+    const LEVEL: u8 = 1;
+
+    fn encode<T: Serialize, E: serde::ser::Error>(value: &T) -> Result<String, E> {
+        let json = serde_json::to_vec(value).map_err(E::custom)?;
+        if json.len() > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
+            return Err(E::custom(format!(
+                "archive section has {} bytes, exceeding {MAX_HOST_JOURNAL_ARCHIVE_BYTES}",
+                json.len()
+            )));
+        }
+        let deflated = miniz_oxide::deflate::compress_to_vec(&json, LEVEL);
+        Ok(base64::engine::general_purpose::STANDARD.encode(deflated))
+    }
+
+    pub(super) fn serialize_ref<T, S>(value: &Option<&T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: serde::Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_some(&encode::<T, S::Error>(*value)?),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn serialize<T, S>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: serde::Serializer,
+    {
+        serialize_ref(&value.as_ref(), serializer)
+    }
+
+    pub(super) fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        T: serde::de::DeserializeOwned,
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let deflated = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| D::Error::custom(format!("archive section base64: {error}")))?;
+        let json = miniz_oxide::inflate::decompress_to_vec_with_limit(
+            &deflated,
+            MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+        )
+        .map_err(|error| D::Error::custom(format!("archive section deflate: {error}")))?;
+        serde_json::from_slice(&json)
+            .map(Some)
+            .map_err(D::Error::custom)
+    }
 }
 
 fn validate_archive_boundary(
@@ -2032,7 +2104,15 @@ pub(super) struct HostJournalArchive {
     command_lifecycle: Option<EncodedCommandLifecycle>,
     scheduled_patch: Option<ScheduledPatchEvidence>,
     applied: AppliedCommand,
+    #[serde(
+        serialize_with = "archive_section::serialize",
+        deserialize_with = "archive_section::deserialize"
+    )]
     scientific: Option<ScientificBoundary>,
+    #[serde(
+        serialize_with = "archive_section::serialize",
+        deserialize_with = "archive_section::deserialize"
+    )]
     persistence: Option<StorageBuffer>,
 }
 
@@ -5733,7 +5813,10 @@ mod tests {
         let (payload_json, payload_digest) =
             encode_host_journal_archive(&archive, MAX_JOURNAL_BYTES)
                 .expect("encode canonical archive");
-        assert!(payload_json.contains("\"value\":0.025496361777186394"));
+        assert!(
+            archive_section_json(&payload_json, "persistence")
+                .contains("\"value\":0.025496361777186394")
+        );
 
         let decoded = HostJournalArchive::decode(
             &payload_json,
@@ -5749,6 +5832,120 @@ mod tests {
             .metrics[0]
             .value;
         assert_eq!(decoded_value.to_bits(), EXACT_F64.to_bits());
+    }
+
+    /// The plain JSON inside one deflated archive section.
+    fn archive_section_json(payload_json: &str, field: &str) -> String {
+        use base64::Engine as _;
+        let archive: serde_json::Value = serde_json::from_str(payload_json).expect("archive JSON");
+        let encoded = archive[field].as_str().expect("section is a base64 string");
+        let deflated = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("section base64");
+        String::from_utf8(
+            miniz_oxide::inflate::decompress_to_vec(&deflated).expect("section deflate"),
+        )
+        .expect("section JSON is UTF-8")
+    }
+
+    #[test]
+    fn archive_sections_are_deflated_and_tampering_is_refused() {
+        use base64::Engine as _;
+        let persistence = PersistenceBatch {
+            summary: TickSummary {
+                tick: Tick(1),
+                agent_count: 0,
+                births: 0,
+                deaths: 0,
+                total_energy: 0.0,
+                average_energy: 0.0,
+                average_health: 0.0,
+                max_age: 0,
+                spike_hits: 0,
+            },
+            epoch: 0,
+            closed: true,
+            metrics: (0..2_000)
+                .map(|index| MetricSample::new(format!("bulk.metric.{index}"), 0.5))
+                .collect(),
+            events: Vec::new(),
+            agents: Vec::new(),
+            births: Vec::new(),
+            deaths: Vec::new(),
+            replay_events: Vec::new(),
+            narrative_events: Vec::new(),
+            genomes: Vec::new(),
+        };
+        let persistence = Storage::prepare_batch(&persistence).expect("prepare bulk metrics");
+        let run_id = RunId::new(1);
+        let session_id = HostSessionId::new(0x402);
+        let batch_id = JournalBatchId::new(session_id, 1);
+        let host_session_id = encode_journal_u64(session_id.get());
+        let journal_sequence = encode_journal_u64(batch_id.sequence());
+        let scientific_event_sequence = encode_journal_u64(1);
+        let command = applied_lifecycle(
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            applied(),
+        );
+        let encoded_command =
+            EncodedCommandLifecycle::encode(&command).expect("encode command lifecycle");
+        let scientific = scientific();
+        let archive = HostJournalArchiveRef {
+            version: HOST_JOURNAL_ARCHIVE_VERSION,
+            run_id,
+            host_session_id: &host_session_id,
+            journal_sequence: &journal_sequence,
+            scientific_event_sequence: Some(&scientific_event_sequence),
+            command_lifecycle: Some(&encoded_command),
+            scheduled_patch: None,
+            applied: applied(),
+            scientific: Some(&scientific),
+            persistence: Some(&persistence),
+        };
+        let (payload_json, payload_digest) =
+            encode_host_journal_archive(&archive, MAX_JOURNAL_BYTES).expect("encode archive");
+
+        let plain = serde_json::to_string(&persistence).expect("plain persistence JSON");
+        assert_eq!(archive_section_json(&payload_json, "persistence"), plain);
+        assert!(
+            payload_json.len() * 4 < plain.len(),
+            "a repetitive persistence section must be stored compressed: {} stored for {} plain",
+            payload_json.len(),
+            plain.len()
+        );
+        let decoded = HostJournalArchive::decode(
+            &payload_json,
+            &payload_digest,
+            run_id,
+            batch_id,
+            MAX_JOURNAL_BYTES,
+        )
+        .expect("decode compressed archive");
+        assert_eq!(
+            decoded.persistence.expect("persistence").metrics.len(),
+            2_000
+        );
+
+        // Swap the stored section text in place, keep every other byte, and re-digest, so a
+        // refusal can only come from the section itself.
+        let stored: serde_json::Value = serde_json::from_str(&payload_json).expect("JSON");
+        let stored_section = stored["persistence"].as_str().expect("section").to_owned();
+        let with_section = |section: &[u8]| {
+            let json = payload_json.replacen(
+                &stored_section,
+                &base64::engine::general_purpose::STANDARD.encode(section),
+                1,
+            );
+            let digest = blake3::hash(json.as_bytes()).to_hex().to_string();
+            HostJournalArchive::decode(&json, &digest, run_id, batch_id, MAX_JOURNAL_BYTES)
+        };
+
+        // Control: the canonical level-1 encoding substituted the same way is accepted.
+        assert!(with_section(&miniz_oxide::deflate::compress_to_vec(plain.as_bytes(), 1)).is_ok());
+        // The same rows deflated at another level are not the canonical encoding.
+        assert!(with_section(&miniz_oxide::deflate::compress_to_vec(plain.as_bytes(), 9)).is_err());
+        // A section that is not deflate data is refused.
+        assert!(with_section(b"not deflate data").is_err());
     }
 
     #[test]

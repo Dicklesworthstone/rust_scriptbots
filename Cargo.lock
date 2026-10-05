@@ -11447,11 +11447,13 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "asupersync",
+ "base64 0.22.1",
  "blake3",
  "crossbeam-channel",
  "fsqlite",
  "futures-lite",
  "libc",
+ "miniz_oxide 0.8.9",
  "postcard",
  "rmp-serde",
  "scriptbots-brain",
