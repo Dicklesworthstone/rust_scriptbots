@@ -101,18 +101,63 @@ fn hdr_image_target_renders_content_upstream_canary() {
     ));
     app.finish();
     app.cleanup();
-    for _ in 0..6 {
-        app.update();
-    }
 
-    // Manual readback of the target (same path the capture harness uses).
-    let data = {
+    // Bevy compiles render pipelines asynchronously. On a software adapter the cube's pipeline
+    // was sometimes still compiling after a fixed 6 frames, so the readback held only the clear
+    // colour (distinct=4, max_channel=102) and the canary failed about one run in three with
+    // nothing wrong. Render until content appears or a bounded frame budget runs out; the
+    // assertions below are unchanged, so a genuinely broken HDR path still fails.
+    const FRAME_BUDGET: usize = 120;
+    let mut frames = 0;
+    let mut tight = Vec::new();
+    while frames < FRAME_BUDGET {
+        app.update();
+        frames += 1;
+        tight = unpad_readback(&read_target(&mut app, &target), 128, 128);
+        if has_content(&tight) {
+            break;
+        }
+    }
+    let distinct: std::collections::HashSet<u8> = tight.iter().copied().collect();
+    let max_channel = max_channel(&tight);
+    // The clear color (0.2, 0, 0.4) alone yields ~2-3 distinct bytes and a
+    // max channel of 102; a rendered lit cube adds variety and brighter
+    // pixels.
+    assert!(
+        distinct.len() > 8,
+        "HDR pipeline should draw content within {frames} frames: distinct={} max_channel={max_channel}",
+        distinct.len()
+    );
+    assert!(
+        max_channel > 102,
+        "lit cube must exceed clear color within {frames} frames: max_channel={max_channel}"
+    );
+}
+
+fn max_channel(tight: &[u8]) -> u8 {
+    tight
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|px| px[0].max(px[1]).max(px[2]))
+        .max()
+        .unwrap_or(0)
+}
+
+fn has_content(tight: &[u8]) -> bool {
+    let distinct: std::collections::HashSet<u8> = tight.iter().copied().collect();
+    distinct.len() > 8 && max_channel(tight) > 102
+}
+
+/// Manual readback of the target (same path the capture harness uses).
+fn read_target(app: &mut App, target: &Handle<Image>) -> Vec<u8> {
+    {
         let render_app = app.get_sub_app_mut(RenderApp).expect("render app");
         let world = render_app.world_mut();
         let device = world.resource::<RenderDevice>().clone();
         let queue = world.resource::<RenderQueue>().clone();
         let gpu_images = world.resource::<RenderAssets<GpuImage>>();
-        let gpu_image = gpu_images.get(&target).expect("gpu image prepared");
+        let gpu_image = gpu_images.get(target).expect("gpu image prepared");
         let bytes_per_row = RenderDevice::align_copy_bytes_per_row(128 * 4) as u32;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hdr_canary_readback"),
@@ -150,26 +195,5 @@ fn hdr_image_target_renders_content_upstream_canary() {
         };
         buffer.unmap();
         data
-    };
-    let tight = unpad_readback(&data, 128, 128);
-    let distinct: std::collections::HashSet<u8> = tight.iter().copied().collect();
-    let max_channel = tight
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|px| px[0].max(px[1]).max(px[2]))
-        .max()
-        .unwrap_or(0);
-    // The clear color (0.2, 0, 0.4) alone yields ~2-3 distinct bytes and a
-    // max channel of 102; a rendered lit cube adds variety and brighter
-    // pixels.
-    assert!(
-        distinct.len() > 8,
-        "HDR pipeline should draw content: distinct={} max_channel={max_channel}",
-        distinct.len()
-    );
-    assert!(
-        max_channel > 102,
-        "lit cube must exceed clear color: max_channel={max_channel}"
-    );
+    }
 }
