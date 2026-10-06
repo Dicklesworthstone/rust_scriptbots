@@ -79,11 +79,13 @@ run_repo_checks() {
 }
 
 # Run the checks with a fresh failure counter and report the result code only.
-rc() {
+# A subshell, so the counter a deliberately failing self-test fixture raises does not leak
+# into the caller's: it used to, and every --self-test run exited 1 after printing four "ok"s.
+rc() (
   failures=0
   run_repo_checks
   [ "$failures" -eq 0 ]
-}
+)
 
 run_self_test() {
   local tmp
