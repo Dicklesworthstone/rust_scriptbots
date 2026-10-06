@@ -32,7 +32,28 @@
 #     owning bead.
 #
 # RESIDUAL-RISK TRACKING:
-#   Currently no active advisory suppressions. All previous quick-xml
-#   exceptions were retired under bd-2oov after wayland-scanner 0.31.11.
+#   The wayland-scanner quick-xml exceptions were retired under bd-2oov after
+#   wayland-scanner 0.31.11. quick-xml 0.39.4 re-entered through fnx-readwrite
+#   (scriptbots-analytics); those two exceptions are owned by bd-hyg2.
 
 schema = 1
+
+[[advisory]]
+id = "RUSTSEC-2026-0194"
+package = "quick-xml"
+locked_version = "0.39.4"
+owning_bead = "bd-hyg2"
+justification = "Sole path: quick-xml 0.39.4 <- fnx-readwrite 0.2.2 <- scriptbots-analytics. Production analytics code only WRITES GraphML/edge lists (graphs.rs export_* -> EdgeListEngine::write_*); the flagged start-tag parsing runs only in tests/graph_reports.rs on output the crate generated itself. No untrusted XML is parsed. Every published fnx-readwrite (0.2.0/0.2.2/0.2.3) requires quick-xml ^0.39.2, so no compatible fixed version exists."
+removal_trigger = "A fnx-readwrite release requiring quick-xml >= 0.41, bumped through the bd-2z0.8 lane with this flag and entry deleted in the same commit; or, immediately, any analytics read path for externally supplied XML."
+reviewed_at = "2026-10-06"
+reviewed_by = "NavyCanyon: cargo tree -i quick-xml@0.39.4 on Cargo.lock and a source read of every fnx_readwrite call site"
+
+[[advisory]]
+id = "RUSTSEC-2026-0195"
+package = "quick-xml"
+locked_version = "0.39.4"
+owning_bead = "bd-hyg2"
+justification = "Sole path: quick-xml 0.39.4 <- fnx-readwrite 0.2.2 <- scriptbots-analytics. The flagged NsReader namespace-declaration allocation is a parse path; production analytics code only writes GraphML/edge lists, and parsing happens only in tests on the crate's own generated output. No untrusted XML is parsed. No fnx-readwrite release requires a fixed quick-xml."
+removal_trigger = "A fnx-readwrite release requiring quick-xml >= 0.41, bumped through the bd-2z0.8 lane with this flag and entry deleted in the same commit; or, immediately, any analytics read path for externally supplied XML."
+reviewed_at = "2026-10-06"
+reviewed_by = "NavyCanyon: cargo tree -i quick-xml@0.39.4 on Cargo.lock and a source read of every fnx_readwrite call site"

@@ -292,7 +292,9 @@ jobs:
         # (bd-2z0.8.14): every --ignore requires a complete documented entry
         # there, and the suppression gate in this job fails on drift in either direction.
         run: |
-          cargo audit
+          cargo audit \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195
 
       - name: Advisory-suppression documentation gate (bd-2z0.8.14)
         run: |
