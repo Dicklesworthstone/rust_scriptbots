@@ -9,7 +9,23 @@ rustup target add wasm32-unknown-unknown
 cargo check --target wasm32-unknown-unknown -p scriptbots-web
 ```
 
-`wasm-pack` integration will land in a later phase; see `docs/wasm/` for the roadmap and research artifacts.
+To produce the browser package the demo in `web/` loads (`web/pkg/scriptbots_web.js`), use
+either route:
+
+```bash
+# wasm-pack (the route web/README.md documents)
+wasm-pack build crates/scriptbots-web --target web --out-dir web/pkg -- --locked
+
+# or plain cargo + wasm-bindgen-cli (version must match the locked wasm-bindgen, 0.2.129)
+cargo build --locked --release --target wasm32-unknown-unknown -p scriptbots-web
+wasm-bindgen --target web --out-dir crates/scriptbots-web/web/pkg \
+  target/wasm32-unknown-unknown/release/scriptbots_web.wasm
+```
+
+`scripts/e2e_wasm_browser_stats_dom.sh` then drives the demo page in headless Chromium through
+Playwright and checks the live stats DOM (needs `bun` and the `playwright` module). Release-grade
+WASM evidence is DSR-only; an npm package layout is still open (bd-azi3). See `docs/wasm/` for
+the roadmap and research artifacts.
 
 ## Bindings overview
 
