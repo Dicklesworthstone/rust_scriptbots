@@ -9,6 +9,11 @@ use js_sys::Uint8Array;
 use postcard::{from_bytes, to_allocvec};
 use rand::Rng;
 use scriptbots_brain::{MlpBrain, mlp::MlpBrainFamily};
+#[cfg(all(
+    test,
+    any(not(target_arch = "wasm32"), feature = "native-parity-fixture")
+))]
+use scriptbots_core::CoreBuildIdentityV0;
 use scriptbots_core::gallery::{
     base_config_for_scenario, canonical_build_link, reconstruct_config_from_permalink,
 };
@@ -21,8 +26,8 @@ use scriptbots_core::{
 };
 #[cfg(test)]
 use scriptbots_core::{
-    AgentUid, CoreBuildIdentityV0, DynamicAgentSnapshot as AgentSnapshot,
-    DynamicSnapshotSummary as SnapshotSummary, DynamicSnapshotWorld as SnapshotWorld,
+    AgentUid, DynamicAgentSnapshot as AgentSnapshot, DynamicSnapshotSummary as SnapshotSummary,
+    DynamicSnapshotWorld as SnapshotWorld,
 };
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
@@ -959,8 +964,10 @@ fn clamp01(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
+    use scriptbots_core::DYNAMIC_WORLD_SNAPSHOT_SCHEMA;
     use scriptbots_core::permalink::BuildLink;
-    use scriptbots_core::{BirthOrigin, DYNAMIC_WORLD_SNAPSHOT_SCHEMA, ScriptBotsConfig};
+    use scriptbots_core::{BirthOrigin, ScriptBotsConfig};
     use std::sync::{Arc, Mutex};
     use wasm_bindgen_test::*;
 
@@ -1541,6 +1548,7 @@ mod tests {
     }
 
     /// Cumulative checkpoint ticks captured in the committed fixture.
+    #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
     const PARITY_CHECKPOINT_TICKS: [u32; 4] = [1, 8, 64, 150];
     /// Absolute floor for per-field float parity comparison. The fixture records
     /// this value so a consumer cannot silently weaken the comparator contract.
@@ -2103,7 +2111,8 @@ mod tests {
         food_digest: String,
     }
 
-    #[cfg(any(not(target_arch = "wasm32"), feature = "native-parity-fixture"))]
+    // Only the native fixture builder records the lane it ran on.
+    #[cfg(not(target_arch = "wasm32"))]
     fn current_core_feature_lane() -> ParityCoreFeatureLaneV1 {
         let build = CoreBuildIdentityV0::current();
         ParityCoreFeatureLaneV1 {
