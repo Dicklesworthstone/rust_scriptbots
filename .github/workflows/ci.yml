@@ -474,10 +474,22 @@ jobs:
           printf 'SCRIPTBOTS_CANDIDATE_DB=%s/scriptbots-%s-%s-candidate.sqlite\n' \
             "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
-      - name: Install mold linker
+      # scriptbots-app pulls wayland-sys and friends; their build scripts need the system
+      # development packages (the job failed at wayland-sys build.rs with mold alone).
+      - name: Install mold linker and system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y mold
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
@@ -578,10 +590,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
-      - name: Install mold linker
+      # The economy-audit CLI step builds scriptbots-app, which pulls wayland-sys and friends;
+      # their build scripts need the system development packages.
+      - name: Install mold linker and system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y mold
+          sudo apt-get install -y \
+            mold \
+            libfontconfig1 \
+            libfreetype6-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libudev-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
