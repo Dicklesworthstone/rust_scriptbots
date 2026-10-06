@@ -13,7 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Instant;
+// web-time: `std::time::Instant::now()` panics on wasm32-unknown-unknown (bd-3dzw).
+use web_time::Instant;
 
 use crate::genome_diff::{
     DiffSummary, GenomeDelta, GenomeDiffError, Locus, LocusSample, LocusValue, diff_genomes,

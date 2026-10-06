@@ -2,9 +2,9 @@ adler2
 ahash
 anyhow
 arc-swap
-arrayref
 arrayvec
 autocfg
+base64
 blake3
 bumpalo
 cc
@@ -71,6 +71,7 @@ wasm-bindgen
 wasm-bindgen-macro
 wasm-bindgen-macro-support
 wasm-bindgen-shared
+web-time
 wfc
 winnow
 zerocopy

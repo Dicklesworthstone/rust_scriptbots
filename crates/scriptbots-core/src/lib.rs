@@ -131,8 +131,13 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
+// `std::time::Instant::now()` panics on wasm32-unknown-unknown, which has no clock. web-time
+// re-exports the std type everywhere else, so native code and public signatures are unchanged,
+// and reads `performance.now()` in the browser (bd-3dzw). Wall-clock values here are diagnostic
+// timings only, never simulation state.
+use web_time::Instant;
 #[cfg(feature = "simd_wide")]
 use wide::f32x4;
 /// Bounded activation payload captured from a brain for inspection.
@@ -16542,7 +16547,8 @@ mod map_sandbox {
     use serde::{Deserialize, Serialize};
     use std::collections::{HashMap, HashSet};
     use std::num::NonZeroU32;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    // web-time: `std::time::SystemTime::now()` panics on wasm32-unknown-unknown (bd-3dzw).
+    use web_time::{SystemTime, UNIX_EPOCH};
     use wfc::{
         Coord, GlobalStats, PatternDescription, PatternTable, RunOwnAll, Size, Wave,
         overlapping::OverlappingPatterns,

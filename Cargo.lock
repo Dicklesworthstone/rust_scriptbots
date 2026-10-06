@@ -11390,6 +11390,7 @@ dependencies = [
  "thiserror 2.0.21",
  "toml 0.8.23",
  "tracing",
+ "web-time",
  "wfc",
  "wide 1.7.1",
 ]

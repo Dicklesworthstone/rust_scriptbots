@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::Range;
-use std::time::Instant;
+// web-time: `std::time::Instant::now()` panics on wasm32-unknown-unknown (bd-3dzw).
+use web_time::Instant;
 
 const DEFAULT_LAYOUT_BYTES: usize = 32 << 20;
 const BTREE_ENTRY_OVERHEAD_BYTES: usize = 48;
