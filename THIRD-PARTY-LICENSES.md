@@ -23,6 +23,7 @@ of this software or derivative works, unmodified, per its own terms:
 - `asupersync`
 - `franken-kernel`, `franken-evidence`, `franken-decision`
 - `fastmcp-rust`, `fastmcp-client`, `fastmcp-console`, `fastmcp-core`, `fastmcp-derive`, `fastmcp-protocol`, `fastmcp-server`, `fastmcp-transport` (FastMCP)
+- `ftui` and its `ftui-*` member crates (`ftui-a11y`, `ftui-backend`, `ftui-core`, `ftui-i18n`, `ftui-layout`, `ftui-render`, `ftui-runtime`, `ftui-style`, `ftui-text`, `ftui-widgets`) (FrankenTUI, pinned git revision `15cc6543`)
 - `fnx-` family crates (`fnx-classes`, `fnx-algorithms`, `fnx-readwrite`, `fnx-runtime`, `fnx-dispatch`, `fnx-cgse`) (franken_networkx analytics graph library)
 - `fp-` family crates (`fp-columnar`, `fp-frame`, `fp-groupby`, `fp-index`, `fp-runtime`, `fp-types`, `frankenpandas`) (frankenpandas analytics dataframe library)
 
