@@ -195,7 +195,11 @@ check_brain_ft_provenance() {
 
 check_brain_ft_numeric_universe() {
   local graph="$1" actual expected
-  expected=$'half v2.7.1\nmatrixmultiply v0.3.10\nsafe_arch v0.7.4\nsafe_arch v1.0.0\nwide v0.7.33\nwide v1.5.0'
+  # Re-reviewed for bd-avkr after the v0.2.0 dependency refresh (cc34f9a8): matrixmultiply
+  # 0.3.10->0.3.11, safe_arch 1.0.0->1.2.0, wide 1.5.0->1.7.1, all semver-compatible; the
+  # structure (one half, one matrixmultiply, the two-version wide/safe_arch split) is unchanged
+  # and `cargo test -p scriptbots-brain-ml --no-default-features --features brain-ft` passes.
+  expected=$'half v2.7.1\nmatrixmultiply v0.3.11\nsafe_arch v0.7.4\nsafe_arch v1.2.0\nwide v0.7.33\nwide v1.7.1'
   actual="$(printf '%s\n' "$graph" \
     | awk '$1 ~ /^(half|matrixmultiply|safe_arch|wide)$/ { print $1 " " $2 }' \
     | sort -u)"
@@ -290,7 +294,7 @@ self_test() {
     ft-api "$suffix" ft-autograd "$suffix" ft-core "$suffix" \
     ft-dispatch "$suffix" ft-kernel-cpu "$suffix" ft-nn "$suffix" \
     ft-optim "$suffix" ft-runtime "$suffix")"
-  good_ft_graph+=$'\nhalf v2.7.1\nmatrixmultiply v0.3.10\nsafe_arch v0.7.4\nsafe_arch v1.0.0\nwide v0.7.33\nwide v1.5.0\nscriptbots-brain-ml v0.1.0'
+  good_ft_graph+=$'\nhalf v2.7.1\nmatrixmultiply v0.3.11\nsafe_arch v0.7.4\nsafe_arch v1.2.0\nwide v0.7.33\nwide v1.7.1\nscriptbots-brain-ml v0.1.0'
   if ! check_brain_ft_closure "$good_ft_graph" >/dev/null 2>&1; then
     echo "::error::self-test FAILED — reviewed brain-ft closure rejected"; return 1
   fi
