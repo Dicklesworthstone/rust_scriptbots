@@ -10,10 +10,14 @@ on:
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same branch/PR
+# Pull requests cancel their superseded runs. Pushes to main do NOT: agents push to main
+# every few minutes, so cancelling made nearly every main run end in 'cancelled' or a
+# 'runner received a shutdown signal' failure, and main's CI result was never observed.
+# Without cancellation the in-flight run finishes and GitHub keeps only the newest
+# pending run, so main is still sampled at its latest commit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
