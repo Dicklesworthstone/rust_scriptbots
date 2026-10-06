@@ -522,32 +522,40 @@ jobs:
           SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES: "16"
         run: SCRIPTBOTS_STORAGE_PATH="$SCRIPTBOTS_CANDIDATE_DB" cargo run --release -p scriptbots-app --bin scriptbots-app -- --config ci/configs/replay_ci.toml
 
-      - name: Verify replay fails closed without production event instrumentation
+      # The headless run records production events (actions, combat, food sharing, narrative
+      # inputs) and a final world digest, so replay is no longer vacuous: these steps assert the
+      # positive contract, and the last one keeps a fail-closed control. (They previously
+      # asserted a 'vacuous nonzero run' refusal from before production instrumentation landed.)
+      - name: Verify the recorded run replays exactly
         run: |
-          if output="$(cargo run --release -p scriptbots-app --bin scriptbots-app -- \
+          output="$(cargo run --release -p scriptbots-app --bin scriptbots-app -- \
               --config ci/configs/replay_ci.toml \
-              --replay-db "$SCRIPTBOTS_BASELINE_DB" \
-              --tick-limit 128 2>&1)"; then
-            printf '%s\n' "$output"
-            printf '%s\n' 'replay unexpectedly accepted empty production event streams' >&2
-            exit 1
-          fi
+              --replay-db "$SCRIPTBOTS_BASELINE_DB" 2>&1)"
           printf '%s\n' "$output"
-          grep -Fq -- 'replay verification refused a vacuous nonzero run' <<< "$output"
+          grep -Fq -- 'Replay matched' <<< "$output"
+          grep -Fq -- 'final digest' <<< "$output"
 
-      - name: Verify comparison also fails closed without production events
+      - name: Verify two runs from the same seed record identical event streams
+        run: |
+          output="$(cargo run --release -p scriptbots-app --bin scriptbots-app -- \
+              --config ci/configs/replay_ci.toml \
+              --replay-db "$SCRIPTBOTS_BASELINE_DB" \
+              --compare-db "$SCRIPTBOTS_CANDIDATE_DB" 2>&1)"
+          printf '%s\n' "$output"
+          grep -Fq -- 'Event streams are identical' <<< "$output"
+
+      - name: Verify replay fails closed when simulated past the recording
         run: |
           if output="$(cargo run --release -p scriptbots-app --bin scriptbots-app -- \
               --config ci/configs/replay_ci.toml \
               --replay-db "$SCRIPTBOTS_BASELINE_DB" \
-              --compare-db "$SCRIPTBOTS_CANDIDATE_DB" \
               --tick-limit 128 2>&1)"; then
             printf '%s\n' "$output"
-            printf '%s\n' 'comparison unexpectedly accepted empty production event streams' >&2
+            printf '%s\n' 'replay past the 16 recorded ticks was unexpectedly accepted' >&2
             exit 1
           fi
           printf '%s\n' "$output"
-          grep -Fq -- 'replay verification refused a vacuous nonzero run' <<< "$output"
+          grep -Fq -- 'replay divergence detected' <<< "$output"
 
   storage_lab_chaos:
     name: Storage LabRuntime Chaos
