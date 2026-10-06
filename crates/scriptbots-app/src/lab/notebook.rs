@@ -808,6 +808,9 @@ impl NotebookRenderer {
             fs::set_permissions(&reproduce_path, fs::Permissions::from_mode(0o755))
                 .map_err(|error| NotebookRenderError::Io(error.to_string()))?;
         }
+        // No executable bit off Unix; the script is still retained beside the notebook.
+        #[cfg(not(unix))]
+        let _ = reproduce_path;
 
         Ok(notebook_path)
     }

@@ -1629,6 +1629,9 @@ fn sync_parent_directory(parent: &Path) -> Result<(), ExperimentRunnerError> {
                 source,
             })?;
     }
+    // Windows cannot open a directory as a File to fsync it; the rename is the durability step.
+    #[cfg(not(unix))]
+    let _ = parent;
     Ok(())
 }
 
