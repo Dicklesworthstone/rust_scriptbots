@@ -223,8 +223,11 @@ check "MCP future protocol version negotiates to 2024-11-05" \
 
 TOOLS="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
     | jq -r '.result.tools[].name' 2>/dev/null | sort | tr '\n' ' ')"
-EXPECTED_TOOLS="apply_patch apply_preset apply_updates get_command_status get_config get_status list_knobs list_presets map_apply map_generate pause resume set_speed shutdown step "
-check "MCP tools/list returns the full 15-tool roster" "$TOOLS" "$EXPECTED_TOOLS"
+# Sorted, space-terminated. The artifact/checkpoint/experiment/narrative/intervene/schema/version
+# tools were added to the server after this probe was written; each is registered in
+# crates/scriptbots-app/src. A tool appearing or disappearing must change this list on purpose.
+EXPECTED_TOOLS="apply_patch apply_preset apply_updates artifact_get artifact_list checkpoint_create checkpoint_list checkpoint_status experiment_cancel experiment_create experiment_list experiment_resume experiment_status get_command_status get_config get_schema get_status get_version intervene list_knobs list_presets map_apply map_generate narrative_around narrative_search pause resume set_speed shutdown step "
+check "MCP tools/list returns the full 30-tool roster" "$TOOLS" "$EXPECTED_TOOLS"
 
 STATUS_CALL="$(http -X POST "$MCP/mcp" -H 'content-type: application/json' \
     -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}' \
