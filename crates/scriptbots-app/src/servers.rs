@@ -66,6 +66,8 @@ pub const DEFAULT_CONTROL_SWAGGER_PATH: &str = "/docs";
 
 const CONTROL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Stack for every control-runtime worker and blocking thread (bd-6sgk).
+const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 /// Return the control CLI's default REST base URL from the server's socket authority.
 #[must_use]
@@ -510,6 +512,11 @@ impl ControlRuntime {
             .spawn(move || -> Result<()> {
                 let result = match tokio::runtime::Builder::new_multi_thread()
                     .thread_name("scriptbots-control-rt")
+                    // Handlers open StorageReaders, which run FrankenSQLite futures synchronously
+                    // on the calling thread; in debug builds that overflowed tokio's default 2 MiB
+                    // and aborted the whole server on the first narrative search (bd-6sgk). Same
+                    // budget as the storage worker. Also applies to spawn_blocking threads.
+                    .thread_stack_size(CONTROL_RUNTIME_THREAD_STACK_BYTES)
                     .enable_all()
                     .build()
                 {
