@@ -3892,7 +3892,12 @@ mod visual_authority_consumer_guard {
     /// guard caught it. That is the argument for having the check at all —
     /// a hand grep is a snapshot of one person's shell history, and this runs
     /// on every build.
-    const EXEMPT: &[(&str, &str)] = &[("bake_biome_atlas", "bd-ikts.2")];
+    ///
+    /// The biome atlas is one unwired unit (bd-hpt6, succeeding bd-ikts.2). Since 275da42e
+    /// `bake_canonical_biome_atlas` calls `bake_biome_atlas` from production code, so the
+    /// latter now reads as consumed; the unit's unconsumed head is `verify_biome_atlas`, which
+    /// only tests call. That is where the exemption sits.
+    const EXEMPT: &[(&str, &str)] = &[("verify_biome_atlas", "bd-hpt6")];
 
     fn workspace_root() -> PathBuf {
         // crates/scriptbots-bevy -> crates -> workspace root
@@ -4242,9 +4247,10 @@ mod visual_authority_consumer_guard {
     #[test]
     fn test_only_call_sites_do_not_count_as_consumers() {
         let internal = visual_internal_production_uses(&workspace_root());
+        // verify_biome_atlas is called only from visual.rs's own tests (bd-hpt6).
         assert!(
-            !internal.contains("bake_biome_atlas"),
-            "bake_biome_atlas is called only from tests, so it must not appear in \
+            !internal.contains("verify_biome_atlas"),
+            "verify_biome_atlas is called only from tests, so it must not appear in \
              the production-only sweep; if it does, the #[cfg(test)] split is wrong"
         );
     }
