@@ -4,4 +4,4 @@
 # Unavailable legacy-capture hashes remain historical evidence in
 # legacy_capture_checklist.md; they are deliberately excluded from this manifest.
 74f35e1b533241c481f961a3156b4841526929930cb3a191815f8f639e38bab9  golden/rust_default.png
-1f68f9474054c92515344df2bc7312dd83bae4fdfd4835c9199851128c429aef  golden/bevy_default.png
+5dce263e39efc388138ada3dd13ec6d05c989be02703ac302f77dcbf8b47e077  golden/bevy_default.png
