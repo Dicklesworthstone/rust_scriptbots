@@ -54,7 +54,9 @@ csv = "1.2.2"
 wfc = "0.10.7"
 direction = "0.18.0"
 rand08 = { package = "rand", version = "0.8.5" }
-miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
+# `=`: journal archive v4 stores level-1 deflate output and decode re-encodes it byte for byte, so
+# a compressor whose output changes would make stored archives unreadable (bd-nvqh).
+miniz_oxide = { version = "=0.8.9", default-features = false, features = ["with-alloc"] }
 
 fastmcp-rust = { version = "=0.10.0" }
 fastmcp-server = { version = "=0.10.0" }
