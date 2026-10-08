@@ -20936,7 +20936,65 @@ impl Storage {
         Ok(())
     }
 
+    /// Apply one science batch with FrankenSQLite's foreign-key enforcement suspended for exactly
+    /// that transaction (bd-50bg).
+    ///
+    /// With `PRAGMA foreign_keys = ON`, the pinned engine routes every multi-row
+    /// `INSERT ... VALUES` through its row-by-row fallback (frankensqlite#496), roughly doubling
+    /// the per-row cost, and a 5,000-agent world writes about 1,500 science rows per tick. Every
+    /// row in this transaction carries this pipeline's own `run_id`, so the only constraint the
+    /// declared foreign keys enforce here is "the run exists"; the ledger and progress rows are
+    /// read back and checked explicitly below. That one invariant is checked by
+    /// [`Self::apply_flush_transaction`] before any write, with the same
+    /// `FrankenError::ForeignKeyViolation` the engine raised. Enforcement is restored after the
+    /// transaction on every path; a connection whose enforcement could not be restored is
+    /// reported as a failed attempt rather than left silently unenforced.
     fn flush_attempt(
+        connection: &Connection,
+        path: &str,
+        run_id: RunId,
+        buffer: &StorageBuffer,
+        outbox_ids: &[PersistenceBatchId],
+    ) -> Result<(), FlushAttemptError> {
+        let not_applied = |source| FlushAttemptError {
+            source,
+            commit_state: FailureCommitState::RolledBack,
+        };
+        let enforced = connection
+            .query_row("PRAGMA foreign_keys")
+            .and_then(|row| {
+                row.get_typed::<i64>(0)
+                    .map_err(|error| FrankenError::Internal(error.to_string()))
+            })
+            .map_err(not_applied)?
+            != 0;
+        if !enforced {
+            return Self::apply_flush_transaction(connection, path, run_id, buffer, outbox_ids);
+        }
+        connection
+            .execute("PRAGMA foreign_keys = OFF")
+            .map_err(not_applied)?;
+        let outcome = Self::apply_flush_transaction(connection, path, run_id, buffer, outbox_ids);
+        let restored = connection.execute("PRAGMA foreign_keys = ON");
+        match (outcome, restored) {
+            (outcome, Ok(_)) => outcome,
+            (Ok(()), Err(source)) => Err(FlushAttemptError {
+                source: FrankenError::Internal(format!(
+                    "batch committed but foreign-key enforcement could not be restored: {source}"
+                )),
+                commit_state: FailureCommitState::Committed,
+            }),
+            (Err(failure), Err(source)) => Err(FlushAttemptError {
+                source: FrankenError::Internal(format!(
+                    "{}; foreign-key enforcement could not be restored either: {source}",
+                    failure.source
+                )),
+                commit_state: failure.commit_state,
+            }),
+        }
+    }
+
+    fn apply_flush_transaction(
         connection: &Connection,
         path: &str,
         run_id: RunId,
@@ -20958,6 +21016,17 @@ impl Storage {
                 path,
                 HostJournalFaultPoint::PersistenceAfterTransactionBegin,
             )?;
+            // The invariant the suspended foreign keys enforced (see `flush_attempt`).
+            let run_rows = tx
+                .query_row_with_params(
+                    "SELECT COUNT(*) FROM runs WHERE run_id = ?1",
+                    &[sqlite_run_id(run_id)],
+                )?
+                .get_typed::<i64>(0)
+                .map_err(|error| FrankenError::Internal(error.to_string()))?;
+            if run_rows != 1 {
+                return Err(FrankenError::ForeignKeyViolation);
+            }
             Self::insert_ticks(&tx, run_id, &buffer.ticks)?;
             #[cfg(test)]
             fail_at_host_journal_transaction_fault(
@@ -28349,6 +28418,14 @@ mod tests {
             matches!(&failure.source, FrankenError::ForeignKeyViolation),
             "expected the missing run foreign key, observed {:?}",
             failure.source
+        );
+        // bd-50bg: the apply suspends enforcement for its own transaction only.
+        assert_eq!(
+            connection
+                .query_row("PRAGMA foreign_keys")?
+                .get_typed::<i64>(0)?,
+            1,
+            "foreign-key enforcement must be restored after a failed apply"
         );
         assert_eq!(
             connection
