@@ -11342,7 +11342,7 @@ dependencies = [
 
 [[package]]
 name = "scriptbots-index"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ordered-float 4.6.0",
  "thiserror 2.0.21",
@@ -11373,7 +11373,7 @@ dependencies = [
 
 [[package]]
 name = "scriptbots-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "asupersync",

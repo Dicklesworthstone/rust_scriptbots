@@ -10,6 +10,64 @@ Repository: <https://github.com/Dicklesworthstone/rust_scriptbots>
 
 ---
 
+## [v0.3.0] - 2026-10-08
+
+Source release (GitHub Release notes, same venue as v0.2.0; no prebuilt binaries).
+72 commits since v0.2.0.
+
+### Compatibility: v0.2.0 run databases
+- **v0.3.0 cannot recover, replay or analyze a run database written by v0.2.0. No data is lost: keep a v0.2.0 binary to work with runs recorded by v0.2.0.**
+  - Why: the host journal archive moved from version 3 to version 4 (deflated sections, below). Archive versions are checked strictly, as they were between v0.1.1 and v0.2.0.
+  - Affected: `--recover-storage`, `--replay-db` on a journaled recording, `sb_analyze`, the `control_cli` domain-events export, and the `Storage::append_run` / `StorageReader::open_finished` library APIs.
+  - Each of these refuses a v0.2.0 database with `unsupported version 3, expected 4` before writing anything.
+  - Plain reads through `StorageReader::open` are unaffected.
+- Brain genome and evaluator-state JSON written by v0.2.0 (payload as a number array) still decodes, alongside the new base64 form.
+
+### Added
+- **Replay of interactive runs from tick zero**: `--replay-db` re-applies the run's journaled operator commands at the ticks the host applied them. These include REST/MCP/TUI/GUI interventions, config patches, spawns, mutation-rate edits and map applies, so server and interactive runs replay-verify instead of diverging at the first command.
+
+### Changed
+- **Journal archive v4**: the scientific and persistence sections are stored deflated (level 1) inside the archive. In a 5,000-agent run the archive shrinks from 0.74 to 0.25 MB per tick and the database from 1.70 to 1.18 MB per tick.
+  - `miniz_oxide` is pinned to `=0.8.9` because decoding re-encodes the sections byte for byte.
+- Science batches apply with SQLite foreign-key enforcement turned off for that one transaction, which avoids FrankenSQLite's row-by-row fallback. The run row is checked explicitly first, and enforcement is restored on every path.
+- Founder bursts up to the stated 10k target persist. Genome payloads are base64 in JSON (about 2.7x smaller), and the batch, event-page and in-flight budgets are sized for 10k founders. The payload size estimator charges what is actually written. Previously a fill above about 1,000 founders stopped the run at tick 60.
+- Dependencies refreshed to the latest semver-compatible releases (`cargo update`).
+  - `fnx-readwrite`/`fnx-dispatch` stay at 0.2.2, because 0.2.3 pulls `fnx-classes` 0.3, which is incompatible with the analytics graph types.
+  - Optional `tract-onnx` moves to 0.23, which clears RUSTSEC-2026-0217.
+  - Major-version upgrades remain deferred, as in v0.2.0.
+
+### Fixed
+- On a server with file storage (the default for runs), every `POST /api/control/intervene` failed in v0.2.0: journaled interventions were written in a form postcard cannot decode. Interventions now journal and apply.
+- A debug server no longer aborts on its first `GET /api/narrative/search`: control-server threads get a 32 MiB stack.
+- A host whose drive loop fails now records a terminal fault and publishes it. Previously REST kept reporting `running` and the TUI kept showing RUNNING for a stopped world.
+- The `arctic` preset applies to a default world. It was refused because `food_respawn_amount` exceeded `food_max`.
+- `--replay-db` explains how to proceed when a journaled recording can't be opened as a finished run: run `--recover-storage` first, or use v0.2.0 for a v0.2.0 recording.
+- TUI:
+  - the help overlay closes on Esc instead of quitting the run;
+  - pause/resume keeps the chosen speed;
+  - an 80x24 terminal shows run state, help and panels;
+  - logs stay off the HUD;
+  - the history chart is accurate;
+  - the command palette offers only what the live HUD supports.
+- Browser build: wall-clock diagnostics use `web-time`, so they cannot panic in the browser, and the web crate is warning- and clippy-clean on wasm32. The README documents the working browser-package builds.
+- Windows: `clippy -D warnings` is clean.
+- Tests and CI:
+  - the bevy visual-authority guard tracks the biome atlas at its real unconsumed head;
+  - the render CPU-surrogate golden is re-pinned to the Fit-World framing;
+  - the web native-parity fixture is refreshed after config-schema drift, with no simulation change;
+  - the ftui family check accepts one pinned git revision;
+  - the replay CI job asserts an exact replay, with a fail-closed control.
+
+### Known issues
+- Unchanged from v0.2.0 (#5):
+  - the loopback REST/MCP servers do not validate `Host`/`Origin` headers (DNS rebinding); keep them on loopback, and disable them with `SCRIPTBOTS_CONTROL_REST_ENABLED=false` when not needed;
+  - `POST /api/v1/checkpoints` keeps every checkpoint in memory and on disk for the life of the process;
+  - run bundles copy only the main database file.
+- `--replay-db` on a journaled recording whose server did not shut down cleanly needs `--recover-storage` first. v0.2.0 replayed the durable prefix of such a recording.
+- Workspace member crates keep their own `0.1.0` package versions; the release version is the workspace version and tag.
+
+---
+
 ## [v0.2.0] - 2026-10-04
 
 Source release (GitHub Release notes, same venue as v0.1.1; no prebuilt binaries).
