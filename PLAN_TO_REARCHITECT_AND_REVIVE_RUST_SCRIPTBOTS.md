@@ -4,6 +4,18 @@
 
 **Evidence date:** 2026-07-11
 
+**Reality-check refresh (2026-10-08):** [Completed — LavenderLion; assessment and
+bridge-plan reconciliation only; implementation and product acceptance remain open]
+The complete repository AGENTS.md and README.md, current source at `697c11bd`, and the
+authoritative work graph are reconciled in `REALITY_CHECK_2026-09-03.md`. Fresh pinned DSR
+passes workspace check/strict Clippy but fails approximate-run manifest persistence;
+`bd-16g.15.3` retains that reproduction at P1. Five new gap/acceptance tasks and four
+reopened original gates preserve the full lab vision. Next: repair that contract and
+qualify persistent-host reliability → scientific resume/analysis/bundle/publication →
+ordinary-launch meadow and terminal → separate platform proofs → composed release journey.
+The September ownership-transfer notes below are historical: that production cutover
+is now implemented; full HostCore/session resume remains open under `bd-2z0.5.13`.
+
 **Reality-check refresh (2026-09-06):** [Completed — TurquoiseLake; assessment only]
 Current source and retained DSR evidence are reconciled in `REALITY_CHECK_2026-09-03.md`.
 The July motivation and dependency snapshots below are historical; current pins are in

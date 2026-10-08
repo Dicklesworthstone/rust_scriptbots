@@ -1,6 +1,340 @@
-# Reality Check — rust_scriptbots — reassessed 2026-09-24
+# Reality Check — rust_scriptbots — reassessed 2026-10-08
 
-## Current assessment — 2026-09-24 (independent re-audit; supersedes and CORRECTS the 2026-09-22 section)
+## Current assessment — 2026-10-08
+
+**The project contains a substantial deterministic simulator and real research infrastructure,
+but it has not delivered the complete Evolution Lab promised by the README and recovery plan.
+The principal gap is a reliable, observable, reproducible user journey across the production
+host, persistence, frontends, replay and analysis. The cinematic hardware-GPU meadow and durable
+browser laboratory remain unfinished. Closing component tasks is not evidence of that journey.**
+
+This assessment supersedes the September conclusions below while preserving their historical
+observations. In particular, the September statement that experiments do not execute is obsolete:
+the current control path runs real matched-seed experiments. The statement that analytics has no
+real simulation test is also obsolete. Conversely, the September assertions that full application
+resume, GPU certification and the complete analytics pipeline were proven were too broad.
+
+### Audit boundary and method
+
+- Source inspected: `main` at `697c11bdeb935fdb3c8f1a51e81504c0279069f0`, before this
+  documentation/tracker refresh. The shared checkout already contained the untracked
+  `.beads/.br-wal-index-ymExP7/`, which was preserved. The DSR attempt uses an independent clean
+  clone of that exact commit, not the modified shared checkout or an old binary.
+- Read the complete repository `AGENTS.md` (1,057 lines) and `README.md` (1,196 lines). Reviewed
+  the authoritative recovery plan, historical GPUI/Bevy/WASM plans, architecture, Franken
+  integration, terminal stack, rendering specifications/art direction, browser decisions,
+  performance and GPU documents, checkpoint contracts, analytics pipeline and tournament outputs.
+  Historical plans provide the vision; they do not override current source or the recovery plan.
+- `/data/projects/AGENTS.md`, required by repository rule 0.5, is absent on this host. Its full
+  suite-wide text could not be read. The repository's quoted reward-hacking, work-graph and
+  exact-class performance requirements were preserved; no performance run or baseline promotion
+  was attempted.
+- Followed production callers and consumers, not just declarations: brain registration, owner
+  thread, control receipts, checkpoint capture/restore, persistence stages, report execution,
+  terminal drawing, Bevy synchronization and the browser animation loop. Read the authoritative
+  BR export and specific acceptance/history for potentially closed-but-incomplete work.
+- Queried the actual GitHub releases API on 2026-10-08 around 23:01 UTC. Published v0.3.0,
+  v0.2.0 and v0.1.1 each have an empty attached-asset array. Retained the response in
+  `/tmp/scriptbots-reality-20261008-KHcnun/github-releases.json`; repository capability is
+  not evidence of downloadable binaries.
+- Evidence vocabulary: **implemented** means the observed source performs the operation;
+  **partial** means a named boundary is missing; **unproven** means the relevant fresh acceptance
+  was not observed. A test definition, historical pass or issue status alone is not a fresh pass.
+  This audit does not claim every optional platform/feature combination has been exercised.
+
+### Fresh verification at the inspected source
+
+Correctness execution is through the pinned DSR profile `scriptbots-reality`, with a unique
+external proof directory, `--no-sync`, explicit source SHA and native Linux target. Profile and
+raw logs originated at `/tmp/scriptbots-reality-20261008-KHcnun/` and are also retained on the
+persistent filesystem at `/data/tmp/scriptbots-reality-20261008-evidence-GQojsv/`. All 406 copied
+proof files were compared by SHA256 and match their originals. The profile invokes the
+repository's existing `scripts/dsr_verify.sh` workspace lane. No direct Cargo/RCH acceptance
+command was issued outside DSR.
+
+| Observation | Result and limit |
+|---|---|
+| First DSR version `reality-20261008-697c11bd` | Infrastructure refusal before compilation: DSR cache isolation rejected a symlink in the unrelated cached k9 checkout. DSR process exit 6. No compiler/test verdict. |
+| Second version `reality-20261008-697c11bd-clean-cache` | Retried with a new empty external Cargo cache; the source and gates were unchanged. Terminal result: typed `failed`, exit 1, seven successful steps; DSR process exit 6. This later attempt reached a real test failure. |
+| Formatting | `cargo fmt --all --check` passed inside DSR. |
+| Engine pin, license inventory, Asupersync universe, WASM dependency graph | All four existing guards passed inside DSR. A graph guard is not a browser execution test or legal opinion. |
+| Workspace compilation | `cargo check --locked --workspace --all-targets` passed inside DSR. A dependency future-incompatibility warning names `proc-macro-error2`; this is not a workspace error. |
+| Strict workspace Clippy | `cargo clippy --locked --workspace --all-targets -- -D warnings` passed inside DSR. The historical 421-core-diagnostic result is not the current result on this lane. |
+| Analytics pipeline target | Both tests passed: the real two-seed simulation/report test and the fixture-based full pipeline. The latter emits the manifest; this does not fill the real-world CLI/export/FTS acceptance gap. |
+| Application real-process target | Four tests passed; three 600-second regression tests were explicitly ignored. Map/replay/control/experiment/checkpoint/artifact paths executed. One artifact manifest reports source `unknown`, and the control manifest observes an applied receipt plus a signalled child exit; these cannot certify the complete source-bound durable-shutdown journey. The DSR command/log binding independently identifies the code executed. |
+| Workspace tests | Failed at `scriptbots-app`'s `run_manifest_emitted::test_gpu_sense_backend_approximate_allowed`: llvmpipe initialized, then storage rejected complete build provenance with approximate `reproducible=false`. That target had 14 passes/one failure. Across the executed portion, 34 target summaries report 870 passes, one failure and seven ignored tests; these counts do not constitute a workspace pass. Cargo exit 101, log capture exit 0. |
+| Later workspace targets, economy-fault tests, final analyzer build | Not reached after the fail-closed workspace result. Test compilation and earlier CLI invocations do not replace the required final lane steps. |
+| Dedicated hardware GPU qualification, real PTY, browser, long storage soak, performance | Not executed in this audit. These retain their owning acceptance tasks; no current FPS/TPS, hardware certification or broad release pass is asserted. |
+
+The DSR verifier requires the typed verdict, exact source, required command identities, raw-log
+hashes and nonzero executed-test counts. A zero orchestration exit cannot substitute for those
+observations. The earlier cache refusal and the later clean-cache result remain separate records.
+The failed workspace log has SHA256
+`1530715d727db0272107055f88e7c19ac8385215e79f6c0587d455bd63a217df`; its command record,
+typed verdict, source/toolchain/profile and orchestration receipt are preserved together.
+
+### Vision-to-source matrix
+
+The entries below distinguish real functionality from missing integration or acceptance. None
+uses the fraction of closed beads as a product-completion percentage.
+
+| Promised capability | Current source and remaining boundary | Existing or repaired owner |
+|---|---|---|
+| Deterministic evolving world | Ordered tick stages, stable agent UIDs, domain/agent RNG protocols, brain inheritance, resource ledger and versioned scientific digest are implemented. Long-lived curated ecology and fresh acceptance remain separate. | `bd-2z0.3`, `bd-2z0.10.5`, `bd-lmk6` |
+| Faithful legacy mechanics | Transcribed micro-oracles and explicit intentional differences exist. Captured execution traces qualifying the larger legacy-fidelity claim do not. Chaotic cross-platform long-run equality is not promised by the recovery plan. | Closed micro-oracle foundation `bd-2z0.1.7`; new qualification `bd-2z0.18` |
+| Sole-owner runtime | Production `HostThread` moves the world and persistence session into `HostCore`; clients use the channel protocol and fixed-deadline driver. The old shared-world tick architecture is not the current production design. Lifecycle/contention/soak proof remains open. | `bd-2z0.4.11`, `bd-2z0.8.9.16` |
+| Pluggable evolving brains | MLP, DWRAON and Assembly have production registration and versioned family contracts. Neuroflow is explicitly selectable but withheld from mixed heritable cohorts because its legacy runner lacks that protocol. | `bd-2z0.3`; current `src/brains.rs` refusal is deliberate |
+| ML and lifetime learning | Candle has real CPU tensor forward inference. Tract/tch fallback paths remain sensor-copy placeholders; they are not admitted production presets. Optional FtBrain has real flat-genome validation and CPU kernel inference, but packed batching, learning and final survival/checkpoint/tournament qualification are incomplete. | `bd-2z0.3.12.3`–`.6` |
+| Persistent scientific runs | FrankenSQLite owner-thread connection, writer/identity leases, durable outbox, idempotent admission, distinct admitted/applied/durable watermarks, recovery and immutable read snapshots are implemented. Throughput and long-server liveness are still unresolved acceptance. | `bd-l103`, `bd-kgob`, `bd-50bg`, `bd-w1oi`, `bd-j8o2`, `bd-vrb3` |
+| Responsive REST/MCP control | Real routers, command admission/application receipts, status, configuration, inspection and intervention paths exist. Real listener liveness and command/journal latency must remain independently observable. Authority/Origin protection is absent. | `bd-g6wf`, `bd-w1oi`, `bd-j8o2`; new `bd-2z0.15` |
+| Matched-seed experiments | REST/MCP creation now drives `MatchedSeedExperimentRunner` on a worker; status/cancel/resume and artifact production are real. This corrects the September pending-facade finding. Complete source-bound acceptance remains with the existing API/journey contract. | `bd-2z0.12.2` delivered implementation; `bd-2z0.13.11` composed proof |
+| Checkpoint capture | Versioned science checkpoint encode/decode, quiescent capture, API worker recording and periodic production capture are real. Aggregate API payload/file/metadata retention has no budget. | `bd-2z0.5.13` implemented subset; new `bd-2z0.16` |
+| Checkpoint-start replay | CLI restores `WorldState`, prepares its executable brain registry and resumes scientific replay from checkpoint ticks; corruption/divergence support is real. Full host/session resume is a different, still-missing original requirement. | Reopened `bd-2z0.5.13` |
+| Timeline/replay UI | Events, checkpoint machinery and audit data exist. Scrubbable narrated timeline and experiment/replay panes are unfinished. Final server-digest and persisted narrative continuity gaps still have owners. | `bd-ji3a`, `bd-2z0.7.6.1`, `bd-46iu`, `bd-16g.2.9` |
+| Reproducible portable bundles | Archive schemas, artifact hashes, verification and database-free experiment bundles are real. DB export reads metadata and later copies only the main file without a finished-source lease; a live/WAL state can invalidate the logical join. | New `bd-2z0.17`; companion `bd-2z0.19` |
+| Scientific analysis | Offline report registry, numerical validation, lineage/graph algorithms, Arrow/Parquet export and real-world report test are implemented. The complete real-world CLI/export/FTS/planted-event/null-control manifest and repeated proof remain incomplete. | Reopened `bd-2z0.11.9`; `bd-16g.2.9` |
+| Scientific tournament publication | Matched-world execution, uncertainty-aware ratings, row exclusion and generated Markdown are implemented. The committed document mixes smoke results with full-protocol labels and unknown source provenance. | Reopened `bd-16g.12.3` and conjunctive parent `bd-16g.12` |
+| Useful terminal laboratory | Real Ratatui panels, inspector, controls, rolling views and actual presented-buffer screenshot path exist. The production draw loop still uses Crossterm/Ratatui; FrankenTUI model presence is not live ftui Program/view integration. | `bd-2z0.6.8`; PTY owners `bd-dkd9`, `bd-2z0.14.3.5.2` |
+| Native GPU laboratory | GPUI/wgpu/Bevy code and real host snapshot consumption exist. Failure handling, per-window acknowledged interactions, full lab workflow and real-device visual proof remain open. | `bd-2z0.7.11`, `bd-2z0.7.14`, `bd-2z0.7.6`, `bd-2z0.7.8` |
+| Cinematic living meadow | Terrain/creature/particle/lighting/camera modules provide substrate. The live Bevy path still uses per-agent mesh/material entities; the resident instanced pipeline, complete visual stack, interpolation and ordinary-launch showcase are not delivered. | `bd-2z0.7.3`, `bd-2z0.14.1.1`–`.12`, `.20`, `.21` |
+| Hardware GPU sensing certification | Compute-provider code and exact/approximate policy exist. The checked-in evidence does not prove the certified hardware table. Fresh DSR also observes approximate exploration rejected by a provenance/reproducibility conflation in storage. | Existing `bd-16g.15.3`, raised P3 → P1 on the executed workspace failure |
+| Predictable CPU/GPU budgets | The deterministic regression harness, exact-class fingerprint and typed verdict contract are substantial. No fresh admissible 1k/5k performance pass or 10k publication proof was executed here. A self-speedup is maintenance, not a win over an incumbent. | `bd-h33`, `bd-2z0.14.1.12`, existing perf gate contract |
+| Browser Evolution Lab | WASM simulation/bindings, Canvas demo, snapshots and permalink/fork exports are real. The browser loop advances one science tick per animation frame; the fuller WebGPU/front-end/runtime and browser durability path are unfinished. | `bd-2z0.12.3`, `.4`, `.7`, `bd-azi3`, `bd-ywtv`, `bd-ac4l` |
+| Procedural map sandbox | Real generate/apply commands and artifacts exist. Constrained previews, editing/undo, ordinary-product workflow and acceptance are unfinished. | `bd-2z0.10.7`, `.8` |
+| Archipelago/communication/audio | Local island/migration and scientific signal/audio substrate exist. Distributed transport, long multi-island acceptance, communication emergence study and live adaptive/spatial sound integration remain open. | `bd-brw4`, `bd-t3ge`, `bd-16g.7`, `bd-16g.14`, `bd-2z0.14.1.11` |
+| First-run and release experience | CLI/help/docs/build scaffolding are real. Supported matrix, native walkthroughs, current artifact provenance and the joined experience still lack final proof. The live GitHub API lists zero attached assets on v0.3.0, v0.2.0 and v0.1.1; these do not supply downloadable prebuilt binaries. | `bd-2z0.10.4`, `bd-1bdd`, `bd-2z0.13.3`, `.9`, `.11` |
+
+### Concrete findings that change the picture
+
+**1. Preserve the newly implemented capabilities.** The sole-owner host, executable REST/MCP
+experiments, periodic/API checkpoint capture and checkpoint-start scientific replay have callers
+in the production application. They are no longer just plans. Likewise,
+`crates/scriptbots-analytics/tests/e2e_pipeline.rs:873` constructs real persisted 400-tick worlds;
+its test at line 931 asserts actual natural births/deaths and population accounting while running
+the report registry. Describing current analytics as entirely fixture-only would be wrong.
+Candle and FtBrain also contain actual kernel inference; describing every ML backend as a stub
+would be wrong. Their admission, learning and proof boundaries still matter.
+
+**2. Full resume was closed against a narrower implementation.**
+`crates/scriptbots-core/src/checkpoint.rs:1` explicitly excludes persistence session, retained
+analytics, configuration-audit revision and host histories. The CLI restore at
+`crates/scriptbots-app/src/main.rs:5414` reconstructs `WorldState` and a replay collector. The
+original `bd-2z0.5.13` acceptance requires full HostCore/session ownership, sequenced commands,
+configuration/session state and corresponding receipt/readback proof. Reopened that original
+owner without erasing the useful core replay implementation or adding a duplicate resume task.
+
+**3. Analytics now has a real-world test, but its advertised E2E wrapper rejects two passes.**
+`scripts/e2e_analytics.sh:59` requires exactly `1 passed`; the target has two `#[test]` functions.
+Only the hand-built-fixture test emits the manifest. The real-world test uses the report registry,
+not the complete real-world analyzer CLI/export/FTS journey, and does not apply the originally
+required planted intervention with a stationary null control. This is a source-observed wrapper
+and evidence-binding defect, not an executed failure in this audit. Reopened `bd-2z0.11.9` with
+those precise remaining criteria and positive implementation credit. A repair must prove both
+named tests and the real journey; replacing the sentinel with unconditional success is forbidden.
+
+**4. The leaderboard confuses planned protocol with executed protocol.**
+`docs/leaderboard.md` says three families, 32 seeds, 20,000 ticks, 24 agents and a balanced Latin
+square. Its results contain two families, four seeds and eight matches, and source revision
+`unknown`. Those are the configured smoke families/seeds/orders, not a complete canonical run.
+In `crates/scriptbots-app/src/tournament.rs:3746`, execution selects `to_smoke_spec()`; at line
+3841 the renderer receives the original full spec. The metadata renderer at line 3325 reads
+families, seeds, ticks, cohort and order from that full spec. This explains the mismatch without
+assuming the rating mathematics is fake. Reopened `bd-16g.12.3` and its parent gate. Render actual
+execution identity, distinguish plan from observations, and require complete declared rows before
+full publication. Do not manually edit generated numbers or shrink the canonical matrix.
+
+**5. Three operational gaps lacked dedicated ownership.**
+
+- `crates/scriptbots-app/src/servers.rs` builds state-changing REST/MCP routers without
+  authority/Origin validation. Default loopback binding is real, but not that request-boundary
+  protection. Filed `bd-2z0.15` for one configured listener-derived policy and zero-side-effect
+  negative controls through actual sockets.
+- `crates/scriptbots-app/src/control.rs:960` retains unbounded payload/metadata/idempotency maps;
+  `create_checkpoint` at line 1546 adds disk and cached payload bytes. Pagination and per-download
+  limits do not bound aggregate retention. Filed `bd-2z0.16` for count/byte admission, concurrency,
+  retry/restart accounting, periodic/SQL payload accounting and typed exhaustion. The permitted default is bounded refusal/cache
+  accounting, **not automatic deletion of stored files**.
+- `crates/scriptbots-storage/src/bundle.rs:192` opens a non-finished reader, closes it after
+  metadata reads, then copies the main file. `StorageReader::open_finished` already supplies a
+  stronger leased/validated boundary, but this export does not use it. Filed `bd-2z0.17` to retain
+  one identity-bound state through materialization and independently verify logical DB contents,
+  including WAL disposition. Hash equality alone is insufficient.
+
+Their separate mock-free execution companion, `bd-2z0.19`, depends on all three implementations
+and blocks the existing composed journey proof `bd-2z0.13.11`. It preserves the independent long
+storage/journal regressions rather than replacing them with a short successful smoke.
+
+**6. Fresh DSR exposes a real approximate-run persistence defect.** The workspace lane failed
+in `run_manifest_emitted::test_gpu_sense_backend_approximate_allowed`. The actual llvmpipe
+Vulkan adapter initialized and explicit approximate opt-in correctly set scientific
+`reproducible=false`. Storage then refused startup with
+`/build/provenance_complete is true, expected reproducible=false`. This is not absence of an
+adapter: `crates/scriptbots-app/src/lib.rs:1543` records approximate scientific policy without
+falsifying complete build evidence, whereas `crates/scriptbots-storage/src/lib.rs:3751` equates
+the two flags before independently deriving build completeness. Existing `bd-16g.15.3`
+already requires approximate labels to survive persistence/export while certification/ranking
+refuse them. Added the exact retained failure and raised that owner from P3 to P1; left its full
+acceptance and assignee intact. A contract repair must independently derive both observations,
+publish the validator's win/lose admission split, admit legitimate approximate exploration,
+and keep forged provenance, approximate-as-reproducible, stale evidence and invalid projections
+rejected. Skipping the test, clearing true provenance or allowing any startup failure would
+conceal the defect. The later workspace targets, economy-fault lane and final analyzer-build
+step remain unexecuted, not passed.
+
+**7. Performance and hardware claims are ahead of retained qualification.** The October storage
+change at `crates/scriptbots-storage/src/lib.rs:20942` avoids the engine's FK row-by-row insert
+path in scientific batches, checks the run identity and restores FK state. That is a real
+implementation change deserving validation; it does not by itself close `bd-50bg`, the memory-DB
+growth problem, journal latency or current exact-class CPU budgets. None of the September runtime
+measurements or the changelog's local speedup claims was re-executed here. GPU certification is
+even more explicit: `ci/fixtures/sense_lane_parity.json` contains llvmpipe, a 2024 timestamp,
+old build/toolchain identity, a placeholder fixture digest and all-zero CPU/GPU digests. It cannot
+qualify the AMD/NVIDIA/Apple certified rows in `docs/gpu-lane.md`. The existing `bd-16g.15.3`
+already owns this gap, so it received the concrete observation rather than a duplicate task.
+
+**8. Frontend presence is not completion of the product.** Real terminal drawing still calls
+`ratatui::Terminal::draw`; an ftui model alongside it is not a live ftui renderer. Real Bevy
+snapshot consumption does not establish GPU instancing or a cinematic meadow. The browser's
+`web/main.js:203` calls `simHandle.tick(1)` from requestAnimationFrame: presentation cadence still
+drives that demo's science. Existing terminal, renderer and browser acceptance leaves already
+cover these missing boundaries. Hardware images, a real PTY and a real browser are required to
+claim their respective cells; CPU/test-backend substitutes cannot fill them.
+
+**9. Documentation needs one source-derived supported matrix.** The README's portable CPU
+baseline claim conflicts with `.cargo/config.toml` selecting `x86-64-v3` on native x86 Linux;
+its Windows troubleshooting suggests stable Rust despite the pinned nightly requirement.
+Franken dependency documents still describe graph/dataframe consumers as planned after real
+offline consumers were added. These are concrete reconciliation items for the existing
+`bd-1bdd`, not reasons to rewrite historical plans or reduce the supported-feature contract.
+The live [v0.3.0 release](https://github.com/Dicklesworthstone/rust_scriptbots/releases/tag/v0.3.0)
+has no attached assets, consistent with its source-only changelog qualification; the two older
+published releases inspected also have none. Packaging code and a release tag cannot certify
+the download/install path without actual artifact publication and extraction proof.
+
+### The five reality-check answers
+
+1. **What works now?** There is real deterministic simulation, production single-owner runtime,
+   real brain families, control/experiment execution, owner-thread persistence with explicit
+   durability stages, scientific checkpoint/replay, useful native/TUI/Canvas rendering and
+   substantial offline analytics/tournament code. Fresh workspace compilation, strict Clippy,
+   dependency guards and both analytics pipeline tests passed here; source implementation is
+   broader than this audit's executed acceptance coverage.
+2. **What is missing or incomplete?** Full application resume; complete real-world analytics and
+   truthful full-protocol publication; server/storage liveness and operational bounds; live ftui
+   integration/PTY proof; cinematic resident GPU rendering and real hardware budgets; complete
+   browser/runtime/durability and map/timeline workflows; and one joined first-run-to-export proof.
+3. **What blocks delivery?** The fresh workspace test failure needs the manifest/storage contract
+   repaired and the full correctness lane rerun. Persistent-run throughput/liveness and strict
+   qualification precede scientific trust. Frontend production wiring and real-device access precede visual claims.
+   Source/run/command/checkpoint/artifact identity continuity precedes release claims. The large
+   core/storage/renderer/terminal modules make boundary changes expensive; extraction must follow
+   observed seams and invariants rather than become a substitute milestone.
+4. **Would implementing every previously active bead finish it?** No. Three operational gaps had
+   no dedicated owner, larger legacy-fidelity qualification was uncovered, and closed resume,
+   analytics and leaderboard obligations hid unfinished acceptance. Even after this graph repair,
+   the answer is conditional: implementing **and executing the unchanged acceptance** of all
+   owners would address the identified vision gaps; closing issues alone would not. Supported
+   platforms/capabilities must be versioned explicitly, not silently narrowed to available proofs.
+5. **Which goals lacked any owner?** Authority/Origin protection, aggregate checkpoint retention,
+   logically consistent leased/WAL bundle export and captured legacy-fidelity qualification.
+   They now have `bd-2z0.15`–`.18`; `.19` supplies the operational joined acceptance. The other
+   major missing features already had owners and were not duplicated.
+
+### Ordered bridge to a deliverable lab
+
+1. **Qualify and stabilize the persistent host.** Complete `bd-l103`, `bd-vlp7`, `bd-kgob`,
+   `bd-50bg`, `bd-w1oi`, `bd-j8o2` and the lifecycle/latency leaves with their original named
+   reproductions. First repair the observed approximate-manifest storage failure under
+   `bd-16g.15.3` and rerun the unchanged pinned correctness lane; this does not close that owner's
+   separate hardware matrix. Record exact last successful control response, observed admission/application/
+   durability and graceful shutdown. A different seed/host or forced termination cannot certify
+   the original liveness/shutdown defect. New authority and resource-budget work can proceed
+   independently; its final proof joins the persistent production path.
+2. **Complete the scientific artifact chain.** Finish original host/session resume, real-world
+   analysis, consistent bundle export, narrated-input parity and tournament publication. Use
+   known-changing intervention inputs and no-change controls; legitimate null scientific results
+   remain valid. Preserve raw DBs, receipts and first divergences so each claim is falsifiable.
+3. **Deliver one ordinary-launch meadow and its terminal peer.** Finish balanced ecology and
+   onboarding, actual FrankenTUI runtime, resident Bevy rendering, acknowledged interaction,
+   terrain/water/creatures/lighting/animation and true PTY/device evidence. Reuse one host and the
+   declared feature-preservation ledger. A stand-alone look-development image does not satisfy
+   ordinary-app startup, inspection, intervention or shutdown.
+4. **Qualify platform and performance cells independently.** Browser packaging/clock/durability,
+   optional Ft learning, distributed islands and adaptive audio retain their separate owners.
+   Do not turn their current experimental/unexecuted dispositions into supported cells. CPU/GPU
+   comparisons run only through clean expected-commit exact-class DSR with raw samples and typed
+   verdict; baseline recording remains separate from final comparison.
+5. **Run the composed journey and publish truthfully.** `bd-2z0.13.9` composes evidence and `.11`
+   executes startup → living observation → stable-UID inspection → applied intervention → durable
+   run → checkpoint/session continuation → matched seeds → report → independently verified bundle.
+   Every predecessor/output identity must join. Missing, foreign, stale, approximate or unexecuted
+   evidence cannot be averaged into pass. `bd-1bdd` then reconciles supported matrix, instructions,
+   actual media and release assets; no date or readiness percentage is inferred from task counts.
+
+### Skill follow-through and graph reconciliation
+
+Applied the complete reality-check workflow, including the verbatim frozen bead-generation and
+refinement prompts. Reused this report and the active recovery plan; no parallel report or code
+variant was created. The scope is assessment and planning, not implementation of the bridge.
+
+- **Ambition review 1 — coherent failure boundaries:** joined authority, checkpoint accounting
+  and DB export to real host/storage lifecycle, rather than proposing isolated header checks,
+  pagination or hash-only assertions. Preserved strict no-deletion behavior and partial-failure
+  accounting.
+- **Ambition review 2 — independent scientific observations:** added actual reference traces,
+  real-world pipeline identity, logical bundle readback and complete tournament cells; retained
+  non-vacuous positive and negative controls with source-bound receipts.
+- **Ambition review 3 — delivery and platform contracts:** sequenced ordinary-launch meadow,
+  terminal and source-composed release proof while preserving optional research scope. Neither
+  a new backend nor unmeasured mathematical sophistication is a substitute for missing consumers.
+- **Refinement 1:** checked duplicates against all 711 original records and reread original
+  acceptance. Reopened exact incomplete owners rather than cloning their scope; new tasks have
+  self-contained background, implementation boundary, unit/integration/E2E cases and logging.
+- **Refinement 2:** checked concurrency, exact retry, changed payload, budget reservation,
+  retained partial artifacts, restart/directory accounting, WAL/live-writer refusal and independent
+  verification. Included periodic producers and SQL checkpoint payload in retention accounting;
+  clarified no automatic file removal and no assumed upstream backup capability.
+- **Refinement 3:** checked executed versus planned matrix, source identity, named tests, false
+  fixture-only success, software GPU exclusions and field-specific legacy comparisons. Kept full
+  canonical tournament and ten-run analytics acceptance intact.
+- **Refinement 4:** checked priorities/dependency direction and linkage to the existing composed
+  proof. Added operational companion blockers and original leaderboard parent/docs blockers;
+  clarified that component proof supplies the dependent composed proof rather than requiring
+  its prior closure. Did not block harness authoring on unrelated optional hardware or learning work.
+- **Refinement 5:** final readback checks every new description/acceptance, retained original
+  criteria on reopen, graph cycles and authoritative BV triage. Missing captured legacy traces
+  keep qualification open; an unmeasured label is an honest interim disposition, not final pass.
+  The last planning readback found no further change required. Subsequent terminal DSR feedback
+  supplied the concrete approximate-storage failure to the existing GPU and correctness owners,
+  raised the GPU owner's priority and prompted a final graph/readback verification. No planning
+  change is counted as a delivered feature.
+
+Before refresh: **711 total; 582 closed, 114 open, 15 in progress**. Changes: **five new tasks**,
+**four reopened records** (three capability acceptances and the leaderboard parent), evidence
+comments on existing terminal/GPU/docs/lint owners, and explicit acceptance dependencies. No issue
+was closed by this audit. The executed failure also raises existing `bd-16g.15.3` from P3 to P1;
+it does not create a duplicate scope. Final graph: **716 total; 578 closed, 123 open, 15 in progress**.
+`br sync --status --json` reports healthy state, zero dirty records and identical DB/export
+coverage of 716 identities. `br dep cycles --include-closed --json` reports zero cycles across
+active and archived records. The final authoritative BV wrapper successfully validates all 716
+records with no read/validation errors; its 73 graph-actionable recommendations differ from the
+44 BR-ready claims by design. BR remains the claim authority. Its read-only triage and blocked
+readback confirm `.19` waits on `.15`/`.16`/`.17`, the composed journey waits on `.19` and the
+reopened original acceptances, and docs wait on leaderboard/fidelity qualification.
+
+BR also refreshed its tracked three-way merge baseline, `.beads/beads.base.jsonl`, to byte
+identity with the canonical 716-record export. That generated bookkeeping includes records
+already present before this audit; it does not add another authority or represent extra work.
+
+Pre-commit UBS was invoked on the five changed documentation/tracker files and returned
+`no-supported-languages` (exit 3, zero files scanned). This is **not** a clean source scan or a
+code finding; no scanner override was used. Manual frozen-diff review and `git diff --check`
+validate this non-code change. No Rust implementation, dependency pin, benchmark baseline or
+generated numeric artifact was modified by the audit.
+
+---
+
+## Prior assessment — 2026-09-24 (superseded by the October assessment; historical observations)
 
 **Verdict: the deterministic simulation core is genuinely strong, but the product the README sells — a living, observable, LLM-steerable evolution lab — does not currently work end to end. Three first-order defects were observed in a live run, and several closed beads that the 2026-09-22 section certified as WORKING are stubs or rest on placeholder evidence. The 2026-09-22 answers "YES, all open beads would close the gap" and "NONE uncovered" were wrong.**
 
