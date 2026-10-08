@@ -13,15 +13,16 @@ Repository: <https://github.com/Dicklesworthstone/rust_scriptbots>
 ## [v0.3.0] - 2026-10-08
 
 Source release (GitHub Release notes, same venue as v0.2.0; no prebuilt binaries).
-72 commits since v0.2.0.
+74 commits since v0.2.0.
 
 ### Compatibility: v0.2.0 run databases
 - **v0.3.0 cannot recover, replay or analyze a run database written by v0.2.0. No data is lost: keep a v0.2.0 binary to work with runs recorded by v0.2.0.**
   - Why: the host journal archive moved from version 3 to version 4 (deflated sections, below). Archive versions are checked strictly, as they were between v0.1.1 and v0.2.0.
-  - Affected: `--recover-storage`, `--replay-db` on a journaled recording, `sb_analyze`, the `control_cli` domain-events export, and the `Storage::append_run` / `StorageReader::open_finished` library APIs.
+  - Affected: `--recover-storage`, `--replay-db` on a journaled recording, `sb_analyze`, the `control_cli` domain-events export, and the library APIs that open a finished or existing run: `Storage`/`StoragePipeline` `append_run` and `recover_existing*`, `StorageReader::open_finished*`, and `scriptbots_analytics::ReaderCtx::open*`.
   - Each of these refuses a v0.2.0 database with `unsupported version 3, expected 4` before writing anything.
   - Plain reads through `StorageReader::open` are unaffected.
 - Brain genome and evaluator-state JSON written by v0.2.0 (payload as a number array) still decodes, alongside the new base64 form.
+- The reverse does not hold: v0.2.0 cannot read data written by v0.3.0. That covers run databases (archive v4) and genome/evaluator JSON with base64 payloads, including MAP-Elites archive exports.
 
 ### Added
 - **Replay of interactive runs from tick zero**: `--replay-db` re-applies the run's journaled operator commands at the ticks the host applied them. These include REST/MCP/TUI/GUI interventions, config patches, spawns, mutation-rate edits and map applies, so server and interactive runs replay-verify instead of diverging at the first command.
@@ -41,7 +42,7 @@ Source release (GitHub Release notes, same venue as v0.2.0; no prebuilt binaries
 - A debug server no longer aborts on its first `GET /api/narrative/search`: control-server threads get a 32 MiB stack.
 - A host whose drive loop fails now records a terminal fault and publishes it. Previously REST kept reporting `running` and the TUI kept showing RUNNING for a stopped world.
 - The `arctic` preset applies to a default world. It was refused because `food_respawn_amount` exceeded `food_max`.
-- `--replay-db` explains how to proceed when a journaled recording can't be opened as a finished run: run `--recover-storage` first, or use v0.2.0 for a v0.2.0 recording.
+- When `--replay-db` refuses a journaled recording as a finished run, the error names the remedy: `--recover-storage` first for a run that did not shut down cleanly, or v0.2.0 for a v0.2.0 recording.
 - TUI:
   - the help overlay closes on Esc instead of quitting the run;
   - pause/resume keeps the chosen speed;
@@ -64,7 +65,9 @@ Source release (GitHub Release notes, same venue as v0.2.0; no prebuilt binaries
   - `POST /api/v1/checkpoints` keeps every checkpoint in memory and on disk for the life of the process;
   - run bundles copy only the main database file.
 - `--replay-db` on a journaled recording whose server did not shut down cleanly needs `--recover-storage` first. v0.2.0 replayed the durable prefix of such a recording.
-- Workspace member crates keep their own `0.1.0` package versions; the release version is the workspace version and tag.
+- `--replay-db` refuses a recording whose islands exchanged migrants (archipelago runs) with a clear error, instead of replaying it.
+- `cargo audit` ignores RUSTSEC-2026-0194/0195 (quick-xml 0.39.4 via `fnx-readwrite`). No compatible fixed version exists, and XML parsing on those paths runs only in tests, on the crate's own output.
+- Workspace member crates other than `scriptbots-runtime` and `scriptbots-index` keep their own `0.1.0` package versions. Those two inherit the workspace version, now 0.3.0. The release version is the workspace version and tag.
 
 ---
 
