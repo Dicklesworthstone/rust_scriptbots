@@ -42942,6 +42942,9 @@ mod tests {
         let mut legacy_oversized = json.clone();
         legacy_oversized["payload"] =
             serde_json::to_value(vec![0_u8; MAX_BRAIN_GENOME_PAYLOAD_BYTES + 1]).expect("array");
+        // Text carries no size hint, so this exercises the in-loop bound as well.
+        let legacy_oversized_text = serde_json::to_string(&legacy_oversized).expect("text");
+        assert!(serde_json::from_str::<BrainGenomeEnvelope>(&legacy_oversized_text).is_err());
         assert!(serde_json::from_value::<BrainGenomeEnvelope>(legacy_oversized).is_err());
         let mut not_bytes = json.clone();
         not_bytes["payload"] = serde_json::json!([1, 256]);

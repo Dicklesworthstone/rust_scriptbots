@@ -4631,17 +4631,16 @@ fn run_replay_cli(
     storage.close()?;
     // A host-driven run journaled its operator commands; the journal is read through a
     // finished-run reader, which takes the file's exclusive lease once the plain one is closed.
+    // An unclean shutdown is refused while the journal pages are read, a v0.2.0 recording
+    // (journal archive v3) when the finished reader opens, so the hint covers both steps.
     let operator_commands = if journaled {
-        let finished = StorageReader::open_finished(&db_display).with_context(|| {
+        finished_run_operator_commands(&db_display).with_context(|| {
             format!(
-                "failed to open {db_display} as a finished run to read its command journal \
+                "failed to read the command journal of {db_display} as a finished run \
                  (a run that did not shut down cleanly needs `--recover-storage {db_display}` \
                  first; a run recorded by scriptbots v0.2.0 replays with v0.2.0)"
             )
-        })?;
-        let commands = recorded_operator_commands(&finished)?;
-        finished.close()?;
-        commands
+        })?
     } else {
         BTreeMap::new()
     };
@@ -5252,6 +5251,16 @@ struct ReplayMirror {
     flush_ticks: BTreeSet<u64>,
     /// Operator commands the host applied, by the world tick it applied them at.
     operator_commands: BTreeMap<u64, Vec<scriptbots_core::ControlCommand>>,
+}
+
+/// Opens `db` as a finished run and reads its journaled operator commands.
+fn finished_run_operator_commands(
+    db: &str,
+) -> Result<BTreeMap<u64, Vec<scriptbots_core::ControlCommand>>> {
+    let finished = StorageReader::open_finished(db)?;
+    let commands = recorded_operator_commands(&finished)?;
+    finished.close()?;
+    Ok(commands)
 }
 
 /// Every science-changing operator command a recorded host applied, by applied tick (bd-1leq).
