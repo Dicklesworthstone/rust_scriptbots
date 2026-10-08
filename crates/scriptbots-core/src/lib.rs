@@ -10183,7 +10183,9 @@ where
 
     let visitor = BoundedBytesVisitor::<LIMIT> { label };
     if deserializer.is_human_readable() {
-        deserializer.deserialize_str(visitor)
+        // Text written before `bd-vg58` (v0.2.0) carries the payload as a JSON number array;
+        // `deserialize_any` reads both that and the base64 string, under the same bound.
+        deserializer.deserialize_any(visitor)
     } else {
         deserializer.deserialize_bytes(visitor)
     }
@@ -42924,9 +42926,29 @@ mod tests {
                 .encode(vec![0_u8; MAX_BRAIN_GENOME_PAYLOAD_BYTES + 1])
         });
         assert!(serde_json::from_value::<BrainGenomeEnvelope>(oversized).is_err());
-        let mut malformed = json;
+        let mut malformed = json.clone();
         malformed["payload"] = serde_json::Value::String("not base64!".to_owned());
         assert!(serde_json::from_value::<BrainGenomeEnvelope>(malformed).is_err());
+
+        // JSON written by v0.2.0 (payload as a number array) still decodes, under the same bound.
+        let mut legacy = json.clone();
+        legacy["payload"] = serde_json::to_value(&payload).expect("payload as a number array");
+        assert!(legacy["payload"].is_array());
+        let legacy_text = serde_json::to_string(&legacy).expect("legacy JSON text");
+        assert_eq!(
+            serde_json::from_str::<BrainGenomeEnvelope>(&legacy_text).expect("decode legacy JSON"),
+            genome
+        );
+        let mut legacy_oversized = json.clone();
+        legacy_oversized["payload"] =
+            serde_json::to_value(vec![0_u8; MAX_BRAIN_GENOME_PAYLOAD_BYTES + 1]).expect("array");
+        assert!(serde_json::from_value::<BrainGenomeEnvelope>(legacy_oversized).is_err());
+        let mut not_bytes = json.clone();
+        not_bytes["payload"] = serde_json::json!([1, 256]);
+        assert!(serde_json::from_value::<BrainGenomeEnvelope>(not_bytes).is_err());
+        let mut not_a_payload = json;
+        not_a_payload["payload"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<BrainGenomeEnvelope>(not_a_payload).is_err());
 
         let state = family.state(7);
         let state_json = serde_json::to_value(&state).expect("encode state as JSON");
