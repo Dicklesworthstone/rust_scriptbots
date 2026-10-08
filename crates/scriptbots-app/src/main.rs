@@ -4633,7 +4633,11 @@ fn run_replay_cli(
     // finished-run reader, which takes the file's exclusive lease once the plain one is closed.
     let operator_commands = if journaled {
         let finished = StorageReader::open_finished(&db_display).with_context(|| {
-            format!("failed to open {db_display} as a finished run to read its command journal")
+            format!(
+                "failed to open {db_display} as a finished run to read its command journal \
+                 (a run that did not shut down cleanly needs `--recover-storage {db_display}` \
+                 first; a run recorded by scriptbots v0.2.0 replays with v0.2.0)"
+            )
         })?;
         let commands = recorded_operator_commands(&finished)?;
         finished.close()?;
