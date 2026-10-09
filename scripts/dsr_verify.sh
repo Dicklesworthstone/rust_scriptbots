@@ -14,8 +14,8 @@ verify_evidence() {
     case "$lane" in
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
         connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests sensing-manifest-tests manifest-storage-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
-        tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy tournament-tests tournament-cli) ;;
-        tournament-smoke-and-analytics) required+=(workspace-check workspace-clippy tournament-tests tournament-cli analytics-pipeline) ;;
+        tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli) ;;
+        tournament-smoke-and-analytics) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli analytics-pipeline) ;;
         analytics) required+=(workspace-check workspace-clippy analytics-pipeline) ;;
         graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
@@ -163,14 +163,23 @@ export TMPDIR="$proof_dir/tmp"
 # Embed the verified build inputs in the executable itself. Runtime manifests
 # deliberately do not infer a shipped binary's origin from its caller's checkout.
 export SCRIPTBOTS_SOURCE_REVISION="$actual_commit"
-export SCRIPTBOTS_SOURCE_BRANCH="$(git branch --show-current)"
+SCRIPTBOTS_SOURCE_BRANCH="$(git branch --show-current)"
 export SCRIPTBOTS_SOURCE_TREE_CLEAN=true
-export SCRIPTBOTS_SOURCE_STATUS_DIGEST="$(git status --porcelain --untracked-files=all | sha256sum | cut -d ' ' -f 1)"
-export SCRIPTBOTS_SOURCE_DIFF_DIGEST="$(git diff --binary HEAD | sha256sum | cut -d ' ' -f 1)"
+SCRIPTBOTS_SOURCE_STATUS_DIGEST="$(git status --porcelain --untracked-files=all | sha256sum | cut -d ' ' -f 1)"
+SCRIPTBOTS_SOURCE_DIFF_DIGEST="$(git diff --binary HEAD | sha256sum | cut -d ' ' -f 1)"
+export SCRIPTBOTS_SOURCE_BRANCH SCRIPTBOTS_SOURCE_STATUS_DIGEST SCRIPTBOTS_SOURCE_DIFF_DIGEST
 export SCRIPTBOTS_RUSTC_VV="$compiler_identity"
 steps=0
 touch "$proof_dir/commands.jsonl"
-trap 'rc=$?; if (( rc != 0 )); then jq -n --arg source "$actual_commit" --arg lane "$SCRIPTBOTS_VERIFY_LANE" --argjson exit_code "$rc" --argjson completed_steps "$steps" '\''{schema:"scriptbots.verification.v1",status:"failed",source:$source,lane:$lane,exit_code:$exit_code,completed_steps:$completed_steps}'\'' > "$proof_dir/verdict.json"; fi' EXIT
+record_failed_verdict() {
+    local rc=$?
+    if (( rc != 0 )); then
+        jq -n --arg source "$actual_commit" --arg lane "$SCRIPTBOTS_VERIFY_LANE" \
+            --argjson exit_code "$rc" --argjson completed_steps "$steps" \
+            '{schema:"scriptbots.verification.v1",status:"failed",source:$source,lane:$lane,exit_code:$exit_code,completed_steps:$completed_steps}' > "$proof_dir/verdict.json"
+    fi
+}
+trap record_failed_verdict EXIT
 
 run_step() {
     local name=$1 kind=$2
@@ -242,6 +251,7 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
     tournament-smoke|tournament-full|tournament-smoke-and-analytics)
         run_step workspace-check check cargo check --locked --workspace --all-targets
         run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
+        run_step assembly-tests test cargo test --locked -p scriptbots-brain --features experimental assembly::tests:: -- --nocapture
         run_step tournament-tests test cargo test --locked -p scriptbots-app --lib tournament:: -- --nocapture
         export SCRIPTBOTS_TOURNAMENT_PROOF_DIR="$proof_dir/tournament"
         tournament_mode=smoke

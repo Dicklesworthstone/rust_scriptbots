@@ -311,6 +311,168 @@ fn wait_for_control_addresses(child: &mut Child, timeout: Duration) -> Result<Se
     }
 }
 
+/// Real filesystem partial-write retention through the shipped REST server (bd-2z0.16).
+#[cfg(target_os = "linux")]
+#[test]
+#[serial]
+fn real_process_partial_checkpoint_write_remains_charged_and_unpublished() -> Result<()> {
+    let run_dir = tempdir()?.keep();
+    let artifacts_dir = run_dir.join("artifacts");
+    // The kernel writes the first 64 bytes and then returns EFBIG. Ignore SIGXFSZ
+    // in this child only, so the real API can observe and report the write error.
+    // Pipes remain unlimited, and the parent retains both child streams.
+    let mut child = Command::new("prlimit")
+        .args([
+            "--fsize=64:64",
+            "--",
+            "bash",
+            "-c",
+            "trap '' XFSZ; exec \"$@\"",
+            "checkpoint-write-probe",
+        ])
+        .arg(binary())
+        .args(["--mode", "server", "--storage", "memory"])
+        .args(["--checkpoint-interval", "0", "--checkpoint-max-count", "1"])
+        .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
+        .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_CONTROL_MCP", "http")
+        .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_ARTIFACTS_DIR", &artifacts_dir)
+        .env("RUST_LOG", "warn,scriptbots_app=info")
+        .current_dir(&run_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn actual server under the kernel file-size limit")?;
+    let (rest_addr, _, server_log) =
+        match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+            Ok(found) => found,
+            Err(error) => {
+                let _ = child.kill();
+                let output = child.wait_with_output()?;
+                std::fs::write(run_dir.join("stdout.log"), output.stdout)?;
+                std::fs::write(run_dir.join("startup-error.txt"), error.to_string())?;
+                return Err(error);
+            }
+        };
+    let mut guard = ChildGuard(Some(child));
+    let outcome: Result<()> = (|| {
+        let request = br#"{"idempotency_key":"partial-write"}"#;
+        let (code, body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/checkpoints",
+            request,
+            Some("application/json"),
+        )?;
+        assert_eq!(code, 503, "actual write failure: {body}");
+        assert!(
+            body.contains("retained partial/unconfirmed file data"),
+            "{body}"
+        );
+        let files = std::fs::read_dir(&artifacts_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(files.len(), 1);
+        let partial = std::fs::read(&files[0])?;
+        assert_eq!(partial.len(), 64, "observe an actual partial write");
+        let (list_code, list_body) = http(rest_addr, "GET", "/api/v1/checkpoints")?;
+        assert_eq!(list_code, 200);
+        let list: serde_json::Value = serde_json::from_str(&list_body)?;
+        assert_eq!(list["total"].as_u64(), Some(0));
+        assert_eq!(list["retention"]["file_count"].as_u64(), Some(1));
+        assert_eq!(list["retention"]["file_bytes"].as_u64(), Some(64));
+        assert_eq!(list["retention"]["request_entries"].as_u64(), Some(1));
+        assert_eq!(list["retention"]["pending_entries"].as_u64(), Some(1));
+        assert_eq!(list["retention"]["sql_count"].as_u64(), Some(0));
+        for _ in 0..2 {
+            let (retry_code, retry_body) = http_with_body(
+                rest_addr,
+                "POST",
+                "/api/v1/checkpoints",
+                request,
+                Some("application/json"),
+            )?;
+            assert_eq!(
+                retry_code, 503,
+                "partial evidence must not be overwritten: {retry_body}"
+            );
+            assert!(
+                retry_body.contains("incomplete or changed retained file data"),
+                "{retry_body}"
+            );
+            assert_eq!(std::fs::read(&files[0])?, partial);
+        }
+        let (quota_code, quota_body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/checkpoints",
+            b"{}",
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            quota_code, 507,
+            "partial file consumes retention: {quota_body}"
+        );
+        let (status_code, _) = http(rest_addr, "GET", "/api/status")?;
+        assert_eq!(
+            status_code, 200,
+            "control reads survive the filesystem error"
+        );
+        std::fs::write(
+            run_dir.join("partial-write-proof.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "scriptbots.partial-checkpoint-write.v1", "request": "partial-write",
+                "first_status": code, "first_body": body, "list": list,
+                "retained_path": files[0], "actual_bytes": partial.len(),
+                "blake3": blake3::hash(&partial).to_hex().to_string(), "quota_status": quota_code,
+            }))?,
+        )?;
+        let (shutdown_code, shutdown_body) = http(rest_addr, "POST", "/api/control/shutdown")?;
+        assert_eq!(
+            shutdown_code, 200,
+            "shutdown after partial write: {shutdown_body}"
+        );
+        let process = guard.0.as_mut().expect("owned process");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(exit) = process.try_wait()? {
+                assert!(
+                    exit.success(),
+                    "graceful shutdown after partial write: {exit}"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("partial-write server did not shut down within the existing 15-second bound");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Ok(())
+    })();
+    let mut process = guard.0.take().expect("owned process");
+    if process.try_wait()?.is_none() {
+        process.kill()?;
+    }
+    process.wait()?;
+    let mut stdout = String::new();
+    process
+        .stdout
+        .take()
+        .expect("captured stdout")
+        .read_to_string(&mut stdout)?;
+    std::fs::write(run_dir.join("stdout.log"), stdout)?;
+    std::fs::write(
+        run_dir.join("stderr.log"),
+        server_log
+            .lock()
+            .map_err(|_| anyhow!("server log poisoned"))?
+            .join("\n"),
+    )?;
+    println!("PARTIAL_WRITE_PROOF_DIR: {}", run_dir.display());
+    outcome
+}
+
 /// THE REAL-PROCESS CONTROL-PLANE ACCEPTANCE PROBE (bd-6mus, bd-0n87).
 ///
 /// Asserts wire-level contracts against the real SHIPPED BINARY:
