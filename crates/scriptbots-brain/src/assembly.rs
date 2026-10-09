@@ -1092,9 +1092,15 @@ mod tests {
         assert!(!inspection.build.truncated);
         assert!(inspection.activations.connections.is_empty());
         let observed_cells = &inspection.activations.layers[0].values;
-        let checkpoint_cells = checkpoint.payload()[ASSEMBLY_STATE_HEADER_BYTES..]
-            .chunks_exact(ASSEMBLY_CELL_BYTES)
-            .map(|cell| u32::from_le_bytes(cell.try_into().expect("cell width")))
+        let (checkpoint_cells, remainder) =
+            checkpoint.payload()[ASSEMBLY_STATE_HEADER_BYTES..].as_chunks::<ASSEMBLY_CELL_BYTES>();
+        assert!(
+            remainder.is_empty(),
+            "checkpoint cells use the declared width"
+        );
+        let checkpoint_cells = checkpoint_cells
+            .iter()
+            .map(|cell| u32::from_le_bytes(*cell))
             .collect::<Vec<_>>();
         assert_eq!(
             observed_cells
