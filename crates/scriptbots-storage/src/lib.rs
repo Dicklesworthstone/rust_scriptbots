@@ -9683,7 +9683,7 @@ impl StorageReader {
     }
 
     /// Copy the leased, checkpointed main image without opening the source path again.
-    /// WAL/journal data is refused rather than checkpointing or changing the source.
+    /// WAL frames and journal data are refused rather than changing the source.
     pub(crate) fn materialize_finished_database(
         &self,
         source: &Path,
@@ -9719,11 +9719,15 @@ impl StorageReader {
                 let sidecar = PathBuf::from(name);
                 match fs::symlink_metadata(&sidecar) {
                     Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+                    Ok(metadata)
+                        if suffix == "-wal"
+                            && metadata.is_file()
+                            && Self::wal_has_valid_header_without_frames(&sidecar)? => {}
                     Ok(_) => {
                         return Err(StorageError::InvalidTarget {
                             path: source_text.to_owned(),
                             reason: format!(
-                                "finished bundle export requires checkpointed storage; sidecar {} is nonempty or not a regular file",
+                                "finished bundle export requires checkpointed storage; sidecar {} contains frames, journal data, or an invalid header, or is not a regular file",
                                 sidecar.display()
                             ),
                         });
@@ -9761,6 +9765,62 @@ impl StorageReader {
             source,
         })?;
         verify_source()
+    }
+
+    /// FrankenSQLite TRUNCATE retains the new generation's header. A valid header
+    /// without any frame carries no database changes. Validate the SQLite wire
+    /// format and checksum, rather than accepting an arbitrary nonempty sidecar.
+    /// Format: https://www.sqlite.org/fileformat2.html#wal_header_format
+    fn wal_has_valid_header_without_frames(path: &Path) -> Result<bool, StorageError> {
+        use std::io::Read as _;
+
+        type HeaderWords = [[u8; size_of::<u32>()]; 8];
+        let inspect = || -> io::Result<bool> {
+            let mut file = fs::File::open(path)?;
+            if file.metadata()?.len() != size_of::<HeaderWords>() as u64 {
+                return Ok(false);
+            }
+            let mut header = [0_u8; size_of::<HeaderWords>()];
+            file.read_exact(&mut header)?;
+            let mut extra = [0_u8; 1];
+            if file.read(&mut extra)? != 0 {
+                return Ok(false);
+            }
+            let words: HeaderWords = std::array::from_fn(|index| {
+                std::array::from_fn(|byte| header[index * size_of::<u32>() + byte])
+            });
+            let magic = u32::from_be_bytes(words[0]);
+            let page_size = u32::from_be_bytes(words[2]);
+            if !matches!(magic, 0x377f_0682 | 0x377f_0683)
+                || u32::from_be_bytes(words[1]) != 3_007_000
+                || !(512..=65_536).contains(&page_size)
+                || !page_size.is_power_of_two()
+            {
+                return Ok(false);
+            }
+            let checksum_start = words.len() - 2;
+            let checksum_word = if magic == 0x377f_0683 {
+                u32::from_be_bytes
+            } else {
+                u32::from_le_bytes
+            };
+            let (mut first, mut second) = (0_u32, 0_u32);
+            for pair in words[..checksum_start].chunks_exact(2) {
+                first = first
+                    .wrapping_add(checksum_word(pair[0]))
+                    .wrapping_add(second);
+                second = second
+                    .wrapping_add(checksum_word(pair[1]))
+                    .wrapping_add(first);
+            }
+            Ok(first == u32::from_be_bytes(words[checksum_start])
+                && second == u32::from_be_bytes(words[checksum_start + 1]))
+        };
+        inspect().map_err(|source| StorageError::Filesystem {
+            operation: "validate empty WAL header for finished bundle",
+            path: path.to_path_buf(),
+            source,
+        })
     }
 
     pub(crate) fn require_finished_bundle_state(&self) -> Result<(), StorageError> {

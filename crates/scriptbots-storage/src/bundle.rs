@@ -824,6 +824,67 @@ mod tests {
     }
 
     #[test]
+    fn bundle_accepts_only_valid_wal_headers_without_frames()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let db_path = temp_db_path("empty-wal-header-bundle");
+        Storage::create_new_file_for_run(
+            &db_path.to_string_lossy(),
+            RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(13)),
+        )?
+        .close()?;
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let header = fs::read(&wal_path)?;
+        assert!(
+            !header.is_empty(),
+            "observe the actual retained engine header"
+        );
+        assert!(StorageReader::wal_has_valid_header_without_frames(
+            &wal_path
+        )?);
+        let original_db = fs::read(&db_path)?;
+        let output = temp_bundle_dir("empty-wal-header");
+        create_run_bundle(&db_path, &output)?;
+        verify_run_bundle(&output)?;
+        assert_eq!(fs::read(&wal_path)?, header);
+        assert_eq!(fs::read(&db_path)?, original_db);
+
+        let mut extra_frame_byte = header.clone();
+        extra_frame_byte.push(0);
+        let mut bad_checksum = header.clone();
+        *bad_checksum.last_mut().expect("nonempty engine header") ^= 1;
+        let mut bad_magic = header.clone();
+        bad_magic[0] ^= 1;
+        let mut bad_version = header.clone();
+        bad_version[size_of::<u32>()] ^= 1;
+        for (name, bytes) in [
+            ("extra-frame-byte", extra_frame_byte),
+            ("checksum-corruption", bad_checksum),
+            ("magic-corruption", bad_magic),
+            ("version-corruption", bad_version),
+            ("short-header", header[..header.len() - 1].to_vec()),
+        ] {
+            let path = temp_db_path(name);
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            assert!(
+                !StorageReader::wal_has_valid_header_without_frames(&path)?,
+                "invalid WAL case {name} was accepted"
+            );
+            assert_eq!(
+                fs::read(&path)?,
+                bytes,
+                "validation must not rewrite {name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn bundle_copy_holds_writer_lease_and_refuses_changed_source_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let db_path = temp_db_path("leased-bundle");
@@ -833,13 +894,25 @@ mod tests {
         )?;
         storage.close()?;
         let reader = StorageReader::open_finished(&db_path.to_string_lossy())?;
-        assert!(matches!(
-            crate::StoragePipeline::recover_existing(&db_path.to_string_lossy()),
-            Err(StorageError::InvalidData {
-                context: "storage.path_lease",
-                ..
-            })
-        ));
+        let error = match crate::StoragePipeline::recover_existing(&db_path.to_string_lossy()) {
+            Err(error) => error,
+            Ok(mut pipeline) => {
+                pipeline.shutdown()?;
+                return Err("finished reader did not exclude a writer".into());
+            }
+        };
+        assert!(
+            matches!(
+                &error,
+                StorageError::Worker(crate::StorageWorkerError::Internal {
+                    operation: crate::StorageOperation::Startup,
+                    commit_state: crate::FailureCommitState::NotAdmitted,
+                    detail,
+                    ..
+                }) if detail.contains("storage.path_lease") && detail.contains("another ScriptBots writer")
+            ),
+            "{error:?}"
+        );
         let copy_path = temp_db_path("leased-copy");
         reader.materialize_finished_database(&db_path, &copy_path)?;
         let before = fs::read(&copy_path)?;
@@ -869,7 +942,23 @@ mod tests {
             &pending.to_string_lossy(),
             RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(9)),
         )?;
-        let (receipt, _) = storage.stage_outbox(0, &crate::StorageBuffer::default())?;
+        let buffer = crate::StorageBuffer {
+            ticks: vec![crate::TickRow {
+                tick: 0,
+                epoch: 0,
+                closed: false,
+                agent_count: 0,
+                births: 0,
+                deaths: 0,
+                total_energy: 0.0,
+                average_energy: 0.0,
+                average_health: 0.0,
+                island_id: 0,
+            }],
+            ..crate::StorageBuffer::default()
+        };
+        let (receipt, newly_admitted) = storage.stage_outbox(0, &buffer)?;
+        assert!(newly_admitted);
         let progress = storage.persistence_watermarks()?;
         assert_eq!(progress.admitted, Some(receipt.batch_id));
         assert_eq!(progress.applied, None);
