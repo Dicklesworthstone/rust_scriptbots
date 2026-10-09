@@ -3770,6 +3770,97 @@ pub(crate) mod tests {
             .expect("ordinary storage shutdown succeeds");
     }
 
+    #[test]
+    fn checkpoint_indeterminate_owner_ack_retains_identity_and_retries_the_committed_row() {
+        let directory = tempfile::tempdir().expect("checkpoint directory").keep();
+        let (handle, _host) = checkpoint_test_handle(&directory, 1, 1024 * 1024);
+        let mut pipeline =
+            scriptbots_storage::StoragePipeline::unattributed_memory().expect("real owner");
+        let normal_writer = pipeline.checkpoint_writer();
+        normal_writer
+            .configure_retention(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 1,
+                max_bytes: 1024 * 1024,
+            })
+            .expect("SQL capacity");
+        let paused = pipeline
+            .pause_worker_for_test()
+            .expect("pause actual owner");
+        pipeline
+            .set_deadlines(scriptbots_storage::StorageDeadlines {
+                flush_ack: std::time::Duration::from_millis(20),
+                ..scriptbots_storage::StorageDeadlines::default()
+            })
+            .expect("short negative acknowledgement deadline");
+        let timed_writer = pipeline.checkpoint_writer();
+        pipeline
+            .set_deadlines(scriptbots_storage::StorageDeadlines::default())
+            .expect("restore normal controller deadlines");
+        let handle = handle.with_checkpoint_writer(Some(timed_writer));
+        let request = CheckpointCreateRequest {
+            idempotency_key: Some("actual-owner-ack-timeout".to_owned()),
+            description: Some("exact retry after the real queued write commits".to_owned()),
+        };
+        let error = handle
+            .create_checkpoint(request.clone())
+            .expect_err("paused actual owner must miss its acknowledgement deadline");
+        assert!(matches!(
+            error,
+            ControlError::CheckpointRetentionUnavailable(ref detail)
+                if detail.contains("outcome is unknown")
+        ));
+        let pending = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .expect("retained exact identity")
+            .requests
+            .values()
+            .next()
+            .expect("pending request")
+            .clone();
+        assert!(!pending.acknowledged);
+        let original = fs::read(directory.join(&pending.artifact.relative_path))
+            .expect("unconfirmed file retained");
+        assert_eq!(original.len() as u64, pending.metadata.byte_size);
+        assert_eq!(
+            handle
+                .list_checkpoints(None, None)
+                .expect("published list")
+                .total,
+            0,
+            "a timed-out receipt must not publish persisted metadata"
+        );
+        drop(paused);
+        let committed = normal_writer
+            .retention_usage()
+            .expect("queued write has completed");
+        assert_eq!(committed.count, 1);
+        let handle = handle.with_checkpoint_writer(Some(normal_writer));
+        let result = handle
+            .create_checkpoint(request.clone())
+            .expect("exact retry");
+        assert_eq!(result.checkpoint_id, pending.metadata.checkpoint_id);
+        assert_eq!(
+            serde_json::to_value(handle.create_checkpoint(request).expect("repeat retry"))
+                .expect("retry metadata"),
+            serde_json::to_value(&result).expect("accepted metadata")
+        );
+        let usage = handle.checkpoint_retention_usage().expect("bounded usage");
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(usage.sql_count, Some(1));
+        assert_eq!(usage.pending_entries, 0);
+        assert_eq!(usage.request_entries, 1);
+        assert_eq!(
+            handle
+                .read_artifact_bytes(&result.checkpoint_id)
+                .expect("download")
+                .1,
+            original
+        );
+        pipeline.shutdown().expect("normal ordered owner shutdown");
+    }
+
     #[cfg(unix)]
     #[test]
     fn checkpoint_file_reservation_failure_preserves_capacity_and_allows_retry() {
