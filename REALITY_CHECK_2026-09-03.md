@@ -8,27 +8,76 @@ HTTP authority/Origin enforcement and truthful tournament/analysis integration. 
 execution list lives in the existing recovery plan; all six original implementation owners
 remain in progress. The composed journey retains its blocking dependencies.
 
-At this update, production changes extend through `bd64f84b`; the analytics test reader-lifetime
-fix is `5f68228e`. These are committed local changes, not a pushed or released product.
+At this update, production diagnostics extend through `ae3894e3`; the analytics reader-lifetime
+fix is `5f68228e` and the database-scoped identity gate correction is `d07ecd36`.
+`323a448b` subsequently binds an optional profile seed cache in the DSR launcher.
+These are committed local changes, not a pushed or released product.
 Every correctness execution uses a clean pinned main clone and a unique DSR profile/version
 with `--no-sync`. No performance number or whole-product acceptance is claimed.
 
 | Delivered source change | Observed evidence and remaining boundary |
 |---|---|
 | Separate build provenance completeness from sensing reproducibility | Clean `fb29a8d1`: fifteen application manifest and twenty-one storage schema tests pass, including distinct complete/incomplete × exact/approximate cells and forged-policy refusals. Earlier `6f82b4e9` observes actual llvmpipe startup/readback and exact-mode refusal. Hardware parity/scaling remains open. |
-| Hold bundle source/copy identity and OS leases through database readback and manifest-last publication | Clean `fb29a8d1`: all ten bundle tests pass, including portable-copy ownership, lease survival through SQL close, logical checkpoint contradictions and live/pending/alias/collision refusals. A validated frame-free 32-byte engine WAL header is newly admitted; malformed headers and framed WAL remain refused. Production CLI/other-process acceptance is pending. |
-| Bound checkpoint files, request metadata, directory leases and every SQL producer | Clean `fb29a8d1`: six storage and eight application checkpoint tests pass, including actual delayed-owner acknowledgement, later commitment, exact identity retry, concurrency/restart accounting and zero-consumption Neuroflow refusal. Actual kernel partial writes and REST/MCP quota/continued-control acceptance are pending. |
-| Enforce actual listener authority and configured browser Origin before side effects | Clean `fb29a8d1` correctly fails two of 33 server tests: credentials were normalized away and an overflowing explicit port defaulted. `bd64f84b` rejects both and adds empty/signed-port controls while keeping original assertions. Fresh `connected-20261009-bd64f84b` is running; real socket acceptance is pending. |
+| Hold bundle source/copy identity and OS leases through database readback and manifest-last publication | Clean `fb29a8d1`: all ten bundle tests pass, including portable-copy ownership, lease survival through SQL close, logical checkpoint contradictions and live/pending/alias/collision refusals. A validated frame-free 32-byte engine WAL header is newly admitted; malformed headers and framed WAL remain refused. At `bd64f84b` and `b49012c8`, the actual file server shuts down successfully, production CLI creates/verifies the finished bundle, and independent SQL joins observe admitted=applied=durable=2. The larger connectivity lane remains red. |
+| Bound checkpoint files, request metadata, directory leases and every SQL producer | Clean `fb29a8d1`: six storage and eight application checkpoint tests pass, including actual delayed-owner acknowledgement, later commitment, exact identity retry, concurrency/restart accounting and zero-consumption Neuroflow refusal. At `bd64f84b` and `b49012c8`, a real kernel-limited 64-byte partial write stays charged and unpublished. REST/MCP retain two byte-identical 331,945-byte checkpoints, reject collision and concurrent overflow, and ordinary science still advances. At `ae3894e3`, the unchanged original memory probe passes once in 84.74s, observing periodic quota disable, continued science/controls and successful shutdown. DSR final collection then refuses a dependency link; whole-lane acceptance remains open. |
+| Enforce actual listener authority and configured browser Origin before side effects | Clean `fb29a8d1` correctly fails two of 33 server tests: credentials were normalized away and an overflowing explicit port defaulted. `bd64f84b` rejects both and adds empty/signed-port controls while keeping original assertions. Both later runs pass all 33 server tests. `b49012c8` observes real socket policy refusals with unchanged world fields/admission and zero artifact entries, then fails at a later MCP map apply. `ae3894e3` preserves underlying errors and passes the original memory probe once; the earlier MCP cause remains unestablished. |
 | Wire declared founder seed and observed topology/rates into truthful tournament provenance | Clean `fb29a8d1`: nineteen Assembly and thirty-four tournament tests pass. Two actual original 2k smoke CLI invocations produce byte-identical raw rows, ratings and Markdown: eight matches/sixteen family rows, with four document/config/raw-row/rating mutation refusals. Original full 32-seed × 3-order × 20k-tick publication remains open. |
-| Connect real seeded worlds to analyzer CLI, Parquet and fail-closed evidence | Clean `fb29a8d1`: the synthetic fixture passes; the real-world test fails its first analyzer CLI because the test retained a reader lease. `5f68228e` releases each reader before the independent CLI without relaxing storage ownership. Fresh science execution is running. Original real intervention/null/lineage/control-CLI FTS and repeated-run acceptance remain open. |
-| Repair existing correctness CI and legacy wrapper routing | Actionlint, Bash/ShellCheck, immutable action pins and actual local profile preparation pass. Separate pinned DSR connectivity/science jobs retain the original wire probe. GitHub runners API still reports zero at 06:52 UTC; no hosted/nightly execution is claimed. |
+| Connect real seeded worlds to analyzer CLI, Parquet and fail-closed evidence | Clean `5f68228e` executes both original tests successfully in 796.66s after releasing readers before independent CLI opens. The actual 400-tick world has 183 births, 12 deaths, watermarks 400=400=400, all twelve analyzer CLI reports and five matching SQL/Parquet counts. The wrapper then falsely rejects equal database-scoped run IDs in distinct databases. `d07ecd36` compares actual filesystem identities and adds two alias/collapse negatives. DSR readback with the `ae3894e3` verifier accepts that retained dataset, rejects all 25 mutations and accepts unchanged inputs again, preserving both source identities. This is verifier readback, not fresh same-source simulation. Original real intervention/null/lineage/control-CLI FTS and repeated-run acceptance remain open. |
+| Repair existing correctness CI and legacy wrapper routing | Actionlint, Bash/ShellCheck, immutable action pins and actual local profile preparation pass. Separate pinned DSR connectivity/science jobs retain the original wire probe. `1f094663` documents/checks the controller-local path requirement: actual local preparation passes and SSH configuration refuses before an unusable checkout. General SSH DSR profiles work with explicit remote staging. GitHub runners API still reports zero at 06:52 UTC; no hosted/nightly execution is claimed. |
 
 Both focused `fb29a8d1` attempts pass formatting, four dependency guards, all-target workspace
 check and strict all-target Clippy before their later failures. A fresh optimized native
 workspace profile on `hz3` retains the unchanged workspace and core `economy-faults` suites.
 Its first attempt failed before compilation because the worker lacked the pinned source path.
-The retry stages that exact checkout and verifies local/remote profile SHA256 equality first;
-no test result is inferred from orchestration or cache preparation.
+The next setup attempt fails on the global SBH catalog's permissions before compilation.
+The current `b49012c8` retry stages exact source/profile bytes and preserves protection through
+a private writable copy of the existing configuration/catalog. Workspace check and strict
+Clippy pass. The real analytics test fails at treatment tick 351 on a 120-second
+admission acknowledgement timeout, typed `Indeterminate`; the fixture is still executing.
+Read-only thread states observe filesystem I/O waits and host I/O pressure is high, but
+the cause of the timeout is unestablished. Economy-faults has not executed. Neither setup
+failure is a test result, and this actual test failure is retained rather than relabeled.
+The full `5f68228e` publication attempt fails after CLI compilation: command and output-capture
+exit codes are both 1, no full CLI invocations or matches are observed, and its raw failure is
+retained. Separately observed `/tmp` quota errors explain the move to persistent proof storage;
+the publication command's own failing errno was not retained.
+
+The installed DSR final Cargo-cache verifier refuses Cargo's recreated Proptest README symlink
+at the immutable locked revision. This blocks collection even after the successful memory
+probe. A declared Git `core.symlinks=false` configuration trial still observes the link and
+fails the unchanged guard before compilation. No DSR gate, dependency pin or fetched source
+was changed. The existing build-farm acceptance task retains this compatibility blocker.
+
+Two first persistent retries refuse an unrelated ambient k9 link before compilation:
+the launcher did not consume the profile's declared seed cache. Explicit caller export
+corrects those launches. At `ae3894e3`, formatting, all four guards, workspace check,
+strict all-target Clippy and all five original control-process tests now pass together
+(three existing long probes remain ignored). All four replay tests also pass (379.06s),
+including checkpoint-start continuation and production bundle create/verify. The typed inner
+connectivity verdict passes all sixteen steps. Outer DSR fails/6 after the unchanged final
+private-cache verifier refuses the Proptest link; no successful final collection is claimed.
+`323a448b` binds the optional cache declaration in the launcher. Three actual invalid-root
+controls refuse before build work. The real native DSR seed-selection probe records the
+declared empty cache, zero files and a private destination despite a different caller cache.
+It deliberately stops with recipe exit 42 before Cargo/collection; outer failed/6 is expected.
+The distinct `.4` launcher defect closes on that original-criterion solo qualification,
+with the seed receipt, profile/host/source/launcher/log hashes retained. This closes only
+cache selection; it does not transfer or close any original full qualification condition.
+The original full build-farm qualification remains blocked/open; its refused claim and
+existing edge are preserved.
+
+Both legacy wrapper entry points accept the unchanged retained connectivity evidence in a
+separate DSR readback (`ae3894e3` artifacts, `323a448b` verifier). Its recipe succeeds and
+release packaging then fails; a diagnostic-mode attempt refuses the absent strict release
+contract before execution. Both failures remain retained, without a release claim. The
+persistent full tournament retry has built the actual optimized CLI and started the original
+96-match plan at 10:15:12 UTC; no completed matches are observed at this update.
+
+The inactive attempts through 09:45 UTC are retained in
+`/data/tmp/scriptbots-proof-followup-20261009/implementation-attempts-through-0945.tar`.
+All 5,102 archived regular files match their originals by SHA256. The inventory explicitly
+excludes source clones, the empty cache and the active remote launch log; this is preservation
+of those attempts, not a final aggregate acceptance or a new capability.
 
 Two external shared-checkout resets to `origin/main` are observed in the reflog at 07:40:19
 and 07:46:41 UTC; the issuer is unidentified. Implementation commits were recovered by safe
@@ -42,31 +91,31 @@ health but retains warnings for existing ignore patterns and preserved recovery 
 
 This is a solo review of actual diffs, original criteria, retained commands, current tracker
 and bounded reflog; it is not independent author verification. The full external worksheet
-is `/tmp/scriptbots-implementation-20261009-2WARDx/honesty-inventory-implementation.md`.
+is `/data/tmp/scriptbots-proof-followup-20261009/honesty-inventory-implementation.md`.
 Older-session checks read six contextual CASS hits; the indexed coverage stops in September.
 
 | # | Question / disposition |
 |---|---|
-| 1 | Weakened gates: yes, authored analytics temporarily reduced twelve report identities and eight required invariants. `6b663f00` and `865531f0` restore the original exact sets; `933b09c3` adds 23 verifier mutations. Disclosed here and in Beads. Runtime mutation acceptance is pending. |
+| 1 | Weakened gates: yes, authored analytics temporarily reduced twelve report identities and eight required invariants. `6b663f00` and `865531f0` restore the original exact sets; `933b09c3` adds 23 verifier mutations and `d07ecd36` adds two identity controls. All 25 actually refuse in source-bound DSR readback, with untouched data accepted before and after. Simulator/verifier revisions remain explicit. Disclosed here and in Beads. |
 | 2 | Fake implementation/mocks: none found in reviewed new production/test hunks. Actual owners, processes, sockets, filesystem/kernel faults and Neuroflow are used; synthetic statistical fixtures are labeled separately. |
 | 3 | Golden regeneration: none in the implementation range. No performance baseline, scientific digest or tournament specification was changed. |
-| 4 | Gate/budget changes: validated frame-free WAL admission has explicit malformed/framed negatives; Assembly inspection compares real working cells and checkpoint/output continuation. Outer DSR timeout is 7200s after infrastructure timeout; application shutdown remains 15s. No assertion/lint suppression substitutes for behavior. |
+| 4 | Gate/budget changes: validated frame-free WAL admission has explicit malformed/framed negatives; Assembly inspection compares real working cells and checkpoint/output continuation. `d07ecd36` repairs false comparison of database-scoped IDs using actual roots/file identities and two new refusal cases. `b49012c8` waits for observed periodic disable before the unchanged policy baseline/assertions. Outer DSR timeout is 7200s; application shutdown remains 15s. No assertion/lint suppression substitutes for behavior. |
 | 5 | Fake special cases: none found in reviewed production changes. No fixture-path detection or benchmark hardcoding. Full hardware/publication criteria remain. |
 | 6 | Zero-run green: an initial UBS diagnostic selected zero files; it receives no scan credit. Later retained engine runs have actual populations and findings. DSR requires nonzero executed tests and exact named analytics tests. |
 | 7 | Unrun commands claimed: none found in reviewed commentary/tracker/verdict records. Authored changes and pending executions remain qualified. |
 | 8 | Proof inflation: software-adapter, synthetic fixture, seeded world, source compilation and hardware proof stay separate. No whole-product pass inferred. |
 | 9 | Hidden failures: authored gate omissions could have hidden missing evidence; corrected as above. Cache/compiler/lint/seed/topology/bundle/server/reader-lease failures and timeouts are retained. |
 | 10 | Silenced stderr: captured logs support claims. Earlier child stdout is discarded and never cited as inspected; new partial-write controls retain both streams. |
-| 11 | False closure: no implementation Bead closed; original scopes and composed blocking edges preserved. No follow-up laundering. |
+| 11 | False closure: the distinct cache-selection defect `.4` closes on all its original criteria, including actual native DSR seed observation and three typed negatives. Six original implementation owners and composed blocking edges remain unchanged; no original qualification condition was transferred. |
 | 12 | Spec weakened: original tournament matrix, hardware qualification, real scarcity/null/search and repeated analytics criteria remain unchanged. |
-| 13 | Self/peer closure: none in this implementation window. |
+| 13 | Self/peer closure: the cache-selection defect is closed after solo original-criterion re-execution, explicitly labeled. No independent reviewer or broader product acceptance is claimed. |
 | 14 | Gameable delegation: no subagents used. |
 | 15 | Unverified subagent reports: none used. |
 | 16 | Refusal farming: positive startup, checkpoint admission/retry, bundle materialization and actual tournament execution exist alongside refusals; negatives alone do not close tasks. |
 | 17 | Independence overstated: solo review is labeled. Separate reader processes are data observations, not independent reviewer opinions. |
 | 18 | Post-result denominator: declared matrix/test/report/invariant sets remain fixed. Smaller authored gate denominators are recorded as defects and restored. |
 | 19 | Replay explanations: gate omissions, repeated compiler/lint fixes, tool cleanup and external resets are disclosed. The first UBS meta-runner removed its own temporary shadow; earlier DSR launches may remove their private stage. Later UBS retains artifacts and project DSR launchers set `DSR_KEEP_BUILD_STAGES=1`. No manual destructive Git/file command was issued; no repository file was deleted by those tool cleanup paths. |
-| 20 | Strongest observed evidence: `fb29a8d1` component passes and actual two-invocation 2k tournament with four CLI drift refusals. Final connectivity, real-world analytics, unchanged full workspace and original broader acceptance are still pending. |
+| 20 | Strongest observed evidence: the sixteen-step typed inner connectivity pass at `ae3894e3`, all five original process and four replay tests, actual two-invocation 2k tournament/four CLI drift refusals, real file-server finished-bundle/SQL readback and partial-write controls, both original analytics tests with actual CLI/Parquet evidence at `5f68228e`, all 25 gate readback refusals at verifier `ae3894e3`, and native cache selection at `323a448b`. Final Rust collection, fresh composed analytics, full tournament, unchanged workspace and original broader acceptance remain open. The remote real analytics failure at tick 351 remains a failure. |
 
 ## Current assessment — 2026-10-08
 

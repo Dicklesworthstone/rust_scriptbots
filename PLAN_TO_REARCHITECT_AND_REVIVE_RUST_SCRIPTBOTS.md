@@ -51,18 +51,30 @@ were recovered by safe fast-forward, and isolated source/evidence copies remain 
   - [x] Retain database-free semantics and portable copied-database lease ownership.
     All ten bundle tests pass in clean pinned `connected-20261009-fb29a8d1`, including
     frame-free-header positives, malformed/framed WAL and hash-valid logical contradictions.
-  - [ ] Exercise the production CLI and another process's durable readback in the complete lane.
-    Earlier `9e3fe1cb` failed three bundle cases; `fb29a8d1` fixes their lease/identity
-    causes. It then failed two server cases. Fresh corrected-source `bd64f84b` is executing.
+  - [x] Exercise the production CLI and another process's durable readback in the named lane.
+    The file process probe at `bd64f84b` and `b49012c8` actually creates/verifies the
+    finished bundle and independently reads SQL with all watermarks equal to 2.
+    At `ae3894e3`, all sixteen connectivity steps have a typed inner pass, including
+    all five original control-process and four replay tests. DSR then refuses final
+    Cargo-cache verification/collection on the pinned Proptest README link. Overall
+    DSR acceptance remains open; the earlier memory-probe failure remains unexplained.
 - [ ] `bd-2z0.15`: enforce configured authority/Origin before side effects.
-  - [ ] Derive policy from actual listeners and advertised endpoints and observe both policy logs.
-  - [ ] Apply the same policy to REST and MCP before commands, experiments or artifacts.
-  - [ ] Exercise accepted CLI/browser clients and rejected requests over real sockets.
-  - [ ] Cover IPv4/IPv6, ports, credentials, null/duplicate Origins/Hosts, proxy headers,
+  - [x] Derive policy from actual listeners and advertised endpoints and observe both policy logs.
+  - [x] Apply the same policy to REST and MCP before commands, experiments or artifacts.
+  - [x] Exercise accepted CLI/browser clients and rejected requests over real sockets.
+  - [x] Cover IPv4/IPv6, ports, credentials, null/duplicate Origins/Hosts, proxy headers,
     absolute targets, HTTP/2 authority and WebSocket upgrades without weakening guards.
     `fb29a8d1` passed 31/33 server tests; credentialed Origin and overflowing explicit
     port were wrongly normalized. `bd64f84b` rejects both and supplements the unchanged
-    tests with empty/signed ports. Its clean source-bound DSR execution is pending.
+    tests with empty/signed ports. Both `bd64f84b` and `b49012c8` execute all 33 server
+    tests successfully; `b49012c8` also observes real listener refusals with identical
+    before/after world state, zero artifact entries and unchanged command admission.
+    That complete process probe failed at a later MCP map-apply operation. A pinned
+    `ae3894e3` diagnostic executes the unchanged original memory probe successfully
+    in 84.74s, including its later MCP operation. This single pass does not establish
+    the cause of the earlier failure. A subsequent pinned `ae3894e3` connectivity run
+    passes all 33 server tests and all five original process tests together; the
+    sixteen-step inner lane passes, then DSR refuses final cache collection.
 - [ ] `bd-2z0.16`: bound checkpoint retention across every actual producer.
   - [x] Trace API/periodic producers, file payloads, request metadata, leases and SQL payloads.
   - [x] Remove duplicate payload caching and bound retained directory leases.
@@ -72,14 +84,27 @@ were recovered by safe fast-forward, and isolated source/evidence copies remain 
   - [x] Observe real Neuroflow capture refusal before retention consumption.
     Clean pinned `fb29a8d1` passes all six storage and eight application checkpoint tests.
     This component evidence does not replace the pending operational process acceptance.
-  - [ ] Observe kernel-limited partial writes, retain/charge their exact bytes, and verify retries.
-  - [ ] Drive real REST/MCP creates to count/byte exhaustion and preserve accepted downloads.
-  - [ ] Observe periodic quota disable while ordinary science and controls continue.
+  - [x] Observe kernel-limited partial writes, retain/charge their exact bytes, and verify retries.
+  - [x] Drive real REST/MCP creates to count/byte exhaustion and preserve accepted downloads.
+    Both `bd64f84b` and `b49012c8` observe the real 64-byte failed write without publication,
+    exact retries and charged quota. The file journey retains two byte-identical 331,945-byte
+    checkpoints, rejects collision/concurrent overflow and still advances ordinary science.
+  - [x] Observe periodic quota disable while ordinary science and controls continue.
+    The original memory probe passes at `ae3894e3`; DSR subsequently refuses artifact
+    collection on the pinned Proptest README symlink. Probe execution and collection
+    are separate observations; neither implies complete retention acceptance.
+    The later complete named connectivity lane passes all original process/replay
+    tests at the same Rust revision, with final DSR collection still refused.
 - [ ] `bd-2z0.19`: compose authority, retention and bundle behavior through actual processes.
   - [ ] Wait for original component acceptance; preserve the three blocking edges.
-  - [ ] Observe graceful ordered shutdown within the original 15-second bound.
-  - [ ] Bind embedded source/compiler, actual policy/quota observations and durable DB joins.
-  - [ ] Execute both existing control wrapper entry points through the complete pinned DSR lane.
+  - [x] Observe graceful ordered shutdown within the original 15-second bound.
+  - [x] Bind embedded source/compiler, actual policy/quota observations and durable DB joins.
+  - [x] Execute both existing control wrapper entry points over the retained pinned lane.
+    Source `ae3894e3` observes the production process/replay journey; verifier
+    `323a448b` executes both entry points against unchanged hashes. That separate
+    readback recipe succeeds, then its DSR release packaging fails. Diagnostic mode
+    refuses the profile's absent strict release contract before execution. Neither
+    readback attempt is a final collected Rust artifact or a release qualification.
   - [ ] Retain hash-valid logical mismatch, pending, wrong source/run, missing artifact,
     stale/zero-test, missing protection/accounting and actual successful controls.
   - [ ] Close only on original evidence and then unblock `bd-2z0.13.11`.
@@ -100,23 +125,38 @@ were recovered by safe fast-forward, and isolated source/evidence copies remain 
     earlier guessed binary path is fixed by consuming Cargo's compiler-artifact executable.
   - [ ] Execute two original full-protocol CLI invocations (32 seeds × 3 orders × 20k ticks,
     24 founders; each invocation also retains its original internal reproducibility rerun).
+    Clean pinned `publication-20261009-5f68228e` builds the CLI with declared
+    optimization level 1, then fails output capture (command/log exits 1/1) before
+    the full CLI invocations. No full matches are observed. `/tmp` independently
+    returns quota errors; that is not a retained errno from the publication command.
+    The original matrix, tick count, founders and four CLI runs remain unchanged.
+    The persistent `ae3894e3` retry builds the actual CLI and starts the original
+    full 96-match plan at 10:15:12 UTC. At this update no completed match rows are
+    observed; real execution is active, not publication acceptance.
   - [ ] Commit the generated full leaderboard beside actual raw rows and ratings, with provenance.
   - [x] Connect bounded smoke/analytics to the existing CI workflow.
   - [ ] Provide and execute the original full nightly publication lane on an available controller.
 - [ ] `bd-2z0.11.9`: complete the full real simulation-to-analysis journey.
-  - [ ] Observe both original named tests and all declared tests succeeding.
+  - [x] Observe both original named tests and all declared tests succeeding.
     At `fb29a8d1`, the fixture passed and real-world CLI failed because the test retained
-    its reader lease. `5f68228e` releases readers before independent CLI opens; fresh
-    composed science acceptance is running without any lease/assertion waiver.
-  - [ ] Observe all twelve original report identities and all eight ground-truth invariants.
+    its reader lease. `5f68228e` releases readers before independent CLI opens; both
+    original tests pass in 796.66s, with 183 births, 12 deaths and all watermarks at 400.
+  - [x] Observe all twelve original report identities and all eight ground-truth invariants.
     Authored omissions (nonempty registry and four-invariant gate) were disclosed; `6b663f00`
     and `865531f0` restore the original contracts, with 23 actual verifier mutations in
-    `933b09c3`. Positive runtime and mutation acceptance remain pending.
-  - [ ] Retain distinct fixture/real-world run manifests with exact source/compiler identity.
-  - [ ] Execute all twelve analyzer CLI reports and retain their schemas, logs and hashes.
-  - [ ] Independently compare all five real-world Parquet tables with SQL counts.
-  - [ ] Observe missing/empty/corrupt DB and unknown-report refusals.
-  - [ ] Falsify fixture-only, missing named test, changed report and every missing report/invariant.
+    `933b09c3`. Runtime report/invariant assertions pass at `5f68228e`. Its wrapper
+    wrongly rejected two distinct fresh databases whose
+    database-scoped run IDs both equal 1. `d07ecd36` compares actual roots/file identities,
+    hashes the fixture database too, and adds collapsed-root and aliased-database negatives.
+  - [x] Retain distinct fixture/real-world run manifests with exact source/compiler identity.
+  - [x] Execute all twelve analyzer CLI reports and retain their schemas, logs and hashes.
+  - [x] Independently compare all five real-world Parquet tables with SQL counts.
+  - [x] Observe missing/empty/corrupt DB and unknown-report refusals.
+  - [x] Falsify fixture-only, missing named test, changed report and every missing report/invariant.
+    Source-bound DSR readback `analytics-identity-20261009-ae3894e3-persistent` accepts
+    the retained `5f68228e` dataset before and after all 25 refusals, including distinct
+    directory/database identity controls. Artifact source is `5f68228e`, verifier is
+    `ae3894e3`; this is gate readback, not fresh simulation on the verifier revision.
   - [ ] Observe real planted scarcity at the original p < .01 and a nonvacuous stationary null.
   - [ ] Join independently observed two-parent lineage and multiple interaction-event ground truth.
   - [ ] Exercise actual control-CLI FTS against the same scientific DB and retained exports.
@@ -124,22 +164,64 @@ were recovered by safe fast-forward, and isolated source/evidence copies remain 
 - [ ] Verification and work preservation.
   - [x] At `fb29a8d1`, both focused lanes pass formatting, four dependency guards,
     all-target workspace check and strict all-target Clippy. Neither is yet a whole-lane pass.
-  - [ ] Complete the corrected-source connectivity lane, production process tests and replay tests.
+  - [x] Complete the corrected-source named connectivity execution, process tests and replay tests.
+    `b49012c8` preserves and passes the policy state/admission assertions after waiting for
+    observed periodic quota disable. A later MCP map apply returns an internal error:
+    `ae3894e3` retains the underlying control error and stderr. Its focused original
+    memory probe passes once; final DSR collection refuses the pinned Proptest symlink.
+    The earlier MCP failure is unresolved. Its first setup failed before testing on an
+    existing target directory. A declared Git `core.symlinks=false` trial also refuses
+    that symlink after metadata, before compilation; it is not a workaround.
+    The later persistent `ae3894e3` run passes all sixteen steps, all five original
+    control-process tests (78.21s) and all four replay tests (379.06s). Its typed
+    inner verdict is `pass`; outer DSR is `failed`/6 after final private-cache
+    refusal/4. Final collection and overall DSR acceptance remain outstanding.
   - [ ] Complete the composed smoke/analytics lane and its independent evidence readback.
   - [ ] Complete unchanged workspace tests and core `economy-faults` tests through pinned DSR.
     A separate `hz3` native profile declares optimization level 1 before execution;
     its first attempt failed before compilation because the remote pinned source path was
-    absent. Exact source and matching profile bytes are staged for the `5f68228e` retry.
-    No workspace compilation/test or performance result yet.
+    absent. A second attempt stopped before compilation on the global SBH catalog's
+    permissions. The `b49012c8` retry stages exact source/profile bytes and uses an isolated
+    writable copy of the existing protection configuration. Workspace check and strict
+    Clippy pass. The real analytics test fails at treatment tick 351 on the unchanged
+    120-second admission acknowledgement deadline, typed `Indeterminate`. The worker
+    is observed waiting on filesystem I/O amid high host I/O pressure; causation is
+    not established. The fixture is still executing; economy-faults has not run.
+    Neither failed setup is a workspace test result; no performance result is claimed.
   - [x] Configure project DSR launchers to retain temporary stages (`ba90679d`), with shell checks.
   - [x] Recover and validate canonical JSONL/Beads after the observed external checkout resets.
     Isolated rebuild observes 716 tasks and all six active owners/comments; ordinary BR
     merge has zero conflicts/deletions and cycles stay empty. Existing doctor warnings remain.
   - [ ] Preserve the full twenty-question honesty inventory and final positive/negative evidence.
+  - [ ] Resolve the DSR dependency-link compatibility blocker with its original cache protections.
+    The installed DSR explicitly refuses symlinks; Cargo recreates a tracked contained
+    README link at immutable Proptest revision `3dca1987`. No dependency pin, source or
+    DSR gate was changed. The existing build-farm acceptance task owns this limitation.
+  - [x] `bd-build-farm-reliability-lb19.4` [Completed — cache selection only]: bind a profile's
+    declared seed cache in the launcher and reject invalid roots before build work.
+    Two persistent retries refused the ambient k9 link before compilation because
+    only the build profile, not the launcher, selected the empty cache. Separate
+    corrected launches now pass latest-Rust-source formatting/check/Clippy and all
+    five original control-process tests (three existing long probes ignored).
+    `323a448b` wires the optional cache into the launcher. Bash/ShellCheck and actual
+    missing/relative/symlink-root refusals pass. Native DSR records the declared
+    empty seed, zero files and its private destination, despite the different caller
+    cache. The recipe deliberately stops with exit 42 before Cargo/collection;
+    outer `failed`/6 is expected and is not product acceptance. The exact receipt,
+    profile/host/source/launcher/log identities and original-criterion solo readback
+    are retained in `seed-selection-20261009-323a448b/qualification.json` with hashes.
+    The new distinct defect closes at 10:16:31 UTC. The broader `.2` claim is correctly refused
+    by its existing `bd-vlp7` dependency; its state and edges remain unchanged.
+  - [x] Capture new proof attempts under `/data/tmp/scriptbots-proof-followup-20261009`.
+    `/tmp` returns per-user quota errors despite free filesystem capacity. Preserve old
+    attempts; new paths and capture failures do not change the original acceptance gates.
   - [ ] Copy/hash final proof onto persistent storage, preserving failed attempts and raw logs.
   - [ ] Commit code, tracker and reports separately through reviewed frozen trees.
   - [ ] Synchronize main/remotes only after required acceptance, without force or hook bypass.
   - [ ] Re-triage authoritative ready work and continue host/replay/frontend dependencies in order.
+    The latest ready view still includes hardware rendering, host/frontend continuation,
+    core population explosion and storage scan costs. Persistence retries already have
+    real runtime/application callers; no unwired-retry defect is claimed.
 
 [Currently In Progress — `bd-pcfj`, TurquoiseLake, 2026-09-06: transfer production ownership
 into HostThread/HostCore, preserve frontend inspection and exports through bounded owner requests,
