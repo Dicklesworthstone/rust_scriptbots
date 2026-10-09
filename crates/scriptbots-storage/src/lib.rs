@@ -9805,7 +9805,11 @@ impl StorageReader {
                 u32::from_le_bytes
             };
             let (mut first, mut second) = (0_u32, 0_u32);
-            for pair in words[..checksum_start].chunks_exact(2) {
+            let (pairs, remainder) = words[..checksum_start].as_chunks::<2>();
+            if !remainder.is_empty() {
+                return Ok(false);
+            }
+            for pair in pairs {
                 first = first
                     .wrapping_add(checksum_word(pair[0]))
                     .wrapping_add(second);
