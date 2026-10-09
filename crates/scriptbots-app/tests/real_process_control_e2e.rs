@@ -331,11 +331,12 @@ fn wait_for_control_addresses(child: &mut Child, timeout: Duration) -> Result<Se
 #[test]
 #[serial]
 fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screenshot() -> Result<()> {
-    let run_dir = tempdir()?;
-    let artifacts_dir = run_dir.path().join("artifacts");
+    let run_dir = tempdir()?.keep();
+    let artifacts_dir = run_dir.join("artifacts");
 
     let mut child = Command::new(binary())
         .args(["--mode", "server", "--storage", "memory"])
+        .args(["--checkpoint-interval", "1", "--checkpoint-max-count", "0"])
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
         // Port 0: the OS assigns and the process announces what it bound.
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
@@ -348,7 +349,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         // telemetry emits thousands of lines and the listener announcement is
         // drowned in them, which is how the first run of this test timed out.
         .env("RUST_LOG", "warn,scriptbots_app=info")
-        .current_dir(run_dir.path())
+        .current_dir(&run_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1072,7 +1073,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         assert_eq!(artifact_val["terrain"]["height"], 60);
 
         // MCP map_apply via generated file path (large maps use file path / hex postcard to respect JSON-RPC node limits)
-        let map_file = run_dir.path().join("mcp_generated_map.json");
+        let map_file = run_dir.join("mcp_generated_map.json");
         std::fs::write(&map_file, artifact_text.as_bytes())?;
         let mcp_apply_req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1144,14 +1145,49 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
             "MCP unknown tool must return JSON-RPC error object: {unknown_body}"
         );
 
-        // (9) Lifecycle: observe a live child, then deliberately kill and reap it.
+        // Optional periodic capture exhaustion must leave the owner responsive.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let observed = server_log
+                .lock()
+                .expect("server logs retained")
+                .iter()
+                .any(|line| line.contains("optional_capture_disabled"));
+            if observed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "periodic quota disposition was not observed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (usage_code, usage_body) = http(rest_addr, "GET", "/api/v1/checkpoints")?;
+        assert_eq!(usage_code, 200, "{usage_body}");
+        let usage: serde_json::Value = serde_json::from_str(&usage_body)?;
+        assert_eq!(usage["retention"]["sql_count"].as_u64(), Some(0));
+        assert_eq!(usage["retention"]["file_count"].as_u64(), Some(0));
+        assert_eq!(usage["retention"]["max_count"].as_u64(), Some(0));
+        println!("PERIODIC_CHECKPOINT_QUOTA: {usage_body}");
+
+        // Observe a live child, then require the actual ordered shutdown to finish.
         let child = guard.0.as_mut().expect("child still held");
         assert!(
             child.try_wait()?.is_none(),
             "--mode server must still be running after the assertions; it exited early"
         );
-        child.kill()?;
+        let (shutdown_code, shutdown_body) = http(rest_addr, "POST", "/api/control/shutdown")?;
+        assert_eq!(shutdown_code, 200, "{shutdown_body}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while child.try_wait()?.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "graceful memory server shutdown did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let exit = child.wait()?;
+        assert!(exit.success(), "graceful shutdown failed: {exit}");
         guard.0 = None;
 
         let commit = std::env::var("SCRIPTBOTS_GIT_COMMIT")
@@ -1558,13 +1594,15 @@ fn real_process_cli_replay_journal_roundtrip_and_divergence() -> Result<()> {
 #[test]
 #[serial]
 fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
-    let run_dir = tempdir()?;
-    let jsonl_log_path = run_dir.path().join("e2e_events.jsonl");
+    let run_dir = tempdir()?.keep();
+    let artifacts_dir = run_dir.join("artifacts");
+    let jsonl_log_path = run_dir.join("e2e_events.jsonl");
 
     // The cadence is far longer than this run, so the paused world is always between
     // persistence ticks: the checkpoint below must flush the partial tail itself (bd-2mpi).
     let mut child = Command::new(binary())
         .args(["--mode", "server", "--storage", "file"])
+        .args(["--checkpoint-interval", "0", "--checkpoint-max-count", "2"])
         .args([
             "--set",
             &format!("persistence_interval={MID_CADENCE_INTERVAL}"),
@@ -1574,8 +1612,9 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_CONTROL_MCP", "http")
         .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_ARTIFACTS_DIR", &artifacts_dir)
         .env("RUST_LOG", "warn,scriptbots_app=info")
-        .current_dir(run_dir.path())
+        .current_dir(&run_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1978,6 +2017,234 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             chk_json["tick"].as_u64().expect("checkpoint tick")
         );
 
+        // The second real capture uses MCP, sharing the REST service's actual budget.
+        let mcp_checkpoint_request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 90, "method": "tools/call",
+            "params": {"name": "checkpoint_create", "arguments": {
+                "description": "MCP checkpoint é🦀", "idempotency_key": "real-proc-chk-002"
+            }}
+        });
+        let (mcp_checkpoint_code, mcp_checkpoint_body) = http_with_body(
+            mcp_addr,
+            "POST",
+            "/mcp",
+            &serde_json::to_vec(&mcp_checkpoint_request)?,
+            Some("application/json"),
+        )?;
+        assert_eq!(mcp_checkpoint_code, 200, "{mcp_checkpoint_body}");
+        let mcp_checkpoint_result: serde_json::Value = serde_json::from_str(&mcp_checkpoint_body)?;
+        assert!(
+            mcp_checkpoint_result["error"].is_null(),
+            "{mcp_checkpoint_body}"
+        );
+        let mcp_checkpoint: serde_json::Value = serde_json::from_str(
+            mcp_checkpoint_result["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP checkpoint metadata"),
+        )?;
+        let mcp_checkpoint_id = mcp_checkpoint["checkpoint_id"]
+            .as_str()
+            .expect("second identity");
+        assert_ne!(mcp_checkpoint_id, chk_id);
+        assert_eq!(mcp_checkpoint["tick"].as_u64(), Some(chk_tick));
+        let (second_code, second_bytes) = http_with_body_raw(
+            rest_addr,
+            "GET",
+            &format!("/api/v1/artifacts/{mcp_checkpoint_id}/download"),
+            &[],
+            None,
+        )?;
+        assert_eq!(second_code, 200);
+        assert_eq!(
+            scriptbots_app::control::compute_blake3(&second_bytes),
+            mcp_checkpoint["checksum_blake3"]
+                .as_str()
+                .expect("MCP BLAKE3")
+        );
+        assert_eq!(
+            scriptbots_app::control::compute_sha256(&second_bytes),
+            mcp_checkpoint["checksum_sha256"]
+                .as_str()
+                .expect("MCP SHA-256")
+        );
+        assert_eq!(
+            second_bytes, dl_bytes,
+            "paused captures must encode the same scientific boundary"
+        );
+
+        let (usage_code, usage_body) = http(rest_addr, "GET", "/api/v1/checkpoints")?;
+        assert_eq!(usage_code, 200, "{usage_body}");
+        let usage: serde_json::Value = serde_json::from_str(&usage_body)?;
+        let retained_bytes = u64::try_from(dl_bytes.len() + second_bytes.len())?;
+        let retention = &usage["retention"];
+        for field in [
+            "max_count",
+            "file_count",
+            "observed_file_count_high_water",
+            "sql_count",
+            "request_entries",
+        ] {
+            assert_eq!(
+                retention[field].as_u64(),
+                Some(2),
+                "actual {field}: {usage_body}"
+            );
+        }
+        assert_eq!(retention["file_bytes"].as_u64(), Some(retained_bytes));
+        assert_eq!(
+            retention["observed_file_bytes_high_water"].as_u64(),
+            Some(retained_bytes)
+        );
+        assert_eq!(retention["pending_entries"].as_u64(), Some(0));
+        assert_eq!(retention["payload_cache_bytes"].as_u64(), Some(0));
+        assert!(retention["inventory_error"].is_null(), "{usage_body}");
+        assert!(retention["sql_usage_error"].is_null(), "{usage_body}");
+        assert!(
+            retention["sql_bytes"]
+                .as_u64()
+                .expect("actual SQL byte observation")
+                > retained_bytes
+        );
+        assert!(
+            retention["sql_bytes"].as_u64().expect("SQL bytes")
+                <= retention["max_bytes"].as_u64().expect("declared bytes")
+        );
+
+        // Exact retries succeed at capacity, whereas a changed keyed request conflicts.
+        let (retry_code, retry_body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/checkpoints",
+            &serde_json::to_vec(&chk_payload)?,
+            Some("application/json"),
+        )?;
+        assert_eq!(retry_code, 201, "{retry_body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&retry_body)?,
+            chk_json
+        );
+        let changed =
+            serde_json::json!({"description": "changed", "idempotency_key": "real-proc-chk-001"});
+        let (collision_code, collision_body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/v1/checkpoints",
+            &serde_json::to_vec(&changed)?,
+            Some("application/json"),
+        )?;
+        assert_eq!(collision_code, 409, "{collision_body}");
+        let refusals: Vec<_> = (0..4)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    http_with_body(
+                        rest_addr,
+                        "POST",
+                        "/api/v1/checkpoints",
+                        format!("{{\"idempotency_key\":\"exhausted-{index}\"}}").as_bytes(),
+                        Some("application/json"),
+                    )
+                })
+            })
+            .collect();
+        for refusal in refusals {
+            let (code, body) = refusal.join().expect("quota caller joined")?;
+            assert_eq!(code, 507, "{body}");
+            log_event(
+                serde_json::json!({"transport": "rest", "phase": "checkpoint_quota", "code": code, "body": body}),
+            );
+        }
+        let (_, after_body) = http(rest_addr, "GET", "/api/v1/checkpoints")?;
+        let after: serde_json::Value = serde_json::from_str(&after_body)?;
+        assert_eq!(
+            after, usage,
+            "refusals/retry must not add files, rows or metadata"
+        );
+        assert_eq!(
+            std::fs::read_dir(&artifacts_dir)?
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "bin"))
+                .count(),
+            2
+        );
+        log_event(
+            serde_json::json!({"phase": "checkpoint_retention", "usage": after,
+            "rest_checkpoint": chk_json, "mcp_checkpoint": mcp_checkpoint}),
+        );
+        println!("CHECKPOINT_RETENTION_OBSERVED: {after_body}");
+
+        let db = std::fs::read_dir(run_dir.join("runs"))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
+            .ok_or_else(|| anyhow!("server run left no database under runs/"))?;
+        let live_export = Command::new(binary())
+            .arg("--create-bundle")
+            .arg(&db)
+            .arg("--bundle-output")
+            .arg(run_dir.join("live-export-refused"))
+            .output()?;
+        println!(
+            "LIVE_EXPORT_REFUSAL: {}\n{}",
+            live_export.status,
+            String::from_utf8_lossy(&live_export.stderr)
+        );
+        assert!(
+            !live_export.status.success(),
+            "live writer export must be refused"
+        );
+        assert!(
+            String::from_utf8_lossy(&live_export.stderr).contains("OS lease"),
+            "live export must fail for the real writer lease: {}",
+            String::from_utf8_lossy(&live_export.stderr)
+        );
+        assert!(
+            !run_dir.join("live-export-refused").exists(),
+            "refusal must precede destination creation"
+        );
+
+        let (status_code, status_body) = http(rest_addr, "GET", "/api/status")?;
+        assert_eq!(
+            status_code, 200,
+            "controls/status remain available at exhaustion: {status_body}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status_body)?["tick"].as_u64(),
+            Some(chk_tick)
+        );
+        let (step_code, step_body) = http_with_body(
+            rest_addr,
+            "POST",
+            "/api/control/step",
+            b"{\"count\":1}",
+            Some("application/json"),
+        )?;
+        assert_eq!(
+            step_code, 200,
+            "science step at checkpoint exhaustion: {step_body}"
+        );
+        let step_id = json_str(&step_body, "command_id").expect("step identity");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (code, body) = http(rest_addr, "GET", &format!("/api/control/status/{step_id}"))?;
+            if code == 200 && json_str(&body, "application_state").as_deref() == Some("applied") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "science step never applied at exhaustion: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (_, advanced_body) = http(rest_addr, "GET", "/api/status")?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&advanced_body)?["tick"].as_u64(),
+            Some(chk_tick + 1),
+            "science must advance exactly once at exhaustion"
+        );
+        println!("QUOTA_SCIENCE_ADVANCE: {advanced_body}");
+
         // --- 6. Shutdown and Cleanup Verification ---
         let (shut_code, _) = http(rest_addr, "POST", "/api/control/shutdown")?;
         assert_eq!(shut_code, 200);
@@ -1986,7 +2253,8 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         let wait_deadline = Instant::now() + Duration::from_secs(15);
         let mut exited = false;
         while Instant::now() < wait_deadline {
-            if child.try_wait()?.is_some() {
+            if let Some(exit) = child.try_wait()? {
+                assert!(exit.success(), "ordered shutdown failed: {exit}");
                 exited = true;
                 break;
             }
@@ -2002,10 +2270,6 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         // The flush cut an off-cadence batch and replay ordinals are batch-relative, so this
         // fails unless replay mirrors the recorded boundaries; the shutdown tail carries the
         // final digest, so it is not vacuous either.
-        let db = std::fs::read_dir(run_dir.path().join("runs"))?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
-            .ok_or_else(|| anyhow!("server run left no database under runs/"))?;
         let replay = Command::new(binary())
             .arg("--replay-db")
             .arg(&db)
@@ -2015,7 +2279,7 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
                 &format!("persistence_interval={MID_CADENCE_INTERVAL}"),
             ])
             .env("RUST_LOG", "warn")
-            .current_dir(run_dir.path())
+            .current_dir(&run_dir)
             .output()?;
         let replay_stdout = String::from_utf8_lossy(&replay.stdout);
         assert!(
@@ -2025,16 +2289,111 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             String::from_utf8_lossy(&replay.stderr)
         );
 
+        // Independent readers and separate CLI processes join API identities to durable rows.
+        let reader = scriptbots_storage::StorageReader::open_finished(&db.to_string_lossy())?;
+        let checkpoints = reader.load_checkpoints()?;
+        assert_eq!(checkpoints.len(), 2);
+        for (id, bytes) in [
+            (chk_id.as_str(), &dl_bytes),
+            (mcp_checkpoint_id, &second_bytes),
+        ] {
+            let row = checkpoints
+                .iter()
+                .find(|row| row.checkpoint_id == id)
+                .expect("API checkpoint identity must exist in durable SQL");
+            assert_eq!(row.world_checkpoint()?.encode()?, *bytes);
+        }
+        let sql_bytes = checkpoints.iter().try_fold(0_u64, |total, row| {
+            u64::try_from(
+                row.checkpoint_id.len()
+                    + row.format.len()
+                    + row.payload.len()
+                    + row.payload_digest.len()
+                    + row.metadata_json.len(),
+            )
+            .map(|bytes| total + bytes)
+        })?;
+        assert_eq!(retention["sql_bytes"].as_u64(), Some(sql_bytes));
+        let manifest = reader.run_manifest()?;
+        let watermarks = reader.persistence_watermarks()?;
+        assert!(watermarks.admitted.is_some(), "nonempty production outbox");
+        assert_eq!(watermarks.admitted, watermarks.applied);
+        assert_eq!(watermarks.applied, watermarks.durable);
+        let events = reader.load_replay_events()?;
+        let ledger = reader.run_ledger_summary()?;
+        assert!(ledger.tick_count > 0);
+        assert!(!events.is_empty());
+        reader.close()?;
+        let bundle_dir = run_dir.join("finished-bundle");
+        let exported = Command::new(binary())
+            .arg("--create-bundle")
+            .arg(&db)
+            .arg("--bundle-output")
+            .arg(&bundle_dir)
+            .output()?;
+        println!(
+            "FINISHED_BUNDLE_CREATE: {}\n{}\n{}",
+            exported.status,
+            String::from_utf8_lossy(&exported.stdout),
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        assert!(exported.status.success(), "finished export must succeed");
+        let verified = Command::new(binary())
+            .arg("--verify-bundle")
+            .arg(&bundle_dir)
+            .output()?;
+        println!(
+            "FINISHED_BUNDLE_VERIFY: {}\n{}\n{}",
+            verified.status,
+            String::from_utf8_lossy(&verified.stdout),
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        assert!(
+            verified.status.success(),
+            "separate bundle verification must succeed"
+        );
+        let copied = scriptbots_storage::StorageReader::open_finished(
+            &bundle_dir.join("run.db").to_string_lossy(),
+        )?;
+        assert_eq!(copied.run_manifest()?, manifest);
+        assert_eq!(copied.load_checkpoints()?, checkpoints);
+        assert_eq!(copied.load_replay_events()?, events);
+        assert_eq!(copied.persistence_watermarks()?, watermarks);
+        assert_eq!(copied.run_ledger_summary()?.tick_count, ledger.tick_count);
+        copied.close()?;
+        let bundle: scriptbots_storage::bundle::RunBundleV1 =
+            serde_json::from_slice(&std::fs::read(bundle_dir.join("bundle_manifest.json"))?)?;
+        assert_eq!(bundle.manifest, manifest);
+        assert_eq!(
+            bundle.digests.checkpoint_count,
+            u64::try_from(checkpoints.len())?
+        );
+        assert_eq!(bundle.digests.event_count, u64::try_from(events.len())?);
+        assert_eq!(
+            bundle.digests.persistence_watermarks,
+            Some(scriptbots_storage::bundle::RunBundleWatermarks::from(
+                watermarks
+            ))
+        );
+        log_event(
+            serde_json::json!({"phase": "durable_bundle_readback", "run": manifest.run_id,
+            "watermarks": watermarks, "checkpoint_count": checkpoints.len(),
+            "sql_bytes": sql_bytes, "event_count": events.len(), "tick_count": ledger.tick_count,
+            "bundle": bundle_dir}),
+        );
+
         let commit =
             std::env::var("SCRIPTBOTS_GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string());
         println!(
             "{{\"schema\":\"scriptbots.e2e-experiment-checkpoint-artifact.v1\",\
              \"status\":\"pass\",\"binary\":\"{}\",\"mode\":\"server\",\"storage\":\"file\",\
-             \"tools_count\":{},\"experiments_count\":1,\"checkpoints_count\":1,\"artifacts_count\":1,\
+             \"tools_count\":{},\"experiments_count\":1,\"checkpoints_count\":{},\"artifacts_count\":{},\
              \"injected_faults_handled\":5,\"checksums_verified\":true,\"cleanup_verified\":true,\
              \"source_commit\":\"{}\"}}",
             binary().display(),
             tools.len(),
+            checkpoints.len(),
+            usize::try_from(retention["file_count"].as_u64().expect("retained count"))?,
             commit
         );
 

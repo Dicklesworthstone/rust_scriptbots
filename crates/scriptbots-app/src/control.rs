@@ -3702,6 +3702,92 @@ pub(crate) mod tests {
             .expect("ordinary storage shutdown succeeds");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_file_reservation_failure_preserves_capacity_and_allows_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("checkpoint directory").keep();
+        let (handle, _host) = checkpoint_test_handle(&directory, 1, 1024 * 1024);
+        let original = fs::metadata(&directory)
+            .expect("directory metadata")
+            .permissions();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o500))
+            .expect("make actual file creation unavailable");
+        let request = CheckpointCreateRequest {
+            idempotency_key: Some("reservation-retry".to_owned()),
+            description: None,
+        };
+        let refused = handle.create_checkpoint(request.clone());
+        fs::set_permissions(&directory, original).expect("restore fixture directory access");
+        assert!(matches!(
+            refused,
+            Err(ControlError::CheckpointRetentionUnavailable(_))
+        ));
+        let usage = handle
+            .checkpoint_retention_usage()
+            .expect("failed-create observation");
+        assert_eq!(usage.file_count, 0);
+        assert_eq!(usage.file_bytes, 0);
+        assert_eq!(usage.request_entries, 0);
+        assert_eq!(
+            handle
+                .list_checkpoints(None, None)
+                .expect("no published success")
+                .total,
+            0
+        );
+        let accepted = handle
+            .create_checkpoint(request)
+            .expect("retry after file access restored");
+        let (_, bytes) = handle
+            .read_artifact_bytes(&accepted.checkpoint_id)
+            .expect("real file readback");
+        assert_eq!(compute_blake3(&bytes), accepted.checksum_blake3);
+        assert_eq!(
+            handle
+                .checkpoint_retention_usage()
+                .expect("actual capacity")
+                .file_count,
+            1
+        );
+    }
+
+    #[test]
+    fn checkpoint_oversized_retained_file_is_refused_before_download_and_kept_in_inventory() {
+        let directory = tempfile::tempdir().expect("checkpoint directory").keep();
+        let path = directory.join("oversized.bin");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("reserve real oversized artifact");
+        let bytes = u64::try_from(MAX_ARTIFACT_DOWNLOAD_BYTES).expect("declared byte limit") + 1;
+        file.set_len(bytes)
+            .expect("sparse artifact above the actual read bound");
+        file.sync_all().expect("retained fixture sync");
+        drop(file);
+        assert!(matches!(
+            read_artifact_file_bounded(&path),
+            Err(ControlError::PayloadTooLarge(_))
+        ));
+        let (handle, _host) = checkpoint_test_handle(&directory, 2, bytes - 1);
+        let usage = handle
+            .checkpoint_retention_usage()
+            .expect("historical occupancy");
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(usage.file_bytes, bytes);
+        assert_eq!(usage.request_entries, 0);
+        assert!(matches!(
+            handle.create_checkpoint(CheckpointCreateRequest::default()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        assert_eq!(
+            fs::metadata(&path).expect("refused artifact remains").len(),
+            bytes
+        );
+    }
+
     fn read_status_before_releasing_owner(
         handle: ControlHandle,
         owner: MutexGuard<'_, ()>,
