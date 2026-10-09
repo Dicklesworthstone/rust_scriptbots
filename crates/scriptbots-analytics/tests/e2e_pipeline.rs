@@ -987,7 +987,10 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
         "the seeded run must produce deaths to be non-vacuous"
     );
 
-    let cx = ReaderCtx::open(&run_db).expect("open real run");
+    let run_id = {
+        let cx = ReaderCtx::open(&run_db).expect("open real run");
+        cx.reader.run_id().to_string()
+    };
     let registry = Registry::builtin();
     let mut summary = None;
     let mut report_evidence = Vec::new();
@@ -1006,9 +1009,13 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
             .expect("narrative params"),
             _ => ReportParams::default(),
         };
+        let cx = ReaderCtx::open(&run_db).expect("open real run for report");
         let output = registry
             .run(name, &cx, &params)
             .unwrap_or_else(|error| panic!("report '{name}' failed on a real run: {error}"));
+        // Finished readers hold the OS lease too. Release this owner before the CLI
+        // independently opens the same database; never bypass its lease contract.
+        drop(cx);
         assert_eq!(
             output.latest_tick,
             Some(ticks),
@@ -1125,8 +1132,7 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
             .query_row(&format!("SELECT COUNT(*) FROM {sql_table}"))
             .expect("SQL count");
         let sql_count: i64 = row.get_typed(0).expect("SQL count integer");
-        let parquet_path =
-            export_dir.join(format!("{}_{artifact_name}.parquet", cx.reader.run_id()));
+        let parquet_path = export_dir.join(format!("{run_id}_{artifact_name}.parquet"));
         let parquet = read_parquet_batch(&parquet_path).expect("read CLI Parquet artifact");
         assert_eq!(
             i64::try_from(parquet.num_rows()).expect("row count fits"),
@@ -1197,7 +1203,7 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
         "compiler_identity": option_env!("SCRIPTBOTS_RUSTC_VV"),
         "status": "pass",
         "retained_root": temp_dir,
-        "run_id": cx.reader.run_id().to_string(),
+        "run_id": run_id,
         "database": run_db,
         "database_blake3": blake3::hash(&fs::read(&run_db).expect("finished DB bytes")).to_hex().to_string(),
         "comparison_database": treatment_db,
