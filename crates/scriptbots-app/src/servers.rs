@@ -406,6 +406,12 @@ impl ControlHttpPolicy {
                 .iter()
                 .map(|authority| format!("http://{authority}")),
         );
+        info!(
+            address = %address,
+            allowed_authorities = ?authorities,
+            allowed_origins = ?origins,
+            "Resolved control HTTP request targeting policy"
+        );
         Self {
             authorities,
             origins,

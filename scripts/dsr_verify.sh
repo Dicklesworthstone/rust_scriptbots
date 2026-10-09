@@ -61,6 +61,25 @@ verify_evidence() {
     done
     [[ $(head -n 1 "$directory/source.txt") == "commit $expected" ]] || refuse "source record mismatch"
     [[ $(sed -n 's/^host: //p' "$directory/rustc.txt") == "$target" ]] || refuse "compiler target mismatch"
+    if [[ "$lane" == connectivity ]]; then
+        jq -R -s -e --arg source "$expected" --rawfile compiler "$directory/rustc.txt" '
+            split("\n") | map(fromjson? | select(.schema == "scriptbots.real-process-e2e.v3"
+                or .schema == "scriptbots.e2e-experiment-checkpoint-artifact.v2"))
+            | length == 2 and ([.[].schema] | unique | length) == 2
+            and all(.[]; .source_commit == $source and .compiler_identity == ($compiler | rtrimstr("\n"))
+                and .ordered_shutdown_exit_code == 0 and .tools_count > 0)
+            and all(.[] | select(.schema == "scriptbots.real-process-e2e.v3");
+                .application_state == "applied" and .proved_level == "applied"
+                and .status_code == 200 and .pause_code == 200 and .screenshot_code == 409)
+            and all(.[] | select(.schema == "scriptbots.e2e-experiment-checkpoint-artifact.v2");
+                .status == "pass" and .experiments_count > 0 and .checkpoints_count > 0
+                and .checkpoints_count == .artifacts_count and .checksums_verified == true
+                and .watermarks.admitted > 0 and .watermarks.admitted == .watermarks.applied
+                and .watermarks.applied == .watermarks.durable
+                and .injected_faults_handled == (.fault_observations | length)
+                and ([.fault_observations[][0]] | sort) == ["artifact_path_traversal", "empty_variants", "missing_artifact", "missing_experiment", "unknown_brain_family"])
+        ' "$directory/control-process-tests.log" >/dev/null || refuse "missing source-bound process and durable bundle observations"
+    fi
     if [[ "$lane" == tournament-smoke || "$lane" == tournament-full || "$lane" == tournament-smoke-and-analytics ]]; then
         local tournament_mode=smoke
         [[ "$lane" != tournament-full ]] || tournament_mode=full

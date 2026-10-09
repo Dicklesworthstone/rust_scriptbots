@@ -622,6 +622,20 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         );
 
         // Both actual listeners enforce request targeting before command/body admission.
+        {
+            let logs = server_log.lock().expect("actual listener policy logs");
+            for listener in [rest_addr, mcp_addr] {
+                assert!(
+                    logs.iter().any(|line| {
+                        line.contains("Resolved control HTTP request targeting policy")
+                            && line.contains(&listener.to_string())
+                            && line.contains("lab.example:8080")
+                            && line.contains("https://lab.example")
+                    }),
+                    "missing resolved policy log for actual listener {listener}"
+                );
+            }
+        }
         let authority = rest_addr.to_string();
         let own_origin = format!("http://{authority}");
         let (_, before_checkpoints) = http(rest_addr, "GET", "/api/v1/checkpoints")?;
@@ -1352,39 +1366,20 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         assert!(exit.success(), "graceful shutdown failed: {exit}");
         guard.0 = None;
 
-        let commit = std::env::var("SCRIPTBOTS_GIT_COMMIT")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                Command::new("git")
-                    .current_dir(env!("CARGO_MANIFEST_DIR"))
-                    .args(["rev-parse", "HEAD"])
-                    .output()
-                    .ok()
-                    .and_then(|out| {
-                        if out.status.success() {
-                            String::from_utf8(out.stdout).ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            })
-            .unwrap_or_else(|| "unknown".to_string());
         println!(
-            "{{\"schema\":\"scriptbots.real-process-e2e.v2\",\"binary\":\"{}\",\"mode\":\"server\",\
-         \"storage\":\"memory\",\"rest_address\":\"{rest_addr}\",\"mcp_address\":\"{mcp_addr}\",\
-         \"boot_log_lines\":{},\"status_code\":{status_code},\"pause_code\":{pause_code},\
-         \"pause_id\":\"{pause_id}\",\"step_id\":\"{step_id}\",\"resume_id\":\"{resume_id}\",\
-         \"application_state\":\"applied\",\"journal_state\":\"{journal_state}\",\
-         \"proved_level\":\"applied\",\"screenshot_code\":{shot_code},\
-         \"tools_count\":{},\"child_exit\":\"{}\",\"source_commit\":\"{commit}\"}}",
-            binary().display(),
-            server_log.lock().map_or(0, |l| l.len()),
-            tools.len(),
-            exit.code()
-                .map_or_else(|| "signalled".to_string(), |code| code.to_string()),
+            "{}",
+            serde_json::json!({
+                "schema": "scriptbots.real-process-e2e.v3", "binary": binary(),
+                "mode": "server", "storage": "memory", "rest_address": rest_addr,
+                "mcp_address": mcp_addr, "boot_log_lines": server_log.lock().expect("retained boot log").len(),
+                "status_code": status_code, "pause_code": pause_code, "pause_id": pause_id,
+                "step_id": step_id, "resume_id": resume_id, "application_state": "applied",
+                "journal_state": journal_state, "proved_level": "applied", "screenshot_code": shot_code,
+                "tools_count": tools.len(), "ordered_shutdown_exit_code": exit.code(),
+                "source_commit": option_env!("SCRIPTBOTS_SOURCE_REVISION"),
+                "compiler_identity": option_env!("SCRIPTBOTS_RUSTC_VV"),
+                "retained_root": run_dir,
+            })
         );
 
         Ok(())
@@ -2040,8 +2035,17 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         assert_eq!(mcp_res_code, 200);
 
         // List experiments
-        let (exp_list_code, _) = http(rest_addr, "GET", "/api/v1/experiments?limit=10")?;
+        let (exp_list_code, exp_list_body) =
+            http(rest_addr, "GET", "/api/v1/experiments?limit=10")?;
         assert_eq!(exp_list_code, 200);
+        let experiment_list: serde_json::Value = serde_json::from_str(&exp_list_body)?;
+        let experiments_count = experiment_list["total"]
+            .as_u64()
+            .expect("observed experiment count");
+        assert_eq!(
+            experiments_count, 1,
+            "the actual created experiment is listed"
+        );
 
         // --- 5. Checkpoint and Artifact Lifecycle ---
         // A checkpoint is a real core capture: the owner answers it only at a quiescent
@@ -2425,8 +2429,9 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         if !exited {
             let _ = child.kill();
         }
-        let _ = child.wait();
+        let shutdown_exit = child.wait()?;
         assert!(exited, "server did not finish its ordered shutdown");
+        assert!(shutdown_exit.success(), "ordered shutdown: {shutdown_exit}");
 
         // --- 7. The run, paused-checkpoint flush included, replays exactly ---
         // The flush cut an off-cadence batch and replay ordinals are batch-relative, so this
@@ -2545,19 +2550,30 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
             "bundle": bundle_dir}),
         );
 
-        let commit =
-            std::env::var("SCRIPTBOTS_GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+        let persisted_manifest: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;
+        let persisted_source = persisted_manifest["build"]["source_revision"].as_str();
+        assert_eq!(persisted_source, option_env!("SCRIPTBOTS_SOURCE_REVISION"));
+        let fault_observations = [
+            ("empty_variants", bad_var_code),
+            ("unknown_brain_family", bad_brain_code),
+            ("missing_experiment", not_found_code),
+            ("artifact_path_traversal", trav_code),
+            ("missing_artifact", missing_art_code),
+        ];
         println!(
-            "{{\"schema\":\"scriptbots.e2e-experiment-checkpoint-artifact.v1\",\
-             \"status\":\"pass\",\"binary\":\"{}\",\"mode\":\"server\",\"storage\":\"file\",\
-             \"tools_count\":{},\"experiments_count\":1,\"checkpoints_count\":{},\"artifacts_count\":{},\
-             \"injected_faults_handled\":5,\"checksums_verified\":true,\"cleanup_verified\":true,\
-             \"source_commit\":\"{}\"}}",
-            binary().display(),
-            tools.len(),
-            checkpoints.len(),
-            usize::try_from(retention["file_count"].as_u64().expect("retained count"))?,
-            commit
+            "{}",
+            serde_json::json!({
+                "schema": "scriptbots.e2e-experiment-checkpoint-artifact.v2",
+                "status": "pass", "binary": binary(), "mode": "server", "storage": "file",
+                "tools_count": tools.len(), "experiments_count": experiments_count,
+                "checkpoints_count": checkpoints.len(), "artifacts_count": retention["file_count"],
+                "injected_faults_handled": fault_observations.len(), "fault_observations": fault_observations,
+                "checksums_verified": true, "ordered_shutdown_exit_code": shutdown_exit.code(),
+                "source_commit": persisted_source, "compiler_identity": option_env!("SCRIPTBOTS_RUSTC_VV"),
+                "retained_root": run_dir, "run_id": manifest.run_id,
+                "watermarks": scriptbots_storage::bundle::RunBundleWatermarks::from(watermarks),
+                "bundle_directory": bundle_dir,
+            })
         );
 
         Ok(())
