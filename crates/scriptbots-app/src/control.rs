@@ -3861,6 +3861,67 @@ pub(crate) mod tests {
         pipeline.shutdown().expect("normal ordered owner shutdown");
     }
 
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn checkpoint_capture_refusal_for_a_real_legacy_brain_consumes_no_retention() {
+        let directory = tempfile::tempdir().expect("checkpoint directory").keep();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(43),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("real world");
+        let key = scriptbots_brain_neuro::NeuroflowBrain::register(
+            &mut world,
+            scriptbots_brain_neuro::NeuroflowBrainConfig::default(),
+        )
+        .expect("register real non-restorable brain");
+        let agent = world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("founder");
+        assert!(
+            world
+                .bind_agent_brain(agent, key)
+                .expect("bind actual brain")
+        );
+        let host = TestHost::spawn(world);
+        let mut handle = host.handle();
+        handle.data_services = Arc::new(DataServices::new(directory.clone()));
+        let request = CheckpointCreateRequest {
+            idempotency_key: Some("legacy-refusal".to_owned()),
+            description: None,
+        };
+        for _ in 0..2 {
+            let error = handle
+                .create_checkpoint(request.clone())
+                .expect_err("unsupported checkpoint");
+            assert!(matches!(error, ControlError::Host(_)));
+            assert!(error.to_string().contains("legacy brain"));
+            let usage = handle
+                .checkpoint_retention_usage()
+                .expect("observed retention");
+            assert_eq!(usage.file_count, 0);
+            assert_eq!(usage.file_bytes, 0);
+            assert_eq!(usage.request_entries, 0);
+            assert_eq!(usage.pending_entries, 0);
+            assert_eq!(
+                handle.list_checkpoints(None, None).expect("metadata").total,
+                0
+            );
+        }
+        assert!(
+            fs::read_dir(&directory)
+                .expect("preserved directory")
+                .next()
+                .is_none()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn checkpoint_file_reservation_failure_preserves_capacity_and_allows_retry() {
