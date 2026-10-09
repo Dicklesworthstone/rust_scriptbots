@@ -131,8 +131,11 @@ were recovered by safe fast-forward, and isolated source/evidence copies remain 
     returns quota errors; that is not a retained errno from the publication command.
     The original matrix, tick count, founders and four CLI runs remain unchanged.
     The persistent `ae3894e3` retry builds the actual CLI and starts the original
-    full 96-match plan at 10:15:12 UTC. At this update no completed match rows are
-    observed; real execution is active, not publication acceptance.
+    full 96-match plan at 10:15:12 UTC. That attempt subsequently times out at its
+    actual 3,600-second coordinator limit, despite the profile's unused 7,200-second
+    declaration. Native exit is 5 and outer DSR is failed/6; no completed match rows,
+    second CLI invocation or typed inner verdict are retained. The original protocol
+    is unchanged. The separate launcher fix below does not alter this failed result.
   - [ ] Commit the generated full leaderboard beside actual raw rows and ratings, with provenance.
   - [x] Connect bounded smoke/analytics to the existing CI workflow.
   - [ ] Provide and execute the original full nightly publication lane on an available controller.
@@ -186,13 +189,24 @@ were recovered by safe fast-forward, and isolated source/evidence copies remain 
     Clippy pass. The real analytics test fails at treatment tick 351 on the unchanged
     120-second admission acknowledgement deadline, typed `Indeterminate`. The worker
     is observed waiting on filesystem I/O amid high host I/O pressure; causation is
-    not established. The fixture is still executing; economy-faults has not run.
+    not established. The run subsequently times out at its actual 7,200-second
+    coordinator limit: native timeout/5 and outer failed/6. After the owned test
+    process is stopped, the EXIT trap records typed inner failed/1, seven completed
+    common steps; the earlier observation of absent verdict was temporary.
+    The fixture does not finish; later workspace tests and economy-faults do not run.
+    The coordinator leaves its owned test process alive; its binary, UID and start
+    time are checked before pidfd-bound SIGTERM at 10:43:51.847041 UTC. The process
+    is subsequently absent. All 62 archived regular files match their remote bytes
+    by SHA256; this preserves a failed attempt, not a durability/science proof.
     Neither failed setup is a workspace test result; no performance result is claimed.
   - [x] Configure project DSR launchers to retain temporary stages (`ba90679d`), with shell checks.
   - [x] Recover and validate canonical JSONL/Beads after the observed external checkout resets.
     Isolated rebuild observes 716 tasks and all six active owners/comments; ordinary BR
     merge has zero conflicts/deletions and cycles stay empty. Existing doctor warnings remain.
-  - [ ] Preserve the full twenty-question honesty inventory and final positive/negative evidence.
+  - [x] Preserve the full twenty-question honesty inventory and final positive/negative evidence.
+    The existing reality-check report links the complete solo inventory. Its bounded
+    recent-work audit is DRIFTING: freeze further launcher/profile/gate variants and
+    focus the next capability block on persistence reliability and production resume.
   - [ ] Resolve the DSR dependency-link compatibility blocker with its original cache protections.
     The installed DSR explicitly refuses symlinks; Cargo recreates a tracked contained
     README link at immutable Proptest revision `3dca1987`. No dependency pin, source or
@@ -215,11 +229,51 @@ were recovered by safe fast-forward, and isolated source/evidence copies remain 
   - [x] Capture new proof attempts under `/data/tmp/scriptbots-proof-followup-20261009`.
     `/tmp` returns per-user quota errors despite free filesystem capacity. Preserve old
     attempts; new paths and capture failures do not change the original acceptance gates.
-  - [ ] Copy/hash final proof onto persistent storage, preserving failed attempts and raw logs.
-  - [ ] Commit code, tracker and reports separately through reviewed frozen trees.
+  - [x] `bd-build-farm-reliability-lb19.5` [Completed — launcher input only]: bind an
+    optional declared orchestration timeout to the actual DSR coordinator, preserving
+    the caller/default when omitted. At clean `5ab863fb`, actual native ancestry
+    observes the declared 7,201 seconds instead of the caller's 7,301; omission
+    observes 7,301. Seven actual invalid declarations refuse/2 before build work.
+    Bash/ShellCheck pass. Both native recipes deliberately stop/42 before Cargo or
+    collection, and outer DSR failed/6 is retained. Original-criterion solo
+    qualification and hashes are retained in `deadline-preflight/observations.json`
+    and `deadline-input-20261009-5ab863fb/qualification.json`; the distinct defect
+    closes at 10:49:37 UTC.
+    No prior failed run, application deadline or original acceptance criterion changes.
+  - [x] Explicitly execute the two original 600-second file/memory server regressions.
+    A separate pinned `ae3894e3` native diagnostic executes them with unchanged
+    commands and progress bounds. Its scope is these named original tests only;
+    the profile's generic lane field does not qualify it as a workspace run.
+    The file test passes after 600,576 ms, with 591 observations and tick 0 → 2,959.
+    Its status samples include 549 blocked and 42 healthy observations, all HTTP 200;
+    passing continued progress does not qualify persistence throughput.
+    The original test kills/reaps its child; this proves progress, not graceful
+    shutdown or final durable receipts. Memory passes after 600,916 ms, with 596
+    observations and tick 10 → 801, including 581 blocked and 15 healthy HTTP-200
+    status samples. Both original tests pass in 1,201.50s; the third Assembly-fault
+    regression is unrun. Its custom progress verdict passes; outer DSR subsequently
+    fails/6 after final cache refusal/4 on the same Proptest README link. No original
+    reliability owner closes on these two progress observations.
+  - [x] Copy/hash this block's completed proof onto persistent storage, preserving failed attempts.
+    `implementation-attempts-final-1112.tar` is 216,422,400 bytes, SHA256
+    `dbae4ad72f7ef1b3dd48bedc610a56e402125df059707e947257f0013d46adc6`.
+    All 1,044 original regular-file paths match archived bytes; two symlink targets
+    and the intentional bundle hardlink are preserved. The first archive reader
+    wrongly rejected that hardlink; correcting the reader changes no archived bytes.
+    The inventory names exclusions and 42 retained coordinator runs. This is failure/
+    evidence preservation, not a collected Rust artifact or aggregate acceptance.
+  - [x] Commit code, tracker and reports separately through reviewed frozen trees.
+    Code/input fixes and tracker observations are local main commits; this report
+    refresh is the separate final documentation candidate, with every changed hunk read.
   - [ ] Synchronize main/remotes only after required acceptance, without force or hook bypass.
-  - [ ] Re-triage authoritative ready work and continue host/replay/frontend dependencies in order.
-    The latest ready view still includes hardware rendering, host/frontend continuation,
+    Final Rust collection and unchanged whole-workspace acceptance remain non-pass;
+    implementation is local and unreleased.
+  - [x] Re-triage authoritative ready work after the runtime attempts.
+    BR observes 718 total issues, 117 open, 21 in progress, 580 closed, 81 blocked and
+    39 ready; cycles remain empty. BV's first recommendation is P0 native GPU evidence;
+    its broader graph-actionable set does not authorize claims beyond BR readiness.
+  - [ ] Continue persistence reliability and host/replay/frontend dependencies in order.
+    The ready view still includes hardware rendering, host/frontend continuation,
     core population explosion and storage scan costs. Persistence retries already have
     real runtime/application callers; no unwired-retry defect is claimed.
 

@@ -10,7 +10,8 @@ remain in progress. The composed journey retains its blocking dependencies.
 
 At this update, production diagnostics extend through `ae3894e3`; the analytics reader-lifetime
 fix is `5f68228e` and the database-scoped identity gate correction is `d07ecd36`.
-`323a448b` subsequently binds an optional profile seed cache in the DSR launcher.
+`323a448b` subsequently binds an optional profile seed cache in the DSR launcher;
+`5ab863fb` binds its optional coordinator timeout while preserving an omitted field.
 These are committed local changes, not a pushed or released product.
 Every correctness execution uses a clean pinned main clone and a unique DSR profile/version
 with `--no-sync`. No performance number or whole-product acceptance is claimed.
@@ -33,10 +34,21 @@ The next setup attempt fails on the global SBH catalog's permissions before comp
 The current `b49012c8` retry stages exact source/profile bytes and preserves protection through
 a private writable copy of the existing configuration/catalog. Workspace check and strict
 Clippy pass. The real analytics test fails at treatment tick 351 on a 120-second
-admission acknowledgement timeout, typed `Indeterminate`; the fixture is still executing.
+admission acknowledgement timeout, typed `Indeterminate`. The unchanged run then times
+out at its actual 7,200-second coordinator limit: native timeout/5 and outer failed/6.
+After its owned test is stopped, the EXIT trap records typed inner failed/1 with seven
+completed common steps. The earlier absent-verdict observation is superseded by these
+preserved bytes. The fixture does not finish, and later workspace tests do not run.
 Read-only thread states observe filesystem I/O waits and host I/O pressure is high, but
 the cause of the timeout is unestablished. Economy-faults has not executed. Neither setup
 failure is a test result, and this actual test failure is retained rather than relabeled.
+The coordinator leaves its owned analytics test process alive. Its exact binary, UID
+and start time are checked before pidfd-bound SIGTERM at 10:43:51.847041 UTC; it is
+subsequently absent. The partial failed proof is preserved in the 202,823,680-byte
+`hz3-failed-workspace-20261009-b49012c8.tar` (SHA256
+`f7b15b512d380fe2ea3bff1e51557d8912cc132757cb8d8796ff27f5740d9dcd`). All 62 archived
+regular files match current remote bytes, with zero missing/changed/extra files.
+This establishes preservation of the failure, not scientific/durable certification.
 The full `5f68228e` publication attempt fails after CLI compilation: command and output-capture
 exit codes are both 1, no full CLI invocations or matches are observed, and its raw failure is
 retained. Separately observed `/tmp` quota errors explain the move to persistent proof storage;
@@ -70,14 +82,49 @@ Both legacy wrapper entry points accept the unchanged retained connectivity evid
 separate DSR readback (`ae3894e3` artifacts, `323a448b` verifier). Its recipe succeeds and
 release packaging then fails; a diagnostic-mode attempt refuses the absent strict release
 contract before execution. Both failures remain retained, without a release claim. The
-persistent full tournament retry has built the actual optimized CLI and started the original
-96-match plan at 10:15:12 UTC; no completed matches are observed at this update.
+persistent full tournament retry builds the actual optimized CLI and starts the original
+96-match plan at 10:15:12 UTC, then times out at the actual 3,600-second coordinator
+limit. The profile's 7,200-second declaration had no launcher consumer. No completed
+match row, second CLI invocation or typed inner verdict is retained; native timeout/5
+and outer failed/6 remain failures. The protocol, tick count and cohorts are unchanged.
+
+`5ab863fb` repairs that distinct launcher input defect. Actual native probes observe
+the profile's 7,201-second timeout despite a different 7,301-second caller, and preserve
+7,301 when the field is omitted. All seven invalid declarations refuse/2 before build
+work. Bash/ShellCheck pass. These recipes deliberately stop/42 before Cargo/collection;
+their outer failed/6 is expected and cannot certify a product suite. The distinct `.5`
+Bead closes after solo original-criterion re-execution, with exact inputs/logs/hashes.
+The earlier tournament timeout remains a failed result; no application bound is widened.
+
+The original two 600-second file/memory server regressions run unchanged in a separate
+pinned `ae3894e3` DSR diagnostic. The file test passes after 600,576 ms, observing
+591 samples and tick 0 → 2,959. Of those status samples, 549 report blocked health
+and 42 healthy; all HTTP observations are 200. This is observed backpressure, not
+an acceptable-throughput claim. Memory passes after 600,916 ms, observing 596 samples
+and tick 10 → 801, with 581 blocked and 15 healthy HTTP-200 status samples. Both
+named tests pass in 1,201.50s; the third Assembly-fault test is unrun. The custom
+two-test progress verdict passes; outer DSR subsequently fails/6 on the same final
+cache refusal/4. The existing test
+kills/reaps the child, so progress does not establish graceful shutdown or final durable
+receipts. This diagnostic is not a workspace pass; `bd-w1oi` retains its original owner
+and unresolved analytics failure.
 
 The inactive attempts through 09:45 UTC are retained in
 `/data/tmp/scriptbots-proof-followup-20261009/implementation-attempts-through-0945.tar`.
 All 5,102 archived regular files match their originals by SHA256. The inventory explicitly
 excludes source clones, the empty cache and the active remote launch log; this is preservation
 of those attempts, not a final aggregate acceptance or a new capability.
+
+The completed follow-up observations/profiles/raw logs and 42 coordinator runs are
+preserved in `implementation-attempts-final-1112.tar` under the same persistent root:
+216,422,400 bytes, SHA256
+`dbae4ad72f7ef1b3dd48bedc610a56e402125df059707e947257f0013d46adc6`. Readback matches
+all 1,044 original regular-file paths and retains two symlink targets plus the intentional
+bundle hardlink. The initial archive-reader assertion wrongly rejected that hardlink;
+the corrected reader changes no archive bytes and verifies its content through the link.
+Source clones, dependency caches/targets and earlier tar archives are excluded explicitly;
+their prior inventories/digests remain retained. This establishes byte preservation at
+the capture boundary, not product acceptance. No further launcher/gate variants were added.
 
 Two external shared-checkout resets to `origin/main` are observed in the reflog at 07:40:19
 and 07:46:41 UTC; the issuer is unidentified. Implementation commits were recovered by safe
@@ -93,29 +140,33 @@ This is a solo review of actual diffs, original criteria, retained commands, cur
 and bounded reflog; it is not independent author verification. The full external worksheet
 is `/data/tmp/scriptbots-proof-followup-20261009/honesty-inventory-implementation.md`.
 Older-session checks read six contextual CASS hits; the indexed coverage stops in September.
+The bounded six-commit work audit ending at `1e9e1e65` is **DRIFTING**: one USER, three ENABLER and two
+PROCESS items. Further launcher/profile/gate variants are frozen; persistence reliability
+and production host resume are the next capability priorities. This classification is a
+diagnostic, not a progress quota or capability claim.
 
 | # | Question / disposition |
 |---|---|
 | 1 | Weakened gates: yes, authored analytics temporarily reduced twelve report identities and eight required invariants. `6b663f00` and `865531f0` restore the original exact sets; `933b09c3` adds 23 verifier mutations and `d07ecd36` adds two identity controls. All 25 actually refuse in source-bound DSR readback, with untouched data accepted before and after. Simulator/verifier revisions remain explicit. Disclosed here and in Beads. |
 | 2 | Fake implementation/mocks: none found in reviewed new production/test hunks. Actual owners, processes, sockets, filesystem/kernel faults and Neuroflow are used; synthetic statistical fixtures are labeled separately. |
 | 3 | Golden regeneration: none in the implementation range. No performance baseline, scientific digest or tournament specification was changed. |
-| 4 | Gate/budget changes: validated frame-free WAL admission has explicit malformed/framed negatives; Assembly inspection compares real working cells and checkpoint/output continuation. `d07ecd36` repairs false comparison of database-scoped IDs using actual roots/file identities and two new refusal cases. `b49012c8` waits for observed periodic disable before the unchanged policy baseline/assertions. Outer DSR timeout is 7200s; application shutdown remains 15s. No assertion/lint suppression substitutes for behavior. |
+| 4 | Gate/budget changes: validated frame-free WAL admission has explicit malformed/framed negatives; Assembly inspection compares real working cells and checkpoint/output continuation. `d07ecd36` repairs false comparison of database-scoped IDs using actual roots/file identities and two new refusal cases. `b49012c8` waits for observed periodic disable before the unchanged policy baseline/assertions. Actual coordinator limits are 7200s for remote workspace and 3600s for the failed full publication; `5ab863fb` subsequently wires optional declarations with live ancestry/omission/invalid-input checks. Application shutdown remains 15s. No assertion/lint suppression substitutes for behavior. |
 | 5 | Fake special cases: none found in reviewed production changes. No fixture-path detection or benchmark hardcoding. Full hardware/publication criteria remain. |
 | 6 | Zero-run green: an initial UBS diagnostic selected zero files; it receives no scan credit. Later retained engine runs have actual populations and findings. DSR requires nonzero executed tests and exact named analytics tests. |
 | 7 | Unrun commands claimed: none found in reviewed commentary/tracker/verdict records. Authored changes and pending executions remain qualified. |
 | 8 | Proof inflation: software-adapter, synthetic fixture, seeded world, source compilation and hardware proof stay separate. No whole-product pass inferred. |
 | 9 | Hidden failures: authored gate omissions could have hidden missing evidence; corrected as above. Cache/compiler/lint/seed/topology/bundle/server/reader-lease failures and timeouts are retained. |
 | 10 | Silenced stderr: captured logs support claims. Earlier child stdout is discarded and never cited as inspected; new partial-write controls retain both streams. |
-| 11 | False closure: the distinct cache-selection defect `.4` closes on all its original criteria, including actual native DSR seed observation and three typed negatives. Six original implementation owners and composed blocking edges remain unchanged; no original qualification condition was transferred. |
+| 11 | False closure: the distinct cache-selection `.4` and coordinator-input `.5` defects close on all their original criteria, including actual native seed/timeout observations and three/seven typed negatives respectively. Both stop before Cargo/collection. Six original implementation owners and composed blocking edges remain unchanged; no original qualification condition was transferred. |
 | 12 | Spec weakened: original tournament matrix, hardware qualification, real scarcity/null/search and repeated analytics criteria remain unchanged. |
-| 13 | Self/peer closure: the cache-selection defect is closed after solo original-criterion re-execution, explicitly labeled. No independent reviewer or broader product acceptance is claimed. |
+| 13 | Self/peer closure: the two distinct launcher input defects close after solo original-criterion re-execution, explicitly labeled. No independent reviewer or broader product acceptance is claimed. |
 | 14 | Gameable delegation: no subagents used. |
 | 15 | Unverified subagent reports: none used. |
 | 16 | Refusal farming: positive startup, checkpoint admission/retry, bundle materialization and actual tournament execution exist alongside refusals; negatives alone do not close tasks. |
 | 17 | Independence overstated: solo review is labeled. Separate reader processes are data observations, not independent reviewer opinions. |
 | 18 | Post-result denominator: declared matrix/test/report/invariant sets remain fixed. Smaller authored gate denominators are recorded as defects and restored. |
 | 19 | Replay explanations: gate omissions, repeated compiler/lint fixes, tool cleanup and external resets are disclosed. The first UBS meta-runner removed its own temporary shadow; earlier DSR launches may remove their private stage. Later UBS retains artifacts and project DSR launchers set `DSR_KEEP_BUILD_STAGES=1`. No manual destructive Git/file command was issued; no repository file was deleted by those tool cleanup paths. |
-| 20 | Strongest observed evidence: the sixteen-step typed inner connectivity pass at `ae3894e3`, all five original process and four replay tests, actual two-invocation 2k tournament/four CLI drift refusals, real file-server finished-bundle/SQL readback and partial-write controls, both original analytics tests with actual CLI/Parquet evidence at `5f68228e`, all 25 gate readback refusals at verifier `ae3894e3`, and native cache selection at `323a448b`. Final Rust collection, fresh composed analytics, full tournament, unchanged workspace and original broader acceptance remain open. The remote real analytics failure at tick 351 remains a failure. |
+| 20 | Strongest observed evidence: the sixteen-step typed inner connectivity pass at `ae3894e3`, all five original process and four replay tests, both unchanged original 600-second server progress tests, actual two-invocation 2k tournament/four CLI drift refusals, real file-server finished-bundle/SQL readback and partial-write controls, both original analytics tests with actual CLI/Parquet evidence at `5f68228e`, all 25 gate readback refusals at verifier `ae3894e3`, native cache selection at `323a448b`, and actual timeout selection/omission at `5ab863fb`. Final Rust collection, fresh composed analytics, full tournament, unchanged workspace and original broader acceptance remain open. The remote real analytics failure at tick 351 remains a failure. |
 
 ## Current assessment — 2026-10-08
 
