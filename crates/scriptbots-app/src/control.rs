@@ -625,6 +625,8 @@ pub struct PaginatedCheckpointsResponse {
 pub struct CheckpointRetentionDto {
     pub max_count: u64,
     pub max_bytes: u64,
+    pub max_directory_leases: u64,
+    pub directory_leases: usize,
     pub file_count: u64,
     pub file_bytes: u64,
     pub observed_file_count_high_water: u64,
@@ -1042,6 +1044,12 @@ struct CheckpointRetentionState {
 }
 
 impl CheckpointRetentionState {
+    fn max_directory_leases(limits: scriptbots_storage::CheckpointRetentionLimits) -> u64 {
+        // Keep room for the initial service root and an explicitly configured root even when
+        // capture is disabled. Beyond those roots, the checkpoint count budget bounds leases.
+        limits.max_count.max(2)
+    }
+
     fn add_directory(&mut self, path: &Path) -> Result<PathBuf, ControlError> {
         fs::create_dir_all(path)
             .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
@@ -1049,6 +1057,13 @@ impl CheckpointRetentionState {
             .canonicalize()
             .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
         if !self.directories.contains_key(&path) {
+            let limit = Self::max_directory_leases(self.limits);
+            if u64::try_from(self.directories.len()).unwrap_or(u64::MAX) >= limit {
+                return Err(ControlError::CheckpointCapacity(format!(
+                    "artifact-directory leases={} reached limit={limit}; existing roots and artifacts are preserved; reuse a leased directory or increase the count budget",
+                    self.directories.len(),
+                )));
+            }
             if self
                 .directories
                 .keys()
@@ -1261,11 +1276,20 @@ impl ControlHandle {
         self,
         limits: scriptbots_storage::CheckpointRetentionLimits,
     ) -> Result<Self, ControlError> {
-        self.data_services
+        let mut retention = self
+            .data_services
             .checkpoint_retention
             .lock()
-            .map_err(|_| ControlError::Lock)?
-            .limits = limits;
+            .map_err(|_| ControlError::Lock)?;
+        let directory_limit = CheckpointRetentionState::max_directory_leases(limits);
+        if u64::try_from(retention.directories.len()).unwrap_or(u64::MAX) > directory_limit {
+            return Err(ControlError::CheckpointCapacity(format!(
+                "requested count policy allows {directory_limit} directory leases, but {} are retained; existing roots and artifacts are preserved",
+                retention.directories.len(),
+            )));
+        }
+        retention.limits = limits;
+        drop(retention);
         Ok(self)
     }
 
@@ -1959,6 +1983,8 @@ impl ControlHandle {
         let mut usage = CheckpointRetentionDto {
             max_count: retention.limits.max_count,
             max_bytes: retention.limits.max_bytes,
+            max_directory_leases: CheckpointRetentionState::max_directory_leases(retention.limits),
+            directory_leases: retention.directories.len(),
             file_count: retention.file_count,
             file_bytes: retention.file_bytes,
             observed_file_count_high_water: retention.count_high_water,
@@ -3514,6 +3540,48 @@ pub(crate) mod tests {
                 Err(ControlError::Conflict(_))
             ));
         }
+    }
+
+    #[test]
+    fn checkpoint_directory_leases_are_bounded_and_reusable_without_deletion() {
+        let root = tempfile::tempdir().expect("directory lease proof").keep();
+        let first = root.join("first");
+        let second = root.join("second");
+        let third = root.join("third");
+        let (handle, host) = checkpoint_test_handle(&first, 0, 0);
+        let handle = handle
+            .with_artifacts_dir(second.clone())
+            .expect("second root");
+        let before = handle
+            .checkpoint_retention_usage()
+            .expect("actual directory usage");
+        assert_eq!(before.directory_leases as u64, before.max_directory_leases);
+        assert_eq!(before.file_count, 0);
+        assert!(matches!(
+            handle.data_services.set_artifacts_dir(third.clone()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        let after = handle
+            .checkpoint_retention_usage()
+            .expect("usage after refusal");
+        assert_eq!(after.directory_leases, before.directory_leases);
+        assert_eq!(
+            handle.artifacts_dir(),
+            second.canonicalize().expect("second root exists")
+        );
+        handle
+            .data_services
+            .set_artifacts_dir(first.clone())
+            .expect("reuse leased first root");
+        assert_eq!(
+            handle.artifacts_dir(),
+            first.canonicalize().expect("first root exists")
+        );
+        assert!(
+            first.is_dir() && second.is_dir() && third.is_dir(),
+            "no root was removed"
+        );
+        drop(host);
     }
 
     #[test]

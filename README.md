@@ -871,9 +871,11 @@ For an interactive run, ScriptBots parses the control environment and transactio
     and `GET /api/control/status/{command_id}`
 
 `GET /api/v1/checkpoints` also reports actual file/SQL usage, observed file high-water counts,
-pending request identities, and inventory/query errors. Checkpoint quota exhaustion returns
+pending request identities, retained directory leases and their limit, and inventory/query errors. Checkpoint quota exhaustion returns
 HTTP 507; an unconfirmed file/storage receipt returns HTTP 503 and retains the exact request
-for retry. Changing artifact directories keeps earlier occupancy and leases charged. Startup
+for retry. Changing artifact directories keeps earlier occupancy and leases charged; the count
+policy also bounds retained directory bookkeeping, with room for the initial and configured roots.
+Reusing an already leased directory remains possible at that limit. Startup
 counts existing binary artifacts without labelling them current-run checkpoints. Set
 `SCRIPTBOTS_ARTIFACTS_DIR` for an explicit directory; otherwise each control service reserves
 a unique temporary directory. Files, including partial failed captures, are never automatically
