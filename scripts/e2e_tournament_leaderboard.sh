@@ -27,8 +27,13 @@ case "$mode" in
   *) fail "expected smoke or full mode" ;;
 esac
 export RUST_LOG="scriptbots::tournament=info,info"
-cargo build --locked -p scriptbots-app --bin scriptbots-app
-binary="$CARGO_TARGET_DIR/debug/scriptbots-app"
+cargo build --locked -p scriptbots-app --bin scriptbots-app --message-format=json | tee "$proof/build.jsonl"
+binary=$(jq -e -r -s '
+  [.[] | select(.reason == "compiler-artifact" and .target.name == "scriptbots-app"
+     and (.target.kind | index("bin")) != null and .executable != null) | .executable]
+  | unique
+  | if length == 1 then .[0] else error("expected one Cargo-reported tournament executable") end
+' "$proof/build.jsonl")
 [[ -x "$binary" ]] || fail "missing built tournament executable"
 "$binary" tournament "${protocol_args[@]}" --jobs 4 --out "$proof/first" 2>&1 | tee "$proof/first.log"
 "$binary" tournament "${protocol_args[@]}" --jobs 4 --out "$proof/second" \
@@ -93,7 +98,7 @@ if [[ "$mode" == smoke ]]; then
     cp "$proof/first/tournament_results.jsonl" "$proof/first/ratings.json" "$proof/first/leaderboard.md" "$proof/$negative/"
     case "$negative" in
       document) printf '\nDeliberate document mutation.\n' >> "$proof/$negative/leaderboard.md" ;;
-      config) sed -E 's/Effective Config Digest \| `[a-f0-9]+`/Effective Config Digest | `stale-config`/' \
+      config) sed -E "s/Effective Config Digest \| \`[a-f0-9]+\`/Effective Config Digest | \`stale-config\`/" \
         "$proof/first/leaderboard.md" > "$proof/$negative/leaderboard.md" ;;
       rows) jq -c 'if .family == "mlp" then .survival_share = 0.123456 else . end' \
         "$proof/first/tournament_results.jsonl" > "$proof/$negative/tournament_results.jsonl" ;;

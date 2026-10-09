@@ -239,7 +239,7 @@ pub fn create_run_bundle(
         });
     }
 
-    let reader = StorageReader::open_finished(&run_db_path.to_string_lossy())?;
+    let mut reader = StorageReader::open_finished(&run_db_path.to_string_lossy())?;
     reader.require_finished_bundle_state()?;
     let manifest = reader.run_manifest()?;
     let max_tick = reader.max_tick()?.unwrap_or(0);
@@ -259,7 +259,7 @@ pub fn create_run_bundle(
         error,
     })?;
     let db_path = output_bundle_dir.join("run.db");
-    reader.materialize_finished_database(run_db_path, &db_path)?;
+    let mut copied_reader = reader.materialize_finished_database(run_db_path, &db_path)?;
     let db_bytes = fs::read(&db_path).map_err(|error| BundleError::Io {
         path: db_path,
         error,
@@ -304,8 +304,9 @@ pub fn create_run_bundle(
         artifacts,
     };
 
-    verify_database_projection(output_bundle_dir, &bundle)?;
-    reader.close()?;
+    verify_database_projection(output_bundle_dir, &bundle, &copied_reader)?;
+    copied_reader.close_connection()?;
+    reader.close_connection()?;
     write_bundle_manifest(output_bundle_dir, &bundle)?;
     Ok(bundle)
 }
@@ -390,6 +391,17 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
         });
     }
 
+    // Reserve filesystem ownership before hashing, but preserve hash refusals
+    // before asking the engine to decode potentially corrupt database bytes.
+    let db_path = bundle_dir.join("run.db");
+    let database_lease = if db_path.exists() {
+        Some(StorageReader::lease_bundle_copy(
+            &db_path.to_string_lossy(),
+        )?)
+    } else {
+        None
+    };
+
     for entry in &bundle.artifacts {
         // Exactly the rule the assembler applies, so read and write cannot disagree.
         let rel_path = validate_relative_path(&entry.relative_path)?;
@@ -427,9 +439,10 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
         total_bytes += bytes.len() as u64;
     }
 
-    let db_path = bundle_dir.join("run.db");
-    if db_path.exists() {
-        verify_database_projection(bundle_dir, &bundle)?;
+    if let Some(lease) = database_lease {
+        let reader = StorageReader::open_finished_leased(&db_path.to_string_lossy(), None, lease)?;
+        verify_database_projection(bundle_dir, &bundle, &reader)?;
+        reader.close()?;
     } else if bundle
         .artifacts
         .iter()
@@ -453,7 +466,11 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
 }
 
 /// Reopen the materialized database and compare logical state, not just file hashes.
-fn verify_database_projection(bundle_dir: &Path, bundle: &RunBundleV1) -> Result<(), BundleError> {
+fn verify_database_projection(
+    bundle_dir: &Path,
+    bundle: &RunBundleV1,
+    reader: &StorageReader,
+) -> Result<(), BundleError> {
     for (path, kind) in [
         ("run.db", "database"),
         ("events.json", "events"),
@@ -467,7 +484,6 @@ fn verify_database_projection(bundle_dir: &Path, bundle: &RunBundleV1) -> Result
             return Err(BundleError::MissingArtifact(PathBuf::from(path)));
         }
     }
-    let reader = StorageReader::open_finished(&bundle_dir.join("run.db").to_string_lossy())?;
     reader.require_finished_bundle_state()?;
     let manifest = reader.run_manifest()?;
     if manifest.run_id != bundle.manifest.run_id {
@@ -516,7 +532,6 @@ fn verify_database_projection(bundle_dir: &Path, bundle: &RunBundleV1) -> Result
             return Err(BundleError::DatabaseProjectionMismatch(path));
         }
     }
-    reader.close()?;
     Ok(())
 }
 
@@ -914,7 +929,26 @@ mod tests {
             "{error:?}"
         );
         let copy_path = temp_db_path("leased-copy");
-        reader.materialize_finished_database(&db_path, &copy_path)?;
+        let mut copied_reader = reader.materialize_finished_database(&db_path, &copy_path)?;
+        let companion =
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(crate::storage_writer_lock_path(
+                    &copy_path.to_string_lossy(),
+                ))?;
+        assert!(matches!(
+            companion.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        copied_reader.close_connection()?;
+        assert!(matches!(
+            companion.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(copied_reader);
+        companion.try_lock()?;
+        companion.unlock()?;
         let before = fs::read(&copy_path)?;
         assert!(matches!(
             reader.materialize_finished_database(&db_path, &copy_path),
@@ -925,9 +959,13 @@ mod tests {
         fs::rename(&db_path, &moved)?;
         fs::copy(&moved, &db_path)?;
         let refused_copy = temp_db_path("changed-source-copy");
-        let error = reader
-            .materialize_finished_database(&db_path, &refused_copy)
-            .expect_err("changed path identity must fail");
+        let error = match reader.materialize_finished_database(&db_path, &refused_copy) {
+            Err(error) => error,
+            Ok(copy) => {
+                copy.close()?;
+                return Err("changed path identity was accepted".into());
+            }
+        };
         assert!(error.to_string().contains("DIFFERENT FILE"), "{error}");
         assert!(!refused_copy.exists());
         reader.close()?;
@@ -1064,6 +1102,44 @@ mod tests {
             assert!(!output.exists());
         }
         assert_eq!(fs::read(&original)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn portable_bundle_reserves_its_own_lease_without_relaxing_source_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = temp_db_path("portable-bundle-source");
+        let exported = temp_bundle_dir("portable-bundle-export");
+        let portable = temp_bundle_dir("portable-bundle-readback");
+        let storage = Storage::create_new_file_for_run(
+            &source.to_string_lossy(),
+            RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(12)),
+        )?;
+        storage.close()?;
+        let bundle = create_run_bundle(&source, &exported)?;
+        fs::create_dir(&portable)?;
+        for entry in &bundle.artifacts {
+            fs::copy(
+                exported.join(&entry.relative_path),
+                portable.join(&entry.relative_path),
+            )?;
+        }
+        fs::copy(
+            exported.join("bundle_manifest.json"),
+            portable.join("bundle_manifest.json"),
+        )?;
+        let database = portable.join("run.db");
+        let companion = crate::storage_writer_lock_path(&database.to_string_lossy());
+        assert!(!companion.exists());
+        assert!(matches!(
+            StorageReader::open_finished(&database.to_string_lossy()),
+            Err(StorageError::Filesystem { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!companion.exists());
+        let verified = verify_run_bundle(&portable)?;
+        assert_eq!(verified.total_artifacts_verified, bundle.artifacts.len());
+        assert!(companion.is_file());
+        assert_eq!(fs::read(database)?, fs::read(source)?);
         Ok(())
     }
 

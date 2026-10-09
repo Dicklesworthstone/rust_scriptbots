@@ -9550,7 +9550,7 @@ fn load_archive_cells(
     Ok(cells)
 }
 
-struct FinishedRunReaderLease {
+pub(crate) struct FinishedRunReaderLease {
     _path: StoragePathLease,
     _writer: StorageWriterLease,
     _identity: ExistingStorageLease,
@@ -9682,13 +9682,32 @@ impl StorageReader {
         Self::open_finished_selected(path, Some(run_id))
     }
 
+    /// Portable copies have no inherited companion lease. Reserve their own lease
+    /// while retaining every finished-reader identity, schema and durability gate.
+    pub(crate) fn lease_bundle_copy(path: &str) -> Result<FinishedRunReaderLease, StorageError> {
+        validate_durable_storage_path(path)?;
+        let path_lease = StoragePathLease::acquire(path)?.ok_or(StorageError::InvalidData {
+            context: "storage.bundle_copy",
+            reason: "a bundle copy requires file-backed storage".to_owned(),
+        })?;
+        let writer_lease = StorageWriterLease::acquire_lock(path, true)?;
+        let existing_lease = ExistingStorageLease::open(path)?;
+        Self::require_checkpointed_bundle_image(Path::new(path))?;
+        Ok(FinishedRunReaderLease {
+            _path: path_lease,
+            _writer: writer_lease,
+            _identity: existing_lease,
+        })
+    }
+
     /// Copy the leased, checkpointed main image without opening the source path again.
+    /// The returned reader owns the destination lease through readback and publication.
     /// WAL frames and journal data are refused rather than changing the source.
     pub(crate) fn materialize_finished_database(
         &self,
         source: &Path,
         destination: &Path,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Self, StorageError> {
         use std::io::Seek as _;
 
         let lease = self
@@ -9709,43 +9728,25 @@ impl StorageReader {
             reason: "database path must be UTF-8".to_owned(),
         })?;
         let verify_source = || {
+            lease._identity.verify_path(source_text)?;
             self.require_finished_bundle_state()?;
             lease
                 ._identity
                 .bind_connection(self.connection()?, source_text)?;
-            for suffix in ["-wal", "-journal"] {
-                let mut name = source.as_os_str().to_owned();
-                name.push(suffix);
-                let sidecar = PathBuf::from(name);
-                match fs::symlink_metadata(&sidecar) {
-                    Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
-                    Ok(metadata)
-                        if suffix == "-wal"
-                            && metadata.is_file()
-                            && Self::wal_has_valid_header_without_frames(&sidecar)? => {}
-                    Ok(_) => {
-                        return Err(StorageError::InvalidTarget {
-                            path: source_text.to_owned(),
-                            reason: format!(
-                                "finished bundle export requires checkpointed storage; sidecar {} contains frames, journal data, or an invalid header, or is not a regular file",
-                                sidecar.display()
-                            ),
-                        });
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(source) => {
-                        return Err(StorageError::Filesystem {
-                            operation: "inspect bundle source sidecar",
-                            path: sidecar,
-                            source,
-                        });
-                    }
-                }
-            }
-            Ok(())
+            Self::require_checkpointed_bundle_image(source)
         };
         verify_source()?;
         ensure_no_storage_sidecars(destination)?;
+        let destination_text = destination.to_str().ok_or(StorageError::InvalidData {
+            context: "storage.bundle_copy",
+            reason: "database path must be UTF-8".to_owned(),
+        })?;
+        let path_lease =
+            StoragePathLease::acquire(destination_text)?.ok_or(StorageError::InvalidData {
+                context: "storage.bundle_copy",
+                reason: "a bundle copy requires file-backed storage".to_owned(),
+            })?;
+        let writer_lease = StorageWriterLease::acquire_lock(destination_text, true)?;
         let copy = || -> io::Result<()> {
             let mut input = lease._identity._file.try_clone()?;
             input.rewind()?;
@@ -9764,7 +9765,50 @@ impl StorageReader {
             path: destination.to_path_buf(),
             source,
         })?;
-        verify_source()
+        verify_source()?;
+        let existing_lease = ExistingStorageLease::open(destination_text)?;
+        Self::open_finished_leased(
+            destination_text,
+            None,
+            FinishedRunReaderLease {
+                _path: path_lease,
+                _writer: writer_lease,
+                _identity: existing_lease,
+            },
+        )
+    }
+
+    fn require_checkpointed_bundle_image(path: &Path) -> Result<(), StorageError> {
+        for suffix in ["-wal", "-journal"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let sidecar = PathBuf::from(name);
+            match fs::symlink_metadata(&sidecar) {
+                Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+                Ok(metadata)
+                    if suffix == "-wal"
+                        && metadata.is_file()
+                        && Self::wal_has_valid_header_without_frames(&sidecar)? => {}
+                Ok(_) => {
+                    return Err(StorageError::InvalidTarget {
+                        path: path.display().to_string(),
+                        reason: format!(
+                            "finished bundle export requires checkpointed storage; sidecar {} contains frames, journal data, or an invalid header, or is not a regular file",
+                            sidecar.display()
+                        ),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(StorageError::Filesystem {
+                        operation: "inspect bundle source sidecar",
+                        path: sidecar,
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// FrankenSQLite TRUNCATE retains the new generation's header. A valid header
@@ -9842,14 +9886,31 @@ impl StorageReader {
         })?;
         let writer_lease = StorageWriterLease::acquire_existing(path)?;
         let existing_lease = ExistingStorageLease::open(path)?;
+        Self::open_finished_leased(
+            path,
+            requested_run_id,
+            FinishedRunReaderLease {
+                _path: path_lease,
+                _writer: writer_lease,
+                _identity: existing_lease,
+            },
+        )
+    }
+
+    pub(crate) fn open_finished_leased(
+        path: &str,
+        requested_run_id: Option<RunId>,
+        lease: FinishedRunReaderLease,
+    ) -> Result<Self, StorageError> {
         let conn = open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let validation = existing_lease
+        let validation = lease
+            ._identity
             .bind_connection(&conn, path)
             .and_then(|()| Storage::validate_existing_scriptbots_database(&conn))
             .and_then(|()| Storage::validate_all_persistence_invariants(&conn, true))
             .and_then(|()| Storage::validate_all_host_journal_invariants(&conn, true))
             .and_then(|()| Self::resolve_run_id(&conn, requested_run_id))
-            .and_then(|run_id| existing_lease.verify_path(path).map(|()| run_id));
+            .and_then(|run_id| lease._identity.verify_path(path).map(|()| run_id));
         let run_id = match validation {
             Ok(run_id) => run_id,
             Err(error) => {
@@ -9867,11 +9928,7 @@ impl StorageReader {
             conn: Some(conn),
             run_id,
             narrative_input_binding_v1: OnceLock::new(),
-            _finished_run_lease: Some(FinishedRunReaderLease {
-                _path: path_lease,
-                _writer: writer_lease,
-                _identity: existing_lease,
-            }),
+            _finished_run_lease: Some(lease),
         })
     }
 
@@ -9994,6 +10051,11 @@ impl StorageReader {
 
     /// Close the read-only connection without attempting a WAL checkpoint.
     pub fn close(mut self) -> Result<(), StorageError> {
+        self.close_connection()
+    }
+
+    /// Close SQL before publishing the bundle while retaining its filesystem leases.
+    pub(crate) fn close_connection(&mut self) -> Result<(), StorageError> {
         let connection = self.conn.take().ok_or(StorageError::Closed)?;
         connection.close_without_checkpoint()?;
         Ok(())
