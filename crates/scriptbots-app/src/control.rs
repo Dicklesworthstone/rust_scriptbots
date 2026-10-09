@@ -1772,12 +1772,12 @@ impl ControlHandle {
                 "checkpoint description exceeds 4096 bytes".to_owned(),
             ));
         }
-        if let Some(ref key) = request.idempotency_key {
-            if key.is_empty() || key.len() > 1024 {
-                return Err(ControlError::BadRequest(
-                    "idempotency key must contain 1..=1024 bytes".into(),
-                ));
-            }
+        if let Some(ref key) = request.idempotency_key
+            && (key.is_empty() || key.len() > 1024)
+        {
+            return Err(ControlError::BadRequest(
+                "idempotency key must contain 1..=1024 bytes".into(),
+            ));
         }
         let request_hash =
             compute_blake3(&serde_json::to_vec(&request).map_err(ControlError::serialization)?);
