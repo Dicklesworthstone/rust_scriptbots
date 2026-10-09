@@ -1015,6 +1015,7 @@ pub mod execution {
         let mut initial_genome_digests = BTreeMap::new();
         let mut initial_mutation_rates = BTreeMap::new();
         for family in &plan.spawn_order {
+            let family_name = family.as_str();
             let members = plan.cohort.get(family).copied().ok_or_else(|| {
                 TournamentError::UnbalancedOrders {
                     reason: format!("family {} has no cohort entry", family.as_str()),
@@ -1046,7 +1047,7 @@ pub mod execution {
                 let genome = adapter
                     .random_genome(scriptbots_core::BrainProvenance::default(), &mut brain_rng)
                     .map_err(|error| TournamentError::Publication {
-                        reason: format!("brain-seeded founding genome for {family}: {error}"),
+                        reason: format!("brain-seeded founding genome for {family_name}: {error}"),
                     })?;
                 if !world
                     .bind_agent_brain_genome(id, &genome)
@@ -1062,18 +1063,18 @@ pub mod execution {
                     world
                         .agent_runtime(id)
                         .ok_or_else(|| TournamentError::Publication {
-                            reason: format!("founder runtime missing for {family}"),
+                            reason: format!("founder runtime missing for {family_name}"),
                         })?;
                 if bound_runtime.brain.genome() != Some(&genome) {
                     return Err(TournamentError::Publication {
                         reason: format!(
-                            "bound founder genome differs from brain-seeded genome for {family}"
+                            "bound founder genome differs from brain-seeded genome for {family_name}"
                         ),
                     });
                 }
                 let genome_bytes =
                     serde_json::to_vec(&genome).map_err(|error| TournamentError::Publication {
-                        reason: format!("founder genome serialization for {family}: {error}"),
+                        reason: format!("founder genome serialization for {family_name}: {error}"),
                     })?;
                 initial_genome_digests
                     .entry(*family)
@@ -1083,7 +1084,9 @@ pub mod execution {
                     && previous != bound_runtime.mutation_rates
                 {
                     return Err(TournamentError::Publication {
-                        reason: format!("initial mutation rates differ inside family {family}"),
+                        reason: format!(
+                            "initial mutation rates differ inside family {family_name}"
+                        ),
                     });
                 }
                 let uid = world
@@ -1098,6 +1101,7 @@ pub mod execution {
 
         let mut initial_brain_source_scalars = BTreeMap::new();
         for (family, uid) in first_uid_by_family {
+            let family_name = family.as_str();
             let request = scriptbots_core::BrainInspectionRequest::single(
                 scriptbots_core::BrainInspectionClientId::new(0),
                 scriptbots_core::BrainInspectionRevision::new(0),
@@ -1107,13 +1111,15 @@ pub mod execution {
                 world
                     .inspect_brains(&request)
                     .map_err(|error| TournamentError::Publication {
-                        reason: format!("initial topology inspection for {family}: {error}"),
+                        reason: format!("initial topology inspection for {family_name}: {error}"),
                     })?;
             let telemetry =
                 inspection
                     .ready_for(uid)
                     .ok_or_else(|| TournamentError::Publication {
-                        reason: format!("initial topology inspection unavailable for {family}"),
+                        reason: format!(
+                            "initial topology inspection unavailable for {family_name}"
+                        ),
                     })?;
             initial_brain_source_scalars.insert(family, telemetry.inspection.build.source_scalars);
         }
