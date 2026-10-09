@@ -136,7 +136,7 @@ if [[ ${1:-} == --run ]]; then
     [[ -z $(git -C "$checkout" status --porcelain --untracked-files=all) ]] || refuse "dirty source checkout"
     [[ "$proof_root" = /* && -d "$proof_root" && ! -e "$proof_root/$3" ]] || refuse "missing proof root or reused proof version"
     profile_hash=$(sha256sum "$profile" | cut -d ' ' -f 1)
-    dsr build --tool "$2" --target "$target" --only-native --no-sync --version "$3"
+    DSR_KEEP_BUILD_STAGES=1 dsr build --tool "$2" --target "$target" --only-native --no-sync --version "$3"
     [[ $(sha256sum "$profile" | cut -d ' ' -f 1) == "$profile_hash" ]] || refuse "DSR profile changed during execution"
     verify_evidence "$proof_root/$3" "$expected" "$lane"
     exit 0

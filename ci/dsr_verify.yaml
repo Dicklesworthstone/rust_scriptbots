@@ -26,6 +26,7 @@ env:
   CARGO_TARGET_DIR: /absolute/path/outside/checkout/cargo-target
   CARGO_BUILD_JOBS: "4"
   CARGO_INCREMENTAL: "0"
+  DSR_KEEP_BUILD_STAGES: "1"
 artifact_naming: "${name}-${version}-${os}-${arch}"
 archive_format:
   linux: tar.gz
