@@ -39,12 +39,13 @@ for name in tournament_results.jsonl ratings.json leaderboard.md; do
 done
 
 python3 - "$proof" "$repo_root/tournament/spec.toml" "$mode" "$SCRIPTBOTS_EXPECTED_COMMIT" <<'PY'
-import itertools, json, pathlib, sys, tomllib
+import itertools, json, math, pathlib, sys, tomllib
 proof, spec_path, mode, source = sys.argv[1:]
 proof = pathlib.Path(proof)
 spec = tomllib.loads(pathlib.Path(spec_path).read_text())
 protocol = spec['smoke'] if mode == 'smoke' else spec['tournament']
 families, seeds = protocol['families'], protocol['seeds']
+cohort = protocol['cohort_size']
 ticks = 2000 if mode == 'smoke' else protocol['ticks']
 if protocol['order_policy'] == 'both_assignments':
     orders = [families, families[::-1]]
@@ -62,6 +63,8 @@ for row in rows:
     assert row['source_provenance_complete'] is True and row['reproducible'] is True
     assert row['sense_backend'] == 'cpu_simd' and row['sense_determinism'] == 'exact'
     assert row['initial_brain_source_scalars'] == spec['parameters']['nodes_per_family']
+    assert len(row['initial_mutation_rates']) == cohort // len(families)
+    assert all(math.isfinite(rates['primary']) and rates['primary'] >= 0 and math.isfinite(rates['secondary']) and rates['secondary'] >= 0 for rates in row['initial_mutation_rates'])
 assert len({row['protocol_digest'] for row in rows}) == 1
 assert len({row['config_digest'] for row in rows}) == 1
 matches = len({row['match_id'] for row in rows})

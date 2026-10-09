@@ -731,7 +731,7 @@ pub mod execution {
         pub agents_final: BTreeMap<BrainKind, usize>,
         pub initial_brain_source_scalars: BTreeMap<BrainKind, usize>,
         pub initial_genome_digests: BTreeMap<BrainKind, String>,
-        pub initial_mutation_rates: BTreeMap<BrainKind, scriptbots_core::MutationRates>,
+        pub initial_mutation_rates: BTreeMap<BrainKind, Vec<scriptbots_core::MutationRates>>,
     }
 
     fn config_layer_error(path: &Path, reason: impl std::fmt::Display) -> TournamentError {
@@ -1079,16 +1079,10 @@ pub mod execution {
                 initial_genome_digests
                     .entry(*family)
                     .or_insert_with(|| blake3::hash(&genome_bytes).to_hex().to_string());
-                if let Some(previous) =
-                    initial_mutation_rates.insert(*family, bound_runtime.mutation_rates)
-                    && previous != bound_runtime.mutation_rates
-                {
-                    return Err(TournamentError::Publication {
-                        reason: format!(
-                            "initial mutation rates differ inside family {family_name}"
-                        ),
-                    });
-                }
+                initial_mutation_rates
+                    .entry(*family)
+                    .or_insert_with(Vec::new)
+                    .push(bound_runtime.mutation_rates);
                 let uid = world
                     .agent_uid(id)
                     .ok_or_else(|| TournamentError::UnbalancedOrders {
@@ -3117,7 +3111,7 @@ pub mod leaderboard {
         pub source_provenance_complete: bool,
         pub initial_brain_source_scalars: usize,
         pub initial_genome_digest: String,
-        pub initial_mutation_rates: scriptbots_core::MutationRates,
+        pub initial_mutation_rates: Vec<scriptbots_core::MutationRates>,
         pub survival_share: f64,
         pub biomass_share: f64,
         pub mean_lineage_depth: f64,
@@ -3230,7 +3224,8 @@ pub mod leaderboard {
                         [&to_brain_kind(family_name)]
                         .clone(),
                     initial_mutation_rates: report.initial_mutation_rates
-                        [&to_brain_kind(family_name)],
+                        [&to_brain_kind(family_name)]
+                        .clone(),
                     survival_share: outcome.survival_share,
                     biomass_share: outcome.biomass_share,
                     mean_lineage_depth: outcome.mean_lineage_depth,
@@ -3311,10 +3306,14 @@ pub mod leaderboard {
                     .initial_genome_digest
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
-                || !row.initial_mutation_rates.primary.is_finite()
-                || row.initial_mutation_rates.primary < 0.0
-                || !row.initial_mutation_rates.secondary.is_finite()
-                || row.initial_mutation_rates.secondary < 0.0
+                || Some(row.initial_mutation_rates.len())
+                    != plan.cohort.get(&to_brain_kind(&row.family)).copied()
+                || row.initial_mutation_rates.iter().any(|rates| {
+                    !rates.primary.is_finite()
+                        || rates.primary < 0.0
+                        || !rates.secondary.is_finite()
+                        || rates.secondary < 0.0
+                })
                 || row.extinct_at.is_some_and(|tick| tick > row.ticks_run)
                 || row.manifest_digest != result_manifest_digest(row)
             {
@@ -3596,12 +3595,27 @@ pub mod leaderboard {
                 first.protocol_digest
             ));
         }
-        let mut initial_rates = BTreeMap::new();
+        let mut initial_rates: BTreeMap<&str, (f32, f32, f32, f32, usize)> = BTreeMap::new();
         for row in rows {
-            initial_rates.insert(&row.family, row.initial_mutation_rates);
+            for rates in &row.initial_mutation_rates {
+                let observed = initial_rates.entry(&row.family).or_insert((
+                    rates.primary,
+                    rates.primary,
+                    rates.secondary,
+                    rates.secondary,
+                    0,
+                ));
+                observed.0 = observed.0.min(rates.primary);
+                observed.1 = observed.1.max(rates.primary);
+                observed.2 = observed.2.min(rates.secondary);
+                observed.3 = observed.3.max(rates.secondary);
+                observed.4 += 1;
+            }
         }
-        for (family, rates) in initial_rates {
-            out.push_str(&format!("| Initial Mutation Rates: {family} | primary `{}`, secondary `{}` (evolve during execution) |\n", rates.primary, rates.secondary));
+        for (family, (primary_min, primary_max, secondary_min, secondary_max, count)) in
+            initial_rates
+        {
+            out.push_str(&format!("| Initial Mutation Rates: {family} | primary `{primary_min}..={primary_max}`, secondary `{secondary_min}..={secondary_max}` from {count} founder observations (later generations may mutate) |\n"));
         }
         out.push_str(&format!(
             "| Sensory Lane | `{}` (Determinism: `{}`) |\n",
@@ -5462,7 +5476,7 @@ mod tests {
             source_provenance_complete: true,
             initial_brain_source_scalars: 200,
             initial_genome_digest: "fixture-genome".to_owned(),
-            initial_mutation_rates: scriptbots_core::MutationRates::default(),
+            initial_mutation_rates: vec![scriptbots_core::MutationRates::default()],
             biomass_share: 0.5,
             mean_lineage_depth: 4.0,
             max_lineage_depth: 5,
@@ -5760,7 +5774,7 @@ mod tests {
         );
         assert!(!outcome.leaderboard_md.contains("20000 ticks per match"));
 
-        for mutation in 0..12 {
+        for mutation in 0..14 {
             let mut altered = rows.clone();
             match mutation {
                 0 => altered[0].seed ^= 1,
@@ -5775,6 +5789,8 @@ mod tests {
                 9 => altered[0].run_id.push('x'),
                 10 => altered[0].initial_brain_source_scalars = 0,
                 11 => altered[0].family = "unplanned-family".to_owned(),
+                12 => altered[0].initial_mutation_rates.clear(),
+                13 => altered[0].initial_mutation_rates[0].primary = -1.0,
                 _ => unreachable!(),
             }
             // The altered row has a valid content digest: the semantic guard must still refuse it.
