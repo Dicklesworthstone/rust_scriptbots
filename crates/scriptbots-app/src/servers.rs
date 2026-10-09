@@ -4507,6 +4507,7 @@ where
 }
 
 fn map_control_error(err: ControlError) -> McpError {
+    tracing::warn!(error = %err, "MCP control operation failed");
     match err {
         ControlError::CheckpointCapacity(message)
         | ControlError::CheckpointRetentionUnavailable(message) => {

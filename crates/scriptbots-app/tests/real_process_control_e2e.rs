@@ -1301,7 +1301,7 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         let mcp_apply_json: serde_json::Value = serde_json::from_str(&mcp_apply_body)?;
         let status_text = mcp_apply_json["result"]["content"][0]["text"]
             .as_str()
-            .unwrap_or_else(|| panic!("status text missing in mcp_apply_body: {mcp_apply_body}"));
+            .ok_or_else(|| anyhow!("status text missing in mcp_apply_body: {mcp_apply_body}"))?;
         let status_obj: serde_json::Value = serde_json::from_str(status_text)?;
         let mcp_cmd_id = status_obj["command_id"].as_str().expect("command_id");
 
@@ -1412,6 +1412,11 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
     if let Err(ref e) = outcome {
         eprintln!("TEST FAILED WITH: {e:?}");
         if let Ok(lines) = server_log.lock() {
+            std::fs::write(run_dir.join("server.stderr"), lines.join("\n"))?;
+            eprintln!(
+                "Retained server stderr: {}",
+                run_dir.join("server.stderr").display()
+            );
             eprintln!("=== SERVER STDERR ({} lines) ===", lines.len());
             for line in lines.iter().rev().take(100).rev() {
                 eprintln!("{line}");
