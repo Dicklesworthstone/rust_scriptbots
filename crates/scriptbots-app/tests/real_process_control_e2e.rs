@@ -368,9 +368,14 @@ fn verify_cadence_replay(database: &std::path::Path, tick: u64) -> Result<()> {
         })
         .map(|entry| entry.tick)
         .collect();
-    anyhow::ensure!(reader.max_tick()? == Some(tick), "shutdown advanced science");
+    anyhow::ensure!(
+        reader.max_tick()? == Some(tick),
+        "shutdown advanced science"
+    );
     reader.close()?;
-    println!("CADENCE_REPLAY: tick={tick}, summaries={summary_ticks:?}, digests={digest_ticks:?}, watermarks={watermarks:?}");
+    println!(
+        "CADENCE_REPLAY: tick={tick}, summaries={summary_ticks:?}, digests={digest_ticks:?}, watermarks={watermarks:?}"
+    );
     let replay = cadence_replay_command()
         .arg("--replay-db")
         .arg(database)
@@ -381,7 +386,8 @@ fn verify_cadence_replay(database: &std::path::Path, tick: u64) -> Result<()> {
     std::fs::write(parent.join("replay.stdout"), &replay.stdout)?;
     std::fs::write(parent.join("replay.stderr"), &replay.stderr)?;
     anyhow::ensure!(
-        replay.status.success() && String::from_utf8_lossy(&replay.stdout).contains("Replay matched"),
+        replay.status.success()
+            && String::from_utf8_lossy(&replay.stdout).contains("Replay matched"),
         "cadence-aligned run did not replay: {}\n{}\n{}",
         replay.status,
         String::from_utf8_lossy(&replay.stdout),
