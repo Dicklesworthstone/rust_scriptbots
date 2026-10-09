@@ -311,6 +311,178 @@ fn wait_for_control_addresses(child: &mut Child, timeout: Duration) -> Result<Se
     }
 }
 
+/// Keep recording and replay configuration identical, without ambient app overrides.
+fn cadence_replay_command() -> Command {
+    let mut command = Command::new(binary());
+    for (name, _) in std::env::vars_os() {
+        let bytes = name.as_encoded_bytes();
+        if bytes.starts_with(b"SCRIPTBOTS_") || bytes.starts_with(b"SB_") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .args(["--rng-seed", &CHECKPOINT_RUN_SEED.to_string()])
+        .args(["--set", "persistence_interval=1"])
+        .env("RUST_LOG", "warn,scriptbots_app=info");
+    command
+}
+
+fn apply_cadence_control(addr: SocketAddr, path: &str, body: &[u8]) -> Result<()> {
+    let (code, response) = http_with_body(addr, "POST", path, body, Some("application/json"))?;
+    anyhow::ensure!(code == 200, "{path} returned {code}: {response}");
+    let id = json_str(&response, "command_id").context("control receipt has a command id")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (code, body) = http(addr, "GET", &format!("/api/control/status/{id}"))?;
+        if code == 200
+            && json_str(&body, "application_state").as_deref() == Some("applied")
+            && json_str(&body, "journal_state").as_deref() == Some("durable")
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{path} never became durable: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn verify_cadence_replay(database: &std::path::Path, tick: u64) -> Result<()> {
+    let reader = scriptbots_storage::StorageReader::open_finished(&database.to_string_lossy())?;
+    let watermarks = reader.persistence_watermarks()?;
+    let summary_ticks: Vec<_> = reader
+        .summary_ticks()?
+        .into_iter()
+        .filter(|tick| *tick > 0)
+        .collect();
+    let digest_ticks: Vec<_> = reader
+        .load_replay_events()?
+        .into_iter()
+        .filter(|entry| {
+            entry.tick > 0
+                && matches!(
+                    entry.event.kind,
+                    scriptbots_core::ReplayEventKind::WorldDigest { .. }
+                )
+        })
+        .map(|entry| entry.tick)
+        .collect();
+    anyhow::ensure!(reader.max_tick()? == Some(tick), "shutdown advanced science");
+    reader.close()?;
+    println!("CADENCE_REPLAY: tick={tick}, summaries={summary_ticks:?}, digests={digest_ticks:?}, watermarks={watermarks:?}");
+    let replay = cadence_replay_command()
+        .arg("--replay-db")
+        .arg(database)
+        .output()?;
+    let parent = database
+        .parent()
+        .context("database has an artifact directory")?;
+    std::fs::write(parent.join("replay.stdout"), &replay.stdout)?;
+    std::fs::write(parent.join("replay.stderr"), &replay.stderr)?;
+    anyhow::ensure!(
+        replay.status.success() && String::from_utf8_lossy(&replay.stdout).contains("Replay matched"),
+        "cadence-aligned run did not replay: {}\n{}\n{}",
+        replay.status,
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    anyhow::ensure!(
+        !digest_ticks.is_empty(),
+        "replay needs observed digest anchors"
+    );
+    anyhow::ensure!(
+        digest_ticks == summary_ticks,
+        "each completed cadence batch needs one digest"
+    );
+    anyhow::ensure!(
+        watermarks.admitted.is_some()
+            && watermarks.admitted == watermarks.applied
+            && watermarks.applied == watermarks.durable,
+        "finished run watermarks disagree: {watermarks:?}"
+    );
+    Ok(())
+}
+
+/// A sealed cadence batch must already contain the digest that shutdown cannot append.
+#[test]
+#[serial]
+fn real_process_cadence_aligned_shutdown_replays_non_vacuously() -> Result<()> {
+    let run_dir = tempdir()?.keep();
+    println!("cadence replay artifacts: {}", run_dir.display());
+    let database = run_dir.join("cadence.sqlite");
+    let mut child = cadence_replay_command()
+        .args(["--mode", "server", "--storage", "file"])
+        .args(["--checkpoint-interval", "0"])
+        .env("SCRIPTBOTS_STORAGE_PATH", &database)
+        .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
+        .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_CONTROL_MCP", "http")
+        .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+        .current_dir(&run_dir)
+        .stdout(std::fs::File::create(run_dir.join("server.stdout"))?)
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (addr, _, log) = match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+        Ok(found) => found,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let mut guard = ChildGuard(Some(child));
+    let result = (|| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (code, body) = http(addr, "GET", "/api/status")?;
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+            if code == 200 && status["tick"].as_u64().is_some_and(|tick| tick > 0) {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "automatic science never advanced: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        apply_cadence_control(addr, "/api/control/pause", b"")?;
+        let (_, paused) = http(addr, "GET", "/api/status")?;
+        let paused: serde_json::Value = serde_json::from_str(&paused)?;
+        let before = paused["tick"].as_u64().context("paused tick")?;
+        apply_cadence_control(addr, "/api/control/step", br#"{"count":1}"#)?;
+        let (_, stepped) = http(addr, "GET", "/api/status")?;
+        let stepped: serde_json::Value = serde_json::from_str(&stepped)?;
+        let tick = stepped["tick"].as_u64().context("completed step tick")?;
+        anyhow::ensure!(
+            tick == before + 1 && stepped["paused"] == true,
+            "single step: {stepped}"
+        );
+        let (code, body) = http(addr, "POST", "/api/control/shutdown")?;
+        anyhow::ensure!(code == 200, "shutdown returned {code}: {body}");
+        let child = guard.0.as_mut().context("owned server child")?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(exit) = child.try_wait()? {
+                anyhow::ensure!(exit.success(), "ordered shutdown failed: {exit}");
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "ordered shutdown exceeded 15 seconds"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        verify_cadence_replay(&database, tick)
+    })();
+    let lines = log
+        .lock()
+        .map_err(|_| anyhow!("server log poisoned"))?
+        .join("\n");
+    std::fs::write(run_dir.join("server.stderr"), lines)?;
+    result
+}
+
 /// Real filesystem partial-write retention through the shipped REST server (bd-2z0.16).
 #[cfg(target_os = "linux")]
 #[test]
