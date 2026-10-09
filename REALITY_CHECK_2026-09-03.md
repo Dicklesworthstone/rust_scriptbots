@@ -1,5 +1,73 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-08
 
+## Implementation follow-through — 2026-10-09
+
+The user authorized implementation after the assessment. The highest-value first tranche
+repairs approximate startup, durable portable bundles, bounded checkpoint retention,
+HTTP authority/Origin enforcement and truthful tournament/analysis integration. The granular
+execution list lives in the existing recovery plan; all six original implementation owners
+remain in progress. The composed journey retains its blocking dependencies.
+
+At this update, production changes extend through `bd64f84b`; the analytics test reader-lifetime
+fix is `5f68228e`. These are committed local changes, not a pushed or released product.
+Every correctness execution uses a clean pinned main clone and a unique DSR profile/version
+with `--no-sync`. No performance number or whole-product acceptance is claimed.
+
+| Delivered source change | Observed evidence and remaining boundary |
+|---|---|
+| Separate build provenance completeness from sensing reproducibility | Clean `fb29a8d1`: fifteen application manifest and twenty-one storage schema tests pass, including distinct complete/incomplete × exact/approximate cells and forged-policy refusals. Earlier `6f82b4e9` observes actual llvmpipe startup/readback and exact-mode refusal. Hardware parity/scaling remains open. |
+| Hold bundle source/copy identity and OS leases through database readback and manifest-last publication | Clean `fb29a8d1`: all ten bundle tests pass, including portable-copy ownership, lease survival through SQL close, logical checkpoint contradictions and live/pending/alias/collision refusals. A validated frame-free 32-byte engine WAL header is newly admitted; malformed headers and framed WAL remain refused. Production CLI/other-process acceptance is pending. |
+| Bound checkpoint files, request metadata, directory leases and every SQL producer | Clean `fb29a8d1`: six storage and eight application checkpoint tests pass, including actual delayed-owner acknowledgement, later commitment, exact identity retry, concurrency/restart accounting and zero-consumption Neuroflow refusal. Actual kernel partial writes and REST/MCP quota/continued-control acceptance are pending. |
+| Enforce actual listener authority and configured browser Origin before side effects | Clean `fb29a8d1` correctly fails two of 33 server tests: credentials were normalized away and an overflowing explicit port defaulted. `bd64f84b` rejects both and adds empty/signed-port controls while keeping original assertions. Fresh `connected-20261009-bd64f84b` is running; real socket acceptance is pending. |
+| Wire declared founder seed and observed topology/rates into truthful tournament provenance | Clean `fb29a8d1`: nineteen Assembly and thirty-four tournament tests pass. Two actual original 2k smoke CLI invocations produce byte-identical raw rows, ratings and Markdown: eight matches/sixteen family rows, with four document/config/raw-row/rating mutation refusals. Original full 32-seed × 3-order × 20k-tick publication remains open. |
+| Connect real seeded worlds to analyzer CLI, Parquet and fail-closed evidence | Clean `fb29a8d1`: the synthetic fixture passes; the real-world test fails its first analyzer CLI because the test retained a reader lease. `5f68228e` releases each reader before the independent CLI without relaxing storage ownership. Fresh science execution is running. Original real intervention/null/lineage/control-CLI FTS and repeated-run acceptance remain open. |
+| Repair existing correctness CI and legacy wrapper routing | Actionlint, Bash/ShellCheck, immutable action pins and actual local profile preparation pass. Separate pinned DSR connectivity/science jobs retain the original wire probe. GitHub runners API still reports zero at 06:52 UTC; no hosted/nightly execution is claimed. |
+
+Both focused `fb29a8d1` attempts pass formatting, four dependency guards, all-target workspace
+check and strict all-target Clippy before their later failures. A fresh optimized native
+workspace profile on `hz3` retains the unchanged workspace and core `economy-faults` suites.
+Its first attempt failed before compilation because the worker lacked the pinned source path.
+The retry stages that exact checkout and verifies local/remote profile SHA256 equality first;
+no test result is inferred from orchestration or cache preparation.
+
+Two external shared-checkout resets to `origin/main` are observed in the reflog at 07:40:19
+and 07:46:41 UTC; the issuer is unidentified. Implementation commits were recovered by safe
+fast-forward from retained objects and isolated clones. Canonical Beads was recovered from
+its preserved controller database/history, then independently rebuilt in an isolated cache:
+716 records, six restored active owners, no lost prior comments or dependency changes,
+zero cycles. Ordinary BR merge reports zero conflicts/deletions. Doctor reports operational
+health but retains warnings for existing ignore patterns and preserved recovery artifacts.
+
+### Twenty-question honesty review of the implementation window
+
+This is a solo review of actual diffs, original criteria, retained commands, current tracker
+and bounded reflog; it is not independent author verification. The full external worksheet
+is `/tmp/scriptbots-implementation-20261009-2WARDx/honesty-inventory-implementation.md`.
+Older-session checks read six contextual CASS hits; the indexed coverage stops in September.
+
+| # | Question / disposition |
+|---|---|
+| 1 | Weakened gates: yes, authored analytics temporarily reduced twelve report identities and eight required invariants. `6b663f00` and `865531f0` restore the original exact sets; `933b09c3` adds 23 verifier mutations. Disclosed here and in Beads. Runtime mutation acceptance is pending. |
+| 2 | Fake implementation/mocks: none found in reviewed new production/test hunks. Actual owners, processes, sockets, filesystem/kernel faults and Neuroflow are used; synthetic statistical fixtures are labeled separately. |
+| 3 | Golden regeneration: none in the implementation range. No performance baseline, scientific digest or tournament specification was changed. |
+| 4 | Gate/budget changes: validated frame-free WAL admission has explicit malformed/framed negatives; Assembly inspection compares real working cells and checkpoint/output continuation. Outer DSR timeout is 7200s after infrastructure timeout; application shutdown remains 15s. No assertion/lint suppression substitutes for behavior. |
+| 5 | Fake special cases: none found in reviewed production changes. No fixture-path detection or benchmark hardcoding. Full hardware/publication criteria remain. |
+| 6 | Zero-run green: an initial UBS diagnostic selected zero files; it receives no scan credit. Later retained engine runs have actual populations and findings. DSR requires nonzero executed tests and exact named analytics tests. |
+| 7 | Unrun commands claimed: none found in reviewed commentary/tracker/verdict records. Authored changes and pending executions remain qualified. |
+| 8 | Proof inflation: software-adapter, synthetic fixture, seeded world, source compilation and hardware proof stay separate. No whole-product pass inferred. |
+| 9 | Hidden failures: authored gate omissions could have hidden missing evidence; corrected as above. Cache/compiler/lint/seed/topology/bundle/server/reader-lease failures and timeouts are retained. |
+| 10 | Silenced stderr: captured logs support claims. Earlier child stdout is discarded and never cited as inspected; new partial-write controls retain both streams. |
+| 11 | False closure: no implementation Bead closed; original scopes and composed blocking edges preserved. No follow-up laundering. |
+| 12 | Spec weakened: original tournament matrix, hardware qualification, real scarcity/null/search and repeated analytics criteria remain unchanged. |
+| 13 | Self/peer closure: none in this implementation window. |
+| 14 | Gameable delegation: no subagents used. |
+| 15 | Unverified subagent reports: none used. |
+| 16 | Refusal farming: positive startup, checkpoint admission/retry, bundle materialization and actual tournament execution exist alongside refusals; negatives alone do not close tasks. |
+| 17 | Independence overstated: solo review is labeled. Separate reader processes are data observations, not independent reviewer opinions. |
+| 18 | Post-result denominator: declared matrix/test/report/invariant sets remain fixed. Smaller authored gate denominators are recorded as defects and restored. |
+| 19 | Replay explanations: gate omissions, repeated compiler/lint fixes, tool cleanup and external resets are disclosed. The first UBS meta-runner removed its own temporary shadow; earlier DSR launches may remove their private stage. Later UBS retains artifacts and project DSR launchers set `DSR_KEEP_BUILD_STAGES=1`. No manual destructive Git/file command was issued; no repository file was deleted by those tool cleanup paths. |
+| 20 | Strongest observed evidence: `fb29a8d1` component passes and actual two-invocation 2k tournament with four CLI drift refusals. Final connectivity, real-world analytics, unchanged full workspace and original broader acceptance are still pending. |
+
 ## Current assessment — 2026-10-08
 
 **The project contains a substantial deterministic simulator and real research infrastructure,

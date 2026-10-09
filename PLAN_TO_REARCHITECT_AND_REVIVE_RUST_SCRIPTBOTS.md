@@ -26,6 +26,121 @@ Passing server runs do not close the intermittent storage/journal latency invest
 
 **Primary outcome:** turn the repository into a deterministic, genuinely evolving artificial-life laboratory with one correct simulation runtime, a polished FrankenTUI interface, a real GPU desktop interface, trustworthy replay/experiments, and tests that exercise the actual shipped paths.
 
+### Implementation pass — 2026-10-09, LavenderLion [Currently In Progress]
+
+This is the user's requested granular execution checklist. Original Bead criteria and
+dependency edges remain binding. A checked component is qualified by its observed source
+and scope; it does not close its containing task. This list was reconstructed after two
+external resets of the shared checkout at 07:40:19 and 07:46:41 UTC. Implementation commits
+were recovered by safe fast-forward, and isolated source/evidence copies remain retained.
+
+- [ ] `bd-16g.15.3`: repair approximate startup while retaining original hardware qualification.
+  - [x] Separate complete build provenance from scientific reproducibility in storage.
+  - [x] Validate sensing policy and reject inconsistent reproducibility/certification claims.
+  - [x] Persist/read complete/incomplete × exact/approximate cells without collapsing the matrix.
+    Clean pinned `fb29a8d1` passes fifteen application manifest and twenty-one storage
+    schema tests. Its containing connectivity lane later failed server policy tests.
+  - [x] Execute the actual-adapter startup/readback and exact-mode refusal regression.
+    Observed at `6f82b4e9` on llvmpipe/Vulkan; this is software-adapter evidence.
+    The containing workspace run timed out; hardware and whole-suite passes are not claimed.
+  - [ ] Retain original hardware parity, fault controls and scaling acceptance.
+- [ ] `bd-2z0.17`: produce one independently readable durable database-backed bundle.
+  - [x] Hold source and copied-database leases through metadata, copy, readback and publication.
+  - [x] Preserve source/WAL bytes and refuse live, pending, aliases, changed identity and collisions.
+  - [x] Compare logical run manifest, max tick, checkpoints, events and all three watermarks.
+  - [x] Retain database-free semantics and portable copied-database lease ownership.
+    All ten bundle tests pass in clean pinned `connected-20261009-fb29a8d1`, including
+    frame-free-header positives, malformed/framed WAL and hash-valid logical contradictions.
+  - [ ] Exercise the production CLI and another process's durable readback in the complete lane.
+    Earlier `9e3fe1cb` failed three bundle cases; `fb29a8d1` fixes their lease/identity
+    causes. It then failed two server cases. Fresh corrected-source `bd64f84b` is executing.
+- [ ] `bd-2z0.15`: enforce configured authority/Origin before side effects.
+  - [ ] Derive policy from actual listeners and advertised endpoints and observe both policy logs.
+  - [ ] Apply the same policy to REST and MCP before commands, experiments or artifacts.
+  - [ ] Exercise accepted CLI/browser clients and rejected requests over real sockets.
+  - [ ] Cover IPv4/IPv6, ports, credentials, null/duplicate Origins/Hosts, proxy headers,
+    absolute targets, HTTP/2 authority and WebSocket upgrades without weakening guards.
+    `fb29a8d1` passed 31/33 server tests; credentialed Origin and overflowing explicit
+    port were wrongly normalized. `bd64f84b` rejects both and supplements the unchanged
+    tests with empty/signed ports. Its clean source-bound DSR execution is pending.
+- [ ] `bd-2z0.16`: bound checkpoint retention across every actual producer.
+  - [x] Trace API/periodic producers, file payloads, request metadata, leases and SQL payloads.
+  - [x] Remove duplicate payload caching and bound retained directory leases.
+  - [x] Reserve count/bytes across exact retry, collision, concurrency and restart inventory.
+  - [x] Derive SQL UTF-8 byte accounting from actual checkpoint payloads and enforce policy.
+  - [x] Observe a real delayed-owner acknowledgement, later commitment and one-file/row retry.
+  - [x] Observe real Neuroflow capture refusal before retention consumption.
+    Clean pinned `fb29a8d1` passes all six storage and eight application checkpoint tests.
+    This component evidence does not replace the pending operational process acceptance.
+  - [ ] Observe kernel-limited partial writes, retain/charge their exact bytes, and verify retries.
+  - [ ] Drive real REST/MCP creates to count/byte exhaustion and preserve accepted downloads.
+  - [ ] Observe periodic quota disable while ordinary science and controls continue.
+- [ ] `bd-2z0.19`: compose authority, retention and bundle behavior through actual processes.
+  - [ ] Wait for original component acceptance; preserve the three blocking edges.
+  - [ ] Observe graceful ordered shutdown within the original 15-second bound.
+  - [ ] Bind embedded source/compiler, actual policy/quota observations and durable DB joins.
+  - [ ] Execute both existing control wrapper entry points through the complete pinned DSR lane.
+  - [ ] Retain hash-valid logical mismatch, pending, wrong source/run, missing artifact,
+    stale/zero-test, missing protection/accounting and actual successful controls.
+  - [ ] Close only on original evidence and then unblock `bd-2z0.13.11`.
+  - [x] Repair the obsolete CI caller while preserving the original wire-level probe.
+    `b98fa14a` adds separate pinned connectivity/science jobs. Actionlint, Bash/ShellCheck,
+    immutable action pins and actual local profile preparation pass; repository runners = 0.
+- [ ] `bd-16g.12.3`: publish the tournament protocol actually executed.
+  - [x] Bind generated protocol/config/source metadata and observed result-matrix cells.
+  - [x] Preserve executed tick budgets and spawn order while reconstructing ratings.
+  - [x] Connect the declared brain seed to real founding genomes and verify its effect.
+  - [x] Derive topology and mutation-rate statements from every live founder.
+  - [x] Implement Assembly's bounded working-cell inspection with checkpoint-bit/output checks
+    and unchanged continuation; retain over-budget refusals.
+  - [x] Run the original 2k smoke through two actual CLI invocations with identical artifacts.
+  - [x] Reject document/config/raw-row/rating drift through the actual CLI `--check` path.
+    Clean pinned `science-20261009-fb29a8d1` observes 19 Assembly and 34 tournament test
+    passes, 8 smoke matches/16 family rows and all four actual mutation refusals. The
+    earlier guessed binary path is fixed by consuming Cargo's compiler-artifact executable.
+  - [ ] Execute two original full-protocol CLI invocations (32 seeds × 3 orders × 20k ticks,
+    24 founders; each invocation also retains its original internal reproducibility rerun).
+  - [ ] Commit the generated full leaderboard beside actual raw rows and ratings, with provenance.
+  - [x] Connect bounded smoke/analytics to the existing CI workflow.
+  - [ ] Provide and execute the original full nightly publication lane on an available controller.
+- [ ] `bd-2z0.11.9`: complete the full real simulation-to-analysis journey.
+  - [ ] Observe both original named tests and all declared tests succeeding.
+    At `fb29a8d1`, the fixture passed and real-world CLI failed because the test retained
+    its reader lease. `5f68228e` releases readers before independent CLI opens; fresh
+    composed science acceptance is running without any lease/assertion waiver.
+  - [ ] Observe all twelve original report identities and all eight ground-truth invariants.
+    Authored omissions (nonempty registry and four-invariant gate) were disclosed; `6b663f00`
+    and `865531f0` restore the original contracts, with 23 actual verifier mutations in
+    `933b09c3`. Positive runtime and mutation acceptance remain pending.
+  - [ ] Retain distinct fixture/real-world run manifests with exact source/compiler identity.
+  - [ ] Execute all twelve analyzer CLI reports and retain their schemas, logs and hashes.
+  - [ ] Independently compare all five real-world Parquet tables with SQL counts.
+  - [ ] Observe missing/empty/corrupt DB and unknown-report refusals.
+  - [ ] Falsify fixture-only, missing named test, changed report and every missing report/invariant.
+  - [ ] Observe real planted scarcity at the original p < .01 and a nonvacuous stationary null.
+  - [ ] Join independently observed two-parent lineage and multiple interaction-event ground truth.
+  - [ ] Exercise actual control-CLI FTS against the same scientific DB and retained exports.
+  - [ ] Complete the original repeated accepted-run streak without changing its criteria.
+- [ ] Verification and work preservation.
+  - [x] At `fb29a8d1`, both focused lanes pass formatting, four dependency guards,
+    all-target workspace check and strict all-target Clippy. Neither is yet a whole-lane pass.
+  - [ ] Complete the corrected-source connectivity lane, production process tests and replay tests.
+  - [ ] Complete the composed smoke/analytics lane and its independent evidence readback.
+  - [ ] Complete unchanged workspace tests and core `economy-faults` tests through pinned DSR.
+    A separate `hz3` native profile declares optimization level 1 before execution;
+    its first attempt failed before compilation because the remote pinned source path was
+    absent. Exact source and matching profile bytes are staged for the `5f68228e` retry.
+    No workspace compilation/test or performance result yet.
+  - [x] Configure project DSR launchers to retain temporary stages (`ba90679d`), with shell checks.
+  - [x] Recover and validate canonical JSONL/Beads after the observed external checkout resets.
+    Isolated rebuild observes 716 tasks and all six active owners/comments; ordinary BR
+    merge has zero conflicts/deletions and cycles stay empty. Existing doctor warnings remain.
+  - [ ] Preserve the full twenty-question honesty inventory and final positive/negative evidence.
+  - [ ] Copy/hash final proof onto persistent storage, preserving failed attempts and raw logs.
+  - [ ] Commit code, tracker and reports separately through reviewed frozen trees.
+  - [ ] Synchronize main/remotes only after required acceptance, without force or hook bypass.
+  - [ ] Re-triage authoritative ready work and continue host/replay/frontend dependencies in order.
+
 [Currently In Progress — `bd-pcfj`, TurquoiseLake, 2026-09-06: transfer production ownership
 into HostThread/HostCore, preserve frontend inspection and exports through bounded owner requests,
 and migrate presentation/controls together. Checklist and proof limits are in the existing
