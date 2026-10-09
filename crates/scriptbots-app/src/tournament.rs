@@ -1013,7 +1013,8 @@ pub mod execution {
         let mut arm_by_uid: HashMap<scriptbots_core::AgentUid, BrainKind> = HashMap::new();
         let mut first_uid_by_family = BTreeMap::new();
         let mut initial_genome_digests = BTreeMap::new();
-        let mut initial_mutation_rates = BTreeMap::new();
+        let mut initial_mutation_rates =
+            BTreeMap::<BrainKind, Vec<scriptbots_core::MutationRates>>::new();
         for family in &plan.spawn_order {
             let family_name = family.as_str();
             let members = plan.cohort.get(family).copied().ok_or_else(|| {
@@ -1081,7 +1082,7 @@ pub mod execution {
                     .or_insert_with(|| blake3::hash(&genome_bytes).to_hex().to_string());
                 initial_mutation_rates
                     .entry(*family)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(bound_runtime.mutation_rates);
                 let uid = world
                     .agent_uid(id)

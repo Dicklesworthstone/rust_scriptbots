@@ -15,6 +15,7 @@ verify_evidence() {
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
         connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests sensing-manifest-tests manifest-storage-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
         tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy tournament-tests tournament-cli) ;;
+        tournament-smoke-and-analytics) required+=(workspace-check workspace-clippy tournament-tests tournament-cli analytics-pipeline) ;;
         analytics) required+=(workspace-check workspace-clippy analytics-pipeline) ;;
         graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
@@ -60,14 +61,16 @@ verify_evidence() {
     done
     [[ $(head -n 1 "$directory/source.txt") == "commit $expected" ]] || refuse "source record mismatch"
     [[ $(sed -n 's/^host: //p' "$directory/rustc.txt") == "$target" ]] || refuse "compiler target mismatch"
-    if [[ "$lane" == tournament-smoke || "$lane" == tournament-full ]]; then
-        jq -e --arg source "$expected" --arg mode "${lane#tournament-}" \
+    if [[ "$lane" == tournament-smoke || "$lane" == tournament-full || "$lane" == tournament-smoke-and-analytics ]]; then
+        local tournament_mode=smoke
+        [[ "$lane" != tournament-full ]] || tournament_mode=full
+        jq -e --arg source "$expected" --arg mode "$tournament_mode" \
             '.schema == "scriptbots.tournament-proof.v1" and .status == "pass" and .source == $source and .mode == $mode and .identical_invocations == 2' \
             "$directory/tournament/verdict.json" >/dev/null || refuse "missing or mismatched tournament observations"
         [[ -s "$directory/tournament/artifacts.sha256" ]] || refuse "missing tournament artifact hashes"
         sha256sum --check "$directory/tournament/artifacts.sha256" >/dev/null || refuse "changed tournament artifacts"
     fi
-    if [[ "$lane" == analytics ]]; then
+    if [[ "$lane" == analytics || "$lane" == tournament-smoke-and-analytics ]]; then
         bash scripts/e2e_analytics.sh --verify-evidence "$directory/analytics" "$expected" || refuse "missing, changed or mismatched analytics observations"
     fi
 }
@@ -110,7 +113,7 @@ fi
 proof_version=${1:-}
 [[ "$proof_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "missing or unsafe proof version"
 [[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned source commit"
-[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == connectivity || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-full || ${SCRIPTBOTS_VERIFY_LANE:-} == analytics || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
+[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == connectivity || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-full || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke-and-analytics || ${SCRIPTBOTS_VERIFY_LANE:-} == analytics || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
 [[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || refuse "invoke through the native DSR profile"
 [[ ${SCRIPTBOTS_VERIFY_PROFILE:-} = /* && -f "$SCRIPTBOTS_VERIFY_PROFILE" ]] || refuse "missing materialized DSR profile"
 [[ ${SCRIPTBOTS_PROOF_ROOT:-} = /* && -d "$SCRIPTBOTS_PROOF_ROOT" ]] || refuse "missing external proof root"
@@ -236,12 +239,17 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step control-process-tests test cargo test --locked -p scriptbots-app --test real_process_control_e2e -- --nocapture
         run_step replay-process-tests test cargo test --locked -p scriptbots-app --test replay_e2e -- --nocapture
         ;;
-    tournament-smoke|tournament-full)
+    tournament-smoke|tournament-full|tournament-smoke-and-analytics)
         run_step workspace-check check cargo check --locked --workspace --all-targets
         run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
         run_step tournament-tests test cargo test --locked -p scriptbots-app --lib tournament:: -- --nocapture
         export SCRIPTBOTS_TOURNAMENT_PROOF_DIR="$proof_dir/tournament"
-        run_step tournament-cli check bash scripts/e2e_tournament_leaderboard.sh "${SCRIPTBOTS_VERIFY_LANE#tournament-}"
+        tournament_mode=smoke
+        [[ "$SCRIPTBOTS_VERIFY_LANE" != tournament-full ]] || tournament_mode=full
+        run_step tournament-cli check bash scripts/e2e_tournament_leaderboard.sh "$tournament_mode"
+        if [[ "$SCRIPTBOTS_VERIFY_LANE" == tournament-smoke-and-analytics ]]; then
+            run_step analytics-pipeline check bash scripts/e2e_analytics.sh --inside-dsr "$proof_dir/analytics"
+        fi
         ;;
     analytics)
         run_step workspace-check check cargo check --locked --workspace --all-targets
