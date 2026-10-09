@@ -85,7 +85,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | frankentorch | **git only**, no tags; pinned `e4c6bdd5…` | nightly | **no** (rayon) | MIT+Rider |
 | franken_numpy | **git only** | nightly | **no** (getrandom backend) | MIT+Rider |
 
-Workspace pins `nightly-2026-07-09`, so nightly-only deps are admissible.
+Workspace pins `nightly-2026-08-31` in `rust-toolchain.toml`, so nightly-only deps are admissible.
 License: one byte-identical MIT + OpenAI/Anthropic-rider LICENSE family-wide
 (sha + full analysis + distribution obligations: `docs/licenses.md`;
 release-packaging obligation: bd-2z0.13.6).
