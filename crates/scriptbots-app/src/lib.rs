@@ -985,9 +985,9 @@ impl RunIdentityV1 {
 /// Version-three record tying run identity, scenario construction, stable identity allocation,
 /// domain-separated random-stream continuation, and normalized configuration to a build.
 ///
-/// `reproducible` means the manifest has an explicit seed and complete clean-source provenance. It
-/// does not override the characterization digest's exclusions or claim that replay can reconstruct
-/// the world.
+/// `reproducible` requires an explicit seed, complete clean-source provenance and exact sensing.
+/// Approximate sensing preserves the build evidence but lowers this scientific claim. It does not
+/// override the characterization digest's exclusions or claim that replay can reconstruct the world.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RunManifestV3 {

@@ -3749,12 +3749,6 @@ fn validate_v3_build(record: &RunManifestRecord, manifest: &Value) -> Result<(),
         manifest_required_nullable_string(manifest, pointer, MAX_MANIFEST_TEXT_BYTES, true)?;
     }
     let provenance_complete = manifest_required_bool(manifest, "/build/provenance_complete")?;
-    if provenance_complete != record.reproducible {
-        return Err(manifest_projection_error(format!(
-            "/build/provenance_complete is {provenance_complete}, expected reproducible={}",
-            record.reproducible
-        )));
-    }
     let derived_complete = source_revision.is_some()
         && source_tree_clean == Some(true)
         && source_status_digest.is_some()
@@ -3784,7 +3778,79 @@ fn validate_v3_build(record: &RunManifestRecord, manifest: &Value) -> Result<(),
             record.target_triple
         )));
     }
+    let sensing_exact = validate_v3_sense_policy(record, manifest)?;
+    let expected_reproducible = derived_complete && sensing_exact;
+    if record.reproducible != expected_reproducible {
+        return Err(manifest_projection_error(format!(
+            "/reproducible is {}, but build provenance and sensing policy derive {expected_reproducible}",
+            record.reproducible
+        )));
+    }
     Ok(())
+}
+
+/// Check persisted sensing declarations without pulling a GPU runtime into storage.
+/// This checks evidence consistency; establishing hardware parity belongs to the GPU gate.
+/// Older manifests omit this extension and retain the CPU reference contract.
+fn validate_v3_sense_policy(
+    record: &RunManifestRecord,
+    manifest: &Value,
+) -> Result<bool, StorageError> {
+    if matches!(manifest.get("sense_policy"), None | Some(Value::Null)) {
+        return Ok(true);
+    }
+    manifest_required_object(manifest, "/sense_policy")?;
+    let backend =
+        manifest_required_bounded_string(manifest, "/sense_policy/backend", MAX_RUN_LABEL_BYTES)?;
+    let determinism = manifest_required_bounded_string(
+        manifest,
+        "/sense_policy/determinism",
+        MAX_RUN_LABEL_BYTES,
+    )?;
+    manifest_required_bounded_string(manifest, "/sense_policy/source", MAX_RUN_LABEL_BYTES)?;
+    let allowed = manifest_required_bool(manifest, "/sense_policy/allow_approximate")?;
+    let certified = manifest_required_bool(manifest, "/sense_policy/certified_exact")?;
+    let evidence = manifest.pointer("/sense_policy/gate_evidence");
+    let has_evidence = !matches!(evidence, None | Some(Value::Null));
+    match (backend, determinism) {
+        ("cpu", "exact") if certified && !has_evidence => Ok(true),
+        ("gpu", "approximate") if allowed && !certified => {
+            if has_evidence {
+                require_manifest_projection(
+                    manifest,
+                    "/sense_policy/gate_evidence/determinism",
+                    &json!("approximate"),
+                )?;
+            }
+            Ok(false)
+        }
+        ("gpu", "exact") if certified && has_evidence => {
+            manifest_required_object(manifest, "/sense_policy/gate_evidence")?;
+            require_manifest_projection(
+                manifest,
+                "/sense_policy/gate_evidence/determinism",
+                &json!("exact"),
+            )?;
+            require_manifest_projection(
+                manifest,
+                "/sense_policy/gate_evidence/target",
+                &json!(record.target_triple),
+            )?;
+            let ticks = manifest_required_u64(manifest, "/sense_policy/gate_evidence/tick_count")?;
+            let delta =
+                manifest_required_value(manifest, "/sense_policy/gate_evidence/max_sensor_delta")?
+                    .as_f64();
+            if ticks == 0 || delta != Some(0.0) {
+                return Err(manifest_projection_error(
+                    "/sense_policy exact GPU evidence requires executed ticks and zero sensor delta",
+                ));
+            }
+            Ok(true)
+        }
+        _ => Err(manifest_projection_error(
+            "/sense_policy requires certified exact CPU, certified GPU with exact evidence, or explicitly allowed uncertified approximate GPU",
+        )),
+    }
 }
 
 fn validate_v3_core_build(manifest: &Value) -> Result<(), StorageError> {

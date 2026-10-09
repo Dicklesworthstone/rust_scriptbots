@@ -1295,6 +1295,19 @@ fn test_gpu_sense_backend_approximate_allowed() {
             comparison_lane.contains("approximate GPU sensing"),
             "manifest limitations must declare approximate GPU sensing; got: {comparison_lane}"
         );
+        let reader = StorageReader::open_finished(
+            dir.join("run.sqlite").to_str().expect("UTF-8 run path"),
+        )
+        .expect("approximate run leaves a finished readable database");
+        let persisted = reader.run_manifest().expect("durable run manifest");
+        let stored: serde_json::Value =
+            serde_json::from_str(&persisted.manifest_json).expect("durable manifest JSON");
+        assert!(!persisted.reproducible);
+        assert_eq!(stored["sense_policy"], manifest["sense_policy"]);
+        assert_eq!(stored["build"], manifest["build"]);
+        assert_eq!(stored["warnings"], manifest["warnings"]);
+        assert_eq!(stored["limitations"], manifest["limitations"]);
+        reader.close().expect("finished database reader closes");
     } else {
         // If the machine has no GPU adapter at all (neither hardware nor software)
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -276,6 +276,117 @@ fn manifest_validation_error(record: RunManifestRecord) -> String {
         .to_string()
 }
 
+fn with_sensing_policy(mut record: RunManifestRecord, approximate: bool) -> RunManifestRecord {
+    record.reproducible &= !approximate;
+    let reproducible = record.reproducible;
+    mutate_manifest(&mut record, |value| {
+        value["reproducible"] = serde_json::json!(reproducible);
+        value["sense_policy"] = serde_json::json!({
+            "backend": if approximate { "gpu" } else { "cpu" },
+            "determinism": if approximate { "approximate" } else { "exact" },
+            "source": "cli-flag",
+            "allow_approximate": approximate,
+            "certified_exact": !approximate,
+            "reason": "storage policy fixture"
+        });
+        if approximate {
+            let warnings = serde_json::json!([
+                "gpu sensing is approximate; run is not certified as reproducible"
+            ]);
+            value["warnings"] = warnings.clone();
+            value["build"]["warnings"] = warnings;
+            value["limitations"]["comparison_lane"] = serde_json::json!(
+                "same pinned test lane; approximate GPU sensing"
+            );
+        }
+    });
+    record
+}
+
+#[test]
+fn sensing_reproducibility_is_persisted_separately_from_build_provenance()
+-> Result<(), Box<dyn std::error::Error>> {
+    for complete in [false, true] {
+        for approximate in [false, true] {
+            let label = format!("sense_complete_{complete}_approximate_{approximate}");
+            let run_id = RunId::from_namespace_sequence(0x5e05_e001, 1);
+            let mut record = manifest(run_id, &label, 1_700_000_000_001);
+            if !complete {
+                record.source_tree_dirty = Some(true);
+                record.reproducible = false;
+                mutate_manifest(&mut record, |value| {
+                    value["build"]["source_tree_clean"] = serde_json::json!(false);
+                    value["build"]["provenance_complete"] = serde_json::json!(false);
+                    value["reproducible"] = serde_json::json!(false);
+                });
+            }
+            let record = with_sensing_policy(record, approximate);
+            let expected_manifest: serde_json::Value = serde_json::from_str(&record.manifest_json)?;
+            let path = temp_db_path(&label);
+            let mut pipeline = StoragePipeline::create_new_file_for_run(&path, record)?;
+            pipeline.shutdown()?;
+            // Recovery independently revalidates the persisted projection and its digest.
+            let mut recovered = StoragePipeline::recover_existing(&path)?;
+            recovered.shutdown()?;
+            let reader = StorageReader::open_finished_for_run(&path, run_id)?;
+            let persisted = reader.run_manifest()?;
+            let actual: serde_json::Value = serde_json::from_str(&persisted.manifest_json)?;
+            assert_eq!(persisted.reproducible, complete && !approximate, "{label}");
+            assert_eq!(actual["build"]["provenance_complete"], complete, "{label}");
+            assert_eq!(actual, expected_manifest, "{label}");
+            reader.close()?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sensing_manifest_rejects_forged_reproducibility_and_inconsistent_policy() {
+    let run_id = RunId::from_namespace_sequence(0x5e05_e002, 1);
+    let valid = with_sensing_policy(manifest(run_id, "approximate", 1_700_000_000_001), true);
+    accept_manifest(valid.clone());
+
+    let mut forged = valid.clone();
+    forged.reproducible = true;
+    mutate_manifest(&mut forged, |value| {
+        value["reproducible"] = serde_json::json!(true);
+    });
+    let error = manifest_validation_error(forged);
+    assert!(error.contains("sensing policy derive false"), "{error}");
+
+    for (field, replacement) in [
+        ("allow_approximate", serde_json::json!(false)),
+        ("certified_exact", serde_json::json!(true)),
+        ("backend", serde_json::json!("cpu")),
+        ("backend", serde_json::json!("unknown")),
+        ("determinism", serde_json::json!("unknown")),
+        ("determinism", serde_json::json!("exact")),
+        ("source", serde_json::json!("")),
+        ("allow_approximate", serde_json::json!("true")),
+        ("gate_evidence", serde_json::json!({"determinism": "exact"})),
+    ] {
+        let mut invalid = valid.clone();
+        mutate_manifest(&mut invalid, |value| {
+            value["sense_policy"][field] = replacement;
+        });
+        let error = manifest_validation_error(invalid);
+        assert!(error.contains("/sense_policy"), "{field}: {error}");
+    }
+
+    let mut invalid = valid.clone();
+    mutate_manifest(&mut invalid, |value| {
+        value["sense_policy"] = serde_json::json!("approximate");
+    });
+    assert!(manifest_validation_error(invalid).contains("/sense_policy must be an object"));
+
+    let mut invalid = valid;
+    mutate_manifest(&mut invalid, |value| {
+        value["sense_policy"]["determinism"] = serde_json::json!("exact");
+        value["sense_policy"]["certified_exact"] = serde_json::json!(true);
+    });
+    assert!(manifest_validation_error(invalid).contains("/sense_policy requires"));
+}
+
 fn overlapping_batch(epoch: u64, energy: f32) -> PersistenceBatch {
     let position = Position::new(12.0, 34.0);
     let agent = AgentState {
@@ -1110,7 +1221,7 @@ fn v3_manifest_validation_rejects_incomplete_rng_and_provenance() {
     });
     let error = manifest_validation_error(false_completeness);
     assert!(
-        error.contains("/build/provenance_complete") && error.contains("reproducible=true"),
+        error.contains("/build/provenance_complete") && error.contains("embedded evidence derives true"),
         "unexpected error: {error}"
     );
 
