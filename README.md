@@ -1179,6 +1179,11 @@ before a build starts. DSR copies only cache inputs into a private Cargo home. U
 empty external directory for a fresh download lane; dependency-link and final collection
 guards still apply. If the profile omits it, DSR uses the caller's cache selection.
 
+An optional profile `env.DSR_BUILD_TIMEOUT` also sets the orchestration deadline through
+the launcher. Its value must be a nonzero integer number of seconds. This binds the
+actual coordinator timeout, as well as the recipe environment; omitting the field
+preserves the caller's selection or DSR's default.
+
 The launcher rejects undeclared hosts and calls `dsr build` with the profile's
 explicit target, `--only-native`, `--no-sync` and the unique version. The runner
 checks clean `main`, expected commit, actual host target, external

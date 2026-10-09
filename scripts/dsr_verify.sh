@@ -130,6 +130,12 @@ if [[ ${1:-} == --run ]]; then
     expected=$(yq -r '.env.SCRIPTBOTS_EXPECTED_COMMIT' "$profile")
     lane=$(yq -r '.env.SCRIPTBOTS_VERIFY_LANE' "$profile")
     proof_root=$(yq -r '.env.SCRIPTBOTS_PROOF_ROOT' "$profile")
+    if [[ $(yq -r '.env | has("DSR_BUILD_TIMEOUT")' "$profile") == true ]]; then
+        build_timeout=$(yq -r '.env.DSR_BUILD_TIMEOUT' "$profile")
+        [[ "$build_timeout" =~ ^[1-9][0-9]*$ ]] || refuse "profile DSR build timeout must be a nonzero integer in seconds"
+        # DSR captures its orchestration deadline before exporting recipe env.
+        export DSR_BUILD_TIMEOUT="$build_timeout"
+    fi
     seed_cache=$(yq -r '.env.CARGO_HOME // ""' "$profile")
     if [[ -n "$seed_cache" ]]; then
         [[ "$seed_cache" = /* && -d "$seed_cache" && ! -L "$seed_cache" ]] || refuse "profile Cargo seed cache must be an existing absolute real directory"
