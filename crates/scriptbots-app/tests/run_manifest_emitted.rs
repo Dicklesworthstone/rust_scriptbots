@@ -1295,10 +1295,9 @@ fn test_gpu_sense_backend_approximate_allowed() {
             comparison_lane.contains("approximate GPU sensing"),
             "manifest limitations must declare approximate GPU sensing; got: {comparison_lane}"
         );
-        let reader = StorageReader::open_finished(
-            dir.join("run.sqlite").to_str().expect("UTF-8 run path"),
-        )
-        .expect("approximate run leaves a finished readable database");
+        let reader =
+            StorageReader::open_finished(dir.join("run.sqlite").to_str().expect("UTF-8 run path"))
+                .expect("approximate run leaves a finished readable database");
         let persisted = reader.run_manifest().expect("durable run manifest");
         let stored: serde_json::Value =
             serde_json::from_str(&persisted.manifest_json).expect("durable manifest JSON");

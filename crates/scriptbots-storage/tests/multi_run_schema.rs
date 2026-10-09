@@ -295,9 +295,8 @@ fn with_sensing_policy(mut record: RunManifestRecord, approximate: bool) -> RunM
             ]);
             value["warnings"] = warnings.clone();
             value["build"]["warnings"] = warnings;
-            value["limitations"]["comparison_lane"] = serde_json::json!(
-                "same pinned test lane; approximate GPU sensing"
-            );
+            value["limitations"]["comparison_lane"] =
+                serde_json::json!("same pinned test lane; approximate GPU sensing");
         }
     });
     record
@@ -1221,7 +1220,8 @@ fn v3_manifest_validation_rejects_incomplete_rng_and_provenance() {
     });
     let error = manifest_validation_error(false_completeness);
     assert!(
-        error.contains("/build/provenance_complete") && error.contains("embedded evidence derives true"),
+        error.contains("/build/provenance_complete")
+            && error.contains("embedded evidence derives true"),
         "unexpected error: {error}"
     );
 
