@@ -57,8 +57,8 @@ report_contract = {
     "compare-runs", "metric-distribution", "phenotype-interactions", "lineage-fitness",
     "lineage-structure", "dynasty-communities", "interaction-centrality", "narrative-validate",
 }
-assert len(declared) == len(required) == len(report_contract)
-assert set(declared) == set(required) == report_contract
+assert len(declared) == len(required) == len(report_contract), "missing or substituted required report"
+assert set(declared) == set(required) == report_contract, "missing or substituted required report"
 reports = {r["name"]: r for r in real["reports"]}
 assert len(reports) == len(real["reports"]) and set(reports) == set(declared)
 invariants = {i["invariant"]: i for i in fixture["invariants"]}
@@ -80,7 +80,7 @@ artifacts.append(database)
 for name, report in reports.items():
     assert report["exit_code"] == 0 and report["command"]
     path = pathlib.Path(report["json_path"])
-    assert digest(path) == report["json_blake3"]
+    assert digest(path) == report["json_blake3"], "changed retained report bytes"
     output = json.loads(path.read_text())
     assert output["schema_version"] == report["schema_version"]
     assert output["report"] == name and output["db_path"] == real["database"]
@@ -125,6 +125,92 @@ if [[ ${1:-} == --verify-evidence ]]; then
   verify_manifest "$2" "$3" verify
   exit 0
 fi
+if [[ ${1:-} == --falsify-evidence ]]; then
+  [[ $# == 4 && $2 = /* && $4 = /* && ! -e $4 ]] || fail "usage: --falsify-evidence ACCEPTED_DIRECTORY ARTIFACT_SOURCE FRESH_OUTPUT_DIRECTORY"
+  [[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || fail "DSR native profile required"
+  [[ $(git rev-parse HEAD) == "${SCRIPTBOTS_EXPECTED_COMMIT:-}" && -z $(git status --porcelain --untracked-files=all) ]] || fail "dirty or mismatched verifier source"
+  case "$4/" in "$repo_root/"*) fail "negative fixtures must be external" ;; esac
+  python3 - "$repo_root/scripts/e2e_analytics.sh" "$2" "$3" "$4" "$SCRIPTBOTS_EXPECTED_COMMIT" <<'PY'
+import hashlib, json, pathlib, shutil, subprocess, sys
+
+script, accepted, source, output, verifier_source = sys.argv[1:]
+accepted, output = pathlib.Path(accepted), pathlib.Path(output)
+output.mkdir()
+def check(directory, label):
+    command = ["bash", script, "--verify-evidence", str(directory), source]
+    result = subprocess.run(command, capture_output=True, text=True)
+    (output / f"{label}.stdout.log").write_text(result.stdout)
+    (output / f"{label}.stderr.log").write_text(result.stderr)
+    return command, result
+positive_command, positive = check(accepted, "positive")
+assert positive.returncode == 0, positive.stderr
+fixture = json.loads((accepted / "fixture.json").read_text())
+real = json.loads((accepted / "real-world.json").read_text())
+reports = [report["name"] for report in real["reports"]]
+invariants = [invariant["invariant"] for invariant in fixture["invariants"]]
+cases = [("fixture_only", None), ("missing_named_test", None), ("changed_report", None)]
+cases += [("missing_report", name) for name in reports]
+cases += [("missing_invariant", name) for name in invariants]
+observations = []
+for index, (kind, name) in enumerate(cases):
+    directory = output / f"{index:02d}-{kind}"
+    directory.mkdir()
+    for filename in ("fixture.json", "real-world.json", "tests.list.log", "tests.log", "verdict.json", "artifacts.sha256"):
+        if kind != "fixture_only" or filename != "real-world.json":
+            shutil.copyfile(accepted / filename, directory / filename)
+    expected_error = {
+        "fixture_only": "real-world.json",
+        "missing_named_test": "missing named pipeline test",
+        "changed_report": "changed retained report bytes",
+        "missing_report": "missing or substituted required report",
+        "missing_invariant": "missing or substituted ground-truth invariant",
+    }[kind]
+    if kind == "missing_named_test":
+        declarations = (directory / "tests.list.log").read_text()
+        declarations = "\n".join(line for line in declarations.splitlines()
+                                 if not line.startswith("report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth:")) + "\n"
+        (directory / "tests.list.log").write_text(declarations)
+    elif kind == "changed_report":
+        changed = json.loads((directory / "real-world.json").read_text())
+        report = changed["reports"][0]
+        copied = directory / "changed-report.json"
+        copied.write_bytes(pathlib.Path(report["json_path"]).read_bytes() + b"\n")
+        report["json_path"] = str(copied)
+        (directory / "real-world.json").write_text(json.dumps(changed))
+    elif kind == "missing_report":
+        changed = json.loads((directory / "fixture.json").read_text())
+        stage = next(stage for stage in changed["stages"] if stage["stage"] == "report_suite_execution")
+        for key in ("reports_executed", "required_reports"):
+            stage["details"][key] = [report for report in stage["details"][key] if report != name]
+        (directory / "fixture.json").write_text(json.dumps(changed))
+        changed = json.loads((directory / "real-world.json").read_text())
+        changed["reports"] = [report for report in changed["reports"] if report["name"] != name]
+        (directory / "real-world.json").write_text(json.dumps(changed))
+    elif kind == "missing_invariant":
+        changed = json.loads((directory / "fixture.json").read_text())
+        changed["invariants"] = [invariant for invariant in changed["invariants"] if invariant["invariant"] != name]
+        (directory / "fixture.json").write_text(json.dumps(changed))
+    label = directory.name
+    command, refused = check(directory, label)
+    assert refused.returncode != 0 and expected_error in refused.stderr, (kind, name, refused.stderr)
+    observations.append({"case": kind, "omitted_identity": name, "command": command,
+                         "exit_code": refused.returncode, "stderr_path": str(output / f"{label}.stderr.log")})
+command, after = check(accepted, "positive-after")
+assert after.returncode == 0, after.stderr
+artifact_hashes = "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}\n"
+                          for path in sorted(output.rglob("*")) if path.is_file())
+(output / "artifacts.sha256").write_text(artifact_hashes)
+(output / "verdict.json").write_text(json.dumps({
+    "schema": "scriptbots.analytics-falsification.v1", "status": "pass",
+    "artifact_source": source, "verifier_source": verifier_source,
+    "positive_before_exit": positive.returncode, "positive_after_exit": after.returncode,
+    "required_report_names": reports, "required_invariant_names": invariants,
+    "rejected_cases": observations,
+}, indent=2))
+print(f"Observed {len(observations)} refused mutations and unchanged accepted evidence.")
+PY
+  exit 0
+fi
 if [[ ${1:-} != --inside-dsr ]]; then
   [[ $# == 2 ]] || fail "usage: PROFILE UNIQUE_VERSION (pinned DSR configuration required)"
   exec bash scripts/dsr_verify.sh --run "$1" "$2"
@@ -153,4 +239,5 @@ sha256sum --check "$out_dir/artifacts.sha256"
 jq -n --arg source "$SCRIPTBOTS_EXPECTED_COMMIT" --argjson tests "$declared_tests" \
   '{schema:"scriptbots.analytics-proof.v1",status:"pass",source:$source,executed_tests:$tests,scope:"synthetic statistical fixture plus real seeded-world reports, analyzer CLI and verified Parquet; original remaining acceptance is recorded in real-world.json"}' \
   > "$out_dir/verdict.json"
+bash "$repo_root/scripts/e2e_analytics.sh" --falsify-evidence "$out_dir" "$SCRIPTBOTS_EXPECTED_COMMIT" "$out_dir/falsification"
 printf 'e2e_analytics: observed %s passing tests; retained evidence at %s\n' "$declared_tests" "$out_dir"

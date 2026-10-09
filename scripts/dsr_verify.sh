@@ -72,6 +72,19 @@ verify_evidence() {
     fi
     if [[ "$lane" == analytics || "$lane" == tournament-smoke-and-analytics ]]; then
         bash scripts/e2e_analytics.sh --verify-evidence "$directory/analytics" "$expected" || refuse "missing, changed or mismatched analytics observations"
+        jq -e --arg source "$expected" '
+            .schema == "scriptbots.analytics-falsification.v1" and .status == "pass"
+            and .artifact_source == $source and .verifier_source == $source
+            and .positive_before_exit == 0 and .positive_after_exit == 0
+            and (.required_report_names | length) == (.required_report_names | unique | length)
+            and (.required_invariant_names | length) == (.required_invariant_names | unique | length)
+            and (.rejected_cases | length) == ((.required_report_names | length) + (.required_invariant_names | length) + 3)
+            and all(.rejected_cases[]; .exit_code != 0)
+            and ([.rejected_cases[] | select(.case == "missing_report") | .omitted_identity] | sort) == (.required_report_names | sort)
+            and ([.rejected_cases[] | select(.case == "missing_invariant") | .omitted_identity] | sort) == (.required_invariant_names | sort)
+            and ([.rejected_cases[] | select(.omitted_identity == null) | .case] | sort) == ["changed_report", "fixture_only", "missing_named_test"]
+        ' "$directory/analytics/falsification/verdict.json" >/dev/null || refuse "missing analytics mutation refusals"
+        sha256sum --check "$directory/analytics/falsification/artifacts.sha256" >/dev/null || refuse "changed analytics mutation evidence"
     fi
 }
 
