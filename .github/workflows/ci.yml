@@ -446,7 +446,7 @@ jobs:
           grep -F "NATIVE-vs-WASM divergence" "$LOG"
           grep -F "first divergence at tick 1" "$LOG"
           grep -F "agent[0]" "$LOG"
-          grep -F 'field `position.x`' "$LOG"
+          grep -F "field \`position.x\`" "$LOG"
           grep -F "config_hash=" "$LOG"
 
       - name: wasm-pack test (headless Chrome)
@@ -819,6 +819,94 @@ jobs:
       - name: Run wire-level REST+MCP control-plane acceptance probe (bd-6mus)
         run: bash scripts/e2e_control_plane.sh
 
-      - name: Run real-process control-plane E2E probe (bd-0n87)
-        run: bash scripts/e2e_real_process_control.sh
+  source_bound_dsr:
+    name: Source-bound DSR (${{ matrix.lane }})
+    # DSR and its declared native host are provisioned on this controller.
+    # No hosted Cargo result substitutes for a missing DSR execution.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, scriptbots-dsr]
+    timeout-minutes: 130
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [connectivity, tournament-smoke-and-analytics]
+    env:
+      SCRIPTBOTS_DSR_BASE_CONFIG_DIR: ${{ vars.SCRIPTBOTS_DSR_BASE_CONFIG_DIR }}
+      SCRIPTBOTS_DSR_LINUX_HOST: ${{ vars.SCRIPTBOTS_DSR_LINUX_HOST }}
+      SCRIPTBOTS_CI_LANE: ${{ matrix.lane }}
+      SCRIPTBOTS_CI_SOURCE: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+          clean: false
+          persist-credentials: false
+
+      - name: Materialize a unique expected-source DSR profile
+        id: profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SCRIPTBOTS_CI_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SCRIPTBOTS_DSR_BASE_CONFIG_DIR" = /* ]]
+          [[ "$SCRIPTBOTS_DSR_LINUX_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]
+          command -v dsr
+          command -v yq
+          ci_root="$(mktemp -d "$RUNNER_TEMP/scriptbots-dsr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SCRIPTBOTS_CI_LANE}.XXXXXX")"
+          export ci_source="$ci_root/source" ci_config="$ci_root/dsr"
+          export ci_proofs="$ci_root/proofs" ci_target="$ci_root/cargo-target"
+          export ci_profile_name="scriptbots-ci-${SCRIPTBOTS_CI_LANE}"
+          export ci_profile="$ci_config/repos.d/$ci_profile_name.yaml"
+          mkdir -p "$ci_config/repos.d" "$ci_proofs" "$ci_target" "$ci_root/empty-cargo-home"
+          cp "$SCRIPTBOTS_DSR_BASE_CONFIG_DIR/config.yaml" "$ci_config/config.yaml"
+          cp "$SCRIPTBOTS_DSR_BASE_CONFIG_DIR/hosts.yaml" "$ci_config/hosts.yaml"
+          git init --initial-branch=main "$ci_source"
+          git -C "$ci_source" fetch --no-tags "$GITHUB_WORKSPACE" "$SCRIPTBOTS_CI_SOURCE"
+          git -C "$ci_source" switch -c main FETCH_HEAD
+          cp "$ci_source/ci/dsr_verify.yaml" "$ci_profile"
+          yq -i '
+            .tool_name = strenv(ci_profile_name) |
+            .local_path = strenv(ci_source) |
+            .cross_compile."linux/amd64".host = strenv(SCRIPTBOTS_DSR_LINUX_HOST) |
+            .env.SCRIPTBOTS_EXPECTED_COMMIT = strenv(SCRIPTBOTS_CI_SOURCE) |
+            .env.SCRIPTBOTS_VERIFY_PROFILE = strenv(ci_profile) |
+            .env.SCRIPTBOTS_PROOF_ROOT = strenv(ci_proofs) |
+            .env.SCRIPTBOTS_VERIFY_LANE = strenv(SCRIPTBOTS_CI_LANE) |
+            .env.CARGO_TARGET_DIR = strenv(ci_target) |
+            .env.CARGO_PROFILE_DEV_DEBUG = "0" |
+            .env.CARGO_PROFILE_TEST_DEBUG = "0" |
+            .env.DSR_BUILD_TIMEOUT = "7200"
+          ' "$ci_profile"
+          printf 'config=%s\nprofile=%s\nversion=%s\nproofs=%s\ncargo_home=%s\nsource=%s\n' \
+            "$ci_config" "$ci_profile_name" "ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SCRIPTBOTS_CI_LANE}-${SCRIPTBOTS_CI_SOURCE:0:12}" \
+            "$ci_proofs" "$ci_root/empty-cargo-home" "$ci_source" >> "$GITHUB_OUTPUT"
+
+      - name: Execute and parse the complete pinned DSR lane
+        shell: bash
+        env:
+          DSR_CONFIG_DIR: ${{ steps.profile.outputs.config }}
+          CARGO_HOME: ${{ steps.profile.outputs.cargo_home }}
+          DSR_BUILD_TIMEOUT: "7200"
+          CI_PROFILE: ${{ steps.profile.outputs.profile }}
+          CI_VERSION: ${{ steps.profile.outputs.version }}
+          CI_PROOFS: ${{ steps.profile.outputs.proofs }}
+          CI_SOURCE_DIR: ${{ steps.profile.outputs.source }}
+        run: |
+          set -euo pipefail
+          cd "$CI_SOURCE_DIR"
+          if [[ "$SCRIPTBOTS_CI_LANE" == connectivity ]]; then
+            bash scripts/e2e_real_process_control.sh "$CI_PROFILE" "$CI_VERSION" 2>&1 | tee "$CI_PROOFS/dsr-launch.log"
+            bash scripts/e2e_experiment_checkpoint_artifacts.sh --verify-evidence "$CI_PROOFS/$CI_VERSION" "$SCRIPTBOTS_CI_SOURCE"
+          else
+            bash scripts/dsr_verify.sh --run "$CI_PROFILE" "$CI_VERSION" 2>&1 | tee "$CI_PROOFS/dsr-launch.log"
+          fi
+
+      - name: Retain DSR profiles, commands, raw logs and typed observations
+        if: always() && steps.profile.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dsr-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.profile.outputs.proofs }}/
+          if-no-files-found: error
 

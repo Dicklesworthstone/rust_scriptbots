@@ -1211,6 +1211,19 @@ SQL, and probes missing, empty and corrupt databases plus an unknown report.
 Its manifest names the remaining real intervention, narrative-search and
 interaction-export acceptance; a passing lane does not close those requirements.
 
+CI's `source_bound_dsr` matrix connects the complete `connectivity` and
+`tournament-smoke-and-analytics` lanes to the existing DSR runner. It requires a
+controller labelled `self-hosted`, `linux`, `x64`, `scriptbots-dsr`, with DSR,
+`yq`, and the pinned native toolchain installed. Set the repository variables
+`SCRIPTBOTS_DSR_BASE_CONFIG_DIR` to an external directory containing the actual
+DSR `config.yaml` and `hosts.yaml`, and `SCRIPTBOTS_DSR_LINUX_HOST` to the declared
+native host key. Each job materializes a separate profile and clean `main` copy
+at the event's exact source, uses a unique proof version, parses the complete
+lane evidence, and uploads its raw logs and observations even after a failed run.
+Unprovisioned controllers leave execution pending; workflow wiring does not prove
+that CI ran. The original wire-level control probe remains a separate CI job.
+This matrix covers bounded tournament smoke, not the full publication protocol.
+
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.
