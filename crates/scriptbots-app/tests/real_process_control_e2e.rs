@@ -38,6 +38,37 @@ fn http_with_body(
     body_bytes: &[u8],
     content_type: Option<&str>,
 ) -> Result<(u16, String)> {
+    http_with_headers(
+        addr,
+        method,
+        path,
+        body_bytes,
+        content_type,
+        &[("Host", &addr.to_string())],
+    )
+}
+
+fn http_with_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body_bytes: &[u8],
+    content_type: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Result<(u16, String)> {
+    let (status, _, body) =
+        http_with_response_headers(addr, method, path, body_bytes, content_type, headers)?;
+    Ok((status, body))
+}
+
+fn http_with_response_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body_bytes: &[u8],
+    content_type: Option<&str>,
+    headers: &[(&str, &str)],
+) -> Result<(u16, String, String)> {
     let mut stream = TcpStream::connect(addr)
         .with_context(|| format!("connect failed for {method} {path} to {addr}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(20)))?;
@@ -45,9 +76,13 @@ fn http_with_body(
         Some(ct) => format!("Content-Type: {ct}\r\n"),
         None => String::new(),
     };
+    write!(stream, "{method} {path} HTTP/1.1\r\n")?;
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{ct_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "{ct_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body_bytes.len()
     )
     .with_context(|| format!("write header failed for {method} {path} to {addr}"))?;
@@ -74,7 +109,7 @@ fn http_with_body(
         .ok_or_else(|| anyhow!("no status line in {head:?} for {method} {path}"))?
         .parse()
         .with_context(|| format!("parse status line for {method} {path}"))?;
-    Ok((status, body.to_string()))
+    Ok((status, head.to_string(), body.to_string()))
 }
 
 fn http(addr: SocketAddr, method: &str, path: &str) -> Result<(u16, String)> {
@@ -297,6 +332,7 @@ fn wait_for_control_addresses(child: &mut Child, timeout: Duration) -> Result<Se
 #[serial]
 fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screenshot() -> Result<()> {
     let run_dir = tempdir()?;
+    let artifacts_dir = run_dir.path().join("artifacts");
 
     let mut child = Command::new(binary())
         .args(["--mode", "server", "--storage", "memory"])
@@ -305,6 +341,9 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
         .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_CONTROL_MCP", "http")
         .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES", "lab.example:8080")
+        .env("SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS", "https://lab.example")
+        .env("SCRIPTBOTS_ARTIFACTS_DIR", &artifacts_dir)
         // Narrow the filter deliberately: at bare `info` the fsqlite statement-reuse
         // telemetry emits thousands of lines and the listener announcement is
         // drowned in them, which is how the first run of this test timed out.
@@ -419,6 +458,211 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
             "pause must freeze world ticks; got {tick1} then {tick2}"
         );
 
+        // Both actual listeners enforce request targeting before command/body admission.
+        let authority = rest_addr.to_string();
+        let own_origin = format!("http://{authority}");
+        let (_, before_checkpoints) = http(rest_addr, "GET", "/api/v1/checkpoints")?;
+        let (_, before_artifacts) = http(rest_addr, "GET", "/api/v1/artifacts")?;
+        let (_, before_experiments) = http(rest_addr, "GET", "/api/v1/experiments")?;
+        assert_eq!(std::fs::read_dir(&artifacts_dir)?.count(), 0);
+        let rejected_headers = [
+            vec![("Host", "foreign.example:8080")],
+            vec![("Host", "127.0.0.1:1")],
+            vec![
+                ("Host", authority.as_str()),
+                ("Origin", "https://foreign.example"),
+            ],
+            vec![("Host", authority.as_str()), ("Origin", "null")],
+            vec![
+                ("Host", authority.as_str()),
+                ("Origin", own_origin.as_str()),
+                ("Origin", "https://foreign.example"),
+            ],
+            vec![
+                ("Host", authority.as_str()),
+                ("X-Forwarded-Host", authority.as_str()),
+            ],
+        ];
+        for headers in &rejected_headers {
+            for (path, payload) in [
+                ("/api/control/step", br#"{"count":1}"#.as_slice()),
+                ("/api/v1/checkpoints", b"{}".as_slice()),
+                ("/api/v1/experiments", br#"{"variants":[{"variant_id":"mlp","brain_family":"mlp"}],"seeds":[1],"ticks_per_run":5}"#.as_slice()),
+            ] {
+                let (code, body) = http_with_headers(
+                    rest_addr,
+                    "POST",
+                    path,
+                    payload,
+                    Some("application/json"),
+                    headers,
+                )?;
+                assert_eq!(code, 403, "rejected {path}: {body}");
+                println!("HTTP_POLICY_REJECTION: {}", serde_json::json!({
+                    "listener": rest_addr, "method": "POST", "path": path,
+                    "headers": headers, "status": code,
+                }));
+            }
+        }
+        let (code, body) = http_with_headers(
+            rest_addr,
+            "GET",
+            "http://foreign.example/api/status",
+            &[],
+            None,
+            &[("Host", &authority)],
+        )?;
+        assert_eq!(code, 403, "absolute-form foreign target: {body}");
+        for headers in [
+            vec![],
+            vec![("Host", "not a valid authority")],
+            vec![("Host", authority.as_str()), ("Host", authority.as_str())],
+        ] {
+            let (code, body) = http_with_headers(
+                rest_addr,
+                "POST",
+                "/api/control/step",
+                br#"{"count":1}"#,
+                Some("application/json"),
+                &headers,
+            )?;
+            assert!(matches!(code, 400 | 403), "invalid Host: {code} {body}");
+        }
+        let (code, body) = http_with_headers(
+            rest_addr,
+            "GET",
+            "/api/ws/stream",
+            &[],
+            None,
+            &[
+                ("Host", &authority),
+                ("Origin", "https://foreign.example"),
+                ("Upgrade", "websocket"),
+                ("Sec-WebSocket-Version", "13"),
+                ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+        )?;
+        assert_eq!(code, 403, "WebSocket foreign origin: {body}");
+        let (code, response_headers, body) = http_with_response_headers(
+            rest_addr,
+            "OPTIONS",
+            "/api/control/step",
+            &[],
+            None,
+            &[
+                ("Host", &authority),
+                ("Origin", &own_origin),
+                ("Access-Control-Request-Method", "POST"),
+                ("Access-Control-Request-Headers", "content-type"),
+            ],
+        )?;
+        assert_eq!(code, 204, "accepted browser preflight: {body}");
+        assert!(
+            response_headers
+                .to_ascii_lowercase()
+                .contains(&format!("access-control-allow-origin: {own_origin}"))
+        );
+        for headers in [
+            vec![("Access-Control-Request-Method", "DELETE")],
+            vec![
+                ("Access-Control-Request-Method", "POST"),
+                ("Access-Control-Request-Method", "GET"),
+            ],
+            vec![
+                ("Access-Control-Request-Method", "POST"),
+                ("Access-Control-Request-Headers", "x-unconfigured"),
+            ],
+            vec![
+                ("Access-Control-Request-Method", "POST"),
+                ("Access-Control-Request-Headers", "content-type"),
+                ("Access-Control-Request-Headers", "accept"),
+            ],
+        ] {
+            let mut request_headers = vec![
+                ("Host", authority.as_str()),
+                ("Origin", own_origin.as_str()),
+            ];
+            request_headers.extend(headers);
+            let (code, body) = http_with_headers(
+                rest_addr,
+                "OPTIONS",
+                "/api/control/step",
+                &[],
+                None,
+                &request_headers,
+            )?;
+            assert_eq!(code, 403, "unsupported preflight: {body}");
+        }
+        for (key, before) in [
+            ("checkpoints", before_checkpoints),
+            ("artifacts", before_artifacts),
+            ("experiments", before_experiments),
+        ] {
+            let (_, after) = http(rest_addr, "GET", &format!("/api/v1/{key}"))?;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&before)?,
+                serde_json::from_str::<serde_json::Value>(&after)?,
+                "rejected requests changed {key}"
+            );
+        }
+        let (_, after_status) = http(rest_addr, "GET", "/api/status")?;
+        let after_status: serde_json::Value = serde_json::from_str(&after_status)?;
+        assert_eq!(std::fs::read_dir(&artifacts_dir)?.count(), 0);
+        for field in [
+            "tick",
+            "agent_count",
+            "config_revision",
+            "last_applied_command",
+            "command_queue_depth",
+        ] {
+            assert_eq!(
+                after_status.get(field).expect("observed status field"),
+                f2.get(field).expect("observed original status field"),
+                "rejected requests changed {field}"
+            );
+        }
+        for (listener, path) in [(rest_addr, "/api/status"), (mcp_addr, "/health")] {
+            let authority = listener.to_string();
+            for origin in [None, Some("https://lab.example")] {
+                let mut headers = vec![("Host", authority.as_str())];
+                if let Some(origin) = origin {
+                    headers.push(("Origin", origin));
+                }
+                let (code, body) = http_with_headers(listener, "GET", path, &[], None, &headers)?;
+                assert_eq!(code, 200, "accepted configured client: {body}");
+            }
+            let (code, body) = http_with_headers(
+                listener,
+                "GET",
+                path,
+                &[],
+                None,
+                &[("Host", "lab.example:8080")],
+            )?;
+            assert_eq!(code, 200, "accepted advertised authority: {body}");
+        }
+        let mcp_authority = mcp_addr.to_string();
+        for headers in [
+            vec![("Host", "foreign.example:8080")],
+            vec![
+                ("Host", mcp_authority.as_str()),
+                ("Origin", "https://foreign.example"),
+            ],
+        ] {
+            let (code, body) = http_with_headers(
+                mcp_addr,
+                "POST",
+                "/mcp",
+                b"not JSON",
+                Some("application/json"),
+                &headers,
+            )?;
+            assert_eq!(
+                code, 403,
+                "MCP policy must run before JSON decoding: {body}"
+            );
+        }
+
         // (4) Single step: exactly one tick, remains paused
         let (step_code, step_body) = http_with_body(
             rest_addr,
@@ -428,6 +672,30 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
             Some("application/json"),
         )?;
         assert_eq!(step_code, 200, "step must be accepted: {step_body}");
+        let pause_receipt: serde_json::Value = serde_json::from_str(&receipt_body)?;
+        let step_receipt: serde_json::Value = serde_json::from_str(&step_body)?;
+        let pause_sequence = pause_receipt["admission_sequence"]
+            .as_u64()
+            .expect("observed pause admission");
+        let step_sequence = step_receipt["admission_sequence"]
+            .as_u64()
+            .expect("observed step admission");
+        assert_eq!(
+            step_sequence,
+            pause_sequence + 1,
+            "rejected requests must admit zero owner commands"
+        );
+        println!(
+            "HTTP_POLICY_STATE: {}",
+            serde_json::json!({
+                "rest_listener": rest_addr, "mcp_listener": mcp_addr,
+                "advertised_authority": "lab.example:8080",
+                "configured_origin": "https://lab.example",
+                "before": f2, "after": after_status,
+                "pause_admission": pause_sequence, "next_admission": step_sequence,
+                "artifact_directory_entries": std::fs::read_dir(&artifacts_dir)?.count(),
+            })
+        );
         let step_id = json_str(&step_body, "command_id")
             .ok_or_else(|| anyhow!("step response carried no command_id: {step_body}"))?;
 

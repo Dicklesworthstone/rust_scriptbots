@@ -279,6 +279,68 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
     );
     reader.close().expect("reader closes");
 
+    // Export and verify through separate shipped application processes. Then read the
+    // copied database independently, including the actual science rows and durability.
+    let bundle_dir = temp_dir.path().join("portable-run");
+    let created = base_command(env!("CARGO_BIN_EXE_scriptbots-app"))
+        .arg("--create-bundle")
+        .arg(&baseline_db)
+        .arg("--bundle-output")
+        .arg(&bundle_dir)
+        .output()
+        .expect("bundle export process runs");
+    println!("BUNDLE_CREATE_STDOUT:\n{}", stdout_text(&created));
+    println!("BUNDLE_CREATE_STDERR:\n{}", stderr_text(&created));
+    assert!(
+        created.status.success(),
+        "bundle create: {}",
+        stderr_text(&created)
+    );
+    let verified = base_command(env!("CARGO_BIN_EXE_scriptbots-app"))
+        .arg("--verify-bundle")
+        .arg(&bundle_dir)
+        .output()
+        .expect("bundle verification process runs");
+    println!("BUNDLE_VERIFY_STDOUT:\n{}", stdout_text(&verified));
+    println!("BUNDLE_VERIFY_STDERR:\n{}", stderr_text(&verified));
+    assert!(
+        verified.status.success(),
+        "bundle verify: {}",
+        stderr_text(&verified)
+    );
+    let source = StorageReader::open_finished(&db_display).expect("finished source");
+    let copied = StorageReader::open_finished(&bundle_dir.join("run.db").to_string_lossy())
+        .expect("independent portable database opens without source sidecars");
+    assert_eq!(
+        copied.run_manifest().expect("copied manifest"),
+        source.run_manifest().expect("source manifest")
+    );
+    assert_eq!(
+        copied.persistence_watermarks().expect("copied watermarks"),
+        source.persistence_watermarks().expect("source watermarks")
+    );
+    assert_eq!(
+        copied
+            .run_ledger_summary()
+            .expect("copied ledger")
+            .tick_count,
+        ledger.tick_count
+    );
+    assert_eq!(
+        copied.load_replay_events().expect("copied replay"),
+        recorded_replay
+    );
+    assert_eq!(
+        copied.load_checkpoints().expect("copied checkpoints"),
+        source.load_checkpoints().expect("source checkpoints")
+    );
+    assert_eq!(
+        copied.recent_metrics(8).expect("copied metrics").len(),
+        metrics.len()
+    );
+    copied.close().expect("copied reader closes");
+    source.close().expect("source reader closes");
+
     // ------------------------------------------------------------------
     // Phase 3: CSV export boundary — headers, order, and counts.
     // ------------------------------------------------------------------

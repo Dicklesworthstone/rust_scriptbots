@@ -9648,6 +9648,91 @@ impl StorageReader {
         Self::open_finished_selected(path, Some(run_id))
     }
 
+    /// Copy the leased, checkpointed main image without opening the source path again.
+    /// WAL/journal data is refused rather than checkpointing or changing the source.
+    pub(crate) fn materialize_finished_database(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), StorageError> {
+        use std::io::Seek as _;
+
+        let lease = self
+            ._finished_run_lease
+            .as_ref()
+            .ok_or(StorageError::InvalidData {
+                context: "storage.bundle_source",
+                reason: "bundle materialization requires a finished-run reader lease".to_owned(),
+            })?;
+        if !lease._identity.identity_is_enforceable {
+            return Err(StorageError::InvalidData {
+                context: "storage.bundle_source",
+                reason: "bundle materialization requires a stable filesystem identity".to_owned(),
+            });
+        }
+        let source_text = source.to_str().ok_or(StorageError::InvalidData {
+            context: "storage.bundle_source",
+            reason: "database path must be UTF-8".to_owned(),
+        })?;
+        let verify_source = || {
+            self.require_finished_bundle_state()?;
+            lease
+                ._identity
+                .bind_connection(self.connection()?, source_text)?;
+            for suffix in ["-wal", "-journal"] {
+                let mut name = source.as_os_str().to_owned();
+                name.push(suffix);
+                let sidecar = PathBuf::from(name);
+                match fs::symlink_metadata(&sidecar) {
+                    Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+                    Ok(_) => {
+                        return Err(StorageError::InvalidTarget {
+                            path: source_text.to_owned(),
+                            reason: format!(
+                                "finished bundle export requires checkpointed storage; sidecar {} is nonempty or not a regular file",
+                                sidecar.display()
+                            ),
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(StorageError::Filesystem {
+                            operation: "inspect bundle source sidecar",
+                            path: sidecar,
+                            source,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        };
+        verify_source()?;
+        ensure_no_storage_sidecars(destination)?;
+        let copy = || -> io::Result<()> {
+            let mut input = lease._identity._file.try_clone()?;
+            input.rewind()?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            let copied = io::copy(&mut input, &mut output)?;
+            if copied != input.metadata()?.len() {
+                return Err(io::Error::other("source length changed during bundle copy"));
+            }
+            output.sync_all()
+        };
+        copy().map_err(|source| StorageError::Filesystem {
+            operation: "materialize finished bundle database",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        verify_source()
+    }
+
+    pub(crate) fn require_finished_bundle_state(&self) -> Result<(), StorageError> {
+        Storage::require_all_runs_fully_durable(self.finished_connection()?)
+    }
+
     fn open_finished_selected(
         path: &str,
         requested_run_id: Option<RunId>,

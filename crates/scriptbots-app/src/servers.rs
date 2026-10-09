@@ -12,8 +12,9 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::sse::{Event, Sse};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Request, State},
+    http::{HeaderMap, StatusCode, Uri, Version},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -131,6 +132,10 @@ pub struct ControlServerConfig {
     pub database_path: Option<PathBuf>,
     /// Records API-created checkpoints through the run's storage worker.
     pub checkpoint_writer: Option<scriptbots_storage::StorageCheckpointWriter>,
+    /// Additional advertised HTTP authorities, including ports. Wildcard binds require these.
+    pub allowed_authorities: Vec<String>,
+    /// Additional browser origins as http(s)://host:port, without paths or credentials.
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for ControlServerConfig {
@@ -147,6 +152,8 @@ impl Default for ControlServerConfig {
             presented_frame: empty_presented_frame(),
             database_path: None,
             checkpoint_writer: None,
+            allowed_authorities: Vec::new(),
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -156,6 +163,26 @@ impl ControlServerConfig {
     /// for validation at the launch/reservation boundary.
     pub fn from_env() -> Self {
         let mut config = Self::default();
+
+        for (name, values) in [
+            (
+                "SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES",
+                &mut config.allowed_authorities,
+            ),
+            (
+                "SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS",
+                &mut config.allowed_origins,
+            ),
+        ] {
+            if let Some(raw) = read_control_environment(name, &mut config.environment_errors) {
+                if !raw.trim().is_empty() {
+                    *values = raw
+                        .split(',')
+                        .map(|value| value.trim().to_owned())
+                        .collect();
+                }
+            }
+        }
 
         if let Some(addr) = read_control_environment(
             "SCRIPTBOTS_CONTROL_REST_ADDR",
@@ -265,15 +292,241 @@ impl ControlServerConfig {
     }
 
     fn validate_environment(&self) -> Result<()> {
-        if self.environment_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow!(
+        if !self.environment_errors.is_empty() {
+            return Err(anyhow!(
                 "invalid control server environment: {}",
                 self.environment_errors.join("; ")
-            ))
+            ));
+        }
+        for authority in &self.allowed_authorities {
+            canonical_http_authority(authority, 80).ok_or_else(|| {
+                anyhow!("SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES contains a malformed authority")
+            })?;
+        }
+        for origin in &self.allowed_origins {
+            canonical_http_origin(origin).ok_or_else(|| {
+                anyhow!("SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS contains a malformed origin")
+            })?;
+        }
+        let wildcard = self.rest_enabled && self.rest_address.ip().is_unspecified()
+            || matches!(self.mcp_transport, McpTransportConfig::Http { bind_address } if bind_address.ip().is_unspecified());
+        if wildcard && self.allowed_authorities.is_empty() {
+            return Err(anyhow!(
+                "wildcard control listeners require SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES with advertised host:port values"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn canonical_http_authority(value: &str, default_port: u16) -> Option<String> {
+    let authority = value.parse::<axum::http::uri::Authority>().ok()?;
+    let host = authority.host();
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let host = if let Ok(ip) = bare_host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        }
+    } else {
+        if host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    || !label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            return None;
+        }
+        host.to_ascii_lowercase()
+    };
+    let port = match authority.port() {
+        Some(_) => authority.port_u16()?,
+        None => default_port,
+    };
+    (port != 0).then(|| format!("{host}:{port}"))
+}
+
+fn canonical_http_origin(value: &str) -> Option<String> {
+    let (scheme, authority) = value.split_once("://")?;
+    let port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    Some(format!(
+        "{scheme}://{}",
+        canonical_http_authority(authority, port)?
+    ))
+}
+
+/// Listener-derived request targeting policy, shared by every REST and MCP HTTP route.
+#[derive(Debug, Clone)]
+struct ControlHttpPolicy {
+    authorities: std::collections::BTreeSet<String>,
+    origins: std::collections::BTreeSet<String>,
+}
+
+impl ControlHttpPolicy {
+    fn for_listener(config: &ControlServerConfig, address: SocketAddr) -> Self {
+        let mut authorities = config
+            .allowed_authorities
+            .iter()
+            .filter_map(|value| canonical_http_authority(value, 80))
+            .collect::<std::collections::BTreeSet<_>>();
+        if !address.ip().is_unspecified() {
+            authorities.insert(address.to_string());
+        }
+        if address.ip().is_loopback() {
+            authorities.insert(format!("localhost:{}", address.port()));
+        }
+        let mut origins = config
+            .allowed_origins
+            .iter()
+            .filter_map(|value| canonical_http_origin(value))
+            .collect::<std::collections::BTreeSet<_>>();
+        origins.extend(
+            authorities
+                .iter()
+                .map(|authority| format!("http://{authority}")),
+        );
+        Self {
+            authorities,
+            origins,
         }
     }
+
+    fn check(&self, headers: &HeaderMap, uri: &Uri, version: Version) -> Result<(), &'static str> {
+        if headers
+            .keys()
+            .any(|name| name == "forwarded" || name.as_str().starts_with("x-forwarded-"))
+        {
+            return Err("forwarded headers require a trusted proxy boundary; none is configured");
+        }
+        let mut hosts = headers.get_all(axum::http::header::HOST).iter();
+        let host = hosts.next();
+        if hosts.next().is_some() {
+            return Err("multiple Host headers are refused");
+        }
+        let host = match host {
+            Some(value) => value.to_str().ok(),
+            None if version == Version::HTTP_2 => {
+                uri.authority().map(axum::http::uri::Authority::as_str)
+            }
+            None => None,
+        }
+        .and_then(|value| canonical_http_authority(value, 80))
+        .ok_or("a valid Host or HTTP/2 authority is required")?;
+        if !self.authorities.contains(&host) {
+            return Err("request authority is not configured for this control listener");
+        }
+        if let Some(authority) = uri.authority() {
+            if uri.scheme_str() != Some("http")
+                || canonical_http_authority(authority.as_str(), 80).as_deref()
+                    != Some(host.as_str())
+            {
+                return Err("request target authority disagrees with Host");
+            }
+        }
+        let mut origins = headers.get_all(axum::http::header::ORIGIN).iter();
+        if let Some(origin) = origins.next() {
+            if origins.next().is_some() {
+                return Err("multiple Origin headers are refused");
+            }
+            let origin = origin
+                .to_str()
+                .ok()
+                .and_then(canonical_http_origin)
+                .ok_or("a single valid HTTP browser Origin is required")?;
+            if !self.origins.contains(&origin) {
+                return Err("browser Origin is not configured for this control listener");
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn enforce_control_http_policy(
+    State(policy): State<ControlHttpPolicy>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(reason) = policy.check(request.headers(), request.uri(), request.version()) {
+        return AppError {
+            status: StatusCode::FORBIDDEN,
+            message: reason.to_owned(),
+        }
+        .into_response();
+    }
+    let origin = request.headers().get(axum::http::header::ORIGIN).cloned();
+    let mut response = if request.method() == axum::http::Method::OPTIONS && origin.is_some() {
+        let mut methods = request
+            .headers()
+            .get_all("access-control-request-method")
+            .iter();
+        let method = methods.next().and_then(|value| value.to_str().ok());
+        let mut requested_headers = request
+            .headers()
+            .get_all("access-control-request-headers")
+            .iter();
+        let allowed_headers = match requested_headers.next() {
+            None => true,
+            Some(value) => value.to_str().is_ok_and(|headers| {
+                headers.split(',').all(|name| {
+                    matches!(
+                        name.trim().to_ascii_lowercase().as_str(),
+                        "accept" | "content-type" | "mcp-protocol-version"
+                    )
+                })
+            }),
+        };
+        if !matches!(method, Some("GET" | "HEAD" | "POST"))
+            || methods.next().is_some()
+            || requested_headers.next().is_some()
+            || !allowed_headers
+        {
+            return AppError {
+                status: StatusCode::FORBIDDEN,
+                message: "unsupported control HTTP preflight".to_owned(),
+            }
+            .into_response();
+        }
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+            axum::http::HeaderValue::from_static("GET, HEAD, POST"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            axum::http::HeaderValue::from_static("Accept, Content-Type, Mcp-Protocol-Version"),
+        );
+        response
+    } else {
+        next.run(request).await
+    };
+    if let Some(origin) = origin {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        response.headers_mut().append(
+            axum::http::header::VARY,
+            axum::http::HeaderValue::from_static("Origin"),
+        );
+    }
+    response
 }
 
 fn read_control_environment(name: &str, errors: &mut Vec<String>) -> Option<String> {
@@ -929,7 +1182,7 @@ async fn start_control_servers(
             info!("MCP control server disabled via configuration");
             None
         }
-        Some(reserved) => Some(prepare_mcp_server(handle, reserved).await?),
+        Some(reserved) => Some(prepare_mcp_server(handle, &config, reserved).await?),
     };
 
     let rest = prepared_rest.map(|prepared| {
@@ -1237,7 +1490,7 @@ pub struct SpeedRequestBody {
             PaginatedArtifactsResponse
         )
     ),
-    info(title = "ScriptBots Control API", version = "0.0.0"),
+    info(title = "ScriptBots Control API", version = "0.0.0", description = "HTTP requests require the bound listener's IP/localhost authority or SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES. Browser Origin must match a configured authority or SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS. CLI clients may omit Origin. Forwarded headers are refused; this targeting policy does not authenticate callers."),
     tags(
         (name = "control", description = "Runtime configuration controls"),
         (name = "map", description = "Procedural map generation and application controls"),
@@ -2965,7 +3218,12 @@ fn prepare_rest_server(
         .url("/api-docs/openapi.json", openapi)
         .into();
 
-    let router = Router::new().merge(api_router).merge(swagger_router);
+    let router = Router::new().merge(api_router).merge(swagger_router).layer(
+        middleware::from_fn_with_state(
+            ControlHttpPolicy::for_listener(config, reserved.address),
+            enforce_control_http_policy,
+        ),
+    );
 
     let listener = tokio::net::TcpListener::from_std(reserved.listener)
         .context("failed to adopt reserved REST listener")?;
@@ -2993,6 +3251,7 @@ async fn serve_prepared_rest_server(
 
 async fn prepare_mcp_server(
     handle: ControlHandle,
+    config: &ControlServerConfig,
     reserved: ReservedControlListener,
 ) -> Result<PreparedMcpServer> {
     info!(address = %reserved.address, "Preparing MCP HTTP server");
@@ -3040,7 +3299,11 @@ async fn prepare_mcp_server(
             notification_sender,
             request_sender,
             notifications_tx,
-        });
+        })
+        .layer(middleware::from_fn_with_state(
+            ControlHttpPolicy::for_listener(config, reserved.address),
+            enforce_control_http_policy,
+        ));
     let listener = tokio::net::TcpListener::from_std(reserved.listener)
         .context("failed to adopt reserved MCP HTTP listener")?;
 
@@ -4428,12 +4691,14 @@ mod tests {
         response
     }
 
-    const CONTROL_ENVIRONMENT_VARIABLES: [&str; 5] = [
+    const CONTROL_ENVIRONMENT_VARIABLES: &[&str] = &[
         "SCRIPTBOTS_CONTROL_REST_ADDR",
         "SCRIPTBOTS_CONTROL_SWAGGER_PATH",
         "SCRIPTBOTS_CONTROL_REST_ENABLED",
         "SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR",
         "SCRIPTBOTS_CONTROL_MCP",
+        "SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES",
+        "SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS",
     ];
 
     struct ControlEnvironmentGuard(Vec<(&'static str, Option<OsString>)>);
@@ -4441,10 +4706,11 @@ mod tests {
     impl ControlEnvironmentGuard {
         fn cleared() -> Self {
             let saved = CONTROL_ENVIRONMENT_VARIABLES
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|name| (name, env::var_os(name)))
                 .collect();
-            for name in CONTROL_ENVIRONMENT_VARIABLES {
+            for &name in CONTROL_ENVIRONMENT_VARIABLES {
                 // SAFETY: serial tests isolate these process-global environment changes.
                 unsafe { env::remove_var(name) };
             }
@@ -4464,6 +4730,140 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn http_policy_checks_ipv4_ipv6_origins_and_request_target_consistency() {
+        let config = ControlServerConfig {
+            allowed_authorities: vec!["lab.example:8080".to_owned()],
+            allowed_origins: vec!["https://lab.example".to_owned()],
+            ..ControlServerConfig::default()
+        };
+        config
+            .validate_environment()
+            .expect("declared targeting policy");
+        let uri: Uri = "/api/control/step"
+            .parse()
+            .expect("relative request target");
+        for (address, host, own_origin) in [
+            (
+                "127.0.0.1:40123",
+                "127.0.0.1:40123",
+                "http://127.0.0.1:40123",
+            ),
+            (
+                "[::1]:40123",
+                "[0:0:0:0:0:0:0:1]:40123",
+                "http://[::1]:40123",
+            ),
+        ] {
+            let policy = ControlHttpPolicy::for_listener(&config, address.parse().expect("socket"));
+            let mut headers = HeaderMap::new();
+            headers.insert("host", host.parse().expect("Host"));
+            policy
+                .check(&headers, &uri, Version::HTTP_11)
+                .expect("CLI without Origin");
+            for origin in [own_origin, "https://lab.example"] {
+                headers.insert("origin", origin.parse().expect("Origin"));
+                policy
+                    .check(&headers, &uri, Version::HTTP_11)
+                    .expect("allowed browser");
+            }
+            for origin in [
+                "null",
+                "https://foreign.example",
+                "https://lab.example/path",
+                "https://user@lab.example",
+                "http://localhost:1",
+                "https://lab.example https://other.example",
+            ] {
+                headers.insert("origin", origin.parse().expect("negative Origin"));
+                assert!(
+                    policy.check(&headers, &uri, Version::HTTP_11).is_err(),
+                    "{origin}"
+                );
+            }
+            headers.remove("origin");
+            headers.append("host", host.parse().expect("duplicate Host"));
+            assert!(policy.check(&headers, &uri, Version::HTTP_11).is_err());
+            headers.remove("host");
+            headers.insert("host", host.parse().expect("Host"));
+            headers.append("origin", own_origin.parse().expect("first Origin"));
+            headers.append(
+                "origin",
+                "https://lab.example".parse().expect("second Origin"),
+            );
+            assert!(policy.check(&headers, &uri, Version::HTTP_11).is_err());
+            headers.remove("origin");
+            let foreign: Uri = "http://foreign.example/api/control/step"
+                .parse()
+                .expect("absolute URI");
+            assert!(policy.check(&headers, &foreign, Version::HTTP_11).is_err());
+            for header in [
+                "forwarded",
+                "x-forwarded-host",
+                "x-forwarded-proto",
+                "x-forwarded-for",
+            ] {
+                headers.insert(header, "untrusted".parse().expect("proxy header"));
+                assert!(policy.check(&headers, &uri, Version::HTTP_11).is_err());
+                headers.remove(header);
+            }
+            headers.insert("upgrade", "websocket".parse().expect("upgrade header"));
+            headers.insert(
+                "origin",
+                "https://foreign.example"
+                    .parse()
+                    .expect("foreign upgrade Origin"),
+            );
+            assert!(policy.check(&headers, &uri, Version::HTTP_11).is_err());
+        }
+        let policy =
+            ControlHttpPolicy::for_listener(&config, "127.0.0.1:40123".parse().expect("socket"));
+        let headers = HeaderMap::new();
+        let h2_uri: Uri = "http://127.0.0.1:40123/api/status"
+            .parse()
+            .expect("HTTP/2 target");
+        policy
+            .check(&headers, &h2_uri, Version::HTTP_2)
+            .expect("HTTP/2 authority without Host");
+        assert!(policy.check(&headers, &uri, Version::HTTP_11).is_err());
+    }
+
+    #[test]
+    fn wildcard_and_malformed_targeting_configuration_refuse_before_reservation() {
+        let config = ControlServerConfig {
+            rest_address: "0.0.0.0:0".parse().expect("wildcard socket"),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        };
+        assert!(
+            ControlServerReservation::prepare(config.clone())
+                .err()
+                .expect("undeclared wildcard")
+                .to_string()
+                .contains("advertised")
+        );
+        let mut declared = config;
+        declared.allowed_authorities = vec!["lab.example:8080".to_owned()];
+        ControlServerReservation::prepare(declared).expect("explicit wildcard deployment");
+        for value in [
+            "",
+            "lab.example:0",
+            "lab.example:65536",
+            "user@lab.example:8080",
+            "http://lab.example:8080",
+            "lab.example:8080/path",
+        ] {
+            let config = ControlServerConfig {
+                allowed_authorities: vec![value.to_owned()],
+                ..ControlServerConfig::default()
+            };
+            assert!(
+                ControlServerReservation::prepare(config).is_err(),
+                "{value}"
+            );
         }
     }
 

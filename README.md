@@ -513,9 +513,21 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - `SCRIPTBOTS_CONTROL_REST_ENABLED` — `true|false`.
 - `SCRIPTBOTS_CONTROL_MCP` — `disabled|http` (default `http`).
 - `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR` — MCP HTTP bind address (default `127.0.0.1:8090`).
+- `SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES` — comma-separated additional advertised `host:port` values for REST and MCP HTTP. By default each listener accepts its actual bound IP/port and, for loopback, `localhost` at that port. Wildcard binds require explicit advertised authorities; a foreign or wrong-port Host is refused.
+- `SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS` — comma-separated additional browser origins such as `https://lab.example`, without credentials, paths or queries. Default browser origins are `http://` at the accepted authorities. A missing Origin is allowed for CLI/MCP clients; malformed, duplicate, foreign and `null` Origins are refused before request bodies or control/artifact work. Allowed origins receive CORS responses for GET/HEAD/POST and supported JSON/MCP headers.
+- The same request policy protects REST, Swagger, streams, WebSocket upgrades and MCP HTTP. Absolute request targets must agree with Host. Forwarded and `X-Forwarded-*` headers are refused: there is no configured trusted-proxy boundary. These checks validate request targeting and do not authenticate callers; stdio MCP is unchanged.
 - Control-server environment is validated before startup side effects. Malformed or non-Unicode control values fail closed; `https://` in either MCP transport/address setting is rejected because the embedded MCP listener is plaintext HTTP rather than silently claiming TLS.
 - `SCRIPTBOTS_STORAGE_PATH` — optional new-run FrankenSQLite file path. Without it, ScriptBots creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`. In either case the app reserves the path with create-new semantics and refuses an existing database or stale `-wal`, `-shm`, `-journal`, `-wal-fec`, or lock sidecar. A cleanly closed run keeps an empty `-wal` and its `-shm` beside the database, so remove the database together with its sidecars before reusing a path. The selected path is printed as `Run database: ...`; save that exact value for later reads and exports.
 - `SCRIPTBOTS_RECOVER_STORAGE` — existing file-backed run to repair and finalize, equivalent to `--recover-storage FILE`. Recovery exits after persistence repair; it does not resume the simulation. The core science checkpoint is a separate persistence-disabled API, while application run-bundle discovery and resume remain roadmap work.
+
+`--create-bundle RUN_DB --bundle-output DIRECTORY` exports a finished, checkpointed database
+under its existing writer/path/identity lease. The destination must be new. Live writers,
+unfinished persistence, nonempty WAL/journal files and changed/aliased source paths are refused;
+export does not checkpoint or rewrite the source. The copied database is independently opened
+and compared with the manifest, events, checkpoints, maximum tick and persistence watermarks
+before the final bundle manifest is written. `--verify-bundle DIRECTORY` repeats those logical
+checks alongside artifact hashes. Database-free experiment bundles remain valid and report
+zero persisted events/checkpoints. A failed export retains partial files without a success manifest.
 
 ### Dual-window mode (GUI)
 - ScriptBots opens two GPUI windows as one transactional launch and tiles them inside the primary display's visible frame: a flexible World window and a narrow `ScriptBots Lab` companion. The Lab does not duplicate the canvas; its Overview, Inspect, Analytics, and Timeline tabs keep one task-focused surface visible at a time, with dense diagnostics closed by default and the active section vertically scrollable. On narrow displays the pair stacks without overlap.
