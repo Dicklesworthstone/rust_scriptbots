@@ -542,6 +542,11 @@ fn main() -> Result<()> {
     };
     let control_reservation = if resolved_renderer.is_some() {
         let mut control_config = ControlServerConfig::try_from_env()?;
+        control_config.checkpoint_retention_limits =
+            scriptbots_storage::CheckpointRetentionLimits {
+                max_count: cli.checkpoint_max_count,
+                max_bytes: cli.checkpoint_max_bytes,
+            };
         control_config.scenario = Some(Arc::clone(&launch_scenario_shared));
         Some(ControlServerReservation::prepare(control_config)?)
     } else {
@@ -831,6 +836,16 @@ fn main() -> Result<()> {
         },
     )?;
     let session_id = HostSessionId::new(rand::random());
+    if let Err(error) = storage_pipeline.checkpoint_writer().configure_retention(
+        scriptbots_storage::CheckpointRetentionLimits {
+            max_count: cli.checkpoint_max_count,
+            max_bytes: cli.checkpoint_max_bytes,
+        },
+    ) {
+        return finish_with_storage(Err(error.into()), "checkpoint retention startup", || {
+            shutdown_storage(&mut storage_pipeline).map(|_| ())
+        });
+    }
     let journal = match storage_pipeline.journal_port(session_id, Default::default()) {
         Ok(journal) => journal,
         Err(error) => {
@@ -1042,40 +1057,49 @@ impl CheckpointRecorder {
             .name("scriptbots-checkpoints".to_owned())
             .spawn(move || {
                 let mut last_recorded: Option<u64> = None;
+                let mut pending = None;
                 while !thread_stop.load(Ordering::Acquire) {
                     let tick = host.snapshot_hub().latest().world.tick;
                     let due = last_recorded.map_or(tick >= interval, |last| {
                         tick >= (last / interval).saturating_add(1).saturating_mul(interval)
                     });
-                    if due {
+                    if due && pending.is_none() {
                         match host.capture_checkpoint_v1() {
                             Ok(checkpoint) => {
                                 let captured = checkpoint.tick().0;
                                 if last_recorded.is_none_or(|last| captured > last) {
-                                    let metadata =
-                                        serde_json::json!({"source": "interval", "interval": interval});
-                                    match writer.record(
-                                        &format!("auto-t{captured}"),
-                                        &checkpoint,
-                                        &metadata,
-                                    ) {
-                                        Ok(ordinal) => {
-                                            info!(tick = captured, ordinal, "recorded interval checkpoint");
-                                            last_recorded = Some(captured);
-                                            // Give the window after this checkpoint a canonical
-                                            // digest so `--checkpoint-start` replay is non-vacuous.
-                                            if let Err(error) = host.request_replay_world_digest() {
-                                                warn!(tick = captured, %error, "replay digest request refused");
-                                            }
-                                        }
-                                        Err(error) => {
-                                            warn!(tick = captured, %error, "interval checkpoint was not recorded");
-                                        }
-                                    }
+                                    pending = Some(checkpoint);
                                 }
                             }
                             Err(error) => {
                                 debug!(tick, %error, "interval checkpoint capture deferred");
+                            }
+                        }
+                    }
+                    if let Some(checkpoint) = &pending {
+                        let captured = checkpoint.tick().0;
+                        let metadata =
+                            serde_json::json!({"source": "interval", "interval": interval});
+                        match writer.record(&format!("auto-t{captured}"), checkpoint, &metadata) {
+                            Ok(ordinal) => {
+                                info!(tick = captured, ordinal, "recorded interval checkpoint");
+                                last_recorded = Some(captured);
+                                pending = None;
+                                // Give the window after this checkpoint a canonical
+                                // digest so `--checkpoint-start` replay is non-vacuous.
+                                if let Err(error) = host.request_replay_world_digest() {
+                                    warn!(tick = captured, %error, "replay digest request refused");
+                                }
+                            }
+                            Err(error) => {
+                                if matches!(
+                                    error,
+                                    scriptbots_storage::StorageError::CheckpointCapacityExceeded { .. }
+                                ) {
+                                    warn!(tick = captured, %error, disposition = "optional_capture_disabled", "interval checkpoint retention exhausted; science and controls continue");
+                                    break;
+                                }
+                                warn!(tick = captured, %error, "interval checkpoint receipt is unconfirmed; retaining exact payload for retry");
                             }
                         }
                     }
@@ -3673,6 +3697,12 @@ struct AppCli {
         default_value_t = DEFAULT_CHECKPOINT_INTERVAL
     )]
     checkpoint_interval: u64,
+    /// Maximum immutable checkpoint count per run/database and artifact service (0 refuses capture).
+    #[arg(long, env = "SCRIPTBOTS_CHECKPOINT_MAX_COUNT", default_value_t = scriptbots_storage::CheckpointRetentionLimits::default().max_count)]
+    checkpoint_max_count: u64,
+    /// Checkpoint bytes per SQL representation and artifact files, accounted separately; preserved files are never removed.
+    #[arg(long, env = "SCRIPTBOTS_CHECKPOINT_MAX_BYTES", default_value_t = scriptbots_storage::CheckpointRetentionLimits::default().max_bytes)]
+    checkpoint_max_bytes: u64,
     /// Explicit number of simulation ticks to run before launching the selected frontend.
     #[arg(
         long = "bootstrap-ticks",

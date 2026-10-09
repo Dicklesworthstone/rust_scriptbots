@@ -13,7 +13,7 @@ verify_evidence() {
     local required=(formatting fsqlite-pin franken-licenses asupersync-universe wasm-graph)
     case "$lane" in
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
-        connectivity) required+=(workspace-check workspace-clippy bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
+        connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
         graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
         graphs-and-recipes) required+=(graph-check graph-tests archive-unit archive-integration architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
@@ -215,6 +215,8 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         # Fold into bd-2z0.19's composed acceptance when bounded retention is delivered.
         run_step workspace-check check cargo check --locked --workspace --all-targets
         run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
+        run_step storage-checkpoint-tests test cargo test --locked -p scriptbots-storage --lib checkpoint_ -- --nocapture
+        run_step checkpoint-unit-tests test cargo test --locked -p scriptbots-app --lib control::tests::checkpoint_ -- --nocapture
         run_step bundle-tests test cargo test --locked -p scriptbots-storage --lib bundle::tests:: -- --nocapture
         run_step control-unit-tests test cargo test --locked -p scriptbots-app --lib servers::tests:: -- --nocapture
         run_step control-process-tests test cargo test --locked -p scriptbots-app --test real_process_control_e2e -- --nocapture

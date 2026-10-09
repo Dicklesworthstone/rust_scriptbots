@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
@@ -176,6 +177,10 @@ pub struct KnobUpdate {
 /// Errors produced by the control domain when mutating configuration.
 #[derive(Debug, Error)]
 pub enum ControlError {
+    #[error("checkpoint retention exhausted: {0}")]
+    CheckpointCapacity(String),
+    #[error("checkpoint retention unavailable: {0}")]
+    CheckpointRetentionUnavailable(String),
     #[error(transparent)]
     Host(#[from] scriptbots_runtime::HostAccessError),
     #[error("failed to lock world state")]
@@ -612,6 +617,25 @@ pub struct PaginatedCheckpointsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub has_more: bool,
+    pub retention: CheckpointRetentionDto,
+}
+
+/// Actual file occupancy is separate from SQL's hex/metadata representation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CheckpointRetentionDto {
+    pub max_count: u64,
+    pub max_bytes: u64,
+    pub file_count: u64,
+    pub file_bytes: u64,
+    pub observed_file_count_high_water: u64,
+    pub observed_file_bytes_high_water: u64,
+    pub request_entries: usize,
+    pub pending_entries: usize,
+    pub payload_cache_bytes: u64,
+    pub sql_count: Option<u64>,
+    pub sql_bytes: Option<u64>,
+    pub inventory_error: Option<String>,
+    pub sql_usage_error: Option<String>,
 }
 
 /// Paginated response for artifacts.
@@ -792,6 +816,34 @@ pub fn compute_blake3(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
+fn read_artifact_file_bounded(path: &Path) -> Result<Vec<u8>, ControlError> {
+    let file = fs::File::open(path).map_err(|error| ControlError::NotFound(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(ControlError::BadRequest(
+            "artifact is not a regular file".to_owned(),
+        ));
+    }
+    let limit = u64::try_from(MAX_ARTIFACT_DOWNLOAD_BYTES).expect("download limit fits u64");
+    if metadata.len() > limit {
+        return Err(ControlError::PayloadTooLarge(
+            "artifact exceeds the download byte bound".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    if bytes.len() > MAX_ARTIFACT_DOWNLOAD_BYTES {
+        return Err(ControlError::PayloadTooLarge(
+            "artifact grew beyond the download byte bound".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// A REST/MCP-created matched-seed batch executing on a background runner thread.
 ///
 /// The runner's atomically written status file is the only source of run
@@ -961,30 +1013,188 @@ impl ExperimentJob {
 pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
-    checkpoint_data: Mutex<BTreeMap<String, Vec<u8>>>,
     artifacts: Mutex<BTreeMap<String, ArtifactMetadataDto>>,
     idempotency: Mutex<BTreeMap<String, (String, Value)>>,
     artifacts_dir: RwLock<PathBuf>,
+    checkpoint_retention: Mutex<CheckpointRetentionState>,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedCheckpoint {
+    request_hash: String,
+    metadata: CheckpointMetadataDto,
+    artifact: ArtifactMetadataDto,
+    directory: PathBuf,
+    database_metadata: Value,
+    acknowledged: bool,
+}
+
+#[derive(Debug)]
+struct CheckpointRetentionState {
+    limits: scriptbots_storage::CheckpointRetentionLimits,
+    directories: BTreeMap<PathBuf, scriptbots_storage::ArtifactDirectoryLease>,
+    requests: BTreeMap<String, RetainedCheckpoint>,
+    file_count: u64,
+    file_bytes: u64,
+    count_high_water: u64,
+    bytes_high_water: u64,
+    inventory_error: Option<String>,
+}
+
+impl CheckpointRetentionState {
+    fn add_directory(&mut self, path: &Path) -> Result<PathBuf, ControlError> {
+        fs::create_dir_all(path)
+            .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
+        let path = path
+            .canonicalize()
+            .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
+        if !self.directories.contains_key(&path) {
+            if self
+                .directories
+                .keys()
+                .any(|known| path.starts_with(known) || known.starts_with(&path))
+            {
+                return Err(ControlError::Conflict(
+                    "checkpoint artifact directories must not overlap".to_owned(),
+                ));
+            }
+            let lease = scriptbots_storage::ArtifactDirectoryLease::acquire(&path)
+                .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
+            self.directories.insert(path.clone(), lease);
+        }
+        self.refresh()?;
+        Ok(path)
+    }
+
+    fn refresh(&mut self) -> Result<(), ControlError> {
+        if self.directories.is_empty() {
+            return Err(ControlError::CheckpointRetentionUnavailable(
+                "no artifact directory lease was acquired".to_owned(),
+            ));
+        }
+        fn scan(path: &Path, depth: usize) -> std::io::Result<(u64, u64)> {
+            if depth > 32 {
+                return Err(std::io::Error::other(
+                    "checkpoint inventory exceeds its directory depth bound",
+                ));
+            }
+            let mut count = 0_u64;
+            let mut bytes = 0_u64;
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                let (added_count, added_bytes) = if metadata.is_dir() {
+                    scan(&entry.path(), depth + 1)?
+                } else if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "bin")
+                {
+                    if !metadata.is_file() {
+                        return Err(std::io::Error::other(
+                            "checkpoint inventory contains a non-regular binary artifact",
+                        ));
+                    }
+                    (1, metadata.len())
+                } else {
+                    (0, 0)
+                };
+                count = count
+                    .checked_add(added_count)
+                    .ok_or_else(|| std::io::Error::other("checkpoint count overflow"))?;
+                bytes = bytes
+                    .checked_add(added_bytes)
+                    .ok_or_else(|| std::io::Error::other("checkpoint bytes overflow"))?;
+            }
+            Ok((count, bytes))
+        }
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        for (path, lease) in &self.directories {
+            lease
+                .verify()
+                .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
+            let (directory_count, directory_bytes) = scan(path, 0)
+                .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
+            count = count.checked_add(directory_count).ok_or_else(|| {
+                ControlError::CheckpointRetentionUnavailable("checkpoint count overflow".to_owned())
+            })?;
+            bytes = bytes.checked_add(directory_bytes).ok_or_else(|| {
+                ControlError::CheckpointRetentionUnavailable(
+                    "checkpoint byte count overflow".to_owned(),
+                )
+            })?;
+        }
+        self.file_count = count;
+        self.file_bytes = bytes;
+        self.count_high_water = self.count_high_water.max(count);
+        self.bytes_high_water = self.bytes_high_water.max(bytes);
+        self.inventory_error = None;
+        Ok(())
+    }
+
+    fn admit(&self, requested_bytes: u64) -> Result<(), ControlError> {
+        if let Some(error) = &self.inventory_error {
+            return Err(ControlError::CheckpointRetentionUnavailable(error.clone()));
+        }
+        if self.file_count >= self.limits.max_count
+            || u64::try_from(self.requests.len()).unwrap_or(u64::MAX) >= self.limits.max_count
+            || self
+                .file_bytes
+                .checked_add(requested_bytes)
+                .is_none_or(|bytes| bytes > self.limits.max_bytes)
+        {
+            return Err(ControlError::CheckpointCapacity(format!(
+                "files={} / {} bytes, request_entries={}, requested={} bytes; limits={} files / {} bytes; preserved artifacts require additional configured capacity or a separate run/directory",
+                self.file_count,
+                self.file_bytes,
+                self.requests.len(),
+                requested_bytes,
+                self.limits.max_count,
+                self.limits.max_bytes,
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl DataServices {
     pub fn new(artifacts_dir: PathBuf) -> Self {
-        let _ = fs::create_dir_all(&artifacts_dir);
+        let mut retention = CheckpointRetentionState {
+            limits: scriptbots_storage::CheckpointRetentionLimits::default(),
+            directories: BTreeMap::new(),
+            requests: BTreeMap::new(),
+            file_count: 0,
+            file_bytes: 0,
+            count_high_water: 0,
+            bytes_high_water: 0,
+            inventory_error: None,
+        };
+        let artifacts_dir = match retention.add_directory(&artifacts_dir) {
+            Ok(path) => path,
+            Err(error) => {
+                retention.inventory_error = Some(error.to_string());
+                artifacts_dir
+            }
+        };
         Self {
             experiments: Mutex::new(BTreeMap::new()),
             checkpoints: Mutex::new(BTreeMap::new()),
-            checkpoint_data: Mutex::new(BTreeMap::new()),
             artifacts: Mutex::new(BTreeMap::new()),
             idempotency: Mutex::new(BTreeMap::new()),
             artifacts_dir: RwLock::new(artifacts_dir),
+            checkpoint_retention: Mutex::new(retention),
         }
     }
 
-    pub fn set_artifacts_dir(&self, dir: PathBuf) {
-        let _ = fs::create_dir_all(&dir);
-        if let Ok(mut lock) = self.artifacts_dir.write() {
-            *lock = dir;
-        }
+    pub fn set_artifacts_dir(&self, dir: PathBuf) -> Result<(), ControlError> {
+        let mut retention = self
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let dir = retention.add_directory(&dir)?;
+        *self.artifacts_dir.write().map_err(|_| ControlError::Lock)? = dir;
+        Ok(())
     }
 
     pub fn artifacts_dir(&self) -> PathBuf {
@@ -993,26 +1203,19 @@ impl DataServices {
             .map(|p| p.clone())
             .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_artifacts"))
     }
-
-    /// Register an external artifact with computed checksums and metadata.
-    pub fn register_artifact(&self, meta: ArtifactMetadataDto, data: Option<Vec<u8>>) {
-        let id = meta.artifact_id.clone();
-        if let Some(bytes) = data
-            && let Ok(mut lock) = self.checkpoint_data.lock()
-        {
-            lock.insert(id.clone(), bytes);
-        }
-        if let Ok(mut lock) = self.artifacts.lock() {
-            lock.insert(id, meta);
-        }
-    }
 }
 
 impl Default for DataServices {
     fn default() -> Self {
         let dir = std::env::var("SCRIPTBOTS_ARTIFACTS_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_artifacts"));
+            .unwrap_or_else(|_| {
+                std::env::temp_dir().join(format!(
+                    "scriptbots-artifacts-{}-{:032x}",
+                    std::process::id(),
+                    rand::random::<u128>()
+                ))
+            });
         Self::new(dir)
     }
 }
@@ -1049,9 +1252,21 @@ impl ControlHandle {
     }
 
     /// Set custom artifacts directory for data services.
-    pub fn with_artifacts_dir(self, dir: std::path::PathBuf) -> Self {
-        self.data_services.set_artifacts_dir(dir);
-        self
+    pub fn with_artifacts_dir(self, dir: std::path::PathBuf) -> Result<Self, ControlError> {
+        self.data_services.set_artifacts_dir(dir)?;
+        Ok(self)
+    }
+
+    pub fn with_checkpoint_retention_limits(
+        self,
+        limits: scriptbots_storage::CheckpointRetentionLimits,
+    ) -> Result<Self, ControlError> {
+        self.data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .limits = limits;
+        Ok(self)
     }
 
     /// Return the active artifacts directory.
@@ -1178,6 +1393,7 @@ impl ControlHandle {
                 "ExperimentCreateRequest".into(),
                 "CheckpointCreateRequest".into(),
                 "CheckpointMetadataDto".into(),
+                "CheckpointRetentionDto".into(),
                 "ArtifactMetadataDto".into(),
                 "PaginatedExperimentsResponse".into(),
                 "PaginatedCheckpointsResponse".into(),
@@ -1547,38 +1763,63 @@ impl ControlHandle {
         &self,
         request: CheckpointCreateRequest,
     ) -> Result<CheckpointMetadataDto, ControlError> {
+        if request
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > 4096)
+        {
+            return Err(ControlError::BadRequest(
+                "checkpoint description exceeds 4096 bytes".to_owned(),
+            ));
+        }
         if let Some(ref key) = request.idempotency_key {
             if key.is_empty() || key.len() > 1024 {
                 return Err(ControlError::BadRequest(
                     "idempotency key must contain 1..=1024 bytes".into(),
                 ));
             }
-            let payload_hash =
-                compute_blake3(format!("{}:{:?}", key, request.description).as_bytes());
-            if let Ok(lock) = self.data_services.idempotency.lock()
-                && let Some((stored_hash, cached_val)) = lock.get(key)
-            {
-                if stored_hash == &payload_hash {
-                    if let Ok(dto) =
-                        serde_json::from_value::<CheckpointMetadataDto>(cached_val.clone())
-                    {
-                        return Ok(dto);
-                    }
-                } else {
-                    return Err(ControlError::Conflict(
-                        "idempotency key reused with different payload".into(),
-                    ));
-                }
-            }
         }
-
-        // Only a real core checkpoint is ever labelled as one; a capture refusal is the answer.
-        // The owner answers at the next quiescent boundary when deferred persistence output is
-        // still queued, so this does not fail merely for landing between persistence batches.
+        let request_hash =
+            compute_blake3(&serde_json::to_vec(&request).map_err(ControlError::serialization)?);
+        let mut retention = self
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let request_identity = request
+            .idempotency_key
+            .as_ref()
+            .map(|key| format!("checkpoint:{key}"));
+        if let Some(identity) = &request_identity
+            && let Some(retained) = retention.requests.get(identity).cloned()
+        {
+            if retained.request_hash != request_hash {
+                return Err(ControlError::Conflict(
+                    "checkpoint idempotency key reused with a changed request".to_owned(),
+                ));
+            }
+            return self.finish_retained_checkpoint(&mut retention, identity, retained);
+        }
+        let dir = self.data_services.artifacts_dir();
+        if !retention.directories.contains_key(&dir) {
+            return Err(ControlError::CheckpointRetentionUnavailable(
+                "the active artifact directory is not leased".to_owned(),
+            ));
+        }
+        retention.refresh()?;
+        retention.admit(0)?;
         let checkpoint = self.capture_checkpoint_v1()?;
         let encoded_bytes = checkpoint
             .encode()
             .map_err(|e| ControlError::Serialization(e.to_string()))?;
+        if encoded_bytes.len() > MAX_ARTIFACT_DOWNLOAD_BYTES {
+            return Err(ControlError::PayloadTooLarge(
+                "checkpoint exceeds the artifact download byte bound".to_owned(),
+            ));
+        }
+        let byte_size = u64::try_from(encoded_bytes.len())
+            .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        retention.admit(byte_size)?;
         let tick = checkpoint.tick().0;
         let schema = scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA.to_string();
 
@@ -1588,16 +1829,12 @@ impl ControlHandle {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let checkpoint_id = format!("ckpt-{secs}{nanos:04}-t{tick}");
+        let checkpoint_id = format!("ckpt-{:032x}-t{tick}", rand::random::<u128>());
 
         let meta = CheckpointMetadataDto {
             checkpoint_id: checkpoint_id.clone(),
             tick,
-            byte_size: encoded_bytes.len() as u64,
+            byte_size,
             checksum_blake3: blake3_hex.clone(),
             checksum_sha256: sha256_hex.clone(),
             schema,
@@ -1610,56 +1847,145 @@ impl ControlHandle {
             artifact_id: checkpoint_id.clone(),
             filename: filename.clone(),
             content_type: "application/octet-stream".into(),
-            byte_size: encoded_bytes.len() as u64,
+            byte_size,
             checksum_blake3: blake3_hex.clone(),
             checksum_sha256: sha256_hex,
             created_at_utc: format!("{secs}"),
             relative_path: filename.clone(),
         };
 
-        let dir = self.data_services.artifacts_dir();
         let file_path = dir.join(&filename);
-        fs::write(&file_path, &encoded_bytes).map_err(|error| {
-            ControlError::Serialization(format!(
-                "cannot write checkpoint artifact {}: {error}",
-                file_path.display()
-            ))
-        })?;
-        // The run database row goes through the connection-owning storage worker.
+        let identity = request_identity.unwrap_or_else(|| checkpoint_id.clone());
+        let retained = RetainedCheckpoint {
+            request_hash,
+            metadata: meta,
+            artifact: art_meta,
+            directory: dir,
+            database_metadata: serde_json::json!({"source": "control_api", "description": request.description}),
+            acknowledged: false,
+        };
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .map_err(|error| {
+                ControlError::CheckpointRetentionUnavailable(format!(
+                    "checkpoint file was not reserved: {error}"
+                ))
+            })?;
+        retention
+            .requests
+            .insert(identity.clone(), retained.clone());
+        let written = file
+            .write_all(&encoded_bytes)
+            .and_then(|()| file.sync_all());
+        drop(file);
+        retention.refresh()?;
+        written.map_err(|error| ControlError::CheckpointRetentionUnavailable(format!(
+            "checkpoint {checkpoint_id} has retained partial/unconfirmed file data: {error}; the file is preserved and never overwritten"
+        )))?;
+        self.finish_retained_checkpoint(&mut retention, &identity, retained)
+    }
+
+    fn finish_retained_checkpoint(
+        &self,
+        retention: &mut CheckpointRetentionState,
+        identity: &str,
+        mut retained: RetainedCheckpoint,
+    ) -> Result<CheckpointMetadataDto, ControlError> {
+        let bytes =
+            read_artifact_file_bounded(&retained.directory.join(&retained.artifact.relative_path))?;
+        if bytes.len() as u64 != retained.metadata.byte_size
+            || compute_blake3(&bytes) != retained.metadata.checksum_blake3
+            || compute_sha256(&bytes) != retained.metadata.checksum_sha256
+        {
+            return Err(ControlError::CheckpointRetentionUnavailable(format!(
+                "checkpoint {} has incomplete or changed retained file data; retry cannot overwrite that evidence",
+                retained.metadata.checkpoint_id,
+            )));
+        }
+        if !retained.acknowledged {
+            fs::File::open(retained.directory.join(&retained.artifact.relative_path))
+                .and_then(|file| file.sync_all())
+                .map_err(|error| ControlError::CheckpointRetentionUnavailable(format!(
+                    "checkpoint {} file durability is unconfirmed: {error}; retained data permits exact retry",
+                    retained.metadata.checkpoint_id,
+                )))?;
+            let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+                .map_err(|error| ControlError::Serialization(error.to_string()))?;
+            if let Some(writer) = &self.checkpoint_writer {
+                writer.record(&retained.metadata.checkpoint_id, &checkpoint, &retained.database_metadata)
+                    .map_err(|error| match error {
+                        scriptbots_storage::StorageError::CheckpointCapacityExceeded { .. } => ControlError::CheckpointCapacity(error.to_string()),
+                        other => ControlError::CheckpointRetentionUnavailable(format!(
+                            "checkpoint {} persistence receipt is unconfirmed: {other}; retained file and request identity permit exact retry",
+                            retained.metadata.checkpoint_id,
+                        )),
+                    })?;
+            }
+            self.data_services
+                .checkpoints
+                .lock()
+                .map_err(|_| ControlError::Lock)?
+                .insert(
+                    retained.metadata.checkpoint_id.clone(),
+                    retained.metadata.clone(),
+                );
+            self.data_services
+                .artifacts
+                .lock()
+                .map_err(|_| ControlError::Lock)?
+                .insert(
+                    retained.artifact.artifact_id.clone(),
+                    retained.artifact.clone(),
+                );
+            retained.acknowledged = true;
+            retention
+                .requests
+                .insert(identity.to_owned(), retained.clone());
+        }
+        Ok(retained.metadata)
+    }
+
+    pub fn checkpoint_retention_usage(&self) -> Result<CheckpointRetentionDto, ControlError> {
+        let mut retention = self
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        if let Err(error) = retention.refresh() {
+            retention.inventory_error = Some(error.to_string());
+        }
+        let mut usage = CheckpointRetentionDto {
+            max_count: retention.limits.max_count,
+            max_bytes: retention.limits.max_bytes,
+            file_count: retention.file_count,
+            file_bytes: retention.file_bytes,
+            observed_file_count_high_water: retention.count_high_water,
+            observed_file_bytes_high_water: retention.bytes_high_water,
+            request_entries: retention.requests.len(),
+            pending_entries: retention
+                .requests
+                .values()
+                .filter(|entry| !entry.acknowledged)
+                .count(),
+            payload_cache_bytes: 0,
+            sql_count: None,
+            sql_bytes: None,
+            inventory_error: retention.inventory_error.clone(),
+            sql_usage_error: None,
+        };
+        drop(retention);
         if let Some(writer) = &self.checkpoint_writer {
-            let metadata = serde_json::json!({
-                "source": "control_api",
-                "description": request.description,
-            });
-            writer
-                .record(&checkpoint_id, &checkpoint, &metadata)
-                .map_err(|error| {
-                    ControlError::Serialization(format!(
-                        "checkpoint {checkpoint_id} was not recorded in the run database: {error}"
-                    ))
-                })?;
-        }
-
-        if let Ok(mut lock) = self.data_services.checkpoints.lock() {
-            lock.insert(checkpoint_id.clone(), meta.clone());
-        }
-        if let Ok(mut lock) = self.data_services.checkpoint_data.lock() {
-            lock.insert(checkpoint_id.clone(), encoded_bytes.clone());
-        }
-        if let Ok(mut lock) = self.data_services.artifacts.lock() {
-            lock.insert(checkpoint_id.clone(), art_meta);
-        }
-
-        if let Some(ref key) = request.idempotency_key {
-            let payload_hash = compute_blake3(format!("{}:{:?}", key, meta.description).as_bytes());
-            if let Ok(mut lock) = self.data_services.idempotency.lock()
-                && let Ok(val) = serde_json::to_value(&meta)
-            {
-                lock.insert(key.clone(), (payload_hash, val));
+            match writer.retention_usage() {
+                Ok(sql) => {
+                    usage.sql_count = Some(sql.count);
+                    usage.sql_bytes = Some(sql.bytes);
+                }
+                Err(error) => usage.sql_usage_error = Some(error.to_string()),
             }
         }
-
-        Ok(meta)
+        Ok(usage)
     }
 
     /// Look up checkpoint metadata by ID.
@@ -1700,6 +2026,7 @@ impl ControlHandle {
         let total = lock.len();
         let items: Vec<CheckpointMetadataDto> =
             lock.values().skip(offset).take(limit).cloned().collect();
+        drop(lock);
 
         let has_more = offset + items.len() < total;
         let next_cursor = if has_more {
@@ -1715,6 +2042,7 @@ impl ControlHandle {
             offset,
             next_cursor,
             has_more,
+            retention: self.checkpoint_retention_usage()?,
         })
     }
 
@@ -1789,38 +2117,26 @@ impl ControlHandle {
             ));
         }
 
-        let bytes = if let Ok(lock) = self.data_services.checkpoint_data.lock() {
-            if let Some(b) = lock.get(artifact_id) {
-                b.clone()
-            } else {
-                let dir = self.data_services.artifacts_dir();
-                let file_path = dir.join(rel_path);
-                let canonical_dir = dir
-                    .canonicalize()
-                    .map_err(|e| ControlError::BadRequest(format!("invalid artifacts dir: {e}")))?;
-                let canonical_file = file_path
-                    .canonicalize()
-                    .map_err(|e| ControlError::NotFound(format!("artifact file not found: {e}")))?;
-                if !canonical_file.starts_with(&canonical_dir) {
-                    return Err(ControlError::BadRequest(
-                        "path traversal detected: outside artifacts dir".into(),
-                    ));
-                }
-                let metadata = fs::metadata(&canonical_file)
-                    .map_err(|e| ControlError::NotFound(format!("artifact metadata error: {e}")))?;
-                if metadata.len() > MAX_ARTIFACT_DOWNLOAD_BYTES as u64 {
-                    return Err(ControlError::PayloadTooLarge(format!(
-                        "artifact byte size {} exceeds 64MB download limit",
-                        metadata.len()
-                    )));
-                }
-                fs::read(&canonical_file).map_err(|e| {
-                    ControlError::BadRequest(format!("failed to read artifact: {e}"))
-                })?
-            }
-        } else {
-            return Err(ControlError::Lock);
-        };
+        let dir = self
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .requests
+            .values()
+            .find(|entry| entry.artifact.artifact_id == artifact_id)
+            .map(|entry| entry.directory.clone())
+            .unwrap_or_else(|| self.data_services.artifacts_dir());
+        let file_path = dir.join(rel_path);
+        let canonical_file = file_path
+            .canonicalize()
+            .map_err(|error| ControlError::NotFound(format!("artifact file not found: {error}")))?;
+        if !canonical_file.starts_with(&dir) {
+            return Err(ControlError::BadRequest(
+                "path traversal detected: outside artifacts dir".to_owned(),
+            ));
+        }
+        let bytes = read_artifact_file_bounded(&canonical_file)?;
 
         if bytes.len() > MAX_ARTIFACT_DOWNLOAD_BYTES {
             return Err(ControlError::PayloadTooLarge(format!(
@@ -1835,6 +2151,13 @@ impl ControlHandle {
                 "artifact integrity verification failed: expected blake3 {}, got {}",
                 artifact.checksum_blake3, actual_blake3
             )));
+        }
+        if bytes.len() as u64 != artifact.byte_size
+            || compute_sha256(&bytes) != artifact.checksum_sha256
+        {
+            return Err(ControlError::InvalidPatch(
+                "artifact byte count or SHA-256 changed".to_owned(),
+            ));
         }
 
         Ok((artifact, bytes))
@@ -3083,6 +3406,300 @@ pub(crate) mod tests {
             .expect("world"),
         );
         (host.handle(), host)
+    }
+
+    fn checkpoint_test_handle(
+        directory: &Path,
+        count: u64,
+        bytes: u64,
+    ) -> (ControlHandle, TestHost) {
+        let host = TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 40,
+                world_height: 40,
+                food_cell_size: 10,
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("checkpoint world"),
+        );
+        let mut handle = host.handle();
+        handle.data_services = Arc::new(DataServices::new(directory.to_path_buf()));
+        let handle = handle
+            .with_checkpoint_retention_limits(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: count,
+                max_bytes: bytes,
+            })
+            .expect("checkpoint policy");
+        (handle, host)
+    }
+
+    #[test]
+    fn checkpoint_retention_serializes_distinct_and_identical_concurrent_creates() {
+        for identical in [false, true] {
+            let directory = tempfile::tempdir().expect("checkpoint directory").keep();
+            let (handle, _host) = checkpoint_test_handle(&directory, 1, 1024 * 1024);
+            let barrier = Arc::new(std::sync::Barrier::new(12));
+            let workers: Vec<_> = (0..12)
+                .map(|index| {
+                    let handle = handle.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        handle.create_checkpoint(CheckpointCreateRequest {
+                            idempotency_key: Some(if identical {
+                                "same".to_owned()
+                            } else {
+                                format!("request-{index}")
+                            }),
+                            description: Some("concurrent capture".to_owned()),
+                        })
+                    })
+                })
+                .collect();
+            let outcomes: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("creator joined"))
+                .collect();
+            let accepted: Vec<_> = outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().ok())
+                .collect();
+            assert_eq!(accepted.len(), if identical { outcomes.len() } else { 1 });
+            for outcome in &outcomes {
+                if let Err(error) = outcome {
+                    assert!(
+                        matches!(error, ControlError::CheckpointCapacity(_)),
+                        "{error}"
+                    );
+                }
+            }
+            for checkpoint in &accepted {
+                assert_eq!(checkpoint.checkpoint_id, accepted[0].checkpoint_id);
+            }
+            let (artifact, bytes) = handle
+                .read_artifact_bytes(&accepted[0].checkpoint_id)
+                .expect("accepted bytes");
+            assert_eq!(compute_blake3(&bytes), artifact.checksum_blake3);
+            let usage = handle
+                .checkpoint_retention_usage()
+                .expect("retention observation");
+            assert_eq!(usage.file_count, 1);
+            assert_eq!(usage.file_bytes, bytes.len() as u64);
+            assert_eq!(usage.request_entries, 1);
+            assert_eq!(usage.pending_entries, 0);
+            assert_eq!(usage.payload_cache_bytes, 0);
+            assert!(usage.observed_file_count_high_water <= usage.max_count);
+            assert!(usage.observed_file_bytes_high_water <= usage.max_bytes);
+            let original_key = handle
+                .data_services
+                .checkpoint_retention
+                .lock()
+                .expect("retained request")
+                .requests
+                .keys()
+                .next()
+                .expect("accepted identity")
+                .strip_prefix("checkpoint:")
+                .expect("keyed checkpoint")
+                .to_owned();
+            assert!(matches!(
+                handle.create_checkpoint(CheckpointCreateRequest {
+                    idempotency_key: Some(original_key),
+                    description: Some("changed".to_owned()),
+                }),
+                Err(ControlError::Conflict(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_retention_exact_bytes_directory_change_and_restart_preserve_files() {
+        let first = tempfile::tempdir()
+            .expect("first checkpoint directory")
+            .keep();
+        let second = tempfile::tempdir()
+            .expect("second checkpoint directory")
+            .keep();
+        let (handle, host) = checkpoint_test_handle(&first, 1, 0);
+        let checkpoint_bytes = handle
+            .capture_checkpoint_v1()
+            .expect("real checkpoint")
+            .encode()
+            .expect("encoded checkpoint");
+        let required = checkpoint_bytes.len() as u64;
+        let request = CheckpointCreateRequest {
+            idempotency_key: Some("exact".to_owned()),
+            description: None,
+        };
+        let handle = handle
+            .with_checkpoint_retention_limits(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 1,
+                max_bytes: required - 1,
+            })
+            .expect("one-byte short policy");
+        assert!(matches!(
+            handle.create_checkpoint(request.clone()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        assert_eq!(std::fs::read_dir(&first).expect("inventory").count(), 0);
+        let handle = handle
+            .with_checkpoint_retention_limits(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 1,
+                max_bytes: required,
+            })
+            .expect("exact policy");
+        let retained = handle
+            .create_checkpoint(request.clone())
+            .expect("exact capacity admits");
+        assert_eq!(retained.byte_size, required);
+        assert_eq!(
+            handle
+                .create_checkpoint(request)
+                .expect("idempotent retry")
+                .checkpoint_id,
+            retained.checkpoint_id
+        );
+        let before = handle
+            .read_artifact_bytes(&retained.checkpoint_id)
+            .expect("initial read")
+            .1;
+        let handle = handle
+            .with_artifacts_dir(second)
+            .expect("directory change retains earlier lease/accounting");
+        assert!(matches!(
+            handle.create_checkpoint(CheckpointCreateRequest::default()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        assert_eq!(
+            handle
+                .read_artifact_bytes(&retained.checkpoint_id)
+                .expect("original directory read")
+                .1,
+            before
+        );
+        assert_eq!(
+            handle
+                .checkpoint_retention_usage()
+                .expect("all directories")
+                .file_count,
+            1
+        );
+        drop(handle);
+        let mut restarted = host.handle();
+        restarted.data_services = Arc::new(DataServices::new(first.clone()));
+        let restarted = restarted
+            .with_checkpoint_retention_limits(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 1,
+                max_bytes: required,
+            })
+            .expect("restart budget");
+        let observed = restarted
+            .checkpoint_retention_usage()
+            .expect("restart occupancy");
+        assert_eq!(observed.file_count, 1);
+        assert_eq!(observed.file_bytes, required);
+        assert_eq!(
+            observed.request_entries, 0,
+            "historical files must not be claimed as current-run requests"
+        );
+        assert!(matches!(
+            restarted.create_checkpoint(CheckpointCreateRequest::default()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        assert_eq!(
+            fs::read(first.join(format!("{}.bin", retained.checkpoint_id)))
+                .expect("preserved file"),
+            before
+        );
+    }
+
+    #[test]
+    fn checkpoint_pending_storage_refusal_retries_the_same_artifact_after_capacity_changes() {
+        let directory = tempfile::tempdir().expect("checkpoint directory").keep();
+        let (handle, _host) = checkpoint_test_handle(&directory, 1, 1024 * 1024);
+        let mut pipeline =
+            scriptbots_storage::StoragePipeline::unattributed_memory().expect("real storage owner");
+        let writer = pipeline.checkpoint_writer();
+        writer
+            .configure_retention(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 0,
+                max_bytes: 1024 * 1024,
+            })
+            .expect("zero SQL capacity");
+        let handle = handle.with_checkpoint_writer(Some(writer.clone()));
+        let request = CheckpointCreateRequest {
+            idempotency_key: Some("pending".to_owned()),
+            description: Some("retained exact retry".to_owned()),
+        };
+        assert!(matches!(
+            handle.create_checkpoint(request.clone()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        let before = handle
+            .checkpoint_retention_usage()
+            .expect("pending observation");
+        assert_eq!(before.file_count, 1);
+        assert_eq!(before.pending_entries, 1);
+        assert_eq!(before.sql_count, Some(0));
+        assert_eq!(
+            handle
+                .list_checkpoints(None, None)
+                .expect("published checkpoints")
+                .total,
+            0
+        );
+        let pending_id = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .expect("retained identity")
+            .requests
+            .values()
+            .next()
+            .expect("pending entry")
+            .metadata
+            .checkpoint_id
+            .clone();
+        let original =
+            fs::read(directory.join(format!("{pending_id}.bin"))).expect("retained pending bytes");
+        writer
+            .configure_retention(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 1,
+                max_bytes: 1024 * 1024,
+            })
+            .expect("additional configured capacity");
+        let acknowledged = handle
+            .create_checkpoint(request.clone())
+            .expect("exact pending retry");
+        assert_eq!(acknowledged.checkpoint_id, pending_id);
+        assert_eq!(
+            handle
+                .create_checkpoint(request)
+                .expect("completed retry")
+                .checkpoint_id,
+            pending_id
+        );
+        let after = handle
+            .checkpoint_retention_usage()
+            .expect("acknowledged observation");
+        assert_eq!(after.file_count, 1);
+        assert_eq!(after.file_bytes, before.file_bytes);
+        assert_eq!(after.sql_count, Some(1));
+        assert_eq!(after.pending_entries, 0);
+        assert_eq!(
+            handle
+                .read_artifact_bytes(&pending_id)
+                .expect("download after retry")
+                .1,
+            original
+        );
+        pipeline
+            .shutdown()
+            .expect("ordinary storage shutdown succeeds");
     }
 
     fn read_status_before_releasing_owner(

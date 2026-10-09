@@ -38,14 +38,14 @@ use crate::ScenarioIdentityV0;
 use crate::command::CommandSubmit;
 use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
-    CheckpointCreateRequest, CheckpointMetadataDto, CommandStatusDto, ConfigSnapshot, ControlError,
-    ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
-    ExperimentCreateRequest, ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto,
-    HydrologySnapshot, InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate,
-    MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
-    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
-    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
-    parse_intervention_command, parse_map_artifact,
+    CheckpointCreateRequest, CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto,
+    ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
+    ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentRunRecordDto,
+    ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
+    InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyRequestBody, MapGenerateRequestBody,
+    PaginatedArtifactsResponse, PaginatedCheckpointsResponse, PaginatedExperimentsResponse,
+    Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
+    SpeedRequest, parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use scriptbots_core::{
@@ -136,6 +136,8 @@ pub struct ControlServerConfig {
     pub allowed_authorities: Vec<String>,
     /// Additional browser origins as http(s)://host:port, without paths or credentials.
     pub allowed_origins: Vec<String>,
+    /// Checkpoint file and SQL bounds; payload representations are accounted separately.
+    pub checkpoint_retention_limits: scriptbots_storage::CheckpointRetentionLimits,
 }
 
 impl Default for ControlServerConfig {
@@ -154,6 +156,7 @@ impl Default for ControlServerConfig {
             checkpoint_writer: None,
             allowed_authorities: Vec::new(),
             allowed_origins: Vec::new(),
+            checkpoint_retention_limits: scriptbots_storage::CheckpointRetentionLimits::default(),
         }
     }
 }
@@ -174,13 +177,13 @@ impl ControlServerConfig {
                 &mut config.allowed_origins,
             ),
         ] {
-            if let Some(raw) = read_control_environment(name, &mut config.environment_errors) {
-                if !raw.trim().is_empty() {
-                    *values = raw
-                        .split(',')
-                        .map(|value| value.trim().to_owned())
-                        .collect();
-                }
+            if let Some(raw) = read_control_environment(name, &mut config.environment_errors)
+                && !raw.trim().is_empty()
+            {
+                *values = raw
+                    .split(',')
+                    .map(|value| value.trim().to_owned())
+                    .collect();
             }
         }
 
@@ -433,13 +436,12 @@ impl ControlHttpPolicy {
         if !self.authorities.contains(&host) {
             return Err("request authority is not configured for this control listener");
         }
-        if let Some(authority) = uri.authority() {
-            if uri.scheme_str() != Some("http")
+        if let Some(authority) = uri.authority()
+            && (uri.scheme_str() != Some("http")
                 || canonical_http_authority(authority.as_str(), 80).as_deref()
-                    != Some(host.as_str())
-            {
-                return Err("request target authority disagrees with Host");
-            }
+                    != Some(host.as_str()))
+        {
+            return Err("request target authority disagrees with Host");
         }
         let mut origins = headers.get_all(axum::http::header::ORIGIN).iter();
         if let Some(origin) = origins.next() {
@@ -730,7 +732,8 @@ impl ControlRuntime {
     ) -> Result<(Self, CommandSubmit)> {
         let handle = ControlHandle::new(host)
             .with_database(reservation.config.database_path.clone())
-            .with_checkpoint_writer(reservation.config.checkpoint_writer.clone());
+            .with_checkpoint_writer(reservation.config.checkpoint_writer.clone())
+            .with_checkpoint_retention_limits(reservation.config.checkpoint_retention_limits)?;
         let submit_handle = handle.clone();
         let command_submit: CommandSubmit = Arc::new(move |command| {
             match submit_handle.submit_command(command, None) {
@@ -1484,6 +1487,7 @@ pub struct SpeedRequestBody {
             ExperimentSummaryDto,
             CheckpointCreateRequest,
             CheckpointMetadataDto,
+            CheckpointRetentionDto,
             ArtifactMetadataDto,
             PaginatedExperimentsResponse,
             PaginatedCheckpointsResponse,
@@ -1587,6 +1591,13 @@ fn require_json_content_type(headers: &HeaderMap, bytes: &[u8]) -> Result<(), Ap
 impl From<ControlError> for AppError {
     fn from(err: ControlError) -> Self {
         match err {
+            ControlError::CheckpointCapacity(message) => Self {
+                status: StatusCode::INSUFFICIENT_STORAGE,
+                message,
+            },
+            ControlError::CheckpointRetentionUnavailable(message) => {
+                Self::service_unavailable(message)
+            }
             ControlError::NotFound(msg) => Self::not_found(msg),
             ControlError::BadRequest(msg) => Self::bad_request(msg),
             ControlError::PayloadTooLarge(msg) => Self::payload_too_large(msg),
@@ -4480,6 +4491,10 @@ where
 
 fn map_control_error(err: ControlError) -> McpError {
     match err {
+        ControlError::CheckpointCapacity(message)
+        | ControlError::CheckpointRetentionUnavailable(message) => {
+            McpError::new(McpErrorCode::InternalError, message)
+        }
         ControlError::NotFound(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::BadRequest(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::PayloadTooLarge(msg) => McpError::new(McpErrorCode::InvalidParams, msg),

@@ -440,6 +440,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
   - `terminal`: force emoji TUI.
 - `--bootstrap-ticks N`: explicitly run `N` science ticks after seeding and before frontend launch (default `0`, so ordinary startup launches at tick zero).
  - `--checkpoint-interval TICKS`: record a `WorldCheckpointV1` plus a replay digest into the run database every TICKS ticks of an interactive run (default 1000; `0` disables; env `SCRIPTBOTS_CHECKPOINT_INTERVAL`). `--replay-db FILE --checkpoint-start` later verifies the run from the latest one.
+ - `--checkpoint-max-count COUNT` and `--checkpoint-max-bytes BYTES`: retention limits (defaults 256 and 268435456; env `SCRIPTBOTS_CHECKPOINT_MAX_COUNT` / `SCRIPTBOTS_CHECKPOINT_MAX_BYTES`). Every producer shares the storage owner's per-run and whole-database limits. SQL bytes include hexadecimal payloads and UTF-8 metadata. API artifact files have a separate budget with the same limits; downloads read through files without retaining a payload cache. Zero refuses new captures. Existing checkpoints remain intact, and exact retries reuse their row and file. Optional interval capture disables itself on quota exhaustion while science and controls continue.
  - `--dump-png <FILE>` (GUI builds): write an offscreen PNG and exit (no UI). Pair with `--png-size WxH`.
  - `--png-size WxH` (GUI builds): snapshot size for `--dump-png` (e.g., `1280x720`).
  - `--debug-watermark`: overlay a tiny diagnostics watermark in the render canvas.
@@ -868,6 +869,15 @@ For an interactive run, ScriptBots parses the control environment and transactio
   - Playback (two-axis command status): `POST /api/control/pause`, `POST /api/control/resume`,
     `POST /api/control/step`, `POST /api/control/speed`, `POST /api/control/shutdown`,
     and `GET /api/control/status/{command_id}`
+
+`GET /api/v1/checkpoints` also reports actual file/SQL usage, observed file high-water counts,
+pending request identities, and inventory/query errors. Checkpoint quota exhaustion returns
+HTTP 507; an unconfirmed file/storage receipt returns HTTP 503 and retains the exact request
+for retry. Changing artifact directories keeps earlier occupancy and leases charged. Startup
+counts existing binary artifacts without labelling them current-run checkpoints. Set
+`SCRIPTBOTS_ARTIFACTS_DIR` for an explicit directory; otherwise each control service reserves
+a unique temporary directory. Files, including partial failed captures, are never automatically
+removed or overwritten.
 
 `GET /api/status` and MCP `get_status` report one immutable owner publication:
 `paused`, `lifecycle`, tagged `health` (including blocker/fault detail),

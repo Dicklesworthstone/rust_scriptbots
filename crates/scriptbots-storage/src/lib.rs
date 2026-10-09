@@ -4466,6 +4466,17 @@ pub struct NarrativeInputPageV1 {
 /// Storage error wrapper.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error(
+        "checkpoint retention exhausted for {scope}: retained {count} rows / {bytes} bytes, requested {requested_bytes} bytes, limits {max_count} rows / {max_bytes} bytes; existing checkpoints are preserved"
+    )]
+    CheckpointCapacityExceeded {
+        scope: &'static str,
+        count: u64,
+        bytes: u64,
+        requested_bytes: u64,
+        max_count: u64,
+        max_bytes: u64,
+    },
     /// The batch was refused BEFORE it was prepared, because it is too large.
     ///
     /// This is a `NotAdmitted` outcome in the strictest sense: nothing was
@@ -6864,6 +6875,29 @@ pub struct PersistedCheckpointRecord {
     pub payload: String,
     pub payload_digest: String,
     pub metadata_json: String,
+}
+
+/// Separate count and byte bounds for immutable checkpoint retention.
+/// SQL accounting includes every retained UTF-8 field, including the hex payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRetentionLimits {
+    pub max_count: u64,
+    pub max_bytes: u64,
+}
+
+impl Default for CheckpointRetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_count: 256,
+            max_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRetentionUsage {
+    pub count: u64,
+    pub bytes: u64,
 }
 
 impl PersistedCheckpointRecord {
@@ -13673,6 +13707,81 @@ struct ExistingStorageLease {
     identity_is_enforceable: bool,
 }
 
+/// Exclusive artifact-directory writer lease using the same stable companion lock
+/// and native filesystem identity checks as database writers. No database is opened.
+pub struct ArtifactDirectoryLease {
+    writer: StorageWriterLease,
+    path: PathBuf,
+    identity: StorageFileIdentity,
+}
+
+impl std::fmt::Debug for ArtifactDirectoryLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactDirectoryLease")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ArtifactDirectoryLease {
+    pub fn acquire(path: &Path) -> Result<Self, StorageError> {
+        let path_text = path.to_str().ok_or(StorageError::InvalidData {
+            context: "checkpoint.artifact_directory",
+            reason: "artifact directory path must be UTF-8".to_owned(),
+        })?;
+        let metadata = fs::symlink_metadata(path).map_err(|source| StorageError::Filesystem {
+            operation: "inspect artifact directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !metadata.is_dir() || !cfg!(any(unix, windows)) {
+            return Err(StorageError::InvalidData {
+                context: "checkpoint.artifact_directory",
+                reason:
+                    "artifact retention requires a real directory with native filesystem identity"
+                        .to_owned(),
+            });
+        }
+        let lease = Self {
+            writer: StorageWriterLease::acquire_lock(path_text, true)?,
+            path: path.to_path_buf(),
+            identity: StorageFileIdentity::from_metadata(&metadata),
+        };
+        lease.verify()?;
+        Ok(lease)
+    }
+
+    pub fn verify(&self) -> Result<(), StorageError> {
+        let current =
+            fs::symlink_metadata(&self.path).map_err(|source| StorageError::Filesystem {
+                operation: "verify artifact directory",
+                path: self.path.clone(),
+                source,
+            })?;
+        if !current.is_dir() || StorageFileIdentity::from_metadata(&current) != self.identity {
+            return Err(StorageError::InvalidData {
+                context: "checkpoint.artifact_directory",
+                reason: "artifact directory identity changed".to_owned(),
+            });
+        }
+        let lock_metadata =
+            self.writer
+                .file
+                .metadata()
+                .map_err(|source| StorageError::Filesystem {
+                    operation: "verify artifact writer lease",
+                    path: self.writer.lock_path.clone(),
+                    source,
+                })?;
+        StorageWriterLease::verify_path(
+            &self.writer.lock_path,
+            &self.writer.lock_path.display().to_string(),
+            &StorageFileIdentity::from_metadata(&lock_metadata),
+        )
+    }
+}
+
 impl ExistingStorageLease {
     fn open(path: &str) -> Result<Self, StorageError> {
         let metadata =
@@ -14292,6 +14401,7 @@ pub struct Storage {
     replay_flush_threshold: usize,
     analytics: Option<AnalyticsSnapshotProvider>,
     island_sparklines: BTreeMap<u32, VecDeque<f32>>,
+    checkpoint_limits: CheckpointRetentionLimits,
 }
 
 impl Storage {
@@ -14343,6 +14453,66 @@ impl Storage {
             metadata_json: metadata.to_string(),
         };
         record.world_checkpoint()?;
+        let existing = self.connection()?.query_with_params(
+            "SELECT tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json
+             FROM checkpoints WHERE run_id = ?1 AND checkpoint_id = ?2",
+            &[sqlite_run_id(self.run_id), checkpoint_id.into()],
+        )?;
+        if let Some(row) = existing.first() {
+            let retained = PersistedCheckpointRecord {
+                checkpoint_id: checkpoint_id.to_owned(),
+                tick: checked_u64("checkpoints.tick", decode(row, 0, "checkpoints.tick")?)?,
+                checkpoint_ordinal: checked_u64(
+                    "checkpoints.checkpoint_ordinal",
+                    decode(row, 1, "checkpoints.checkpoint_ordinal")?,
+                )?,
+                format: decode(row, 2, "checkpoints.format")?,
+                payload: decode(row, 3, "checkpoints.payload")?,
+                payload_digest: decode(row, 4, "checkpoints.payload_digest")?,
+                metadata_json: decode(row, 5, "checkpoints.metadata_json")?,
+            };
+            if retained == record {
+                return Ok(());
+            }
+            return Err(StorageError::InvalidData {
+                context: "checkpoints.identity",
+                reason: "checkpoint identity already retains a different payload or metadata"
+                    .to_owned(),
+            });
+        }
+        let requested_bytes = [
+            record.checkpoint_id.len(),
+            record.format.len(),
+            record.payload.len(),
+            record.payload_digest.len(),
+            record.metadata_json.len(),
+        ]
+        .into_iter()
+        .try_fold(0_u64, |sum, bytes| {
+            sum.checked_add(u64::try_from(bytes).ok()?)
+        })
+        .ok_or(StorageError::InvalidData {
+            context: "checkpoints.retained_bytes",
+            reason: "checkpoint retained byte count overflowed".to_owned(),
+        })?;
+        for (scope, run_id) in [("run", Some(self.run_id)), ("database", None)] {
+            let usage = Self::checkpoint_retention_usage_for(self.connection()?, run_id)?;
+            if usage.count >= self.checkpoint_limits.max_count
+                || usage
+                    .bytes
+                    .checked_add(requested_bytes)
+                    .is_none_or(|bytes| bytes > self.checkpoint_limits.max_bytes)
+            {
+                return Err(StorageError::CheckpointCapacityExceeded {
+                    scope,
+                    count: usage.count,
+                    bytes: usage.bytes,
+                    requested_bytes,
+                    max_count: self.checkpoint_limits.max_count,
+                    max_bytes: self.checkpoint_limits.max_bytes,
+                });
+            }
+        }
         let tick = record.tick;
         let tick_i64 = i64::try_from(tick).map_err(|error| StorageError::InvalidData {
             context: "checkpoints.tick",
@@ -14377,6 +14547,18 @@ impl Storage {
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         metadata: &Value,
     ) -> Result<u64, StorageError> {
+        let existing = self.connection()?.query_with_params(
+            "SELECT checkpoint_ordinal FROM checkpoints WHERE run_id = ?1 AND checkpoint_id = ?2",
+            &[sqlite_run_id(self.run_id), checkpoint_id.into()],
+        )?;
+        if let Some(row) = existing.first() {
+            let ordinal = checked_u64(
+                "checkpoints.checkpoint_ordinal",
+                decode(row, 0, "checkpoints.checkpoint_ordinal")?,
+            )?;
+            self.record_checkpoint(checkpoint_id, ordinal, checkpoint, metadata)?;
+            return Ok(ordinal);
+        }
         let rows = self.connection()?.query_with_params(
             "SELECT COALESCE(MAX(checkpoint_ordinal) + 1, 0) FROM checkpoints WHERE run_id = ?1",
             &[sqlite_run_id(self.run_id)],
@@ -14388,6 +14570,41 @@ impl Storage {
         let ordinal = checked_u64("checkpoints.next_ordinal", next)?;
         self.record_checkpoint(checkpoint_id, ordinal, checkpoint, metadata)?;
         Ok(ordinal)
+    }
+
+    fn checkpoint_retention_usage_for(
+        connection: &Connection,
+        run_id: Option<RunId>,
+    ) -> Result<CheckpointRetentionUsage, StorageError> {
+        let sql = "SELECT COUNT(*), COALESCE(SUM(
+            LENGTH(CAST(checkpoint_id AS BLOB)) + LENGTH(CAST(format AS BLOB)) +
+            LENGTH(CAST(payload AS BLOB)) + LENGTH(CAST(payload_digest AS BLOB)) +
+            LENGTH(CAST(metadata_json AS BLOB))), 0) FROM checkpoints";
+        let row = match run_id {
+            Some(run_id) => connection.query_row_with_params(
+                &format!("{sql} WHERE run_id = ?1"),
+                &[sqlite_run_id(run_id)],
+            )?,
+            None => connection.query_row(sql)?,
+        };
+        Ok(CheckpointRetentionUsage {
+            count: checked_u64(
+                "checkpoints.retained_count",
+                decode(&row, 0, "checkpoints.retained_count")?,
+            )?,
+            bytes: checked_u64(
+                "checkpoints.retained_bytes",
+                decode(&row, 1, "checkpoints.retained_bytes")?,
+            )?,
+        })
+    }
+
+    pub fn checkpoint_retention_usage(&self) -> Result<CheckpointRetentionUsage, StorageError> {
+        Self::checkpoint_retention_usage_for(self.connection()?, None)
+    }
+
+    pub fn set_checkpoint_retention_limits(&mut self, limits: CheckpointRetentionLimits) {
+        self.checkpoint_limits = limits;
     }
 
     /// Persist a canonical audio timeline as an artifact in the database.
@@ -14790,6 +15007,7 @@ impl Storage {
             replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
             analytics: None,
             island_sparklines: BTreeMap::new(),
+            checkpoint_limits: CheckpointRetentionLimits::default(),
         };
         if initialize_schema && let Err(error) = storage.initialize_schema() {
             storage.terminally_failed = true;
@@ -22131,7 +22349,14 @@ enum StorageCommand {
         checkpoint_id: String,
         checkpoint: Box<scriptbots_core::WorldCheckpointV1>,
         metadata: Value,
-        reply: xchan::Sender<Result<u64, String>>,
+        reply: xchan::Sender<Result<u64, StorageError>>,
+    },
+    ConfigureCheckpointRetention {
+        limits: CheckpointRetentionLimits,
+        reply: xchan::Sender<Result<CheckpointRetentionUsage, StorageError>>,
+    },
+    CheckpointRetentionUsage {
+        reply: xchan::Sender<Result<CheckpointRetentionUsage, StorageError>>,
     },
     Shutdown {
         reply: xchan::Sender<Result<ShutdownReceipt, StorageWorkerError>>,
@@ -22389,10 +22614,7 @@ impl StorageCheckpointWriter {
         }
         match reply_rx.recv_timeout(self.reply) {
             Ok(Ok(ordinal)) => Ok(ordinal),
-            Ok(Err(reason)) => Err(StorageError::InvalidData {
-                context: "checkpoints.record",
-                reason,
-            }),
+            Ok(Err(error)) => Err(error),
             Err(xchan::RecvTimeoutError::Timeout) => Err(StorageError::InvalidData {
                 context: "checkpoints.acknowledgement",
                 reason: format!(
@@ -22402,6 +22624,47 @@ impl StorageCheckpointWriter {
             }),
             Err(xchan::RecvTimeoutError::Disconnected) => Err(StorageError::Closed),
         }
+    }
+
+    pub fn configure_retention(
+        &self,
+        limits: CheckpointRetentionLimits,
+    ) -> Result<CheckpointRetentionUsage, StorageError> {
+        let (reply, receiver) = xchan::bounded(1);
+        self.tx
+            .send_timeout(
+                StorageCommand::ConfigureCheckpointRetention { limits, reply },
+                self.enqueue,
+            )
+            .map_err(|error| StorageError::InvalidData {
+                context: "checkpoints.configure",
+                reason: error.to_string(),
+            })?;
+        receiver
+            .recv_timeout(self.reply)
+            .map_err(|error| StorageError::InvalidData {
+                context: "checkpoints.configure_acknowledgement",
+                reason: error.to_string(),
+            })?
+    }
+
+    pub fn retention_usage(&self) -> Result<CheckpointRetentionUsage, StorageError> {
+        let (reply, receiver) = xchan::bounded(1);
+        self.tx
+            .send_timeout(
+                StorageCommand::CheckpointRetentionUsage { reply },
+                self.enqueue,
+            )
+            .map_err(|error| StorageError::InvalidData {
+                context: "checkpoints.usage",
+                reason: error.to_string(),
+            })?;
+        receiver
+            .recv_timeout(self.reply)
+            .map_err(|error| StorageError::InvalidData {
+                context: "checkpoints.usage_acknowledgement",
+                reason: error.to_string(),
+            })?
     }
 }
 
@@ -25226,13 +25489,18 @@ fn storage_worker(
             } => {
                 // A single-row insert: a refusal is reported to the requester and
                 // does not poison the scientific persistence lane.
-                let result = storage
-                    .record_next_checkpoint(&checkpoint_id, &checkpoint, &metadata)
-                    .map_err(|error| error.to_string());
+                let result = storage.record_next_checkpoint(&checkpoint_id, &checkpoint, &metadata);
                 if let Err(error) = &result {
                     warn!(checkpoint_id = %checkpoint_id, %error, "checkpoint record refused");
                 }
                 let _ = reply.send(result);
+            }
+            StorageCommand::ConfigureCheckpointRetention { limits, reply } => {
+                storage.set_checkpoint_retention_limits(limits);
+                let _ = reply.send(storage.checkpoint_retention_usage());
+            }
+            StorageCommand::CheckpointRetentionUsage { reply } => {
+                let _ = reply.send(storage.checkpoint_retention_usage());
             }
             StorageCommand::Shutdown { reply } => {
                 let result = shutdown_worker_storage(storage, &mut state, &analytics);
@@ -37285,6 +37553,170 @@ mod tests {
         assert_eq!(progress.get_typed::<i64>(1)?, 0);
         assert_eq!(progress.get_typed::<i64>(2)?, 0);
         inspector.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_retention_enforces_exact_utf8_bytes_and_retries_without_extra_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(77),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })?;
+        let checkpoint = world.checkpoint_v1()?;
+        let metadata = json!({"description": "é🦀"});
+        let encoded = checkpoint.encode()?;
+        let expected_bytes = u64::try_from(
+            "cp-1".len()
+                + format!(
+                    "{}+postcard_hex",
+                    scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+                )
+                .len()
+                + journal::encode_lower_hex(&encoded).len()
+                + format!("blake3:{}", blake3::hash(&encoded).to_hex()).len()
+                + metadata.to_string().len(),
+        )?;
+        let path = temp_db_path("checkpoint-retention");
+        let path_text = path.to_string_lossy().to_string();
+        let mut storage = Storage::create_new_file_for_run(
+            &path_text,
+            RunManifestRecord::unattributed(RunId::new(1)),
+        )?;
+        let empty = CheckpointRetentionUsage { count: 0, bytes: 0 };
+        storage.set_checkpoint_retention_limits(CheckpointRetentionLimits {
+            max_count: 0,
+            max_bytes: expected_bytes,
+        });
+        assert!(matches!(
+            storage.record_next_checkpoint("cp-1", &checkpoint, &metadata),
+            Err(StorageError::CheckpointCapacityExceeded { count: 0, .. })
+        ));
+        assert_eq!(storage.checkpoint_retention_usage()?, empty);
+        storage.set_checkpoint_retention_limits(CheckpointRetentionLimits {
+            max_count: 1,
+            max_bytes: expected_bytes - 1,
+        });
+        assert!(
+            matches!(storage.record_next_checkpoint("cp-1", &checkpoint, &metadata), Err(StorageError::CheckpointCapacityExceeded { bytes: 0, requested_bytes, .. }) if requested_bytes == expected_bytes)
+        );
+        assert_eq!(storage.checkpoint_retention_usage()?, empty);
+        storage.set_checkpoint_retention_limits(CheckpointRetentionLimits {
+            max_count: 1,
+            max_bytes: expected_bytes,
+        });
+        assert_eq!(
+            storage.record_next_checkpoint("cp-1", &checkpoint, &metadata)?,
+            0
+        );
+        assert_eq!(
+            storage.checkpoint_retention_usage()?,
+            CheckpointRetentionUsage {
+                count: 1,
+                bytes: expected_bytes
+            }
+        );
+        assert_eq!(
+            storage.record_next_checkpoint("cp-1", &checkpoint, &metadata)?,
+            0
+        );
+        assert!(matches!(
+            storage.record_next_checkpoint("cp-1", &checkpoint, &json!({"changed": true})),
+            Err(StorageError::InvalidData {
+                context: "checkpoints.identity",
+                ..
+            })
+        ));
+        assert!(matches!(
+            storage.record_next_checkpoint("cp-2", &checkpoint, &metadata),
+            Err(StorageError::CheckpointCapacityExceeded { count: 1, .. })
+        ));
+        storage.close()?;
+
+        let mut appended =
+            Storage::append_run(&path_text, RunManifestRecord::unattributed(RunId::new(2)))?;
+        appended.set_checkpoint_retention_limits(CheckpointRetentionLimits {
+            max_count: 1,
+            max_bytes: expected_bytes,
+        });
+        assert!(matches!(
+            appended.record_next_checkpoint("cp-2", &checkpoint, &metadata),
+            Err(StorageError::CheckpointCapacityExceeded {
+                scope: "database",
+                count: 1,
+                ..
+            })
+        ));
+        assert_eq!(appended.checkpoint_retention_usage()?.bytes, expected_bytes);
+        appended.close()?;
+        let reader = StorageReader::open_finished_for_run(&path_text, RunId::new(1))?;
+        let retained = reader.load_checkpoints()?;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].world_checkpoint()?.encode()?, encoded);
+        assert_eq!(retained[0].metadata_json, metadata.to_string());
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_lost_acknowledgement_reuses_the_exact_worker_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(91),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })?;
+        let checkpoint = world.checkpoint_v1()?;
+        let path = temp_db_path("checkpoint-lost-ack");
+        let path_text = path.to_string_lossy().to_string();
+        let mut pipeline = StoragePipeline::create_unattributed_file(&path_text)?;
+        let writer = pipeline.checkpoint_writer();
+        writer.configure_retention(CheckpointRetentionLimits {
+            max_count: 1,
+            ..CheckpointRetentionLimits::default()
+        })?;
+        let (reply, receiver) = xchan::bounded(1);
+        drop(receiver);
+        writer.tx.send(StorageCommand::RecordCheckpoint {
+            checkpoint_id: "lost-ack".to_owned(),
+            checkpoint: Box::new(checkpoint.clone()),
+            metadata: json!({"source": "lost-receipt-fixture"}),
+            reply,
+        })?;
+        let committed = writer.retention_usage()?;
+        assert_eq!(committed.count, 1);
+        assert_eq!(
+            writer.record(
+                "lost-ack",
+                &checkpoint,
+                &json!({"source": "lost-receipt-fixture"})
+            )?,
+            0
+        );
+        assert_eq!(writer.retention_usage()?, committed);
+        assert!(matches!(
+            writer.record("different", &checkpoint, &json!({})),
+            Err(StorageError::CheckpointCapacityExceeded { count: 1, .. })
+        ));
+        // Optional checkpoint exhaustion must not poison ordinary scientific persistence.
+        pipeline.submit(&sample_batch(1, 1.0))?;
+        let receipt = pipeline.shutdown()?;
+        assert_eq!(receipt.committed_tick, Some(1));
+        let reader = StorageReader::open_finished(&path_text)?;
+        assert_eq!(reader.load_checkpoints()?.len(), 1);
+        assert_eq!(reader.recent_ticks(8)?.len(), 1);
+        reader.close()?;
         Ok(())
     }
 
