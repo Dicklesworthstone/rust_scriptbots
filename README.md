@@ -1203,6 +1203,14 @@ This executes the existing real FrankenSQLite and `sb-analyze` subprocess tests,
 retaining their fixtures and outputs. It covers graph acceptance; the complete
 seeded simulation and report journey remains open under `bd-2z0.11.9`.
 
+The `analytics` DSR lane runs both declared analytics pipeline tests and requires
+separate retained manifests for the statistical fixture and the actual seeded
+world. The world drives every registered report through `sb-analyze`, compares
+demographic counts to simulation observations, verifies Parquet row counts against
+SQL, and probes missing, empty and corrupt databases plus an unknown report.
+Its manifest names the remaining real intervention, narrative-search and
+interaction-export acceptance; a passing lane does not close those requirements.
+
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.

@@ -3,7 +3,7 @@
 //! Validates the complete scientific analysis journey:
 //! 1. A hand-built seeded fixture with a planted regime change (population crash) and a
 //!    stationary null control, so statistical reports have a known ground truth.
-//! 2. Execution of the complete report suite (all 12 built-in reports via CLI & Registry).
+//! 2. Execution of the registered report suite, with the real-world test also invoking the CLI.
 //! 3. Ground-truth invariant assertions across reports (significance under FDR, false-positive control,
 //!    lineage component conservation, descendant birth accounting).
 //! 4. Parquet export (Apache `parquet` writer) with exact SQL row count equality & round-trip verification.
@@ -49,6 +49,10 @@ struct InvariantRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct E2eManifest {
     schema: String,
+    evidence_class: String,
+    source_commit: Option<String>,
+    compiler_identity: Option<String>,
+    retained_root: String,
     run_id: String,
     verdict: String,
     total_duration_ms: u128,
@@ -355,14 +359,14 @@ fn populate_seeded_fixture(dir: &Path) -> (String, String) {
 )]
 fn test_analytics_e2e_full_pipeline_and_invariants() {
     let start_total = Instant::now();
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let (run_db, ctrl_db) = populate_seeded_fixture(temp_dir.path());
+    let temp_dir = tempfile::tempdir().expect("tempdir").keep();
+    let (run_db, ctrl_db) = populate_seeded_fixture(&temp_dir);
 
     let mut stages = Vec::new();
     let mut invariants = Vec::new();
 
     // ------------------------------------------------------------------------
-    // STAGE 1: Verify Simulation & Storage Populated
+    // STAGE 1: Verify the hand-built statistical fixture was persisted
     // ------------------------------------------------------------------------
     let t0 = Instant::now();
     let cx = ReaderCtx::open(&run_db).expect("open reader context");
@@ -372,7 +376,7 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     assert_eq!(total_events, 2, "must have exactly 2 narrative events");
 
     stages.push(StageRecord {
-        stage: "simulation_and_persistence".to_string(),
+        stage: "synthetic_fixture_persistence".to_string(),
         duration_ms: t0.elapsed().as_millis(),
         status: "pass".to_string(),
         details: serde_json::json!({
@@ -383,16 +387,23 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     });
 
     // ------------------------------------------------------------------------
-    // STAGE 2: Execute Complete Report Suite (All 12 Reports)
+    // STAGE 2: Execute every declared report
     // ------------------------------------------------------------------------
     let t1 = Instant::now();
     let registry = Registry::builtin();
     let report_names: Vec<&str> = registry.list().into_iter().map(|(n, _)| n).collect();
 
+    assert!(
+        !report_names.is_empty(),
+        "the report registry must not be empty"
+    );
     assert_eq!(
+        report_names
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         report_names.len(),
-        12,
-        "registry must have exactly 12 built-in reports: {report_names:?}"
+        "duplicate report declarations: {report_names:?}"
     );
 
     let mut report_machines = std::collections::BTreeMap::new();
@@ -574,7 +585,7 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     // STAGE 4: FrankenPandas Export and SQL Count Verification
     // ------------------------------------------------------------------------
     let t3 = Instant::now();
-    let export_dir = temp_dir.path().join("exports");
+    let export_dir = temp_dir.join("exports");
     fs::create_dir_all(&export_dir).expect("create export dir");
 
     let tables = [
@@ -600,7 +611,7 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     drop(cx);
 
     // CLI invocation: sb-analyze export --format parquet --verify
-    let cli_export_dir = temp_dir.path().join("cli_exports");
+    let cli_export_dir = temp_dir.join("cli_exports");
     let sb_analyze_bin = env!("CARGO_BIN_EXE_sb-analyze");
     let export_status = Command::new(sb_analyze_bin)
         .arg(&run_db)
@@ -709,7 +720,7 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     });
 
     // Also run sb-analyze summarize
-    let summary_dir = temp_dir.path().join("summaries");
+    let summary_dir = temp_dir.join("summaries");
     let summarize_status = Command::new(sb_analyze_bin)
         .arg(&run_db)
         .arg("summarize")
@@ -749,7 +760,7 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     // STAGE 5: Graph Export Verification (Lineage, Dynasty, Interaction)
     // ------------------------------------------------------------------------
     let t4 = Instant::now();
-    let graph_dir = temp_dir.path().join("graphs");
+    let graph_dir = temp_dir.join("graphs");
     fs::create_dir_all(&graph_dir).expect("create graph dir");
 
     let lineage_path = graph_dir.join("lineage.edgelist");
@@ -841,7 +852,11 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     // ------------------------------------------------------------------------
     let total_duration = start_total.elapsed().as_millis();
     let manifest = E2eManifest {
-        schema: "scriptbots.analytics.e2e-manifest.v1".to_string(),
+        schema: "scriptbots.analytics.e2e-manifest.v2".to_string(),
+        evidence_class: "synthetic_statistical_fixture".to_owned(),
+        source_commit: option_env!("SCRIPTBOTS_SOURCE_REVISION").map(str::to_owned),
+        compiler_identity: option_env!("SCRIPTBOTS_RUSTC_VV").map(str::to_owned),
+        retained_root: temp_dir.display().to_string(),
         run_id: cx.reader.run_id().to_string(),
         verdict: "pass".to_string(),
         total_duration_ms: total_duration,
@@ -850,10 +865,10 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     };
 
     let manifest_json = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
-    let manifest_path = temp_dir.path().join("MANIFEST.json");
+    let manifest_path = temp_dir.join("MANIFEST.json");
     fs::write(&manifest_path, &manifest_json).expect("write manifest");
 
-    if let Some(target_manifest) = std::env::var_os("SCRIPTBOTS_E2E_ANALYTICS_MANIFEST") {
+    if let Some(target_manifest) = std::env::var_os("SCRIPTBOTS_E2E_ANALYTICS_FIXTURE_MANIFEST") {
         fs::write(target_manifest, &manifest_json).expect("write manifest to target path");
     }
 
@@ -928,11 +943,16 @@ fn run_real_simulation(dir: &Path, name: &str, seed: u64) -> (String, u64, u64, 
 /// bd-2z0.11.9: the report suite on the output of an actual `WorldState` run (the test above
 /// uses a hand-built fixture), with invariants checked against the simulation's own record.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "real-world pipeline joins the CLI, SQL, exports, ground truth and negative controls"
+)]
 fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let started = Instant::now();
+    let temp_dir = tempfile::tempdir().expect("tempdir").keep();
     let (run_db, ticks, born, deaths, populations) =
-        run_real_simulation(temp_dir.path(), "real.sqlite", 7);
-    let (treatment_db, ..) = run_real_simulation(temp_dir.path(), "real_treatment.sqlite", 8);
+        run_real_simulation(&temp_dir, "real.sqlite", 7);
+    let (treatment_db, ..) = run_real_simulation(&temp_dir, "real_treatment.sqlite", 8);
     assert!(
         born > 0,
         "the seeded run must produce natural births to be non-vacuous"
@@ -945,6 +965,10 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
     let cx = ReaderCtx::open(&run_db).expect("open real run");
     let registry = Registry::builtin();
     let mut summary = None;
+    let mut report_evidence = Vec::new();
+    let report_dir = temp_dir.join("reports");
+    fs::create_dir(&report_dir).expect("create retained reports directory");
+    let sb_analyze = env!("CARGO_BIN_EXE_sb-analyze");
     for (name, _) in registry.list() {
         let params = match name {
             "compare-runs" => ReportParams::from_pairs([format!("treatment_db={treatment_db}")])
@@ -965,6 +989,54 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
             Some(ticks),
             "report '{name}' latest tick"
         );
+        let json_path = report_dir.join(format!("{name}.json"));
+        let md_path = report_dir.join(format!("{name}.md"));
+        let mut command = Command::new(sb_analyze);
+        command.args([&run_db, "run", name, "--json"]);
+        command.arg(&json_path).arg("--md").arg(&md_path);
+        for (key, value) in params.iter() {
+            command.arg("--params").arg(format!("{key}={value}"));
+        }
+        let command_record = format!("{command:?}");
+        let cli_started = Instant::now();
+        let cli_output = command.output().expect("execute actual analyzer report");
+        fs::write(
+            report_dir.join(format!("{name}.stdout.log")),
+            &cli_output.stdout,
+        )
+        .expect("retain report stdout");
+        fs::write(
+            report_dir.join(format!("{name}.stderr.log")),
+            &cli_output.stderr,
+        )
+        .expect("retain report stderr");
+        assert!(
+            cli_output.status.success(),
+            "{command_record}: {cli_output:?}"
+        );
+        let json_bytes = fs::read(&json_path).expect("read CLI report JSON");
+        let cli_json: serde_json::Value =
+            serde_json::from_slice(&json_bytes).expect("parse actual CLI report envelope");
+        assert_eq!(cli_json["report"], name);
+        assert_eq!(cli_json["schema_version"], output.schema_version);
+        assert_eq!(cli_json["db_path"], run_db);
+        assert_eq!(cli_json["latest_tick"], ticks);
+        assert_eq!(cli_json["row_count"], output.row_count);
+        assert!(fs::metadata(&md_path).expect("report markdown").len() > 0);
+        if name == "run-summary" {
+            assert_eq!(cli_json["machine"], output.machine);
+        }
+        report_evidence.push(serde_json::json!({
+            "name": name,
+            "command": command_record,
+            "exit_code": cli_output.status.code(),
+            "duration_ms": cli_started.elapsed().as_millis(),
+            "json_path": json_path,
+            "markdown_path": md_path,
+            "schema_version": output.schema_version,
+            "row_count": output.row_count,
+            "json_blake3": blake3::hash(&json_bytes).to_hex().to_string(),
+        }));
         if name == "run-summary" {
             summary = Some(output.machine);
         }
@@ -998,5 +1070,135 @@ fn report_suite_on_a_real_seeded_simulation_matches_the_simulation_ground_truth(
     assert!(
         (reported_mean - mean).abs() < 1e-9,
         "population mean {reported_mean} vs simulation {mean}"
+    );
+
+    let export_dir = temp_dir.join("parquet");
+    let mut export = Command::new(sb_analyze);
+    export.args([&run_db, "export", "--verify", "--out-dir"]);
+    export.arg(&export_dir);
+    let export_command = format!("{export:?}");
+    let export_output = export.output().expect("export real simulation tables");
+    fs::write(temp_dir.join("export.stdout.log"), &export_output.stdout)
+        .expect("retain export stdout");
+    fs::write(temp_dir.join("export.stderr.log"), &export_output.stderr)
+        .expect("retain export stderr");
+    assert!(
+        export_output.status.success(),
+        "{export_command}: {export_output:?}"
+    );
+    let conn = open_with_flags(&run_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("independent SQL row-count reader");
+    let mut table_evidence = Vec::new();
+    for (artifact_name, sql_table) in [
+        ("run", "runs"),
+        ("agent", "agents"),
+        ("lineage", "lineage_edges"),
+        ("event", "replay_events"),
+        ("metric", "metrics"),
+    ] {
+        let row = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {sql_table}"))
+            .expect("SQL count");
+        let sql_count: i64 = row.get_typed(0).expect("SQL count integer");
+        let parquet_path =
+            export_dir.join(format!("{}_{artifact_name}.parquet", cx.reader.run_id()));
+        let parquet = read_parquet_batch(&parquet_path).expect("read CLI Parquet artifact");
+        assert_eq!(
+            i64::try_from(parquet.num_rows()).expect("row count fits"),
+            sql_count
+        );
+        table_evidence.push(serde_json::json!({
+            "table": sql_table,
+            "sql_count": sql_count,
+            "parquet_count": parquet.num_rows(),
+            "path": parquet_path,
+            "blake3": blake3::hash(&fs::read(&parquet_path).expect("Parquet bytes")).to_hex().to_string(),
+        }));
+    }
+    conn.close_without_checkpoint()
+        .expect("close read-only count reader");
+
+    let mut negative_evidence = Vec::new();
+    let missing_db = temp_dir.join("missing.sqlite");
+    let empty_db = temp_dir.join("empty.sqlite");
+    let corrupt_db = temp_dir.join("corrupt.sqlite");
+    fs::write(&empty_db, []).expect("create retained empty negative fixture");
+    fs::write(&corrupt_db, b"deliberately invalid database")
+        .expect("create retained corrupt negative fixture");
+    for (label, database, report) in [
+        ("missing_database", missing_db.as_path(), "run-summary"),
+        ("empty_database", empty_db.as_path(), "run-summary"),
+        ("corrupt_database", corrupt_db.as_path(), "run-summary"),
+        (
+            "missing_report",
+            Path::new(&run_db),
+            "missing-report-negative-control",
+        ),
+    ] {
+        let negative = Command::new(sb_analyze)
+            .arg(database)
+            .args(["run", report])
+            .output()
+            .expect("execute actual negative analyzer command");
+        fs::write(
+            temp_dir.join(format!("{label}.stderr.log")),
+            &negative.stderr,
+        )
+        .expect("retain negative stderr");
+        assert!(
+            !negative.status.success(),
+            "negative {label} accepted: {negative:?}"
+        );
+        assert!(
+            !negative.stderr.is_empty(),
+            "negative {label} must explain refusal"
+        );
+        negative_evidence.push(serde_json::json!({
+            "case": label,
+            "database": database,
+            "report": report,
+            "exit_code": negative.status.code(),
+            "stderr_path": temp_dir.join(format!("{label}.stderr.log")),
+        }));
+    }
+    assert!(
+        !missing_db.exists(),
+        "read-only missing input must remain absent"
+    );
+    let manifest = serde_json::json!({
+        "schema": "scriptbots.analytics.real-world-manifest.v1",
+        "evidence_class": "seeded_world_reports_cli_and_parquet",
+        "source_commit": option_env!("SCRIPTBOTS_SOURCE_REVISION"),
+        "compiler_identity": option_env!("SCRIPTBOTS_RUSTC_VV"),
+        "status": "pass",
+        "retained_root": temp_dir,
+        "run_id": cx.reader.run_id().to_string(),
+        "database": run_db,
+        "database_blake3": blake3::hash(&fs::read(&run_db).expect("finished DB bytes")).to_hex().to_string(),
+        "comparison_database": treatment_db,
+        "seed": 7,
+        "comparison_seed": 8,
+        "ticks": ticks,
+        "births": born,
+        "deaths": deaths,
+        "populations": populations,
+        "ground_truth_summary": summary,
+        "reports": report_evidence,
+        "export_command": export_command,
+        "export_exit_code": export_output.status.code(),
+        "tables": table_evidence,
+        "negative_controls": negative_evidence,
+        "duration_ms": started.elapsed().as_millis(),
+        "remaining_acceptance": ["real planted scarcity and stationary-null narrative validation", "control CLI narrative search on that same run", "interaction multievent export joins"],
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("real-world manifest JSON");
+    fs::write(temp_dir.join("MANIFEST.json"), &manifest_bytes).expect("retain real-world manifest");
+    if let Some(target_manifest) = std::env::var_os("SCRIPTBOTS_E2E_ANALYTICS_REAL_MANIFEST") {
+        fs::write(target_manifest, &manifest_bytes)
+            .expect("write real-world manifest to proof directory");
+    }
+    println!(
+        "E2E_ANALYTICS_REAL_MANIFEST: {}",
+        serde_json::to_string(&manifest).expect("manifest")
     );
 }

@@ -15,6 +15,7 @@ verify_evidence() {
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
         connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests sensing-manifest-tests manifest-storage-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
         tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy tournament-tests tournament-cli) ;;
+        analytics) required+=(workspace-check workspace-clippy analytics-pipeline) ;;
         graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
         graphs-and-recipes) required+=(graph-check graph-tests archive-unit archive-integration architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
@@ -66,6 +67,9 @@ verify_evidence() {
         [[ -s "$directory/tournament/artifacts.sha256" ]] || refuse "missing tournament artifact hashes"
         sha256sum --check "$directory/tournament/artifacts.sha256" >/dev/null || refuse "changed tournament artifacts"
     fi
+    if [[ "$lane" == analytics ]]; then
+        bash scripts/e2e_analytics.sh --verify-evidence "$directory/analytics" "$expected" || refuse "missing, changed or mismatched analytics observations"
+    fi
 }
 
 if [[ ${1:-} == --verify-evidence ]]; then
@@ -106,7 +110,7 @@ fi
 proof_version=${1:-}
 [[ "$proof_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "missing or unsafe proof version"
 [[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned source commit"
-[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == connectivity || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-full || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
+[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == connectivity || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-full || ${SCRIPTBOTS_VERIFY_LANE:-} == analytics || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
 [[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || refuse "invoke through the native DSR profile"
 [[ ${SCRIPTBOTS_VERIFY_PROFILE:-} = /* && -f "$SCRIPTBOTS_VERIFY_PROFILE" ]] || refuse "missing materialized DSR profile"
 [[ ${SCRIPTBOTS_PROOF_ROOT:-} = /* && -d "$SCRIPTBOTS_PROOF_ROOT" ]] || refuse "missing external proof root"
@@ -238,6 +242,11 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step tournament-tests test cargo test --locked -p scriptbots-app --lib tournament:: -- --nocapture
         export SCRIPTBOTS_TOURNAMENT_PROOF_DIR="$proof_dir/tournament"
         run_step tournament-cli check bash scripts/e2e_tournament_leaderboard.sh "${SCRIPTBOTS_VERIFY_LANE#tournament-}"
+        ;;
+    analytics)
+        run_step workspace-check check cargo check --locked --workspace --all-targets
+        run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
+        run_step analytics-pipeline check bash scripts/e2e_analytics.sh --inside-dsr "$proof_dir/analytics"
         ;;
     graphs|graphs-and-recipes)
         run_step graph-check check cargo check --locked -p scriptbots-analytics --all-targets
