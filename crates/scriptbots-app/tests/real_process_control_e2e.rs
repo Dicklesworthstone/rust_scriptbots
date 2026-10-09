@@ -1625,8 +1625,9 @@ fn bd_w1oi_server_mode_keeps_advancing_with_file_storage() -> Result<()> {
     verify_server_progress("file", None)
 }
 
-/// DSR30's exact world seed produced Assembly cell 197 = infinity within two seconds.
-/// The same arithmetic must now produce an explicit agent death while the real server advances.
+/// DSR30's seed and original corner-grid ecology produced Assembly cell 197 = infinity.
+/// Pin those scientific inputs: later scenario-free defaults use different founders/ecology.
+/// The same arithmetic must produce an explicit agent death while the real server advances.
 #[test]
 #[serial]
 #[ignore = "bd-bfkd exact seeded server regression: 600 seconds; run explicitly through DSR"]
@@ -1661,6 +1662,27 @@ fn verify_server_progress(storage: &str, seed: Option<u64>) -> Result<()> {
         .stdout(std::fs::File::create(run_dir.join("server.stdout"))?)
         .stderr(std::fs::File::create(&stderr_path)?);
     if let Some(seed) = seed {
+        // DSR53 at 5bb567ab qualified this fault with the original app-v1 launch.
+        // A scenario retains its 4x4 founders and bypasses app-v2 ecology overrides;
+        // the changed fields below come from the original source declarations.
+        let scenario = run_dir.join("assembly-overflow-launch-v1.toml");
+        std::fs::write(
+            &scenario,
+            r#"schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "bd-bfkd-original-launch-v1"
+
+[config]
+persistence_interval = 60
+history_capacity = 600
+food_growth_rate = 0.05
+reproduction_cooldown = 300
+reproduction_rate_herbivore = 1.0
+reproduction_rate_carnivore = 1.0
+population_minimum = 0
+"#,
+        )?;
+        command.arg("--scenario").arg(scenario);
         command.args(["--rng-seed", &seed.to_string()]);
     }
     std::fs::write(run_dir.join("command.txt"), format!("{command:?}\n"))?;
