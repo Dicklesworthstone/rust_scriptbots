@@ -861,6 +861,15 @@ jobs:
           mkdir -p "$ci_config/repos.d" "$ci_proofs" "$ci_target" "$ci_root/empty-cargo-home"
           cp "$SCRIPTBOTS_DSR_BASE_CONFIG_DIR/config.yaml" "$ci_config/config.yaml"
           cp "$SCRIPTBOTS_DSR_BASE_CONFIG_DIR/hosts.yaml" "$ci_config/hosts.yaml"
+          # This workflow materializes controller-local source and proof paths.
+          # SSH-backed profiles require separate remote staging before --no-sync.
+          if ! yq -e '
+            .hosts[strenv(SCRIPTBOTS_DSR_LINUX_HOST)].connection == "local" and
+            .hosts[strenv(SCRIPTBOTS_DSR_LINUX_HOST)].platform == "linux/amd64"
+          ' "$ci_config/hosts.yaml" >/dev/null; then
+            echo "::error::This controller profile requires a local linux/amd64 host; SSH source and proof paths need separate remote staging."
+            exit 1
+          fi
           git init --initial-branch=main "$ci_source"
           git -C "$ci_source" fetch --no-tags "$GITHUB_WORKSPACE" "$SCRIPTBOTS_CI_SOURCE"
           git -C "$ci_source" switch -c main FETCH_HEAD

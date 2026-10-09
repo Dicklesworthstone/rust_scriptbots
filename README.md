@@ -1217,7 +1217,12 @@ controller labelled `self-hosted`, `linux`, `x64`, `scriptbots-dsr`, with DSR,
 `yq`, and the pinned native toolchain installed. Set the repository variables
 `SCRIPTBOTS_DSR_BASE_CONFIG_DIR` to an external directory containing the actual
 DSR `config.yaml` and `hosts.yaml`, and `SCRIPTBOTS_DSR_LINUX_HOST` to the declared
-native host key. Each job materializes a separate profile and clean `main` copy
+native host key. This workflow requires that key to have `connection: local` and
+`platform: linux/amd64` on the same controller: its generated source and proof
+paths are controller-local. An SSH-backed DSR profile requires its source,
+profile and proof paths to be explicitly staged on the remote host before
+`--no-sync`; the CI preparation refuses that configuration before compilation.
+Each job materializes a separate profile and clean `main` copy
 at the event's exact source, uses a unique proof version, parses the complete
 lane evidence, and uploads its raw logs and observations even after a failed run.
 Unprovisioned controllers leave execution pending; workflow wiring does not prove
