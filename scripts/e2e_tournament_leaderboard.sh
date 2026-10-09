@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
-# E2E test for CI-regenerated leaderboard with per-cell provenance (bd-16g.12.3).
-#
-# Proves:
-# 1. Pipeline execution: plan -> run -> rate -> render -> emit
-# 2. Output artifacts: tournament_results.jsonl, ratings.json, leaderboard.md
-# 3. Two runs produce bit-identical result digests and reproducibility gate passes
-# 4. 3-family tournament reproduction barrier holds across mlp, dwraon, assembly
-# 5. CLI subcommand generates artifacts in target directory
-# 6. CLI --check passes against matching generated leaderboard
-# 7. CLI negative control 1: tampered document fails --check with diff
-# 8. CLI negative control 2: stale config digest fails --check with explicit config drift message
-# 9. Exclusion audit: irreproducible runs excluded and recorded in leaderboard footer
-# 10. Structured logging emitted at each stage
+# Real CLI acceptance inside a pinned DSR tournament-smoke or tournament-full lane.
+# Preserve every execution, observation and negative fixture outside the checkout.
 
 set -euo pipefail
 
@@ -24,107 +13,104 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/.." && pwd -P)"
 cd "$repo_root"
 
-if [[ "${CI:-}" == "true" ]]; then
-  cargo_runner=(env RUST_LOG="scriptbots::tournament=info,info" cargo)
-else
-  command -v rch >/dev/null 2>&1 ||
-    fail "rch is required outside CI; local Cargo fallback is forbidden"
-  cargo_runner=(rch exec -- env RUST_LOG="scriptbots::tournament=info,info" cargo)
+[[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || fail "invoke through a pinned native DSR profile"
+[[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || fail "missing expected source identity"
+[[ $(git rev-parse HEAD) == "$SCRIPTBOTS_EXPECTED_COMMIT" && -z $(git status --porcelain --untracked-files=all) ]] || fail "source is dirty or mismatched"
+proof=${SCRIPTBOTS_TOURNAMENT_PROOF_DIR:-}
+[[ "$proof" = /* && ! -e "$proof" ]] || fail "require a fresh external proof directory"
+case "$proof/" in "$repo_root/"*) fail "proof directory must be outside the source" ;; esac
+mkdir "$proof"
+mode=${1:-}
+case "$mode" in
+  smoke) protocol_args=(--smoke --ticks 2000) ;;
+  full) protocol_args=() ;;
+  *) fail "expected smoke or full mode" ;;
+esac
+export RUST_LOG="scriptbots::tournament=info,info"
+cargo build --locked -p scriptbots-app --bin scriptbots-app
+binary="$CARGO_TARGET_DIR/debug/scriptbots-app"
+[[ -x "$binary" ]] || fail "missing built tournament executable"
+"$binary" tournament "${protocol_args[@]}" --jobs 4 --out "$proof/first" 2>&1 | tee "$proof/first.log"
+"$binary" tournament "${protocol_args[@]}" --jobs 4 --out "$proof/second" \
+  --check "$proof/first/leaderboard.md" 2>&1 | tee "$proof/second.log"
+for name in tournament_results.jsonl ratings.json leaderboard.md; do
+  [[ -s "$proof/first/$name" && -s "$proof/second/$name" ]] || fail "missing $name"
+  cmp "$proof/first/$name" "$proof/second/$name" || fail "repeated $name bytes differ"
+done
+
+python3 - "$proof" "$repo_root/tournament/spec.toml" "$mode" "$SCRIPTBOTS_EXPECTED_COMMIT" <<'PY'
+import itertools, json, pathlib, sys, tomllib
+proof, spec_path, mode, source = sys.argv[1:]
+proof = pathlib.Path(proof)
+spec = tomllib.loads(pathlib.Path(spec_path).read_text())
+protocol = spec['smoke'] if mode == 'smoke' else spec['tournament']
+families, seeds = protocol['families'], protocol['seeds']
+ticks = 2000 if mode == 'smoke' else protocol['ticks']
+if protocol['order_policy'] == 'both_assignments':
+    orders = [families, families[::-1]]
+elif protocol['order_policy'] == 'balanced_latin_square':
+    orders = [families[i:] + families[:i] for i in range(len(families))]
+else:
+    orders = list(map(list, itertools.permutations(families)))
+expected = set(itertools.product(seeds, range(len(orders)), families))
+rows = [json.loads(line) for line in (proof/'first/tournament_results.jsonl').read_text().splitlines()]
+cells = [(row['seed'], row['spawn_order_index'], row['family']) for row in rows]
+assert len(cells) == len(set(cells)) == len(expected) and set(cells) == expected
+for row in rows:
+    assert row['ticks_run'] == ticks and row['spawn_order'] == orders[row['spawn_order_index']]
+    assert row['source_revision'] == source and row['source_tree_clean'] is True
+    assert row['source_provenance_complete'] is True and row['reproducible'] is True
+    assert row['sense_backend'] == 'cpu_simd' and row['sense_determinism'] == 'exact'
+    assert row['initial_brain_source_scalars'] == spec['parameters']['nodes_per_family']
+assert len({row['protocol_digest'] for row in rows}) == 1
+assert len({row['config_digest'] for row in rows}) == 1
+matches = len({row['match_id'] for row in rows})
+assert matches == len(seeds) * len(orders)
+ratings = json.loads((proof/'first/ratings.json').read_text())
+for axis in ratings['axes'].values():
+    if 'Rated' in axis:
+        assert axis['Rated']['n_matches'] == matches and axis['Rated']['n_seeds'] == len(seeds)
+        assert set(axis['Rated']['ratings']) == set(families)
+document = (proof/'first/leaderboard.md').read_text()
+assert f'| Tick Budget | {ticks} ticks per match |' in document
+assert f'| Observed Matrix | {matches} matches, {len(rows)} family rows |' in document
+assert ('Smoke Report' in document) == (mode == 'smoke')
+for name in ('first.log', 'second.log'):
+    log = (proof/name).read_text()
+    for observation in ('starting tournament leaderboard execution', 'match outcome row',
+                        'reproducibility gate passed', 'leaderboard execution complete'):
+        assert observation in log, (name, observation)
+print(json.dumps({'source': source, 'mode': mode, 'matches': matches, 'rows': len(rows),
+                  'seeds': len(seeds), 'ticks_per_match': ticks}, sort_keys=True))
+PY
+
+if [[ "$mode" == smoke ]]; then
+  for negative in document config rows ratings; do
+    mkdir "$proof/$negative"
+    cp "$proof/first/tournament_results.jsonl" "$proof/first/ratings.json" "$proof/first/leaderboard.md" "$proof/$negative/"
+    case "$negative" in
+      document) printf '\nDeliberate document mutation.\n' >> "$proof/$negative/leaderboard.md" ;;
+      config) sed -E 's/Effective Config Digest \| `[a-f0-9]+`/Effective Config Digest | `stale-config`/' \
+        "$proof/first/leaderboard.md" > "$proof/$negative/leaderboard.md" ;;
+      rows) jq -c 'if .family == "mlp" then .survival_share = 0.123456 else . end' \
+        "$proof/first/tournament_results.jsonl" > "$proof/$negative/tournament_results.jsonl" ;;
+      ratings) jq '.warnings += ["deliberate rating mutation"]' \
+        "$proof/first/ratings.json" > "$proof/$negative/ratings.json" ;;
+    esac
+    if "$binary" tournament "${protocol_args[@]}" --jobs 4 --check "$proof/$negative/leaderboard.md" \
+      > "$proof/$negative.log" 2>&1; then
+      fail "accepted $negative mutation"
+    fi
+    case "$negative" in
+      config) rg -q 'config digest drift detected' "$proof/$negative.log" || fail "missing config refusal" ;;
+      document) rg -q 'leaderboard document drift detected' "$proof/$negative.log" || fail "missing document refusal" ;;
+      rows|ratings) rg -q 'tournament artifact drift at' "$proof/$negative.log" || fail "missing artifact refusal" ;;
+    esac
+    printf 'Observed rejection: %s\n' "$negative"
+  done
 fi
-
-run1_log="$(mktemp)"
-run2_log="$(mktemp)"
-trap 'rm -f "$run1_log" "$run2_log"' EXIT
-
-printf '==> Phase 1: Running unit & pipeline tests on RCH...\n'
-"${cargo_runner[@]}" test -p scriptbots-app --lib tournament::tests::test_execute_leaderboard_tournament_smoke \
-  -- --exact --nocapture 2>&1 | tee "$run1_log"
-
-printf '==> Phase 2: Running reproducibility check (pass 2)...\n'
-"${cargo_runner[@]}" test -p scriptbots-app --lib tournament::tests::test_execute_leaderboard_tournament_smoke \
-  -- --exact --nocapture 2>&1 | tee "$run2_log"
-
-printf '==> Verifying structured logging from pipeline runs...\n'
-python3 -c '
-import sys, re
-
-with open(sys.argv[1]) as f:
-    log1 = f.read()
-with open(sys.argv[2]) as f:
-    log2 = f.read()
-
-# Assert start log present
-assert "starting tournament leaderboard execution" in log1, "missing start log in pass 1"
-assert "starting tournament leaderboard execution" in log2, "missing start log in pass 2"
-
-# Assert match outcome row logs present
-assert "match outcome row" in log1, "missing match outcome rows in pass 1"
-assert "match outcome row" in log2, "missing match outcome rows in pass 2"
-
-# Assert reproducibility gate passed
-assert "reproducibility gate passed" in log1, "missing reproducibility gate pass log in pass 1"
-assert "reproducibility gate passed" in log2, "missing reproducibility gate pass log in pass 2"
-
-# Assert leaderboard completion log
-assert "leaderboard execution complete" in log1, "missing completion log in pass 1"
-assert "leaderboard execution complete" in log2, "missing completion log in pass 2"
-' "$run1_log" "$run2_log"
-printf '  Structured logging verified.\n'
-
-printf '==> Phase 3: Testing 3-family reproduction barrier (mlp, dwraon, assembly)...\n'
-"${cargo_runner[@]}" test -p scriptbots-app --lib tournament::tests::test_execute_leaderboard_tournament_three_families_barrier \
-  -- --exact --nocapture
-
-printf '==> Phase 4: Testing row exclusion filter and negative controls in unit suite...\n'
-"${cargo_runner[@]}" test -p scriptbots-app --lib tournament::tests::test_leaderboard_row_exclusion_filter \
-  -- --exact --nocapture
-"${cargo_runner[@]}" test -p scriptbots-app --lib tournament::tests::test_leaderboard_drift_check \
-  -- --exact --nocapture
-
-printf '==> Phase 5: Testing CLI tournament subcommand and artifact emission...\n'
-cli_out_dir="artifacts/tournament"
-mkdir -p "$cli_out_dir"
-"${cargo_runner[@]}" run -p scriptbots-app --bin scriptbots-app -- \
-  tournament --smoke --out "$cli_out_dir"
-
-[[ -s "$cli_out_dir/tournament_results.jsonl" ]] || fail "missing tournament_results.jsonl"
-[[ -s "$cli_out_dir/ratings.json" ]] || fail "missing ratings.json"
-[[ -s "$cli_out_dir/leaderboard.md" ]] || fail "missing leaderboard.md"
-printf '  CLI generated all 3 artifacts in %s\n' "$cli_out_dir"
-
-printf '==> Phase 6: Testing CLI --check mode (positive control)...\n'
-"${cargo_runner[@]}" run -p scriptbots-app --bin scriptbots-app -- \
-  tournament --smoke --check "$cli_out_dir/leaderboard.md"
-printf '  Positive --check passed.\n'
-
-printf '==> Phase 7: Testing CLI --check mode negative control 1 (document drift)...\n'
-drift_doc="$(mktemp)"
-trap 'rm -f "$run1_log" "$run2_log" "$drift_doc"' EXIT
-sed 's/1500.0/1999.9/g' "$cli_out_dir/leaderboard.md" > "$drift_doc"
-drift_err_log="$(mktemp)"
-trap 'rm -f "$run1_log" "$run2_log" "$drift_doc" "$drift_err_log"' EXIT
-
-if "${cargo_runner[@]}" run -p scriptbots-app --bin scriptbots-app -- \
-  tournament --smoke --check "$drift_doc" > "$drift_err_log" 2>&1; then
-  fail "expected --check to fail on drifted document, but it exited 0"
-fi
-grep -qi -E "drift|diff" "$drift_err_log" ||
-  fail "expected document drift / diff error in output"
-printf '  Negative Control 1 passed: detected document drift and rejected.\n'
-
-printf '==> Phase 8: Testing CLI --check mode negative control 2 (config drift)...\n'
-cfg_drift_doc="$(mktemp)"
-cfg_err_log="$(mktemp)"
-trap 'rm -f "$run1_log" "$run2_log" "$drift_doc" "$drift_err_log" "$cfg_drift_doc" "$cfg_err_log"' EXIT
-sed -E 's/Effective Config Digest \| `[a-f0-9]+`/Effective Config Digest | `stale_config_digest_deadbeef`/g' \
-  "$cli_out_dir/leaderboard.md" > "$cfg_drift_doc"
-
-if "${cargo_runner[@]}" run -p scriptbots-app --bin scriptbots-app -- \
-  tournament --smoke --check "$cfg_drift_doc" > "$cfg_err_log" 2>&1; then
-  fail "expected --check to fail on stale config digest, but it exited 0"
-fi
-grep -qi -E "config.*drift" "$cfg_err_log" ||
-  fail "expected explicit config drift in output"
-printf '  Negative Control 2 passed: detected config drift and rejected.\n'
-
-printf '\n\033[32;1me2e_tournament_leaderboard: ALL TESTS PASSED\033[0m\n'
+sha256sum "$proof/first/tournament_results.jsonl" "$proof/first/ratings.json" "$proof/first/leaderboard.md" \
+  "$proof/second/tournament_results.jsonl" "$proof/second/ratings.json" "$proof/second/leaderboard.md" > "$proof/artifacts.sha256"
+jq -n --arg source "$SCRIPTBOTS_EXPECTED_COMMIT" --arg mode "$mode" \
+  '{schema:"scriptbots.tournament-proof.v1",status:"pass",source:$source,mode:$mode,identical_invocations:2}' > "$proof/verdict.json"
+printf 'Observed identical %s CLI artifacts from two invocations; proof: %s\n' "$mode" "$proof"

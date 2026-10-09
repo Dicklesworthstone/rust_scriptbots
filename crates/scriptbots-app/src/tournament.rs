@@ -36,7 +36,7 @@ const MAX_MATCHES: usize = 4_096;
 const MAX_PARALLEL_MATCH_WORKERS: usize = 64;
 
 /// The complete, shared configuration for a tournament.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TournamentSpec {
     /// Families entered. Equal cohort size per family is enforced.
     pub families: Vec<BrainKind>,
@@ -55,7 +55,7 @@ pub struct TournamentSpec {
 }
 
 /// Spawn-order assignment generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderPolicy {
     /// Exactly two assignments; valid only for two families.
     BothAssignments,
@@ -174,6 +174,8 @@ pub enum TournamentError {
         rerun_digest: String,
         results_digest: String,
     },
+    #[error("tournament publication refused: {reason}")]
+    Publication { reason: String },
     #[error("{reason}")]
     UnbalancedOrders { reason: String },
 }
@@ -727,6 +729,9 @@ pub mod execution {
         pub config_digest: String,
         pub plan: super::MatchPlan,
         pub agents_final: BTreeMap<BrainKind, usize>,
+        pub initial_brain_source_scalars: BTreeMap<BrainKind, usize>,
+        pub initial_genome_digests: BTreeMap<BrainKind, String>,
+        pub initial_mutation_rates: BTreeMap<BrainKind, scriptbots_core::MutationRates>,
     }
 
     fn config_layer_error(path: &Path, reason: impl std::fmt::Display) -> TournamentError {
@@ -736,7 +741,7 @@ pub mod execution {
         }
     }
 
-    fn resolve_spec_config(
+    pub(super) fn resolve_spec_config(
         spec: &super::TournamentSpec,
         base_config: &ScriptBotsConfig,
     ) -> Result<ScriptBotsConfig, TournamentError> {
@@ -1006,18 +1011,21 @@ pub mod execution {
         );
         let mut slot = 0_usize;
         let mut arm_by_uid: HashMap<scriptbots_core::AgentUid, BrainKind> = HashMap::new();
+        let mut first_uid_by_family = BTreeMap::new();
+        let mut initial_genome_digests = BTreeMap::new();
+        let mut initial_mutation_rates = BTreeMap::new();
         for family in &plan.spawn_order {
-            let key = family_keys.get(family).copied().ok_or_else(|| {
-                TournamentError::UnbalancedOrders {
-                    reason: format!("family {} has no registered key", family.as_str()),
-                }
-            })?;
             let members = plan.cohort.get(family).copied().ok_or_else(|| {
                 TournamentError::UnbalancedOrders {
                     reason: format!("family {} has no cohort entry", family.as_str()),
                 }
             })?;
-            for _ in 0..members {
+            let adapter = adapter_for(family.as_str())?;
+            let family_hash = blake3::hash(family.as_str().as_bytes());
+            let mut family_seed_bytes = [0_u8; 8];
+            family_seed_bytes.copy_from_slice(&family_hash.as_bytes()[..8]);
+            let family_seed = u64::from_le_bytes(family_seed_bytes);
+            for member_index in 0..members {
                 let (x, y) = positions.get(slot).copied().ok_or_else(|| {
                     TournamentError::UnbalancedOrders {
                         reason: format!("cohort position {slot} is unavailable"),
@@ -1032,13 +1040,50 @@ pub mod execution {
                     .map_err(|error| TournamentError::UnbalancedOrders {
                         reason: format!("cohort spawn failed at slot {slot}: {error}"),
                     })?;
-                if !world.bind_agent_brain(id, key).map_err(|error| {
-                    TournamentError::UnbalancedOrders {
+                let mut brain_rng = scriptbots_core::SmallRngStream::seed_from_u64(
+                    super::splitmix64(plan.brain_seed ^ family_seed ^ member_index as u64),
+                );
+                let genome = adapter
+                    .random_genome(scriptbots_core::BrainProvenance::default(), &mut brain_rng)
+                    .map_err(|error| TournamentError::Publication {
+                        reason: format!("brain-seeded founding genome for {family}: {error}"),
+                    })?;
+                if !world
+                    .bind_agent_brain_genome(id, &genome)
+                    .map_err(|error| TournamentError::UnbalancedOrders {
                         reason: format!("cohort brain bind failed at slot {slot}: {error}"),
-                    }
-                })? {
+                    })?
+                {
                     return Err(TournamentError::UnbalancedOrders {
                         reason: format!("brain bind returned false for family {}", family.as_str()),
+                    });
+                }
+                let bound_runtime =
+                    world
+                        .agent_runtime(id)
+                        .ok_or_else(|| TournamentError::Publication {
+                            reason: format!("founder runtime missing for {family}"),
+                        })?;
+                if bound_runtime.brain.genome() != Some(&genome) {
+                    return Err(TournamentError::Publication {
+                        reason: format!(
+                            "bound founder genome differs from brain-seeded genome for {family}"
+                        ),
+                    });
+                }
+                let genome_bytes =
+                    serde_json::to_vec(&genome).map_err(|error| TournamentError::Publication {
+                        reason: format!("founder genome serialization for {family}: {error}"),
+                    })?;
+                initial_genome_digests
+                    .entry(*family)
+                    .or_insert_with(|| blake3::hash(&genome_bytes).to_hex().to_string());
+                if let Some(previous) =
+                    initial_mutation_rates.insert(*family, bound_runtime.mutation_rates)
+                    && previous != bound_runtime.mutation_rates
+                {
+                    return Err(TournamentError::Publication {
+                        reason: format!("initial mutation rates differ inside family {family}"),
                     });
                 }
                 let uid = world
@@ -1047,7 +1092,30 @@ pub mod execution {
                         reason: format!("cohort agent at slot {slot} has no stable uid"),
                     })?;
                 arm_by_uid.insert(uid, *family);
+                first_uid_by_family.entry(*family).or_insert(uid);
             }
+        }
+
+        let mut initial_brain_source_scalars = BTreeMap::new();
+        for (family, uid) in first_uid_by_family {
+            let request = scriptbots_core::BrainInspectionRequest::single(
+                scriptbots_core::BrainInspectionClientId::new(0),
+                scriptbots_core::BrainInspectionRevision::new(0),
+                uid,
+            );
+            let inspection =
+                world
+                    .inspect_brains(&request)
+                    .map_err(|error| TournamentError::Publication {
+                        reason: format!("initial topology inspection for {family}: {error}"),
+                    })?;
+            let telemetry =
+                inspection
+                    .ready_for(uid)
+                    .ok_or_else(|| TournamentError::Publication {
+                        reason: format!("initial topology inspection unavailable for {family}"),
+                    })?;
+            initial_brain_source_scalars.insert(family, telemetry.inspection.build.source_scalars);
         }
 
         let mut extinct_at: BTreeMap<BrainKind, u64> = BTreeMap::new();
@@ -1206,6 +1274,9 @@ pub mod execution {
             config_digest,
             plan: plan.clone(),
             agents_final: family_live,
+            initial_brain_source_scalars,
+            initial_genome_digests,
+            initial_mutation_rates,
         })
     }
 
@@ -3032,6 +3103,15 @@ pub mod leaderboard {
         pub brain_seed: u64,
         pub family: String,
         pub spawn_order_index: u32,
+        pub spawn_order: Vec<String>,
+        pub ticks_run: u64,
+        pub protocol_digest: String,
+        pub source_revision: Option<String>,
+        pub source_tree_clean: Option<bool>,
+        pub source_provenance_complete: bool,
+        pub initial_brain_source_scalars: usize,
+        pub initial_genome_digest: String,
+        pub initial_mutation_rates: scriptbots_core::MutationRates,
         pub survival_share: f64,
         pub biomass_share: f64,
         pub mean_lineage_depth: f64,
@@ -3099,6 +3179,8 @@ pub mod leaderboard {
         sense_backend: &str,
         sense_determinism: &str,
         reproducible: bool,
+        protocol_digest: &str,
+        build: &BuildProvenanceV0,
     ) -> Vec<TournamentResultRow> {
         let mut rows = Vec::new();
         for report in reports {
@@ -3111,18 +3193,13 @@ pub mod leaderboard {
 
             for (family_name, outcome) in &report.outcome.per_family {
                 let run_id = format!("run-{match_id:016x}-{family_name}");
-                let manifest_raw = format!(
-                    "{run_id}:{config_digest}:{seed}:{world_seed}:{brain_seed}:{reproducible}:{sense_backend}:{sense_determinism}"
-                );
-                let manifest_digest = blake3::hash(manifest_raw.as_bytes()).to_hex().to_string();
-
                 let agents_final = report
                     .agents_final
                     .get(&to_brain_kind(family_name))
                     .copied()
                     .unwrap_or(0);
 
-                rows.push(TournamentResultRow {
+                let mut row = TournamentResultRow {
                     run_id,
                     match_id,
                     seed,
@@ -3130,6 +3207,24 @@ pub mod leaderboard {
                     brain_seed,
                     family: family_name.clone(),
                     spawn_order_index,
+                    spawn_order: report
+                        .outcome
+                        .spawn_order
+                        .iter()
+                        .map(|family| family.as_str().to_owned())
+                        .collect(),
+                    ticks_run: report.outcome.ticks_run,
+                    protocol_digest: protocol_digest.to_owned(),
+                    source_revision: build.source_revision.clone(),
+                    source_tree_clean: build.source_tree_clean,
+                    source_provenance_complete: build.derived_provenance_complete(),
+                    initial_brain_source_scalars: report.initial_brain_source_scalars
+                        [&to_brain_kind(family_name)],
+                    initial_genome_digest: report.initial_genome_digests
+                        [&to_brain_kind(family_name)]
+                        .clone(),
+                    initial_mutation_rates: report.initial_mutation_rates
+                        [&to_brain_kind(family_name)],
                     survival_share: outcome.survival_share,
                     biomass_share: outcome.biomass_share,
                     mean_lineage_depth: outcome.mean_lineage_depth,
@@ -3138,15 +3233,103 @@ pub mod leaderboard {
                     novelty_coverage: outcome.novelty_coverage,
                     agents_final,
                     config_digest: config_digest.clone(),
-                    manifest_digest,
+                    manifest_digest: String::new(),
                     reproducible,
                     sense_backend: sense_backend.to_owned(),
                     sense_determinism: sense_determinism.to_owned(),
                     warnings: report.outcome.warnings.clone(),
-                });
+                };
+                row.manifest_digest = result_manifest_digest(&row);
+                rows.push(row);
             }
         }
         rows
+    }
+
+    pub(super) fn result_manifest_digest(row: &TournamentResultRow) -> String {
+        let mut projection = row.clone();
+        projection.manifest_digest.clear();
+        let bytes = serde_json::to_vec(&projection)
+            .expect("finite tournament result row has a serializable manifest");
+        blake3::hash(&bytes).to_hex().to_string()
+    }
+
+    /// Validate every planned match/family cell before rows enter the rating pipeline.
+    pub fn validate_result_matrix(
+        rows: &[TournamentResultRow],
+        spec: &TournamentSpec,
+        protocol_digest: &str,
+        build: &BuildProvenanceV0,
+    ) -> Result<(), TournamentError> {
+        let plans = super::plan(spec)?;
+        let mut expected = BTreeMap::new();
+        for plan in &plans {
+            for family in &plan.spawn_order {
+                expected.insert((plan.match_id.0, family.as_str()), plan);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            let key = (row.match_id, row.family.as_str());
+            let Some(plan) = expected.get(&key) else {
+                return Err(TournamentError::Publication {
+                    reason: format!("unplanned result cell {} / {}", row.match_id, row.family),
+                });
+            };
+            let spawn_order: Vec<_> = plan
+                .spawn_order
+                .iter()
+                .map(|family| family.as_str().to_owned())
+                .collect();
+            if !seen.insert(key)
+                || row.run_id != format!("run-{:016x}-{}", row.match_id, row.family)
+                || row.seed != plan.seed
+                || row.world_seed != plan.world_seed
+                || row.brain_seed != plan.brain_seed
+                || row.spawn_order_index != plan.spawn_order_index
+                || row.spawn_order != spawn_order
+                || row.ticks_run != spec.ticks
+                || row.protocol_digest != protocol_digest
+                || row.source_revision != build.source_revision
+                || row.source_tree_clean != build.source_tree_clean
+                || row.source_provenance_complete != build.derived_provenance_complete()
+                || !row.survival_share.is_finite()
+                || !(0.0..=1.0).contains(&row.survival_share)
+                || !row.biomass_share.is_finite()
+                || !(0.0..=1.0).contains(&row.biomass_share)
+                || !row.mean_lineage_depth.is_finite()
+                || row.mean_lineage_depth < 0.0
+                || row.initial_brain_source_scalars == 0
+                || row.initial_genome_digest.len() != blake3::OUT_LEN * 2
+                || !row
+                    .initial_genome_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || !row.initial_mutation_rates.primary.is_finite()
+                || row.initial_mutation_rates.primary < 0.0
+                || !row.initial_mutation_rates.secondary.is_finite()
+                || row.initial_mutation_rates.secondary < 0.0
+                || row.extinct_at.is_some_and(|tick| tick > row.ticks_run)
+                || row.manifest_digest != result_manifest_digest(row)
+            {
+                return Err(TournamentError::Publication {
+                    reason: format!(
+                        "duplicate or mismatched result cell {} / {}",
+                        row.match_id, row.family
+                    ),
+                });
+            }
+        }
+        if seen.len() != expected.len() {
+            return Err(TournamentError::Publication {
+                reason: format!(
+                    "result matrix has {} cells; planned {}",
+                    seen.len(),
+                    expected.len()
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Filter eligible result rows for rating computation, discarding and reporting invalid runs.
@@ -3177,7 +3360,7 @@ pub mod leaderboard {
                     "run excluded from tournament leaderboard"
                 );
                 excluded.push(record);
-            } else if row.sense_determinism.eq_ignore_ascii_case("approximate") {
+            } else if !row.sense_determinism.eq_ignore_ascii_case("exact") {
                 let record = ExcludedRunRecord {
                     run_id: row.run_id.clone(),
                     match_id: row.match_id,
@@ -3243,6 +3426,7 @@ pub mod leaderboard {
         seed: u64,
         spawn_order_index: u32,
         spawn_order: Vec<String>,
+        ticks_run: u64,
         per_family: BTreeMap<String, FamilyOutcome>,
         warnings: Vec<String>,
     }
@@ -3258,13 +3442,11 @@ pub mod leaderboard {
                 .or_insert_with(|| RowMatchAccumulator {
                     seed: r.seed,
                     spawn_order_index: r.spawn_order_index,
-                    spawn_order: Vec::new(),
+                    spawn_order: r.spawn_order.clone(),
+                    ticks_run: r.ticks_run,
                     per_family: BTreeMap::new(),
                     warnings: r.warnings.clone(),
                 });
-            if !entry.spawn_order.contains(&r.family) {
-                entry.spawn_order.push(r.family.clone());
-            }
             entry.per_family.insert(
                 r.family.clone(),
                 FamilyOutcome {
@@ -3283,7 +3465,7 @@ pub mod leaderboard {
             .map(|(match_id, acc)| MatchOutcome {
                 match_id: MatchId(match_id),
                 seed: acc.seed,
-                ticks_run: 0,
+                ticks_run: acc.ticks_run,
                 spawn_order_index: acc.spawn_order_index,
                 spawn_order: acc.spawn_order.iter().map(|s| to_brain_kind(s)).collect(),
                 per_family: acc.per_family,
@@ -3294,8 +3476,11 @@ pub mod leaderboard {
 
     /// Generate the complete `docs/leaderboard.md` markdown content.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_leaderboard_document(
         spec: &TournamentSpecFile,
+        executed_spec: &TournamentSpec,
+        is_smoke: bool,
         rating_table: &RatingTable,
         rows: &[TournamentResultRow],
         excluded: &[ExcludedRunRecord],
@@ -3304,8 +3489,19 @@ pub mod leaderboard {
     ) -> String {
         let mut out = String::new();
 
-        out.push_str("<!-- DO NOT EDIT: Automatically generated by scriptbots-app tournament. Regenerate with: scriptbots-app tournament --spec tournament/spec.toml -->\n\n");
-        out.push_str("# ScriptBots Canonical Brain-Family Tournament Leaderboard\n\n");
+        let smoke_flag = if is_smoke { " --smoke" } else { "" };
+        out.push_str(&format!("<!-- DO NOT EDIT: Automatically generated by scriptbots-app tournament. Regenerate with: scriptbots-app tournament --spec tournament/spec.toml{smoke_flag} -->\n\n"));
+        out.push_str(&format!(
+            "# ScriptBots Canonical Brain-Family Tournament {}\n\n",
+            if is_smoke {
+                "Smoke Report"
+            } else {
+                "Leaderboard"
+            }
+        ));
+        if is_smoke {
+            out.push_str("**Smoke execution. These rows do not establish the full canonical tournament.**\n\n");
+        }
         out.push_str("Empirical multi-axis comparative evaluation of autonomous neural agent architectures under identical ecological pressure with regularized Bradley-Terry / Zermelo ratings and clustered bootstrap confidence intervals.\n\n");
 
         out.push_str("## Protocol & Scientific Boundary Conditions\n\n");
@@ -3323,46 +3519,84 @@ pub mod leaderboard {
         ));
         out.push_str(&format!(
             "| Entered Families | {} |\n",
-            spec.tournament.families.join(", ")
+            executed_spec
+                .families
+                .iter()
+                .map(|family| family.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
-        let seeds_summary = if spec.tournament.seeds.len() <= 8 {
-            format!("{:?}", spec.tournament.seeds)
+        let seeds_summary = if executed_spec.seeds.len() <= 8 {
+            format!("{:?}", executed_spec.seeds)
         } else {
             format!(
                 "[{}, {}, ..., {}] ({} total)",
-                spec.tournament.seeds[0],
-                spec.tournament.seeds[1],
-                spec.tournament.seeds.last().unwrap_or(&0),
-                spec.tournament.seeds.len()
+                executed_spec.seeds[0],
+                executed_spec.seeds[1],
+                executed_spec.seeds.last().unwrap_or(&0),
+                executed_spec.seeds.len()
             )
         };
         out.push_str(&format!("| Evaluated Seeds | {seeds_summary} |\n"));
         out.push_str(&format!(
             "| Tick Budget | {} ticks per match |\n",
-            spec.tournament.ticks
+            executed_spec.ticks
         ));
-        let agents_per_fam = if spec.tournament.families.is_empty() {
+        let agents_per_fam = if executed_spec.families.is_empty() {
             0
         } else {
-            spec.tournament.cohort_size / spec.tournament.families.len()
+            executed_spec.cohort_size / executed_spec.families.len()
         };
         out.push_str(&format!(
             "| Cohort Size | {} total agents ({} per family) |\n",
-            spec.tournament.cohort_size, agents_per_fam
+            executed_spec.cohort_size, agents_per_fam
         ));
         out.push_str(&format!(
             "| Order Policy | `{}` |\n",
-            spec.tournament.order_policy
+            match executed_spec.order_policy {
+                OrderPolicy::BothAssignments => "both_assignments",
+                OrderPolicy::BalancedLatinSquare => "balanced_latin_square",
+                OrderPolicy::AllPermutations => "all_permutations",
+            }
         ));
         out.push_str(&format!(
-            "| Closed World | `{}` (extinction is terminal, zero respawn) |\n",
-            spec.tournament.closed
+            "| Closed World | `{}` ({}) |\n",
+            executed_spec.closed,
+            if executed_spec.closed {
+                "extinction is terminal, zero respawn"
+            } else {
+                "population lifeline enabled"
+            }
         ));
-        out.push_str("| Reproductive Isolation | Same-kind mating barrier enforced (zero cross-family mating) |\n");
-        let nodes = spec.parameters.as_ref().map_or(200, |p| p.nodes_per_family);
+        out.push_str(
+            "| Reproductive Isolation | Cross-family births checked at every completed tick |\n",
+        );
+        let topology: BTreeSet<_> = rows
+            .iter()
+            .map(|row| row.initial_brain_source_scalars)
+            .collect();
         out.push_str(&format!(
-            "| Parameter Complexity | {nodes} nodes per family across all architectures |\n"
+            "| Observed Initial Topology | {topology:?} source activation scalars per inspected family representative |\n"
         ));
+        let observed_matches: BTreeSet<_> = rows.iter().map(|row| row.match_id).collect();
+        out.push_str(&format!(
+            "| Observed Matrix | {} matches, {} family rows |\n",
+            observed_matches.len(),
+            rows.len()
+        ));
+        if let Some(first) = rows.first() {
+            out.push_str(&format!(
+                "| Executed Protocol Digest | `{}` |\n",
+                first.protocol_digest
+            ));
+        }
+        let mut initial_rates = BTreeMap::new();
+        for row in rows {
+            initial_rates.insert(&row.family, row.initial_mutation_rates);
+        }
+        for (family, rates) in initial_rates {
+            out.push_str(&format!("| Initial Mutation Rates: {family} | primary `{}`, secondary `{}` (evolve during execution) |\n", rates.primary, rates.secondary));
+        }
         out.push_str(&format!(
             "| Sensory Lane | `{}` (Determinism: `{}`) |\n",
             spec.tournament.sense_backend, spec.tournament.sense_determinism
@@ -3501,7 +3735,7 @@ pub mod leaderboard {
         out.push_str("## Exclusion Audit\n\n");
         out.push_str(&format!("- Total Excluded Runs: {}\n", excluded.len()));
         if excluded.is_empty() {
-            out.push_str("*Zero exclusions: all match rows verified reproducible (`reproducible = true`), exact-sense (`sense_determinism = exact`), and matching canonical config digest.*\n\n");
+            out.push_str("*Zero exclusions: the complete planned matrix passed row identity, source, protocol, tick-budget, exact CPU sensing, and config checks before rating.*\n\n");
         } else {
             out.push_str("### Discarded Observations\n\n");
             for rec in excluded {
@@ -3595,6 +3829,8 @@ pub mod leaderboard {
     /// Error returned when `--check` encounters document or config drift.
     #[derive(Debug, Clone, PartialEq, thiserror::Error)]
     pub enum LeaderboardCheckError {
+        #[error("tournament artifact drift at {path}:\n{diff}")]
+        ArtifactDrift { path: PathBuf, diff: String },
         #[error("committed leaderboard file not found at {path}: {reason}")]
         FileNotFound { path: PathBuf, reason: String },
         #[error(
@@ -3749,6 +3985,29 @@ pub mod leaderboard {
             spec_file.to_spec()?
         };
 
+        if !is_smoke && !build_provenance.derived_provenance_complete() {
+            return Err(TournamentError::Publication {
+                reason: "full publication requires complete provenance from a clean, known source revision".to_owned(),
+            });
+        }
+        if spec_file.tournament.sense_backend != "cpu_simd"
+            || spec_file.tournament.sense_determinism != "exact"
+            || !build_provenance.core.simd_wide
+        {
+            return Err(TournamentError::Publication {
+                reason:
+                    "the tournament executor supports only its compiled exact CPU SIMD sensing lane"
+                        .to_owned(),
+            });
+        }
+        let require_identical_rerun = !is_smoke
+            || check_reproducibility
+            || spec_file.tournament.reproducible
+            || spec_file
+                .reproducibility
+                .as_ref()
+                .is_some_and(|policy| policy.require_identical_rerun);
+
         let planned_matches = super::plan(&runtime_spec)?.len();
         let spec_path_str = spec_path
             .map(|p| p.display().to_string())
@@ -3767,7 +4026,8 @@ pub mod leaderboard {
             effective_base_config.reproduction_partner_chance = 0.0;
         }
 
-        let mut digest_config = effective_base_config.clone();
+        let mut digest_config =
+            super::execution::resolve_spec_config(&runtime_spec, &effective_base_config)?;
         digest_config.rng_seed = None;
         digest_config.closed = runtime_spec.closed;
         let expected_config_digest = blake3::hash(
@@ -3777,6 +4037,17 @@ pub mod leaderboard {
         )
         .to_hex()
         .to_string();
+        let protocol_bytes = serde_json::to_vec(&(
+            &runtime_spec,
+            &spec_file.parameters,
+            &spec_file.tournament.sense_backend,
+            &spec_file.tournament.sense_determinism,
+            &expected_config_digest,
+        ))
+        .map_err(|error| TournamentError::Publication {
+            reason: format!("executed protocol serialization failed: {error}"),
+        })?;
+        let protocol_digest = blake3::hash(&protocol_bytes).to_hex().to_string();
 
         tracing::info!(
             target: "scriptbots::tournament::leaderboard",
@@ -3800,6 +4071,12 @@ pub mod leaderboard {
             .first()
             .map(|r| r.config_digest.clone())
             .unwrap_or_default();
+        if config_digest != expected_config_digest {
+            return Err(TournamentError::ConfigDrift {
+                expected: expected_config_digest,
+                found: config_digest,
+            });
+        }
 
         for report in &reports {
             for (family, outcome) in &report.outcome.per_family {
@@ -3823,9 +4100,30 @@ pub mod leaderboard {
             &spec_file.tournament.sense_backend,
             &spec_file.tournament.sense_determinism,
             spec_file.tournament.reproducible,
+            &protocol_digest,
+            build_provenance,
         );
+        validate_result_matrix(&rows, &runtime_spec, &protocol_digest, build_provenance)?;
+        if let Some(parameters) = &spec_file.parameters
+            && rows
+                .iter()
+                .any(|row| row.initial_brain_source_scalars != parameters.nodes_per_family)
+        {
+            return Err(TournamentError::Publication {
+                reason: format!(
+                    "observed initial family topology differs from requested {} nodes/cells",
+                    parameters.nodes_per_family
+                ),
+            });
+        }
 
         let (eligible_rows, excluded_runs) = filter_eligible_rows(&rows, &config_digest);
+        validate_result_matrix(
+            &eligible_rows,
+            &runtime_spec,
+            &protocol_digest,
+            build_provenance,
+        )?;
         let eligible_outcomes = rows_to_match_outcomes(&eligible_rows);
 
         let rating_options = RatingOptions {
@@ -3840,6 +4138,8 @@ pub mod leaderboard {
 
         let leaderboard_md = generate_leaderboard_document(
             spec_file,
+            &runtime_spec,
+            is_smoke,
             &rating_table,
             &eligible_rows,
             &excluded_runs,
@@ -3861,19 +4161,28 @@ pub mod leaderboard {
         let results_digest = blake3::hash(results_jsonl.as_bytes()).to_hex().to_string();
         let ratings_digest = blake3::hash(ratings_json.as_bytes()).to_hex().to_string();
 
-        if check_reproducibility {
+        if require_identical_rerun {
             tracing::info!(
                 target: "scriptbots::tournament::leaderboard",
                 "running second pass to verify byte-level reproducibility gate"
             );
             let reports_rerun =
                 run_tournament_with_jobs(&runtime_spec, &effective_base_config, jobs)?;
+            super::enforce_no_config_drift(&reports_rerun)?;
             let rows_rerun = reports_to_result_rows(
                 &reports_rerun,
                 &spec_file.tournament.sense_backend,
                 &spec_file.tournament.sense_determinism,
                 spec_file.tournament.reproducible,
+                &protocol_digest,
+                build_provenance,
             );
+            validate_result_matrix(
+                &rows_rerun,
+                &runtime_spec,
+                &protocol_digest,
+                build_provenance,
+            )?;
             let results_rerun_jsonl =
                 TournamentResultRow::serialize_jsonl(&rows_rerun).map_err(|e| {
                     TournamentError::UnbalancedOrders {
@@ -3890,10 +4199,46 @@ pub mod leaderboard {
                     results_digest,
                 });
             }
+            let (eligible_rerun, excluded_rerun) =
+                filter_eligible_rows(&rows_rerun, &config_digest);
+            validate_result_matrix(
+                &eligible_rerun,
+                &runtime_spec,
+                &protocol_digest,
+                build_provenance,
+            )?;
+            let ratings_rerun =
+                rate_tournament(&rows_to_match_outcomes(&eligible_rerun), &rating_options)
+                    .map_err(|error| TournamentError::Publication {
+                        reason: format!("rerun rating failed: {error}"),
+                    })?;
+            let ratings_rerun_json =
+                serde_json::to_string_pretty(&ratings_rerun).map_err(|error| {
+                    TournamentError::Publication {
+                        reason: format!("rerun rating serialization failed: {error}"),
+                    }
+                })?;
+            let document_rerun = generate_leaderboard_document(
+                spec_file,
+                &runtime_spec,
+                is_smoke,
+                &ratings_rerun,
+                &eligible_rerun,
+                &excluded_rerun,
+                &config_digest,
+                build_provenance,
+            );
+            if ratings_rerun_json != ratings_json || document_rerun != leaderboard_md {
+                return Err(TournamentError::Publication {
+                    reason:
+                        "identical raw rows did not reproduce ratings and generated document bytes"
+                            .to_owned(),
+                });
+            }
             tracing::info!(
                 target: "scriptbots::tournament::leaderboard",
                 digest = %results_digest,
-                "reproducibility gate passed: bit-identical results across invocations"
+                "reproducibility gate passed: identical rows, ratings and document across execution passes"
             );
         }
 
@@ -3908,6 +4253,31 @@ pub mod leaderboard {
                 verdict = "drift";
                 TournamentError::LeaderboardCheck(e)
             })?;
+            let artifact_directory = check_path.parent().unwrap_or_else(|| Path::new("."));
+            for (name, generated) in [
+                ("tournament_results.jsonl", results_jsonl.as_str()),
+                ("ratings.json", ratings_json.as_str()),
+            ] {
+                let path = artifact_directory.join(name);
+                let committed = fs::read_to_string(&path).map_err(|error| {
+                    LeaderboardCheckError::FileNotFound {
+                        path: path.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                if committed != generated {
+                    return Err(LeaderboardCheckError::ArtifactDrift {
+                        diff: compute_unified_diff(
+                            &committed,
+                            generated,
+                            &path.display().to_string(),
+                            name,
+                        ),
+                        path,
+                    }
+                    .into());
+                }
+            }
         }
 
         let outcome = LeaderboardPipelineOutcome {
@@ -5078,6 +5448,15 @@ mod tests {
             family: "mlp".to_string(),
             spawn_order_index: 0,
             survival_share: 0.6,
+            spawn_order: vec!["mlp".to_owned(), "dwraon".to_owned()],
+            ticks_run: 50,
+            protocol_digest: "protocol-fixture".to_owned(),
+            source_revision: Some("source-fixture".to_owned()),
+            source_tree_clean: Some(true),
+            source_provenance_complete: true,
+            initial_brain_source_scalars: 200,
+            initial_genome_digest: "fixture-genome".to_owned(),
+            initial_mutation_rates: scriptbots_core::MutationRates::default(),
             biomass_share: 0.5,
             mean_lineage_depth: 4.0,
             max_lineage_depth: 5,
@@ -5262,11 +5641,39 @@ mod tests {
     }
 
     #[test]
+    fn tournament_brain_seed_changes_bound_founder_genomes() {
+        let spec_file = leaderboard::TournamentSpecFile::from_toml_str(include_str!(
+            "../../../tournament/spec.toml"
+        ))
+        .expect("pinned tournament specification");
+        let mut spec = spec_file.to_smoke_spec().expect("smoke plan");
+        spec.seeds.truncate(1);
+        let match_plan = plan(&spec).expect("matched world plan")[0].clone();
+        let config = scriptbots_core::ScriptBotsConfig::default();
+        let first =
+            execution::run_match(&match_plan, 1, true, &config).expect("first founding cohort");
+        let same =
+            execution::run_match(&match_plan, 1, true, &config).expect("same founding seeds");
+        assert_eq!(first.initial_genome_digests, same.initial_genome_digests);
+        let mut changed = match_plan.clone();
+        changed.brain_seed ^= 1;
+        let other = execution::run_match(&changed, 1, true, &config).expect("changed brain seed");
+        assert_eq!(first.plan.world_seed, other.plan.world_seed);
+        assert!(first.initial_genome_digests.iter().all(|(family, digest)| {
+            other
+                .initial_genome_digests
+                .get(family)
+                .is_some_and(|other| other != digest)
+        }));
+    }
+
+    #[test]
     fn test_execute_leaderboard_tournament_smoke() {
         use crate::BuildProvenanceV0;
         use leaderboard::{
-            LeaderboardCheckError, TournamentSpecFile, check_leaderboard_drift,
-            execute_leaderboard_tournament,
+            LeaderboardCheckError, TournamentResultRow, TournamentSpecFile,
+            check_leaderboard_drift, execute_leaderboard_tournament, generate_leaderboard_document,
+            rows_to_match_outcomes, validate_result_matrix,
         };
         use scriptbots_core::ScriptBotsConfig;
 
@@ -5302,6 +5709,103 @@ mod tests {
         assert_eq!(outcome.excluded_rows, 0);
         assert!(!outcome.results_digest.is_empty());
         assert!(!outcome.ratings_digest.is_empty());
+        let rows = TournamentResultRow::deserialize_jsonl(&outcome.results_jsonl)
+            .expect("parse actually executed result rows");
+        let runtime_spec = spec_file.to_smoke_spec().expect("actual smoke protocol");
+        let protocol_digest = &rows[0].protocol_digest;
+        validate_result_matrix(&rows, &runtime_spec, protocol_digest, &build)
+            .expect("complete source-bound execution matrix");
+        assert!(rows.iter().all(|row| row.ticks_run == runtime_spec.ticks));
+        assert!(
+            rows.iter()
+                .all(|row| row.source_revision == build.source_revision)
+        );
+        let planned = plan(&runtime_spec).expect("planned smoke matches");
+        let reconstructed = rows_to_match_outcomes(&rows);
+        for match_outcome in &reconstructed {
+            let expected = planned
+                .iter()
+                .find(|plan| plan.match_id == match_outcome.match_id)
+                .expect("observed match belongs to plan");
+            assert_eq!(match_outcome.spawn_order, expected.spawn_order);
+            assert_eq!(match_outcome.ticks_run, runtime_spec.ticks);
+        }
+        assert!(outcome.leaderboard_md.contains("Smoke Report"));
+        assert!(outcome.leaderboard_md.contains("--smoke"));
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("| Entered Families | mlp, dwraon |")
+        );
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("| Tick Budget | 50 ticks per match |")
+        );
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("| Cohort Size | 8 total agents (4 per family) |")
+        );
+        assert!(
+            outcome
+                .leaderboard_md
+                .contains("| Observed Matrix | 4 matches, 8 family rows |")
+        );
+        assert!(!outcome.leaderboard_md.contains("20000 ticks per match"));
+
+        for mutation in 0..12 {
+            let mut altered = rows.clone();
+            match mutation {
+                0 => altered[0].seed ^= 1,
+                1 => altered[0].world_seed ^= 1,
+                2 => altered[0].brain_seed ^= 1,
+                3 => altered[0].ticks_run -= 1,
+                4 => altered[0].spawn_order.reverse(),
+                5 => altered[0].spawn_order_index += 1,
+                6 => altered[0].protocol_digest.push('x'),
+                7 => altered[0].source_revision = Some("unrelated-source".to_owned()),
+                8 => altered[0].source_tree_clean = Some(false),
+                9 => altered[0].run_id.push('x'),
+                10 => altered[0].initial_brain_source_scalars = 0,
+                11 => altered[0].family = "unplanned-family".to_owned(),
+                _ => unreachable!(),
+            }
+            // The altered row has a valid content digest: the semantic guard must still refuse it.
+            altered[0].manifest_digest = leaderboard::result_manifest_digest(&altered[0]);
+            assert!(
+                matches!(
+                    validate_result_matrix(&altered, &runtime_spec, protocol_digest, &build),
+                    Err(TournamentError::Publication { .. })
+                ),
+                "semantic mutation {mutation} was admitted"
+            );
+        }
+        let mut duplicated = rows.clone();
+        duplicated.push(rows[0].clone());
+        assert!(
+            validate_result_matrix(&duplicated, &runtime_spec, protocol_digest, &build).is_err()
+        );
+        assert!(
+            validate_result_matrix(&rows[1..], &runtime_spec, protocol_digest, &build).is_err()
+        );
+
+        let mut incomplete_build = build.clone();
+        incomplete_build.source_revision = None;
+        assert!(matches!(
+            execute_leaderboard_tournament(
+                &spec_file,
+                None,
+                false,
+                &base_config,
+                &incomplete_build,
+                None,
+                None,
+                false,
+                2,
+            ),
+            Err(TournamentError::Publication { .. })
+        ));
         assert!(
             outcome
                 .leaderboard_md
@@ -5329,12 +5833,65 @@ mod tests {
                 .contains("## Run & Match Provenance Footnotes")
         );
 
-        // Check self-consistency (--check against generated document passes)
+        // Rebuild ratings and the document from parsed persisted rows, retaining assignment order.
         let dummy_path = std::path::Path::new("docs/leaderboard.md");
-        assert!(
-            check_leaderboard_drift(&outcome.leaderboard_md, &outcome.leaderboard_md, dummy_path)
-                .is_ok()
+        let rating_options = RatingOptions {
+            bootstrap_replicates: 50,
+            ..RatingOptions::default()
+        };
+        let rebuilt_ratings = rate_tournament(&reconstructed, &rating_options)
+            .expect("rate independently parsed execution rows");
+        let rebuilt_document = generate_leaderboard_document(
+            &spec_file,
+            &runtime_spec,
+            true,
+            &rebuilt_ratings,
+            &rows,
+            &[],
+            &outcome.config_digest,
+            &build,
         );
+        assert!(
+            check_leaderboard_drift(&outcome.leaderboard_md, &rebuilt_document, dummy_path).is_ok()
+        );
+
+        let mlp_rows: Vec<_> = rows.iter().filter(|row| row.family == "mlp").collect();
+        let mean_mlp_survival =
+            mlp_rows.iter().map(|row| row.survival_share).sum::<f64>() / mlp_rows.len() as f64;
+        let changed_mlp_survival = if mean_mlp_survival >= 0.5 { 0.0 } else { 1.0 };
+        let mut changed_rows = rows.clone();
+        for row in &mut changed_rows {
+            row.survival_share = if row.family == "mlp" {
+                changed_mlp_survival
+            } else {
+                1.0 - changed_mlp_survival
+            };
+            row.manifest_digest = leaderboard::result_manifest_digest(row);
+        }
+        validate_result_matrix(&changed_rows, &runtime_spec, protocol_digest, &build)
+            .expect("altered metrics still have valid row identities and manifest digests");
+        let changed_ratings =
+            rate_tournament(&rows_to_match_outcomes(&changed_rows), &rating_options)
+                .expect("rate altered raw observations");
+        assert_ne!(
+            serde_json::to_value(&changed_ratings).expect("changed rating values"),
+            serde_json::from_str::<serde_json::Value>(&outcome.ratings_json)
+                .expect("original rating values"),
+        );
+        let changed_document = generate_leaderboard_document(
+            &spec_file,
+            &runtime_spec,
+            true,
+            &changed_ratings,
+            &changed_rows,
+            &[],
+            &outcome.config_digest,
+            &build,
+        );
+        assert!(matches!(
+            check_leaderboard_drift(&outcome.leaderboard_md, &changed_document, dummy_path),
+            Err(LeaderboardCheckError::DocumentDrift { .. })
+        ));
 
         // Negative check 1: mutated row in document fails with DocumentDrift
         let mutated_doc = outcome.leaderboard_md.replace("1500.00", "1599.99");

@@ -14,6 +14,7 @@ verify_evidence() {
     case "$lane" in
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
         connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests sensing-manifest-tests manifest-storage-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
+        tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy tournament-tests tournament-cli) ;;
         graphs) required+=(graph-check graph-tests archive-unit archive-integration) ;;
         recipes) required+=(architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
         graphs-and-recipes) required+=(graph-check graph-tests archive-unit archive-integration architecture-doc-examples architecture-recipes recipe-dependencies architecture-mutations) ;;
@@ -58,6 +59,13 @@ verify_evidence() {
     done
     [[ $(head -n 1 "$directory/source.txt") == "commit $expected" ]] || refuse "source record mismatch"
     [[ $(sed -n 's/^host: //p' "$directory/rustc.txt") == "$target" ]] || refuse "compiler target mismatch"
+    if [[ "$lane" == tournament-smoke || "$lane" == tournament-full ]]; then
+        jq -e --arg source "$expected" --arg mode "${lane#tournament-}" \
+            '.schema == "scriptbots.tournament-proof.v1" and .status == "pass" and .source == $source and .mode == $mode and .identical_invocations == 2' \
+            "$directory/tournament/verdict.json" >/dev/null || refuse "missing or mismatched tournament observations"
+        [[ -s "$directory/tournament/artifacts.sha256" ]] || refuse "missing tournament artifact hashes"
+        sha256sum --check "$directory/tournament/artifacts.sha256" >/dev/null || refuse "changed tournament artifacts"
+    fi
 }
 
 if [[ ${1:-} == --verify-evidence ]]; then
@@ -98,7 +106,7 @@ fi
 proof_version=${1:-}
 [[ "$proof_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "missing or unsafe proof version"
 [[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned source commit"
-[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == connectivity || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
+[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == connectivity || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-full || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
 [[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || refuse "invoke through the native DSR profile"
 [[ ${SCRIPTBOTS_VERIFY_PROFILE:-} = /* && -f "$SCRIPTBOTS_VERIFY_PROFILE" ]] || refuse "missing materialized DSR profile"
 [[ ${SCRIPTBOTS_PROOF_ROOT:-} = /* && -d "$SCRIPTBOTS_PROOF_ROOT" ]] || refuse "missing external proof root"
@@ -223,6 +231,13 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step control-unit-tests test cargo test --locked -p scriptbots-app --lib servers::tests:: -- --nocapture
         run_step control-process-tests test cargo test --locked -p scriptbots-app --test real_process_control_e2e -- --nocapture
         run_step replay-process-tests test cargo test --locked -p scriptbots-app --test replay_e2e -- --nocapture
+        ;;
+    tournament-smoke|tournament-full)
+        run_step workspace-check check cargo check --locked --workspace --all-targets
+        run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
+        run_step tournament-tests test cargo test --locked -p scriptbots-app --lib tournament:: -- --nocapture
+        export SCRIPTBOTS_TOURNAMENT_PROOF_DIR="$proof_dir/tournament"
+        run_step tournament-cli check bash scripts/e2e_tournament_leaderboard.sh "${SCRIPTBOTS_VERIFY_LANE#tournament-}"
         ;;
     graphs|graphs-and-recipes)
         run_step graph-check check cargo check --locked -p scriptbots-analytics --all-targets
