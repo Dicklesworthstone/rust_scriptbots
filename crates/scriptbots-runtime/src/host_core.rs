@@ -4190,6 +4190,9 @@ impl HostCore {
             .scientific
             .checked_next()
             .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+        // A cadence batch seals this tick before shutdown can add a replay anchor.
+        // The request is consumed only when the completed persistence batch is ready.
+        self.world.request_replay_world_digest();
         let completion = match self.persistence.step_outcome(&mut self.world) {
             Ok(completion) => completion,
             Err(error) => {
@@ -4271,10 +4274,8 @@ impl HostCore {
             }
             shared.audit_gate_closed = true;
         }
-        // Every recorded run ends with the canonical world digest, whichever driver ran it,
-        // so replay verification has a final state to compare against. The request is a flag
-        // consumed by the next projection: a driver that already asked, or a final tick that
-        // was itself a cadence boundary, still yields exactly one digest.
+        // Anchor an unsealed partial tail. A sealed cadence tick already carries the
+        // digest requested by its step; it cannot be projected a second time.
         self.world.request_replay_world_digest();
         let persistence = match self.persistence.stage_final_batch(&mut self.world) {
             Ok(persistence) => persistence,
@@ -4599,6 +4600,7 @@ impl HostCore {
             .scientific
             .checked_next()
             .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+        self.world.request_replay_world_digest();
         let completion = match self.persistence.step_outcome(&mut self.world) {
             Ok(completion) => completion,
             Err(error) => {
