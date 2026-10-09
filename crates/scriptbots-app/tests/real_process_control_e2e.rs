@@ -489,7 +489,7 @@ fn real_process_partial_checkpoint_write_remains_charged_and_unpublished() -> Re
 ///     protocolVersion; POST /mcp notifications/initialized -> 202; POST /mcp tools/list -> 200
 ///     with all 13 tools; POST /mcp tools/call get_status -> 200 with live tick;
 ///     POST /mcp tools/call unknown -> JSON-RPC error.
-///  9. Process lifecycle: process remains alive throughout, then the test kills and reaps it.
+///  9. Process lifecycle: process remains alive throughout, then shuts down in owner order.
 #[test]
 #[serial]
 fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screenshot() -> Result<()> {
@@ -572,6 +572,30 @@ fn real_process_server_mode_applies_commands_and_refuses_an_unpresented_screensh
             knobs_count >= 100,
             "knobs roster must publish >= 100 knobs, found {knobs_count}"
         );
+
+        // The configured periodic producer captures through a host-owned persistence
+        // flush before its zero retention budget refuses the record. Observe its
+        // disable event before taking the policy baseline so that a legitimate
+        // background flush cannot be mistaken for a rejected HTTP command.
+        let capture_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let disabled = server_log
+                .lock()
+                .expect("actual periodic producer logs")
+                .iter()
+                .any(|line| {
+                    line.contains("interval checkpoint retention exhausted")
+                        && line.contains("optional_capture_disabled")
+                });
+            if disabled {
+                break;
+            }
+            assert!(
+                Instant::now() < capture_deadline,
+                "periodic producer must observe quota refusal before the policy baseline"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
 
         // (3) Two-axis playback semantics: Pause
         let (pause_code, pause_body) = http(rest_addr, "POST", "/api/control/pause")?;
