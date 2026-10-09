@@ -2,11 +2,12 @@
 
 use rand::Rng;
 use scriptbots_core::{
-    BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator, BrainEvaluatorStateEnvelope,
-    BrainExecutionFault, BrainFamilyCodec, BrainFamilyId, BrainGenomeEnvelope, BrainGenomeMaterial,
-    BrainHeredityCapabilityV1, BrainInspection, BrainInspectionError, BrainInspectionSnapshot,
+    ActivationLayer, BrainActivations, BrainAdapterIdentityV1, BrainEnvelopeKind, BrainEvaluator,
+    BrainEvaluatorStateEnvelope, BrainExecutionFault, BrainFamilyCodec, BrainFamilyId,
+    BrainGenomeEnvelope, BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainInspection,
+    BrainInspectionError, BrainInspectionLimits, BrainInspectionSnapshot,
     BrainLocusSchemaIdentityV1, BrainMutationTrialGroupV1, BrainProtocolError, MutationRates,
-    OffspringStatePolicy, RandomStream,
+    OffspringStatePolicy, RandomStream, bound_brain_inspection,
 };
 use std::any::Any;
 
@@ -98,6 +99,51 @@ impl AssemblyBrain {
     fn from_cells(cells: [f32; BRAIN_SIZE]) -> Result<Self, BrainProtocolError> {
         validate_cells(&cells, BrainEnvelopeKind::EvaluatorState)?;
         Ok(Self { cells })
+    }
+
+    /// Read the self-modifying working cells without inventing neural edges.
+    fn inspect_cells(
+        &self,
+        limits: BrainInspectionLimits,
+    ) -> Result<BrainInspectionSnapshot, BrainInspectionError> {
+        const LAYER_NAME: &str = "Assembly working cells";
+        let source_values = self.cells.len();
+        let payload_bytes = size_of::<ActivationLayer>()
+            .saturating_add(LAYER_NAME.len())
+            .saturating_add(size_of_val(&self.cells))
+            .saturating_add(OUTPUT_SIZE.saturating_mul(size_of::<usize>()));
+        let retain = limits.max_layers() >= 1
+            && limits.max_name_bytes() >= LAYER_NAME.len()
+            && limits.max_values() >= source_values
+            && limits.max_source_scalars() >= source_values
+            && limits.max_payload_bytes() >= payload_bytes;
+        let activations = BrainActivations {
+            layers: if retain {
+                vec![ActivationLayer {
+                    name: LAYER_NAME.to_owned(),
+                    width: source_values,
+                    height: 1,
+                    values: self.cells.to_vec(),
+                }]
+            } else {
+                Vec::new()
+            },
+            connections: Vec::new(),
+            output_slots: if retain {
+                (0..OUTPUT_SIZE)
+                    .map(|index| source_values - 1 - index)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            truncated: !retain,
+        };
+        let mut snapshot =
+            bound_brain_inspection(Self::KIND.as_str(), activations, source_values, limits)?;
+        snapshot.build.source_layers = 1;
+        snapshot.build.source_name_bytes = LAYER_NAME.len();
+        snapshot.build.source_values = source_values;
+        Ok(snapshot)
     }
 
     fn tick_with_budget(&mut self, inputs: &[f32; INPUT_SIZE]) -> ([f32; OUTPUT_SIZE], usize) {
@@ -334,7 +380,7 @@ impl BrainEvaluator for AssemblyProtocolEvaluator {
         request: BrainInspection,
     ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
         match request {
-            BrainInspection::Activations(_) => Ok(None),
+            BrainInspection::Activations(limits) => self.brain.inspect_cells(limits).map(Some),
         }
     }
 
@@ -732,7 +778,7 @@ impl Brain for AssemblyBrain {
         request: BrainInspection,
     ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
         match request {
-            BrainInspection::Activations(_) => Ok(None),
+            BrainInspection::Activations(limits) => self.inspect_cells(limits).map(Some),
         }
     }
 }
@@ -742,9 +788,8 @@ mod tests {
     use super::*;
     use rand::RngCore;
     use scriptbots_core::{
-        AgentData, AgentUid, BrainBinding, BrainFamilyAdapter, BrainGenomeDerivation,
-        BrainInspectionLimits, DeathCause, Position, ScriptBotsConfig, SmallRngStream, Tick,
-        WorldState,
+        AgentData, AgentUid, BrainBinding, BrainFamilyAdapter, BrainGenomeDerivation, DeathCause,
+        Position, ScriptBotsConfig, SmallRngStream, Tick, WorldState,
     };
 
     #[test]
@@ -971,6 +1016,103 @@ mod tests {
     }
 
     #[test]
+    fn working_cell_inspection_is_bounded_and_preserves_legacy_continuation() {
+        let mut rng = SmallRngStream::seed_from_u64(704);
+        let mut brain = AssemblyBrain::random(&mut rng);
+        let mut untouched = brain.clone();
+        let before = brain.cells.map(f32::to_bits);
+        let hard = BrainInspectionLimits::hard();
+        let full = brain
+            .inspect(BrainInspection::Activations(hard))
+            .expect("bounded legacy inspection")
+            .expect("working cells");
+        assert_eq!(full.build.source_scalars, brain.cells.len());
+        assert_eq!(full.build.retained_values, brain.cells.len());
+        assert_eq!(full.activations.layers[0].width, brain.cells.len());
+        assert_eq!(full.activations.layers[0].height, 1);
+        assert_eq!(
+            full.activations.layers[0]
+                .values
+                .iter()
+                .map(|cell| cell.to_bits())
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert!(full.activations.connections.is_empty());
+        let no_layers = BrainInspectionLimits::tightened(
+            0,
+            hard.max_name_bytes(),
+            hard.max_values(),
+            hard.max_edges(),
+            hard.max_payload_bytes(),
+            hard.max_source_scalars(),
+        );
+        let clipped = brain.inspect_cells(no_layers).expect("clipped view");
+        assert_eq!(clipped.build.source_scalars, brain.cells.len());
+        assert_eq!(clipped.build.retained_values, 0);
+        assert!(clipped.activations.layers.is_empty());
+        assert!(clipped.activations.output_slots.is_empty());
+        assert!(clipped.build.truncated);
+        assert!(clipped.build.retained_payload_bytes <= no_layers.max_payload_bytes());
+        let undersized_source = BrainInspectionLimits::tightened(
+            hard.max_layers(),
+            hard.max_name_bytes(),
+            hard.max_values(),
+            hard.max_edges(),
+            hard.max_payload_bytes(),
+            brain.cells.len() - 1,
+        );
+        assert!(matches!(brain.inspect_cells(undersized_source),
+            Err(BrainInspectionError::SourceScalarLimitExceeded { required, limit, .. })
+                if required == brain.cells.len() && limit == brain.cells.len() - 1
+        ));
+        assert_eq!(brain.cells.map(f32::to_bits), before);
+        let inputs = [0.25; INPUT_SIZE];
+        assert_eq!(
+            brain.tick(&inputs).map(f32::to_bits),
+            untouched.tick(&inputs).map(f32::to_bits)
+        );
+        assert_eq!(
+            brain.cells.map(f32::to_bits),
+            untouched.cells.map(f32::to_bits)
+        );
+    }
+
+    fn assert_protocol_working_cell_inspection(
+        evaluator: &dyn BrainEvaluator,
+        checkpoint: &BrainEvaluatorStateEnvelope,
+        outputs: &[f32; OUTPUT_SIZE],
+    ) {
+        let inspection = evaluator
+            .inspect(BrainInspection::Activations(BrainInspectionLimits::hard()))
+            .expect("Assembly working-cell inspection")
+            .expect("Assembly working cells are supported");
+        assert_eq!(inspection.build.source_scalars, BRAIN_SIZE);
+        assert_eq!(inspection.build.retained_values, BRAIN_SIZE);
+        assert!(!inspection.build.truncated);
+        assert!(inspection.activations.connections.is_empty());
+        let observed_cells = &inspection.activations.layers[0].values;
+        let checkpoint_cells = checkpoint.payload()[ASSEMBLY_STATE_HEADER_BYTES..]
+            .chunks_exact(ASSEMBLY_CELL_BYTES)
+            .map(|cell| u32::from_le_bytes(cell.try_into().expect("cell width")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed_cells
+                .iter()
+                .map(|cell| cell.to_bits())
+                .collect::<Vec<_>>(),
+            checkpoint_cells
+        );
+        assert_eq!(inspection.activations.output_slots.len(), outputs.len());
+        for (output, slot) in outputs.iter().zip(&inspection.activations.output_slots) {
+            assert_eq!(
+                observed_cells[*slot].clamp(0.0, 1.0).to_bits(),
+                output.to_bits()
+            );
+        }
+    }
+
+    #[test]
     fn protocol_codec_is_exact_and_checkpoint_restore_preserves_the_next_output() {
         let family = AssemblyFamilyAdapter::new().expect("canonical Assembly family");
         let cells = fixture_cells();
@@ -1020,19 +1162,13 @@ mod tests {
         let checkpoint = family
             .checkpoint_evaluator(evaluator.as_ref())
             .expect("validated checkpoint");
-        assert!(
-            evaluator
-                .inspect(BrainInspection::Activations(BrainInspectionLimits::hard(),))
-                .expect("Assembly inspection refusal")
-                .is_none(),
-            "Assembly must explicitly report that activations are unsupported"
-        );
+        assert_protocol_working_cell_inspection(evaluator.as_ref(), &checkpoint, &first_outputs);
         assert_eq!(
             family
                 .checkpoint_evaluator(evaluator.as_ref())
-                .expect("checkpoint after unsupported inspection"),
+                .expect("checkpoint after working-cell inspection"),
             checkpoint,
-            "unsupported inspection must not alter Assembly working state"
+            "working-cell inspection must not alter Assembly working state"
         );
         assert_ne!(checkpoint.payload(), state.payload());
         let mut restored = family
