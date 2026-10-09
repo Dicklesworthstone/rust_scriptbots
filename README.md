@@ -1173,6 +1173,12 @@ DSR_CONFIG_DIR=/absolute/path/to/dsr-config \
   bash scripts/dsr_verify.sh --run scriptbots-verify proof-20260905-001
 ```
 
+An optional profile `env.CARGO_HOME` selects DSR's seed cache through this launcher.
+Create that absolute directory first; missing directories and symlink roots are refused
+before a build starts. DSR copies only cache inputs into a private Cargo home. Use an
+empty external directory for a fresh download lane; dependency-link and final collection
+guards still apply. If the profile omits it, DSR uses the caller's cache selection.
+
 The launcher rejects undeclared hosts and calls `dsr build` with the profile's
 explicit target, `--only-native`, `--no-sync` and the unique version. The runner
 checks clean `main`, expected commit, actual host target, external

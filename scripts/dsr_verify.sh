@@ -130,6 +130,13 @@ if [[ ${1:-} == --run ]]; then
     expected=$(yq -r '.env.SCRIPTBOTS_EXPECTED_COMMIT' "$profile")
     lane=$(yq -r '.env.SCRIPTBOTS_VERIFY_LANE' "$profile")
     proof_root=$(yq -r '.env.SCRIPTBOTS_PROOF_ROOT' "$profile")
+    seed_cache=$(yq -r '.env.CARGO_HOME // ""' "$profile")
+    if [[ -n "$seed_cache" ]]; then
+        [[ "$seed_cache" = /* && -d "$seed_cache" && ! -L "$seed_cache" ]] || refuse "profile Cargo seed cache must be an existing absolute real directory"
+        # DSR selects the seed from its launcher environment, then replaces the
+        # build's CARGO_HOME with a private copy. Bind both to the declared input.
+        export CARGO_HOME="$seed_cache"
+    fi
     [[ "$checkout" = /* && -d "$checkout" && "$expected" =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned DSR source"
     [[ $(git -C "$checkout" branch --show-current) == main ]] || refuse "source must be on main"
     [[ $(git -C "$checkout" rev-parse HEAD) == "$expected" ]] || refuse "source commit mismatch"
