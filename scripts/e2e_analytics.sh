@@ -51,6 +51,8 @@ assert len(stages) == len(fixture["stages"])
 assert all(s["status"] == "pass" for s in stages.values())
 assert set(stages) == {"synthetic_fixture_persistence", "report_suite_execution", "ground_truth_invariants", "frankenpandas_export_and_summary", "graph_exports", "narrative_search_fts"}
 declared = stages["report_suite_execution"]["details"]["reports_executed"]
+required = stages["report_suite_execution"]["details"]["required_reports"]
+assert len(declared) == len(required) and set(declared) == set(required)
 reports = {r["name"]: r for r in real["reports"]}
 assert len(reports) == len(real["reports"]) and set(reports) == set(declared)
 assert {"run-summary", "narrative-timeline", "narrative-validate", "lineage-structure", "interaction-centrality"} <= set(reports)

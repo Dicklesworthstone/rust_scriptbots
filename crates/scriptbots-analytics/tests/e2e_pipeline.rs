@@ -30,6 +30,22 @@ use scriptbots_core::{
 use scriptbots_storage::{ExportTable, OpenFlags, RowExt, Storage, open_with_flags};
 use serde::{Deserialize, Serialize};
 
+// The existing public report contract, pinned by identities rather than a prose count.
+const REQUIRED_REPORT_NAMES: &[&str] = &[
+    "run-summary",
+    "narrative-timeline",
+    "metric-summary",
+    "metric-changepoints",
+    "compare-runs",
+    "metric-distribution",
+    "phenotype-interactions",
+    "lineage-fitness",
+    "lineage-structure",
+    "dynasty-communities",
+    "interaction-centrality",
+    "narrative-validate",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StageRecord {
     stage: String,
@@ -393,9 +409,17 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
     let registry = Registry::builtin();
     let report_names: Vec<&str> = registry.list().into_iter().map(|(n, _)| n).collect();
 
-    assert!(
-        !report_names.is_empty(),
-        "the report registry must not be empty"
+    assert_eq!(report_names.len(), REQUIRED_REPORT_NAMES.len());
+    assert_eq!(
+        report_names
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        REQUIRED_REPORT_NAMES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "every previously declared report must still be present"
     );
     assert_eq!(
         report_names
@@ -443,6 +467,7 @@ fn test_analytics_e2e_full_pipeline_and_invariants() {
         status: "pass".to_string(),
         details: serde_json::json!({
             "reports_executed": report_names,
+            "required_reports": REQUIRED_REPORT_NAMES,
         }),
     });
 
