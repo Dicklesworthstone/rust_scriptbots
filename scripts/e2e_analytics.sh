@@ -33,7 +33,16 @@ for manifest in (fixture, real):
     assert manifest["compiler_identity"], "missing compiler identity"
     assert pathlib.Path(manifest["retained_root"]).is_dir(), "missing retained fixture"
 assert fixture["compiler_identity"] == real["compiler_identity"]
-assert fixture["run_id"] != real["run_id"], "collapsed fixture/world identity"
+fixture_root = pathlib.Path(fixture["retained_root"]).resolve(strict=True)
+real_root = pathlib.Path(real["retained_root"]).resolve(strict=True)
+assert fixture_root != real_root, "collapsed fixture/world retained root"
+# Run identifiers are scoped to a database: separate fresh databases both start
+# at run 1. Compare the observed filesystem identities instead.
+fixture_database = fixture_root / "run.sqlite"
+database = pathlib.Path(real["database"])
+assert fixture_database.stat().st_size > 0 and database.stat().st_size > 0
+assert not fixture_database.samefile(database), "aliased fixture/world database"
+assert database.resolve(strict=True).parent == real_root, "world database outside retained root"
 assert real["births"] > 0 and real["deaths"] > 0 and real["ticks"] > 0
 populations = real["populations"]
 assert len(populations) == real["ticks"] and populations
@@ -73,8 +82,7 @@ invariant_contract = {
 assert set(invariants) == invariant_contract, "missing or substituted ground-truth invariant"
 def digest(path):
     return subprocess.check_output(["b3sum", str(path)], text=True).split()[0]
-artifacts = [directory / "fixture.json", directory / "real-world.json", directory / "tests.list.log", directory / "tests.log"]
-database = pathlib.Path(real["database"])
+artifacts = [directory / "fixture.json", directory / "real-world.json", directory / "tests.list.log", directory / "tests.log", fixture_database]
 assert database.stat().st_size > 0 and digest(database) == real["database_blake3"]
 artifacts.append(database)
 for name, report in reports.items():
@@ -148,7 +156,8 @@ fixture = json.loads((accepted / "fixture.json").read_text())
 real = json.loads((accepted / "real-world.json").read_text())
 reports = [report["name"] for report in real["reports"]]
 invariants = [invariant["invariant"] for invariant in fixture["invariants"]]
-cases = [("fixture_only", None), ("missing_named_test", None), ("changed_report", None)]
+cases = [("fixture_only", None), ("missing_named_test", None), ("changed_report", None),
+         ("collapsed_root", None), ("aliased_database", None)]
 cases += [("missing_report", name) for name in reports]
 cases += [("missing_invariant", name) for name in invariants]
 observations = []
@@ -164,6 +173,8 @@ for index, (kind, name) in enumerate(cases):
         "changed_report": "changed retained report bytes",
         "missing_report": "missing or substituted required report",
         "missing_invariant": "missing or substituted ground-truth invariant",
+        "collapsed_root": "collapsed fixture/world retained root",
+        "aliased_database": "aliased fixture/world database",
     }[kind]
     if kind == "missing_named_test":
         declarations = (directory / "tests.list.log").read_text()
@@ -176,6 +187,13 @@ for index, (kind, name) in enumerate(cases):
         copied = directory / "changed-report.json"
         copied.write_bytes(pathlib.Path(report["json_path"]).read_bytes() + b"\n")
         report["json_path"] = str(copied)
+        (directory / "real-world.json").write_text(json.dumps(changed))
+    elif kind in ("collapsed_root", "aliased_database"):
+        changed = json.loads((directory / "real-world.json").read_text())
+        if kind == "collapsed_root":
+            changed["retained_root"] = fixture["retained_root"]
+        else:
+            changed["database"] = str(pathlib.Path(fixture["retained_root"]) / "run.sqlite")
         (directory / "real-world.json").write_text(json.dumps(changed))
     elif kind == "missing_report":
         changed = json.loads((directory / "fixture.json").read_text())
