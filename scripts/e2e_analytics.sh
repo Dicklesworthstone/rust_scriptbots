@@ -52,14 +52,25 @@ assert all(s["status"] == "pass" for s in stages.values())
 assert set(stages) == {"synthetic_fixture_persistence", "report_suite_execution", "ground_truth_invariants", "frankenpandas_export_and_summary", "graph_exports", "narrative_search_fts"}
 declared = stages["report_suite_execution"]["details"]["reports_executed"]
 required = stages["report_suite_execution"]["details"]["required_reports"]
-assert len(declared) == len(required) and set(declared) == set(required)
+report_contract = {
+    "run-summary", "narrative-timeline", "metric-summary", "metric-changepoints",
+    "compare-runs", "metric-distribution", "phenotype-interactions", "lineage-fitness",
+    "lineage-structure", "dynasty-communities", "interaction-centrality", "narrative-validate",
+}
+assert len(declared) == len(required) == len(report_contract)
+assert set(declared) == set(required) == report_contract
 reports = {r["name"]: r for r in real["reports"]}
 assert len(reports) == len(real["reports"]) and set(reports) == set(declared)
-assert {"run-summary", "narrative-timeline", "narrative-validate", "lineage-structure", "interaction-centrality"} <= set(reports)
 invariants = {i["invariant"]: i for i in fixture["invariants"]}
 assert len(invariants) == len(fixture["invariants"])
 assert all(i["status"] == "pass" for i in invariants.values())
-assert {"planted_shift_significant_fdr", "null_noise_not_significant", "parquet_sql_row_count_equality", "narrative_search_hit_confirmed"} <= set(invariants)
+invariant_contract = {
+    "run_summary_accounting_verified", "narrative_timeline_replay_events_present",
+    "planted_shift_significant_fdr", "null_noise_not_significant",
+    "lineage_founder_components_conserved", "lineage_descendants_match_births",
+    "parquet_sql_row_count_equality", "narrative_search_hit_confirmed",
+}
+assert set(invariants) == invariant_contract, "missing or substituted ground-truth invariant"
 def digest(path):
     return subprocess.check_output(["b3sum", str(path)], text=True).split()[0]
 artifacts = [directory / "fixture.json", directory / "real-world.json", directory / "tests.list.log", directory / "tests.log"]
