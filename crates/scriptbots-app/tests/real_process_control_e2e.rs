@@ -2377,7 +2377,8 @@ fn real_process_experiments_checkpoints_artifacts_e2e() -> Result<()> {
         );
         log_event(
             serde_json::json!({"phase": "durable_bundle_readback", "run": manifest.run_id,
-            "watermarks": watermarks, "checkpoint_count": checkpoints.len(),
+            "watermarks": scriptbots_storage::bundle::RunBundleWatermarks::from(watermarks),
+            "checkpoint_count": checkpoints.len(),
             "sql_bytes": sql_bytes, "event_count": events.len(), "tick_count": ledger.tick_count,
             "bundle": bundle_dir}),
         );
