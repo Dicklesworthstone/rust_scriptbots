@@ -323,8 +323,23 @@ impl ControlServerConfig {
 }
 
 fn canonical_http_authority(value: &str, default_port: u16) -> Option<String> {
+    if value.contains('@') {
+        return None;
+    }
     let authority = value.parse::<axum::http::uri::Authority>().ok()?;
     let host = authority.host();
+    // Authority::port() also returns None for an invalid explicit port. Read
+    // its original suffix so overflow and empty ports cannot become defaults.
+    let port = match authority.as_str().strip_prefix(host)? {
+        "" => default_port,
+        suffix => {
+            let digits = suffix.strip_prefix(':')?;
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            digits.parse::<u16>().ok()?
+        }
+    };
     let bare_host = host
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
@@ -355,10 +370,6 @@ fn canonical_http_authority(value: &str, default_port: u16) -> Option<String> {
             return None;
         }
         host.to_ascii_lowercase()
-    };
-    let port = match authority.port() {
-        Some(_) => authority.port_u16()?,
-        None => default_port,
     };
     (port != 0).then(|| format!("{host}:{port}"))
 }
@@ -4873,6 +4884,8 @@ mod tests {
             "",
             "lab.example:0",
             "lab.example:65536",
+            "lab.example:",
+            "lab.example:+443",
             "user@lab.example:8080",
             "http://lab.example:8080",
             "lab.example:8080/path",
