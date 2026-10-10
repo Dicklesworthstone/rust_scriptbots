@@ -145,8 +145,11 @@ for profile in ('truecolor', 'no-color'):
                 observed.append(title)
                 def screenshot_matches():
                     try:
+                        request = urllib.request.Request(
+                            'http://127.0.0.1:' + str(port) + '/api/screenshot/ascii',
+                            headers={'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'})
                         with urllib.request.urlopen(
-                                'http://127.0.0.1:' + str(port) + '/api/screenshot/ascii', timeout=0.2) as response:
+                                request, timeout=0.2) as response:
                             body = response.read(200_000)
                         if title.encode() in body:
                             with open(directory / ('screen-' + key + '.txt'), 'xb') as screenshot:

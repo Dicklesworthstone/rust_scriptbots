@@ -557,14 +557,12 @@ impl Model for LiveTerminalModel<'_> {
         let mut app = self.app.borrow_mut();
         let mut widgets = self.widgets.borrow_mut();
         let area = Rect::new(0, 0, frame.width(), frame.height());
-        let result = widgets
+        widgets
             .resize(area)
-            .and_then(|()| widgets.draw(|legacy| app.draw(legacy)).map(|_| ()));
-        if let Err(error) = result {
-            drop(app);
-            let _ = self.fail(error.into());
-            return;
-        }
+            .unwrap_or_else(|never| match never {});
+        widgets
+            .draw(|legacy| app.draw(legacy))
+            .unwrap_or_else(|never| match never {});
         let buffer = widgets.backend().buffer();
         copy_widgets_to_ftui(buffer, frame);
         app.last_draw = Instant::now();
@@ -2579,7 +2577,7 @@ impl<'a> TerminalApp<'a> {
                             )
                         })
                         .collect(),
-                    regrowth_rate: snapshot.config.food_regrowth_rate,
+                    regrowth_rate: snapshot.config.food_growth_rate,
                 }))
             }
             ShellRoute::Diagnostics => {
@@ -15566,7 +15564,7 @@ mod tests {
             }
         }
         let host = TerminalTestHost::take(world);
-        let runtime = ControlRuntime::stub();
+        let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         let mut lineage = LiveLineages::new(app.client.event_cursor());
@@ -15599,13 +15597,13 @@ mod tests {
             data.active_clades, None,
             "founder ancestry is not clade analysis"
         );
-        let observed_tick = app.client.port().snapshot_hub().latest().world.world.tick;
+        let observed_tick = app.client.port().snapshot_hub().latest().world.tick;
         for _ in 0..4 {
             lineage.poll(&mut app.client);
             let _ = lineage.view_data();
         }
         assert_eq!(
-            app.client.port().snapshot_hub().latest().world.world.tick,
+            app.client.port().snapshot_hub().latest().world.tick,
             observed_tick
         );
     }
@@ -15614,7 +15612,7 @@ mod tests {
     fn live_model_navigation_uses_science_views_and_preserves_legacy_widgets() {
         use frankentui_shell::ShellRoute;
         let host = TerminalTestHost::take(command_characterization_world());
-        let runtime = ControlRuntime::stub();
+        let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let app = TerminalApp::new(&renderer, host.context(&runtime));
         let initial_tick = app.snapshot.tick;
@@ -15668,7 +15666,7 @@ mod tests {
     #[test]
     fn palette_navigation_clears_click_targets_before_another_input_event() {
         let host = TerminalTestHost::take(command_characterization_world());
-        let runtime = ControlRuntime::stub();
+        let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let app = TerminalApp::new(&renderer, host.context(&runtime));
         let mut simulator = ftui::runtime::ProgramSimulator::new(
@@ -15702,13 +15700,13 @@ mod tests {
         assert!(app.hit_regions.header_targets.is_empty());
         assert!(app.map_area.is_none());
         assert!(app.host.snapshot_hub().latest().playback.paused);
-        assert_eq!(app.host.snapshot_hub().latest().world.world.tick, 0);
+        assert_eq!(app.host.snapshot_hub().latest().world.tick, 0);
     }
 
     #[test]
     fn live_model_only_publishes_acknowledged_frame_and_discards_failed_candidate() {
         let host = TerminalTestHost::take(command_characterization_world());
-        let runtime = ControlRuntime::stub();
+        let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let app = TerminalApp::new(&renderer, host.context(&runtime));
         let mut simulator = ftui::runtime::ProgramSimulator::new(
@@ -15838,7 +15836,7 @@ mod tests {
     #[test]
     fn live_receipt_refresh_observes_owner_application_without_extra_science() {
         let host = TerminalTestHost::take(command_characterization_world());
-        let runtime = ControlRuntime::stub();
+        let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         let initial_tick = app.snapshot.tick;
