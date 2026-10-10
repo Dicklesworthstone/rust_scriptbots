@@ -2216,9 +2216,8 @@ impl<'a> TerminalApp<'a> {
             self.pending_selections
                 .retain(|selection| selection.command_id != id);
             if let Some(mut receipt) = self.frankentui.receipt_for(&id.to_string()).cloned() {
-                receipt.status = frankentui_shell::ReceiptStatusKind::Failed(format!(
-                    "Not submitted: {reason}"
-                ));
+                receipt.status =
+                    frankentui_shell::ReceiptStatusKind::Failed(format!("Not submitted: {reason}"));
                 self.frankentui.record_receipt(receipt);
             }
         }
@@ -17001,9 +17000,8 @@ for case in ('panic', 'subscription', 'renderer'):
         app.navigate_route(ShellRoute::Diagnostics);
         apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::SetSpeed(1.5));
         assert_eq!(app.retained_render.revisions.control.get(), 0);
-        let mut simulator = ftui::runtime::ProgramSimulator::new(
-            LiveTerminalModel::new(app).expect("live model"),
-        );
+        let mut simulator =
+            ftui::runtime::ProgramSimulator::new(LiveTerminalModel::new(app).expect("live model"));
         let ids: Vec<_> = [ControlCommand::SetSpeed(2.5), ControlCommand::Pause]
             .into_iter()
             .map(|command| {
@@ -17057,11 +17055,25 @@ for case in ('panic', 'subscription', 'renderer'):
                 }
             ));
             assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
-            assert_eq!(host.port().snapshot_hub().latest().revisions.control.get(), 1);
+            assert_eq!(
+                host.port().snapshot_hub().latest().revisions.control.get(),
+                1
+            );
         }
-        assert!(simulator.model().app.borrow().unpresented_commands.is_empty());
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .unpresented_commands
+                .is_empty()
+        );
         assert_eq!(
-            host.port().snapshot_hub().latest().playback.speed_multiplier,
+            host.port()
+                .snapshot_hub()
+                .latest()
+                .playback
+                .speed_multiplier,
             1.5
         );
     }
@@ -17070,11 +17082,7 @@ for case in ('panic', 'subscription', 'renderer'):
     fn live_unsubmitted_request_capacity_and_cancellation_do_not_reach_ingress() {
         use frankentui_shell::{ReceiptStatusKind, ShellMessage, ShellRoute};
 
-        for (fail, count) in [
-            (false, UNRESOLVED_COMMAND_CAPACITY),
-            (false, 2),
-            (true, 2),
-        ] {
+        for (fail, count) in [(false, UNRESOLVED_COMMAND_CAPACITY), (false, 2), (true, 2)] {
             let (mut driver, port) = terminal_manual_driver(command_characterization_world(), 8);
             let (runtime, _) = ControlRuntime::dummy();
             let renderer = TerminalRenderer::default();
@@ -17168,9 +17176,8 @@ for case in ('panic', 'subscription', 'renderer'):
             .expect("paused science before capture");
         let renderer = TerminalRenderer::default();
         let app = TerminalApp::new(&renderer, host.context(&runtime));
-        let mut simulator = ftui::runtime::ProgramSimulator::new(
-            LiveTerminalModel::new(app).expect("live model"),
-        );
+        let mut simulator =
+            ftui::runtime::ProgramSimulator::new(LiveTerminalModel::new(app).expect("live model"));
         for key in ['7', 'k'] {
             simulator.inject_event(ftui::core::event::Event::Key(
                 ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char(key)),
@@ -17226,10 +17233,8 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(command_frame.contains(&format!("[PENDING] id={}", command_ids[0])));
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
-        let command_receipt = wait_for_terminal_receipt(
-            &mut simulator.model().app.borrow_mut(),
-            &command_ids[0],
-        );
+        let command_receipt =
+            wait_for_terminal_receipt(&mut simulator.model().app.borrow_mut(), &command_ids[0]);
         assert!(matches!(
             command_receipt.status,
             ReceiptStatusKind::Applied | ReceiptStatusKind::Durable
@@ -17284,11 +17289,8 @@ for case in ('panic', 'subscription', 'renderer'):
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
         assert!(matches!(
-            wait_for_terminal_receipt(
-                &mut simulator.model().app.borrow_mut(),
-                &command_ids[1],
-            )
-            .status,
+            wait_for_terminal_receipt(&mut simulator.model().app.borrow_mut(), &command_ids[1],)
+                .status,
             ReceiptStatusKind::StaleRevision {
                 observed: 1,
                 expected: 0
@@ -17315,12 +17317,20 @@ for case in ('panic', 'subscription', 'renderer'):
             2
         );
         assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
-        assert_eq!(host.port().snapshot_hub().latest().revisions.control.get(), 1);
         assert_eq!(
-            host.port().scientific_digest_v1().expect("after alternation"),
+            host.port().snapshot_hub().latest().revisions.control.get(),
+            1
+        );
+        assert_eq!(
+            host.port()
+                .scientific_digest_v1()
+                .expect("after alternation"),
             before
         );
-        println!("retained observed-pending checkpoint: {}", artifacts.display());
+        println!(
+            "retained observed-pending checkpoint: {}",
+            artifacts.display()
+        );
         drop(simulator);
         runtime.shutdown().expect("real service shutdown");
     }
@@ -17430,7 +17440,10 @@ for case in ('panic', 'subscription', 'renderer'):
         let text = export::buffer_to_plain_text(model.widgets.borrow().backend().buffer());
         assert!(text.contains(&format!("[PENDING] id={id}")));
         assert!(text.contains("(reduced detail)"));
-        assert_eq!(host.port().world_digests().expect("render-only owner"), before);
+        assert_eq!(
+            host.port().world_digests().expect("render-only owner"),
+            before
+        );
         model.on_shutdown();
         assert!(model.app.borrow().unpresented_commands.is_empty());
     }
@@ -19113,7 +19126,8 @@ for case in ('panic', 'subscription', 'renderer'):
         );
         let pending_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(160, 36));
         assert!(pending_frame.contains(&pending.summary()));
-        std::fs::write(directory.join("pending.txt"), &pending_frame).expect("retain pending frame");
+        std::fs::write(directory.join("pending.txt"), &pending_frame)
+            .expect("retain pending frame");
 
         // Resolve the actual file authority before application. Otherwise its
         // asynchronous lookup can make the channel discover Applied and Durable
@@ -19140,7 +19154,13 @@ for case in ('panic', 'subscription', 'renderer'):
         }
         assert_eq!(driver.host().core().latest_snapshot().world.tick, 0);
         assert_eq!(
-            driver.host().core().latest_snapshot().revisions.control.get(),
+            driver
+                .host()
+                .core()
+                .latest_snapshot()
+                .revisions
+                .control
+                .get(),
             0
         );
         let mut owner_time = 0;
@@ -19199,7 +19219,10 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(matches!(retry.application(), ApplicationState::Applied(_)));
         assert_eq!(retry.journal(), &JournalState::Durable);
         assert_eq!(
-            retry.admission_sequence().expect("original admission").get(),
+            retry
+                .admission_sequence()
+                .expect("original admission")
+                .get(),
             1
         );
         let mut changed = original.clone();
@@ -19237,7 +19260,10 @@ for case in ('panic', 'subscription', 'renderer'):
             .command_journal_record(session, original.command_id)
             .expect("actual durable command readback");
         assert_eq!(recorded.lifecycle.envelope(), &original);
-        assert_eq!(recorded.terminal_boundary.tick, scriptbots_core::Tick::zero());
+        assert_eq!(
+            recorded.terminal_boundary.tick,
+            scriptbots_core::Tick::zero()
+        );
         assert_eq!(recorded.terminal_boundary.revisions.control.get(), 1);
         reader.close().expect("close read-only finished database");
         println!(
