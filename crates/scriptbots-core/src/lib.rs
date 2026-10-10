@@ -96,7 +96,7 @@ pub use migration::{MigratingAgent, MigrationTransferError};
 pub use checkpoint::{
     CheckpointBrainRegistryRequirementV1, CheckpointBrainRegistryRequirementsV1,
     MAX_WORLD_CHECKPOINT_BYTES, WORLD_CHECKPOINT_V1_CODEC_VERSION, WORLD_CHECKPOINT_V1_SCHEMA,
-    WorldCheckpointError, WorldCheckpointV1,
+    WorldCheckpointError, WorldCheckpointV1, WorldHostCheckpointV1,
 };
 
 pub use channels::{
@@ -4707,7 +4707,7 @@ pub struct SensorContribution {
 /// boundary and feeds the clamped value to the brain during the transition that
 /// completes at `observation_tick`. Keeping both ticks prevents later analytics
 /// from pairing a received value with the actuation that replaces its source.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RealizedHearingObservation {
     /// Stable identity of the agent whose hearing channel was populated.
     pub receiver_uid: AgentUid,
@@ -5692,8 +5692,9 @@ pub struct ActiveEffect {
 /// Core keeps a bounded ring of exactly what it applied and what lapsed;
 /// surfaces (TUI, REST, MCP) read the ring and emit the
 /// `scriptbots::intervention` logs. Observational history like the narrative
-/// ring: never part of the characterization digest or checkpoints.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// ring: outside the characterization digest and science-only checkpoints. Full host
+/// checkpoints retain the ring and its sequence cursor as owner observation state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AppliedInterventionRecord {
     /// Monotonic sequence within the run, starting at 1; surfaces watermark on it.
     pub seq: u64,
@@ -5712,6 +5713,36 @@ pub struct AppliedInterventionRecord {
     pub expires_at: Option<Tick>,
     /// True for effect-expiry records, false for command applications.
     pub expired: bool,
+}
+
+impl<'de> Deserialize<'de> for AppliedInterventionRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OwnedRecord {
+            seq: u64,
+            tick: Tick,
+            kind: String,
+            region: Region,
+            agents_affected: usize,
+            cells_affected: usize,
+            expires_at: Option<Tick>,
+            expired: bool,
+        }
+        let record = OwnedRecord::deserialize(deserializer)?;
+        let kind = checkpoint::intervention_history_kind(&record.kind)
+            .ok_or_else(|| serde::de::Error::custom("unknown applied intervention label"))?;
+        Ok(Self {
+            seq: record.seq,
+            tick: record.tick,
+            kind,
+            region: record.region,
+            agents_affected: record.agents_affected,
+            cells_affected: record.cells_affected,
+            expires_at: record.expires_at,
+            expired: record.expired,
+        })
+    }
 }
 /// The effect an [`ActiveEffect`] has on the region while in force.
 ///
@@ -12926,6 +12957,8 @@ fn parse_legacy_rgb(raw: &str) -> Option<[f32; 3]> {
     Some(rgb)
 }
 
+const CONFIG_AUDIT_CAPACITY: usize = 64;
+
 /// Configuration change audit entry captured in-process.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigAuditEntry {
@@ -15632,7 +15665,7 @@ pub mod narrative {
     /// material (a big change, in both relative and absolute terms) and it must
     /// not repeat. These floors are the difference between a timeline people
     /// read and one they learn to ignore.
-    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
     pub struct NarrativePolicy {
         /// Minimum fractional population change (e.g. `0.20` = 20%).
         pub min_population_fraction: f64,
@@ -15873,7 +15906,8 @@ pub mod narrative {
     }
 
     /// Bounded, deduplicated stream of a run's narrative events.
-    #[derive(Debug, Default, Clone)]
+    #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct RunNarrative {
         events: VecDeque<EventRecord>,
         pending_persistence: Vec<EventRecord>,
@@ -15891,6 +15925,35 @@ pub mod narrative {
     }
 
     impl RunNarrative {
+        pub(crate) fn validate_checkpoint(&self, tick: Tick, capacity: usize) -> bool {
+            let policy = self.policy;
+            self.events.len() <= capacity
+                && self.pending_persistence.is_empty()
+                && [
+                    policy.min_population_fraction,
+                    policy.min_population_absolute,
+                    policy.min_energy_absolute,
+                    policy.min_combat_absolute,
+                ]
+                .into_iter()
+                .all(|value| value.is_finite() && value >= 0.0)
+                && self.events.iter().all(|event| {
+                    event.schema_version == EVENT_RECORD_SCHEMA_VERSION
+                        && event.tick <= tick
+                        && event.severity.is_finite()
+                        && (0.0..=1.0).contains(&event.severity)
+                        && [event.magnitude, event.before, event.after, event.score]
+                            .into_iter()
+                            .all(f64::is_finite)
+                })
+                && self.last_emitted.iter().enumerate().all(|(index, (kind, at))| {
+                    *at <= tick.0
+                        && !self.last_emitted[..index]
+                            .iter()
+                            .any(|(previous, _)| previous == kind)
+                })
+        }
+
         /// Recently detected events, oldest first.
         #[must_use]
         pub const fn events(&self) -> &VecDeque<EventRecord> {
@@ -20410,7 +20473,7 @@ impl HydrologyState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct FoodCellProfile {
     capacity: f32,
     growth_multiplier: f32,
@@ -20518,7 +20581,7 @@ const fn terrain_kind_fertility_bonus(kind: TerrainKind) -> f32 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TickCadence {
     aging_interval: u32,
     chart_interval: u32,
@@ -20694,8 +20757,8 @@ pub struct WorldState {
     pending_interventions: Vec<Intervention>,
     active_effects: Vec<ActiveEffect>,
     /// Bounded audit ring of applied/lapsed interventions (bd-16g.10.1). Surfaces
-    /// read this to emit the `scriptbots::intervention` logs; never in digests
-    /// or checkpoints.
+    /// read this to emit the `scriptbots::intervention` logs; outside science digests
+    /// and retained by the separate full-host continuation companion.
     applied_interventions: VecDeque<AppliedInterventionRecord>,
     /// Monotonic sequence source for `AppliedInterventionRecord::seq`.
     next_intervention_seq: u64,
@@ -30262,8 +30325,8 @@ impl WorldState {
             tick: self.tick.0,
             patch,
         });
-        if self.config_audit.len() > 64 {
-            let drop_count = self.config_audit.len() - 64;
+        if self.config_audit.len() > CONFIG_AUDIT_CAPACITY {
+            let drop_count = self.config_audit.len() - CONFIG_AUDIT_CAPACITY;
             self.config_audit.drain(0..drop_count);
         }
     }
@@ -32470,6 +32533,29 @@ impl PersistenceAdmissionSession {
     #[must_use]
     pub const fn last_admitted_tick(&self) -> Option<Tick> {
         self.last_admitted_tick
+    }
+
+    /// Restore the admission cursor of a freshly bound full-host continuation.
+    ///
+    /// This is owner bookkeeping, not a durability attestation. The runtime must compare the
+    /// checkpoint's cursor with the actual persistence adapter's continued-session receipt.
+    /// A pending batch, wrong world, or already populated admission cursor is refused.
+    pub fn restore_admission_cursor(
+        &mut self,
+        world: &WorldState,
+        last_admitted_tick: Option<Tick>,
+    ) -> Result<(), PersistenceSessionError> {
+        self.ensure_binding(world)?;
+        if self.pending.is_some()
+            || self.last_admitted_tick.is_some()
+            || last_admitted_tick.is_some_and(|tick| tick > world.tick())
+        {
+            return Err(PersistenceSessionError::Unavailable {
+                detail: "continuation admission cursor requires a fresh quiescent session".to_owned(),
+            });
+        }
+        self.last_admitted_tick = last_admitted_tick;
+        Ok(())
     }
 }
 

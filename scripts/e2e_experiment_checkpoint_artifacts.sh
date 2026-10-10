@@ -13,6 +13,14 @@
 #  8. Byte-level checksum verification (SHA-256 and BLAKE3) of downloaded artifact
 #  9. Graceful ordered shutdown, durable SQL readback and separate CLI bundle verification
 # 10. Source-bound process observations within the complete pinned DSR connectivity lane
+# 11. Full-host handoff and same-session MLP continuation: uninterrupted N versus K+(N-K),
+#     actual six-point step traces, checkpoint payload readback, and all persistence prefixes
+# 12. Production host-artifact comparison reports the first observed divergent tick/stage;
+#     corrupt and truncated closed database copies refuse without advancing science or journal
+#     prefixes, with original artifacts and raw subprocess streams retained beneath DSR TMPDIR
+#
+# The unchanged connectivity replay-process-tests row executes replay_e2e in full, including
+# mock_free_full_host_checkpoint_continuation_e2e. This wrapper accepts no filtered test lane.
 
 set -euo pipefail
 

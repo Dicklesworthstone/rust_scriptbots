@@ -35,9 +35,10 @@
 use crate::{
     BrainProjection, BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId,
     CommandStatus, EventCatchUp, EventCatchUpLocator, EventCursor, EventHub, EventPoll,
-    FixedDeadlineHost, HostAccessError, HostBlocker, HostDriveInterest, HostEvent, HostPort,
-    HostSessionId, LocalHostPort, ManualInstant, NativeDriveTrigger, NativeScheduleError,
-    ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
+    FixedDeadlineHost, HostAccessError, HostBlocker, HostCheckpointError, HostCheckpointV1,
+    HostDriveInterest, HostEvent, HostPort, HostSessionId, LocalHostPort, ManualInstant,
+    NativeDriveTrigger, NativeScheduleError, ProtocolEventSequence, RenderSnapshot, SnapshotHub,
+    SnapshotRevision,
 };
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentUid, CharacterizationDigestV0, INPUT_SIZE, MutationRates,
@@ -45,7 +46,7 @@ use scriptbots_core::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -165,6 +166,9 @@ enum IngressMessage {
     },
     CaptureCheckpoint {
         reply: Sender<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>>,
+    },
+    CaptureHostCheckpoint {
+        request: HostCaptureRequest,
     },
     /// A command envelope plus the one-shot admission reply lane.
     Command {
@@ -291,6 +295,7 @@ impl ProtocolEventBoard {
 /// one bounded owner round-trip to durable command authority.
 pub struct ChannelHostPort {
     sender: SyncSender<IngressMessage>,
+    ingress_open: Arc<Mutex<bool>>,
     statuses: Arc<RwLock<StatusBoard>>,
     protocol_events: Arc<RwLock<ProtocolEventBoard>>,
     snapshots: SnapshotHub,
@@ -304,6 +309,7 @@ impl Clone for ChannelHostPort {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            ingress_open: Arc::clone(&self.ingress_open),
             statuses: Arc::clone(&self.statuses),
             protocol_events: Arc::clone(&self.protocol_events),
             snapshots: self.snapshots.clone(),
@@ -492,6 +498,65 @@ impl ChannelHostPort {
         self.read_owner(|reply| IngressMessage::CaptureCheckpoint { reply })
     }
 
+    /// Capture a settled owner/session checkpoint without retiring the owner.
+    pub fn capture_host_checkpoint_v1(&self) -> Result<HostCheckpointV1, HostCheckpointError> {
+        self.read_host_checkpoint(false)
+    }
+
+    /// Capture within the caller's remaining total budget.
+    pub fn capture_host_checkpoint_v1_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<HostCheckpointV1, HostCheckpointError> {
+        self.bounded_before(deadline)?.capture_host_checkpoint_v1()
+    }
+
+    /// Fence later ingress and retire this driver at the captured, settled owner boundary.
+    ///
+    /// This does not submit Shutdown or attest storage durability. A successful reply means
+    /// the driver will perform no later admissions or science. The caller must also join its
+    /// owner thread before transferring storage ownership. A reply timeout cannot confirm
+    /// whether handoff completed; it must not be reported as a completed handoff.
+    pub fn handoff_host_checkpoint_v1(&self) -> Result<HostCheckpointV1, HostCheckpointError> {
+        self.read_host_checkpoint(true)
+    }
+
+    /// Request deliberate handoff within the caller's remaining total budget.
+    pub fn handoff_host_checkpoint_v1_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<HostCheckpointV1, HostCheckpointError> {
+        self.bounded_before(deadline)?.handoff_host_checkpoint_v1()
+    }
+
+    fn read_host_checkpoint(&self, handoff: bool) -> Result<HostCheckpointV1, HostCheckpointError> {
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(self.remaining_budget(started))
+            .ok_or_else(|| Self::protocol_violation("host checkpoint deadline overflow"))?;
+        let (reply, receiver) = std::sync::mpsc::channel();
+        self.enqueue(
+            IngressMessage::CaptureHostCheckpoint {
+                request: HostCaptureRequest {
+                    reply,
+                    deadline,
+                    handoff,
+                },
+            },
+            started,
+        )?;
+        receiver
+            .recv_timeout(self.remaining_budget(started))
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => Self::protocol_violation(if handoff {
+                    "host checkpoint reply timed out; owner handoff is unconfirmed"
+                } else {
+                    "host checkpoint reply timed out"
+                }),
+                RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
+            })?
+    }
+
     fn protocol_violation(message: impl Into<String>) -> HostAccessError {
         HostAccessError::ProtocolViolation {
             message: message.into(),
@@ -518,7 +583,26 @@ impl ChannelHostPort {
                     self.submit_deadline
                 )));
             }
-            match self.sender.try_send(pending) {
+            let ingress_open = match self.ingress_open.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::park_timeout(RETRY_PARK.min(remaining));
+                    continue;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(Self::protocol_violation(
+                        "channel ingress handoff fence poisoned",
+                    ));
+                }
+            };
+            if !*ingress_open {
+                return Err(Self::protocol_violation(
+                    "channel owner handoff has fenced later ingress",
+                ));
+            }
+            let result = self.sender.try_send(pending);
+            drop(ingress_open);
+            match result {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Full(returned)) => {
                     pending = returned;
@@ -698,7 +782,8 @@ pub struct ChannelStepReport {
     pub admitted: usize,
     /// Whether the host advanced one drive boundary.
     pub drove: bool,
-    /// Scheduling interest observed after the boundary.
+    /// Driver scheduling interest after the boundary. Deliberate handoff terminates this
+    /// driver while the captured host lifecycle remains Running.
     pub interest: HostDriveInterest,
 }
 
@@ -713,6 +798,8 @@ pub enum ChannelRunOutcome {
     /// shutdown first; the owner's lifecycle and journal receipts show whether
     /// finalization completed.
     Faulted,
+    /// A deliberate checkpoint handoff retired the driver without ordered Shutdown.
+    HandedOff,
 }
 
 /// Exact accounting returned when the driver exits.
@@ -746,6 +833,7 @@ pub struct ChannelHostDriver {
     host: FixedDeadlineHost,
     port: LocalHostPort,
     receiver: Receiver<IngressMessage>,
+    ingress_open: Arc<Mutex<bool>>,
     pending_ingress: Option<IngressMessage>,
     statuses: Arc<RwLock<StatusBoard>>,
     protocol_events: Arc<RwLock<ProtocolEventBoard>>,
@@ -763,9 +851,20 @@ pub struct ChannelHostDriver {
     parked_captures: Vec<CaptureReply>,
     /// Persistence flush requested on behalf of parked captures (bd-2mpi).
     capture_flush: CaptureFlush,
+    /// Full owner captures retain their original caller budgets and a fixed capacity.
+    parked_host_captures: Vec<HostCaptureRequest>,
+    host_capture_capacity: usize,
+    handoff_pending: bool,
+    handed_off: bool,
 }
 
 type CaptureReply = Sender<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>>;
+
+struct HostCaptureRequest {
+    reply: Sender<Result<HostCheckpointV1, HostCheckpointError>>,
+    deadline: Instant,
+    handoff: bool,
+}
 
 /// Progress of the persistence flush a paused host needs before it can be captured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -791,11 +890,13 @@ impl ChannelHostDriver {
     ) -> Result<(Self, ChannelHostPort), ChannelHostOptionsError> {
         let options = options.validate()?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(options.ingress_capacity);
+        let ingress_open = Arc::new(Mutex::new(true));
         let statuses = Arc::new(RwLock::new(StatusBoard::default()));
         let protocol_events = Arc::new(RwLock::new(ProtocolEventBoard::default()));
         let local = host.local_port();
         let port = ChannelHostPort {
             sender,
+            ingress_open: Arc::clone(&ingress_open),
             statuses: Arc::clone(&statuses),
             protocol_events: Arc::clone(&protocol_events),
             snapshots: host.snapshot_hub(),
@@ -809,6 +910,7 @@ impl ChannelHostDriver {
             host,
             port: local,
             receiver,
+            ingress_open,
             pending_ingress: None,
             statuses,
             protocol_events,
@@ -823,6 +925,10 @@ impl ChannelHostDriver {
             shutdown_requested: false,
             parked_captures: Vec::new(),
             capture_flush: CaptureFlush::Idle,
+            parked_host_captures: Vec::with_capacity(options.ingress_capacity),
+            host_capture_capacity: options.ingress_capacity,
+            handoff_pending: false,
+            handed_off: false,
         };
         Ok((driver, port))
     }
@@ -911,8 +1017,177 @@ impl ChannelHostDriver {
         for reply in parked {
             self.capture_or_park(reply);
         }
-        if self.parked_captures.is_empty() {
+        if self.parked_captures.is_empty() && self.parked_host_captures.is_empty() {
             self.capture_flush = CaptureFlush::Idle;
+        }
+    }
+
+    fn set_ingress_open(&self, open: bool) -> Result<(), HostAccessError> {
+        let mut ingress_open = self.ingress_open.lock().map_err(|_| {
+            ChannelHostPort::protocol_violation("channel ingress handoff fence poisoned")
+        })?;
+        *ingress_open = open;
+        Ok(())
+    }
+
+    fn finish_host_capture(
+        &mut self,
+        request: HostCaptureRequest,
+        result: Result<HostCheckpointV1, HostCheckpointError>,
+    ) {
+        if request.handoff {
+            let retiring = result.is_ok();
+            // Fence the owner before a successful reply can become visible to the caller.
+            self.handed_off = retiring;
+            self.handoff_pending = false;
+            if !retiring {
+                let _ = self.set_ingress_open(true);
+            }
+            if request.reply.send(result).is_err() && retiring {
+                // The caller abandoned its reply before capture completed. No acknowledgement
+                // escaped, so the original owner remains available rather than being stranded.
+                self.handed_off = false;
+                let _ = self.set_ingress_open(true);
+            }
+        } else {
+            let _ = request.reply.send(result);
+        }
+    }
+
+    fn host_capture_or_park(&mut self, request: HostCaptureRequest) {
+        if Instant::now() >= request.deadline {
+            let error = ChannelHostPort::protocol_violation(
+                "host checkpoint caller budget elapsed before capture",
+            );
+            self.finish_host_capture(request, Err(error.into()));
+            return;
+        }
+        if self.handed_off {
+            let _ = request.reply.send(Err(HostAccessError::Disconnected.into()));
+            return;
+        }
+        let error = match self.host.core().capture_host_checkpoint_v1() {
+            Ok(checkpoint) => {
+                // Exercise the actual bounded codec before retiring the owner; callers must
+                // receive a serializable artifact, not merely an in-memory state projection.
+                let result = checkpoint.encode().map(|_| checkpoint);
+                if Instant::now() >= request.deadline {
+                    let error = ChannelHostPort::protocol_violation(
+                        "host checkpoint caller budget elapsed during capture",
+                    );
+                    self.finish_host_capture(request, Err(error.into()));
+                } else {
+                    self.finish_host_capture(request, result);
+                }
+                return;
+            }
+            Err(error) => error,
+        };
+        if !error.is_retryable_quiescence() {
+            self.finish_host_capture(request, Err(error));
+            return;
+        }
+        let world_tail = matches!(
+            &error,
+            HostCheckpointError::World(
+                scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
+                    | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
+            )
+        );
+        let advancing = self.journal_retry_needed()
+            || matches!(
+                self.host.drive_interest(),
+                HostDriveInterest::ReadyNow
+                    | HostDriveInterest::Deadline
+                    | HostDriveInterest::Draining
+            );
+        if world_tail && !advancing && self.capture_flush != CaptureFlush::Admitted {
+            match self.host.request_persistence_flush() {
+                Ok(_) => self.capture_flush = CaptureFlush::Admitted,
+                Err(HostAccessError::CommandAuthorityLookup {
+                    failure:
+                        crate::CommandAuthorityLookupFailure::Pending
+                        | crate::CommandAuthorityLookupFailure::Busy
+                        | crate::CommandAuthorityLookupFailure::Capacity { .. },
+                    ..
+                }) => self.capture_flush = CaptureFlush::Submitting,
+                Err(error) => {
+                    self.finish_host_capture(request, Err(error.into()));
+                    return;
+                }
+            }
+        } else if world_tail && !advancing {
+            self.finish_host_capture(request, Err(error));
+            return;
+        }
+        self.parked_host_captures.push(request);
+    }
+
+    fn accept_host_capture(&mut self, request: HostCaptureRequest) {
+        if self.parked_host_captures.len() >= self.host_capture_capacity {
+            let error = ChannelHostPort::protocol_violation(
+                "bounded host checkpoint request capacity exhausted",
+            );
+            let _ = request.reply.send(Err(error.into()));
+            return;
+        }
+        if request.handoff {
+            if let Err(error) = self.set_ingress_open(false) {
+                let _ = request.reply.send(Err(error.into()));
+                return;
+            }
+            self.handoff_pending = true;
+        }
+        self.host_capture_or_park(request);
+    }
+
+    fn service_parked_host_captures(&mut self) {
+        let parked = std::mem::take(&mut self.parked_host_captures);
+        for request in parked {
+            self.host_capture_or_park(request);
+        }
+        if self.parked_captures.is_empty() && self.parked_host_captures.is_empty() {
+            self.capture_flush = CaptureFlush::Idle;
+        }
+    }
+
+    fn refuse_handoff_ingress(message: IngressMessage) {
+        let error = || {
+            ChannelHostPort::protocol_violation("owner handoff refused later queued ingress")
+        };
+        match message {
+            IngressMessage::BrainProjection { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::AgentInspection { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::DebugAgents { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::RequestReplayDigest { reply } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::ScientificDigest { reply } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::WorldDigests { reply } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::CaptureCheckpoint { reply } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::CaptureHostCheckpoint { request } => {
+                let _ = request.reply.send(Err(error().into()));
+            }
+            IngressMessage::Command { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::CommandStatus { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            #[cfg(test)]
+            IngressMessage::Wake => {}
         }
     }
 
@@ -954,6 +1229,10 @@ impl ChannelHostDriver {
     }
 
     fn process_ingress(&mut self, message: IngressMessage) {
+        if self.handoff_pending || self.handed_off {
+            Self::refuse_handoff_ingress(message);
+            return;
+        }
         match message {
             IngressMessage::BrainProjection { request, reply } => {
                 let result = self
@@ -998,6 +1277,9 @@ impl ChannelHostDriver {
                 let _ = reply.send(result);
             }
             IngressMessage::CaptureCheckpoint { reply } => self.capture_or_park(reply),
+            IngressMessage::CaptureHostCheckpoint { request } => {
+                self.accept_host_capture(request);
+            }
             IngressMessage::Command { envelope, reply } => {
                 let result = self.host.submit(envelope);
                 if let Ok(status) = &result
@@ -1041,6 +1323,25 @@ impl ChannelHostDriver {
                     break;
                 }
             }
+        }
+    }
+
+    fn refuse_retired_requests(&mut self) {
+        if let Some(message) = self.pending_ingress.take() {
+            Self::refuse_handoff_ingress(message);
+        }
+        // The shared fence prevents every public producer from refilling this bounded queue.
+        for _ in 0..self.host_capture_capacity {
+            let Ok(message) = self.receiver.try_recv() else {
+                break;
+            };
+            Self::refuse_handoff_ingress(message);
+        }
+        for reply in std::mem::take(&mut self.parked_captures) {
+            let _ = reply.send(Err(HostAccessError::Disconnected));
+        }
+        for request in std::mem::take(&mut self.parked_host_captures) {
+            let _ = request.reply.send(Err(HostAccessError::Disconnected.into()));
         }
     }
 
@@ -1150,6 +1451,28 @@ impl ChannelHostDriver {
             return Ok(true);
         }
 
+        if !self.parked_host_captures.is_empty()
+            && matches!(
+                self.host.drive_interest(),
+                HostDriveInterest::ReadyNow | HostDriveInterest::Draining
+            )
+        {
+            // Settle work already belonging to this boundary before adding new automatic
+            // science credit. A full-speed host would otherwise create another journal batch
+            // on every receipt poll and never expose its actual settled checkpoint cut.
+            let observed = self.host.last_observed().unwrap_or(now);
+            if now < observed {
+                return Err(NativeScheduleError::ClockMovedBackwards {
+                    previous: observed.as_nanos(),
+                    observed: now.as_nanos(),
+                }
+                .into());
+            }
+            self.host
+                .drive_at(observed, NativeDriveTrigger::Maintenance)?;
+            return Ok(true);
+        }
+
         let trigger = match self.host.drive_interest() {
             HostDriveInterest::ReadyNow => NativeDriveTrigger::Command,
             HostDriveInterest::Deadline => {
@@ -1178,14 +1501,28 @@ impl ChannelHostDriver {
     ///
     /// Returns [`ChannelDriveError`] when admission or the schedule fails.
     pub fn step(&mut self, now: ManualInstant) -> Result<ChannelStepReport, ChannelDriveError> {
+        if self.handed_off {
+            self.refuse_retired_requests();
+            return Ok(ChannelStepReport {
+                admitted: 0,
+                drove: false,
+                interest: HostDriveInterest::Terminated,
+            });
+        }
         let admission_before = self.host.core().admission_cursor();
         self.drain_ingress();
         self.update_journal_retry_deadline(now)?;
-        let drove = self.drive_due_boundary(now)?;
+        let drove = !self.handed_off && self.drive_due_boundary(now)?;
         // A batch acknowledgement can seal the boundary outside a science drive, so
         // parked captures are retried on every step, not only after a tick.
-        self.service_parked_captures();
-        if self.controller_disconnected && !self.shutdown_requested {
+        if !self.handed_off {
+            self.service_parked_captures();
+            self.service_parked_host_captures();
+        }
+        if self.handed_off {
+            self.refuse_retired_requests();
+        }
+        if self.controller_disconnected && !self.shutdown_requested && !self.handed_off {
             match self.host.request_shutdown() {
                 Ok(_) => self.shutdown_requested = true,
                 Err(HostAccessError::CommandAuthorityLookup {
@@ -1201,13 +1538,16 @@ impl ChannelHostDriver {
         self.mirror_retained_statuses();
         self.mirror_protocol_events();
         self.update_journal_retry_deadline(now)?;
-        let mut interest = if self.journal_retry_at.is_some() {
+        let mut interest = if self.handed_off {
+            HostDriveInterest::Terminated
+        } else if self.journal_retry_at.is_some() {
             HostDriveInterest::Draining
         } else {
             self.host.drive_interest()
         };
         let retrying_submission = (self.controller_disconnected && !self.shutdown_requested)
-            || self.capture_flush == CaptureFlush::Submitting;
+            || self.capture_flush == CaptureFlush::Submitting
+            || !self.parked_host_captures.is_empty();
         if retrying_submission && interest == HostDriveInterest::WakeOnly {
             interest = HostDriveInterest::Draining;
         }
@@ -1228,7 +1568,8 @@ impl ChannelHostDriver {
         })
     }
 
-    /// Drive the host to its terminal lifecycle and return exact accounting.
+    /// Drive until the host lifecycle terminates or deliberate handoff retires this driver,
+    /// and return exact accounting.
     ///
     /// Quiescent hosts park without a periodic timer. Retained
     /// [`HostBlocker::JournalFull`] work is retried at the configured maintenance
@@ -1255,7 +1596,9 @@ impl ChannelHostDriver {
             match report.interest {
                 HostDriveInterest::Terminated => {
                     return Ok(ChannelRunReceipt {
-                        outcome: if self.controller_disconnected {
+                        outcome: if self.handed_off {
+                            ChannelRunOutcome::HandedOff
+                        } else if self.controller_disconnected {
                             ChannelRunOutcome::ControllerDisconnected
                         } else {
                             ChannelRunOutcome::Stopped
@@ -1580,6 +1923,413 @@ mod tests {
             .core()
             .pending_journal_batch()
             .expect("exact retained step batch")
+    }
+
+    fn queue_host_capture(
+        port: &ChannelHostPort,
+        handoff: bool,
+        deadline: Instant,
+    ) -> Receiver<Result<HostCheckpointV1, HostCheckpointError>> {
+        let (reply, receipt) = std::sync::mpsc::channel();
+        assert!(
+            port.sender
+                .try_send(IngressMessage::CaptureHostCheckpoint {
+                    request: HostCaptureRequest {
+                        reply,
+                        deadline,
+                        handoff,
+                    },
+                })
+                .is_ok(),
+            "checkpoint intent must enter the actual bounded ingress"
+        );
+        receipt
+    }
+
+    #[test]
+    fn full_host_capture_settles_running_journal_before_new_automatic_science() {
+        let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("running capture world");
+        let core = HostCore::new(
+            HostSessionId::new(91),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    ..PlaybackSnapshot::default()
+                },
+                tick_period_nanos: 1,
+                snapshot_interval_ticks: 1,
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("full-speed owner with actual volatile journal");
+        let (mut driver, port) =
+            ChannelHostDriver::new(FixedDeadlineHost::new(core), fast_options())
+                .expect("running capture channel");
+        let resume = queue_command(&port, 91, HostCommand::Resume);
+        let capture = queue_host_capture(&port, false, Instant::now() + Duration::from_secs(5));
+        let first = driver
+            .step(ManualInstant::from_nanos(10))
+            .expect("admit and apply the preceding resume");
+        assert_eq!(first.admitted, 1);
+        resume
+            .try_recv()
+            .expect("resume reply")
+            .expect("resume admitted");
+        assert!(matches!(
+            driver.host().core().capture_host_checkpoint_v1(),
+            Err(HostCheckpointError::Busy {
+                reason: crate::HostCheckpointBusy::Journal,
+            })
+        ));
+        assert!(matches!(
+            capture.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let pending_tick = driver.host().core().world_tick();
+        assert!(matches!(
+            driver.step(ManualInstant::from_nanos(9)),
+            Err(ChannelDriveError::Schedule(
+                NativeScheduleError::ClockMovedBackwards { .. }
+            ))
+        ));
+        assert_eq!(driver.host().core().world_tick(), pending_tick);
+        let settled = driver
+            .step(ManualInstant::from_nanos(1_000_000))
+            .expect("poll the real receipt without new automatic credit");
+        assert!(settled.drove);
+        let checkpoint = capture
+            .try_recv()
+            .expect("settled checkpoint reply")
+            .expect("actual full-host capture");
+        assert_eq!(checkpoint.tick(), pending_tick);
+        assert_eq!(driver.host().core().world_tick(), pending_tick);
+        assert_eq!(checkpoint.session_id(), HostSessionId::new(91));
+        let decoded = HostCheckpointV1::decode(&checkpoint.encode().expect("full encoding"))
+            .expect("independent host decoding");
+        assert!(!decoded.playback().paused);
+        assert_eq!(decoded.journal_cut(), checkpoint.journal_cut());
+        assert_eq!(decoded.world_checkpoint().tick(), pending_tick);
+        assert!(!driver.handed_off);
+        let before = driver.host().core().admission_cursor();
+        driver
+            .step(ManualInstant::from_nanos(1_000_001))
+            .expect("ordinary running cadence resumes");
+        assert!(driver.host().core().world_tick() > pending_tick);
+        assert_eq!(driver.host().core().admission_cursor(), before);
+    }
+
+    #[test]
+    fn full_host_capture_flushes_actual_paused_partial_persistence_without_shutdown() {
+        let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: 3,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("partial-cadence world");
+        let core = HostCore::new(
+            HostSessionId::new(92),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    ..PlaybackSnapshot::default()
+                },
+                snapshot_interval_ticks: 1,
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("paused cadence owner");
+        let (mut driver, port) =
+            ChannelHostDriver::new(FixedDeadlineHost::new(core), fast_options())
+                .expect("paused capture channel");
+        let step = queue_command(&port, 92, HostCommand::Step);
+        driver
+            .step(ManualInstant::from_nanos(0))
+            .expect("one partial cadence tick");
+        step.try_recv().expect("step reply").expect("step admitted");
+        driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("actual step journal receipt");
+        assert!(matches!(
+            driver.host().core().capture_host_checkpoint_v1(),
+            Err(HostCheckpointError::World(
+                scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
+                    | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
+            ))
+        ));
+        let before_digest = driver
+            .host()
+            .core()
+            .scientific_digest_v1()
+            .expect("science before flush");
+        let before_admission = driver.host().core().admission_cursor();
+        let capture = queue_host_capture(&port, false, Instant::now() + Duration::from_secs(5));
+        let flush = driver
+            .step(ManualInstant::from_nanos(2))
+            .expect("capture requests actual FlushPersistence");
+        assert_eq!(flush.admitted, 1);
+        assert!(matches!(
+            capture.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        driver
+            .step(ManualInstant::from_nanos(3))
+            .expect("actual flush journal commitment");
+        let checkpoint = capture
+            .try_recv()
+            .expect("full flushed capture reply")
+            .expect("settled paused host checkpoint");
+        assert_eq!(checkpoint.tick(), scriptbots_core::Tick(1));
+        assert_eq!(
+            checkpoint.persistence_last_admitted_tick(),
+            Some(checkpoint.tick())
+        );
+        assert_eq!(
+            driver.host().core().admission_cursor().get(),
+            before_admission.get() + 1
+        );
+        assert_eq!(
+            driver
+                .host()
+                .core()
+                .scientific_digest_v1()
+                .expect("science after flush"),
+            before_digest
+        );
+        assert_eq!(
+            driver.host().core().latest_snapshot().lifecycle,
+            HostLifecycle::Running
+        );
+        assert!(driver.host().core().shutdown_command_status().is_none());
+        assert!(!driver.handed_off);
+    }
+
+    #[test]
+    fn deliberate_handoff_refuses_later_queued_commands_without_new_sequences() {
+        let (mut driver, mut port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("handoff channel");
+        let step = queue_command(&port, 93, HostCommand::Step);
+        let capture = queue_host_capture(&port, true, Instant::now() + Duration::from_secs(5));
+        let later = queue_command(&port, 94, HostCommand::Step);
+        let first = driver
+            .step(ManualInstant::from_nanos(0))
+            .expect("handoff settles earlier work only");
+        assert_eq!(first.admitted, 1);
+        step.try_recv()
+            .expect("earlier reply")
+            .expect("earlier admission");
+        assert!(matches!(
+            later.try_recv().expect("later queue refusal"),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(driver.handoff_pending);
+        assert!(matches!(
+            port.submit(CommandEnvelope::new(CommandId::new(95), HostCommand::Step)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        let final_step = driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("earlier journal completes before handoff");
+        assert_eq!(final_step.interest, HostDriveInterest::Terminated);
+        let checkpoint = capture
+            .try_recv()
+            .expect("handoff reply")
+            .expect("settled handoff checkpoint");
+        assert_eq!(checkpoint.tick(), scriptbots_core::Tick(1));
+        let cursor = driver.host().core().admission_cursor();
+        let bytes = checkpoint.encode().expect("handoff encoding");
+        let retired = driver
+            .step(ManualInstant::from_nanos(10_000_000_000))
+            .expect("retired driver cannot advance");
+        assert!(!retired.drove);
+        assert_eq!(retired.admitted, 0);
+        assert_eq!(driver.host().core().admission_cursor(), cursor);
+        assert_eq!(
+            driver
+                .host()
+                .core()
+                .capture_host_checkpoint_v1()
+                .expect("unchanged retired owner")
+                .encode()
+                .expect("retired encoding"),
+            bytes
+        );
+        assert!(driver.host().core().shutdown_command_status().is_none());
+        assert_eq!(
+            driver.host().core().latest_snapshot().lifecycle,
+            HostLifecycle::Running
+        );
+        let receipt = driver
+            .run(|| ManualInstant::from_nanos(u64::MAX))
+            .expect("retired run");
+        assert_eq!(receipt.outcome, ChannelRunOutcome::HandedOff);
+        assert_eq!(receipt.commands_admitted, 0);
+        assert_eq!(receipt.drives, 0);
+    }
+
+    #[test]
+    fn cross_thread_handoff_reply_and_owner_join_preserve_the_exact_captured_cut() {
+        let (ready, receive) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let (mut driver, port) =
+                ChannelHostDriver::new(test_host(true), fast_options()).expect("owner driver");
+            ready.send(port).expect("port handoff");
+            let receipt = driver
+                .run(|| ManualInstant::from_nanos(0))
+                .expect("owner retirement");
+            assert!(driver.host().core().shutdown_command_status().is_none());
+            let checkpoint = driver
+                .host()
+                .core()
+                .capture_host_checkpoint_v1()
+                .expect("retired owner remains exactly capturable");
+            (receipt, checkpoint.encode().expect("retired artifact"))
+        });
+        let mut port = receive.recv().expect("owner ready");
+        port.submit(CommandEnvelope::new(CommandId::new(96), HostCommand::Step))
+            .expect("earlier actual step admission");
+        let checkpoint = port
+            .handoff_host_checkpoint_v1_before(Instant::now() + Duration::from_secs(5))
+            .expect("actual cross-thread checkpoint acknowledgement");
+        let (receipt, retired_bytes) = owner.join().expect("owner really retired");
+        assert_eq!(receipt.outcome, ChannelRunOutcome::HandedOff);
+        assert_eq!(receipt.commands_admitted, 1);
+        assert_eq!(checkpoint.tick(), scriptbots_core::Tick(1));
+        assert_eq!(
+            checkpoint.encode().expect("returned artifact"),
+            retired_bytes
+        );
+        assert!(matches!(
+            port.submit(CommandEnvelope::new(CommandId::new(97), HostCommand::Step)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_host_capture_requests_refuse_overflow_without_evicting_pending_cut() {
+        let (original_driver, original_port) = bounded_journal_driver();
+        let mut host = original_driver.into_host();
+        drop(original_port);
+        for (id, command) in [(98, HostCommand::Pause), (99, HostCommand::Step)] {
+            host.submit(CommandEnvelope::new(CommandId::new(id), command))
+                .expect("prepare actual bounded-journal commands");
+        }
+        let (mut driver, port) = ChannelHostDriver::new(
+            host,
+            ChannelHostOptions {
+                ingress_capacity: 1,
+                maintenance_period: Duration::from_nanos(100),
+                ..fast_options()
+            },
+        )
+        .expect("capacity-one checkpoint channel");
+        driver
+            .step(ManualInstant::from_nanos(0))
+            .expect("real journal backpressure");
+        assert!(matches!(
+            driver.host().core().health().blocker(),
+            Some(HostBlocker::JournalFull { .. })
+        ));
+        let pending = queue_host_capture(&port, false, Instant::now() + Duration::from_secs(5));
+        driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("retain first capture");
+        assert_eq!(driver.parked_host_captures.len(), 1);
+        let overflow = queue_host_capture(&port, true, Instant::now() + Duration::from_secs(5));
+        driver
+            .step(ManualInstant::from_nanos(2))
+            .expect("refuse overflow");
+        assert!(matches!(
+            overflow.try_recv().expect("explicit capacity refusal"),
+            Err(HostCheckpointError::Host(
+                HostAccessError::ProtocolViolation { .. }
+            ))
+        ));
+        assert_eq!(driver.parked_host_captures.len(), 1);
+        assert!(!driver.handoff_pending);
+        assert!(*port.ingress_open.lock().expect("ingress remains open"));
+        assert!(matches!(
+            pending.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        driver
+            .step(ManualInstant::from_nanos(100))
+            .expect("real retained batch retry");
+        driver
+            .step(ManualInstant::from_nanos(101))
+            .expect("real commitment receipt");
+        let checkpoint = pending
+            .try_recv()
+            .expect("original reply retained")
+            .expect("original cut eventually settles");
+        assert_eq!(checkpoint.tick(), scriptbots_core::Tick(1));
+        assert!(driver.parked_host_captures.is_empty());
+    }
+
+    #[test]
+    fn timed_out_handoff_cannot_retire_owner_after_the_caller_abandons_its_reply() {
+        let (mut driver, port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("stalled owner");
+        {
+            let fence = port.ingress_open.lock().expect("hold ingress fence");
+            assert!(matches!(
+                port.capture_host_checkpoint_v1_before(Instant::now() + Duration::from_millis(20)),
+                Err(HostCheckpointError::Host(
+                    HostAccessError::ProtocolViolation { .. }
+                ))
+            ));
+            assert!(matches!(
+                driver.receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            drop(fence);
+        }
+        let started = Instant::now();
+        assert!(matches!(
+            port.handoff_host_checkpoint_v1_before(started + Duration::from_millis(20)),
+            Err(HostCheckpointError::Host(
+                HostAccessError::ProtocolViolation { .. }
+            ))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        driver
+            .step(ManualInstant::from_nanos(0))
+            .expect("observe expired intent");
+        assert!(!driver.handed_off);
+        assert!(!driver.handoff_pending);
+        assert!(
+            *port
+                .ingress_open
+                .lock()
+                .expect("expired handoff reopens ingress")
+        );
+        assert_eq!(driver.host().core().admission_cursor().get(), 1);
+        assert!(driver.host().core().shutdown_command_status().is_none());
+        let step = queue_command(&port, 100, HostCommand::Step);
+        let report = driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("original owner continues");
+        assert_eq!(report.admitted, 1);
+        step.try_recv()
+            .expect("continued admission reply")
+            .expect("continued admission");
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(1));
+        assert!(matches!(
+            port.capture_host_checkpoint_v1_before(Instant::now()),
+            Err(HostCheckpointError::Host(
+                HostAccessError::ProtocolViolation { .. }
+            ))
+        ));
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -2509,6 +3259,7 @@ mod tests {
             | IngressMessage::RequestReplayDigest { .. }
             | IngressMessage::WorldDigests { .. }
             | IngressMessage::CaptureCheckpoint { .. }
+            | IngressMessage::CaptureHostCheckpoint { .. }
             | IngressMessage::ScientificDigest { .. } => {
                 // ubs:ignore[rust.ownership.panic-macro] — test requires the submission message.
                 panic!("expected command submission")
@@ -2691,6 +3442,7 @@ mod tests {
             | IngressMessage::RequestReplayDigest { .. }
             | IngressMessage::WorldDigests { .. }
             | IngressMessage::CaptureCheckpoint { .. }
+            | IngressMessage::CaptureHostCheckpoint { .. }
             | IngressMessage::ScientificDigest { .. } => {
                 // ubs:ignore[rust.ownership.panic-macro] — test requires the status lookup.
                 panic!("expected command-status lookup")

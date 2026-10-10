@@ -10,7 +10,7 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-10
 
-The source changes through saved commit `5cf4f859c12425349b2215381f34e2600bbc0ec1`
+The source changes through saved commit `c37ea6ebf3bfacd5ba0fb780584318940ce3e786`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
 consumer finding below describes the initial audited source, not this newer candidate.
@@ -184,7 +184,8 @@ foreground/background/underline colors after all overlays, before output and fra
 It preserves symbols, attributes and the deterministic colored fixtures. A real Model test
 checks colored positives against monochrome output/capture and cell/attribute preservation.
 Independent source review supports this boundary; original real-PTY color assertions, goldens,
-16-ms budget and deadlines remain unchanged. The correction still requires native execution.
+16-ms budget and deadlines remain unchanged. The correction executes in R55 below;
+final DSR collection remains unqualified.
 Static UBS reads both complete changed Rust files: exit 1, four critical heuristic observations,
 2,989 warnings and 865 informational observations. The four critical sites are unchanged:
 three subprocess executables come directly from `std::env::current_exe()`, and the remaining
@@ -228,6 +229,82 @@ result and launcher files are preserved; the missing stage is recorded rather th
 These are avoidable launch preparation errors and establish no browser or package result.
 A new descriptor must use DSR's actual version substitution and launcher-level retention,
 locked seed and timeout settings before the unchanged package/browser/parity phases execute.
+
+R55 at clean `c37ea6eb`, including the `8504ab9c` NO_COLOR correction, completes all fourteen
+original inner terminal steps: formatting, five integration/metadata guards, strict workspace
+Clippy/check, 218 runtime tests, 313 terminal tests, five executable E2E tests, eight smoke tests,
+fifteen manifest tests and analyzer build. Actual total: 559 passed, zero failed, six existing
+runtime ignores. The strict source-bound artifact consumer passes. Normal truecolor, NO_COLOR
+and file-backed own Shutdown PTYs observe actual byte input, six resizes and terminal restoration.
+NO_COLOR emits zero color/truecolor SGR and sixteen style SGR; truecolor retains 193 color and
+191 truecolor SGR. The checkpoint observes Pending before Applied; the real seed-41 MLP experiment
+completes three ticks with digest `a056b77ad1761fdd`. Own Shutdown observes its exact Durable/Applied
+receipt before alternate-screen leave and matches the finished database. The three actual fault
+PTYs restore but select Full, so this attempt does not establish reduced-quality or frame-budget
+performance. The unchanged outer DSR cache guard then refuses Cargo's recreated tracked Proptest
+README link: native exit 4, outer failed/6, no collected binary/archive. No containing acceptance
+owner closes. Root independently hashes every one of the 478 retained files (78,439,988 bytes),
+including the 459 proof files; canonical row digest is
+`375ca75c91664682fea6df96b6b59b4a49c3eb639d99e313a31bc47608ed3862`.
+Evidence remains in `/data/tmp/scriptbots-terminal-hz2-20261010-lilacelm/`, including
+`r55-emitted-file-hashes-20261010T1850Z.json` and the original proof/native/observer files.
+
+Browser R56 fails on its Chrome prerequisite after the native fixture passes; no package or
+browser acceptance follows. R58 at clean `34323f4b` moves that prerequisite before compilation
+and retains the raw version bytes before the unchanged predicate. Its first three prerequisites
+pass; Chrome fails. Both checksummed pinned ZIPs pass, and both version processes exit zero with
+empty stderr. Authentic Chrome stdout ends in one ASCII space followed by LF; the old exact
+predicate rejects the retained space. R58 executes none of the twelve subsequent compilation,
+package, DOM/CI smoke, parity or analyzer phases. Root hashes and parses both complete retained
+archives: stage 3,681,587,200 bytes / 83,907 members / SHA256
+`974633179e3f98f77c822ccb202b70878b6175db205852982cb35037f81dfa39`; proof 621,230,080 bytes /
+917 members / SHA256 `80c200a7028d189b0ac89695fb4a1cb1a442c29ff0b6d85c31b54d925afd5013`.
+The reviewed R59 descriptor accepts only the exact pinned zero-space or one-space Chrome formats,
+computes nine labelled synthetic old/new predicate dispositions, and preserves all sixteen gates,
+driver/ZIP pins and corruption controls. It is held until the DSR collection blocker qualifies.
+
+The private DSR candidate `c10a3232` / tree `3684717fb767aaaedcce413364119433c53736ef` carries only
+the six reviewed cache/source guard and regression files on the worker's actual installed
+`bf0543ec` revision. The earlier `4a5a8199` draft on the shared DSR base is preserved; adopting it
+wholesale would import twelve unrelated release files. Both candidates contain the identical
+fully read 1,140-line patch, SHA256 `9e0882d0be71316bdeeeb49e8414833f37e0a805625c278a8684c4a4fe0a8935`.
+The Bash UBS module reports zero findings for the five changed shell files; this is not an
+embedded-Python scan or runtime proof. The installed/shared DSR and dependency pins are unchanged.
+The guard authenticates actual Git HEAD/tree/blob bytes, contained stable targets and inventory;
+observed HEAD alone is not lockfile or upstream-signature authentication.
+
+R60 starts once at 19:43:33 UTC, UUID `6f09478c-3259-4db0-91f8-f224d36b529e`, using the unchanged
+installed DSR as runner. Profile SHA256 is
+`0f8e85409bec0292536c92ef25d70c8a321f697a8ba2a702bbb4a7e13a4b476c`; launcher SHA256 is
+`23b5d0a87c609f2f6348dfd5bacfeac7706463be4fa80963026ef9886e60ad76`.
+Independent full review corrects actual consumers for focused skips, both original default suites,
+all copied-checkout observations, a fresh test Cargo home, seed/tool preservation and the original
+runner's doubled log suffix. Source and baseline focused tests pass. Candidate source/authentication
+tests pass, and the authentic retained Proptest comparison observes baseline refusal/7 versus
+candidate inventory/verify acceptance/0. Candidate cache tests run 71 cases and report one error:
+the corrupt-object negative times out after its unchanged fifteen seconds. The reader computes a
+hash mismatch but reads the next framing byte first; a one-byte shortened corrupt payload has
+already consumed the separator. An independently reviewed isolated successor checks the mismatch
+first. Valid objects still require the hash and separator. This is a narrow early-refusal repair,
+not a general larger-truncation deadline fix. Root retires the exact owned, already-failing R60
+native timeout group at 20:43:59 UTC; its EXIT custody checks complete and every owned process
+retires by 20:44:36. Eight completed case rows and the typed failed verdict remain. The unfinished
+ShellCheck and later syntax/full-suite/final-source checks are unqualified. R61 starts once at
+20:48:52 UTC against private `7161c7fc`; its original 71-case candidate cache test exits zero.
+The remaining fifteen-case/full-suite/outer-collection qualification is still running. No timeout,
+assertion, warning severity or gate is weakened.
+
+Two external shared-checkout resets at 19:37:38 and 19:38:44 moved main to ancestor `7c9264a1`.
+Root reads the entire affected file list, observes no deletion/conflict, and fast-forwards back to
+preserved `c37ea6eb`; all 53 committed changes return without rewriting history. The displaced
+uncommitted notes are reconstructed from retained raw evidence. Before Beads reconciliation,
+`reset-recovery-20261010T1945Z/` preserves the complete tracker and both documents. A separately
+exported database reproduces the prior `ea8efa33` export exactly; all four changed issue rows add
+only the six known comments/timestamps, with no lost comment, status, acceptance or dependency
+change. The ordinary merge has 718 issues, zero conflicts and zero deletions; its only difference
+from that prior export is four one-microsecond update timestamps. JSONL/base now match, coverage
+is complete and active cycles are empty. The two existing doctor warnings remain. Publication
+hold remains; no reset, cleanup, deletion or push was performed by root.
 
 Checked items below name implementation or observations at their stated boundary. They do
 not close a containing Bead. This checklist answers the user's explicit request and retires
@@ -317,9 +394,43 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Trace R52's actual NO_COLOR startup and fullscreen escapes to both production emitters.
 - [x] Correct both emitters in source and add output/capture cell-and-attribute discrimination;
   preserve the original PTY color guard, colored goldens, budget and deadlines.
-- [ ] Execute the new Model test and unchanged truecolor/NO_COLOR PTY journeys at the final source.
+- [x] Execute the new Model test and unchanged truecolor/NO_COLOR PTY journeys at R55's frozen
+  `c37ea6eb` source; distinguish its inner pass from failed outer collection.
 - [x] Retain R53's pre-test version-binding failure and disclose its missing temporary stage.
 - [ ] Qualify the actual browser package in a new version-bound, retention-enabled DSR run.
+- [x] Retain and independently hash all R55 files and R58 complete archives; update original
+  Beads with inner/outer distinctions and unexecuted stages rather than close them.
+- [x] Preserve the blocked build-farm claim refusal and its immediate correction; do not
+  remove `bd-vlp7`, claim the blocked owner or duplicate its full acceptance.
+- [x] Implement and independently review the private six-file DSR link correction; bank the
+  exact installed-base candidate and preserve the shared-base draft without adoption.
+- [x] Review all R60 profile/launcher lines and correct the five custody/skip consumers and
+  actual runner log names; retain every prior descriptor and source pin.
+- [x] Stage/hash the complete private source bundle and clean clone; observe worker health,
+  unchanged installed tool and original seed before the single R60 native launch.
+- [x] Observe authentic old-refusal/new-admission Proptest behavior and the actual corrupt-blob
+  cache-test failure within R60; preserve its original fifteen-second guard.
+- [x] Retire the owned, already-failing R60 native timeout group after exact process identity
+  review. TERM at 20:43:59 UTC retained the eight completed case rows, genuine cache failure,
+  typed failed verdict and zero-exit seed/tool custody checks; all owned processes retired by
+  20:44:36. The unfinished ShellCheck, syntax, full suites and final-source gate remain
+  unqualified. No missing check is treated as a test failure or pass.
+- [x] Implement the independently reviewed early hash-mismatch refusal in a fresh isolated
+  successor; leave the active R60 source and descriptor immutable.
+- [x] Scan, independently review and bank the minimal successor as private `7161c7fc`;
+  review the complete R61 descriptor without changing test timeouts or warning gates.
+- [ ] Execute fresh source-pinned R61 validation; require all fifteen case exits, both
+  unfiltered original 139-file suites, exact typed pass and actually collected artifacts.
+  ShellCheck still examines every runtime-derived original input at warning severity, now
+  one file per invocation with each actual command, source hash and exit retained.
+- [ ] Read back all emitted successor proof bytes, authentic fixture identity and actual suite
+  pass/fail/skip counts. Keep naturally skipped platform probes unqualified.
+- [ ] Bind reviewed private DSR entrypoint/source hashes into successor product launchers;
+  a partial artifact archive or PATH change cannot stand in for the complete pinned tool.
+- [ ] Complete terminal, browser, workspace/economy-faults and original latency qualification
+  serially with their unchanged source, class, scenario, budgets and negative controls.
+- [x] Recover the 19:37/19:38 external resets by fast-forward and zero-conflict Beads merge;
+  retain source/tracker preimages and all six recovered comments without graph changes.
 - [ ] Locate the outstanding normal checkpoint stage with contemporaneous process/task/file/
   receipt evidence; keep file synchronization, storage acknowledgment and delivery distinct.
 - [ ] Diagnose the worker's real filesystem stalls without terminating unrelated work or
@@ -335,11 +446,59 @@ as a working list when its original owners are fully qualified; retained evidenc
   executable E2E, smoke, manifests and analyzer; accept only the source-bound typed pass.
 - [ ] Complete a fresh workspace DSR lane, including core `economy-faults` and analyzer.
 - [ ] Execute the latest one-shot continuation-binding rejection/configuration/gap guards.
-- [x] Keep full Host/session continuation capability false while only world restore exists.
+- [x] Keep full Host/session continuation capability false until the complete owner/storage/CLI
+  acceptance cohort is qualified; the new continuation source has not run natively yet.
 - [x] Acquire the persistence binding before mutating recording settings or the gap marker.
 - [ ] Implement and qualify full Host/session continuation: command/event counters, deadlines,
   configuration revisions, deduplication, journal prefixes, audit and persistence watermarks.
 - [ ] Compare uninterrupted and restored sessions through the original named positive probe.
+- [x] Write the versioned full-owner codec and core continuity companion, preserving session,
+  command ordering/retry identities, scientific/configuration/control revisions, scheduled
+  actions, audit/history, domain RNG, QD/novelty state, resource accounting and observer state.
+  These are current source changes, not executed continuation evidence.
+- [x] Write the bounded channel capture/handoff path with its original caller deadline, ingress
+  fence, real partial-tail flush, owner retirement and independent thread join. Ordinary
+  owner science remains uninstrumented unless diagnostic tracing is requested.
+- [x] Write actual FrankenSQLite host-artifact recording and exact row readback, worker-derived
+  admitted/applied/durable cut metadata, and recovered same-session journal registration.
+  Later same-tick commands and completed Shutdown must refuse a stale artifact.
+- [x] Write the CLI handoff and bounded continuation modes. Derive bootstrap command IDs from
+  the current tick and require each requested Step to advance once. Reject unpaused bounded
+  continuation and explicit controls that would otherwise be silently ignored.
+- [x] Write the production read-only artifact comparator using actual immutable storage leases,
+  science/journal prefixes and complete chronological six-stage traces. Distinguish trace
+  divergence from the separately observed completed boundary; incomplete traces cannot pass.
+- [x] Finish, freeze and independently read every owner/core test and implementation hunk,
+  including next-stage equivalence and deterministic perturbation controls. Native execution
+  remains pending. Correct the channel's running-capture test to issue Resume: Step pauses
+  playback; the independently decoded artifact now must prove unpaused state.
+- [x] Finish and review actual file-worker capture/readback/recovery test source, exact lost-receipt
+  retry, unchanged-row identity collision, same-tick stale-cut refusal, quota recovery and
+  shared typed SQL failure cause through first receipt and shutdown/join.
+  Include a real adapter-advance control: its continuation witness must disappear after that
+  port accepts new journal work, both before and after its durable acknowledgement. All eight
+  tests remain unrun; source review does not qualify recovery.
+- [x] Finish and review real subprocess E2E source: uninterrupted 18 ticks versus 7+11 in the same
+  continued run/session, exact retained payloads and stage traces, real SQL row counts and all
+  three watermarks, corrupt/truncated artifacts, and actual production first-divergence output.
+  Preserve companion leases when materializing closed copies; remove the helper's explicit
+  terminal-mode environment only for continuation/comparison. Name the final science hash
+  boundary_digest and retain the actual six-point observations separately as step_traces.
+  The shared comparison validator also has a real MLP versus unused opaque-factory negative;
+  valid capture with explicitly incomplete coverage must refuse a full-equivalence claim.
+  Every new subprocess and comparison test remains unrun.
+- [x] Read the frozen source hunks and execute UBS over all eleven changed Rust files with
+  native phases disabled. The actual exit is one with 46 critical heuristics, not a clean
+  scanner pass. Recover the complete original location records and triage before banking;
+  an empty SARIF merge must not erase those findings.
+- [ ] Read every frozen source hunk, scan the changed Rust scope, and bank one coherent source
+  cohort separately from Beads exports. No original acceptance is removed or split off.
+- [ ] Execute source-pinned DSR formatting, workspace all-target check, strict workspace Clippy,
+  workspace tests and core economy fault-feature tests; fix actual failures without relaxing gates.
+- [ ] Execute the existing connectivity lane that consumes the full replay subprocess suite;
+  retain raw child output, actual artifact identities and source-bound typed verdicts.
+- [ ] Re-run the ordinary tick-zero/core checkpoint-start replay and bundle/refusal lanes at
+  the final source. Enable the public continuation guarantee only after complete acceptance.
 - [ ] Retain broad PTY/capability matrix and full research-journey criteria with their owners.
 - [x] Attach R28/R32/R34 failures and current source repair identities to the original Beads.
 - [ ] Attach final terminal/workspace profile, source and completed raw proof identities.

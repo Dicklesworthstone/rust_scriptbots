@@ -19,7 +19,7 @@ use scriptbots_runtime::{
     CommandLifecycleEvidence, CommandLifecycleTransition, ConfigRevision, ControlRevision,
     EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason,
     EventCommitment, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot,
-    EventSequence, EventSequenceRange, HostAccessError, HostCommand, HostRevisions, HostSessionId,
+    EventSequence, EventSequenceRange, HostAccessError, HostCommand, HostJournalCutV1, HostRevisions, HostSessionId,
     IslandId, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort,
     JournalReceipt, JournalReceiptState, JournaledScientificEvent, RejectionReason, RunId,
     ScheduledPatchEvidence, ScientificBoundary, ScientificEvent, ScientificRevision,
@@ -2677,6 +2677,19 @@ impl JournalReaderPublisher {
         }));
     }
 
+    pub(super) fn install_continuation_index(&self) -> Result<(), StorageError> {
+        let JournalReaderBackend::File { path, run_id, lease } = &self.inner.backend else {
+            return Err(StorageError::InvalidData {
+                context: "host_journal_reader.continuation",
+                reason: "continuation requires the leased recovered run file".to_owned(),
+            });
+        };
+        let (available, identities) = load_host_journal_index(path, lease, *run_id,
+            self.inner.session_id, self.inner.identity_capacity)?;
+        self.install_recovered_index(available, identities);
+        Ok(())
+    }
+
     pub(super) fn publish(
         &self,
         batch: &JournalBatch,
@@ -2959,6 +2972,12 @@ impl JournalSessionShared {
         }
     }
 
+    pub(super) fn restore_completed_sequence(&self, sequence: u64) {
+        self.completed_sequence.store(sequence, Ordering::Release);
+        self.acknowledged_sequence.store(sequence, Ordering::Release);
+        self.final_accepted_sequence.store(sequence, Ordering::Release);
+    }
+
     pub(super) fn cache_terminal(
         &self,
         batch_id: JournalBatchId,
@@ -3054,6 +3073,7 @@ pub struct StorageJournalPort {
     reader: Arc<dyn EventJournalReader>,
     command_reader: Option<Arc<dyn CommandAuthorityReader>>,
     shutdown_requirement: ShutdownCommitRequirement,
+    continuation_cut: Option<HostJournalCutV1>,
     expected_sequence: u64,
     last_accepted_sequence: u64,
     open: bool,
@@ -3348,10 +3368,22 @@ impl StorageJournalPort {
             reader: publisher.reader(),
             command_reader,
             shutdown_requirement,
+            continuation_cut: None,
             expected_sequence: 1,
             last_accepted_sequence: 0,
             open: true,
         }
+    }
+
+    pub(super) fn with_continuation_cut(mut self, cut: Option<HostJournalCutV1>) -> Result<Self, StorageError> {
+        if let Some(cut) = cut {
+            self.expected_sequence = cut.last_journal_sequence.checked_add(1).ok_or_else(|| StorageError::InvalidData {
+                context: "host_journal_port.continuation", reason: "next journal sequence overflowed".to_owned(),
+            })?;
+            self.last_accepted_sequence = cut.last_journal_sequence;
+            self.continuation_cut = Some(cut);
+        }
+        Ok(self)
     }
 
     /// Exact journal and durable-authority bytes accepted but not yet released by worker progress.
@@ -3647,6 +3679,21 @@ impl JournalPort for StorageJournalPort {
 
     fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
         self.shutdown_requirement
+    }
+
+    fn continuation_cut(&self) -> Option<HostJournalCutV1> {
+        let cut = self.continuation_cut?;
+        let sequence = cut.last_journal_sequence;
+        (self.open
+            && !self.shared.worker_closed.load(Ordering::Acquire)
+            && self.last_accepted_sequence == sequence
+            && sequence.checked_add(1) == Some(self.expected_sequence)
+            && self.shared.completed_sequence.load(Ordering::Acquire) == sequence
+            && self.shared.acknowledged_sequence.load(Ordering::Acquire) == sequence
+            && self.outstanding.is_empty()
+            && self.suppressed_receipts.is_empty()
+            && self.receipts.is_empty())
+        .then_some(cut)
     }
 }
 

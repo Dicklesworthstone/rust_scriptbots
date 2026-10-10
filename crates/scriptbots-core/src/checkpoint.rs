@@ -6,7 +6,10 @@
 //! family-authored semantic-identity contracts. It does not claim to restore a persistence
 //! session, retained analytics output,
 //! configuration-audit revision, UI selection, mutation-log prose, chart history, narrative
-//! history, or renderer state. Those host-owned surfaces belong to the later replay/runtime work.
+//! history, or renderer state. The separate [`WorldHostCheckpointV1`] companion carries
+//! core-owned auxiliary science and observational continuity for the runtime's full host
+//! artifact; it does not
+//! change the science-only wire contract or reconstruct storage ownership.
 //! Keeping that boundary explicit prevents a core round trip from being advertised as a storage
 //! or application recovery feature.
 
@@ -84,6 +87,421 @@ const MAX_CHECKPOINT_EAGER_ALLOCATION_BYTES: usize = 1024 * 1024;
 #[derive(Clone)]
 pub struct WorldCheckpointV1 {
     state: WorldCheckpointStateV1,
+}
+
+/// Core-owned continuity accompanying a runtime host checkpoint.
+///
+/// This data is deliberately separate from the stable science checkpoint. It preserves raw
+/// recording configuration, auxiliary science and RNG state, bounded observer histories and
+/// their counters, and presentation selections by stable UID. It contains no executable adapter
+/// or persistence connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldHostCheckpointV1 {
+    config: ScriptBotsConfig,
+    config_revision: u64,
+    persistence_boundary: PersistenceBoundaryStatus,
+    cadence: TickCadence,
+    food_profiles: Vec<FoodCellProfile>,
+    temperature: Option<crate::ScalarField>,
+    config_audit: Vec<crate::ConfigAuditEntry>,
+    history: Vec<crate::TickSummary>,
+    narrative: crate::narrative::RunNarrative,
+    interventions: Vec<InterventionHistoryV1>,
+    next_intervention_seq: u64,
+    agents: Vec<AgentObserverV1>,
+    replay_tick: u64,
+    replay_interactions: (usize, u64, usize, usize, usize, usize),
+    reported_lifecycle_records: (usize, usize),
+    last_tick_counts: (usize, usize, u32, u32),
+    carcass_totals: (f32, f32),
+    combat_counts: (u32, u32),
+    sense_saturations_total: u64,
+    capture_budget: crate::CaptureBudget,
+    probe_stats: crate::ProbeStats,
+    active_probe: Option<AgentUid>,
+    captured_probe_agents: Vec<AgentUid>,
+    last_probed_agent_death: Option<(AgentUid, Tick)>,
+    visual_events: Vec<crate::visual::LocatedWorldVisualEvent>,
+    visual_dropped_events: (u64, u64),
+    resource_ledger_enabled: bool,
+    resource_report: crate::ResourceLedgerReport,
+    realized_hearing_capture_enabled: bool,
+    realized_hearing: Vec<crate::RealizedHearingObservation>,
+    communication_emitted: Vec<f64>,
+    communication_realized: Vec<f64>,
+    communication_report: Option<crate::infotheory::CommunicationMiWindowReport>,
+    last_tick_emitted_sound: f64,
+    communication_rng: Option<crate::RandomStreamState>,
+    archive: Option<crate::MapElitesArchive>,
+    archive_logged_eligibility_warning: bool,
+    agent_stats: Vec<(AgentUid, crate::AgentAccumulatedStats)>,
+    archive_evaluations: u64,
+    novelty_state: Option<crate::NoveltyState>,
+    consecutive_zero_novelty_samples: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentObserverV1 {
+    uid: AgentUid,
+    indicator: IndicatorState,
+    selection: SelectionState,
+    combat: CombatEventFlags,
+    mutation_log: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterventionHistoryV1 {
+    seq: u64,
+    tick: Tick,
+    kind: String,
+    region: Region,
+    agents_affected: usize,
+    cells_affected: usize,
+    expires_at: Option<Tick>,
+    expired: bool,
+}
+
+pub(super) fn intervention_history_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "drought" => Some("drought"),
+        "embargo" => Some("embargo"),
+        "bloom" => Some("bloom"),
+        "meteor" => Some("meteor"),
+        "paint_terrain" => Some("paint_terrain"),
+        "set_closed_world" => Some("set_closed_world"),
+        "inject_cohort" => Some("inject_cohort"),
+        "spawn_from_archive" => Some("spawn_from_archive"),
+        "expiry:drought" => Some("expiry:drought"),
+        "expiry:embargo" => Some("expiry:embargo"),
+        _ => None,
+    }
+}
+
+impl WorldHostCheckpointV1 {
+    /// Raw production configuration, including recording cadence.
+    #[must_use]
+    pub const fn config(&self) -> &ScriptBotsConfig {
+        &self.config
+    }
+
+    /// Actual configuration revision at the captured owner boundary.
+    #[must_use]
+    pub const fn config_revision(&self) -> u64 {
+        self.config_revision
+    }
+
+    /// Validate this companion against its independently validated science checkpoint.
+    pub fn validate(&self, world: &WorldCheckpointV1) -> Result<(), WorldCheckpointError> {
+        self.config.validate()?;
+        let mut normalized = self.config.clone();
+        normalized.persistence_interval = 0;
+        let json = |config: &ScriptBotsConfig| {
+            serde_json::to_vec(config).map_err(|error| WorldCheckpointError::Codec {
+                operation: "host configuration",
+                detail: error.to_string(),
+            })
+        };
+        if json(&normalized)? != json(world.config())? {
+            return contract_error(
+                "host.config",
+                "raw configuration differs from science".to_owned(),
+            );
+        }
+        ensure_count_bound(
+            "host.config_audit",
+            self.config_audit.len(),
+            crate::CONFIG_AUDIT_CAPACITY,
+        )?;
+        ensure_count_bound("host.history", self.history.len(), 65_536)?;
+        ensure_count_bound("host.narrative", self.narrative.events().len(), 65_536)?;
+        ensure_count_bound(
+            "host.interventions",
+            self.interventions.len(),
+            crate::APPLIED_INTERVENTION_CAPACITY,
+        )?;
+        if !self.narrative.validate_checkpoint(world.tick(), 65_536)
+            || !matches!(
+                self.persistence_boundary,
+                PersistenceBoundaryStatus::Open { tick } | PersistenceBoundaryStatus::Sealed { tick }
+                    if tick == world.tick())
+            || self.config_audit.iter().any(|entry| entry.tick > world.tick().0)
+            || self.config_audit.windows(2).any(|pair| pair[0].tick > pair[1].tick)
+            || self.history.iter().any(|summary| {
+                summary.tick > world.tick()
+                    || !summary.total_energy.is_finite()
+                    || !summary.average_energy.is_finite()
+                    || !summary.average_health.is_finite()
+            })
+            || self
+                .history
+                .windows(2)
+                .any(|pair| pair[0].tick.0.checked_add(1) != Some(pair[1].tick.0))
+            || self.next_intervention_seq == 0
+            || self.interventions.iter().any(|record| {
+                record.seq == 0
+                    || record.seq >= self.next_intervention_seq
+                    || record.tick > world.tick()
+                    || intervention_history_kind(&record.kind).is_none()
+            })
+            || self.interventions.windows(2).any(|pair| pair[0].seq >= pair[1].seq)
+        {
+            return contract_error(
+                "host.history",
+                "invalid retained output or counter".to_owned(),
+            );
+        }
+        let expected: BTreeSet<_> = world
+            .state
+            .agents
+            .iter()
+            .map(|agent| agent.identity.uid)
+            .collect();
+        let actual: BTreeSet<_> = self.agents.iter().map(|agent| agent.uid).collect();
+        if self.agents.len() != actual.len()
+            || actual != expected
+            || self.agents.iter().any(|agent| {
+                !agent.indicator.intensity.is_finite()
+                    || agent.indicator.color.iter().any(|value| !value.is_finite())
+                    || agent.mutation_log.len() > 65_536
+            })
+            || self.active_probe.is_some_and(|uid| !expected.contains(&uid))
+            || self
+                .captured_probe_agents
+                .iter()
+                .any(|uid| !expected.contains(uid))
+            || self.reported_lifecycle_records.0 > world.state.pending_birth_records.len()
+            || self.reported_lifecycle_records.1 != 0
+            || self.replay_tick > world.tick().0
+            || !self.carcass_totals.0.is_finite()
+            || !self.carcass_totals.1.is_finite()
+        {
+            return contract_error(
+                "host.agents",
+                "invalid observer identity or counter".to_owned(),
+            );
+        }
+        self.validate_auxiliary_state(world)?;
+        Ok(())
+    }
+
+    fn validate_auxiliary_state(
+        &self,
+        world: &WorldCheckpointV1,
+    ) -> Result<(), WorldCheckpointError> {
+        if self.food_profiles.len() != world.state.food.cells.len()
+            || self.food_profiles.iter().any(|profile| {
+                [
+                    profile.capacity,
+                    profile.growth_multiplier,
+                    profile.decay_multiplier,
+                    profile.fertility,
+                    profile.nutrient_density,
+                ]
+                .into_iter()
+                .any(|value| !value.is_finite() || value < 0.0)
+            })
+            || self.cadence.aging_interval == 0
+            || !self.cadence.reproduction_chance.is_finite()
+            || !(0.0..=1.0).contains(&self.cadence.reproduction_chance)
+        {
+            return contract_error(
+                "host.derived",
+                "invalid derived transition continuation".to_owned(),
+            );
+        }
+        if let Some(temperature) = &self.temperature {
+            temperature.validate()?;
+            if temperature.width() != world.state.terrain.width
+                || temperature.height() != world.state.terrain.height
+            {
+                return contract_error(
+                    "host.temperature",
+                    "map temperature dimensions differ from terrain".to_owned(),
+                );
+            }
+        }
+        for (path, count) in [
+            ("host.communication_emitted", self.communication_emitted.len()),
+            ("host.communication_realized", self.communication_realized.len()),
+            ("host.realized_hearing", self.realized_hearing.len()),
+            ("host.agent_stats", self.agent_stats.len()),
+        ] {
+            ensure_count_bound(path, count, MAX_CHECKPOINT_AGENTS)?;
+        }
+        if self.communication_emitted.len() != self.communication_realized.len()
+            || self
+                .communication_emitted
+                .iter()
+                .chain(&self.communication_realized)
+                .any(|value| !value.is_finite())
+            || !self.last_tick_emitted_sound.is_finite()
+            || self.communication_rng.is_some() != self.config.communication_scramble
+            || self.realized_hearing.iter().any(|observation| {
+                observation.observation_tick > world.tick()
+                    || observation.source_tick > observation.observation_tick
+                    || !observation.hearing.is_finite()
+                    || !(0.0..=1.0).contains(&observation.hearing)
+            })
+            || self.agent_stats.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || self.agent_stats.iter().any(|(_, stats)| {
+                stats.spiked_ticks > stats.ticks_observed
+                    || [
+                        stats.speed_sum,
+                        stats.give_intent_sum,
+                        stats.sound_output_sum,
+                        stats.turn_angle_sum,
+                        stats.food_intake_sum,
+                    ]
+                    .into_iter()
+                    .any(|value| !value.is_finite())
+                    || stats.last_heading.is_some_and(|heading| !heading.is_finite())
+            })
+            || self.resource_report.completed_ticks > world.tick().0
+            || self
+                .resource_report
+                .latest
+                .as_ref()
+                .is_some_and(|report| report.tick > world.tick())
+            || self.resource_report.cumulative.len() != crate::RESOURCE_FLOW_KINDS.len()
+            || self
+                .resource_report
+                .cumulative
+                .iter()
+                .zip(crate::RESOURCE_FLOW_KINDS)
+                .any(|(flow, kind)| flow.kind != kind)
+        {
+            return contract_error(
+                "host.auxiliary",
+                "invalid retained science instrumentation".to_owned(),
+            );
+        }
+        if let Some(state) = &self.communication_rng {
+            crate::SmallRngStream::from_state(state).map_err(|error| {
+                WorldCheckpointError::Contract {
+                    path: "host.communication_rng".to_owned(),
+                    detail: error.to_string(),
+                }
+            })?;
+        }
+        let finite_amounts = |amounts: crate::ResourceAmounts| {
+            [amounts.food, amounts.energy, amounts.health]
+                .into_iter()
+                .all(f64::is_finite)
+        };
+        let valid_flows = |flows: &[crate::ResourceFlow]| {
+            flows.len() == crate::RESOURCE_FLOW_KINDS.len()
+                && flows
+                    .iter()
+                    .zip(crate::RESOURCE_FLOW_KINDS)
+                    .all(|(flow, kind)| {
+                        flow.kind == kind
+                            && finite_amounts(flow.delta)
+                            && finite_amounts(flow.activity)
+                    })
+        };
+        if !valid_flows(&self.resource_report.cumulative)
+            || self.resource_report.latest.as_ref().is_some_and(|report| {
+                !finite_amounts(report.opening)
+                    || !finite_amounts(report.closing)
+                    || !valid_flows(&report.flows)
+                    || !finite_amounts(report.reconciliation.observed_delta)
+                    || !finite_amounts(report.reconciliation.attributed_delta)
+                    || !finite_amounts(report.reconciliation.unexplained_delta)
+                    || !report.reconciliation.tolerance.is_finite()
+                    || report.reconciliation.tolerance < 0.0
+            })
+        {
+            return contract_error(
+                "host.resource_report",
+                "invalid cumulative resource output".to_owned(),
+            );
+        }
+        // These already-serializable production objects are retained as data. Their executable
+        // evaluators remain entirely in the separately prepared, identity-checked registry.
+        if let Some(archive) = &self.archive {
+            archive
+                .space
+                .validate()
+                .map_err(|error| WorldCheckpointError::Contract {
+                    path: "host.archive.grid".to_owned(),
+                    detail: error.to_string(),
+                })?;
+            let total = archive.space.total_cells().map_err(|error| {
+                WorldCheckpointError::Contract {
+                    path: "host.archive.grid".to_owned(),
+                    detail: error.to_string(),
+                }
+            })?;
+            if total != archive.max_archive_cells
+                || u64::try_from(archive.cells.len()).unwrap_or(u64::MAX) > total
+                || archive.current_bytes > archive.max_archive_bytes
+                || archive
+                    .cells
+                    .values()
+                    .fold(0_usize, |size, entry| {
+                        size.saturating_add(entry.approximate_bytes())
+                    })
+                    != archive.current_bytes
+                || !self.config.archive_enabled
+                || archive.space != self.config.archive_space
+                || archive.quality_metric != self.config.archive_quality_metric
+                || archive.min_lifetime_ticks != self.config.archive_min_lifetime_ticks
+                || archive.max_archive_bytes != self.config.archive_max_bytes
+                || archive.cells.iter().any(|(cell, entry)| {
+                    archive.space.cell_index(&entry.descriptor).ok() != Some(*cell)
+                        || entry.tick_inserted > world.tick()
+                        || !entry.quality.is_finite()
+                        || entry
+                            .genome
+                            .require_protocol(
+                                entry.genome.family_id(),
+                                entry.genome.schema_version(),
+                                entry.genome.codec_version(),
+                            )
+                            .is_err()
+                })
+            {
+                return contract_error(
+                    "host.archive",
+                    "invalid retained behavioral archive".to_owned(),
+                );
+            }
+        } else if self.archive_logged_eligibility_warning || self.config.archive_enabled {
+            return contract_error(
+                "host.archive",
+                "configured or observed archive is absent".to_owned(),
+            );
+        }
+        if let Some(novelty) = &self.novelty_state
+            && (novelty.last_recompute_tick > world.tick()
+                || novelty.scores.len() > MAX_CHECKPOINT_AGENTS
+                || novelty.normalized_scores.len() > MAX_CHECKPOINT_AGENTS
+                || novelty
+                    .scores
+                    .values()
+                    .any(|value| !value.is_finite() || *value < 0.0)
+                || novelty.normalized_scores.values().any(|value| {
+                    !value.is_finite() || !(0.0..=1.0).contains(value)
+                })
+                || [
+                    novelty.mean_novelty,
+                    novelty.p50_novelty,
+                    novelty.p95_novelty,
+                    novelty.max_novelty,
+                ]
+                .into_iter()
+                .any(|value| !value.is_finite() || value < 0.0))
+        {
+            return contract_error(
+                "host.novelty",
+                "invalid retained novelty state".to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Data-only registry roster a host must recreate before restoring a checkpoint.
@@ -849,6 +1267,284 @@ impl WorldCheckpointV1 {
 }
 
 impl WorldState {
+    /// Capture the core-owned companion for a full runtime checkpoint.
+    ///
+    /// Undelivered science, narrative and configuration-dependent output must first cross its
+    /// actual persistence boundary. Capture never drains or discards that work.
+    pub fn capture_host_continuity_v1(
+        &self,
+        science: &WorldCheckpointV1,
+    ) -> Result<WorldHostCheckpointV1, WorldCheckpointError> {
+        self.ensure_checkpoint_has_no_deferred_host_output()?;
+        if self.has_pending_persistence_material()
+            || !self.pending_genomes.is_empty()
+            || !self.pending_communication_metrics.is_empty()
+            || self.replay_world_digest_pending
+            || self.resource_ledger.working.is_some()
+        {
+            return Err(WorldCheckpointError::DeferredHostOutput {
+                field: "host.persistence_tail",
+            });
+        }
+        if self.sense_provider.is_some() {
+            return contract_error(
+                "host.sense_provider",
+                "caller-installed executable sensing is not checkpoint data".to_owned(),
+            );
+        }
+        #[cfg(feature = "economy-faults")]
+        if self.resource_ledger.fault.is_some() {
+            return contract_error(
+                "host.resource_fault",
+                "injected economy fault cannot become continuation state".to_owned(),
+            );
+        }
+        let uid_for = |id| {
+            self.agent_uid(id)
+                .ok_or_else(|| WorldCheckpointError::Contract {
+                    path: "host.probe".to_owned(),
+                    detail: "retained probe has no live stable identity".to_owned(),
+                })
+        };
+        let mut agents = self
+            .agents
+            .iter_handles()
+            .map(|id| {
+                let uid = uid_for(id)?;
+                let runtime = self.agent_runtime(id).ok_or_else(|| {
+                    WorldCheckpointError::Contract {
+                        path: "host.runtime".to_owned(),
+                        detail: "live agent has no runtime".to_owned(),
+                    }
+                })?;
+                Ok(AgentObserverV1 {
+                    uid,
+                    indicator: runtime.indicator,
+                    selection: runtime.selection,
+                    combat: runtime.combat,
+                    mutation_log: runtime.mutation_log.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, WorldCheckpointError>>()?;
+        agents.sort_unstable_by_key(|agent| agent.uid);
+        let continuity = WorldHostCheckpointV1 {
+            config: self.config.clone(),
+            config_revision: self.config_revision,
+            persistence_boundary: self.persistence_boundary,
+            cadence: self.cadence.clone(),
+            food_profiles: self.food_profiles.clone(),
+            temperature: self.temperature.clone(),
+            config_audit: self.config_audit.clone(),
+            history: self.history.iter().cloned().collect(),
+            narrative: self.narrative.clone(),
+            interventions: self
+                .applied_interventions
+                .iter()
+                .map(|record| InterventionHistoryV1 {
+                    seq: record.seq,
+                    tick: record.tick,
+                    kind: record.kind.to_owned(),
+                    region: record.region,
+                    agents_affected: record.agents_affected,
+                    cells_affected: record.cells_affected,
+                    expires_at: record.expires_at,
+                    expired: record.expired,
+                })
+                .collect(),
+            next_intervention_seq: self.next_intervention_seq,
+            agents,
+            replay_tick: self.replay_tick,
+            replay_interactions: (
+                self.replay_interactions_this_tick,
+                self.replay_interactions_dropped_total,
+                self.replay_interactions_observed_pending,
+                self.replay_interactions_persisted_pending,
+                self.replay_interactions_sampled_out_pending,
+                self.replay_interactions_truncated_pending,
+            ),
+            reported_lifecycle_records: self.reported_lifecycle_records,
+            last_tick_counts: (
+                self.last_births,
+                self.last_deaths,
+                self.last_spike_hits,
+                self.last_max_age,
+            ),
+            carcass_totals: (self.carcass_health_distributed, self.carcass_reproduction_bonus),
+            combat_counts: (self.combat_spike_attempts, self.combat_spike_hits),
+            sense_saturations_total: self.sense_saturations_total,
+            capture_budget: self.capture_budget,
+            probe_stats: self.probe_stats,
+            active_probe: self.active_activation_probe.map(|(_, uid)| uid),
+            captured_probe_agents: self
+                .last_captured_probe_agents
+                .iter()
+                .copied()
+                .map(uid_for)
+                .collect::<Result<Vec<_>, _>>()?,
+            last_probed_agent_death: self.last_probed_agent_death,
+            visual_events: self.visual_events.clone(),
+            visual_dropped_events: (
+                self.visual_dropped_events_this_tick,
+                self.visual_dropped_events_total,
+            ),
+            resource_ledger_enabled: self.resource_ledger.enabled,
+            resource_report: self.resource_ledger.report.clone(),
+            realized_hearing_capture_enabled: self.realized_hearing_capture_enabled,
+            realized_hearing: self.latest_realized_hearing_observations.clone(),
+            communication_emitted: self.communication_emitted_history.iter().copied().collect(),
+            communication_realized: self.communication_realized_history.iter().copied().collect(),
+            communication_report: self.latest_communication_mi_report.clone(),
+            last_tick_emitted_sound: self.last_tick_emitted_sound,
+            communication_rng: self
+                .communication_scramble_stream
+                .as_ref()
+                .map(crate::SmallRngStream::state),
+            archive: self.archive.clone(),
+            archive_logged_eligibility_warning: self
+                .archive
+                .as_ref()
+                .is_some_and(|archive| archive.logged_eligibility_warning),
+            agent_stats: self
+                .agent_stats
+                .iter()
+                .map(|(uid, stats)| (*uid, stats.clone()))
+                .collect(),
+            archive_evaluations: self.archive_evaluations,
+            novelty_state: self.novelty_state.clone(),
+            consecutive_zero_novelty_samples: self.consecutive_zero_novelty_samples,
+        };
+        continuity.validate(science)?;
+        Ok(continuity)
+    }
+
+    /// Restore science and core-owned host continuity with trusted executable adapters.
+    ///
+    /// The returned world has no persistence owner. The runtime must bind a real continuation
+    /// session and independently validate its journal cut before admitting any new command.
+    pub fn restore_host_checkpoint_v1(
+        science: &WorldCheckpointV1,
+        continuity: &WorldHostCheckpointV1,
+        registry: BrainRegistry,
+    ) -> Result<Self, WorldCheckpointError> {
+        continuity.validate(science)?;
+        let mut world = Self::restore_checkpoint_parts(science, registry, Some(continuity))?;
+        world.config = continuity.config.clone();
+        world.config_revision = continuity.config_revision;
+        world.persistence_boundary = continuity.persistence_boundary;
+        world.config_audit.clone_from(&continuity.config_audit);
+        world.history = continuity.history.iter().cloned().collect();
+        world.narrative = continuity.narrative.clone();
+        world.applied_interventions = continuity
+            .interventions
+            .iter()
+            .map(|record| {
+                Ok(crate::AppliedInterventionRecord {
+                    seq: record.seq,
+                    tick: record.tick,
+                    kind: intervention_history_kind(&record.kind).ok_or_else(|| {
+                        WorldCheckpointError::Contract {
+                            path: "host.interventions.kind".to_owned(),
+                            detail: "unknown retained intervention kind".to_owned(),
+                        }
+                    })?,
+                    region: record.region,
+                    agents_affected: record.agents_affected,
+                    cells_affected: record.cells_affected,
+                    expires_at: record.expires_at,
+                    expired: record.expired,
+                })
+            })
+            .collect::<Result<_, WorldCheckpointError>>()?;
+        world.next_intervention_seq = continuity.next_intervention_seq;
+        let by_uid: HashMap<_, _> = world
+            .agents
+            .iter_handles()
+            .filter_map(|id| world.agent_uid(id).map(|uid| (uid, id)))
+            .collect();
+        for saved in &continuity.agents {
+            let id = by_uid[&saved.uid];
+            let runtime = world.runtime.get_mut(id).ok_or_else(|| {
+                WorldCheckpointError::Contract {
+                    path: "host.agents.runtime".to_owned(),
+                    detail: "restored agent has no runtime".to_owned(),
+                }
+            })?;
+            runtime.indicator = saved.indicator;
+            runtime.selection = saved.selection;
+            runtime.combat = saved.combat;
+            runtime.mutation_log.clone_from(&saved.mutation_log);
+        }
+        world.replay_tick = continuity.replay_tick;
+        (
+            world.replay_interactions_this_tick,
+            world.replay_interactions_dropped_total,
+            world.replay_interactions_observed_pending,
+            world.replay_interactions_persisted_pending,
+            world.replay_interactions_sampled_out_pending,
+            world.replay_interactions_truncated_pending,
+        ) = continuity.replay_interactions;
+        world.reported_lifecycle_records = continuity.reported_lifecycle_records;
+        (
+            world.last_births,
+            world.last_deaths,
+            world.last_spike_hits,
+            world.last_max_age,
+        ) = continuity.last_tick_counts;
+        (
+            world.carcass_health_distributed,
+            world.carcass_reproduction_bonus,
+        ) = continuity.carcass_totals;
+        (world.combat_spike_attempts, world.combat_spike_hits) = continuity.combat_counts;
+        world.sense_saturations_total = continuity.sense_saturations_total;
+        world.capture_budget = continuity.capture_budget;
+        world.probe_stats = continuity.probe_stats;
+        world.active_activation_probe = continuity.active_probe.map(|uid| (by_uid[&uid], uid));
+        world.last_captured_probe_agents = continuity
+            .captured_probe_agents
+            .iter()
+            .map(|uid| by_uid[uid])
+            .collect();
+        world.last_probed_agent_death = continuity.last_probed_agent_death;
+        world.visual_events.clone_from(&continuity.visual_events);
+        (
+            world.visual_dropped_events_this_tick,
+            world.visual_dropped_events_total,
+        ) = continuity.visual_dropped_events;
+        world.resource_ledger.enabled = continuity.resource_ledger_enabled;
+        world.resource_ledger.report = continuity.resource_report.clone();
+        world.realized_hearing_capture_enabled = continuity.realized_hearing_capture_enabled;
+        world.latest_realized_hearing_observations.clone_from(&continuity.realized_hearing);
+        world.communication_emitted_history =
+            continuity.communication_emitted.iter().copied().collect();
+        world.communication_realized_history =
+            continuity.communication_realized.iter().copied().collect();
+        world
+            .latest_communication_mi_report
+            .clone_from(&continuity.communication_report);
+        world.last_tick_emitted_sound = continuity.last_tick_emitted_sound;
+        world.communication_scramble_stream = continuity
+            .communication_rng
+            .as_ref()
+            .map(crate::SmallRngStream::from_state)
+            .transpose()
+            .map_err(|error| WorldCheckpointError::Contract {
+                path: "host.communication_rng".to_owned(),
+                detail: error.to_string(),
+            })?;
+        world.archive = continuity.archive.clone();
+        if let Some(archive) = &mut world.archive {
+            archive.logged_eligibility_warning = continuity.archive_logged_eligibility_warning;
+        }
+        world.agent_stats = continuity.agent_stats.iter().cloned().collect();
+        world.archive_evaluations = continuity.archive_evaluations;
+        world.novelty_state = continuity.novelty_state.clone();
+        world.consecutive_zero_novelty_samples = continuity.consecutive_zero_novelty_samples;
+        // The raw recording configuration is part of the full host companion. A caller-bound
+        // continuation will own the next batch; the science-only discard marker is inapplicable.
+        world.persistence_discarded_records_at = None;
+        Ok(world)
+    }
+
     /// Capture a strict V1 checkpoint at a quiescent, persistence-disabled science boundary.
     ///
     /// Bound legacy runners are rejected because they have no versioned genome/evaluator-state
@@ -974,6 +1670,18 @@ impl WorldState {
     pub fn restore_checkpoint_v1(
         checkpoint: &WorldCheckpointV1,
         brain_registry: BrainRegistry,
+    ) -> Result<Self, WorldCheckpointError> {
+        Self::restore_checkpoint_parts(checkpoint, brain_registry, None)
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "checkpoint restore reconstructs the same f32 grid geometry as WorldState::build"
+    )]
+    fn restore_checkpoint_parts(
+        checkpoint: &WorldCheckpointV1,
+        brain_registry: BrainRegistry,
+        host_continuity: Option<&WorldHostCheckpointV1>,
     ) -> Result<Self, WorldCheckpointError> {
         checkpoint.validate_contract()?;
         let state = &checkpoint.state;
@@ -1118,6 +1826,14 @@ impl WorldState {
         restored.persistence_boundary = PersistenceBoundaryStatus::Open {
             tick: restored.tick,
         };
+
+        if let Some(continuity) = host_continuity {
+            // Applied maps can carry explicit fertility and temperature fields. Retain their
+            // actual derived profiles before the unchanged full science-digest comparison.
+            restored.food_profiles.clone_from(&continuity.food_profiles);
+            restored.cadence = continuity.cadence.clone();
+            restored.temperature = continuity.temperature.clone();
+        }
 
         let actual_digest = restored.world_digest_v1()?;
         if actual_digest != state.source_digest {
@@ -2706,6 +3422,214 @@ mod tests {
         let mut registry = BrainRegistry::new();
         assert_eq!(register_checkpoint_family(&mut registry), 0);
         registry
+    }
+
+    fn assert_host_auxiliary_state_equal(original: &WorldState, restored: &WorldState) {
+        assert_eq!(restored.archive, original.archive);
+        assert_eq!(restored.novelty_state, original.novelty_state);
+        assert_eq!(restored.agent_stats, original.agent_stats);
+        assert_eq!(
+            restored.communication_emitted_history,
+            original.communication_emitted_history
+        );
+        assert_eq!(
+            restored.communication_realized_history,
+            original.communication_realized_history
+        );
+        assert_eq!(
+            restored
+                .communication_scramble_stream
+                .as_ref()
+                .map(crate::SmallRngStream::state),
+            original
+                .communication_scramble_stream
+                .as_ref()
+                .map(crate::SmallRngStream::state)
+        );
+        assert_eq!(restored.resource_ledger.report, original.resource_ledger.report);
+        assert_eq!(restored.applied_interventions, original.applied_interventions);
+        assert_eq!(restored.next_intervention_seq, original.next_intervention_seq);
+    }
+
+    #[test]
+    fn host_companion_preserves_nonempty_executable_brains_audit_rng_and_next_stage_digests() {
+        let (mut original, key) = world_with_checkpoint_family();
+        let mut config = original.config.clone();
+        config.persistence_interval = 1;
+        config.history_capacity = 16;
+        config.narrative_interval = 1;
+        config.narrative_capacity = 8;
+        config.reproduction_energy_threshold = f32::MAX;
+        config.archive_enabled = true;
+        config.archive_interval = 1;
+        config.archive_min_lifetime_ticks = 1;
+        config.selection_mode = crate::EvolutionSelectionMode::Novelty;
+        config.communication_mi_interval = 1;
+        config.communication_mi_window = 4;
+        config.communication_scramble = true;
+        config.communication_scramble_seed = Some(0xc011_7105);
+        original
+            .apply_config_update(config)
+            .expect("actual configured auxiliary science consumers");
+        let width = original.terrain.width();
+        let height = original.terrain.height();
+        let field_cells = original.terrain.tiles().len();
+        let artifact = crate::MapArtifact::new(
+            original.terrain.clone(),
+            Some(crate::ScalarField::new(width, height, vec![0.25; field_cells]).unwrap()),
+            Some(crate::ScalarField::new(width, height, vec![0.9; field_cells]).unwrap()),
+            None,
+            None,
+            MapArtifactMetadata {
+                generator: MapGeneratorKind::RuleBased,
+                tileset_id: "host-continuation-temperature".to_owned(),
+                tileset_hash: 1,
+                seed: original.config.resolved_rng_seed(),
+                width,
+                height,
+                attempt_count: 1,
+                succeeded_on: 1,
+                generated_at_epoch_ms: 0,
+            },
+        )
+        .expect("actual map with explicit scalar fields");
+        original
+            .apply_map_artifact(&artifact)
+            .expect("production map installation");
+        original.set_resource_ledger_enabled(true);
+        for _ in 0..2 {
+            let agent = original
+                .try_spawn_agent(AgentData::default())
+                .expect("actual protocol founder");
+            assert!(
+                original
+                    .bind_agent_brain(agent, key)
+                    .expect("executable family binding")
+            );
+        }
+        original
+            .enqueue_intervention(crate::Intervention::Drought {
+                region: crate::Region::All,
+                ticks: 1,
+                growth_scale: 0.5,
+            })
+            .expect("actual intervention application and expiry history");
+        let mut source_session = original
+            .bind_persistence(Box::new(crate::NullPersistence))
+            .expect("actual production null sink binding");
+        source_session
+            .step(&mut original)
+            .expect("first acknowledged nonempty step");
+        assert_eq!(
+            original
+                .applied_interventions()
+                .iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            ["drought", "expiry:drought"]
+        );
+        let mut next_config = original.config.clone();
+        next_config.food_max = 0.73;
+        original
+            .apply_config_update(next_config)
+            .expect("actual config mutation and audit");
+        for at in 1..=2 {
+            let science = original
+                .capture_checkpoint_quiescent()
+                .expect("actual settled science boundary");
+            let companion = original
+                .capture_host_continuity_v1(&science)
+                .expect("actual full companion");
+            let encoded =
+                serde_json::to_vec(&companion).expect("data-only host companion encoding");
+            let decoded: WorldHostCheckpointV1 =
+                serde_json::from_slice(&encoded).expect("owned history decoding");
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+            assert!(matches!(
+                WorldState::restore_host_checkpoint_v1(&science, &decoded, BrainRegistry::new()),
+                Err(WorldCheckpointError::RegistryMismatch { .. })
+            ));
+            let mut restored = WorldState::restore_host_checkpoint_v1(
+                &science,
+                &decoded,
+                prepared_checkpoint_registry(),
+            )
+            .expect("trusted executable registry reconstruction");
+            assert_eq!(restored.tick(), Tick(at));
+            assert_eq!(restored.agents().len(), 2);
+            assert_eq!(restored.config_revision(), original.config_revision());
+            assert_eq!(restored.config_audit(), original.config_audit());
+            assert!(original.temperature.is_some());
+            assert_eq!(restored.temperature, original.temperature);
+            assert!(
+                original
+                    .archive
+                    .as_ref()
+                    .is_some_and(|archive| !archive.cells.is_empty())
+            );
+            assert!(original.novelty_state.is_some());
+            assert_eq!(original.agent_stats.len(), 2);
+            assert_eq!(
+                original.communication_emitted_history.len(),
+                usize::try_from(at).unwrap()
+            );
+            assert_eq!(original.resource_ledger.report.completed_ticks, at);
+            assert_host_auxiliary_state_equal(&original, &restored);
+            assert_protocol_state_equal(&original, &restored);
+            let mut restored_session = restored
+                .bind_persistence(Box::new(crate::NullPersistence))
+                .expect("fresh exact world/sink pair");
+            restored_session
+                .restore_admission_cursor(&restored, source_session.last_admitted_tick())
+                .expect("captured acknowledged admission cursor");
+            let mut perturbed = WorldState::restore_host_checkpoint_v1(
+                &science,
+                &decoded,
+                prepared_checkpoint_registry(),
+            )
+            .expect("separate actual negative world");
+            let negative_agent = perturbed
+                .agents()
+                .iter_handles()
+                .next()
+                .expect("nonempty negative");
+            perturbed
+                .try_update_agent_runtime(negative_agent, |runtime| runtime.energy += 0.125)
+                .expect("deterministic valid state perturbation");
+            let mut negative_session = perturbed
+                .bind_persistence(Box::new(crate::NullPersistence))
+                .unwrap();
+            negative_session
+                .restore_admission_cursor(&perturbed, source_session.last_admitted_tick())
+                .unwrap();
+            let mut left_trace = crate::WorldStepTracer::default();
+            let mut right_trace = crate::WorldStepTracer::default();
+            let mut negative_trace = crate::WorldStepTracer::default();
+            source_session
+                .step_traced(&mut original, &mut left_trace)
+                .expect("next source production stages");
+            restored_session
+                .step_traced(&mut restored, &mut right_trace)
+                .expect("next restored production stages");
+            negative_session
+                .step_traced(&mut perturbed, &mut negative_trace)
+                .expect("actual negative production stages");
+            let left = left_trace.latest().expect("actual source stage trace");
+            let right = right_trace.latest().expect("actual continuation stage trace");
+            assert_eq!(
+                left.first_divergence(right).expect("valid stage trace pair"),
+                None
+            );
+            assert_eq!(
+                original.world_digest_v1().unwrap(),
+                restored.world_digest_v1().unwrap()
+            );
+            assert_host_auxiliary_state_equal(&original, &restored);
+            assert_eq!(
+                left.first_divergence(negative_trace.latest().unwrap()).unwrap(),
+                Some(crate::WorldStepTracePoint::Sense)
+            );
+        }
     }
 
     fn encode_unvalidated_state(state: &WorldCheckpointStateV1) -> Vec<u8> {

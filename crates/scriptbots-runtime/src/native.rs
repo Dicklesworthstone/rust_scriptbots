@@ -2139,6 +2139,7 @@ mod tests {
             scientific_event_capacity: 64,
             genesis_origin_capacity: 16_384,
             volatile_event_history_capacity: 512,
+            trace_history_capacity: 0,
             capture_agent_visuals: false,
         }
     }

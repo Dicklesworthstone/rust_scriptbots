@@ -23,7 +23,7 @@ use scriptbots_runtime::channel::{
 use scriptbots_runtime::{
     ApplicationState, CommandEnvelope, CommandId, FixedDeadlineHost, HostCommand, HostCore,
     HostCoreOptions, HostFault, HostPort, HostSessionId, JournalPort, JournalState,
-    ManualHostDriver, ManualInstant, ScheduledConfigPatch, ShutdownCommitRequirement,
+    HostCheckpointV1, ManualHostDriver, ManualInstant, ScheduledConfigPatch, ShutdownCommitRequirement,
 };
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::{Builder, JoinHandle};
@@ -46,6 +46,11 @@ pub struct HostBootstrap {
 pub struct HostThread {
     port: ChannelHostPort,
     handle: JoinHandle<Result<HostThreadReceipt>>,
+}
+
+enum HostStart {
+    Fresh { options: HostCoreOptions, bootstrap: HostBootstrap },
+    Continued { checkpoint: Box<HostCheckpointV1>, ticks: u64 },
 }
 
 /// Owner observations when the drive loop exits; a fault does not prove finalization.
@@ -112,6 +117,32 @@ impl HostThread {
         channel_options: ChannelHostOptions,
         bootstrap: HostBootstrap,
     ) -> Result<Self> {
+        Self::spawn_owned(session_id, world, persistence, journal, channel_options,
+            HostStart::Fresh { options: core_options, bootstrap })
+    }
+
+    /// Rebuild the artifact's owner on its own thread using an already validated
+    /// continued journal and a freshly bound persistence sink. No session is allocated.
+    pub fn spawn_from_checkpoint(
+        checkpoint: HostCheckpointV1,
+        world: WorldState,
+        persistence: PersistenceAdmissionSession,
+        journal: Box<dyn JournalPort + Send>,
+        channel_options: ChannelHostOptions,
+        ticks: u64,
+    ) -> Result<Self> {
+        Self::spawn_owned(checkpoint.session_id(), world, persistence, journal, channel_options,
+            HostStart::Continued { checkpoint: Box::new(checkpoint), ticks })
+    }
+
+    fn spawn_owned(
+        session_id: HostSessionId,
+        world: WorldState,
+        persistence: PersistenceAdmissionSession,
+        journal: Box<dyn JournalPort + Send>,
+        channel_options: ChannelHostOptions,
+        start: HostStart,
+    ) -> Result<Self> {
         // Rendezvous of exactly one message. The port cannot exist until the
         // host does, and the host cannot exist off this thread, so the caller
         // has to wait for the thread to hand it back. Sending the RESULT rather
@@ -126,9 +157,8 @@ impl HostThread {
                     world,
                     persistence,
                     journal,
-                    core_options,
                     channel_options,
-                    bootstrap,
+                    start,
                     &ready_tx,
                 )
             })
@@ -163,30 +193,37 @@ impl HostThread {
         world: WorldState,
         persistence: PersistenceAdmissionSession,
         journal: Box<dyn JournalPort + Send>,
-        core_options: HostCoreOptions,
         channel_options: ChannelHostOptions,
-        bootstrap: HostBootstrap,
+        start: HostStart,
         ready_tx: &SyncSender<Result<ChannelHostPort, String>>,
     ) -> Result<HostThreadReceipt> {
         let build = (|| -> Result<(ChannelHostDriver, ChannelHostPort)> {
             let requirement = journal.shutdown_commit_requirement();
-            let mut core = HostCore::with_journal_and_persistence(
-                session_id,
-                world,
-                core_options,
-                journal,
-                persistence,
-            )
-            .context("HostCore construction failed")?;
-            core.install_schedule(bootstrap.schedule, crate::resolve_scheduled_config_patch)
-                .context("invalid owner scenario schedule")?;
-            let completed =
-                drive_bootstrap(&mut core, bootstrap.ticks, requirement).and_then(|()| {
-                    match bootstrap.on_completed {
-                        Some(observe) => core.with_world(observe),
-                        None => Ok(()),
-                    }
-                });
+            let (mut core, ticks, observe) = match start {
+                HostStart::Fresh { options, bootstrap } => {
+                    let mut core = HostCore::with_journal_and_persistence(
+                        session_id, world, options, journal, persistence,
+                    ).context("HostCore construction failed")?;
+                    core.install_schedule(bootstrap.schedule, crate::resolve_scheduled_config_patch)
+                        .context("invalid owner scenario schedule")?;
+                    (core, bootstrap.ticks, bootstrap.on_completed)
+                }
+                HostStart::Continued { checkpoint, ticks } => {
+                    let resolver = checkpoint.has_schedule().then_some(
+                        crate::resolve_scheduled_config_patch as scriptbots_runtime::PreparedConfigPatchResolver,
+                    );
+                    let core = HostCore::restore_host_checkpoint_v1(
+                        &checkpoint, world, persistence, journal, resolver, ManualInstant::from_nanos(0),
+                    ).context("HostCore checkpoint continuation refused")?;
+                    (core, ticks, None)
+                }
+            };
+            let completed = drive_bootstrap(&mut core, ticks, requirement).and_then(|()| {
+                match observe {
+                    Some(observe) => core.with_world(observe),
+                    None => Ok(()),
+                }
+            });
             if let Err(error) = completed {
                 // Preserve the original failure; ordered shutdown attempts to retain the
                 // completed persistence tail before the storage controller closes.
@@ -331,7 +368,10 @@ fn drive_bootstrap(
     requirement: ShutdownCommitRequirement,
 ) -> Result<()> {
     let mut port = core.local_port();
-    for sequence in 1..=ticks {
+    for step in 1..=ticks {
+        let before_tick = core.world().tick().0;
+        let sequence = before_tick.checked_add(1)
+            .context("owner bootstrap or continuation tick sequence overflowed")?;
         let envelope = CommandEnvelope::new(
             CommandId::from_client_sequence(u64::MAX - 1, sequence),
             HostCommand::Step,
@@ -390,6 +430,11 @@ fn drive_bootstrap(
             if matches!(status.application(), ApplicationState::Applied(_))
                 && journal_committed(status.journal(), requirement)
             {
+                if core.world().tick().0 != sequence {
+                    return Err(anyhow!(
+                        "owner Step {step} at source tick {before_tick} did not advance exactly one tick; command identity {sequence} may already belong to earlier work"
+                    ));
+                }
                 tracing::debug!(sequence, tick = core.latest_snapshot().world.tick,
                     journal = ?status.journal(), "Owner bootstrap Step applied and journal committed");
                 break;

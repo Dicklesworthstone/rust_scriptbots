@@ -298,9 +298,20 @@ were recovered by safe fast-forward, and isolated source/evidence copies remain 
     recent-work audit is DRIFTING: freeze further launcher/profile/gate variants and
     focus the next capability block on persistence reliability and production resume.
   - [ ] Resolve the DSR dependency-link compatibility blocker with its original cache protections.
-    The installed DSR explicitly refuses symlinks; Cargo recreates a tracked contained
-    README link at immutable Proptest revision `3dca1987`. No dependency pin, source or
-    DSR gate was changed. The existing build-farm acceptance task owns this limitation.
+    [Currently In Progress — LilacElm; private enabler for owned terminal/browser acceptance].
+    R55 at clean `c37ea6eb` passes all fourteen inner terminal gates and 559 tests, then
+    unchanged installed DSR refuses Cargo's tracked contained Proptest README link.
+    A private six-file guard/test candidate `c10a3232` is pinned to the worker's exact
+    installed `bf0543ec` baseline; the earlier shared-base draft is preserved rather than
+    importing twelve unrelated release files. R60's actual authentic Proptest comparison
+    observes baseline refusal/7 versus candidate inventory/verify acceptance/0. One of
+    71 candidate cache tests times out on corrupt-object framing, so this candidate does
+    not qualify. A separately isolated, independently reviewed operand-order repair
+    rejects an already-observed hash mismatch before waiting for the next separator;
+    its native validation is pending. Original test deadlines, strict guards and dependency
+    pins remain. Both original unfiltered suites, warning ShellCheck/syntax, raw skips,
+    seed/tool/fixture custody and actual outer collection are required. No shared/installed
+    DSR change or full build-farm closure is claimed; `bd-vlp7` remains a blocker.
   - [x] `bd-build-farm-reliability-lb19.4` [Completed — cache selection only]: bind a profile's
     declared seed cache in the launcher and reject invalid roots before build work.
     Two persistent retries refused the ambient k9 link before compilation because
@@ -376,11 +387,18 @@ reality-check report. Preparation and a compiling adapter do not close the produ
 configuration patches at owner tick boundaries, including bootstrap, with separate
 owner-action journal evidence and truthful frontend reporting.]
 
-[Currently In Progress — `bd-2z0.5.13`, TurquoiseLake, 2026-09-11: production checkpoint
+[Currently In Progress — `bd-2z0.5.13`, LilacElm, 2026-10-10: production checkpoint
 continuation. First correct the emitted/persisted guarantee, then capture a quiescent live
 persistence boundary with host journal, command and schedule state; restore that exact session
 and start replay at its saved tick. Preserve corruption/first-divergence controls and tick-zero
-replay. Core persistence-disabled checkpoints alone do not complete this task.]
+replay. Core persistence-disabled checkpoints alone do not complete this task. Existing
+owner-side source work now extends the capture/restore envelope while the independent
+private DSR validation finishes. Runtime/core edits and storage/CLI integration remain
+one acceptance cohort; no library-only subset closes the original task. The current source
+now includes worker-derived storage cuts, exact same-session journal recovery, deliberate
+owner handoff/join, bounded CLI continuation, and chronological stage-trace comparison.
+Nonempty real-owner/file-worker/subprocess positive and negative tests are being completed;
+all new continuation source remains natively unqualified and the public guarantee stays false.]
 
 [Currently In Progress — `bd-g6wf`, LilacElm, 2026-10-10: execute the existing ignored
 control-plane latency acceptance through a clean, source-pinned native DSR profile after the

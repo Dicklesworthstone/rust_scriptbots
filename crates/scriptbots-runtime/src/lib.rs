@@ -91,7 +91,10 @@ pub use archipelago::{
     MAX_ISLANDS, MigrationBarrierReport, StepTopology, Topology,
 };
 pub use host_core::{
-    HostCore, HostCoreBuildError, HostCoreOptions, LocalHostPort, MigrationArrival, VolatileJournal,
+    HOST_CHECKPOINT_V1_CODEC, HOST_CHECKPOINT_V1_CODEC_VERSION, HOST_CHECKPOINT_V1_SCHEMA,
+    HostCheckpointBusy, HostCheckpointError, HostCheckpointV1, HostCore, HostCoreBuildError,
+    HostCoreOptions, HostJournalCutV1, LocalHostPort, MAX_HOST_CHECKPOINT_BYTES, MigrationArrival,
+    PreparedConfigPatchResolver, VolatileJournal,
 };
 pub use native::{FixedDeadlineHost, NativeDriveReceipt, NativeDriveTrigger, NativeScheduleError};
 
@@ -644,16 +647,10 @@ pub struct RenderSnapshot {
     /// every tick: interventions are rare events, so this is a pointer clone on
     /// almost every publication, exactly like `config_audit`.
     ///
-    /// SERIALIZED BUT NOT DESERIALIZED, and that asymmetry is forced rather than
-    /// chosen: `AppliedInterventionRecord::kind` is a `&'static str` from a fixed
-    /// label set, so the record cannot be deserialized into any lifetime shorter
-    /// than `'static` and deriving it here would require `'de: 'static` on the
-    /// whole snapshot. A decoded snapshot therefore reports an EMPTY ring rather
-    /// than the sender's — stated here because silently defaulting is exactly the
-    /// kind of gap that reads as "no interventions happened". Nothing decodes
-    /// `RenderSnapshot` today; if something ever needs to, this field has to
-    /// carry an owned label first.
-    #[serde(serialize_with = "serde_arc::serialize", skip_deserializing)]
+    /// Host continuation retains this actual observer output. The record decoder reads an
+    /// owned label and admits only the production label set; it never leaks arbitrary strings
+    /// to manufacture a static lifetime or silently replaces the retained ring with emptiness.
+    #[serde(with = "serde_arc")]
     pub applied_interventions: Arc<Vec<AppliedInterventionRecord>>,
     /// Bounded narrative ring from this completed world boundary.
     #[serde(with = "serde_arc")]
@@ -3424,6 +3421,16 @@ pub trait CommandAuthorityReader: Send + Sync {
 /// not wait for database I/O, worker progress, or durability. A rejected batch
 /// remains owned by the caller through the original [`Arc<JournalBatch>`].
 pub trait JournalPort {
+    /// Actual adapter-observed continued-session prefix, if this adapter was opened for restore.
+    ///
+    /// Fresh adapters return `None`. A continuation adapter must return this only after checking
+    /// its real session, contiguous journal/event prefixes, commitment threshold, and absence of
+    /// completed shutdown or an advanced tail. The runtime compares this data with the exact
+    /// captured owner cut; this method itself performs no I/O or caller assertion of durability.
+    fn continuation_cut(&self) -> Option<HostJournalCutV1> {
+        None
+    }
+
     /// Try to transfer responsibility for one exact immutable batch.
     fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission;
 
@@ -4224,6 +4231,88 @@ struct EventHotView {
     entries: VecDeque<JournaledScientificEvent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventHubCheckpointV1 {
+    next_sequence: EventSequence,
+    published_total: u64,
+    entries: Vec<JournaledScientificEvent>,
+    genesis: GenesisOrigins,
+}
+
+impl EventHubCheckpointV1 {
+    fn validate(
+        &self,
+        cut: HostJournalCutV1,
+        tick: Tick,
+        capacity: usize,
+        genesis_capacity: usize,
+    ) -> Result<(), HostAccessError> {
+        if self.next_sequence.get().checked_sub(1) != Some(cut.last_scientific_event_sequence)
+            || self.published_total != cut.last_scientific_event_sequence
+            || self.entries.len() > capacity
+        {
+            return Err(protocol_violation("event checkpoint counter or capacity mismatch"));
+        }
+        let mut previous = None;
+        for entry in &self.entries {
+            let event = entry.event.as_ref();
+            let qualifies = match cut.commitment_requirement {
+                ShutdownCommitRequirement::CommittedVolatile => matches!(
+                    entry.commitment,
+                    EventCommitment::CommittedVolatile | EventCommitment::Durable
+                ),
+                ShutdownCommitRequirement::Durable => entry.commitment == EventCommitment::Durable,
+            };
+            if !qualifies
+                || event.session_id != cut.session_id
+                || event.batch_id.session_id() != cut.session_id
+                || event.batch_id.sequence() == 0
+                || event.batch_id.sequence() > cut.last_journal_sequence
+                || event.sequence.get() == 0
+                || event.sequence.get() > cut.last_scientific_event_sequence
+                || event.tick > tick
+                || !scientific_boundary_matches_event(event)
+                || previous.is_some_and(|(sequence, batch): (u64, u64)| {
+                    sequence.checked_add(1) != Some(event.sequence.get())
+                        || batch >= event.batch_id.sequence()
+                })
+            {
+                return Err(protocol_violation(
+                    "event checkpoint contains an unsettled or incoherent record",
+                ));
+            }
+            previous = Some((event.sequence.get(), event.batch_id.sequence()));
+        }
+        if self
+            .entries
+            .last()
+            .map_or(cut.last_scientific_event_sequence != 0, |entry| {
+                entry.event.sequence.get() != cut.last_scientific_event_sequence
+            })
+        {
+            return Err(protocol_violation("event checkpoint lost its retained tip"));
+        }
+        match &self.genesis {
+            GenesisOrigins::Open { origins } | GenesisOrigins::Sealed { origins } => {
+                let mut uids = std::collections::HashSet::new();
+                if origins.len() > genesis_capacity
+                    || origins.iter().any(|origin| {
+                        origin.tick != Tick::zero() || !uids.insert(origin.agent_uid)
+                    })
+                    || (matches!(self.genesis, GenesisOrigins::Open { .. }) && tick != Tick::zero())
+                {
+                    return Err(protocol_violation(
+                        "event checkpoint genesis prefix is invalid",
+                    ));
+                }
+            }
+            GenesisOrigins::Unavailable { .. } => {}
+        }
+        Ok(())
+    }
+}
+
 impl From<&EventHubState> for EventHotView {
     fn from(state: &EventHubState) -> Self {
         Self {
@@ -4248,16 +4337,18 @@ pub struct EventHub {
 }
 
 /// Actual tick-zero arrival records retained separately from completed scientific ticks.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GenesisOrigins {
     /// The owner can still append real arrivals before its first step.
     Open {
         /// Immutable canonical origin prefix, in insertion order.
+        #[serde(with = "serde_arc")]
         origins: Arc<Vec<BirthRecord>>,
     },
     /// The exact origin prefix captured before the first successful step.
     Sealed {
         /// Immutable canonical origins, independent of persistence cadence.
+        #[serde(with = "serde_arc")]
         origins: Arc<Vec<BirthRecord>>,
     },
     /// Complete initial ancestry cannot be established from retained canonical records.
@@ -4268,7 +4359,7 @@ pub enum GenesisOrigins {
 }
 
 /// Why the detached genesis observer cannot establish a complete origin prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GenesisUnavailableReason {
     /// No owner observation has been supplied to this hub.
     NotObserved,
@@ -4304,6 +4395,39 @@ impl fmt::Debug for EventHub {
 }
 
 impl EventHub {
+    fn capture_checkpoint(&self) -> Result<EventHubCheckpointV1, HostAccessError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| protocol_violation("scientific event checkpoint lock poisoned"))?;
+        if state.reserved_front.is_some() {
+            return Err(protocol_violation("scientific event publication is reserved"));
+        }
+        let checkpoint = EventHubCheckpointV1 {
+            next_sequence: state.next_sequence,
+            published_total: state.published_total,
+            entries: state.entries.iter().cloned().collect(),
+            genesis: self.genesis.load_full().as_ref().clone(),
+        };
+        Ok(checkpoint)
+    }
+
+    fn restore_checkpoint(&self, checkpoint: &EventHubCheckpointV1) -> Result<(), HostAccessError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| protocol_violation("scientific event checkpoint lock poisoned"))?;
+        if !state.entries.is_empty() || state.published_total != 0 {
+            return Err(protocol_violation("event restore requires a fresh hub"));
+        }
+        state.next_sequence = checkpoint.next_sequence;
+        state.published_total = checkpoint.published_total;
+        state.entries = checkpoint.entries.iter().cloned().collect();
+        self.hot.store(Arc::new(EventHotView::from(&*state)));
+        self.genesis.store(Arc::new(checkpoint.genesis.clone()));
+        Ok(())
+    }
+
     /// Construct one bounded scientific-event hub.
     ///
     /// # Errors

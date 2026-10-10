@@ -5,7 +5,7 @@
 //! replay/digest behavior with zero mocks: baseline verification must succeed and a
 //! perturbed candidate must report its first divergence.
 
-use scriptbots_storage::{Connection, RowExt, StorageReader};
+use scriptbots_storage::{Connection, OpenFlags, PersistedCheckpointRecord, RowExt, StorageReader};
 use std::{
     env,
     ffi::OsString,
@@ -17,6 +17,390 @@ use tempfile::tempdir;
 
 const SEED: u64 = 42;
 const BOOTSTRAP_TICKS: u64 = 24;
+
+const HOST_CONTINUATION_TICKS: u64 = 18;
+const HOST_HANDOFF_TICK: u64 = 7;
+const HOST_MINIMUM_POPULATION: usize = 20;
+
+/// Keep the subprocess streams beside the closed databases, including failed invocations.
+/// The connectivity DSR lane places TMPDIR beneath its retained external proof directory.
+fn retained_host_output(directory: &Path, name: &str, command: &mut Command) -> Output {
+    let stdout_path = directory.join(format!("{name}.stdout"));
+    let stderr_path = directory.join(format!("{name}.stderr"));
+    let stdout = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&stdout_path)
+        .expect("create unique retained stdout");
+    let stderr = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&stderr_path)
+        .expect("create unique retained stderr");
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    command.current_dir(directory).stdout(stdout).stderr(stderr);
+    let status = command.status().expect("run actual host checkpoint CLI");
+    fs::write(
+        directory.join(format!("{name}.process.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "executable": command.get_program().to_string_lossy(),
+            "arguments": arguments,
+            "exit_code": status.code(),
+            "success": status.success(),
+        }))
+        .expect("encode observed process disposition"),
+    )
+    .expect("retain process disposition");
+    Output {
+        status,
+        stdout: fs::read(stdout_path).expect("read actual retained stdout"),
+        stderr: fs::read(stderr_path).expect("read actual retained stderr"),
+    }
+}
+
+fn produce_host_handoff(
+    directory: &Path,
+    name: &str,
+    database: &Path,
+    ticks: u64,
+    checkpoint_id: &str,
+    food_growth_rate: &str,
+) -> Output {
+    let mut command = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    command
+        .env("SCRIPTBOTS_STORAGE_PATH", database)
+        .args(["--storage", "file", "--threads", "1", "--brain", "mlp"])
+        .arg("--bootstrap-ticks")
+        .arg(ticks.to_string())
+        .arg("--checkpoint-handoff")
+        .arg(checkpoint_id)
+        .arg("--set")
+        .arg(format!("rng_seed={SEED}"))
+        .args([
+            "--set",
+            "persistence_interval=1",
+            "--set",
+            "replay_event_tick_cap=65536",
+        ])
+        .arg("--set")
+        .arg(format!("population_minimum={HOST_MINIMUM_POPULATION}"))
+        .arg("--set")
+        .arg(format!("food_growth_rate={food_growth_rate}"));
+    retained_host_output(directory, name, &mut command)
+}
+
+fn continue_host_handoff(
+    directory: &Path,
+    name: &str,
+    database: &Path,
+    checkpoint_id: &str,
+    ticks: u64,
+) -> Output {
+    let mut command = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    command
+        .env_remove("SCRIPTBOTS_MODE")
+        .arg("--continue-host-db")
+        .arg(database)
+        .arg("--host-checkpoint-id")
+        .arg(checkpoint_id)
+        .arg("--continue-ticks")
+        .arg(ticks.to_string())
+        .args(["--brain", "mlp"]);
+    retained_host_output(directory, name, &mut command)
+}
+
+fn compare_host_handoffs(
+    directory: &Path,
+    name: &str,
+    expected_database: &Path,
+    expected_id: &str,
+    actual_database: &Path,
+    actual_id: &str,
+) -> Output {
+    let mut command = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
+    command
+        .env_remove("SCRIPTBOTS_MODE")
+        .arg("--compare-host-db")
+        .arg(expected_database)
+        .arg("--compare-host-checkpoint-id")
+        .arg(expected_id)
+        .arg("--host-candidate-db")
+        .arg(actual_database)
+        .arg("--host-candidate-checkpoint-id")
+        .arg(actual_id);
+    retained_host_output(directory, name, &mut command)
+}
+
+fn host_cli_report(output: &Output, schema: &str) -> serde_json::Value {
+    let reports = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter(|report| report["schema"].as_str() == Some(schema))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reports.len(),
+        1,
+        "expected one actual {schema} report; stdout={} stderr={}",
+        stdout_text(output),
+        stderr_text(output)
+    );
+    reports.into_iter().next().expect("single observed report")
+}
+
+fn assert_host_comparison_source(source: &serde_json::Value, handoff: &serde_json::Value) {
+    for field in [
+        "artifact_path",
+        "run_id",
+        "session_id",
+        "checkpoint_id",
+        "checkpoint_tick",
+        "payload_digest",
+        "source_commit",
+        "root_seed",
+        "brain_roster",
+        "watermarks",
+        "journal_cut",
+    ] {
+        assert_eq!(
+            source[field], handoff[field],
+            "production comparison must bind actual {field} provenance"
+        );
+    }
+}
+
+fn host_watermarks_json(
+    watermarks: scriptbots_storage::PersistenceWatermarks,
+) -> serde_json::Value {
+    serde_json::json!({
+        "admitted": watermarks.admitted.map(|id| id.get()),
+        "applied": watermarks.applied.map(|id| id.get()),
+        "durable": watermarks.durable.map(|id| id.get()),
+    })
+}
+
+fn copy_closed_host_database(source: &Path, destination: &Path) {
+    let reader = StorageReader::open_finished(source.to_str().expect("UTF-8 source database"))
+        .expect("hold the actual finished source lease");
+    let copied = reader
+        .materialize_finished_database(source, destination)
+        .expect("copy the closed image with its own destination lease");
+    copied.close().expect("close the leased destination reader");
+    reader.close().expect("close the leased source reader");
+}
+
+/// Observe science and journal prefixes independently of the CLI's presentation.
+fn host_database_prefix(database: &Path) -> serde_json::Value {
+    let reader = StorageReader::open(database.to_str().expect("UTF-8 host database"))
+        .expect("open actual host database");
+    let ticks = reader.summary_ticks().expect("read actual science ticks");
+    let watermarks = reader
+        .persistence_watermarks()
+        .expect("read actual three science watermarks");
+    let replay = reader.load_replay_events().expect("read actual replay rows");
+    reader.close().expect("close host science reader");
+    let connection = scriptbots_storage::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open read-only FrankenSQLite journal connection");
+    let prefixes = connection
+        .query(
+            "SELECT host_session_id, admitted_journal_prefix, applied_journal_prefix,
+                    committed_volatile_journal_prefix, durable_journal_prefix,
+                    admitted_event_prefix, applied_event_prefix,
+                    committed_volatile_event_prefix, durable_event_prefix, shutdown_sequence
+             FROM host_journal_progress ORDER BY host_session_id",
+        )
+        .expect("read actual host journal prefixes")
+        .iter()
+        .map(|row| {
+            let fields = (0..9)
+                .map(|index| row.get_typed::<String>(index).expect("journal prefix field"))
+                .collect::<Vec<_>>();
+            let shutdown: Option<String> = row.get_typed(9).expect("shutdown sequence field");
+            serde_json::json!({"prefixes": fields, "shutdown_sequence": shutdown})
+        })
+        .collect::<Vec<_>>();
+    let tables = [
+        "tick_summaries",
+        "agents",
+        "metrics",
+        "replay_events",
+        "host_journal_archive",
+        "host_journal_batch_ledger",
+        "host_command_records",
+        "checkpoints",
+    ];
+    let mut row_counts = serde_json::Map::new();
+    for table in tables {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"))
+            .expect("read actual retained row count")
+            .get_typed(0)
+            .expect("row count field");
+        row_counts.insert(table.to_owned(), count.into());
+    }
+    connection
+        .close_without_checkpoint()
+        .expect("close read-only journal connection");
+    serde_json::json!({
+        "ticks": ticks, "watermarks": host_watermarks_json(watermarks),
+        "replay": replay, "journal": prefixes, "row_counts": row_counts,
+    })
+}
+
+fn assert_host_handoff_readback(
+    database: &Path,
+    report: &serde_json::Value,
+    tick: u64,
+) -> PersistedCheckpointRecord {
+    assert_eq!(report["status"], "handed_off");
+    assert_eq!(report["checkpoint_tick"], tick);
+    assert_eq!(report["artifact_path"], database.to_str().expect("UTF-8 path"));
+    assert_eq!(report["root_seed"], SEED);
+    let reader = StorageReader::open(database.to_str().expect("UTF-8 path"))
+        .expect("open independent host artifact reader");
+    let record = reader
+        .load_checkpoints()
+        .expect("validate actual retained checkpoint rows")
+        .into_iter()
+        .find(|record| Some(record.checkpoint_id.as_str()) == report["checkpoint_id"].as_str())
+        .expect("reported full host artifact exists");
+    let checkpoint = record.host_checkpoint().expect("decode full host artifact");
+    assert_eq!(checkpoint.tick().0, tick);
+    assert_eq!(report["session_id"], checkpoint.session_id().get());
+    assert_eq!(
+        report["checkpoint_schema"],
+        scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
+    );
+    assert_eq!(report["checkpoint_format"], record.format);
+    assert_eq!(report["payload_digest"], record.payload_digest);
+    let encoded = checkpoint.encode().expect("encode validated retained host");
+    assert_eq!(
+        record.payload,
+        encoded
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    assert_eq!(
+        record.payload_digest,
+        format!("blake3:{}", blake3::hash(&encoded).to_hex())
+    );
+    let digest = checkpoint.world_checkpoint().source_digest();
+    digest
+        .validate_contract()
+        .expect("complete science digest contract");
+    assert!(digest.evaluator_state_covered && digest.factory_state_covered);
+    assert_eq!(
+        report["boundary_digest"],
+        serde_json::to_value(digest).expect("digest JSON")
+    );
+    assert_eq!(
+        report["config"],
+        serde_json::to_value(checkpoint.config()).expect("config JSON")
+    );
+    let traces = checkpoint.step_traces();
+    assert_eq!(
+        traces.iter().map(|trace| trace.tick.0).collect::<Vec<_>>(),
+        (1..=tick).collect::<Vec<_>>(),
+        "the actual owner must retain every measured transition"
+    );
+    for trace in traces {
+        trace
+            .validate_contract()
+            .expect("actual six-point trace contract");
+        for stage in &trace.stages {
+            stage
+                .capture
+                .as_ref()
+                .expect("actual complete stage observation");
+        }
+    }
+    assert_eq!(
+        report["step_traces"],
+        serde_json::to_value(traces).expect("trace JSON")
+    );
+    let requirements = checkpoint.world_checkpoint().required_brain_registry();
+    assert_eq!(requirements.entries.len(), 1, "one actual MLP family");
+    assert_eq!(
+        requirements.entries[0].kind,
+        scriptbots_brain::MlpBrain::KIND.as_str()
+    );
+    let manifest = reader.run_manifest().expect("actual stored provenance");
+    assert_eq!(report["run_id"], manifest.run_id.to_string());
+    assert_eq!(manifest.root_seed, SEED);
+    assert_eq!(report["brain_roster"], manifest.brain_roster_json);
+    assert_eq!(
+        report["source_commit"],
+        serde_json::json!(manifest.source_revision)
+    );
+    let ticks = reader.summary_ticks().expect("actual persisted tick rows");
+    assert_eq!(ticks, (1..=tick).collect::<Vec<_>>());
+    assert_eq!(report["persisted_summary_ticks"], serde_json::json!(ticks));
+    assert!(
+        reader.recent_ticks(1).expect("actual final population")[0].agent_count
+            >= HOST_MINIMUM_POPULATION,
+        "nonempty production MLP population must survive the tested boundary"
+    );
+    let watermarks = reader
+        .persistence_watermarks()
+        .expect("actual persistence prefixes");
+    assert!(watermarks.admitted.is_some());
+    assert_eq!(watermarks.admitted, watermarks.applied);
+    assert_eq!(watermarks.applied, watermarks.durable);
+    assert_eq!(report["watermarks"], host_watermarks_json(watermarks));
+    let metadata: serde_json::Value =
+        serde_json::from_str(&record.metadata_json).expect("actual artifact metadata");
+    for field in ["admitted", "applied", "durable"] {
+        assert_eq!(
+            metadata["host_storage_cut"][field],
+            report["watermarks"][field]
+        );
+    }
+    assert_eq!(metadata["host_storage_cut"]["last_admitted_tick"], tick);
+    assert_eq!(metadata["host_storage_cut"]["run_id"], report["run_id"]);
+    let final_batch = reader
+        .batch_status(watermarks.durable.expect("durable prefix"))
+        .expect("actual final batch")
+        .expect("durable ledger row exists");
+    assert_eq!(final_batch.tick, tick);
+    assert_eq!(
+        final_batch.state,
+        scriptbots_storage::BatchPersistenceState::Durable
+    );
+    assert_eq!(
+        checkpoint.persistence_last_admitted_tick(),
+        Some(scriptbots_core::Tick(tick))
+    );
+    assert_eq!(
+        reader.host_journal_sessions().expect("actual sessions"),
+        vec![checkpoint.session_id()]
+    );
+    reader.close().expect("close artifact reader");
+    let prefix = host_database_prefix(database);
+    assert!(!prefix["replay"].as_array().expect("replay array").is_empty());
+    let journal = &prefix["journal"].as_array().expect("journal array")[0];
+    assert!(
+        journal["shutdown_sequence"].is_null(),
+        "handoff must not fabricate shutdown"
+    );
+    let cut = checkpoint.journal_cut();
+    assert_eq!(
+        report["journal_cut"],
+        serde_json::to_value(cut).expect("actual cut JSON")
+    );
+    let fields = journal["prefixes"].as_array().expect("prefix fields");
+    assert_eq!(fields[0], format!("{:016x}", cut.session_id.get()));
+    for field in &fields[1..5] {
+        assert_eq!(*field, format!("{:016x}", cut.last_journal_sequence));
+    }
+    for field in &fields[5..9] {
+        assert_eq!(*field, format!("{:016x}", cut.last_scientific_event_sequence));
+    }
+    record
+}
 
 fn clear_scriptbots_environment(command: &mut Command, names: impl IntoIterator<Item = OsString>) {
     for name in names {
@@ -751,4 +1135,300 @@ fn mock_free_checkpoint_start_replay_e2e() {
             || corrupt_text.contains("error"),
         "expected corruption diagnostic, got: {corrupt_text}"
     );
+}
+
+/// Exercise the production full-host handoff and same-session continuation with real SQL.
+/// Every database and subprocess stream remains beneath the unique external proof directory.
+#[test]
+fn mock_free_full_host_checkpoint_continuation_e2e() {
+    let directory = tempfile::Builder::new()
+        .prefix("host-checkpoint-continuation-")
+        .tempdir()
+        .expect("unique external host continuation proof")
+        .keep();
+    eprintln!(
+        "host continuation evidence retained at {}",
+        directory.display()
+    );
+    let baseline_db = directory.join("uninterrupted.sqlite");
+    let split_db = directory.join("continued.sqlite");
+    let source_db = directory.join("closed-source-cut.sqlite");
+    let baseline_output = produce_host_handoff(
+        &directory,
+        "uninterrupted",
+        &baseline_db,
+        HOST_CONTINUATION_TICKS,
+        "uninterrupted-final",
+        "0.0005",
+    );
+    assert!(
+        baseline_output.status.success(),
+        "actual uninterrupted handoff failed: {}",
+        stderr_text(&baseline_output)
+    );
+    let baseline_report =
+        host_cli_report(&baseline_output, "scriptbots.host-checkpoint-handoff.v1");
+    let baseline_record =
+        assert_host_handoff_readback(&baseline_db, &baseline_report, HOST_CONTINUATION_TICKS);
+    let cut_output = produce_host_handoff(
+        &directory,
+        "initial-cut",
+        &split_db,
+        HOST_HANDOFF_TICK,
+        "first-cut",
+        "0.0005",
+    );
+    assert!(
+        cut_output.status.success(),
+        "actual initial handoff failed: {}",
+        stderr_text(&cut_output)
+    );
+    let cut_report = host_cli_report(&cut_output, "scriptbots.host-checkpoint-handoff.v1");
+    let cut_record = assert_host_handoff_readback(&split_db, &cut_report, HOST_HANDOFF_TICK);
+    copy_closed_host_database(&split_db, &source_db);
+    assert_eq!(
+        fs::read(&source_db).expect("closed source bytes"),
+        fs::read(&split_db).expect("initial database bytes")
+    );
+    let source_bytes = fs::read(&source_db).expect("retained source bytes");
+    let source_prefix = host_database_prefix(&source_db);
+    assert_eq!(source_prefix, host_database_prefix(&split_db));
+    let continued_output = continue_host_handoff(
+        &directory,
+        "continuation",
+        &split_db,
+        "first-cut",
+        HOST_CONTINUATION_TICKS - HOST_HANDOFF_TICK,
+    );
+    assert!(
+        continued_output.status.success(),
+        "actual same-session continuation failed: {}",
+        stderr_text(&continued_output)
+    );
+    let continued_report =
+        host_cli_report(&continued_output, "scriptbots.host-checkpoint-handoff.v1");
+    let continued_record =
+        assert_host_handoff_readback(&split_db, &continued_report, HOST_CONTINUATION_TICKS);
+    assert_eq!(continued_report["session_id"], cut_report["session_id"]);
+    assert_eq!(continued_report["run_id"], cut_report["run_id"]);
+    assert_ne!(continued_report["checkpoint_id"], cut_report["checkpoint_id"]);
+    assert_eq!(
+        continued_report["metadata"]["continued_from_checkpoint"],
+        "first-cut"
+    );
+    assert_eq!(continued_report["metadata"]["source_tick"], HOST_HANDOFF_TICK);
+    assert_eq!(
+        continued_report["metadata"]["requested_steps"],
+        HOST_CONTINUATION_TICKS - HOST_HANDOFF_TICK
+    );
+    let uninterrupted = baseline_record.host_checkpoint().expect("uninterrupted host");
+    let continued = continued_record.host_checkpoint().expect("continued host");
+    assert_eq!(
+        uninterrupted.world_checkpoint().source_digest(),
+        continued.world_checkpoint().source_digest(),
+        "every actual science digest lane must equal N versus K + (N-K)"
+    );
+    assert_eq!(uninterrupted.step_traces(), continued.step_traces());
+    assert_eq!(baseline_report["config"], continued_report["config"]);
+    assert_eq!(baseline_report["brain_roster"], continued_report["brain_roster"]);
+    assert_eq!(baseline_report["source_commit"], continued_report["source_commit"]);
+    let reader = StorageReader::open(split_db.to_str().expect("UTF-8 split database"))
+        .expect("read retained initial artifact after continuation");
+    let checkpoints = reader.load_checkpoints().expect("both actual host artifacts");
+    assert_eq!(checkpoints.len(), 2);
+    assert_eq!(
+        checkpoints[0], cut_record,
+        "continuation must preserve its source artifact"
+    );
+    assert_eq!(checkpoints[1], continued_record);
+    reader.close().expect("close continued artifact reader");
+
+    let matched_output = compare_host_handoffs(
+        &directory,
+        "matched-comparison",
+        &baseline_db,
+        "uninterrupted-final",
+        &split_db,
+        continued_record.checkpoint_id.as_str(),
+    );
+    assert!(
+        matched_output.status.success(),
+        "production comparison of actual continued traces failed: {}",
+        stderr_text(&matched_output)
+    );
+    let matched = host_cli_report(&matched_output, "scriptbots.host-checkpoint-comparison.v1");
+    assert_eq!(matched["status"], "match");
+    assert_eq!(
+        matched["basis"],
+        "complete_observed_step_trace_prefix_and_final_boundary"
+    );
+    assert_eq!(matched["compared_tick"], HOST_CONTINUATION_TICKS);
+    assert_eq!(
+        matched["compared_trace_ticks"],
+        serde_json::json!(uninterrupted.step_traces().len())
+    );
+    assert!(matched["first_observed_divergence"].is_null());
+    assert_eq!(
+        matched["expected_boundary_digest"],
+        serde_json::to_value(uninterrupted.world_checkpoint().source_digest())
+            .expect("actual uninterrupted boundary JSON")
+    );
+    assert_eq!(
+        matched["actual_boundary_digest"],
+        serde_json::to_value(continued.world_checkpoint().source_digest())
+            .expect("actual continued boundary JSON")
+    );
+    assert_host_comparison_source(&matched["expected"], &baseline_report);
+    assert_host_comparison_source(&matched["actual"], &continued_report);
+    assert!(matched["expected"]["continuation_source"].is_null());
+    assert_eq!(
+        matched["actual"]["continuation_source"],
+        serde_json::json!({
+            "checkpoint_id": cut_record.checkpoint_id, "checkpoint_tick": cut_record.tick,
+            "payload_digest": cut_record.payload_digest,
+        })
+    );
+
+    let perturbed_db = directory.join("perturbed.sqlite");
+    let perturbed_output = produce_host_handoff(
+        &directory,
+        "perturbed",
+        &perturbed_db,
+        HOST_CONTINUATION_TICKS,
+        "perturbed-final",
+        "0.4",
+    );
+    assert!(
+        perturbed_output.status.success(),
+        "actual perturbed MLP handoff failed: {}",
+        stderr_text(&perturbed_output)
+    );
+    let perturbed_report =
+        host_cli_report(&perturbed_output, "scriptbots.host-checkpoint-handoff.v1");
+    let perturbed_record =
+        assert_host_handoff_readback(&perturbed_db, &perturbed_report, HOST_CONTINUATION_TICKS);
+    let divergent_output = compare_host_handoffs(
+        &directory,
+        "divergent-comparison",
+        &baseline_db,
+        "uninterrupted-final",
+        &perturbed_db,
+        "perturbed-final",
+    );
+    assert!(
+        !divergent_output.status.success(),
+        "real altered configuration must diverge"
+    );
+    let divergent = host_cli_report(&divergent_output, "scriptbots.host-checkpoint-comparison.v1");
+    assert_eq!(divergent["status"], "diverged");
+    assert_eq!(divergent["compared_tick"], HOST_CONTINUATION_TICKS);
+    assert_eq!(
+        divergent["compared_trace_ticks"],
+        serde_json::json!(uninterrupted.step_traces().len())
+    );
+    assert_host_comparison_source(&divergent["expected"], &baseline_report);
+    assert_host_comparison_source(&divergent["actual"], &perturbed_report);
+    let perturbed = perturbed_record.host_checkpoint().expect("actual perturbed host");
+    // The altered configuration is present at the first Sense observation, before actuation.
+    let first = &divergent["first_observed_divergence"];
+    assert_eq!(first["tick"], 1);
+    assert_eq!(
+        first["stage"],
+        scriptbots_core::WorldStepTracePoint::Sense.as_str()
+    );
+    let expected_stage = uninterrupted.step_traces()[0].stages[0]
+        .capture
+        .as_ref()
+        .expect("actual first baseline Sense capture");
+    let actual_stage = perturbed.step_traces()[0].stages[0]
+        .capture
+        .as_ref()
+        .expect("actual first perturbed Sense capture");
+    assert_ne!(expected_stage.world.config, actual_stage.world.config);
+    assert_ne!(expected_stage.overall, actual_stage.overall);
+    assert_eq!(first["expected_digest"], expected_stage.overall);
+    assert_eq!(first["actual_digest"], actual_stage.overall);
+
+    // Distinct closed copies exercise the outer checksum guard and the inner codec guard.
+    // Recompute only the truncated copy's outer checksum so it reaches actual wire decoding.
+    for name in ["corrupt", "truncated"] {
+        let database = directory.join(format!("{name}.sqlite"));
+        copy_closed_host_database(&source_db, &database);
+        let checkpoint = cut_record.host_checkpoint().expect("validated source artifact");
+        let mut bytes = checkpoint.encode().expect("actual host artifact bytes");
+        let original_digest = cut_record.payload_digest.clone();
+        let digest = if name == "corrupt" {
+            bytes[0] ^= 1;
+            original_digest
+        } else {
+            bytes.truncate(bytes.len() / 2);
+            format!("blake3:{}", blake3::hash(&bytes).to_hex())
+        };
+        let payload = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let connection = Connection::open_existing(database.to_str().expect("UTF-8 copy"))
+            .expect("open only the negative closed copy for real SQL mutation");
+        assert_eq!(
+            connection
+                .execute_with_params(
+                    "UPDATE checkpoints SET payload = ?1, payload_digest = ?2 WHERE checkpoint_id = ?3",
+                    &[payload.into(), digest.into(), "first-cut".into()],
+                )
+                .expect("mutate the copied actual artifact"),
+            1
+        );
+        connection
+            .close()
+            .expect("close mutated copy before the real CLI");
+        let before = host_database_prefix(&database);
+        let output = continue_host_handoff(&directory, name, &database, "first-cut", 1);
+        assert!(!output.status.success(), "{name} artifact must fail closed");
+        let text = strip_ansi(&format!("{}{}", stdout_text(&output), stderr_text(&output)));
+        assert!(
+            text.contains("first-cut") && text.contains("checkpoints.payload"),
+            "refusal must name the actual source artifact: {text}"
+        );
+        if name == "corrupt" {
+            assert!(
+                text.contains("payload digest mismatch"),
+                "outer checksum refusal: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("wire.decode") && !text.contains("payload digest mismatch"),
+                "a valid outer checksum must reach the actual truncated host codec: {text}"
+            );
+        }
+        let after = host_database_prefix(&database);
+        fs::write(
+            directory.join(format!("{name}.prefixes.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({"before": before, "after": after}))
+                .expect("encode actual negative prefix observations"),
+        )
+        .expect("retain actual negative prefix observations");
+        assert_eq!(
+            after,
+            before,
+            "{name} refusal must leave every observed science/journal prefix and row count unchanged"
+        );
+        assert!(!stdout_text(&output).contains("\"status\":\"handed_off\""));
+    }
+    assert_eq!(
+        fs::read(&source_db).expect("original retained source"),
+        source_bytes
+    );
+    assert_eq!(host_database_prefix(&source_db), source_prefix);
+    fs::write(
+        directory.join("observed-handoffs.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "uninterrupted": baseline_report, "initial_cut": cut_report,
+            "continued": continued_report, "perturbed": perturbed_report,
+            "matched_comparison": matched, "divergent_comparison": divergent,
+            "source_prefix": source_prefix,
+        }))
+        .expect("encode actual handoff observations"),
+    )
+    .expect("retain actual handoff observations");
 }

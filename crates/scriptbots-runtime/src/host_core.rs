@@ -4,7 +4,8 @@ use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, BrainProjection,
     BrainProjectionRequest, BrainProjectionSource, CommandAuthorityLookup, CommandAuthorityMode,
     CommandAuthorityReader, CommandClaimPolicy, CommandEnvelope, CommandId,
-    CommandLifecycleEvidence, CommandLifecycleTransition, CommandStatus, ConfigRevision,
+    CommandLifecycleEvidence,
+    CommandLifecycleTransition, CommandStatus, ConfigRevision,
     ControlRevision, DriveReceipt, EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator,
     EventCatchUpUnavailableReason, EventCommitment, EventHub, EventJournalReader, EventPage,
     EventPageSource, EventRetentionSnapshot, EventSequence, EventSequenceRange, FoodLayerSnapshot,
@@ -26,9 +27,11 @@ use scriptbots_core::{
     CompletedStepFault, ConfigAuditEntry, ControlCommand, ControlDisposition, DynamicAgentSnapshot,
     DynamicAgentVisuals, DynamicWorldSnapshot, MigratingAgent, NullPersistence,
     PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError, ScriptBotsConfig,
-    SelectionState, Tick, TickSummary, WorldDigestV1, WorldState, apply_control_command,
+    SelectionState, Tick, TickSummary, WorldDigestV1, WorldState, WorldStepTrace, WorldStepTracer,
+    apply_control_command,
     rng_domains::IslandId,
 };
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -51,8 +54,615 @@ const DEFAULT_VOLATILE_EVENT_HISTORY_CAPACITY: usize = 512;
 const RECEIPT_POLL_LIMIT: usize = 4_096;
 const LIFECYCLE_COMMAND_NAMESPACE: u64 = u64::MAX;
 
+/// Full owner checkpoint schema; distinct from the science-only core schema.
+pub const HOST_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.host-checkpoint.v1";
+/// Canonical envelope revision for [`HostCheckpointV1`].
+pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 1;
+/// Actual envelope, payload and corruption-checksum codecs.
+pub const HOST_CHECKPOINT_V1_CODEC: &str = "postcard-envelope+json+blake3-v1";
+/// Fixed resource ceiling for a complete encoded host artifact.
+pub const MAX_HOST_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_HOST_CHECKPOINT_ENTRIES: usize = 65_536;
+
+/// Actual owner sequence cut, compared with a continued journal adapter's observed prefix.
+///
+/// These data do not attest a file's durability by themselves. Capture records the existing
+/// adapter's commitment requirement; storage must independently observe that exact prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostJournalCutV1 {
+    /// Original host session, retained during continuation.
+    pub session_id: HostSessionId,
+    /// Last owner-allocated journal sequence, including command-only work at the same tick.
+    pub last_journal_sequence: u64,
+    /// Last canonical scientific-event sequence.
+    pub last_scientific_event_sequence: u64,
+    /// Existing journal commitment threshold; restore cannot weaken it.
+    pub commitment_requirement: ShutdownCommitRequirement,
+}
+
+/// Capture, wire or continued-owner reconstruction refusal.
+#[derive(Debug, Error)]
+pub enum HostCheckpointError {
+    /// Existing owner work must settle before capture can observe a complete cut.
+    #[error("host checkpoint is awaiting {reason:?}")]
+    Busy {
+        /// Actual unresolved owner boundary, retained rather than discarded.
+        reason: HostCheckpointBusy,
+    },
+    /// A bounded wire, version, identity, state or quiescence contract was violated.
+    #[error("host checkpoint refusal at `{path}`: {detail}")]
+    Contract {
+        /// Exact boundary that refused the operation.
+        path: &'static str,
+        /// Observed failure, including the original codec or adapter cause.
+        detail: String,
+    },
+    /// The existing science checkpoint contract refused capture or restoration.
+    #[error(transparent)]
+    World(#[from] scriptbots_core::WorldCheckpointError),
+    /// A runtime boundary refused the operation.
+    #[error(transparent)]
+    Host(#[from] HostAccessError),
+    /// A world/session binding or owner constructor refused reconstruction.
+    #[error(transparent)]
+    Build(#[from] HostCoreBuildError),
+}
+
+/// Existing resumable owner work that temporarily prevents a full capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCheckpointBusy {
+    /// An exact scientific persistence batch has not been acknowledged.
+    ScienceAdmission,
+    /// Admitted commands or a retained command-authority lookup are unresolved.
+    Commands,
+    /// Ordered command lifecycle audit work has not settled.
+    Audit,
+    /// A journal handoff, commitment or retained batch is unresolved.
+    Journal,
+    /// A scientific-event retention boundary is pressured.
+    Events,
+    /// A scheduled owner action has not crossed its journal boundary.
+    Schedule,
+}
+
+impl HostCheckpointError {
+    /// Whether existing owner driving or the existing final science flush can settle this cut.
+    #[must_use]
+    pub const fn is_retryable_quiescence(&self) -> bool {
+        matches!(
+            self,
+            Self::Busy { .. }
+                | Self::World(scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. })
+                | Self::World(scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. })
+        )
+    }
+}
+
+fn checkpoint_error(path: &'static str, detail: impl Into<String>) -> HostCheckpointError {
+    HostCheckpointError::Contract {
+        path,
+        detail: detail.into(),
+    }
+}
+
+/// Validated versioned owner artifact with a separate, independently decoded science payload.
+///
+/// Neither executable adapters nor database ownership are serialized. Use a caller-prepared
+/// registry, persistence session, journal continuation and schedule resolver for restoration.
+#[derive(Debug, Clone)]
+pub struct HostCheckpointV1 {
+    state: HostCheckpointStateV1,
+    world: scriptbots_core::WorldCheckpointV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostCheckpointStateV1 {
+    world_bytes: Vec<u8>,
+    continuity: scriptbots_core::WorldHostCheckpointV1,
+    cut: HostJournalCutV1,
+    persistence_last_admitted_tick: Option<Tick>,
+    options: HostCoreOptions,
+    revisions: HostRevisions,
+    playback: PlaybackSnapshot,
+    health: HostHealth,
+    cadence_credit: u128,
+    clock_initialized: bool,
+    next_snapshot: SnapshotRevision,
+    last_published_scientific: ScientificRevision,
+    snapshot: RenderSnapshot,
+    next_lifecycle_command_sequence: u64,
+    next_admission: AdmissionSequence,
+    next_protocol_event: ProtocolEventSequence,
+    next_audit_order: u64,
+    commands: Vec<CommandAuthority>,
+    archived: Vec<ArchivedIdempotency>,
+    last_applied: Option<(AdmissionSequence, CommandId)>,
+    visible_boundary: AppliedCommand,
+    latest_completed_summary: Option<TickSummary>,
+    step_traces: Vec<WorldStepTrace>,
+    protocol_events: Vec<HostEvent>,
+    events: super::EventHubCheckpointV1,
+    schedule: Option<Vec<ScheduledConfigPatch>>,
+    scheduled_patches: Vec<ScheduledPatchStatus>,
+    last_arrival: Option<MigrationArrival>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostCheckpointWireV1 {
+    schema: String,
+    codec_version: u16,
+    codec: String,
+    #[serde(deserialize_with = "deserialize_host_checkpoint_payload")]
+    payload: Vec<u8>,
+    payload_blake3: [u8; blake3::OUT_LEN],
+}
+
+fn deserialize_host_checkpoint_payload<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct PayloadVisitor;
+    impl<'de> serde::de::Visitor<'de> for PayloadVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded host checkpoint payload")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let hint = sequence.size_hint().unwrap_or(0);
+            if hint > MAX_HOST_CHECKPOINT_BYTES {
+                return Err(serde::de::Error::custom(
+                    "host checkpoint payload exceeds bound",
+                ));
+            }
+            let mut bytes = Vec::with_capacity(hint.min(1024 * 1024));
+            while let Some(byte) = sequence.next_element()? {
+                if bytes.len() == MAX_HOST_CHECKPOINT_BYTES {
+                    return Err(serde::de::Error::custom(
+                        "host checkpoint payload exceeds bound",
+                    ));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_seq(PayloadVisitor)
+}
+
+impl HostCheckpointV1 {
+    /// Completed scientific tick of the independently validated core payload.
+    #[must_use]
+    pub const fn tick(&self) -> Tick {
+        self.world.tick()
+    }
+
+    /// Original session identity; a continuation does not mint a new session.
+    #[must_use]
+    pub const fn session_id(&self) -> HostSessionId {
+        self.state.cut.session_id
+    }
+
+    /// Existing science-only payload for scientific replay consumers.
+    #[must_use]
+    pub const fn world_checkpoint(&self) -> &scriptbots_core::WorldCheckpointV1 {
+        &self.world
+    }
+
+    /// Exact owner cut, including same-tick control and audit journal work.
+    #[must_use]
+    pub const fn journal_cut(&self) -> HostJournalCutV1 {
+        self.state.cut
+    }
+
+    /// Last scientific batch actually acknowledged by the owner's persistence session.
+    #[must_use]
+    pub const fn persistence_last_admitted_tick(&self) -> Option<Tick> {
+        self.state.persistence_last_admitted_tick
+    }
+
+    /// Whether the owner had an installed schedule, including an exhausted queue.
+    #[must_use]
+    pub const fn has_schedule(&self) -> bool {
+        self.state.schedule.is_some()
+    }
+
+    /// Raw recording and control configuration retained by the full host boundary.
+    #[must_use]
+    pub const fn config(&self) -> &ScriptBotsConfig {
+        self.state.continuity.config()
+    }
+
+    /// Actual playback state retained at the owner cut.
+    #[must_use]
+    pub const fn playback(&self) -> PlaybackSnapshot {
+        self.state.playback
+    }
+
+    /// Bounded chronological traces collected by the actual owner science steps.
+    ///
+    /// A consumer must validate each trace and refuse error captures before treating it as
+    /// stage-equivalence evidence. Empty history is the default, uninstrumented owner policy.
+    #[must_use]
+    pub fn step_traces(&self) -> &[WorldStepTrace] {
+        &self.state.step_traces
+    }
+
+    /// Reconstruct the world with caller-prepared executable brain adapters and no bound sink.
+    pub fn restore_world(
+        &self,
+        registry: scriptbots_core::BrainRegistry,
+    ) -> Result<WorldState, HostCheckpointError> {
+        self.validate()?;
+        Ok(WorldState::restore_host_checkpoint_v1(
+            &self.world,
+            &self.state.continuity,
+            registry,
+        )?)
+    }
+
+    /// Encode the canonical versioned envelope with a payload corruption checksum.
+    pub fn encode(&self) -> Result<Vec<u8>, HostCheckpointError> {
+        self.validate()?;
+        let payload = serde_json::to_vec(&self.state)
+            .map_err(|error| checkpoint_error("payload.encode", error.to_string()))?;
+        if payload.len() > MAX_HOST_CHECKPOINT_BYTES {
+            return Err(checkpoint_error(
+                "payload.size",
+                "host payload exceeds fixed bound",
+            ));
+        }
+        let wire = HostCheckpointWireV1 {
+            schema: HOST_CHECKPOINT_V1_SCHEMA.to_owned(),
+            codec_version: HOST_CHECKPOINT_V1_CODEC_VERSION,
+            codec: HOST_CHECKPOINT_V1_CODEC.to_owned(),
+            payload_blake3: *blake3::hash(&payload).as_bytes(),
+            payload,
+        };
+        let bytes = postcard::to_allocvec(&wire)
+            .map_err(|error| checkpoint_error("wire.encode", error.to_string()))?;
+        if bytes.len() > MAX_HOST_CHECKPOINT_BYTES {
+            return Err(checkpoint_error("wire.size", "host wire exceeds fixed bound"));
+        }
+        Ok(bytes)
+    }
+
+    /// Decode, checksum, canonicalize and validate both the owner and science layers.
+    pub fn decode(bytes: &[u8]) -> Result<Self, HostCheckpointError> {
+        if bytes.len() > MAX_HOST_CHECKPOINT_BYTES {
+            return Err(checkpoint_error("wire.size", "host wire exceeds fixed bound"));
+        }
+        let (wire, remainder): (HostCheckpointWireV1, _) = postcard::take_from_bytes(bytes)
+            .map_err(|error| checkpoint_error("wire.decode", error.to_string()))?;
+        if !remainder.is_empty() {
+            return Err(checkpoint_error("wire.trailing", "unconsumed envelope bytes"));
+        }
+        if wire.schema != HOST_CHECKPOINT_V1_SCHEMA
+            || wire.codec_version != HOST_CHECKPOINT_V1_CODEC_VERSION
+            || wire.codec != HOST_CHECKPOINT_V1_CODEC
+        {
+            return Err(checkpoint_error(
+                "wire.version",
+                "foreign schema or codec revision",
+            ));
+        }
+        if *blake3::hash(&wire.payload).as_bytes() != wire.payload_blake3 {
+            return Err(checkpoint_error("payload.hash", "payload BLAKE3 mismatch"));
+        }
+        let state: HostCheckpointStateV1 = serde_json::from_slice(&wire.payload)
+            .map_err(|error| checkpoint_error("payload.decode", error.to_string()))?;
+        let world = scriptbots_core::WorldCheckpointV1::decode(&state.world_bytes)?;
+        let checkpoint = Self { state, world };
+        checkpoint.validate()?;
+        if checkpoint.encode()? != bytes {
+            return Err(checkpoint_error(
+                "wire.canonical",
+                "noncanonical owner envelope or payload",
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    fn validate(&self) -> Result<(), HostCheckpointError> {
+        let state = &self.state;
+        validate_options(state.options)?;
+        for capacity in [
+            state.options.command_capacity,
+            state.options.archived_command_capacity,
+            state.options.protocol_event_capacity,
+            state.options.scientific_event_capacity,
+            state.options.genesis_origin_capacity,
+            state.options.volatile_event_history_capacity,
+        ] {
+            if capacity > MAX_HOST_CHECKPOINT_ENTRIES {
+                return Err(checkpoint_error(
+                    "options.capacity",
+                    "owner capacity exceeds checkpoint bound",
+                ));
+            }
+        }
+        state.continuity.validate(&self.world)?;
+        self.validate_owner_counters()?;
+        self.validate_command_history()?;
+        self.validate_schedule()?;
+        self.validate_step_traces()?;
+        state.events.validate(
+            state.cut,
+            self.tick(),
+            state.options.scientific_event_capacity,
+            state.options.genesis_origin_capacity,
+        )?;
+        Ok(())
+    }
+
+    fn validate_step_traces(&self) -> Result<(), HostCheckpointError> {
+        let traces = &self.state.step_traces;
+        if traces.len() > self.state.options.trace_history_capacity
+            || traces.iter().any(|trace| trace.tick > self.tick())
+            || traces
+                .windows(2)
+                .any(|pair| pair[0].tick.0.checked_add(1) != Some(pair[1].tick.0))
+            || traces.last().is_some_and(|trace| trace.tick != self.tick())
+        {
+            return Err(checkpoint_error(
+                "traces.history",
+                "incoherent retained trace prefix",
+            ));
+        }
+        for trace in traces {
+            trace
+                .validate_contract()
+                .map_err(|error| checkpoint_error("traces.contract", error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn validate_owner_counters(&self) -> Result<(), HostCheckpointError> {
+        let state = &self.state;
+        if state.cut.last_journal_sequence == u64::MAX
+            || state.cut.last_scientific_event_sequence > state.cut.last_journal_sequence
+            || state.next_admission.get() == 0
+            || state.next_protocol_event.get() == 0
+            || state.next_audit_order == 0
+            || state.next_lifecycle_command_sequence < state.cut.session_id.get()
+            || state.revisions.scientific.get() < self.tick().0
+            || state.revisions.config.get() != state.continuity.config_revision()
+            || state
+                .persistence_last_admitted_tick
+                .is_some_and(|tick| tick > self.tick())
+            || (!state.clock_initialized && state.cadence_credit != 0)
+            || !state.playback.speed_multiplier.is_finite()
+            || state.playback.speed_multiplier < 0.0
+            || state.snapshot.session_id != self.session_id()
+            || state.snapshot.revision.checked_next() != Some(state.next_snapshot)
+            || state.snapshot.revisions.scientific != state.last_published_scientific
+            || state.snapshot.revisions.scientific > state.revisions.scientific
+            || state.snapshot.world.tick > self.tick().0
+            || state.snapshot.revisions.control != state.revisions.control
+            || state.snapshot.revisions.config != state.revisions.config
+            || state.snapshot.playback != state.playback
+            || state.snapshot.config.as_ref() != state.continuity.config()
+            || !matches!(
+                state.health,
+                HostHealth::Healthy | HostHealth::Blocked(HostBlocker::PlaybackPaused)
+            )
+            || state.snapshot.lifecycle != HostLifecycle::Running
+            || !matches!(
+                state.snapshot.health,
+                HostHealth::Healthy | HostHealth::Blocked(HostBlocker::PlaybackPaused)
+            )
+            || state.snapshot.command_queue_depth != 0
+            || state.snapshot.last_applied_command != state.last_applied.map(|(_, id)| id)
+            || state.protocol_events.len() > state.options.protocol_event_capacity
+            || state.protocol_events.iter().any(|event| {
+                event.session_id != self.session_id()
+                    || event.sequence.get() == 0
+                    || event.sequence >= state.next_protocol_event
+                    || event.tick > self.tick()
+            })
+            || state
+                .protocol_events
+                .windows(2)
+                .any(|pair| pair[0].sequence.checked_next() != Some(pair[1].sequence))
+            || state.last_arrival.is_some_and(|arrival| arrival.tick > self.tick())
+            || state.visible_boundary.tick != self.tick()
+            || state.visible_boundary.revisions != state.revisions
+            || state
+                .latest_completed_summary
+                .as_ref()
+                .is_some_and(|summary| summary.tick != self.tick())
+            || state.cadence_credit >= u128::from(state.options.tick_period_nanos) * SPEED_SCALE
+        {
+            return Err(checkpoint_error(
+                "owner.counters",
+                "incoherent owner revision, publication or sequence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_command_history(&self) -> Result<(), HostCheckpointError> {
+        let state = &self.state;
+        if state.commands.len() > state.options.command_capacity.saturating_mul(2)
+            || state.archived.len() > state.options.archived_command_capacity
+        {
+            return Err(checkpoint_error(
+                "commands.capacity",
+                "retained command history exceeds bound",
+            ));
+        }
+        let mut ids = HashSet::new();
+        for authority in &state.commands {
+            let envelope = authority.envelope.as_ref().ok_or_else(|| {
+                checkpoint_error("commands.envelope", "live authority lost its envelope")
+            })?;
+            if envelope.command_id != authority.status.command_id()
+                || command_envelope_digest(envelope)? != authority.envelope_digest
+                || authority.pending_audit_order.is_some()
+                || (matches!(envelope.command, HostCommand::Shutdown)
+                    && matches!(authority.status.application(), ApplicationState::Applied(_)))
+            {
+                return Err(checkpoint_error(
+                    "commands.identity",
+                    "wrong identity or unfinished audit",
+                ));
+            }
+            authority
+                .lifecycle_evidence()?
+                .validate()
+                .map_err(|error| checkpoint_error("commands.lifecycle", error.to_string()))?;
+            for boundary in [authority.initial_boundary, authority.application_boundary] {
+                if boundary.tick > self.tick()
+                    || boundary.revisions.control > state.revisions.control
+                    || boundary.revisions.config > state.revisions.config
+                    || boundary.revisions.scientific > state.revisions.scientific
+                {
+                    return Err(checkpoint_error(
+                        "commands.boundary",
+                        "command boundary exceeds owner cut",
+                    ));
+                }
+            }
+            self.validate_terminal_status(&authority.status)?;
+            if !ids.insert(authority.status.command_id()) {
+                return Err(checkpoint_error("commands.duplicate", "duplicate command authority"));
+            }
+        }
+        for archived in &state.archived {
+            self.validate_terminal_status(&archived.status)?;
+            if !ids.insert(archived.status.command_id()) {
+                return Err(checkpoint_error("commands.duplicate", "duplicate archived identity"));
+            }
+        }
+        if state
+            .last_applied
+            .is_some_and(|(sequence, _)| sequence.get() == 0 || sequence >= state.next_admission)
+        {
+            return Err(checkpoint_error(
+                "commands.last_applied",
+                "last admission exceeds captured cut",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_status(&self, status: &CommandStatus) -> Result<(), HostCheckpointError> {
+        status
+            .validate()
+            .map_err(|error| checkpoint_error("commands.status", error.to_string()))?;
+        let qualifies = match self.state.cut.commitment_requirement {
+            ShutdownCommitRequirement::CommittedVolatile => matches!(
+                status.journal(),
+                JournalState::CommittedVolatile | JournalState::Durable
+            ),
+            ShutdownCommitRequirement::Durable => matches!(status.journal(), JournalState::Durable),
+        };
+        if matches!(status.application(), ApplicationState::Admitted)
+            || !qualifies
+            || status.admission_sequence().is_some_and(|sequence| {
+                sequence.get() == 0 || sequence >= self.state.next_admission
+            })
+        {
+            return Err(checkpoint_error(
+                "commands.pending",
+                "unsettled command or invalid admission cut",
+            ));
+        }
+        if let ApplicationState::Applied(boundary) = status.application()
+            && (boundary.tick > self.tick()
+                || boundary.revisions.control > self.state.revisions.control
+                || boundary.revisions.config > self.state.revisions.config
+                || boundary.revisions.scientific > self.state.revisions.scientific)
+        {
+            return Err(checkpoint_error(
+                "commands.boundary",
+                "application lies after captured owner cut",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_schedule(&self) -> Result<(), HostCheckpointError> {
+        let state = &self.state;
+        let mut sequence = 0;
+        let mut due = Tick::zero();
+        if state.scheduled_patches.len() > MAX_HOST_CHECKPOINT_ENTRIES
+            || state
+                .schedule
+                .as_ref()
+                .is_some_and(|remaining| remaining.len() > MAX_HOST_CHECKPOINT_ENTRIES)
+        {
+            return Err(checkpoint_error("schedule.capacity", "schedule exceeds fixed bound"));
+        }
+        for status in &state.scheduled_patches {
+            status
+                .evidence
+                .validate()
+                .map_err(|error| checkpoint_error("schedule.evidence", error))?;
+            let patch = &status.evidence.scheduled;
+            if patch.sequence != sequence + 1
+                || patch.due_tick < due
+                || patch.due_tick > self.tick()
+                || status.batch_id.session_id() != self.session_id()
+                || status.batch_id.sequence() == 0
+                || status.batch_id.sequence() > state.cut.last_journal_sequence
+                || !matches!(status.evidence.outcome, ScheduledPatchOutcome::Applied { .. })
+                || !journal_state_qualifies(&status.journal, state.cut.commitment_requirement)
+            {
+                return Err(checkpoint_error(
+                    "schedule.outcome",
+                    "noncontiguous or unsettled schedule prefix",
+                ));
+            }
+            sequence = patch.sequence;
+            due = patch.due_tick;
+        }
+        if let Some(remaining) = &state.schedule {
+            for patch in remaining {
+                patch
+                    .decode_patch()
+                    .map_err(|error| checkpoint_error("schedule.patch", error))?;
+                if sequence.checked_add(1) != Some(patch.sequence)
+                    || patch.due_tick < due
+                    || patch.due_tick < self.tick()
+                {
+                    return Err(checkpoint_error(
+                        "schedule.remaining",
+                        "invalid retained schedule suffix",
+                    ));
+                }
+                sequence = patch.sequence;
+                due = patch.due_tick;
+            }
+        } else if !state.scheduled_patches.is_empty() {
+            return Err(checkpoint_error(
+                "schedule.missing",
+                "schedule outcomes lost their owner queue",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn journal_state_qualifies(state: &JournalState, requirement: ShutdownCommitRequirement) -> bool {
+    match requirement {
+        ShutdownCommitRequirement::CommittedVolatile => {
+            matches!(state, JournalState::CommittedVolatile | JournalState::Durable)
+        }
+        ShutdownCommitRequirement::Durable => matches!(state, JournalState::Durable),
+    }
+}
+
 /// Construction options for a synchronous [`HostCore`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostCoreOptions {
     /// Playback state visible before the first manual-drive boundary.
     pub initial_playback: PlaybackSnapshot,
@@ -90,6 +700,11 @@ pub struct HostCoreOptions {
     /// analysis run must not pay it. Only a host with a drawing frontend
     /// attached should set this.
     pub capture_agent_visuals: bool,
+    /// Maximum actual completed-step traces retained for optional continuation diagnostics.
+    ///
+    /// Zero selects the unchanged ordinary step path. A nonzero capacity uses the existing
+    /// core tracer at the owner's science step and retains its exact success/error captures.
+    pub trace_history_capacity: usize,
 }
 
 impl Default for HostCoreOptions {
@@ -106,6 +721,7 @@ impl Default for HostCoreOptions {
             genesis_origin_capacity: 16_384,
             volatile_event_history_capacity: DEFAULT_VOLATILE_EVENT_HISTORY_CAPACITY,
             capture_agent_visuals: false,
+            trace_history_capacity: 0,
         }
     }
 }
@@ -135,6 +751,7 @@ pub enum HostCoreBuildError {
 #[derive(Debug)]
 pub struct VolatileJournal {
     highest_accepted: Option<JournalBatchId>,
+    continuation_eligible: bool,
     archive: VolatileJournalArchive,
     event_view: Arc<ArcSwap<VolatileEventArchiveView>>,
     receipts: VecDeque<JournalReceipt>,
@@ -181,6 +798,7 @@ impl VolatileJournal {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             highest_accepted: None,
+            continuation_eligible: true,
             archive: VolatileJournalArchive {
                 capacity,
                 entries: VecDeque::with_capacity(capacity),
@@ -327,6 +945,31 @@ impl EventJournalReader for VolatileEventReader {
 }
 
 impl JournalPort for VolatileJournal {
+    fn continuation_cut(&self) -> Option<HostJournalCutV1> {
+        let highest = self.highest_accepted?;
+        if !self.continuation_eligible
+            || !self.receipts.is_empty()
+            || !self.archive.entries.is_empty()
+            || self
+                .archive
+                .scientific_entries
+                .iter()
+                .any(|entry| !entry.committed)
+        {
+            return None;
+        }
+        Some(HostJournalCutV1 {
+            session_id: highest.session_id(),
+            last_journal_sequence: highest.sequence(),
+            last_scientific_event_sequence: self
+                .archive
+                .scientific_entries
+                .back()
+                .map_or(0, |entry| entry.sequence.get()),
+            commitment_requirement: ShutdownCommitRequirement::CommittedVolatile,
+        })
+    }
+
     fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
         let batch_id = batch.id();
         if self.highest_accepted.is_some_and(|highest| {
@@ -384,6 +1027,11 @@ impl JournalPort for VolatileJournal {
             let event_view = volatile_event_view(archive, batch_id.session_id());
             self.event_view.store(Arc::new(event_view));
         }
+        let expected = self
+            .highest_accepted
+            .map_or(Some(1), |highest| highest.sequence().checked_add(1));
+        self.continuation_eligible &= expected == Some(batch_id.sequence())
+            && !batch.is_applied_shutdown();
         self.highest_accepted = Some(batch_id);
         self.receipts.push_back(JournalReceipt::new(
             batch_id,
@@ -439,7 +1087,8 @@ struct AdmittedEnvelope {
     envelope: CommandEnvelope,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommandAuthority {
     envelope: Option<CommandEnvelope>,
     envelope_digest: [u8; blake3::OUT_LEN],
@@ -638,7 +1287,8 @@ struct SharedHostState {
 
 /// Retained proof that one terminal command already ran, kept after its full
 /// `CommandAuthority` is released at durable archival.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArchivedIdempotency {
     envelope_digest: [u8; blake3::OUT_LEN],
     status: CommandStatus,
@@ -2027,6 +2677,7 @@ pub struct HostCore {
     applied_interventions: Arc<Vec<AppliedInterventionRecord>>,
     last_published_intervention_seq: u64,
     latest_completed_summary: Option<TickSummary>,
+    step_traces: VecDeque<WorldStepTrace>,
     next_journal_sequence: u64,
     next_lifecycle_command_sequence: u64,
     active_command: Option<AdmittedEnvelope>,
@@ -2054,12 +2705,13 @@ pub struct HostCore {
     last_arrival: Option<MigrationArrival>,
 }
 
-type ConfigPatchResolver =
+/// Caller-prepared executable resolver for a retained scheduled configuration suffix.
+pub type PreparedConfigPatchResolver =
     fn(&ScriptBotsConfig, &serde_json::Value) -> Result<ScriptBotsConfig, String>;
 
 struct ScheduledConfigQueue {
     remaining: VecDeque<ScheduledConfigPatch>,
-    resolve: ConfigPatchResolver,
+    resolve: PreparedConfigPatchResolver,
 }
 
 fn changed_config_paths(
@@ -2095,7 +2747,8 @@ fn changed_config_paths(
 /// and that UID does not exist until the world's allocator mints it during
 /// application — so it cannot be in the `Immigrate` command and has to be read
 /// back from the host afterwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MigrationArrival {
     /// Island the organism departed from.
     pub origin_island: IslandId,
@@ -2331,6 +2984,7 @@ impl HostCore {
             applied_interventions,
             last_published_intervention_seq,
             latest_completed_summary,
+            step_traces: VecDeque::new(),
             next_journal_sequence: 1,
             next_lifecycle_command_sequence: session_id.get(),
             active_command: None,
@@ -2373,7 +3027,7 @@ impl HostCore {
     pub fn install_schedule(
         &mut self,
         patches: Vec<ScheduledConfigPatch>,
-        resolve: ConfigPatchResolver,
+        resolve: PreparedConfigPatchResolver,
     ) -> Result<(), HostAccessError> {
         if self.last_now.is_some() || self.schedule.is_some() {
             return Err(protocol_violation(
@@ -2484,7 +3138,7 @@ impl HostCore {
     fn apply_scheduled_patch(
         &mut self,
         scheduled: ScheduledConfigPatch,
-        resolve: ConfigPatchResolver,
+        resolve: PreparedConfigPatchResolver,
     ) -> Result<ScheduledPatchEvidence, HostAccessError> {
         let next_control = self.revisions.control.checked_next().ok_or_else(|| {
             protocol_violation("control revision exhausted before scheduled patch")
@@ -2800,6 +3454,284 @@ impl HostCore {
                 message: error.to_string(),
             }
         })
+    }
+
+    /// Capture the complete supported owner/session boundary without draining deferred work.
+    ///
+    /// Callers must finish the actual science, journal and audit acknowledgements first.
+    /// Completed shutdown, faults, pending command authority, migration ownership and every
+    /// indeterminate handoff are refused. The resulting data never attests storage durability.
+    pub fn capture_host_checkpoint_v1(&self) -> Result<HostCheckpointV1, HostCheckpointError> {
+        self.ensure_host_checkpoint_quiescent()?;
+        let world = self.world.capture_checkpoint_quiescent()?;
+        let continuity = self.world.capture_host_continuity_v1(&world)?;
+        let events = self.events.capture_checkpoint()?;
+        let shared = self.shared.borrow();
+        let mut commands: Vec<_> = shared.commands.values().cloned().collect();
+        commands.sort_unstable_by_key(|authority| authority.status.command_id());
+        let archived = shared
+            .archived_order
+            .iter()
+            .map(|id| {
+                shared.archived_idempotency.get(id).cloned().ok_or_else(|| {
+                    checkpoint_error(
+                        "commands.archive",
+                        "archive order lost its canonical identity",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if archived.len() != shared.archived_idempotency.len() {
+            return Err(checkpoint_error(
+                "commands.archive",
+                "archive contains an unordered identity",
+            ));
+        }
+        let state = HostCheckpointStateV1 {
+            world_bytes: world.encode()?,
+            continuity,
+            cut: HostJournalCutV1 {
+                session_id: self.session_id,
+                last_journal_sequence: self.next_journal_sequence.checked_sub(1).ok_or_else(
+                    || checkpoint_error("journal.sequence", "owner journal cursor is zero"),
+                )?,
+                last_scientific_event_sequence: events
+                    .next_sequence
+                    .get()
+                    .checked_sub(1)
+                    .ok_or_else(|| {
+                        checkpoint_error("events.sequence", "owner event cursor is zero")
+                    })?,
+                commitment_requirement: self.journal.shutdown_commit_requirement(),
+            },
+            persistence_last_admitted_tick: self.persistence.last_admitted_tick(),
+            options: self.options,
+            revisions: self.revisions,
+            playback: self.playback,
+            health: self.health.clone(),
+            cadence_credit: self.cadence_credit,
+            clock_initialized: self.last_now.is_some(),
+            next_snapshot: self.next_snapshot,
+            last_published_scientific: self.last_published_scientific,
+            snapshot: self.snapshots.latest().as_ref().clone(),
+            next_lifecycle_command_sequence: self.next_lifecycle_command_sequence,
+            next_admission: shared.next_admission,
+            next_protocol_event: shared.next_event,
+            next_audit_order: shared.next_audit_order,
+            commands,
+            archived,
+            last_applied: shared.last_applied,
+            visible_boundary: shared.visible_boundary,
+            latest_completed_summary: self.latest_completed_summary.clone(),
+            step_traces: self.step_traces.iter().cloned().collect(),
+            protocol_events: shared.events.iter().cloned().collect(),
+            events,
+            schedule: self
+                .schedule
+                .as_ref()
+                .map(|schedule| schedule.remaining.iter().cloned().collect()),
+            scheduled_patches: self.scheduled_patches.as_ref().clone(),
+            last_arrival: self.last_arrival,
+        };
+        let checkpoint = HostCheckpointV1 { state, world };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    fn ensure_host_checkpoint_quiescent(&self) -> Result<(), HostCheckpointError> {
+        let shared = self.shared.borrow();
+        if self.lifecycle != HostLifecycle::Running
+            || shared.admission_lifecycle != HostLifecycle::Running
+            || shared.shutdown_command_id.is_some()
+            || self.shutdown_receipt.is_some()
+            || self.latched_fault.is_some()
+            || self.health.fault().is_some()
+            || self.outbound_migrant.is_some()
+            || self.staged_immigrant.is_some()
+            || !self.failed_journal_batches.is_empty()
+            || self.indeterminate_journal_batch.is_some()
+            || !shared.resolved_command_authority_failures.is_empty()
+            || !shared.resolved_command_authority_failure_order.is_empty()
+        {
+            return Err(checkpoint_error(
+                "owner.quiescence",
+                "fault, migration, unobserved authority outcome or shutdown prevents continuation",
+            ));
+        }
+        let pending = [
+            (
+                HostCheckpointBusy::ScienceAdmission,
+                self.persistence.has_pending_batch() || self.persistence.fault().is_some(),
+            ),
+            (
+                HostCheckpointBusy::Commands,
+                !shared.queue.is_empty()
+                    || self.active_command.is_some()
+                    || self.active_command_started
+                    || shared.pending_command_authority.is_some(),
+            ),
+            (
+                HostCheckpointBusy::Audit,
+                shared.audit_gate_closed
+                    || shared.pending_audit_count != 0
+                    || !shared.pending_audits.is_empty(),
+            ),
+            (
+                HostCheckpointBusy::Journal,
+                self.active_journal_batch.is_some()
+                    || self.retained_journal.is_some()
+                    || self.retained_blocker.is_some()
+                    || !self.inflight_journal.is_empty(),
+            ),
+            (HostCheckpointBusy::Events, self.event_pressure.is_some()),
+            (
+                HostCheckpointBusy::Schedule,
+                self.scheduled_barrier.is_some() || self.scheduled_failure_shutdown,
+            ),
+        ];
+        if let Some((reason, _)) = pending.into_iter().find(|(_, pending)| *pending) {
+            return Err(HostCheckpointError::Busy { reason });
+        }
+        Ok(())
+    }
+
+    /// Reconstitute the original session against an actual continued journal and paired sink.
+    ///
+    /// `world` must come from [`HostCheckpointV1::restore_world`] and the caller's trusted
+    /// registry. `journal` must expose the exact adapter-observed continuation cut. The caller
+    /// supplies executable schedule resolution separately. `now` rebases the monotonic clock;
+    /// offline wall time contributes no science credit, while captured fractional credit remains.
+    pub fn restore_host_checkpoint_v1(
+        checkpoint: &HostCheckpointV1,
+        world: WorldState,
+        mut persistence: PersistenceAdmissionSession,
+        journal: Box<dyn JournalPort>,
+        resolver: Option<PreparedConfigPatchResolver>,
+        now: ManualInstant,
+    ) -> Result<Self, HostCheckpointError> {
+        checkpoint.validate()?;
+        let state = &checkpoint.state;
+        if journal.continuation_cut() != Some(state.cut)
+            || journal.shutdown_commit_requirement() != state.cut.commitment_requirement
+        {
+            return Err(checkpoint_error(
+                "journal.continuation",
+                "fresh, wrong-session or advanced journal prefix",
+            ));
+        }
+        persistence
+            .validate_binding(&world)
+            .map_err(HostCoreBuildError::from)?;
+        if persistence.has_pending_batch() || persistence.last_admitted_tick().is_some() {
+            return Err(checkpoint_error(
+                "persistence.continuation",
+                "sink session is not freshly bound",
+            ));
+        }
+        let actual_science = world.capture_checkpoint_quiescent()?;
+        let actual_continuity = world.capture_host_continuity_v1(&actual_science)?;
+        if actual_science.encode()? != state.world_bytes
+            || serde_json::to_vec(&actual_continuity).map_err(|error| {
+                checkpoint_error("world.continuity.encode", error.to_string())
+            })? != serde_json::to_vec(&state.continuity).map_err(|error| {
+                checkpoint_error("checkpoint.continuity.encode", error.to_string())
+            })?
+        {
+            return Err(checkpoint_error(
+                "world.continuation",
+                "world or raw host continuity differs from artifact",
+            ));
+        }
+        let schedule = match (&state.schedule, resolver) {
+            (Some(remaining), Some(resolve)) => Some(ScheduledConfigQueue {
+                remaining: remaining.iter().cloned().collect(),
+                resolve,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(checkpoint_error(
+                    "schedule.resolver",
+                    "prepared resolver does not match captured schedule",
+                ));
+            }
+        };
+        persistence
+            .restore_admission_cursor(&world, state.persistence_last_admitted_tick)
+            .map_err(HostCoreBuildError::from)?;
+        let mut host = Self::with_journal_and_persistence(
+            checkpoint.session_id(),
+            world,
+            state.options,
+            journal,
+            persistence,
+        )?;
+        host.events.restore_checkpoint(&state.events)?;
+        host.restore_checkpoint_observers(state);
+        host.schedule = schedule;
+        host.scheduled_patches = Arc::new(state.scheduled_patches.clone());
+        host.playback = state.playback;
+        host.health = state.health.clone();
+        host.revisions = state.revisions;
+        host.cadence_credit = state.cadence_credit;
+        host.last_now = state.clock_initialized.then_some(now);
+        host.next_journal_sequence = state
+            .cut
+            .last_journal_sequence
+            .checked_add(1)
+            .ok_or_else(|| checkpoint_error("journal.sequence", "journal cursor exhausted"))?;
+        host.next_lifecycle_command_sequence = state.next_lifecycle_command_sequence;
+        host.last_arrival = state.last_arrival;
+        Ok(host)
+    }
+
+    fn restore_checkpoint_observers(&mut self, state: &HostCheckpointStateV1) {
+        {
+            let mut shared = self.shared.borrow_mut();
+            shared.next_admission = state.next_admission;
+            shared.next_event = state.next_protocol_event;
+            shared.next_audit_order = state.next_audit_order;
+            shared.last_applied = state.last_applied;
+            shared.visible_boundary = state.visible_boundary;
+            shared.events = state.protocol_events.iter().cloned().collect();
+            shared.commands = state
+                .commands
+                .iter()
+                .cloned()
+                .map(|authority| (authority.status.command_id(), authority))
+                .collect();
+            shared.archived_idempotency = state
+                .archived
+                .iter()
+                .cloned()
+                .map(|authority| (authority.status.command_id(), authority))
+                .collect();
+            shared.archived_order = state
+                .archived
+                .iter()
+                .map(|authority| authority.status.command_id())
+                .collect();
+        }
+        let snapshot = &state.snapshot;
+        self.snapshots = SnapshotHub::new(Arc::new(snapshot.clone()));
+        self.next_snapshot = state.next_snapshot;
+        self.last_published_scientific = state.last_published_scientific;
+        self.summary_history = Arc::clone(&snapshot.summary_history);
+        self.config = Arc::clone(&snapshot.config);
+        self.config_audit = Arc::clone(&snapshot.config_audit);
+        self.last_published_config = snapshot.revisions.config;
+        self.applied_interventions = Arc::clone(&snapshot.applied_interventions);
+        self.last_published_intervention_seq = snapshot
+            .applied_interventions
+            .last()
+            .map_or(0, |record| record.seq);
+        self.latest_completed_summary = state.latest_completed_summary.clone();
+        self.step_traces = state.step_traces.iter().cloned().collect();
+        self.snapshot_layers = SnapshotLayerCache {
+            revisions: snapshot.layers.revisions,
+            terrain: Arc::clone(&snapshot.layers.terrain),
+            food: Arc::clone(&snapshot.layers.food),
+            hydrology: snapshot.layers.hydrology.as_ref().map(Arc::clone),
+        };
     }
 
     /// Capture focused inspector data without sharing the world or its evaluator.
@@ -4208,7 +5140,7 @@ impl HostCore {
         // The request is consumed only when the completed persistence batch is ready.
         self.refresh_open_genesis_origins();
         self.world.request_replay_world_digest();
-        let completion = match self.persistence.step_outcome(&mut self.world) {
+        let completion = match self.step_world_outcome() {
             Ok(completion) => completion,
             Err(error) => {
                 let blocked = self.complete_failed(
@@ -4618,7 +5550,7 @@ impl HostCore {
             .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
         self.refresh_open_genesis_origins();
         self.world.request_replay_world_digest();
-        let completion = match self.persistence.step_outcome(&mut self.world) {
+        let completion = match self.step_world_outcome() {
             Ok(completion) => completion,
             Err(error) => {
                 self.latched_fault = Some(HostFault::Scientific {
@@ -4691,6 +5623,25 @@ impl HostCore {
         Ok(ApplyResult::science(
             blocked || self.latched_fault.is_some(),
         ))
+    }
+
+    fn step_world_outcome(
+        &mut self,
+    ) -> Result<scriptbots_core::StepCompletion, scriptbots_core::WorldStepError> {
+        if self.options.trace_history_capacity == 0 {
+            return self.persistence.step_outcome(&mut self.world);
+        }
+        let mut tracer = WorldStepTracer::default();
+        let completion = self
+            .persistence
+            .step_traced_outcome(&mut self.world, &mut tracer);
+        if let Some(trace) = tracer.latest() {
+            if self.step_traces.len() == self.options.trace_history_capacity {
+                self.step_traces.pop_front();
+            }
+            self.step_traces.push_back(trace.clone());
+        }
+        completion
     }
 
     fn automatic_budget(&mut self, elapsed_nanos: u64, speed_multiplier: f32) -> AutomaticBudget {
@@ -4948,6 +5899,11 @@ impl ApplyResult {
 }
 
 fn validate_options(options: HostCoreOptions) -> Result<(), HostCoreBuildError> {
+    if options.trace_history_capacity > MAX_HOST_CHECKPOINT_ENTRIES {
+        return Err(HostCoreBuildError::InvalidOptions {
+            message: "trace_history_capacity exceeds the fixed host checkpoint bound".to_owned(),
+        });
+    }
     if options.command_capacity == 0 {
         return Err(HostCoreBuildError::InvalidOptions {
             message: "command_capacity must be nonzero".to_owned(),
@@ -5056,6 +6012,427 @@ mod tests {
             ..ScriptBotsConfig::default()
         })
         .expect("deterministic test world")
+    }
+
+    fn continuation_world() -> WorldState {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: 1,
+            closed: true,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            narrative_interval: 1,
+            history_capacity: 16,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("nonempty continuation world");
+        for _ in 0..3 {
+            world
+                .try_spawn_agent(AgentData::default())
+                .expect("real founder");
+        }
+        world.set_resource_ledger_enabled(true);
+        world
+    }
+
+    fn continuation_owner(session: u64) -> HostCore {
+        let mut options = options(true);
+        options.trace_history_capacity = 2;
+        let mut owner = HostCore::new(HostSessionId::new(session), continuation_world(), options)
+            .expect("real continuation owner");
+        owner
+            .install_schedule(
+                vec![
+                    scheduled(1, 1, serde_json::json!({"food_max": 0.61})),
+                    scheduled(2, 3, serde_json::json!({"food_max": 0.72})),
+                ],
+                resolve_test_schedule,
+            )
+            .expect("real prepared schedule");
+        owner
+    }
+
+    fn settle_continuation_command(owner: &mut HostCore, envelope: CommandEnvelope, now: u64) {
+        let mut port = owner.local_port();
+        port.submit(envelope).expect("actual admitted command");
+        for offset in 0..4 {
+            owner
+                .drive(ManualInstant::from_nanos(now + offset))
+                .expect("actual manual owner drive");
+        }
+    }
+
+    fn assert_continued_owner_outputs(restored: &HostCore, oracle: &HostCore) {
+        assert_eq!(
+            restored.scientific_digest_v1().unwrap(),
+            oracle.scientific_digest_v1().unwrap()
+        );
+        assert_eq!(restored.world.config_audit(), oracle.world.config_audit());
+        assert_eq!(
+            restored.scheduled_patches.as_ref(),
+            oracle.scheduled_patches.as_ref()
+        );
+        assert_eq!(
+            restored.events.published_total(),
+            oracle.events.published_total()
+        );
+        assert_eq!(
+            restored.shared.borrow().next_admission,
+            oracle.shared.borrow().next_admission
+        );
+        assert_eq!(
+            restored.shared.borrow().next_event,
+            oracle.shared.borrow().next_event
+        );
+        assert_eq!(restored.next_journal_sequence, oracle.next_journal_sequence);
+    }
+
+    fn assert_retained_step_traces(checkpoint: &HostCheckpointV1, completed_steps: u64) {
+        let capacity = checkpoint.state.options.trace_history_capacity;
+        assert_eq!(
+            checkpoint.step_traces().len(),
+            usize::try_from(completed_steps).unwrap().min(capacity)
+        );
+        assert!(checkpoint.step_traces().iter().all(|trace| {
+            trace.validate_contract().is_ok()
+                && trace.stages.iter().all(|stage| {
+                    matches!(
+                        stage.capture,
+                        scriptbots_core::WorldStepTraceCapture::Complete { .. }
+                    )
+                })
+        }));
+    }
+
+    fn assert_continued_command_retry(restored: &mut HostCore, completed_steps: u64) {
+        let previous = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+        let cut = restored.next_journal_sequence;
+        let mut port = restored.local_port();
+        let replay = port.submit(previous).expect("exact old command retry");
+        assert!(matches!(replay.application(), ApplicationState::Applied(_)));
+        assert_eq!(restored.next_journal_sequence, cut);
+        assert_eq!(restored.world_tick(), Tick(completed_steps));
+        assert!(matches!(
+            port.submit(CommandEnvelope::new(CommandId::new(1), HostCommand::Resume)),
+            Err(HostAccessError::CommandIdCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn full_host_checkpoint_continues_nonempty_owner_schedule_counters_and_exact_retries() {
+        for completed_steps in [1_u64, 3] {
+            let mut original = continuation_owner(0xc013);
+            let mut oracle = continuation_owner(0xc013);
+            let spawn = CommandEnvelope::new(
+                CommandId::new(90),
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.5,
+                },
+            );
+            settle_continuation_command(&mut original, spawn.clone(), 1);
+            settle_continuation_command(&mut oracle, spawn, 1);
+            for sequence in 1..=completed_steps {
+                let envelope =
+                    CommandEnvelope::new(CommandId::new(u128::from(sequence)), HostCommand::Step);
+                settle_continuation_command(&mut original, envelope.clone(), sequence * 10);
+                settle_continuation_command(&mut oracle, envelope, sequence * 10);
+            }
+            let checkpoint = original
+                .capture_host_checkpoint_v1()
+                .expect("actual settled host cut");
+            assert_eq!(checkpoint.tick(), Tick(completed_steps));
+            assert_eq!(checkpoint.world_checkpoint().agent_count(), 4);
+            assert_eq!(
+                checkpoint.state.revisions.scientific.get(),
+                completed_steps + 1
+            );
+            assert!(checkpoint.has_schedule());
+            assert_retained_step_traces(&checkpoint, completed_steps);
+            assert_eq!(
+                checkpoint.state.scheduled_patches.len(),
+                usize::from(completed_steps > 1)
+            );
+            let wire = checkpoint.encode().expect("bounded owner encoding");
+            let decoded = HostCheckpointV1::decode(&wire).expect("full owner decoding");
+            assert_eq!(decoded.encode().expect("canonical re-encoding"), wire);
+            let restored_world = decoded
+                .restore_world(scriptbots_core::BrainRegistry::new())
+                .expect("caller-prepared empty registry matches actual unbound founders");
+            let persistence = restored_world
+                .bind_persistence(Box::new(NullPersistence))
+                .expect("fresh real sink session");
+            let journal = original.journal;
+            assert_eq!(journal.continuation_cut(), Some(decoded.journal_cut()));
+            let mut restored = HostCore::restore_host_checkpoint_v1(
+                &decoded,
+                restored_world,
+                persistence,
+                journal,
+                Some(resolve_test_schedule),
+                ManualInstant::from_nanos(1_000),
+            )
+            .expect("actual retained journal continuation");
+            assert_eq!(
+                restored.latest_snapshot().as_ref(),
+                oracle.latest_snapshot().as_ref()
+            );
+            assert_eq!(
+                restored.events.genesis_origins(),
+                oracle.events.genesis_origins()
+            );
+            assert_eq!(restored.revisions, oracle.revisions);
+            assert_eq!(
+                restored.persistence.last_admitted_tick(),
+                Some(Tick(completed_steps))
+            );
+            assert_continued_command_retry(&mut restored, completed_steps);
+            let next = CommandEnvelope::new(CommandId::new(99), HostCommand::Step);
+            settle_continuation_command(&mut restored, next.clone(), 1_010);
+            settle_continuation_command(&mut oracle, next, completed_steps * 10 + 10);
+            assert_continued_owner_outputs(&restored, &oracle);
+            let after = restored
+                .capture_host_checkpoint_v1()
+                .expect("settled continued owner cut");
+            let uninterrupted = oracle.capture_host_checkpoint_v1().expect("actual oracle cut");
+            assert_eq!(after.step_traces(), uninterrupted.step_traces());
+            assert_eq!(
+                after.state.scheduled_patches.len(),
+                if completed_steps == 1 { 1 } else { 2 }
+            );
+            assert!(
+                after.journal_cut().last_journal_sequence
+                    > decoded.journal_cut().last_journal_sequence
+            );
+        }
+    }
+
+    #[test]
+    fn full_host_checkpoint_refuses_fresh_and_same_tick_advanced_journals() {
+        let mut original = continuation_owner(0xc014);
+        settle_continuation_command(
+            &mut original,
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            10,
+        );
+        let checkpoint = original.capture_host_checkpoint_v1().expect("settled cut");
+        let world = checkpoint
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        assert!(matches!(
+            HostCore::restore_host_checkpoint_v1(
+                &checkpoint,
+                world,
+                persistence,
+                Box::new(VolatileJournal::default()),
+                Some(resolve_test_schedule),
+                ManualInstant::from_nanos(100),
+            ),
+            Err(HostCheckpointError::Contract {
+                path: "journal.continuation",
+                ..
+            })
+        ));
+        let mut other = continuation_owner(0xc016);
+        settle_continuation_command(
+            &mut other,
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            10,
+        );
+        assert!(other.journal.continuation_cut().is_some());
+        let world = checkpoint
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        assert!(matches!(
+            HostCore::restore_host_checkpoint_v1(
+                &checkpoint,
+                world,
+                persistence,
+                other.journal,
+                Some(resolve_test_schedule),
+                ManualInstant::from_nanos(100),
+            ),
+            Err(HostCheckpointError::Contract {
+                path: "journal.continuation",
+                ..
+            })
+        ));
+        settle_continuation_command(
+            &mut original,
+            CommandEnvelope::new(CommandId::new(2), HostCommand::SetSpeed(2.0)),
+            20,
+        );
+        assert_eq!(original.world_tick(), checkpoint.tick());
+        assert_ne!(
+            original.journal.continuation_cut(),
+            Some(checkpoint.journal_cut())
+        );
+        let world = checkpoint
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        assert!(matches!(
+            HostCore::restore_host_checkpoint_v1(
+                &checkpoint,
+                world,
+                persistence,
+                original.journal,
+                Some(resolve_test_schedule),
+                ManualInstant::from_nanos(100),
+            ),
+            Err(HostCheckpointError::Contract {
+                path: "journal.continuation",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn full_host_checkpoint_rebases_clock_and_preserves_fractional_automatic_credit() {
+        let options = options(false);
+        let period = options.tick_period_nanos;
+        let fraction = period / 2;
+        let mut original = HostCore::new(HostSessionId::new(0xc017), continuation_world(), options)
+            .expect("actual automatic owner");
+        let mut oracle = HostCore::new(HostSessionId::new(0xc017), continuation_world(), options)
+            .expect("independent actual automatic owner");
+        let capture_at = period * 2 + fraction;
+        for owner in [&mut original, &mut oracle] {
+            owner.drive(ManualInstant::from_nanos(0)).unwrap();
+            owner.drive(ManualInstant::from_nanos(capture_at)).unwrap();
+            owner.drive(ManualInstant::from_nanos(capture_at)).unwrap();
+        }
+        let checkpoint = original
+            .capture_host_checkpoint_v1()
+            .expect("actual automatic cut");
+        assert_eq!(checkpoint.tick(), Tick(2));
+        assert_eq!(
+            checkpoint.state.cadence_credit,
+            u128::from(fraction) * SPEED_SCALE
+        );
+        let world = checkpoint
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        let rebased = 1_000;
+        let mut restored = HostCore::restore_host_checkpoint_v1(
+            &checkpoint,
+            world,
+            persistence,
+            original.journal,
+            None,
+            ManualInstant::from_nanos(rebased),
+        )
+        .expect("actual automatic continuation");
+        for offset in [fraction - 1, fraction] {
+            let resumed = restored
+                .drive(ManualInstant::from_nanos(rebased + offset))
+                .unwrap();
+            let uninterrupted = oracle
+                .drive(ManualInstant::from_nanos(capture_at + offset))
+                .unwrap();
+            assert_eq!(resumed.scientific_steps, uninterrupted.scientific_steps);
+            assert_eq!(resumed.automatic_steps_due, uninterrupted.automatic_steps_due);
+            assert_eq!(resumed.scientific_steps, usize::from(offset == fraction));
+            assert_eq!(
+                restored.scientific_digest_v1().unwrap(),
+                oracle.scientific_digest_v1().unwrap()
+            );
+        }
+        restored
+            .drive(ManualInstant::from_nanos(rebased + fraction))
+            .unwrap();
+        oracle
+            .drive(ManualInstant::from_nanos(capture_at + fraction))
+            .unwrap();
+        assert_eq!(
+            restored.capture_host_checkpoint_v1().unwrap().journal_cut(),
+            oracle.capture_host_checkpoint_v1().unwrap().journal_cut()
+        );
+    }
+
+    #[test]
+    fn full_host_checkpoint_refuses_pending_commands_receipts_shutdown_and_corrupt_wires() {
+        let mut owner = continuation_owner(0xc015);
+        let envelope = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+        owner.local_port().submit(envelope).unwrap();
+        assert!(matches!(
+            owner.capture_host_checkpoint_v1(),
+            Err(HostCheckpointError::Busy {
+                reason: HostCheckpointBusy::Commands,
+            })
+        ));
+        owner.drive(ManualInstant::from_nanos(10)).unwrap();
+        assert!(matches!(
+            owner.capture_host_checkpoint_v1(),
+            Err(HostCheckpointError::Busy {
+                reason: HostCheckpointBusy::Journal,
+            })
+        ));
+        owner.drive(ManualInstant::from_nanos(11)).unwrap();
+        let checkpoint = owner
+            .capture_host_checkpoint_v1()
+            .expect("genuine settled positive");
+        let bytes = checkpoint.encode().unwrap();
+        for length in [0, bytes.len() / 2, bytes.len() - 1] {
+            assert!(HostCheckpointV1::decode(&bytes[..length]).is_err());
+        }
+        let wire: HostCheckpointWireV1 = postcard::from_bytes(&bytes).unwrap();
+        for (schema, version) in [
+            ("foreign.owner", HOST_CHECKPOINT_V1_CODEC_VERSION),
+            (
+                HOST_CHECKPOINT_V1_SCHEMA,
+                HOST_CHECKPOINT_V1_CODEC_VERSION + 1,
+            ),
+        ] {
+            let changed = HostCheckpointWireV1 {
+                schema: schema.to_owned(),
+                codec_version: version,
+                codec: wire.codec.clone(),
+                payload: wire.payload.clone(),
+                payload_blake3: wire.payload_blake3,
+            };
+            assert!(HostCheckpointV1::decode(&postcard::to_allocvec(&changed).unwrap()).is_err());
+        }
+        let mut corrupt: HostCheckpointWireV1 = postcard::from_bytes(&bytes).unwrap();
+        corrupt.payload[0] ^= 1;
+        assert!(matches!(
+            HostCheckpointV1::decode(&postcard::to_allocvec(&corrupt).unwrap()),
+            Err(HostCheckpointError::Contract {
+                path: "payload.hash",
+                ..
+            })
+        ));
+        let mut wrong_counter = checkpoint.clone();
+        wrong_counter.state.next_admission = AdmissionSequence::new(1);
+        assert!(wrong_counter.encode().is_err());
+        let mut wrong_trace = checkpoint.clone();
+        wrong_trace.state.step_traces[0].stages.swap(0, 1);
+        assert!(matches!(
+            wrong_trace.encode(),
+            Err(HostCheckpointError::Contract {
+                path: "traces.contract",
+                ..
+            })
+        ));
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(CommandId::new(2), HostCommand::Shutdown),
+            20,
+        );
+        assert_eq!(owner.lifecycle, HostLifecycle::Stopped);
+        assert!(matches!(
+            owner.capture_host_checkpoint_v1(),
+            Err(HostCheckpointError::Contract {
+                path: "owner.quiescence",
+                ..
+            })
+        ));
+        assert!(owner.journal.continuation_cut().is_none());
     }
 
     fn snapshot_map_artifacts(world: &WorldState) -> (MapArtifact, MapArtifact, MapArtifact) {
@@ -5175,6 +6552,7 @@ mod tests {
             genesis_origin_capacity: 16_384,
             volatile_event_history_capacity: 512,
             capture_agent_visuals: false,
+            trace_history_capacity: 0,
         }
     }
 
