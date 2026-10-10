@@ -13,7 +13,7 @@ verify_evidence() {
     local required=(formatting fsqlite-pin franken-licenses asupersync-universe wasm-graph)
     case "$lane" in
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
-        terminal) required+=(frankentui-metadata workspace-check workspace-clippy terminal-runtime-tests terminal-unit-tests terminal-end-to-end-tests terminal-smoke-tests) ;;
+        terminal) required+=(frankentui-metadata workspace-check workspace-clippy terminal-runtime-tests terminal-unit-tests terminal-end-to-end-tests terminal-smoke-tests terminal-manifest-tests) ;;
         connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests sensing-manifest-tests manifest-storage-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
         tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli) ;;
         tournament-smoke-and-analytics) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli analytics-pipeline) ;;
@@ -583,12 +583,15 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         ;;
     terminal)
         run_step frankentui-metadata check cargo metadata --locked --format-version 1
+        # Report independent lint failures together before repeating compiler-only work.
+        # Keep every target and strict warning policy; a failed lint still stops the lane.
+        run_step workspace-clippy check cargo clippy --locked --workspace --all-targets --keep-going -- -D warnings
         run_step workspace-check check cargo check --locked --workspace --all-targets
-        run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
         run_step terminal-runtime-tests test cargo test --locked -p scriptbots-runtime --lib -- --nocapture
         run_step terminal-unit-tests test cargo test --locked -p scriptbots-app --lib terminal:: -- --nocapture
         run_step terminal-end-to-end-tests test cargo test --locked -p scriptbots-app --test terminal_end_to_end -- --nocapture
         run_step terminal-smoke-tests test cargo test --locked -p scriptbots-app --test terminal_smoke -- --nocapture
+        run_step terminal-manifest-tests test cargo test --locked -p scriptbots-app --test run_manifest_emitted -- --nocapture
         ;;
     connectivity)
         # Fold into bd-2z0.19's composed acceptance when bounded retention is delivered.

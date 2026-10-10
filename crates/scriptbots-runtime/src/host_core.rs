@@ -5246,7 +5246,7 @@ mod tests {
         };
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].event.tick, Tick(1));
-        assert!(page.events[0].event.boundary.births().is_empty());
+        assert_eq!(page.events[0].event.boundary.births(), []);
         assert_eq!(page.events[0].event.boundary.summary().births, 0);
         assert_eq!(
             core.scientific_digest_v1().expect("owner science digest"),
