@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::{Ordering, Reverse},
     collections::{HashMap, VecDeque},
     f32::consts::{PI, TAU},
@@ -361,6 +361,7 @@ struct LiveTerminalModel<'a> {
     app: RefCell<TerminalApp<'a>>,
     widgets: RefCell<Terminal<ratatui::backend::TestBackend>>,
     presentation: Arc<TerminalPresentationObserver>,
+    pointer_frame_presented: Cell<bool>,
     failure: RefCell<Option<anyhow::Error>>,
     service_generation: u64,
     service_in_flight: Option<(frankentui_shell::ShellRoute, u64)>,
@@ -373,9 +374,18 @@ struct LiveTerminalModel<'a> {
 /// Observe the pinned runtime's successful presentation branch. An exhausted
 /// render budget reports zero presentation time; it cannot publish its candidate.
 struct TerminalPresentationObserver {
-    candidate: crate::servers::SharedPresentedFrame,
-    completed: crate::servers::SharedPresentedFrame,
+    candidate: arc_swap::ArcSwapOption<TerminalPresentation>,
+    completed: arc_swap::ArcSwapOption<TerminalPresentation>,
     presented: crate::servers::SharedPresentedFrame,
+}
+
+/// Pointer bindings describe the same candidate as the screenshot. Neither is
+/// available to a consumer until the runtime observes a successful presentation.
+struct TerminalPresentation {
+    frame: Arc<crate::servers::PresentedTerminalFrame>,
+    hit_regions: HitRegionMap,
+    map_area: Option<Rect>,
+    body_width: u16,
 }
 
 impl FrameTimingSink for TerminalPresentationObserver {
@@ -385,7 +395,7 @@ impl FrameTimingSink for TerminalPresentationObserver {
         {
             // A successful sub-microsecond write is conservatively left
             // uncaptured: zero time does not distinguish it from a skipped write.
-            self.presented.store(Some(frame.clone()));
+            self.presented.store(Some(frame.frame.clone()));
             self.completed.store(Some(frame));
         }
     }
@@ -400,14 +410,15 @@ impl<'a> LiveTerminalModel<'a> {
             });
         let lineage = LiveLineages::new(app.client.event_cursor());
         let presentation = Arc::new(TerminalPresentationObserver {
-            candidate: Arc::new(arc_swap::ArcSwapOption::empty()),
-            completed: Arc::new(arc_swap::ArcSwapOption::empty()),
+            candidate: arc_swap::ArcSwapOption::empty(),
+            completed: arc_swap::ArcSwapOption::empty(),
             presented: app.presented_frame.clone(),
         });
         Ok(Self {
             app: RefCell::new(app),
             widgets: RefCell::new(Terminal::new(ratatui::backend::TestBackend::new(80, 24))?),
             presentation,
+            pointer_frame_presented: Cell::new(false),
             failure: RefCell::new(None),
             service_generation: 0,
             service_in_flight: None,
@@ -419,10 +430,12 @@ impl<'a> LiveTerminalModel<'a> {
     }
 
     fn fail(&self, error: anyhow::Error) -> Cmd<LiveTerminalMessage> {
-        self.app
-            .borrow_mut()
-            .frankentui
-            .on_error(&error.to_string());
+        self.pointer_frame_presented.set(false);
+        let mut app = self.app.borrow_mut();
+        app.hit_regions = HitRegionMap::default();
+        app.map_area = None;
+        app.pointer_gesture.cancel("terminal runtime failed");
+        app.frankentui.on_error(&error.to_string());
         if self.failure.borrow().is_none() {
             *self.failure.borrow_mut() = Some(error);
         }
@@ -430,8 +443,13 @@ impl<'a> LiveTerminalModel<'a> {
     }
 
     fn acknowledge_presentation(&self) {
-        if let Some(frame) = self.presentation.completed.swap(None) {
+        if let Some(presentation) = self.presentation.completed.swap(None) {
             let mut app = self.app.borrow_mut();
+            app.hit_regions = presentation.hit_regions.clone();
+            app.map_area = presentation.map_area;
+            app.body_width = presentation.body_width;
+            self.pointer_frame_presented.set(true);
+            let frame = &presentation.frame;
             let tick = frame.tick;
             if app.export_requested() {
                 match app.write_frame_export(&frame.buffer, tick) {
@@ -486,6 +504,12 @@ impl Model for LiveTerminalModel<'_> {
             let mut app = self.app.borrow_mut();
             match message {
                 LiveTerminalMessage::Event(event) => {
+                    if matches!(&event, ftui::core::event::Event::Mouse(_))
+                        && !self.pointer_frame_presented.get()
+                    {
+                        app.pointer_gesture.cancel("frame was not presented");
+                        return Cmd::none();
+                    }
                     let mut consumed_refresh = false;
                     if let ftui::core::event::Event::Key(key) = &event
                         && key.kind == ftui::core::event::KeyEventKind::Press
@@ -558,7 +582,12 @@ impl Model for LiveTerminalModel<'_> {
     }
 
     fn view(&self, frame: &mut ftui::render::frame::Frame) {
+        self.pointer_frame_presented.set(false);
         let mut app = self.app.borrow_mut();
+        // Every candidate must derive its bindings anew, including tiny frames
+        // where a modal returns before it can paint any rows.
+        app.hit_regions = HitRegionMap::default();
+        app.map_area = None;
         let mut widgets = self.widgets.borrow_mut();
         let area = Rect::new(0, 0, frame.width(), frame.height());
         // Terminal::draw reads the backend size during autoresize. Resize both
@@ -573,9 +602,14 @@ impl Model for LiveTerminalModel<'_> {
         app.last_draw = Instant::now();
         self.presentation
             .candidate
-            .store(Some(Arc::new(crate::servers::PresentedTerminalFrame {
-                tick: app.snapshot.tick,
-                buffer: buffer.clone(),
+            .store(Some(Arc::new(TerminalPresentation {
+                frame: Arc::new(crate::servers::PresentedTerminalFrame {
+                    tick: app.snapshot.tick,
+                    buffer: buffer.clone(),
+                }),
+                hit_regions: std::mem::take(&mut app.hit_regions),
+                map_area: app.map_area.take(),
+                body_width: app.body_width,
             })));
     }
 
@@ -16379,11 +16413,17 @@ for case in ('panic', 'subscription', 'renderer'):
         let mut simulator = ftui::runtime::ProgramSimulator::new(model);
         for (index, uid) in founder_uids.iter().enumerate() {
             simulator.send(LiveTerminalMessage::Refresh);
-            let frame = simulator.capture_frame(120, 36);
-            assert!(
-                frankentui_shell::buffer_to_string(frame).contains(&format!(" > {uid:<16}")),
-                "every retained founder must be visibly selectable, including index {index}"
-            );
+            for height in [14, 16, 36] {
+                let text = frankentui_shell::buffer_to_string(simulator.capture_frame(120, height));
+                let selected_row = text
+                    .lines()
+                    .position(|line| line.contains(&format!(" > {uid:<16}")))
+                    .expect("every retained founder survives the actual shell footer");
+                assert!(
+                    selected_row < usize::from(height - frankentui_shell::SHELL_FOOTER_ROWS),
+                    "founder {index} must fit the actual content height {height}"
+                );
+            }
             assert_eq!(
                 simulator
                     .model()
@@ -16643,6 +16683,20 @@ for case in ('panic', 'subscription', 'renderer'):
         }
     }
 
+    // Simulator frames do not reach a terminal writer. Inject the timing sink's
+    // callback explicitly to distinguish presented and skipped candidate branches.
+    fn simulator_presentation_callback(model: &LiveTerminalModel<'_>, present_us: u64) {
+        model.presentation.record_frame(&FrameTiming {
+            frame_idx: 0,
+            update_us: 0,
+            render_us: 1,
+            diff_us: 1,
+            present_us,
+            total_us: 2,
+        });
+        model.acknowledge_presentation();
+    }
+
     #[test]
     fn live_model_navigation_uses_science_views_and_preserves_legacy_widgets() {
         use frankentui_shell::ShellRoute;
@@ -16687,6 +16741,7 @@ for case in ('panic', 'subscription', 'renderer'):
             ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char('1')),
         ));
         simulator.capture_frame(120, 36);
+        simulator_presentation_callback(simulator.model(), 1);
         let app = simulator.model().app.borrow();
         let text =
             export::buffer_to_plain_text(simulator.model().widgets.borrow().backend().buffer());
@@ -16708,6 +16763,7 @@ for case in ('panic', 'subscription', 'renderer'):
             LiveTerminalModel::new(app).expect("live terminal model"),
         );
         simulator.capture_frame(240, 36);
+        simulator_presentation_callback(simulator.model(), 1);
         let mut app = simulator.model().app.borrow_mut();
         let pause_target = app
             .hit_regions
@@ -16765,6 +16821,16 @@ for case in ('panic', 'subscription', 'renderer'):
                 LiveTerminalModel::new(app).expect("actual live palette model"),
             );
             let text = frankentui_shell::buffer_to_string(simulator.capture_frame(width, height));
+            assert!(
+                simulator
+                    .model()
+                    .app
+                    .borrow()
+                    .hit_regions
+                    .palette_rect
+                    .is_none()
+            );
+            simulator_presentation_callback(simulator.model(), 1);
             let (row, column) = text
                 .lines()
                 .enumerate()
@@ -16818,6 +16884,7 @@ for case in ('panic', 'subscription', 'renderer'):
             }
             let refreshed =
                 frankentui_shell::buffer_to_string(simulator.capture_frame(width, height));
+            simulator_presentation_callback(simulator.model(), 1);
             assert_eq!(
                 refreshed
                     .lines()
@@ -16853,6 +16920,137 @@ for case in ('panic', 'subscription', 'renderer'):
             assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
             assert_eq!(host.port().world_digests().expect("owner digests"), before);
         }
+    }
+
+    #[test]
+    fn skipped_palette_candidate_cannot_install_unshown_mouse_action() {
+        use ftui::core::event::{Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+
+        let host = TerminalTestHost::take(command_characterization_world());
+        let before = host.port().world_digests().expect("initial owner digests");
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(frankentui_shell::ShellRoute::Replay);
+        app.palette_open = true;
+        app.palette_query = "Open Lineages".into();
+        let mut simulator = ftui::runtime::ProgramSimulator::new(
+            LiveTerminalModel::new(app).expect("live palette model"),
+        );
+        let shown = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        let (row, column) = shown
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find("> [Navigation] Open Lineages")
+                    .map(|column| (row, column))
+            })
+            .expect("the prior candidate actually contains the distinct Lineages action");
+        let row = u16::try_from(row).expect("actual palette row");
+        let column = u16::try_from(column).expect("actual palette column");
+        simulator_presentation_callback(simulator.model(), 1);
+        let last_presented = simulator
+            .model()
+            .app
+            .borrow()
+            .presented_frame
+            .load_full()
+            .expect("simulated successful presentation");
+        for _ in 0.."Open Lineages".len() {
+            simulator.inject_event(Event::Key(KeyEvent::new(KeyCode::Backspace)));
+        }
+        for character in "Open Diagnostics".chars() {
+            simulator.inject_event(Event::Key(KeyEvent::new(KeyCode::Char(character))));
+        }
+        let unshown = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(
+            unshown.lines().nth(usize::from(row)).is_some_and(|line| {
+                line.find("> [Navigation] Open Diagnostics") == Some(usize::from(column))
+            }),
+            "the skipped candidate changes the action at the same painted coordinates"
+        );
+        simulator_presentation_callback(simulator.model(), 0);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            simulator.inject_event(Event::Mouse(MouseEvent::new(kind, column, row)));
+        }
+        {
+            let app = simulator.model().app.borrow();
+            assert!(
+                app.palette_open,
+                "unshown rows cannot execute a mouse action"
+            );
+            assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::Replay);
+            assert!(app.frankentui.receipts.is_empty());
+            assert!(Arc::ptr_eq(
+                &app.presented_frame.load_full().expect("last shown frame"),
+                &last_presented,
+            ));
+        }
+        simulator.capture_frame(120, 36);
+        simulator_presentation_callback(simulator.model(), 1);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            simulator.inject_event(Event::Mouse(MouseEvent::new(kind, column, row)));
+        }
+        let app = simulator.model().app.borrow();
+        assert!(!app.palette_open, "the same row works after presentation");
+        assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::Diagnostics);
+        assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
+        assert_eq!(host.port().world_digests().expect("owner digests"), before);
+    }
+
+    #[test]
+    fn tiny_legacy_frame_cannot_reuse_prior_palette_mouse_bounds() {
+        use ftui::core::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+
+        let host = TerminalTestHost::take(command_characterization_world());
+        let before = host.port().world_digests().expect("initial owner digests");
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.palette_open = true;
+        app.palette_query = "Open Diagnostics".into();
+        let mut simulator = ftui::runtime::ProgramSimulator::new(
+            LiveTerminalModel::new(app).expect("actual legacy palette model"),
+        );
+        let shown = frankentui_shell::buffer_to_string(simulator.capture_frame(64, 24));
+        let (row, column) = shown
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find("> [Navigation] Open Diagnostics")
+                    .map(|column| (row, column))
+            })
+            .expect("the larger legacy frame actually paints the modal action");
+        let row = u16::try_from(row).expect("actual modal row");
+        let column = u16::try_from(column).expect("actual modal column");
+        assert!(row < 9, "old bounds overlap the next tiny viewport");
+        simulator_presentation_callback(simulator.model(), 1);
+        let tiny = frankentui_shell::buffer_to_string(simulator.capture_frame(64, 9));
+        assert!(!tiny.contains("[Navigation] Open Diagnostics"));
+        simulator_presentation_callback(simulator.model(), 1);
+        {
+            let app = simulator.model().app.borrow();
+            assert!(app.hit_regions.palette_rect.is_none());
+            assert!(app.hit_regions.palette_items.is_empty());
+        }
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            simulator.inject_event(Event::Mouse(MouseEvent::new(kind, column, row)));
+        }
+        let app = simulator.model().app.borrow();
+        assert!(app.palette_open);
+        assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::Dashboard);
+        assert!(app.frankentui.receipts.is_empty());
+        assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
+        assert_eq!(host.port().world_digests().expect("owner digests"), before);
     }
 
     #[test]
@@ -16960,7 +17158,7 @@ for case in ('panic', 'subscription', 'renderer'):
             .expect("painted candidate");
         // Metadata must describe the painted frame even if a later observation
         // advances before the presentation acknowledgement is consumed.
-        simulator.model().app.borrow_mut().snapshot.tick = painted.tick + 1;
+        simulator.model().app.borrow_mut().snapshot.tick = painted.frame.tick + 1;
         simulator.model().presentation.record_frame(&FrameTiming {
             frame_idx: 0,
             update_us: 0,
@@ -16972,8 +17170,12 @@ for case in ('panic', 'subscription', 'renderer'):
         simulator.model().acknowledge_presentation();
         let app = simulator.model().app.borrow();
         let presented = app.presented_frame.load_full().expect("acknowledged frame");
-        assert_eq!(presented.tick, painted.tick);
-        assert_eq!(presented.buffer, painted.buffer);
+        assert_eq!(presented.tick, painted.frame.tick);
+        assert_eq!(presented.buffer, painted.frame.buffer);
+        assert!(
+            app.map_area.is_some(),
+            "acknowledged pointer bounds are installed"
+        );
         drop(app);
         simulator.capture_frame(80, 24);
         simulator.model().presentation.record_frame(&FrameTiming {
@@ -16985,6 +17187,16 @@ for case in ('panic', 'subscription', 'renderer'):
             total_us: 1,
         });
         assert!(simulator.model().presentation.candidate.load().is_none());
+        assert!(!simulator.model().pointer_frame_presented.get());
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .hit_regions
+                .map_rect
+                .is_none()
+        );
         assert!(Arc::ptr_eq(
             &simulator
                 .model()

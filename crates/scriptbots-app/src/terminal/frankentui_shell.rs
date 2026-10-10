@@ -36,6 +36,9 @@ pub fn print_to_frame(frame: &mut Frame, x: u16, y: u16, text: &str) {
 /// Maximum number of receipts retained in the shell history.
 pub(super) const MAX_RECEIPTS: usize = 32;
 
+/// Divider and status rows reserved below science screen content.
+pub(super) const SHELL_FOOTER_ROWS: u16 = 2;
+
 /// Maximum number of effects awaiting the live adapter. Overflow rejects the
 /// new intent without discarding any previously queued work.
 const MAX_PENDING_EFFECTS: usize = 32;
@@ -1507,8 +1510,8 @@ impl Model for FrankenTuiModel {
         }
 
         // 3. Footer Status and Capability Bar
-        if height > 2 {
-            print_to_frame(frame, 0, height - 2, &divider);
+        if height > SHELL_FOOTER_ROWS {
+            print_to_frame(frame, 0, height - SHELL_FOOTER_ROWS, &divider);
         }
         if height > 1 {
             let status_row = height - 1;

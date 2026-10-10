@@ -13,7 +13,7 @@ verify_evidence() {
     local required=(formatting fsqlite-pin franken-licenses asupersync-universe wasm-graph)
     case "$lane" in
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
-        terminal) required+=(workspace-check workspace-clippy terminal-runtime-tests terminal-unit-tests terminal-end-to-end-tests terminal-smoke-tests) ;;
+        terminal) required+=(frankentui-metadata workspace-check workspace-clippy terminal-runtime-tests terminal-unit-tests terminal-end-to-end-tests terminal-smoke-tests) ;;
         connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests sensing-manifest-tests manifest-storage-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
         tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli) ;;
         tournament-smoke-and-analytics) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli analytics-pipeline) ;;
@@ -63,6 +63,17 @@ verify_evidence() {
     [[ $(head -n 1 "$directory/source.txt") == "commit $expected" ]] || refuse "source record mismatch"
     [[ $(sed -n 's/^host: //p' "$directory/rustc.txt") == "$target" ]] || refuse "compiler target mismatch"
     if [[ "$lane" == terminal ]]; then
+        jq -R -s -e '
+            split("\n") | map(fromjson? | select(type == "object" and has("packages") and has("resolve")))
+            | length == 1 and (.[0] as $metadata
+                | [$metadata.packages[] | select(.name == "ftui")] as $ftui
+                | [$metadata.packages[] | select(.name == "scriptbots-app")] as $app
+                | ($ftui | length) == 1 and ($app | length) == 1
+                and $ftui[0].version == "0.5.0"
+                and $ftui[0].source == "git+https://github.com/Dicklesworthstone/frankentui?rev=15cc6543f76b814394c590f9e7719dedd6684e4c#15cc6543f76b814394c590f9e7719dedd6684e4c"
+                and any($metadata.resolve.nodes[]; .id == $app[0].id
+                    and any(.deps[]; .name == "ftui" and .pkg == $ftui[0].id)))
+        ' "$directory/frankentui-metadata.log" >/dev/null || refuse "missing exact locked ftui source and application consumer"
         jq -R -s -e --arg source "$expected" '
             split("\n") | map(fromjson? | select(.schema == "scriptbots.live-tui-fault-pty.v1"))
             | length == 3 and ([.[].fault] | sort) == ["panic", "renderer", "subscription"]
@@ -375,6 +386,7 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step core-economy-faults test cargo test --locked -p scriptbots-core --features economy-faults -- --nocapture
         ;;
     terminal)
+        run_step frankentui-metadata check cargo metadata --locked --format-version 1
         run_step workspace-check check cargo check --locked --workspace --all-targets
         run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
         run_step terminal-runtime-tests test cargo test --locked -p scriptbots-runtime --lib -- --nocapture

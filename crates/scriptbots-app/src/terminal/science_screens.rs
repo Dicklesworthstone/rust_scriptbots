@@ -12,6 +12,7 @@
 //! `Error`, `Data`), supports keyboard navigation, preserves simulation digest neutrality,
 //! and renders to deterministic testable frame buffers.
 
+use super::frankentui_shell::SHELL_FOOTER_ROWS;
 use ftui::render::cell::Cell;
 use ftui::render::drawing::Draw;
 use ftui::render::frame::Frame;
@@ -413,8 +414,8 @@ impl ScienceScreensState {
 
 const SCIENCE_TABLE_ROWS: usize = 5;
 
-fn first_visible_table_index(selected_index: usize) -> usize {
-    selected_index.saturating_sub(SCIENCE_TABLE_ROWS - 1)
+fn first_visible_table_index(selected_index: usize, visible_rows: usize) -> usize {
+    selected_index.saturating_sub(visible_rows.saturating_sub(1))
 }
 
 fn observation_text<T>(value: Option<T>, format_value: impl FnOnce(T) -> String) -> String {
@@ -513,13 +514,14 @@ pub fn render_lineages_screen(
                         "  canonical arrivals/deaths through tick {observed_tick}; migration unobserved"
                     ),
                 );
-                let rows =
-                    (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+                let content_end = u32::from(frame.height().saturating_sub(SHELL_FOOTER_ROWS));
+                let rows = (y_start.saturating_add(7)..content_end).take(SCIENCE_TABLE_ROWS);
+                let visible_rows = rows.clone().count();
                 let founders = data
                     .founder_rows
                     .iter()
                     .enumerate()
-                    .skip(first_visible_table_index(data.selected_index));
+                    .skip(first_visible_table_index(data.selected_index, visible_rows));
                 for (row, (idx, founder)) in rows.zip(founders) {
                     let cursor = if idx == data.selected_index { ">" } else { " " };
                     let line = format!(
@@ -555,13 +557,14 @@ pub fn render_lineages_screen(
                 if data.clades.is_empty() {
                     print_text(frame, 6, y_start + 7, "(No clades segmented yet)");
                 } else {
-                    let rows = (y_start.saturating_add(7)..u32::from(frame.height()))
-                        .take(SCIENCE_TABLE_ROWS);
+                    let content_end = u32::from(frame.height().saturating_sub(SHELL_FOOTER_ROWS));
+                    let rows = (y_start.saturating_add(7)..content_end).take(SCIENCE_TABLE_ROWS);
+                    let visible_rows = rows.clone().count();
                     let clades = data
                         .clades
                         .iter()
                         .enumerate()
-                        .skip(first_visible_table_index(data.selected_index));
+                        .skip(first_visible_table_index(data.selected_index, visible_rows));
                     for (row, (idx, clade)) in rows.zip(clades) {
                         let cursor = if idx == data.selected_index { ">" } else { " " };
                         let diet_str = if clade.mean_diet < 0.35 {
@@ -652,13 +655,14 @@ pub fn render_brain_arena_screen(
             if data.family_breakdown.is_empty() {
                 print_text(frame, 6, y_start + 7, "(No family cohorts active)");
             } else {
-                let rows =
-                    (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+                let content_end = u32::from(frame.height().saturating_sub(SHELL_FOOTER_ROWS));
+                let rows = (y_start.saturating_add(7)..content_end).take(SCIENCE_TABLE_ROWS);
+                let visible_rows = rows.clone().count();
                 let cohorts = data
                     .family_breakdown
                     .iter()
                     .enumerate()
-                    .skip(first_visible_table_index(data.selected_family_index));
+                    .skip(first_visible_table_index(data.selected_family_index, visible_rows));
                 for (row, (idx, cohort)) in rows.zip(cohorts) {
                     let cursor = if idx == data.selected_family_index {
                         ">"
@@ -776,13 +780,14 @@ pub fn render_experiments_screen(
             if data.active_arms.is_empty() {
                 print_text(frame, 6, y_start + 7, "(No experiment arms defined)");
             } else {
-                let rows =
-                    (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+                let content_end = u32::from(frame.height().saturating_sub(SHELL_FOOTER_ROWS));
+                let rows = (y_start.saturating_add(7)..content_end).take(SCIENCE_TABLE_ROWS);
+                let visible_rows = rows.clone().count();
                 let arms = data
                     .active_arms
                     .iter()
                     .enumerate()
-                    .skip(first_visible_table_index(data.selected_arm_index));
+                    .skip(first_visible_table_index(data.selected_arm_index, visible_rows));
                 for (row, (idx, arm)) in rows.zip(arms) {
                     let cursor = if idx == data.selected_arm_index {
                         ">"
@@ -891,13 +896,14 @@ pub fn render_replay_screen(
                     "(No checkpoints recorded. Press [K] to create one)",
                 );
             } else {
-                let rows =
-                    (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+                let content_end = u32::from(frame.height().saturating_sub(SHELL_FOOTER_ROWS));
+                let rows = (y_start.saturating_add(7)..content_end).take(SCIENCE_TABLE_ROWS);
+                let visible_rows = rows.clone().count();
                 let checkpoints = data
                     .checkpoints
                     .iter()
                     .enumerate()
-                    .skip(first_visible_table_index(data.selected_checkpoint_index));
+                    .skip(first_visible_table_index(data.selected_checkpoint_index, visible_rows));
                 for (row, (idx, cp)) in rows.zip(checkpoints) {
                     let cursor = if idx == data.selected_checkpoint_index {
                         ">"
