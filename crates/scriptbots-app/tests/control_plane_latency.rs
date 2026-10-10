@@ -33,6 +33,7 @@ use scriptbots_runtime::{
 };
 
 const AGENT_COUNT: usize = 1_000;
+const LOAD_SPEED_MULTIPLIER: f32 = 8.0;
 const MEASURED_REQUESTS: usize = 200;
 const PHASE_SECONDS: u64 = 3;
 const LATENCY_P95_BUDGET: Duration = Duration::from_millis(50);
@@ -51,6 +52,9 @@ fn populated_world() -> WorldState {
     let mut world = WorldState::new(ScriptBotsConfig {
         rng_seed: Some(0xB134_1A7E),
         persistence_interval: 0,
+        // Production population maintenance fills this deficit after deaths on
+        // every successful tick, independently of scheduled population spawns.
+        population_minimum: AGENT_COUNT,
         ..ScriptBotsConfig::default()
     })
     .expect("latency world");
@@ -71,6 +75,32 @@ fn populated_world() -> WorldState {
         world.try_spawn_agent(agent).expect("spawn load agent");
     }
     world
+}
+
+#[test]
+fn latency_fixture_replenishes_its_minimum_after_deaths() {
+    for minimum in [0, AGENT_COUNT] {
+        let mut world = populated_world();
+        let mut config = world.config().clone();
+        config.population_minimum = minimum;
+        world.apply_config_update(config).expect("fixture minimum");
+        let agents: Vec<_> = world.agents().iter_handles().collect();
+        for id in agents {
+            assert!(
+                world
+                    .try_update_agent(id, |data, runtime| {
+                        data.health = 0.0;
+                        runtime.energy = 0.0;
+                    })
+                    .expect("doomed load agent")
+            );
+        }
+        world.step().expect("actual death and population stages");
+        let summary = world.history().next_back().expect("completed tick");
+        assert_eq!(summary.deaths, AGENT_COUNT);
+        assert_eq!(summary.agent_count, minimum);
+        assert_eq!(world.agents().len(), minimum);
+    }
 }
 
 /// Minimal blocking HTTP GET over a fresh connection; returns the whole
@@ -283,6 +313,9 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
     let world = populated_world();
     let initial_agent_count = world.agents().len();
     assert_eq!(initial_agent_count, AGENT_COUNT);
+    let population_minimum = world.config().population_minimum;
+    assert_eq!(population_minimum, AGENT_COUNT);
+    assert!(!world.config().closed, "production replenishment is enabled");
     let persistence = world
         .bind_persistence(Box::new(scriptbots_core::NullPersistence))
         .expect("persistence binding");
@@ -295,6 +328,10 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
             // A one-nanosecond requested period keeps the real owner under load;
             // its bounded catch-up policy still controls actual science work.
             tick_period_nanos: 1,
+            initial_playback: PlaybackSnapshot {
+                paused: false,
+                speed_multiplier: LOAD_SPEED_MULTIPLIER,
+            },
             ..HostCoreOptions::default()
         },
         ChannelHostOptions::default(),
@@ -451,11 +488,16 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
         serde_json::json!({
             "schema": "scriptbots.control-plane-latency.v1",
             "agent_count": initial_agent_count,
-            "agent_count_scope": "initial population; phase-boundary populations retained",
+            "agent_count_scope": "production minimum replenishment; phase-boundary populations retained",
+            "population_minimum": population_minimum,
             "baseline_start_agent_count": baseline_start.world.summary.agent_count,
             "baseline_end_agent_count": baseline_end.world.summary.agent_count,
             "loaded_start_agent_count": loaded_start_snapshot.world.summary.agent_count,
             "loaded_end_agent_count": loaded_end_snapshot.world.summary.agent_count,
+            "phase_host_health": [&baseline_start.health, &baseline_end.health,
+                &loaded_start_snapshot.health, &loaded_end_snapshot.health],
+            "phase_playback": [&baseline_start.playback, &baseline_end.playback,
+                &loaded_start_snapshot.playback, &loaded_end_snapshot.playback],
             "measured_requests": latencies.len(),
             "failed_requests": failures,
             "latencies_ns": latencies.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
@@ -475,6 +517,28 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
         failures, 0,
         "every latest-summary request must succeed under load"
     );
+    for snapshot in [
+        &baseline_start,
+        &baseline_end,
+        &loaded_start_snapshot,
+        &loaded_end_snapshot,
+    ] {
+        assert!(
+            snapshot.world.summary.agent_count >= population_minimum,
+            "measured phase lost its required active population: {:?}",
+            snapshot.world.summary
+        );
+        assert_eq!(snapshot.health, scriptbots_runtime::HostHealth::Healthy);
+        assert_eq!(snapshot.config.population_minimum, population_minimum);
+        assert!(!snapshot.config.closed);
+        assert_eq!(
+            snapshot.playback,
+            PlaybackSnapshot {
+                paused: false,
+                speed_multiplier: LOAD_SPEED_MULTIPLIER,
+            }
+        );
+    }
     assert!(
         baseline_ticks > 0 && loaded_ticks > 0,
         "both phases must observe actual science progress"
