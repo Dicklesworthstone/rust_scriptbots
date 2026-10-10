@@ -53,19 +53,27 @@ This document specifies the exact terminal stack modernization and FrankenTUI de
 
 ## 3. Current runtime and qualification
 
-- Source through `121a309c` stages bounded commands and checkpoint requests until their
+- Source through `b49008cc` stages bounded commands and checkpoint requests until their
   complete pending identity is visible in a successfully presented frame. Skipped frames,
   insufficient frame size and write failure cannot authorize dispatch. Quit and shutdown
   cancel requests that have not reached the owner.
+- Each own final result then requires its exact successful presentation before another
+  request dispatches. Active receipts are pinned against bounded-history eviction; actual
+  checkpoint catalog ID/tick details survive another queued `k` and reduced rendering.
+- Own palette Shutdown additionally requires the final journal observation before automatic
+  owner exit; overlapping attempts preserve each refusal/result and exact retry.
 - A wrapped pending label removes the covered pointer bindings and cancels an active
   gesture. Command/checkpoint presentation alternates when both queues have work.
 - The shared production and fault-probe configuration lets the existing governor select
   `EssentialOnly`; it retains the 16 ms budget and original skip policy. The reduced view
   identifies its quality level and preserves pending receipts.
-- Completed R24 at `c4011d52` passes formatting, dependency guards, all-target check,
-  strict Clippy, 218 runtime tests and 303 terminal tests. One actual PTY fault test fails
-  before its requested fault fires: 212 candidates render over budget and none presents.
-  This is failed native acceptance. New-source runtime-selected fallback and full terminal
-  execution remain pending; injected simulator callbacks do not prove terminal writes.
+- Completed R28 at `f2b0748a` passes formatting, dependency guards, all-target check,
+  strict Clippy, 218 runtime tests and 309 terminal tests. All three actual fault PTYs
+  select reduced detail, positively present, trigger their fault and restore. The executable
+  observer then fails before app launch on builtin Python module identity. R32 fails formatting
+  and R34 fails Clippy with zero tests. Current observer and receipt repairs require fresh
+  complete native acceptance; injected simulator callbacks do not prove terminal writes.
+- Linux/unwind production-stack test children do not establish release-abort recovery or
+  the separate full storm/TERM/locale/color/signal matrix under `bd-2z0.14.3.5.2`.
 - [The current reality check](../REALITY_CHECK_2026-09-03.md) keeps the granular TODO,
   exact proof identities and original acceptance owners. No source files were removed.

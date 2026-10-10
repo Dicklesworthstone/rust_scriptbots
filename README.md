@@ -143,8 +143,12 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - Interactive terminal mode now runs the pinned FrankenTUI `Program` with the actual
   simulation owner and shared control services. It preserves the existing map and inspector
   widgets and adds live lineage, brain-arena, experiment, replay, environment and diagnostic
-  views. Native terminal acceptance remains open under `bd-2z0.6.8` and `bd-dkd9`; the latest
-  completed lane passed 303 terminal tests and failed the actual PTY fault-readiness test.
+  views. Own commands and checkpoints require successful Pending presentation before dispatch
+  and exact final-result presentation before the next request; checkpoint details survive
+  reduced rendering and queued input. Native acceptance remains open under `bd-2z0.6.8` and
+  `bd-dkd9`. R28 passed 309 terminal tests and all three fault PTYs, then failed the executable
+  observer before app launch. The subsequent R34 stopped at a borrow error with zero tests;
+  repaired `b49008cc` requires fresh native qualification.
   See [the current implementation and TODO](REALITY_CHECK_2026-09-03.md) for exact revisions,
   retained evidence and remaining qualification.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.

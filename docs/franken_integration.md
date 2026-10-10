@@ -18,15 +18,19 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | `ftui` (frankentui) 0.5.0 | direct (`scriptbots-app`) | git rev `15cc6543f76b814394c590f9e7719dedd6684e4c` | `crossterm` | live Program/Model, shared science services and acknowledged receipts; retained Ratatui widgets; native acceptance open (`bd-2z0.6.8`, `bd-dkd9`) |
 | everything else (fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
 
-Terminal source reconciliation, **2026-10-10**, through `121a309c`: the actual interactive
+Terminal source reconciliation, **2026-10-10**, through `b49008cc`: the actual interactive
 consumer is FrankenTUI's `Program`; the existing Ratatui widgets render into its frames.
 Its Model connects the real lineage, arena, experiment, replay, environment and diagnostic
 providers. Pending requests require their own successful presentation before dispatch;
-application and durable journal observations remain distinct. Production and fault probes
+application and durable journal observations remain distinct. Each own final result is pinned
+until exact positive presentation before advancing; checkpoint metadata survives rapid input
+and reduced rendering. Production and fault probes
 allow the governor to reach the labeled `EssentialOnly` view with the unchanged 16 ms budget.
-The completed R24 proof at `c4011d52` fails actual PTY fault readiness after 303 passing
-terminal tests. New-source fallback timing and complete native acceptance are pending;
-simulator callbacks are branch fixtures. [The reality check](../REALITY_CHECK_2026-09-03.md)
+R28 at `f2b0748a` passes 309 terminal tests and all three actual fault PTYs, but its executable
+observer fails before app launch. R32 formatting and R34 Clippy failures run zero tests.
+The current repairs require fresh exact-source acceptance; simulator callbacks are branch
+fixtures and partial terminal proof does not qualify the dependency migration.
+[The reality check](../REALITY_CHECK_2026-09-03.md)
 retains the exact proof boundaries and outstanding work.
 
 ## 2. Verdicts (with the one-paragraph why)

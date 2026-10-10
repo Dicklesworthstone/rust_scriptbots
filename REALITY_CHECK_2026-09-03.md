@@ -10,7 +10,7 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-10
 
-The source changes through saved commit `b4f1989509c870223753b7002a7835d516e53e08`
+The source changes through saved commit `b49008cc6170b6032bd0fe3e30ebbb9ff2cbd22a`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
 consumer finding below describes the initial audited source, not this newer candidate.
@@ -24,11 +24,40 @@ failed/1, nine completed steps; outer DSR failed/6. Executable E2E, smoke, manif
 analyzer were not reached. Raw artifacts remain under
 `/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-c4011d52-r24-hz3`.
 
-The failed actual PTY fault test records 212 over-budget render candidates, all with zero
-presentation time. Construction/init complete, but the requested fault never fires. Source
-review found the adapter's `EssentialOnly` fallback unreachable under the pinned governor's
-default `SimpleBorders` floor. The shared production/fault-probe configuration now permits
-that quality level; its native timing and actual presentation are still unobserved.
+That failed R24 fault test records 212 over-budget render candidates, all with zero presentation
+time. The adapter's `EssentialOnly` fallback was unreachable under the pinned governor's default
+`SimpleBorders` floor. The shared production/fault configuration now permits that quality level
+with the unchanged budget and skip policy. R26 subsequently failed formatting before tests.
+
+R28 at `f2b0748a3c4208f423d9d6bf894835ad0347f74b` passes formatting, the five integration/metadata
+guards, strict all-target workspace Clippy and check, 218 runtime tests and 309 terminal tests.
+All three actual fault PTYs select `EssentialOnly`, positively present, observe their requested
+panic/subscription/renderer fault and restore terminals. This is Linux/unwind production-stack
+test-child evidence, not release-abort recovery. Runtime-selected degradation is observed at frame
+17 after sixteen zero-presentation frames. Renderer frame 16 takes 16,069,380 microseconds; its
+cause is untraced. Executable E2E has three passes and one failure: Python 3.14's builtin `fcntl`
+has no `__file__`, so its observer fails before app launch. Total: 530 passed, one failed, six
+existing ignored; typed failed/1, ten of fourteen steps complete. Smoke, manifests, analyzer and
+the final strict artifact consumer are not reached. All raw proof remains at
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-f2b0748a-r28-hz3`.
+
+`12fb5054` repairs Python code-carrier identity and whole-line JSON framing, adds actual checkpoint
+stream-order probes and makes own palette Shutdown wait for its exact final receipt presentation.
+R32 at that source fails formatting with zero tests. `69bdeb60` applies the exact native formatting
+diff; R34 then fails strict workspace Clippy with E0596 at `terminal/mod.rs:20261`, six of fourteen
+steps complete and zero tests run. Its complete proof is retained at
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-69bdeb60-r34-hz3`;
+Clippy log SHA256 is `5ace159221c6c6113dbd9aedf1f8151f8c0df543e012198630393c8f5ede21b9`.
+
+The current `b49008cc` fixes that borrow and the original-acceptance gap where a queued Pending
+overlay hid an earlier final result. One active request now retains its exact receipt through
+positive final presentation before the next request can dispatch. Bounded-history eviction pins
+that receipt; actual checkpoint catalog ID/tick content survives another queued `k` and reduced
+rendering. Independent source review finds no further material original terminal blocker.
+Source review and the static precursor scan (zero critical, 2,628 warnings, 575 informational)
+are not native qualification. Fresh R36 terminal and R37 workspace profiles are being prepared;
+R30/R31/R33/R35 were held and never launched. No original acceptance, golden, budget, timeout or
+strict artifact consumer was weakened.
 
 Checked items below name implementation or observations at their stated boundary. They do
 not close a containing Bead. This checklist answers the user's explicit request and retires
@@ -40,6 +69,8 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Restore saved commits by fast-forward after the external shared reset.
 - [x] Restore pending patch tree `3976100c` byte-identically before further manual edits.
 - [x] Recover newer Beads comments through a zero-conflict, zero-deletion 718-issue merge.
+- [x] Recover the external 13:40/13:50 resets by fast-forward; preserve source, tracker and raw
+  proofs outside the shared checkout, and move active edits into an independent checkout.
 - [x] Verify the active dependency graph has zero cycles.
 - [x] Repair the mailbox's observed unused-page corruption using a verified external copy;
   compare every table value and schema/column/index/foreign-key property before promotion,
@@ -51,7 +82,9 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Keep independent owner application and journal finality separate in receipts.
 - [x] Add a real file-backed receipt/application/durability/exact-retry/database-readback test
   at `b4f19895`; this test is not executed in R24.
-- [ ] Execute that new test natively and retain its actual phase/readback artifacts.
+- [x] Execute that file-backed test at R28 and retain actual Pending/application/journal-finality,
+  exact retry, changed-payload refusal and independent finished-database readback observations.
+- [ ] Execute it again at the final combined source.
 - [x] Stage bounded live commands until their exact pending identity is observed in a
   successfully presented candidate; poll/retry paths cannot bypass the barrier.
 - [x] Give checkpoint captures their own pending presentation barrier.
@@ -63,7 +96,23 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Preserve the reduced-detail qualifier when a pending footer covers the budget banner.
 - [x] Configure both production and fault probes to allow the same `EssentialOnly` fallback,
   keeping the default governor enabled, frame budget, skip policy and thresholds unchanged.
-- [ ] Observe actual Program-selected fallback and positive presentation in the native PTY.
+- [x] Observe actual Program-selected fallback and positive presentation in all three R28 fault
+  PTYs; retain the untraced renderer latency rather than explaining it without evidence.
+- [x] Repair builtin/frozen Python identity using real executable/mapped-library code carriers.
+- [x] Emit fault-proof JSON as complete standalone lines without relaxing its strict consumer.
+- [x] Add exact real-byte checkpoint Pending-before-Applied observations and raw-prefix readback.
+- [x] Retain every-byte UTF8/CSI/DEC2026 split positives and missing/reversed/wrong-ID negatives.
+- [x] Require own Shutdown's exact final payload and final journal observation before owner exit.
+- [x] Serialize overlapping own Shutdown attempts while retaining exact retry and typed faults.
+- [x] Add file-backed executable Shutdown Pending/final/readback coverage in source.
+- [x] Extend positive final presentation to ordinary commands and checkpoint captures.
+- [x] Pin the active final receipt against eviction using the actual declared history capacity.
+- [x] Preserve actual checkpoint catalog ID/tick content in full and reduced views after rapid `k`.
+- [x] Add real-owner mixed-history saturation, skipped/tiny-frame and release-positive controls.
+- [x] Correct R34's mutable-borrow error and the new field-borrow overlap without changing guards.
+- [x] Review every frozen source hunk, obtain independent source review and retain a source bundle.
+- [ ] Execute new checkpoint stream ordering and own Shutdown PTY/readback at the final SHA.
+- [ ] Observe current full/reduced final receipts, history saturation and ordinary sequencing.
 - [ ] Execute pending/checkpoint/cancellation/alternation/overlay guards at the final SHA.
 - [ ] Complete all fourteen original terminal DSR steps, including three actual fault modes,
   executable E2E, smoke, manifests and analyzer; accept only the source-bound typed pass.
@@ -75,9 +124,10 @@ as a working list when its original owners are fully qualified; retained evidenc
   configuration revisions, deduplication, journal prefixes, audit and persistence watermarks.
 - [ ] Compare uninterrupted and restored sessions through the original named positive probe.
 - [ ] Retain broad PTY/capability matrix and full research-journey criteria with their owners.
-- [ ] Attach exact source/profile/raw proof identities to the existing Beads.
+- [x] Attach R28/R32/R34 failures and current source repair identities to the original Beads.
+- [ ] Attach final terminal/workspace profile, source and completed raw proof identities.
 - [ ] Close only owners whose complete original acceptance is observed.
-- [ ] Reconcile current README/terminal/integration adoption wording with actual source and
+- [x] Reconcile current README/terminal/integration adoption wording with actual source and
   native evidence; do not imply full session continuation or scientific publication.
 - [ ] Review immutable source/doc/tracker hunks and commit separate synchronized exports.
 - [ ] Resolve the existing coordinated push hold and publish main plus its legacy mirror.
@@ -86,6 +136,70 @@ as a working list when its original owners are fully qualified; retained evidenc
 Simulator presentation callbacks remain explicit injected branch observations. They do not
 prove terminal serialization or runtime-selected degradation. Real service and file-backed
 tests establish their named boundaries only after execution; source review is not execution.
+
+### Bounded anti-ceremony inventory — 2026-10-10, through 14:01 UTC
+
+Creation worksheet: this existing TODO/report is PROCESS; running code does not branch on it.
+Its consumer is the user explicitly requesting a comprehensive reality check and granular TODO.
+Its gate is an honest completion report for original `bd-2z0.6.8`, `bd-dkd9` and continuation
+acceptance. Observed defects are the missing live consumer, failed native runs, and external resets
+that erased uncommitted status. Retire the working checklist when the original owners are fully
+qualified; retain the evidence. External source/DB/proof copies are minimal integrity controls:
+they preserve actual reset/corruption losses, are required here, contain exact existing bytes,
+and have no cheaper reliable substitute. The next hour belongs to positive terminal qualification,
+not new audit machinery. Verdict: minimum requested report and integrity controls only.
+
+Real-work worksheet: the project purpose is an evolutionary artificial-life simulator and usable
+research laboratory. The inspected three source commits `12fb5054`, `69bdeb60`, `b49008cc` classify
+as USER, ENABLER, USER; tracker commit `a1a60f28` is PROCESS. This tally is not a productivity metric.
+The visible increment is exact own-result presentation through queued actions and Shutdown; its
+two-minute demo remains unqualified until the native lane runs. Omitting tracker/report work would
+not change runtime behavior, but would lose requested failure/acceptance provenance. Formatting is
+consumed by native R34; its compilation failure prevents any test credit. Full Host/session restore
+is an older user-important open gap; the smaller live terminal integration is being finished first.
+Existing agents provided source review and exact DSR transport/execution; none closed an item.
+No acceptance was split or reduced. Verdict: DRIFTING because recovery/report overhead is substantial;
+correction is to freeze new machinery and spend the next block on exact-source execution and its
+actual failures.
+
+Honesty inventory, bounded to these three source commits, current tracker exports, original owners,
+reviewed DSR profiles, actual R28/R32/R34 commands/verdicts and shared reflog:
+
+1. No (checked: full test-touching diffs); no assertion was removed or test skipped/ignored.
+2. No (checked: owner/service/database tests); explicit simulator branch injections are qualified.
+3. No (checked: commit path lists and complete golden comparisons); no golden was regenerated.
+4. No (checked: source diffs and original profiles); no gate, suppression, timeout or roster relaxed.
+5. No (checked: production dispatch and observers); no benchmark/demo-specific success branch added.
+6. No (checked: typed verdicts and command records); zero-test failures are reported as failures.
+7. No (checked: logs); current compilation/tests remain unexecuted, and static review says so.
+8. No (checked: evidence wording); injected views and Linux/unwind probes retain their boundaries.
+9. Yes: external resets temporarily restored stale R24-only wording. Corrected this existing front
+   section with R28/R32/R34 failures; raw evidence and original open acceptance were never removed.
+10. No (checked: command/log exit pairs); stdout and stderr are retained together.
+11. No (checked: tracker changes); no owner was closed or positive debt moved to a new item.
+12. No (checked: original acceptance before/after); the actual `bd-dkd9` scope is distinguished from
+    the separate original full storm/matrix owner, without removing any criterion from either.
+13. No (checked: tracker/status diffs); existing agents made no closures.
+14. No (checked: dispatches); agents received concrete positives, negatives and source-only limits.
+15. No (checked: frozen diffs and mirrored actual logs); review reports are treated as source claims,
+    and executed proof is read independently rather than promoted from agent agreement.
+16. No (checked: agent outputs); positive implementation stays open pending full execution.
+17. No (checked: review wording); shared-source agreement is source confidence, not independent proof.
+18. No (checked: original fourteen/ten gate rosters); completed-step denominators are unchanged.
+19. Yes: earlier `am doctor --dry-run` created/deleted an internal TemporaryDirectory despite the
+    no-deletion rule; this was already disclosed. An earlier UBS invocation also allowed automatic
+    temporary cleanup before that behavior was inspected. Current UBS retains cleanup paths via
+    a shell override without changing analysis. Do not claim that no file ever disappeared. Shared
+    resets shown in the reflog were external, not commands issued by this agent. Recovery/report
+    overhead has consumed substantial effort and is not product progress.
+20. Strongest current evidence is the immutable `b49008cc` production/test diff, source-rechecked
+    against the original criteria; strongest executed subset remains failed R28 at its older SHA.
+    A skeptic can rerun the pinned DSR lanes. There is no final-source native pass yet.
+
+Disposition: stale claims corrected and disclosed in place; automatic temporary cleanup disclosed,
+with retained-cleanup execution as the countermeasure. Proof-class inflation, golden regeneration,
+gate self-weakening and machinery drift remain forbidden. No older-session CASS search is claimed
+for this bounded inventory. This worksheet remains inside the requested report, not a new system.
 
 This refresh supersedes the October 8 assessment where current source or later retained evidence
 differs. The October 9 implementation and failure records below remain intact. In particular,
@@ -181,7 +295,7 @@ percentage from tracker counts.
 | 12 | Independently verifiable portable bundles | **Implemented production repair, incomplete composed qualification.** Finished export holds a source identity/OS lease through materialization and independent SQL readback, and refuses live/pending/colliding sources. The October 8 naive main-file-copy finding is superseded. Full process acceptance remains open. | `bd-2z0.17`, `bd-2z0.19`, `bd-2z0.13.11` |
 | 13 | Scientific analytics | **Implemented machinery; partial original acceptance.** Offline statistics/lineage/report/Parquet/CLI code and actual seeded-world pipeline executions exist. Real planted scarcity, stationary null, complete two-parent lineage, control-CLI FTS and repeated source-bound success remain outstanding. | `bd-2z0.11.9`, `bd-16g.2.9` |
 | 14 | Publishable comparative tournaments | **Partial.** Actual matched-world CLI execution, ratings and reproducible small smoke outputs exist; misleading protocol/provenance labels have been repaired. The full 32-seed × three-order × 20k-tick, 96-match publication remains uncompleted. | `bd-16g.12.3`, conjunctive parent `bd-16g.12` |
-| 15 | Useful live FrankenTUI laboratory | **Partial.** Real Ratatui world/inspector/control panels and presented-buffer capture exist. `frankentui_shell.rs` is a genuine ftui Model/ProgramSimulator consumer, not a dependency-only placeholder. The actual interactive loop still draws Crossterm/Ratatui, and real ftui view/runtime plus all six science-pane providers are missing. | Reconciled `bd-2z0.6.8`; `bd-dkd9`, `bd-2z0.14.3.5.2` |
+| 15 | Useful live FrankenTUI laboratory | **Implemented integration, native acceptance open.** Through `b49008cc`, the actual interactive consumer is ftui Program/Model with retained Ratatui widgets, all six real science providers, Pending/final presentation barriers and bounded receipt retention. R28 passes 309 terminal units and three fault PTYs but fails executable observer startup; R32/R34 fail before tests. Current repairs require fresh complete native proof. | Original `bd-2z0.6.8`; actual PTY `bd-dkd9`; broad storm/matrix `bd-2z0.14.3.5.2` |
 | 16 | Useful native GPU laboratory | **Partial.** GPUI/wgpu/Bevy code consumes host snapshots. Per-window acknowledged interaction, renderer/device failure behavior and complete laboratory workflows still have open acceptance. | `bd-2z0.7.11`, `bd-2z0.7.14`, `bd-2z0.7.6`, `bd-2z0.7.8` |
 | 17 | Game-grade cinematic meadow | **Partial/unproven.** The live Bevy path still spawns per-agent roots/body/stripe/wheel/spike entities and materials. GPU-resident instancing, LOD, terrain/vegetation/water/material/lighting/particles/camera/animation integration and the playable hardware showcase are not complete. | `bd-2z0.7.3`; granular `bd-2z0.14.1.*`, especially `.20` and `.21` |
 | 18 | Honest graphics/performance evidence | **Unproven at the required scope.** The inspected 1600×900 dark-field reference has six agents and llvmpipe/Vulkan metadata, with no HUD. It supports that software-rendered fixture's visual direction, not actual hardware meadow, native UI or FPS. The GPUI/Bevy decision's precise reported measurements lack a retained raw receipt. | Reopened `bd-2z0.7.7`; `bd-2z0.14.3.10`, `.11`, `.5.3`, `.5.4`, `bd-2z0.14.1.12` |

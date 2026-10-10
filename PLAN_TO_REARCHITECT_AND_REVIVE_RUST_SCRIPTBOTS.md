@@ -40,17 +40,23 @@ Passing server runs do not close the intermittent storage/journal latency invest
 Original owners `bd-2z0.6.8`, `bd-dkd9` and `bd-2z0.5.13` remain open. The current
 execution checklist is the October 10 implementation section of
 `REALITY_CHECK_2026-09-03.md`; it distinguishes saved source from executed qualification.
-The live FrankenTUI runtime/providers are connected in the retained candidates. R24 at
-`c4011d523af99a4c380619af43faa3a321102a2d` passes workspace compilation, strict Clippy,
-218 runtime tests and 303 terminal tests, but fails one actual PTY fault test before
-the executable lanes. Its 212 render candidates all skip presentation. The next source
-change consumes the runtime's quality policy through a shared reachable `EssentialOnly`
-configuration, preserving the 16-ms budget and original acceptance gates.
+The live FrankenTUI runtime/providers are connected through `b49008cc`. R28 at
+`f2b0748a3c4208f423d9d6bf894835ad0347f74b` passes strict workspace Clippy/check, 218 runtime
+and 309 terminal tests; all three actual fault PTYs select reduced detail, present, trigger
+their fault and restore. Its executable observer fails before app launch on Python builtin
+module identity, so only ten of fourteen gates complete. R32 fails formatting; R34 at
+`69bdeb60` fails Clippy on a mutable-borrow error; neither runs tests. Current source repairs
+that error, observer portability/framing, own Shutdown final presentation and ordinary queued
+final-result visibility/history retention. R36 terminal and R37 workspace retain the original
+gates, 16-ms budget and strict artifact consumer; final-source qualification remains pending.
 
-The reset at 07:38 UTC was recovered by a non-destructive fast-forward; the saved pending
-patch was restored byte-identically. Beads reconciliation preserves 718 issues with zero
-conflicts or deletions. No containing Bead closes on partial source or an older passing
-subset. Full Host/session continuation and exact-source native qualification remain required.
+External resets at 07:38, 13:40 and 13:50 UTC were recovered by non-destructive fast-forward;
+source/tracker/proofs are retained outside the shared checkout and active edits now use an
+independent checkout. Beads reconciliation preserves 718 issues with zero conflicts or
+deletions and zero active cycles. No containing Bead closes on partial source or an older
+passing subset. Full Host/session continuation and exact-source native qualification remain
+required. The broad storm/capability matrix stays with `bd-2z0.14.3.5.2`, separate from the
+actual PTY byte/input/resize/restoration scope of `bd-dkd9`.
 
 ### Implementation pass — 2026-10-09, LavenderLion [Currently In Progress]
 
