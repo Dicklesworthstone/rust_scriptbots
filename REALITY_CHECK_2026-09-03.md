@@ -16,6 +16,13 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
+Latest source is `58b7a7c25e97d9ec64f02ce9138b10c71f1da929`. It includes the full-owner
+continuation candidate, exact native-requested formatting, the observed serialization fix,
+and discarded-history/sealed-boundary corrections. The combined feature has not compiled or
+executed to completion. The original checkpoint owner remains in progress and its public
+guarantee remains false. R61 and R67 are suspended pending explicit permission for existing
+test-fixture cleanup; the detailed failures, process identities and remaining tasks follow.
+
 R24 is bound to `c4011d523af99a4c380619af43faa3a321102a2d`, before the latest file-backed
 receipt and pending-presentation changes. Formatting, four integration guards, exact ftui
 metadata, workspace all-target check and strict Clippy pass. Runtime tests: 218 passed,
@@ -291,8 +298,141 @@ native timeout group at 20:43:59 UTC; its EXIT custody checks complete and every
 retires by 20:44:36. Eight completed case rows and the typed failed verdict remain. The unfinished
 ShellCheck and later syntax/full-suite/final-source checks are unqualified. R61 starts once at
 20:48:52 UTC against private `7161c7fc`; its original 71-case candidate cache test exits zero.
-The remaining fifteen-case/full-suite/outer-collection qualification is still running. No timeout,
+The remaining fifteen-case/full-suite/outer-collection qualification is incomplete. No timeout,
 assertion, warning severity or gate is weakened.
+
+R61's baseline full suite has actual failures; the prerequisite is unqualified. Its prebuilt
+packaging test has eleven passes and thirty-three failures: the first permitted repack exits one
+with `environment: line 1: info: unbound variable`, and original refusal controls expect four but
+receive one. The live suite inherits exported DSR logging functions without their nonexportable
+associative severity array. The installed/baseline logging, packaging and test bytes match.
+Notify and installer logs independently expose the same defect. The logger-source repair is
+banked only in the isolated private clone as `f5a62141a095fb90101d5d26dcda1613232e2aa4`, tree
+`95847a1dad01f5cb438e3da4436a9e7aa64bc622`. It restores shell-local severity/color state
+without resetting inherited effective settings, preserves real initialization failure status,
+and adds six fresh-child/PTY controls alongside all sixteen existing tests. A cleanup-only opt-in
+retains its fixtures without changing test predicates. The final two-file static scan exits zero
+with zero critical, 24 counter warnings and one source-following informational finding; its real
+shadow matches both sources and all three logged Python temporary paths survive exit. Native
+tests and complete tool qualification remain pending; no active R61, installed tool, original
+assertion or deadline changes.
+Source-sync separately reaches the original 120-second whole-file timeout: eleven preceding
+invocations consume about 98 seconds, fresh synchronization succeeds, and its final compiler has
+not started. The fixture already uses its own empty Cargo home; parent-cache authentication is
+not its observed cause. Other full-suite failures remain unexplained. R61's recorder accumulates
+failures and continues later cases; the final gate rejects them. Missing candidate observations
+are not inferred from the baseline failures.
+
+The separate R64 diagnostic workspace invocation at clean `714af850` finishes at 21:35:11 UTC.
+Its only executed command, `cargo fmt --all --check`, exits one; the retained typed verdict is
+failed with zero completed steps. No compiler or test step runs. Source and installed-runner
+identity checks before and after exit zero. The formatting log is 120,682 bytes, SHA256
+`e28a8e80c96978a344a2fcb498b66f315a8a570b74f57fbf8492115fd9744e40`.
+The ten workspace gates and verifier remain unchanged. Manual application of those exact layout
+hunks is banked at `e167af16` before a fresh source-pinned diagnostic run; this does not qualify the
+private DSR or the new Host continuation. Hz3's unrelated RCH process is left untouched.
+
+The exact 124 formatting hunks are independently reconstructed from the retained log and match
+all ten edited files byte-for-byte, with no extra edits. Reviewed source-only `e167af16` has tree
+`afaa48092d9978ff483bc45322a2a484205f0273`; no Beads or documents enter that commit. The required
+static UBS invocation completes ten files with 46 critical pattern matches, 11,573 warnings and
+2,573 informational findings, exit one. The prior concrete critical-site review applies to this
+layout-only patch; no clean scanner or compiler verdict is claimed. Its real retained shadow
+matches all ten source inputs; all twelve logged Python temporary paths still exist after exit.
+Eight hook-load and two suppressed Python unlink records plus the shell cleanup log remain.
+Those observations establish retention of the named paths, not recovery of any earlier loss.
+
+R65's launcher starts at 21:46:31 UTC before its clone setup finishes: root failed to await that
+dependent setup. The original identity guard refuses unresolved HEAD before DSR executes; no
+proof directory, compiler command or test exists. The clone subsequently finishes clean on the
+exact source/tree, and all twelve source/verifier/lockfile pins match. The failed launcher remains
+unaltered. The real protection marker is `.sbh-protect`, with root/target/proofs/seed also present
+in the worker's authoritative sacred configuration; root's earlier `.sbh-protected` check was
+incorrect. A fresh version will require completed readiness before launch. No guard is weakened.
+
+R66 starts at 21:48:57 UTC only after readiness completes at 21:48:53, and finishes at
+21:51:45. Formatting and all four initial dependency/graph gates pass. The original workspace
+all-target compiler exits 101 with four E0277 diagnostics sharing one cause: the new full-owner
+codec contains `PersistenceBoundaryStatus`, whose enum lacks Serialize/Deserialize. Its raw
+compiler log is SHA256 `17fbdbe964c68e700603c278c0692be993b315654cc897f07fda094aa4037f71`;
+the typed verdict is failed, five completed steps, with no tests or Clippy executed. The source
+and installed runner remain clean at their pinned identities after failure.
+
+Source-only `6de19f8b56d399cb98f634af73c77e2be1429a66`, tree
+`5a61c5f2a16cef7d185a57d43e39e4bfade5d7e0`, adds only those two derives to that enum.
+Its genuine core-file UBS scan exits zero with zero critical, 5,162 warning and 1,006 informational
+findings; no clean-warning claim is made. All twelve logged Python temporary paths are observed
+present after exit. R67 retains the same ten workspace gates and unchanged verifier, with only
+the source/version pins advanced. The verified incremental bundle fast-forwards the retired
+owned clone, and source/runner/protection readiness completes at 22:00:03 before the new launch.
+Compilation, tests and final qualification of this fix remain pending. The public full-owner
+continuation guarantee remains false and the original owner remains in progress.
+
+R67's first five checks pass and compilation reaches core, runtime, storage and analytics; the
+whole compiler result is not observed. A fresh source review identifies two real full-owner gaps:
+restore erases the discarded-recording marker, and decoding fails to correlate a Sealed current
+boundary with its paired current admission cursor. Both production setters and their later
+refusal consumers were read. Source-only `58b7a7c25e97d9ec64f02ce9138b10c71f1da929`, tree
+`d7e4d0b0c435a7b5996739757fc26b65ee4700bd`, corrects both in the two existing source files.
+The full-owner codec version advances from one to two; science codec eight and its goldens
+remain unchanged. The exact immutable patch has 374 lines, SHA256
+`f7bf1c6fccc5fa12e6d522a53e05850295cca150d67771a4e14c594b5dca23ee`.
+
+Its regression sources exercise actual Host commands through capture/encode/decode/restore:
+a disabled-recording Step must retain the gap and refuse re-enabling without changing the
+configuration, audit or admission cursor; a real recorded Step followed by disable-only
+configuration, with no discarded tick, must allow zero-to-one re-enabling after restoration.
+A third test rehashes boundary/cursor and missing/zero/future-marker tampering and expects
+the corresponding contract refusal, while preserving the pristine tick-zero positive.
+These tests use the real volatile journal and production NullPersistence; they do not claim
+FrankenSQLite rows or durability. All new tests remain uncompiled and unexecuted.
+
+The final required two-file UBS scan exits zero with zero critical, 1,992 warnings and 308
+informational findings. Its real retained shadow matches both exact source inputs and all
+twelve logged Python temporary paths are observed present after exit. This is static evidence,
+not a clean-warning or runtime verdict. R67 remains pinned to earlier `6de19f8b`, so even its
+eventual completion cannot qualify the newer marker/boundary source.
+
+The no-deletion restriction also reaches existing native fixture cleanup. The original prebuilt
+packaging test unconditionally removes its generated `work` tree on EXIT and production helpers
+remove temporary payload/package/repack directories; its original guard asserts that cleanup.
+Earlier completed native tests were launched without a fixture-cleanup exception. Their cleanup
+must not be represented as authorized retention. Root suspends only verified owned R61 native
+PGID 1898814 at 22:09:13 UTC (all four observed members stopped) and R67 PGID 1794371 at 22:10:22
+(all nine observed members stopped before any test step). The user's explicit fixture-cleanup
+question is pending. No source, acceptance, deadline or cleanup predicate is altered; suspended
+invocations have no completed final verdict and are neither retired nor qualified.
+
+Fresh readback at 22:21:48/49 confirms the same boot/start/UID/parent/session identities and
+all nine/four members still in stopped state. Explicit file copies retain 20 R67 proof files
+(53,774 bytes) and 177 R61 files (2,918,769 bytes), including 121 original baseline raw logs,
+under `/data/tmp/scriptbots-suspended-evidence-20261010T2224Z/`. Every copied regular file
+matches its fresh worker SHA256 and length; original fixtures and temporary directories remain
+on their workers. R67's broad copy exits one because its `tmp` directory is not a regular file;
+all 20 regular proof files are independently verified, and the directory is not removed.
+The first dynamic export command was blocked before execution; the subsequent explicit copies
+use no override. R67's five command/log hashes match and the partial compiler log has SHA256
+`451995f2093cfad28133296d7e4b31c7015771a76b13d4f520c06f2602254b56`.
+R61's ten completed case rows match both channel hashes. Neither copy contains a final verdict.
+Original wall-clock timeouts continue to elapse during suspension; no deadline is extended.
+
+The focused R68 logger diagnostic is fully reviewed but not transported or launched. Its
+204-line profile and 56-line launcher parse statically and bind the live old/new source pins,
+all original sixteen logger tests, six added child/PTY controls, warning-level ShellCheck and
+an identical exported-child command with baseline-failure/candidate-success assertions.
+It explicitly leaves packaging unexecuted and complete tool acceptance open. Logger setup
+still replaces its generated latest symlink, so fixture authorization also gates this run.
+Profile SHA256 is `c8b886bdaa399139488452603d5e996ed61f1a470f0928db04f10ac76e6f05d6`;
+launcher SHA256 is `0df59eeae5d163f0a7596c822e53da84ca6b5943e550e386f8d4d7fef9b46998`.
+
+Three recent UBS runs actually removed their temporary shadow directories automatically:
+`tmp.v68Cs6oybA`, `tmp.a8nEeMgMF1`, and the agent SARIF run's `tmp.zC1ebuHD9C`. This violates the
+no-deletion instruction; no deletion permission was given. Source, scanner records and raw logs
+remain, but the removed shadows and anonymous Python streams are not recoverable from those
+records. A manually reviewed external shell/Python retention guard is used for subsequent
+genuine required scans. The later rows above name the actual retained shadows and logged Python
+paths observed after each exit. They establish those named observations, not general retention
+of every transient inode or recovery of the earlier losses.
 
 Two external shared-checkout resets at 19:37:38 and 19:38:44 moved main to ancestor `7c9264a1`.
 Root reads the entire affected file list, observes no deletion/conflict, and fast-forwards back to
@@ -425,6 +565,13 @@ as a working list when its original owners are fully qualified; retained evidenc
   one file per invocation with each actual command, source hash and exit retained.
 - [ ] Read back all emitted successor proof bytes, authentic fixture identity and actual suite
   pass/fail/skip counts. Keep naturally skipped platform probes unqualified.
+- [x] Diagnose the actual inherited logging-state failure using raw positive/refusal output,
+  original production consumers and the running suite environment. Do not attribute the
+  separate source-sync timeout to that defect without an observation.
+- [x] Repair the logger's own exported-shell initialization in an isolated complete source
+  checkout; preserve inherited effective level/file/context and actual failure propagation.
+- [ ] Execute real child-shell/color/filter/error controls plus unchanged packaging guards
+  through DSR; retain the complete original full-suite failures and acceptance.
 - [ ] Bind reviewed private DSR entrypoint/source hashes into successor product launchers;
   a partial artifact archive or PATH change cannot stand in for the complete pinned tool.
 - [ ] Complete terminal, browser, workspace/economy-faults and original latency qualification
@@ -448,6 +595,36 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [ ] Execute the latest one-shot continuation-binding rejection/configuration/gap guards.
 - [x] Keep full Host/session continuation capability false until the complete owner/storage/CLI
   acceptance cohort is qualified; the new continuation source has not run natively yet.
+- [x] Run R64's unchanged ten-gate diagnostic workspace lane at clean `714af850`; retain its
+  formatter failure, zero completed steps and successful source/runner identity checks.
+- [x] Manually apply and independently review all 124 retained formatting hunks; bank only
+  the ten-file source cohort at `e167af16` through the immutable reviewed-tree protocol.
+- [x] Observe retained shadow identity and all twelve logged Python temporary paths after the
+  genuine required UBS invocation. Keep all three earlier violations and its red verdict visible.
+- [x] Retain R65's premature-launch identity refusal before any DSR/compiler/test execution.
+- [x] Complete clone/protection/pin readiness before R66; retain its five passing initial gates
+  and four real compiler diagnostics without awarding test or final qualification credit.
+- [x] Fix the actual missing checkpoint serialization derives in the existing core enum;
+  bank the reviewed one-line source fix separately at `6de19f8b` after its required static scan.
+- [x] Verify the incremental source bundle and complete R67 readiness before a fresh launch.
+- [ ] Read R67's actual compiler/test outcomes through the unchanged ten workspace gates;
+  repair further concrete failures and keep final capability qualification separate.
+- [x] Identify the actual discarded-history marker loss and boundary/admission-cursor mismatch
+  against production setters, restore and later recording/arrival consumers.
+- [x] Finish and review the minimal full-owner marker/coherence fix; preserve the valid sealed,
+  disabled-without-discard re-enable case alongside the discarded-history refusal case.
+- [x] Scan and bank the coherent source fix separately at `58b7a7c2`, with real positive and
+  tampered negative test sources and observed retention of the exact scanner inputs.
+- [ ] Execute all new marker/boundary tests at their exact source pin; finish the unchanged
+  workspace checks, strict Clippy and test lanes before full-owner qualification.
+- [x] Suspend only verified owned native groups before further cleanup-dependent testing and
+  ask for the explicit fixture-cleanup exception required by AGENTS.md.
+- [x] Preserve and hash-verify the suspended runs' 197 existing regular evidence files and
+  contemporaneous process identities without removing fixtures or claiming a final verdict.
+- [x] Review the focused original/new logger diagnostic; retain its distinct scope and all
+  existing packaging/full-suite acceptance. Leave its profile unlaunched pending authorization.
+- [ ] Resolve fixture-cleanup authorization before resuming or launching those dependent tests;
+  keep current suspended work, prior cleanup deviations, original deadlines and failures visible.
 - [x] Acquire the persistence binding before mutating recording settings or the gap marker.
 - [ ] Implement and qualify full Host/session continuation: command/event counters, deadlines,
   configuration revisions, deduplication, journal prefixes, audit and persistence watermarks.
@@ -491,8 +668,33 @@ as a working list when its original owners are fully qualified; retained evidenc
   native phases disabled. The actual exit is one with 46 critical heuristics, not a clean
   scanner pass. Recover the complete original location records and triage before banking;
   an empty SARIF merge must not erase those findings.
-- [ ] Read every frozen source hunk, scan the changed Rust scope, and bank one coherent source
-  cohort separately from Beads exports. No original acceptance is removed or split off.
+- [x] Read the frozen source hunks, scan the changed Rust scope, and bank the coherent source
+  cohort separately from Beads exports: `714af8502ad9f9d219e7ba5c523c337c051f3ab4`, tree
+  `0d74474032ff901c3f0f4966d7562a7e465277fd`. Final UBS remains exit one, with 46 critical
+  heuristics and 11,993 warnings. Exact critical locations and 683 changed warning records,
+  including eighteen production records, were reviewed without suppressing findings or
+  changing scanner gates. Source review found and removed an unused mut. At that source-bank
+  boundary compilation, formatting and all new tests were unrun; the later diagnostic outcomes
+  above apply only to their exact source pins. No original acceptance is removed or split off.
+- [x] Prepare and read the complete minimal R62 workspace and R63 connectivity descriptors,
+  binding `714af850` and the complete private `7161c7fc` DSR checkout. Preserve the original
+  ten/sixteen gate rosters, full replay suite, dependency seed, protection and deadlines.
+- [x] Transport and verify the source bundle and four held launch files byte-for-byte.
+  The fresh worker clone is clean main at `714af850`/tree `0d744740`; lockfile, toolchain
+  and unchanged verifier hashes match. The complete-history bundle is 37,198,402 bytes,
+  SHA256 `91231b3f454a647e1754dd9027ad76e747d424a28257164c9a36f0a293a55c25`.
+- [ ] Launch product lanes serially only after R61's full prerequisite qualification and retirement.
+- [x] Launch the original workspace lane separately as diagnostic source checks through installed
+  DSR on Hz3; retain R64/R66's actual failures and R67's suspension with its five initial checks.
+  The full ten-gate roster and source pins remain; these observations do not replace final
+  qualification, qualify the private DSR candidate or close the continuation owner. Existing
+  foreign worker jobs remain untouched; current disk and I/O pressure stays visible.
+- [x] Disclose the recent UBS cleanup deviation: actual shadows `tmp.v68Cs6oybA` and
+  `tmp.a8nEeMgMF1` are absent after the tool's EXIT trap. No deletion permission existed;
+  the caller omitted the earlier retention override. Source, logs and copied scanner-cache
+  records remain, but the deleted shadows cannot be claimed retained.
+- [x] Verify and apply shell/Python retention to the subsequent required scans; observe actual
+  named temporary paths after exit. Preserve all earlier deletion deviations and their limits.
 - [ ] Execute source-pinned DSR formatting, workspace all-target check, strict workspace Clippy,
   workspace tests and core economy fault-feature tests; fix actual failures without relaxing gates.
 - [ ] Execute the existing connectivity lane that consumes the full replay subprocess suite;
@@ -703,6 +905,128 @@ Disposition: the gate correction's legitimate producer contract and unchanged re
 recorded; full native strict-consumer qualification remains pending. Current failure/partial
 credit is disclosed in place. Gate self-weakening, proof-class inflation, rerun-until-green and
 machinery drift remain named countermeasures. No older-session CASS sweep is claimed here.
+
+Bounded continuation inventory — 17:04–21:49 UTC. The five actual root commits are three USER
+candidates (`34323f4b`, `8504ab9c`, `714af850`), one ENABLER (`e167af16`) and one PROCESS
+(`c37ea6eb`); UNKNOWN=0. These labels describe purpose, not delivered behavior. The browser and
+full Host source are not qualified; R55's fourteen inner terminal steps pass at their older
+revision, while outer collection fails. There is no newly qualified feature in this window.
+Private DSR cache-source commits are separate enablers, with focused positive/negative results
+and still-failing broad qualification. No Bead closes. Verdict: DRIFTING; the tool loop consumed
+too much time. The correction is the now-launched original product workspace lane, not another
+process framework. The oldest unfinished goal remains the complete Evolution Lab (`bd-2z0`).
+
+1. No changed assertion is removed, skipped or ignored to obtain a pass; unrun tests stay unrun.
+2. New Host/storage/CLI probes use real owners and files. Synthetic predicate controls are labelled.
+3. No golden, baseline or expected scientific aggregate changes in these five commits.
+4. No gate deadline, severity, scenario or original test roster is relaxed. DSR's corrupt-object
+   refusal-order fix preserves its original fifteen-second negative; full suites remain red.
+5. No production code branches on benchmark identity; no performance win is claimed.
+6. R64 has zero completed steps; R65 has no DSR run. Neither receives compiler or test credit.
+7. Source review, static scanning and source checkpointing are explicitly separate from execution.
+8. Retained readback remains readback; R55's older execution does not certify `e167af16`.
+9. The current report retains broad DSR failures, unqualified browser/Host paths and public false.
+10. Actual nonzero command, scanner and outer collection exits remain visible; no stderr is hidden.
+11. No closure or follow-up moves original acceptance. All relevant owning Beads remain open.
+12. Plan edits mark work and evidence boundaries; they do not redefine success.
+13. Delegates make no graph or closure mutations; root remains the graph's sole writer here.
+14. Delegated formatter work is bounded to actual logged hunks, with explicit unqualified behavior.
+15. Root reads each source diff and independently reconstructs all 124 formatter hunks from raw log.
+16. Agent completion means its assigned static work ends, not that a product owner qualifies.
+17. Shared reviews count once; the five commit labels are not a productivity quota.
+18. Ten workspace gates and fourteen terminal gates retain their original denominators. R61's
+    original 139-file baseline and candidate suites continue, with natural skips separately recorded.
+19. Actual deviations: three UBS shadows were automatically deleted without permission; earlier
+    mixed code/tracker banking remains disclosed. Root also launched R65 before clone readiness.
+    Its guard stopped execution. Future scan retention is now observed for its named paths, and
+    R66 readiness completes before launch. Recovery does not erase the original mistakes.
+20. Strongest new evidence is the reviewed complete Host source plus exact formatter reconstruction;
+    it is not behavioral proof. R55's real terminal journey is the strongest executed subset,
+    with its exact older source and failed outer collection retained for a skeptic to inspect.
+
+Bounded final source/custody inventory — 21:49–22:24 UTC. Actual root source commits are
+`6de19f8b` (ENABLER: the observed compiler defect) and `58b7a7c2` (USER candidate: preserve
+recording history and reject incoherent restored owner boundaries). The isolated private logger
+commit `f5a62141` is an ENABLER. USER=1, ENABLER=2, PROCESS=0, UNKNOWN=0 for these three
+source banks; the requested report and tracker banks are separate process output. No Bead
+closes, no newly qualified product behavior is delivered, and no ratio is a target.
+
+The real-work answers are: (1) no new two-minute executable demo is qualified; the latest
+source corrects a genuine recording-history loss, but cannot yet be demonstrated as a passing
+restored session; (2) omitting status work changes no product behavior, while retaining the
+existing partial logs preserves the evidence needed to finish the failing runs; (3) R67
+actually begins compiling the derive correction, without a completed workspace result;
+the logger repair has no native consumer result yet; (4) the oldest unfinished user goal is
+the Evolution Lab, and this block addresses its trustworthy continuation requirement;
+(5) no delegate closes anything, and root independently reads/banks the actual source patch;
+(6) no acceptance is cut or moved into follow-ups. Verdict remains DRIFTING: source progress
+is concrete, but the tool loop has consumed too much effort without complete qualification.
+Correction: hold further test-machinery expansion and run the unchanged product acceptance at
+the exact latest source once the explicit fixture-cleanup prerequisite is resolved.
+
+The report/TODO remains the operator-requested process artifact, not a runtime capability.
+The user's request supplies the consumer/gate/observed-gap provenance; the list retires as
+a working list only when its original owners qualify, without deleting retained evidence.
+The copied logs are a minimal integrity control for the observed cleanup/reset losses: their
+consumer is the actual failed/suspended qualification, their scope is existing raw evidence,
+and the original worker fixtures are retained. No recurring dashboard or new proof framework
+is added. The named ready capability remains full-owner continuation; native qualification,
+rather than additional reporting, is the next higher-value block.
+
+Honesty inventory for this bounded final block:
+
+1. No (checked: the complete immutable test/source diff); original cases are not skipped or cut.
+2. No (checked: actual Host Step/UpdateConfig and production persistence/journal consumers);
+   the new tests name their volatile boundary and do not claim file-backed persistence.
+3. No (checked: the exact changed path sets); scientific goldens and baselines do not change.
+4. No (checked: source banks and original diagnostic profiles); no deadline, gate, severity,
+   tolerance, roster or suppression is relaxed. The version change is the owner wire format.
+5. No (checked: production setters and downstream refusal consumers); no test-identity branch
+   or performance result is introduced.
+6. No (checked: actual command rows and suspended process identities); five initial workspace
+   checks receive only check credit, and the new tests receive no execution credit.
+7. No (checked: completed command outputs, exact source banks and new report wording);
+   compiler, Clippy, tests and full-owner qualification are explicitly incomplete.
+8. No (checked: source/static versus native labels); a retained log copy is not a fresh run.
+9. No (checked: current assessment and detailed failure rows); the R66 failure, R61 baseline
+   failures, earlier scanner losses and native cleanup conflict remain visible.
+10. No (checked: scanner and transport outputs); the blocked dynamic export and nonzero broad
+    file-copy exit are recorded, with exact regular-file custody checked independently.
+11. No (checked: issue-field deltas and graph commands); original owners remain in progress,
+    no tasks close and no acceptance is transferred into a new issue.
+12. No (checked: unchanged original acceptance, plan and capability flag); source completion
+    is not substituted for the named full-owner qualification.
+13. No (checked: delegated scope and tracker mutations); root is the sole graph writer here.
+14. No (checked: source-review dispatch); the positive re-enable control and tampered negative
+    cases are explicit, with native behavior outside the delegate's completion claim.
+15. No (checked: every final source hunk, the retained scan's exact input hashes and complete
+    held diagnostic source); agent output alone is not accepted as execution evidence.
+16. No (checked: tracker status and assignments); no guard-only or agent completion closes a
+    positive product capability.
+17. No (checked: report claims); shared-source agreement is not independent runtime proof.
+18. No (checked: original 10/14-gate and 139-file suite rosters); the 197 retained files are
+    a custody count, not a test-success denominator.
+19. Yes: existing native suites perform fixture deletion without the exception required by
+    AGENTS.md. Earlier cleanup is not undone or authorized retroactively. Root discloses the
+    exact prebuilt-test/production-helper chain, suspends only verified owned groups, and asks
+    for explicit permission before further dependent work. The three older UBS shadow losses,
+    R65 premature launch and earlier mixed banking remain in the record.
+20. Strongest current evidence is the exact banked source patch plus the real R66 compiler
+    diagnostics and independently hash-verified partial native logs. It substantiates the
+    source correction and observed failures; a skeptic still needs the unrun positive/negative
+    tests and original complete native acceptance to establish restored-session behavior.
+
+Disposition: the cleanup violation cannot be undone. Its scope and limitation are disclosed
+in place and to the operator; execution honesty/proof-class inflation remain named controls.
+New deletion-dependent execution stays held, with no test-cleanup assertion suppressed and no
+deadline extension. This is an incomplete work block, not a completion report for the project.
+
+CASS is healthy. Six bounded lexical searches produce archive hits; three selected archived
+message windows are read using message indices after correcting an initial coordinate mistake.
+Their phrases alone do not establish misconduct: the viewed older closure names a narrower
+profile-authoring acceptance and leaves full qualification open. This is a bounded history check,
+not a comprehensive clearance of older sessions. No archive index or model is installed.
+This inventory lives in the explicitly requested report and adds no recurring process system.
 
 This refresh supersedes the October 8 assessment where current source or later retained evidence
 differs. The October 9 implementation and failure records below remain intact. In particular,
