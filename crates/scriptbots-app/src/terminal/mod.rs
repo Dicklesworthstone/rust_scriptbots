@@ -17220,8 +17220,36 @@ for case in ('panic', 'subscription', 'renderer'):
                 host.port().snapshot_hub().latest().revisions.control.get(),
                 1
             );
-            let final_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(80, 24));
-            assert!(final_frame.contains(&receipt.summary()));
+            let final_buffer = simulator.capture_frame(80, 24);
+            let final_frame = frankentui_shell::buffer_to_string(final_buffer);
+            let summary = receipt.summary();
+            let columns = usize::from(final_buffer.width());
+            let rows = u16::try_from(summary.chars().count().div_ceil(columns))
+                .expect("bounded final receipt rows");
+            assert!(rows > 1, "the positive receipt must span physical rows");
+            let footer_row = final_buffer.height() - 1;
+            let first_row = footer_row - rows;
+            let final_cells: String = (first_row..footer_row)
+                .map(|row| frankentui_shell::buffer_row_text(final_buffer, row))
+                .collect();
+            assert!(final_cells.starts_with(&summary));
+            let mut corrupted = final_buffer.clone();
+            corrupted.set_raw(0, first_row, ftui::render::cell::Cell::from_char('!'));
+            let corrupted_cells: String = (first_row..footer_row)
+                .map(|row| frankentui_shell::buffer_row_text(&corrupted, row))
+                .collect();
+            assert!(!corrupted_cells.starts_with(&summary));
+            assert_eq!(
+                simulator
+                    .model()
+                    .presentation
+                    .candidate
+                    .load_full()
+                    .expect("complete final candidate")
+                    .request_receipt
+                    .as_ref(),
+                Some(&receipt)
+            );
             assert!(!final_frame.contains("[PENDING] id="));
             simulator_presentation_callback(simulator.model(), 0);
             simulator.send(LiveTerminalMessage::Refresh);
@@ -17252,8 +17280,13 @@ for case in ('panic', 'subscription', 'renderer'):
                     );
                 }
             }
-            let final_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(80, 24));
-            assert!(final_frame.contains(&receipt.summary()));
+            let final_buffer = simulator.capture_frame(80, 24);
+            assert_eq!(usize::from(final_buffer.width()), columns);
+            assert_eq!(final_buffer.height() - 1, footer_row);
+            let final_cells: String = (first_row..footer_row)
+                .map(|row| frankentui_shell::buffer_row_text(final_buffer, row))
+                .collect();
+            assert!(final_cells.starts_with(&summary));
             simulator_presentation_callback(simulator.model(), 1);
             simulator.send(LiveTerminalMessage::Refresh);
             assert!(simulator.model().active_request.borrow().is_none());
@@ -17771,7 +17804,29 @@ for case in ('panic', 'subscription', 'renderer'):
         reduced.set_degradation(ftui::render::budget::DegradationLevel::EssentialOnly);
         model.view(&mut reduced);
         let text = export::buffer_to_plain_text(model.widgets.borrow().backend().buffer());
-        assert!(text.contains(&format!("[PENDING] id={id}")));
+        let pending_receipt = model
+            .app
+            .borrow()
+            .frankentui
+            .receipt_for(&id)
+            .expect("active own Pending receipt")
+            .clone();
+        assert_eq!(pending_receipt.command_id, id);
+        assert_eq!(
+            pending_receipt.status,
+            frankentui_shell::ReceiptStatusKind::Pending
+        );
+        assert!(text.contains(&pending_receipt.summary()));
+        assert_eq!(
+            model
+                .presentation
+                .candidate
+                .load_full()
+                .expect("complete reduced Pending candidate")
+                .request_receipt
+                .as_ref(),
+            Some(&pending_receipt)
+        );
         assert!(text.contains("(reduced detail)"));
         assert_eq!(
             host.port().world_digests().expect("render-only owner"),
@@ -20476,7 +20531,7 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(pending.contains(&format!("[PENDING] id={id} Shutdown")));
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
-        let receipt = wait_for_terminal_receipt(&mut simulator.model().app.borrow_mut(), &id);
+        let receipt = wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &id);
         assert!(matches!(
             receipt.status,
             ReceiptStatusKind::StaleRevision {
