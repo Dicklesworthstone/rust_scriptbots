@@ -380,6 +380,7 @@ struct LiveTerminalModel<'a> {
     checkpoint_in_flight: bool,
     pending_checkpoints: RefCell<VecDeque<String>>,
     presented_checkpoint: RefCell<Option<String>>,
+    active_request: RefCell<Option<PendingTerminalRequest>>,
     presented_shutdown_receipt: RefCell<Option<frankentui_shell::CommandReceiptEntry>>,
     prefer_checkpoint: Cell<bool>,
     last_service_poll: Option<Instant>,
@@ -402,13 +403,22 @@ struct TerminalPresentation {
     map_area: Option<Rect>,
     body_width: u16,
     pending_request: Option<PendingTerminalRequest>,
-    shutdown_receipt: Option<frankentui_shell::CommandReceiptEntry>,
+    request_receipt: Option<frankentui_shell::CommandReceiptEntry>,
 }
 
 #[derive(Clone)]
 enum PendingTerminalRequest {
     Command(CommandId),
     Checkpoint(String),
+}
+
+impl PendingTerminalRequest {
+    fn receipt_id(&self) -> String {
+        match self {
+            Self::Command(id) => id.to_string(),
+            Self::Checkpoint(id) => id.clone(),
+        }
+    }
 }
 
 impl FrameTimingSink for TerminalPresentationObserver {
@@ -450,6 +460,7 @@ impl<'a> LiveTerminalModel<'a> {
             checkpoint_in_flight: false,
             pending_checkpoints: RefCell::new(VecDeque::new()),
             presented_checkpoint: RefCell::new(None),
+            active_request: RefCell::new(None),
             presented_shutdown_receipt: RefCell::new(None),
             prefer_checkpoint: Cell::new(false),
             last_service_poll: None,
@@ -484,22 +495,41 @@ impl<'a> LiveTerminalModel<'a> {
             app.hit_regions = presentation.hit_regions.clone();
             app.map_area = presentation.map_area;
             app.body_width = presentation.body_width;
-            if let Some(receipt) = &presentation.shutdown_receipt
-                && app
+            let receipt_matches_active =
+                presentation.request_receipt.as_ref().is_some_and(|receipt| {
+                    self.active_request
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|request| request.receipt_id() == receipt.command_id)
+                });
+            if let Some(receipt) = &presentation.request_receipt
+                && receipt_matches_active
+                && app.frankentui.receipt_for(&receipt.command_id) == Some(receipt)
+                && !receipt.awaits_observation()
+            {
+                self.active_request.borrow_mut().take();
+                app.frankentui.presentation_receipt = None;
+                app.checkpoint_presentation_result = None;
+                if app
                     .shutdown_request
                     .is_some_and(|id| receipt.command_id == id.to_string())
-            {
-                *self.presented_shutdown_receipt.borrow_mut() = Some(receipt.clone());
-                if matches!(
-                    receipt.status,
-                    frankentui_shell::ReceiptStatusKind::Rejected(_)
-                        | frankentui_shell::ReceiptStatusKind::StaleRevision { .. }
-                        | frankentui_shell::ReceiptStatusKind::Failed(_)
-                ) {
-                    // A rejected request does not stop the owner. Permit a new
-                    // guarded Shutdown after its own refusal has been presented.
-                    app.shutdown_request = None;
+                {
+                    *self.presented_shutdown_receipt.borrow_mut() = Some(receipt.clone());
+                    if matches!(
+                        receipt.status,
+                        frankentui_shell::ReceiptStatusKind::Rejected(_)
+                            | frankentui_shell::ReceiptStatusKind::StaleRevision { .. }
+                            | frankentui_shell::ReceiptStatusKind::Failed(_)
+                    ) {
+                        // A refused Shutdown leaves the owner running. Its own
+                        // final presentation permits a new guarded attempt.
+                        app.shutdown_request = None;
+                    }
                 }
+            }
+            if let Some(request) = &presentation.pending_request {
+                app.frankentui.presentation_receipt = Some(request.receipt_id());
+                *self.active_request.borrow_mut() = Some(request.clone());
             }
             match &presentation.pending_request {
                 Some(PendingTerminalRequest::Command(id)) => {
@@ -686,21 +716,29 @@ impl Model for LiveTerminalModel<'_> {
             .front()
             .cloned()
             .map(PendingTerminalRequest::Checkpoint);
-        let pending_request = if self.prefer_checkpoint.get() {
+        let pending_request = if self.active_request.borrow().is_some() {
+            None
+        } else if self.prefer_checkpoint.get() {
             pending_checkpoint.or(pending_command)
         } else {
             pending_command.or(pending_checkpoint)
         };
-        let shutdown_receipt = app
-            .shutdown_request
-            .and_then(|id| app.frankentui.receipt_for(&id.to_string()))
-            .filter(|receipt| {
-                receipt.action == "Shutdown"
-                    && !receipt.awaits_observation()
-                    && receipt.journal_state.is_some()
-            })
+        let request_receipt = self
+            .active_request
+            .borrow()
+            .as_ref()
+            .and_then(|request| app.frankentui.receipt_for(&request.receipt_id()))
             .cloned();
-        let mut receipt_label = shutdown_receipt
+        let checkpoint_status = app
+            .checkpoint_presentation_result
+            .as_ref()
+            .filter(|(id, _)| {
+                request_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.command_id == *id)
+            })
+            .map(|(_, message)| message.clone());
+        let mut receipt_label = request_receipt
             .as_ref()
             .map(frankentui_shell::CommandReceiptEntry::summary)
             .or_else(|| {
@@ -738,8 +776,22 @@ impl Model for LiveTerminalModel<'_> {
                 } else {
                     app.draw(legacy);
                 }
+                if let Some(message) = &checkpoint_status {
+                    let area = legacy.area();
+                    if area.height > 0 {
+                        legacy.render_widget(
+                            Paragraph::new(message.as_str()),
+                            Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+                        );
+                    }
+                }
                 if let Some(label) = &receipt_label
-                    && let Some(overlay) = paint_request_receipt(legacy, label, &app.palette)
+                    && let Some(overlay) = paint_request_receipt(
+                        legacy,
+                        label,
+                        &app.palette,
+                        request_receipt.is_some(),
+                    )
                 {
                     receipt_visible = true;
                     app.exclude_pointer_overlay(overlay);
@@ -759,9 +811,8 @@ impl Model for LiveTerminalModel<'_> {
                 hit_regions: std::mem::take(&mut app.hit_regions),
                 map_area: app.map_area.take(),
                 body_width: app.body_width,
-                pending_request: pending_request
-                    .filter(|_| receipt_visible && shutdown_receipt.is_none()),
-                shutdown_receipt: shutdown_receipt.filter(|_| receipt_visible),
+                pending_request: pending_request.filter(|_| receipt_visible),
+                request_receipt: request_receipt.filter(|_| receipt_visible),
             })));
     }
 
@@ -807,8 +858,16 @@ impl Model for LiveTerminalModel<'_> {
 
 /// Paint a complete request receipt after all overlays. A frame too small to
 /// name the complete result cannot authorize submission or automatic exit.
-fn paint_request_receipt(frame: &mut Frame<'_>, label: &str, palette: &Palette) -> Option<Rect> {
-    let area = frame.area();
+fn paint_request_receipt(
+    frame: &mut Frame<'_>,
+    label: &str,
+    palette: &Palette,
+    retain_footer: bool,
+) -> Option<Rect> {
+    let mut area = frame.area();
+    if retain_footer {
+        area.height = area.height.saturating_sub(1);
+    }
     if area.width == 0 || area.height == 0 {
         return None;
     }
@@ -1542,7 +1601,7 @@ pub enum TerminalCommandError {
     #[error(transparent)]
     Host(#[from] HostAccessError),
     /// No finished receipt can be evicted to track another command.
-    #[error("command not submitted: unfinished receipt history is full")]
+    #[error("command not submitted: unfinished or unpresented receipt history is full")]
     ReceiptHistoryFull,
     /// No additional exact envelope can wait for presentation or admission.
     #[error(
@@ -1576,6 +1635,7 @@ struct TerminalApp<'a> {
     unpresented_commands: VecDeque<UnresolvedTerminalCommand>,
     presented_command: Option<CommandId>,
     shutdown_request: Option<CommandId>,
+    checkpoint_presentation_result: Option<(String, String)>,
     defer_live_commands: bool,
     pending_selections: VecDeque<PendingTerminalSelection>,
     selection_observation_revision: Option<ControlRevision>,
@@ -1802,6 +1862,7 @@ impl<'a> TerminalApp<'a> {
             unpresented_commands: VecDeque::with_capacity(UNRESOLVED_COMMAND_CAPACITY),
             presented_command: None,
             shutdown_request: None,
+            checkpoint_presentation_result: None,
             defer_live_commands: false,
             pending_selections: VecDeque::with_capacity(PENDING_SELECTION_CAPACITY),
             selection_observation_revision: None,
@@ -3186,6 +3247,9 @@ impl<'a> TerminalApp<'a> {
                 format!("Checkpoint failed: {error}"),
             ),
         };
+        if self.frankentui.presentation_receipt.as_deref() == Some(request_id.as_str()) {
+            self.checkpoint_presentation_result = Some((request_id.clone(), message.clone()));
+        }
         self.frankentui
             .update(ShellMessage::CommandReceipt(CommandReceiptEntry {
                 command_id: request_id,
@@ -15122,6 +15186,29 @@ mod tests {
         }
     }
 
+    fn wait_for_terminal_final_receipt(
+        app: &mut TerminalApp<'_>,
+        command_id: &str,
+    ) -> frankentui_shell::CommandReceiptEntry {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.refresh_command_receipts();
+            let receipt = app
+                .frankentui
+                .receipt_for(command_id)
+                .expect("the terminal retains the submitted command")
+                .clone();
+            if !receipt.awaits_observation() {
+                return receipt;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal command {command_id} lacks a final journal observation: {receipt:?}"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
     fn wait_for_theme(app: &mut TerminalApp<'_>, theme: CuratedThemeId) -> Arc<RenderSnapshot> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -17060,7 +17147,7 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
-    fn live_requests_present_pending_before_actual_fast_stale_rejection() {
+    fn live_requests_present_each_pending_and_final_before_the_next_request() {
         use frankentui_shell::{ReceiptStatusKind, ShellRoute};
 
         let host = TerminalTestHost::take(command_characterization_world());
@@ -17116,7 +17203,8 @@ for case in ('panic', 'subscription', 'renderer'):
             assert!(frame.contains(&format!("[PENDING] id={id}")));
             simulator_presentation_callback(simulator.model(), 1);
             simulator.send(LiveTerminalMessage::Refresh);
-            let receipt = wait_for_terminal_receipt(&mut simulator.model().app.borrow_mut(), id);
+            let receipt =
+                wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), id);
             assert!(matches!(
                 receipt.status,
                 ReceiptStatusKind::StaleRevision {
@@ -17129,6 +17217,43 @@ for case in ('panic', 'subscription', 'renderer'):
                 host.port().snapshot_hub().latest().revisions.control.get(),
                 1
             );
+            let final_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(80, 24));
+            assert!(final_frame.contains(&receipt.summary()));
+            assert!(!final_frame.contains("[PENDING] id="));
+            simulator_presentation_callback(simulator.model(), 0);
+            simulator.send(LiveTerminalMessage::Refresh);
+            simulator.capture_frame(1, 1);
+            simulator_presentation_callback(simulator.model(), 1);
+            simulator.send(LiveTerminalMessage::Refresh);
+            {
+                let app = simulator.model().app.borrow();
+                assert_eq!(
+                    simulator
+                        .model()
+                        .active_request
+                        .borrow()
+                        .as_ref()
+                        .map(PendingTerminalRequest::receipt_id),
+                    Some(id.clone()),
+                    "skipped or incomplete final cells cannot release the next intent"
+                );
+                for pending in &app.unpresented_commands {
+                    assert!(
+                        app.host
+                            .command_status_before(
+                                pending.envelope.command_id,
+                                Instant::now() + Duration::from_secs(10),
+                            )
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+            let final_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(80, 24));
+            assert!(final_frame.contains(&receipt.summary()));
+            simulator_presentation_callback(simulator.model(), 1);
+            simulator.send(LiveTerminalMessage::Refresh);
+            assert!(simulator.model().active_request.borrow().is_none());
         }
         assert!(
             simulator
@@ -17146,6 +17271,89 @@ for case in ('panic', 'subscription', 'renderer'):
                 .speed_multiplier,
             1.5
         );
+    }
+
+    #[test]
+    fn live_final_receipt_survives_mixed_pending_history_until_presentation() {
+        use frankentui_shell::{ShellMessage, ShellRoute};
+
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(ShellRoute::Diagnostics);
+        let mut simulator =
+            ftui::runtime::ProgramSimulator::new(LiveTerminalModel::new(app).expect("live model"));
+        let id = simulator
+            .model()
+            .app
+            .borrow_mut()
+            .submit_with_visible_receipt(ControlCommand::SetSpeed(1.5))
+            .expect("first intent");
+        simulator.capture_frame(120, 36);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        let receipt =
+            wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &id);
+        for index in 1..frankentui_shell::MAX_RECEIPTS {
+            {
+                let mut app = simulator.model().app.borrow_mut();
+                if index % 2 == 0 {
+                    app.frankentui.update(ShellMessage::CreateCheckpoint);
+                } else {
+                    app.submit_with_visible_receipt(ControlCommand::Pause)
+                        .expect("bounded queued intent");
+                }
+            }
+            simulator.send(LiveTerminalMessage::Refresh);
+        }
+        {
+            let mut app = simulator.model().app.borrow_mut();
+            assert_eq!(app.frankentui.receipts.len(), frankentui_shell::MAX_RECEIPTS);
+            assert!(!app.frankentui.has_receipt_capacity());
+            let sequence = app.command_sequence;
+            assert!(
+                app.submit_with_visible_receipt(ControlCommand::Pause)
+                    .is_none()
+            );
+            assert_eq!(app.command_sequence, sequence);
+            app.frankentui.update(ShellMessage::CreateCheckpoint);
+            assert_eq!(app.frankentui.receipt_for(&id), Some(&receipt));
+            for pending in &app.unpresented_commands {
+                assert!(
+                    app.host
+                        .command_status_before(
+                            pending.envelope.command_id,
+                            Instant::now() + Duration::from_secs(10),
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+        simulator.capture_frame(1, 1);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        let final_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(final_frame.contains(&receipt.summary()));
+        simulator_presentation_callback(simulator.model(), 0);
+        simulator.send(LiveTerminalMessage::Refresh);
+        assert!(
+            !simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .has_receipt_capacity()
+        );
+        simulator.capture_frame(120, 36);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        let mut app = simulator.model().app.borrow_mut();
+        assert!(app.frankentui.has_receipt_capacity());
+        app.submit_with_visible_receipt(ControlCommand::Pause)
+            .expect("presented final can now be evicted");
+        assert!(app.frankentui.receipt_for(&id).is_none());
     }
 
     #[test]
@@ -17304,7 +17512,7 @@ for case in ('panic', 'subscription', 'renderer'):
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
         let command_receipt =
-            wait_for_terminal_receipt(&mut simulator.model().app.borrow_mut(), &command_ids[0]);
+            wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &command_ids[0]);
         assert!(matches!(
             command_receipt.status,
             ReceiptStatusKind::Applied | ReceiptStatusKind::Durable
@@ -17316,6 +17524,10 @@ for case in ('panic', 'subscription', 'renderer'):
                 .items
                 .is_empty()
         );
+        let final_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(final_frame.contains(&command_receipt.summary()));
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
         let pending_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(80, 24));
         assert!(pending_frame.contains(&format!("[PENDING] id={request_id}")));
         simulator_presentation_callback(simulator.model(), 1);
@@ -17334,15 +17546,6 @@ for case in ('panic', 'subscription', 'renderer'):
             .expect("same request's actual result")
             .clone();
         assert_eq!(receipt.status, ReceiptStatusKind::Applied);
-        let (_, bytes) = handle
-            .read_artifact_bytes(&checkpoints[0].checkpoint_id)
-            .expect("actual retained checkpoint bytes");
-        let decoded = scriptbots_core::WorldCheckpointV1::decode(&bytes).expect("real checkpoint");
-        assert_eq!(decoded.source_digest(), &before);
-        assert_eq!(
-            host.port().scientific_digest_v1().expect("after capture"),
-            before
-        );
         simulator.inject_event(ftui::core::event::Event::Key(
             ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char('k')),
         ));
@@ -17354,13 +17557,60 @@ for case in ('panic', 'subscription', 'renderer'):
             .expect("second staged checkpoint")
             .clone();
         assert_ne!(next_checkpoint, request_id);
+        let final_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(final_frame.contains(&receipt.summary()));
+        assert!(final_frame.contains(&format!(
+            "Checkpoint {} recorded at tick",
+            checkpoints[0].checkpoint_id
+        )));
+        // This explicitly injected degradation checks the adapter branch, not
+        // the Program governor's live choice or terminal serialization.
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = ftui::render::frame::Frame::new(120, 36, &mut pool);
+        frame.set_degradation(ftui::render::budget::DegradationLevel::EssentialOnly);
+        simulator.model().view(&mut frame);
+        let reduced =
+            export::buffer_to_plain_text(simulator.model().widgets.borrow().backend().buffer());
+        assert!(reduced.contains(&format!("{} (reduced detail)", receipt.summary())));
+        assert!(reduced.contains(&format!(
+            "Checkpoint {} recorded at tick",
+            checkpoints[0].checkpoint_id
+        )));
+        simulator_presentation_callback(simulator.model(), 0);
+        simulator.send(LiveTerminalMessage::Refresh);
+        assert!(simulator.model().active_request.borrow().is_some());
+        let next_command: CommandId =
+            serde_json::from_value(serde_json::Value::String(command_ids[1].clone())).unwrap();
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow_mut()
+                .host
+                .command_status(next_command)
+                .unwrap()
+                .is_none()
+        );
+        simulator.capture_frame(120, 36);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        let (_, bytes) = handle
+            .read_artifact_bytes(&checkpoints[0].checkpoint_id)
+            .expect("actual retained checkpoint bytes");
+        let decoded = scriptbots_core::WorldCheckpointV1::decode(&bytes).expect("real checkpoint");
+        assert_eq!(decoded.source_digest(), &before);
+        assert_eq!(
+            host.port().scientific_digest_v1().expect("after capture"),
+            before
+        );
         let command_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(80, 24));
         assert!(command_frame.contains(&format!("[PENDING] id={}", command_ids[1])));
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
+        let command_receipt =
+            wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &command_ids[1]);
         assert!(matches!(
-            wait_for_terminal_receipt(&mut simulator.model().app.borrow_mut(), &command_ids[1],)
-                .status,
+            command_receipt.status,
             ReceiptStatusKind::StaleRevision {
                 observed: 1,
                 expected: 0
@@ -17374,6 +17624,10 @@ for case in ('panic', 'subscription', 'renderer'):
                 .len(),
             1
         );
+        let final_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(final_frame.contains(&command_receipt.summary()));
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
         let checkpoint_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(80, 24));
         assert!(checkpoint_frame.contains(&format!("[PENDING] id={next_checkpoint}")));
         simulator_presentation_callback(simulator.model(), 1);
@@ -20152,7 +20406,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 .candidate
                 .load_full()
                 .expect("tiny candidate")
-                .shutdown_receipt
+                .request_receipt
                 .is_none()
         );
         simulator_presentation_callback(simulator.model(), 1);
@@ -20178,7 +20432,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 .candidate
                 .load_full()
                 .expect("complete candidate")
-                .shutdown_receipt
+                .request_receipt
                 .as_ref(),
             Some(&receipt)
         );
@@ -20224,8 +20478,8 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(!receipt.awaits_observation());
 
         // Inject only the unfinished observation of the real stale attempt.
-        // The subsequent Shutdown must remain unsubmitted even after its own
-        // Pending cells are presented; neither injected status is a success.
+        // The subsequent Shutdown must remain staged until this unfinished
+        // observation reaches a final presentation; no injected status is a success.
         let next_id = {
             let mut app = simulator.model().app.borrow_mut();
             app.refresh_snapshot();
@@ -20240,12 +20494,15 @@ for case in ('panic', 'subscription', 'renderer'):
                 .envelope
                 .command_id
         };
-        let pending = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
-        assert!(pending.contains(&format!("[PENDING] id={next_id} Shutdown")));
+        let unfinished = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(unfinished.contains(&format!(
+            "[STALE_REV] journal=pending Shutdown: stale revision: expected 0, observed 1 id={id}"
+        )));
+        assert!(!unfinished.contains(&format!("[PENDING] id={next_id} Shutdown")));
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
         {
-            let app = simulator.model().app.borrow();
+            let mut app = simulator.model().app.borrow_mut();
             assert_eq!(
                 app.shutdown_request.map(|id| id.to_string()),
                 Some(id.clone())

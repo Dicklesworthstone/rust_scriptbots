@@ -437,6 +437,8 @@ pub struct FrankenTuiModel {
     pub control_revision: u64,
     pub scientific_revision: u64,
     pub receipts: VecDeque<CommandReceiptEntry>,
+    /// A live request keeps its receipt until the exact final cells are presented.
+    pub(super) presentation_receipt: Option<String>,
     pub status_message: Option<String>,
     pub reduced_color: bool,
     pub reduced_motion: bool,
@@ -466,6 +468,7 @@ impl Default for FrankenTuiModel {
             control_revision: 0,
             scientific_revision: 0,
             receipts: VecDeque::with_capacity(MAX_RECEIPTS),
+            presentation_receipt: None,
             status_message: None,
             reduced_color: false,
             reduced_motion: false,
@@ -515,7 +518,12 @@ impl FrankenTuiModel {
             || self
                 .receipts
                 .iter()
-                .any(|receipt| !receipt.awaits_observation())
+                .any(|receipt| self.receipt_can_be_evicted(receipt))
+    }
+
+    fn receipt_can_be_evicted(&self, receipt: &CommandReceiptEntry) -> bool {
+        !receipt.awaits_observation()
+            && self.presentation_receipt.as_deref() != Some(receipt.command_id.as_str())
     }
 
     /// Existing identities can advance even while every receipt slot is unfinished.
@@ -540,10 +548,11 @@ impl FrankenTuiModel {
             let Some(finished) = self
                 .receipts
                 .iter()
-                .position(|entry| !entry.awaits_observation())
+                .position(|entry| self.receipt_can_be_evicted(entry))
             else {
-                self.status_message =
-                    Some("Receipt unavailable: unfinished receipt history is full".into());
+                self.status_message = Some(
+                    "Receipt unavailable: unfinished or unpresented receipt history is full".into(),
+                );
                 return false;
             };
             self.receipts.remove(finished);
@@ -1010,8 +1019,10 @@ impl Model for FrankenTuiModel {
             }
             ShellMessage::CreateCheckpoint => {
                 if !self.has_receipt_capacity() {
-                    self.status_message =
-                        Some("Checkpoint not requested: unfinished receipt history is full".into());
+                    self.status_message = Some(
+                        "Checkpoint not requested: unfinished or unpresented receipt history is full"
+                            .into(),
+                    );
                     return Cmd::none();
                 }
                 let Some(next_request) = self.command_counter.checked_add(1) else {
