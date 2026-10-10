@@ -496,12 +496,15 @@ impl<'a> LiveTerminalModel<'a> {
             app.map_area = presentation.map_area;
             app.body_width = presentation.body_width;
             let receipt_matches_active =
-                presentation.request_receipt.as_ref().is_some_and(|receipt| {
-                    self.active_request
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|request| request.receipt_id() == receipt.command_id)
-                });
+                presentation
+                    .request_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| {
+                        self.active_request
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|request| request.receipt_id() == receipt.command_id)
+                    });
             if let Some(receipt) = &presentation.request_receipt
                 && receipt_matches_active
                 && app.frankentui.receipt_for(&receipt.command_id) == Some(receipt)
@@ -17293,8 +17296,7 @@ for case in ('panic', 'subscription', 'renderer'):
         simulator.capture_frame(120, 36);
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
-        let receipt =
-            wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &id);
+        let receipt = wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &id);
         for index in 1..frankentui_shell::MAX_RECEIPTS {
             {
                 let mut app = simulator.model().app.borrow_mut();
@@ -17309,7 +17311,10 @@ for case in ('panic', 'subscription', 'renderer'):
         }
         {
             let mut app = simulator.model().app.borrow_mut();
-            assert_eq!(app.frankentui.receipts.len(), frankentui_shell::MAX_RECEIPTS);
+            assert_eq!(
+                app.frankentui.receipts.len(),
+                frankentui_shell::MAX_RECEIPTS
+            );
             assert!(!app.frankentui.has_receipt_capacity());
             let sequence = app.command_sequence;
             assert!(
@@ -17511,8 +17516,10 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(command_frame.contains(&format!("[PENDING] id={}", command_ids[0])));
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
-        let command_receipt =
-            wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &command_ids[0]);
+        let command_receipt = wait_for_terminal_final_receipt(
+            &mut simulator.model().app.borrow_mut(),
+            &command_ids[0],
+        );
         assert!(matches!(
             command_receipt.status,
             ReceiptStatusKind::Applied | ReceiptStatusKind::Durable
@@ -17607,8 +17614,10 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(command_frame.contains(&format!("[PENDING] id={}", command_ids[1])));
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
-        let command_receipt =
-            wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &command_ids[1]);
+        let command_receipt = wait_for_terminal_final_receipt(
+            &mut simulator.model().app.borrow_mut(),
+            &command_ids[1],
+        );
         assert!(matches!(
             command_receipt.status,
             ReceiptStatusKind::StaleRevision {
