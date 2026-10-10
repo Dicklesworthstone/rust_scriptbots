@@ -18333,6 +18333,219 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
+    fn live_receipt_frames_follow_real_file_journal_and_exact_retry() {
+        use frankentui_shell::{ReceiptStatusKind, ShellRoute};
+        use scriptbots_runtime::{
+            HostCore, HostCoreOptions, HostLifecycle, HostSessionId, ManualInstant,
+        };
+        use scriptbots_storage::{StoragePipeline, StorageReader};
+
+        // Keep the real database and frame observations in the DSR scratch tree.
+        let directory = tempfile::Builder::new()
+            .prefix("terminal-durable-command-")
+            .tempdir()
+            .expect("retained file-journal directory")
+            .keep();
+        let database = directory.join("run.sqlite");
+        let path = database.to_str().expect("scratch path is UTF-8");
+        let mut pipeline = StoragePipeline::create_unattributed_file(path)
+            .expect("actual FrankenSQLite worker with a new fixture run");
+        let session = HostSessionId::new(0x5455_4944);
+        let journal = pipeline
+            .journal_port(session, Default::default())
+            .expect("actual file-backed journal adapter");
+        let config = command_characterization_world()
+            .lock()
+            .expect("fixture configuration")
+            .config()
+            .clone();
+        let (world, persistence) = WorldState::with_persistence(config, Box::new(pipeline.sink()))
+            .expect("actual worker-bound world and one-shot session");
+        let core = HostCore::with_journal_and_persistence(
+            session,
+            world,
+            HostCoreOptions {
+                initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            Box::new(journal),
+            persistence,
+        )
+        .expect("sole owner with the real storage and journal boundaries");
+        let (mut driver, port) = scriptbots_runtime::channel::ChannelHostDriver::new(
+            scriptbots_runtime::FixedDeadlineHost::new(core),
+            scriptbots_runtime::channel::ChannelHostOptions {
+                submit_deadline: Duration::from_millis(5),
+                ..scriptbots_runtime::channel::ChannelHostOptions::default()
+            },
+        )
+        .expect("real held owner and channel ingress");
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut context = TerminalTestHost::port_context(port.clone(), &runtime);
+        context.analytics = pipeline.analytics_provider();
+        let mut app = TerminalApp::new(&renderer, context);
+        app.navigate_route(ShellRoute::Diagnostics);
+        let id = app
+            .submit_with_visible_receipt(ControlCommand::SetSpeed(2.5))
+            .expect("held owner leaves the exact request unresolved");
+        let original = app.unresolved_commands[0].envelope.clone();
+        let pending = app
+            .frankentui
+            .receipt_for(&id)
+            .expect("pending request")
+            .clone();
+        assert_eq!(pending.status, ReceiptStatusKind::Pending);
+        assert_eq!(pending.journal_state, None);
+        assert_eq!(port.snapshot_hub().latest().revisions.control.get(), 0);
+        let mut simulator = ftui::runtime::ProgramSimulator::new(
+            LiveTerminalModel::new(app).expect("actual live model"),
+        );
+        let pending_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(160, 36));
+        assert!(pending_frame.contains(&pending.summary()));
+        std::fs::write(directory.join("pending.txt"), &pending_frame).expect("retain pending frame");
+
+        // Resolve the actual file authority before application. Otherwise its
+        // asynchronous lookup can make the channel discover Applied and Durable
+        // at the same later boundary, legitimately omitting the intermediate frame.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let result = driver.host().local_port().submit(original.clone());
+            match result {
+                Ok(status) => {
+                    assert_eq!(status.application(), &ApplicationState::Admitted);
+                    break;
+                }
+                Err(HostAccessError::CommandAuthorityLookup {
+                    failure:
+                        scriptbots_runtime::CommandAuthorityLookupFailure::Pending
+                        | scriptbots_runtime::CommandAuthorityLookupFailure::Busy,
+                    ..
+                }) => {}
+                // ubs:ignore[rust.ownership.panic-macro] — test rejects an unexpected real authority result.
+                other => panic!("file authority did not admit the exact original: {other:?}"),
+            }
+            assert!(Instant::now() < deadline, "file authority did not resolve");
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        assert_eq!(driver.host().core().latest_snapshot().world.tick, 0);
+        assert_eq!(
+            driver.host().core().latest_snapshot().revisions.control.get(),
+            0
+        );
+        let mut owner_time = 0;
+        let mut phases = vec![pending];
+        for (name, expected_status, expected_journal) in [
+            ("applied", ReceiptStatusKind::Applied, JournalState::Pending),
+            ("durable", ReceiptStatusKind::Durable, JournalState::Durable),
+        ] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let receipt = loop {
+                owner_time += 1_000_000;
+                driver
+                    .step(ManualInstant::from_nanos(owner_time))
+                    .expect("drive real journal owner");
+                let mut app = simulator.model().app.borrow_mut();
+                app.refresh_command_receipts();
+                let receipt = app
+                    .frankentui
+                    .receipt_for(&id)
+                    .expect("retained exact identity")
+                    .clone();
+                if receipt.status == expected_status {
+                    if name == "applied" {
+                        assert_eq!(receipt.journal_state, Some(JournalState::Pending));
+                    }
+                    if receipt.journal_state.as_ref() == Some(&expected_journal) {
+                        break receipt;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "missing actual {name} phase: {receipt:?}"
+                );
+                std::thread::park_timeout(Duration::from_millis(1));
+            };
+            let frame = frankentui_shell::buffer_to_string(simulator.capture_frame(160, 36));
+            assert!(
+                frame.contains(&receipt.summary()),
+                "actual {name} receipt is visible"
+            );
+            assert_ne!(
+                frame, pending_frame,
+                "application must change the rendered receipt"
+            );
+            std::fs::write(directory.join(format!("{name}.txt")), &frame)
+                .expect("retain actual receipt frame");
+            phases.push(receipt);
+        }
+        assert_eq!(phases[1].status, ReceiptStatusKind::Applied);
+        assert_eq!(phases[2].status, ReceiptStatusKind::Durable);
+        assert_ne!(phases[1].journal_state, phases[2].journal_state);
+        let mut local = driver.host().local_port();
+        let retry = local
+            .submit(original.clone())
+            .expect("real durable exact retry");
+        assert!(matches!(retry.application(), ApplicationState::Applied(_)));
+        assert_eq!(retry.journal(), &JournalState::Durable);
+        assert_eq!(
+            retry.admission_sequence().expect("original admission").get(),
+            1
+        );
+        let mut changed = original.clone();
+        changed.command = HostCommand::SetSpeed(3.0);
+        assert!(matches!(
+            local.submit(changed),
+            Err(HostAccessError::CommandIdCollision { .. })
+        ));
+        let snapshot = port.snapshot_hub().latest();
+        assert_eq!(snapshot.world.tick, 0);
+        assert_eq!(snapshot.revisions.control.get(), 1);
+        assert_eq!(snapshot.playback.speed_multiplier, 2.5);
+        assert!(snapshot.playback.paused);
+        drop(local);
+        drop(simulator);
+        drop(port);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while driver.host().core().latest_snapshot().lifecycle != HostLifecycle::Stopped {
+            owner_time += 1_000_000;
+            driver
+                .step(ManualInstant::from_nanos(owner_time))
+                .expect("ordered durable shutdown");
+            assert!(Instant::now() < deadline, "owner shutdown did not finish");
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let shutdown = pipeline.shutdown().expect("actual worker shutdown");
+        assert_eq!(
+            shutdown.guarantee,
+            scriptbots_storage::PersistenceGuarantee::Durable
+        );
+        drop(driver);
+        drop(pipeline);
+        let reader = StorageReader::open_finished(path).expect("identity-bound finished run");
+        let recorded = reader
+            .command_journal_record(session, original.command_id)
+            .expect("actual durable command readback");
+        assert_eq!(recorded.lifecycle.envelope(), &original);
+        assert_eq!(recorded.terminal_boundary.tick, scriptbots_core::Tick::zero());
+        assert_eq!(recorded.terminal_boundary.revisions.control.get(), 1);
+        reader.close().expect("close read-only finished database");
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "scriptbots.terminal-durable-command.v1",
+                "source_commit": option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable"),
+                "database": database, "command": original, "phases": phases,
+                "archive_payload_digest": recorded.archive_payload_digest,
+                "shutdown_guarantee": format!("{:?}", shutdown.guarantee),
+            })
+        );
+    }
+
+    #[test]
     fn live_unresolved_commands_are_bounded_without_discarding_exact_envelopes() {
         let (mut driver, port) = terminal_manual_driver(
             command_characterization_world(),
