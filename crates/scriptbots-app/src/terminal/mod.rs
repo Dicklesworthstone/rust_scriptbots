@@ -15858,8 +15858,8 @@ mod tests {
                 let error = run_result.expect_err("presentation failure must propagate");
                 assert!(error.to_string().contains("presentation write failure"));
             } else {
-                let mut program = Program::with_config(model, config)
-                    .expect("real FrankenTUI runtime");
+                let mut program =
+                    Program::with_config(model, config).expect("real FrankenTUI runtime");
                 let run_result = program.run();
                 if case == "subscription" {
                     run_result.expect("handled subscription failure completes lifecycle");
@@ -15872,7 +15872,7 @@ mod tests {
                         .expect("real live error hook observed subscription failure");
                     assert_eq!(
                         error.to_string(),
-                        "subscription 250 failed: injected actual subscription panic"
+                        "FrankenTUI runtime error: subscription 250 failed: injected actual subscription panic"
                     );
                     assert!(program.model().triggered.load(Ordering::Acquire));
                     assert!(program.model().live.app.borrow().frankentui.shutdown_called);
