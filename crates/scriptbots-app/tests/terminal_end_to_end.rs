@@ -65,6 +65,61 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         );
         assert_eq!(observation["frankentui_shutdown_observed"], true);
         assert_eq!(observation["binary_source_observed"], true);
+        let interaction = &observation["byte_input_resize_evidence"];
+        assert_eq!(interaction["source_commit"], observation["source_commit"]);
+        assert_eq!(interaction["owner_tick_unchanged"], true);
+        assert_eq!(interaction["responsiveness_observed"], true);
+        assert_eq!(
+            interaction["observed_resize_sequence"],
+            interaction["requested_resize_sequence"]
+        );
+        let resize_probes = interaction["observed_resize_probes"]
+            .as_array()
+            .expect("actual resize observations must be present");
+        assert!(!resize_probes.is_empty());
+        for probe in resize_probes {
+            assert_eq!(
+                probe["footer_geometry"]["terminal"],
+                probe["footer_geometry"]["presented"]
+            );
+            assert!(probe["footer_geometry"]["terminal"].is_object());
+            assert_eq!(
+                probe["stale_cell_control"]["requested_dimensions_observed"],
+                true
+            );
+            assert_eq!(probe["stale_cell_control"]["full_heading_preserved"], true);
+            assert_eq!(probe["stale_cell_control"]["parser_sequence_accepted"], true);
+            assert_eq!(probe["stale_cell_control"]["rejected"], true);
+            assert!(probe["stale_cell_control"]["observed_footer_geometry"].is_null());
+        }
+        assert_eq!(
+            interaction["observed_arrow_probes"]
+                .as_array()
+                .map(|probes| {
+                    probes
+                        .iter()
+                        .map(|probe| probe["key"].as_str())
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![Some("down"), Some("up")])
+        );
+        assert_eq!(interaction["mouse_navigation"]["observed_route"], "Lineages");
+        assert_eq!(interaction["mouse_navigation"]["observed_sgr_capture"], true);
+        assert!(
+            observation["python_identity"]["executable_sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+        );
+        assert!(
+            observation["parser_guard_evidence"]["rejected_cases"]
+                .as_array()
+                .is_some_and(|cases| !cases.is_empty())
+        );
+        assert!(
+            observation["parser_guard_evidence"]["valid_stream_byte_length"]
+                .as_u64()
+                .is_some_and(|length| length > 0)
+        );
         assert_eq!(
             observation["source_commit"],
             option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable")
@@ -157,6 +212,27 @@ class TerminalScreen:
 
     def text(self):
         return '\n'.join(''.join(row) for row in self.cells)
+
+    def resize(self, width, height):
+        assert 1 <= width <= 300 and 1 <= height <= 80, 'bounded terminal dimensions exceeded'
+        old_width, old_height = self.width, self.height
+        full_scroll_region = self.scroll_top == 0 and self.scroll_bottom == old_height - 1
+        cells = [row[:width] + [' '] * max(0, width - old_width)
+                 for row in self.cells[:height]]
+        cells.extend([[' '] * width for _ in range(max(0, height - old_height))])
+        for row in cells:
+            if row[-1] and unicodedata.east_asian_width(row[-1][0]) in ('W', 'F'):
+                row[-1] = ' '  # A clipped wide glyph cannot retain a missing continuation.
+        self.width, self.height, self.cells = width, height, cells
+        self.x, self.y = min(self.x, width - 1), min(self.y, height - 1)
+        self.saved = (min(self.saved[0], width - 1), min(self.saved[1], height - 1))
+        self.wrap_pending = self.wrap_pending and width == old_width
+        if full_scroll_region or self.scroll_top >= height - 1:
+            self.scroll_top, self.scroll_bottom = 0, height - 1
+        else:
+            self.scroll_bottom = min(self.scroll_bottom, height - 1)
+        # Deliberately preserve decoder and pending: resizing cannot repair a
+        # torn UTF-8 character or CSI already received from the actual child.
 
     def position(self, x, y):
         self.x = max(0, min(self.width - 1, x))
@@ -338,6 +414,106 @@ class TerminalScreen:
         assert len(self.pending) <= 8192, 'bounded partial terminal sequence exceeded'
         assert not final or not self.pending, 'incomplete terminal sequence at shutdown'
 
+def diagnostics_footer_geometry(text, width, height):
+    # Diagnostics rates and queue observations can vary while science is paused.
+    # The shell draws its full-width footer divider after that body, followed by
+    # exactly one final status row; toasts end above these two rows.
+    rows = text.splitlines()
+    if len(rows) != height:
+        return None
+    headings = [row for row, line in enumerate(rows) if routes[-1][1] in line]
+    if len(headings) != 1:
+        return None
+    dividers = [row for row, line in enumerate(rows)
+                if row > headings[0] and line == '-' * width]
+    if len(dividers) != 1 or dividers[0] + 1 != len(rows) - 1:
+        return None
+    status_row = dividers[0] + 1
+    if not rows[status_row].startswith(' ') or not rows[status_row].strip():
+        return None
+    return {'divider_row': dividers[0], 'divider_column': rows[dividers[0]].find('-'),
+            'divider_width': len(rows[dividers[0]]), 'status_row': status_row,
+            'status_text': rows[status_row]}
+
+def check_parser_guards():
+    # These are parser controls, not transcripts or substitute live evidence.
+    accepted, rejected = [], []
+    stream = (b'\x1b[?1049h\x1b[?25l\x1b[2J\x1b[2;2H' + 'Aé'.encode()
+              + b'\x1b7\x1b[1;1HZ\x1b8\x1b[38;2;1;2;3mB\x1b[0m'
+              + b'\x1b[?25h\x1b[?1049l')
+    expected = 'Z       \n AéB    \n        '
+    for split in range(len(stream) + 1):
+        parser = TerminalScreen(8, 3)
+        parser.feed(stream[:split])
+        parser.feed(stream[split:], final=True)
+        assert parser.text() == expected and (parser.x, parser.y) == (4, 1)
+        assert parser.truecolor_count == parser.color_count == 1
+        assert parser.cursor_hidden_observed and parser.cursor_show_observed and parser.cursor_visible
+        assert parser.alternate_left and not parser.alternate and not parser.enabled_capture_modes
+        accepted.append({'case': 'valid_stream_split', 'split_byte': split})
+    parser = TerminalScreen(8, 3)
+    for byte in stream:
+        parser.feed(bytes([byte]))
+    parser.feed(b'', final=True)
+    assert parser.text() == expected
+    accepted.append({'case': 'valid_stream_single_byte_chunks'})
+    parser = TerminalScreen(16, 3)
+    parser.feed(b'HELLO THERE\x1b[1;7HDAVE \x1b[2;1Hdiscard\x1b[2K', final=True)
+    assert parser.text() == 'HELLO DAVE      \n                \n                '
+    accepted.append({'case': 'differential_cursor_repaint_and_erase'})
+    parser = TerminalScreen(8, 3)
+    parser.feed(b'\x1b[3;8H\x1b7\x1b[2;')
+    assert parser.pending == '\x1b[2;'
+    parser.resize(5, 2)
+    assert parser.pending == '\x1b[2;' and parser.saved == (4, 1)
+    parser.feed(b'2HX\x1b8', final=True)
+    assert parser.text() == '     \n X   ' and (parser.x, parser.y) == (4, 1)
+    accepted.append({'case': 'resize_preserves_partial_csi_and_clamps_saved_cursor'})
+    parser = TerminalScreen(8, 3)
+    parser.feed(b'\xc3')
+    parser.resize(5, 2)
+    parser.feed(b'\xa9', final=True)
+    assert parser.text() == 'é    \n     '
+    parser.resize(8, 3)
+    assert parser.text() == 'é       \n        \n        '
+    accepted.append({'case': 'resize_preserves_partial_utf8_and_expands_blank_cells'})
+    invalid = [
+        ('invalid_utf8', b'\xff', UnicodeDecodeError, None),
+        ('truncated_utf8', b'\xc3', UnicodeDecodeError, None),
+        ('truncated_csi', b'\x1b[2;', AssertionError, 'incomplete terminal sequence'),
+        ('truncated_osc', b'\x1b]8;;https://example.invalid', AssertionError, 'incomplete terminal sequence'),
+        ('invalid_csi_byte', b'\x1b[2;\nH', AssertionError, 'invalid CSI byte'),
+        ('incomplete_extended_color', b'\x1b[38;2;1;2m', AssertionError, 'unsupported SGR color'),
+        ('unsupported_csi', b'\x1b[1z', AssertionError, 'unsupported CSI'),
+        ('unsupported_escape', b'\x1bX', AssertionError, 'unsupported escape'),
+        ('unsupported_mode', b'\x1b[?9999h', AssertionError, 'unsupported terminal mode'),
+        ('unsupported_osc', b'\x1b]0;title\x07', AssertionError, 'unsupported OSC'),
+        ('invalid_scroll_region', b'\x1b[3;2r', AssertionError, 'unsupported scroll margins'),
+        ('oversized_csi', b'\x1b[' + b'1' * 300, AssertionError, 'bounded CSI exceeded'),
+    ]
+    for name, transcript, exception, message in invalid:
+        parser = TerminalScreen(8, 3)
+        try:
+            parser.feed(transcript, final=True)
+        except exception as error:
+            assert message is None or message in str(error), (name, str(error))
+            rejected.append({'case': name, 'exception': type(error).__name__, 'reason': str(error)})
+        else:
+            raise AssertionError('parser accepted negative control: ' + name)
+    return {'synthetic_parser_controls': True, 'valid_stream_byte_length': len(stream),
+            'accepted_cases': accepted, 'rejected_cases': rejected}
+
+parser_guard_evidence = check_parser_guards()
+python_identity = {'executable': os.path.realpath(sys.executable), 'version': sys.version,
+                   'implementation': sys.implementation.name, 'cache_tag': sys.implementation.cache_tag,
+                   'platform': sys.platform, 'unicode_version': unicodedata.unidata_version,
+                   'stdlib_modules': {}}
+python_identity['executable_sha256'] = hashlib.sha256(pathlib.Path(python_identity['executable']).read_bytes()).hexdigest()
+for module in (pty, termios, fcntl, codecs, unicodedata):
+    module_path = pathlib.Path(module.__file__).resolve()
+    python_identity['stdlib_modules'][module.__name__] = {
+        'path': str(module_path), 'sha256': hashlib.sha256(module_path.read_bytes()).hexdigest()}
+
 for profile in ('truecolor', 'no-color'):
     directory = pathlib.Path(tempfile.mkdtemp(prefix='live-tui-' + profile + '-'))
     master, slave = pty.openpty()
@@ -370,7 +546,29 @@ for profile in ('truecolor', 'no-color'):
     screenshots = []
     binary_source = None
     data_provider_evidence = None
+    interaction_evidence = None
+    interaction_artifacts = []
+    interaction_events = []
+    interaction_log_bytes = 0
     terminal_input_count = 0
+    def retain_interaction(filename, body):
+        with open(directory / filename, 'xb') as artifact:
+            artifact.write(body)
+        interaction_artifacts.append({'file': filename, 'sha256': hashlib.sha256(body).hexdigest()})
+    retain_interaction('python-identity.json', json.dumps(python_identity, sort_keys=True).encode())
+    retain_interaction('parser-guards.json', json.dumps(parser_guard_evidence, sort_keys=True).encode())
+    with open(directory / 'interaction-events.jsonl', 'xb'):
+        pass
+    def record_interaction(kind, **fields):
+        global interaction_log_bytes
+        event = {'ordinal': len(interaction_events), 'kind': kind,
+                 'expected_source_commit': source, 'profile': profile, **fields}
+        encoded = json.dumps(event, sort_keys=True).encode() + b'\n'
+        interaction_log_bytes += len(encoded)
+        assert interaction_log_bytes <= 1_000_000, 'bounded interaction log exceeded'
+        with open(directory / 'interaction-events.jsonl', 'ab') as events:
+            events.write(encoded)
+        interaction_events.append(event)
     with open(directory / 'stderr.log', 'xb') as log:
         process = subprocess.Popen(
             [binary, '--storage', 'memory', '--bootstrap-ticks', '0', '--threads', '1',
@@ -379,15 +577,37 @@ for profile in ('truecolor', 'no-color'):
              '--set', 'persistence_interval=0', '--checkpoint-interval', '0'],
             stdin=slave, stdout=slave, stderr=log, cwd=directory, env=environment,
             preexec_fn=controlling_terminal)
+        os.set_blocking(master, False)
         def read_terminal():
-            chunk = os.read(master, 65536)
+            try:
+                chunk = os.read(master, 65536)
+            except BlockingIOError:
+                return
+            assert chunk, 'terminal output reached EOF before its slave was closed'
             raw.extend(chunk)
             assert len(raw) <= 2_000_000, 'bounded PTY transcript exceeded'
             screen.feed(chunk)
         def send_terminal_input(data):
             global terminal_input_count
-            assert os.write(master, data) == len(data), 'incomplete terminal input write'
+            assert 0 < len(data) <= 4096, 'bounded terminal input exceeded'
+            deadline = time.monotonic() + 30
+            written = 0
+            while written < len(data) and time.monotonic() < deadline:
+                assert process.poll() is None, 'terminal exited during input write'
+                readable, writable, _ = select.select([master], [master], [], 0.05)
+                if readable:
+                    read_terminal()
+                if writable:
+                    try:
+                        count = os.write(master, data[written:])
+                    except BlockingIOError:
+                        continue
+                    assert count > 0, 'terminal input write made no progress'
+                    written += count
+            assert written == len(data), 'bounded terminal input write timed out'
             terminal_input_count += 1
+            record_interaction('submitted_input', input_write=terminal_input_count,
+                               bytes_hex=data.hex(), byte_count=written, transcript_offset=len(raw))
         def pump_until(predicate, description):
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -652,6 +872,268 @@ for profile in ('truecolor', 'no-color'):
                                 'pause_receipt': pause_receipt, 'step_receipt': step_receipt,
                                 'terminal_input_count_during_change': input_count_during_change},
                     'artifacts': evidence_artifacts}
+
+            # These bounded byte-input probes are not the companion's seeded
+            # >=1000-event storm, capability matrix, or styled-cell comparison.
+            interaction_http_bytes = 0
+            interaction_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with open(directory / 'interaction-http.jsonl', 'xb'):
+                pass
+
+            def interaction_api(path, payload=None):
+                global interaction_http_bytes
+                request_body = None if payload is None else json.dumps(payload, sort_keys=True).encode()
+                headers = {'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'}
+                if request_body is not None:
+                    headers['Content-Type'] = 'application/json'
+                request = urllib.request.Request('http://127.0.0.1:' + str(port) + path,
+                                                 data=request_body, headers=headers)
+                try:
+                    response = interaction_opener.open(request, timeout=2)
+                except urllib.error.HTTPError as error:
+                    response = error
+                with response:
+                    body = response.read(200_001)
+                    assert len(body) <= 200_000, 'bounded interaction response exceeded'
+                    response_headers = {key.lower(): value for key, value in response.getheaders()}
+                    record = json.dumps({'method': request.get_method(), 'path': path,
+                                         'status': response.status, 'headers': response.getheaders(),
+                                         'request_body': None if request_body is None else request_body.decode(),
+                                         'response_body': body.decode()}).encode() + b'\n'
+                    interaction_http_bytes += len(record)
+                    assert interaction_http_bytes <= 8_000_000, 'bounded interaction HTTP log exceeded'
+                    with open(directory / 'interaction-http.jsonl', 'ab') as http_log:
+                        http_log.write(record)
+                    if path == '/api/screenshot/ascii' and response.status == 409:
+                        return None, response_headers
+                    assert response.status == 200, (path, response.status, body.decode())
+                return body, response_headers
+
+            pause_body, _ = interaction_api('/api/control/pause', {})
+            retain_interaction('interaction-pause-response.json', pause_body)
+            pause_id = json.loads(pause_body)['command_id']
+            def interaction_paused():
+                receipt_body, _ = interaction_api('/api/control/status/' + pause_id)
+                receipt = json.loads(receipt_body)
+                assert receipt['command_id'] == pause_id, receipt
+                assert receipt['application_state'] not in ('rejected', 'failed'), receipt
+                if receipt['application_state'] != 'applied':
+                    return False
+                owner_body, _ = interaction_api('/api/status')
+                owner = json.loads(owner_body)
+                if owner['paused'] is not True or owner['last_applied_command'] != pause_id:
+                    return False
+                retain_interaction('interaction-pause-receipt.json', receipt_body)
+                retain_interaction('interaction-before-owner.json', owner_body)
+                interaction_paused.owner = owner
+                interaction_paused.receipt = receipt
+                return True
+            pump_until(interaction_paused, 'owner paused before byte input and resize')
+            interaction_before = interaction_paused.owner
+            baseline_tick = interaction_before['tick']
+
+            def capture_interaction(prefix, title, matches=lambda text: True, output_after=None,
+                                    require_footer_geometry=False):
+                def capture():
+                    terminal_text = screen.text()
+                    if (not screen.alternate or screen.synchronized or screen.pending
+                            or title not in terminal_text or not matches(terminal_text)
+                            or (output_after is not None and len(raw) <= output_after)):
+                        return False
+                    body, headers = interaction_api('/api/screenshot/ascii')
+                    if body is None:
+                        return False
+                    presented_text = body.decode()
+                    if (headers.get('x-scriptbots-frame-size') != str(screen.width) + 'x' + str(screen.height)
+                            or headers.get('x-scriptbots-frame-tick') != str(baseline_tick)
+                            or title not in presented_text or not matches(presented_text)):
+                        return False
+                    assert len(presented_text.splitlines()) == screen.height, 'presented row count disagrees with viewport'
+                    assert len(screen.cells) == screen.height and all(len(row) == screen.width for row in screen.cells)
+                    if require_footer_geometry:
+                        terminal_geometry = diagnostics_footer_geometry(terminal_text, screen.width, screen.height)
+                        presented_geometry = diagnostics_footer_geometry(presented_text, screen.width, screen.height)
+                        if terminal_geometry is None or terminal_geometry != presented_geometry:
+                            return False
+                    terminal_bytes = terminal_text.encode()
+                    retain_interaction(prefix + '-terminal.txt', terminal_bytes)
+                    retain_interaction(prefix + '-screen.txt', body)
+                    retain_interaction(prefix + '-headers.json', json.dumps(headers, sort_keys=True).encode())
+                    capture.result = {'probe': prefix, 'width': screen.width, 'height': screen.height,
+                                      'presented_tick': int(headers['x-scriptbots-frame-tick']),
+                                      'presented_frame_size': headers['x-scriptbots-frame-size'],
+                                      'terminal_sha256': hashlib.sha256(terminal_bytes).hexdigest(),
+                                      'presented_sha256': hashlib.sha256(body).hexdigest(),
+                                      'transcript_offset': len(raw)}
+                    if require_footer_geometry:
+                        capture.result['footer_geometry'] = {'terminal': terminal_geometry,
+                                                             'presented': presented_geometry}
+                    record_interaction('observed_capture', **capture.result)
+                    return True
+                pump_until(capture, 'serialized terminal and presented REST observation for ' + prefix)
+                return capture.result
+
+            def paused_header(text):
+                first_row = text.splitlines()[0] if text else ''
+                return re.search(r'\| Tick: ' + str(baseline_tick) + r' \| Pop: \d+ \| PAUSED\b', first_row) is not None
+
+            diagnostic_title = routes[-1][1]
+            send_terminal_input(b'9')
+            capture_interaction('interaction-before', diagnostic_title, paused_header,
+                                require_footer_geometry=True)
+            foreground_group = struct.unpack('i', fcntl.ioctl(master, termios.TIOCGPGRP, struct.pack('i', 0)))[0]
+            assert foreground_group == process.pid, 'child does not own its controlling terminal foreground group'
+            resize_ladder = [(40, 12), (60, 20), (80, 36), (120, 40), (160, 50), (120, 36)]
+            observed_resizes = []
+            for index, (width, height) in enumerate(resize_ladder):
+                # Drain available old-size output without discarding a partial
+                # escape sequence or resetting the incremental UTF-8 decoder.
+                drain_deadline = time.monotonic() + 0.2
+                while time.monotonic() < drain_deadline and select.select([master], [], [], 0)[0]:
+                    read_terminal()
+                pump_until(lambda: not screen.synchronized and not screen.pending
+                                   and diagnostics_footer_geometry(screen.text(), screen.width, screen.height) is not None,
+                           'complete old-size footer before resize control')
+                prefix = 'resize-' + str(index)
+                before_bytes = screen.text().encode()
+                before_file = prefix + '-before-terminal.txt'
+                retain_interaction(before_file, before_bytes)
+                # Deliberately omit child repainting in this synthetic fault
+                # control. Its cells come from the actual old-size terminal;
+                # local clamp/pad plus a valid harmless SGR reset must fail the
+                # identical footer oracle used for the live new-size capture.
+                stale = TerminalScreen(screen.width, screen.height)
+                stale.cells = [row[:] for row in screen.cells]
+                stale.x, stale.y, stale.saved = screen.x, screen.y, screen.saved
+                stale.scroll_top, stale.scroll_bottom = screen.scroll_top, screen.scroll_bottom
+                stale.wrap_pending, stale.autowrap = screen.wrap_pending, screen.autowrap
+                before_dimensions = (screen.width, screen.height)
+                stale.resize(width, height)
+                benign_input = b'\x1b[0m'
+                stale.feed(benign_input, final=True)
+                stale_bytes = stale.text().encode()
+                stale_file = prefix + '-stale-terminal.txt'
+                retain_interaction(stale_file, stale_bytes)
+                dimensions_observed = (stale.width, stale.height) == (width, height)
+                dimensions_observed &= len(stale.cells) == height and all(len(row) == width for row in stale.cells)
+                heading_preserved = diagnostic_title in stale.text()
+                stale_geometry = diagnostics_footer_geometry(stale.text(), width, height)
+                assert dimensions_observed and heading_preserved, 'stale control must satisfy the old dimension/title checks'
+                assert stale_geometry is None, 'local stale-cell resize plus harmless output satisfied footer oracle'
+                offset = len(raw)
+                started = time.monotonic()
+                screen.resize(width, height)
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', height, width, 0, 0))
+                os.killpg(process.pid, signal.SIGWINCH)
+                assert struct.unpack('HHHH', fcntl.ioctl(slave, termios.TIOCGWINSZ, b'\0' * 8))[:2] == (height, width)
+                record_interaction('requested_resize', width=width, height=height,
+                                   signal='SIGWINCH', transcript_offset=offset)
+                result = capture_interaction(prefix, diagnostic_title,
+                                             paused_header if width >= 80 else lambda text: True,
+                                             output_after=offset, require_footer_geometry=True)
+                result['elapsed_ms'] = (time.monotonic() - started) * 1000
+                result['serialized_bytes_observed'] = len(raw) - offset
+                result['stale_cell_control'] = {
+                    'synthetic_control': True,
+                    'actual_before': {'width': before_dimensions[0], 'height': before_dimensions[1],
+                                      'terminal_file': before_file,
+                                      'terminal_sha256': hashlib.sha256(before_bytes).hexdigest()},
+                    'benign_input_hex': benign_input.hex(), 'benign_input_byte_length': len(benign_input),
+                    'parser_sequence_accepted': not stale.pending,
+                    'terminal_file': stale_file, 'terminal_sha256': hashlib.sha256(stale_bytes).hexdigest(),
+                    'requested_dimensions_observed': dimensions_observed, 'full_heading_preserved': heading_preserved,
+                    'observed_footer_geometry': stale_geometry,
+                    'expected_footer_geometry': result['footer_geometry']['presented'],
+                    'rejected': stale_geometry is None}
+                record_interaction('rejected_stale_resize_control', probe=prefix, **result['stale_cell_control'])
+                observed_resizes.append(result)
+                record_interaction('observed_resize', **result)
+
+            def selected_palette_row(text):
+                selected = []
+                for row, line in enumerate(text.splitlines()):
+                    match = re.search(r'> ((?:\[Recent\] )?\[[^\]]+\] [^│|\r\n]+)', line)
+                    if match is not None:
+                        selected.append((row, match[1].strip()))
+                return selected[0] if len(selected) == 1 else None
+
+            palette_title = 'Command Palette (type to filter, Esc to exit)'
+            send_terminal_input(b'\x10')
+            capture_interaction('palette-open', palette_title,
+                                lambda text: selected_palette_row(text) is not None)
+            initial_selection = selected_palette_row(screen.text())
+            observed_arrows = []
+            send_terminal_input(b'\x1b[B')
+            def arrow_down_matches(text):
+                selected = selected_palette_row(text)
+                return selected is not None and selected[0] == initial_selection[0] + 1 and selected[1] != initial_selection[1]
+            down_capture = capture_interaction('palette-arrow-down', palette_title, arrow_down_matches)
+            down_selection = selected_palette_row(screen.text())
+            observed_arrows.append({'key': 'down', 'input_hex': b'\x1b[B'.hex(),
+                                    'before': initial_selection, 'after': down_selection, 'capture': down_capture})
+            record_interaction('observed_arrow', **observed_arrows[-1])
+            send_terminal_input(b'\x1b[A')
+            up_capture = capture_interaction('palette-arrow-up', palette_title,
+                                             lambda text: selected_palette_row(text) == initial_selection)
+            observed_arrows.append({'key': 'up', 'input_hex': b'\x1b[A'.hex(),
+                                    'before': down_selection, 'after': selected_palette_row(screen.text()),
+                                    'capture': up_capture})
+            record_interaction('observed_arrow', **observed_arrows[-1])
+
+            send_terminal_input(b'Open Lineages')
+            filtered_title = 'Command Palette: "Open Lineages"'
+            target_label = '[Navigation] Open Lineages and Phylogeny'
+            capture_interaction('palette-mouse-target', filtered_title,
+                                lambda text: target_label in text and selected_palette_row(text) is not None)
+            positions = [(column, row) for row, cells in enumerate(screen.cells)
+                         for column in range(screen.width - len(target_label) + 1)
+                         if ''.join(cells[column:column + len(target_label)]) == target_label]
+            assert len(positions) == 1, 'mouse target must occur once in the actual visible cells'
+            column, row = positions[0]
+            mouse_column, mouse_row = column + 4 + 1, row + 1
+            capture_modes_before_input = sorted(screen.enabled_capture_modes)
+            observed_sgr_capture = {1000, 1002, 1006}.issubset(screen.enabled_capture_modes)
+            assert observed_sgr_capture, 'actual SGR button capture was not enabled before mouse input'
+            down_bytes = ('\x1b[<0;' + str(mouse_column) + ';' + str(mouse_row) + 'M').encode()
+            up_bytes = ('\x1b[<0;' + str(mouse_column) + ';' + str(mouse_row) + 'm').encode()
+            send_terminal_input(down_bytes)
+            capture_interaction('palette-mouse-down', filtered_title, lambda text: target_label in text)
+            send_terminal_input(up_bytes)
+            navigation_capture = capture_interaction('palette-mouse-navigation', routes[0][1],
+                                                     lambda text: paused_header(text) and 'Command Palette' not in text)
+            mouse_navigation = {'protocol': 'SGR', 'column_one_based': mouse_column, 'row_one_based': mouse_row,
+                                'observed_sgr_capture': observed_sgr_capture,
+                                'capture_modes_before_input': capture_modes_before_input,
+                                'visible_item': target_label, 'down_hex': down_bytes.hex(), 'up_hex': up_bytes.hex(),
+                                'observed_route': 'Lineages', 'capture': navigation_capture}
+            record_interaction('observed_mouse_navigation', **mouse_navigation)
+            send_terminal_input(b'9')
+            source_pattern = re.compile(r'\bBuild: ' + re.escape(source) + r'\b')
+            responsiveness_capture = capture_interaction('interaction-responsive', diagnostic_title,
+                                                          lambda text: paused_header(text) and source_pattern.search(text) is not None)
+            owner_after_body, _ = interaction_api('/api/status')
+            interaction_after = json.loads(owner_after_body)
+            retain_interaction('interaction-after-owner.json', owner_after_body)
+            assert interaction_after['tick'] == baseline_tick and interaction_after['paused'] is True, interaction_after
+            assert interaction_after['last_applied_command'] == pause_id, 'UI input unexpectedly applied a host command'
+            assert interaction_after['config_revision'] == interaction_before['config_revision'], 'UI navigation changed owner config'
+            interaction_evidence = {
+                'source_commit': binary_source,
+                'requested_resize_sequence': resize_ladder,
+                'observed_resize_sequence': [(result['width'], result['height']) for result in observed_resizes],
+                'observed_resize_probes': observed_resizes, 'observed_arrow_probes': observed_arrows,
+                'mouse_navigation': mouse_navigation, 'before_owner': interaction_before,
+                'after_owner': interaction_after, 'pause_receipt': interaction_paused.receipt,
+                'owner_tick_unchanged': interaction_after['tick'] == interaction_before['tick'],
+                'responsiveness_observed': responsiveness_capture['presented_tick'] == baseline_tick
+                                           and responsiveness_capture['presented_frame_size'] == '120x36',
+                'responsiveness_capture': responsiveness_capture,
+                'submitted_input_write_count_before_quit': len([event for event in interaction_events
+                                                               if event['kind'] == 'submitted_input']),
+                'observed_probe_count': len([event for event in interaction_events
+                                             if event['kind'] in ('observed_resize', 'observed_arrow',
+                                                                  'observed_mouse_navigation')])}
+            retain_interaction('interaction-results.json', json.dumps(interaction_evidence, sort_keys=True).encode())
             send_terminal_input(b'q')
             deadline = time.monotonic() + 30
             while process.poll() is None and time.monotonic() < deadline:
@@ -693,11 +1175,18 @@ for profile in ('truecolor', 'no-color'):
     lifecycle = lifecycle_bytes.decode(errors='replace')
     finalized = 'terminal lifecycle finalized' in lifecycle and 'frankentui' in lifecycle
     assert finalized, 'real FrankenTUI shutdown callback was not observed'
+    for filename in ('interaction-events.jsonl', 'interaction-http.jsonl'):
+        interaction_artifacts.append({'file': filename,
+                                      'sha256': hashlib.sha256((directory / filename).read_bytes()).hexdigest()})
+    interaction_evidence['artifacts'] = interaction_artifacts
     print(json.dumps({'schema': 'scriptbots.live-tui-pty.v1', 'source_commit': binary_source,
                       'binary_source_observed': binary_source is not None,
                       'capability_profile': profile, 'observed_science_routes': observed,
                       'observed_screenshot_routes': screenshots,
                       'data_provider_evidence': data_provider_evidence,
+                      'python_identity': python_identity,
+                      'parser_guard_evidence': parser_guard_evidence,
+                      'byte_input_resize_evidence': interaction_evidence,
                       'observed_color_sgr_count': screen.color_count,
                       'observed_truecolor_sgr_count': screen.truecolor_count,
                       'observed_style_sgr_count': screen.attribute_count,

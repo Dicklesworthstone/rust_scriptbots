@@ -144,6 +144,202 @@ verify_evidence() {
                 [[ $(sha256sum "$artifact_directory/terminal-screen-$index.txt" | cut -d ' ' -f 1) == "$terminal_hash" ]] || refuse "changed observed terminal screen"
                 index=$((index + 1))
             done < <(jq -c '.observed_screenshot_routes[]' <<< "$record")
+            jq -e --arg source "$expected" '
+                .byte_input_resize_evidence as $e
+                | $e.source_commit == $source and $e.owner_tick_unchanged == true
+                and $e.responsiveness_observed == true
+                and $e.requested_resize_sequence == [[40,12],[60,20],[80,36],[120,40],[160,50],[120,36]]
+                and $e.observed_resize_sequence == $e.requested_resize_sequence
+                and ([$e.observed_resize_probes[] | [.width,.height]]) == $e.requested_resize_sequence
+                and all($e.observed_resize_probes[];
+                    .serialized_bytes_observed > 0 and .elapsed_ms > 0
+                    and .presented_tick == $e.before_owner.tick
+                    and .presented_frame_size == ((.width | tostring) + "x" + (.height | tostring))
+                    and .footer_geometry.terminal == .footer_geometry.presented
+                    and .footer_geometry.terminal.divider_row == (.height - 2)
+                    and .footer_geometry.terminal.divider_column == 0
+                    and .footer_geometry.terminal.divider_width == .width
+                    and .footer_geometry.terminal.status_row == (.height - 1)
+                    and (.footer_geometry.terminal.status_text | length) > 0
+                    and .stale_cell_control.synthetic_control == true
+                    and .stale_cell_control.benign_input_hex == "1b5b306d"
+                    and .stale_cell_control.benign_input_byte_length == 4
+                    and .stale_cell_control.parser_sequence_accepted == true
+                    and .stale_cell_control.requested_dimensions_observed == true
+                    and .stale_cell_control.full_heading_preserved == true
+                    and .stale_cell_control.rejected == true
+                    and (.stale_cell_control | has("observed_footer_geometry"))
+                    and .stale_cell_control.observed_footer_geometry == null
+                    and .stale_cell_control.expected_footer_geometry == .footer_geometry.presented
+                    and .stale_cell_control.actual_before.terminal_file == (.probe + "-before-terminal.txt")
+                    and .stale_cell_control.terminal_file == (.probe + "-stale-terminal.txt")
+                    and (.stale_cell_control.actual_before.terminal_sha256 | test("^[0-9a-f]{64}$"))
+                    and (.stale_cell_control.terminal_sha256 | test("^[0-9a-f]{64}$")))
+                and ([$e.observed_arrow_probes[].key]) == ["down","up"]
+                and $e.observed_arrow_probes[0].input_hex == "1b5b42"
+                and $e.observed_arrow_probes[1].input_hex == "1b5b41"
+                and $e.observed_arrow_probes[0].after[0] == ($e.observed_arrow_probes[0].before[0] + 1)
+                and $e.observed_arrow_probes[0].after[1] != $e.observed_arrow_probes[0].before[1]
+                and $e.observed_arrow_probes[1].before == $e.observed_arrow_probes[0].after
+                and $e.observed_arrow_probes[1].after == $e.observed_arrow_probes[0].before
+                and $e.observed_arrow_probes[0].capture.terminal_sha256 != $e.observed_arrow_probes[1].capture.terminal_sha256
+                and $e.mouse_navigation.protocol == "SGR"
+                and $e.mouse_navigation.observed_route == "Lineages"
+                and $e.mouse_navigation.visible_item == "[Navigation] Open Lineages and Phylogeny"
+                and $e.mouse_navigation.observed_sgr_capture == true
+                and ([1000,1002,1006] - $e.mouse_navigation.capture_modes_before_input) == []
+                and $e.mouse_navigation.column_one_based > 0 and $e.mouse_navigation.column_one_based <= 120
+                and $e.mouse_navigation.row_one_based > 0 and $e.mouse_navigation.row_one_based <= 36
+                and ($e.mouse_navigation.column_one_based | floor) == $e.mouse_navigation.column_one_based
+                and ($e.mouse_navigation.row_one_based | floor) == $e.mouse_navigation.row_one_based
+                and $e.pause_receipt.application_state == "applied"
+                and ($e.pause_receipt.command_id | type) == "string" and ($e.pause_receipt.command_id | length) > 0
+                and $e.before_owner.paused == true and $e.after_owner.paused == true
+                and all([$e.before_owner,$e.after_owner][];
+                    (.tick | type) == "number" and .tick >= 0 and (.tick | floor) == .tick
+                    and (.config_revision | type) == "number" and .config_revision >= 0
+                    and (.config_revision | floor) == .config_revision)
+                and $e.before_owner.tick == $e.after_owner.tick
+                and $e.before_owner.config_revision == $e.after_owner.config_revision
+                and $e.before_owner.last_applied_command == $e.pause_receipt.command_id
+                and $e.after_owner.last_applied_command == $e.pause_receipt.command_id
+                and $e.responsiveness_capture.presented_tick == $e.before_owner.tick
+                and $e.responsiveness_capture.presented_frame_size == "120x36"
+                and (.python_identity.executable_sha256 | test("^[0-9a-f]{64}$"))
+                and .python_identity.implementation == "cpython" and .python_identity.platform == "linux"
+                and (.python_identity.stdlib_modules | keys) == ["codecs","fcntl","pty","termios","unicodedata"]
+                and all(.python_identity.stdlib_modules[]; (.path | startswith("/")) and (.sha256 | test("^[0-9a-f]{64}$")))
+                and .parser_guard_evidence.synthetic_parser_controls == true
+                and ([.parser_guard_evidence.accepted_cases[] | select(.case == "valid_stream_split") | .split_byte] as $splits
+                    | .parser_guard_evidence.valid_stream_byte_length > 0
+                    and $splits == [range(0; (.parser_guard_evidence.valid_stream_byte_length + 1))])
+                and ([.parser_guard_evidence.accepted_cases[].case] | unique | sort) ==
+                    ["differential_cursor_repaint_and_erase","resize_preserves_partial_csi_and_clamps_saved_cursor","resize_preserves_partial_utf8_and_expands_blank_cells","valid_stream_single_byte_chunks","valid_stream_split"]
+                and ([.parser_guard_evidence.rejected_cases[].case] | sort) ==
+                    ["incomplete_extended_color","invalid_csi_byte","invalid_scroll_region","invalid_utf8","oversized_csi","truncated_csi","truncated_osc","truncated_utf8","unsupported_csi","unsupported_escape","unsupported_mode","unsupported_osc"]
+                and all(.parser_guard_evidence.rejected_cases[]; (.exception | length) > 0 and (.reason | length) > 0)
+                and ([$e.artifacts[].file] | length) == ([$e.artifacts[].file] | unique | length)
+                and all($e.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")))
+            ' <<< "$record" >/dev/null || refuse "missing or collapsed actual PTY input and resize observations"
+            local interaction_file interaction_hash interaction_record capture_record capture_prefix
+            while IFS= read -r interaction_record; do
+                interaction_file=$(jq -er '.file' <<< "$interaction_record") || refuse "missing interaction artifact filename"
+                [[ "$interaction_file" =~ ^[A-Za-z0-9._-]+$ ]] || refuse "invalid interaction artifact filename"
+                interaction_hash=$(jq -er '.sha256' <<< "$interaction_record") || refuse "missing interaction artifact identity"
+                [[ "$interaction_hash" =~ ^[0-9a-f]{64}$ && -f "$artifact_directory/$interaction_file" ]] || refuse "invalid or missing interaction artifact"
+                [[ $(sha256sum "$artifact_directory/$interaction_file" | cut -d ' ' -f 1) == "$interaction_hash" ]] || refuse "changed terminal interaction artifact"
+            done < <(jq -c '.byte_input_resize_evidence.artifacts[]' <<< "$record")
+            jq -e --argjson observation "$record" '. == ($observation.byte_input_resize_evidence | del(.artifacts))' \
+                "$artifact_directory/interaction-results.json" >/dev/null || refuse "interaction result record differs"
+            jq -e --argjson observation "$record" '. == $observation.python_identity' \
+                "$artifact_directory/python-identity.json" >/dev/null || refuse "Python identity record differs"
+            jq -e --argjson observation "$record" '. == $observation.parser_guard_evidence' \
+                "$artifact_directory/parser-guards.json" >/dev/null || refuse "parser guard record differs"
+            jq -e --argjson observation "$record" '. == $observation.byte_input_resize_evidence.before_owner' \
+                "$artifact_directory/interaction-before-owner.json" >/dev/null || refuse "initial owner record differs"
+            jq -e --argjson observation "$record" '. == $observation.byte_input_resize_evidence.after_owner' \
+                "$artifact_directory/interaction-after-owner.json" >/dev/null || refuse "final owner record differs"
+            jq -e --argjson observation "$record" '. == $observation.byte_input_resize_evidence.pause_receipt' \
+                "$artifact_directory/interaction-pause-receipt.json" >/dev/null || refuse "pause application receipt differs"
+            jq -s -e --argjson observation "$record" --arg source "$expected" '
+                $observation.byte_input_resize_evidence as $e
+                | . as $events
+                | [.[] | select(.kind == "observed_capture") | del(.ordinal,.kind,.expected_source_commit,.profile)] as $captures
+                | ([.[].ordinal]) == [range(0; length)]
+                and all(.[]; .expected_source_commit == $source and .profile == $observation.capability_profile)
+                and ([.[] | select(.kind == "requested_resize") | [.width,.height]]) == $e.requested_resize_sequence
+                and all(.[] | select(.kind == "requested_resize"); .signal == "SIGWINCH")
+                and ([.[] | select(.kind == "observed_resize") | del(.ordinal,.kind,.expected_source_commit,.profile)]) == $e.observed_resize_probes
+                and ([.[] | select(.kind == "rejected_stale_resize_control") | del(.ordinal,.kind,.expected_source_commit,.profile)]) ==
+                    [$e.observed_resize_probes[] | {probe} + .stale_cell_control]
+                and ([.[] | select(.kind == "observed_arrow") | del(.ordinal,.kind,.expected_source_commit,.profile)]) == $e.observed_arrow_probes
+                and ([.[] | select(.kind == "observed_mouse_navigation") | del(.ordinal,.kind,.expected_source_commit,.profile)]) == [$e.mouse_navigation]
+                and ([.[] | select(.kind == "observed_resize" or .kind == "observed_arrow" or .kind == "observed_mouse_navigation")] | length) == $e.observed_probe_count
+                and ([.[] | select(.kind == "submitted_input")] | length) == ($e.submitted_input_write_count_before_quit + 1)
+                and ([.[] | select(.kind == "submitted_input")][-1].bytes_hex) == "71"
+                and any(.[]; .kind == "submitted_input" and .bytes_hex == $e.mouse_navigation.down_hex)
+                and any(.[]; .kind == "submitted_input" and .bytes_hex == $e.mouse_navigation.up_hex)
+                and all(.[] | select(.kind == "submitted_input");
+                    (.bytes_hex | test("^([0-9a-f]{2})+$")) and .byte_count == ((.bytes_hex | length) / 2))
+                and ([.[] | select(.kind == "submitted_input") | .input_write]) ==
+                    [range(1; ([.[] | select(.kind == "submitted_input")] | length) + 1)]
+                and ([.[] | select(.kind == "observed_capture") | .probe] | length) == ([.[] | select(.kind == "observed_capture") | .probe] | unique | length)
+                and ([$captures[].probe] | sort) ==
+                    (["interaction-before","palette-open","palette-arrow-down","palette-arrow-up","palette-mouse-target","palette-mouse-down","palette-mouse-navigation","interaction-responsive"]
+                     + [range(0; ($e.requested_resize_sequence | length)) | "resize-" + tostring] | sort)
+                and all($captures[]; (.terminal_sha256 | test("^[0-9a-f]{64}$")) and (.presented_sha256 | test("^[0-9a-f]{64}$")))
+                and all($e.observed_resize_probes[]; . as $probe
+                    | ([$events[] | select(.kind == "requested_resize" and .width == $probe.width and .height == $probe.height)][0]) as $request
+                    | ([$events[] | select(.kind == "observed_capture" and .probe == $probe.probe)][0]) as $capture
+                    | ([$events[] | select(.kind == "rejected_stale_resize_control" and .probe == $probe.probe)][0]) as $control
+                    | ([$events[] | select(.kind == "observed_resize" and .probe == $probe.probe)][0]) as $result
+                    | ($probe | del(.elapsed_ms,.serialized_bytes_observed,.stale_cell_control)) == ([$captures[] | select(.probe == $probe.probe)][0])
+                    and $request.ordinal < $capture.ordinal and $capture.ordinal < $control.ordinal and $control.ordinal < $result.ordinal
+                    and $capture.transcript_offset > $request.transcript_offset
+                    and $probe.serialized_bytes_observed == ($capture.transcript_offset - $request.transcript_offset)
+                    and ([$events[] | select(.kind == "rejected_stale_resize_control" and .probe == $probe.probe)][0]
+                        | del(.ordinal,.kind,.expected_source_commit,.profile,.probe)) == $probe.stale_cell_control)
+                and all($e.observed_arrow_probes[]; . as $arrow
+                    | ([$events[] | select(.kind == "submitted_input" and .bytes_hex == $arrow.input_hex)][0]) as $input
+                    | ([$events[] | select(.kind == "observed_capture" and .probe == $arrow.capture.probe)][0]) as $capture
+                    | ([$events[] | select(.kind == "observed_arrow" and .key == $arrow.key)][0]) as $result
+                    | $arrow.capture == ([$captures[] | select(.probe == $arrow.capture.probe)][0])
+                    and ([$events[] | select(.kind == "submitted_input" and .bytes_hex == $arrow.input_hex)] | length) == 1
+                    and $input.ordinal < $capture.ordinal and $capture.ordinal < $result.ordinal)
+                and $e.mouse_navigation.capture == ([$captures[] | select(.probe == $e.mouse_navigation.capture.probe)][0])
+                and $e.responsiveness_capture == ([$captures[] | select(.probe == $e.responsiveness_capture.probe)][0])
+                and ([$events[] | select(.kind == "submitted_input" and .bytes_hex == $e.mouse_navigation.down_hex)][0].ordinal)
+                    < ([$events[] | select(.kind == "observed_capture" and .probe == "palette-mouse-down")][0].ordinal)
+                and ([$events[] | select(.kind == "observed_capture" and .probe == "palette-mouse-down")][0].ordinal)
+                    < ([$events[] | select(.kind == "submitted_input" and .bytes_hex == $e.mouse_navigation.up_hex)][0].ordinal)
+                and ([$events[] | select(.kind == "submitted_input" and .bytes_hex == $e.mouse_navigation.up_hex)][0].ordinal)
+                    < ([$events[] | select(.kind == "observed_capture" and .probe == "palette-mouse-navigation")][0].ordinal)
+                and ([$events[] | select(.kind == "observed_capture" and .probe == "palette-mouse-navigation")][0].ordinal)
+                    < ([$events[] | select(.kind == "observed_mouse_navigation")][0].ordinal)
+                and ([$e.artifacts[].file] | sort) ==
+                    (["python-identity.json","parser-guards.json","interaction-pause-response.json","interaction-pause-receipt.json","interaction-before-owner.json","interaction-after-owner.json","interaction-results.json","interaction-events.jsonl","interaction-http.jsonl"]
+                     + [.[] | select(.kind == "observed_capture") | .probe as $prefix
+                        | ($prefix + "-terminal.txt"),($prefix + "-screen.txt"),($prefix + "-headers.json")]
+                     + [$e.observed_resize_probes[].probe as $prefix
+                        | ($prefix + "-before-terminal.txt"),($prefix + "-stale-terminal.txt")] | sort)
+            ' "$artifact_directory/interaction-events.jsonl" >/dev/null || refuse "ordered interaction observations differ"
+            local mouse_column mouse_row mouse_down_hex mouse_up_hex
+            mouse_column=$(jq -er '.byte_input_resize_evidence.mouse_navigation.column_one_based' <<< "$record") || refuse "missing mouse column"
+            mouse_row=$(jq -er '.byte_input_resize_evidence.mouse_navigation.row_one_based' <<< "$record") || refuse "missing mouse row"
+            mouse_down_hex=$(printf '\033[<0;%d;%dM' "$mouse_column" "$mouse_row" | od -An -tx1 | tr -d ' \n')
+            mouse_up_hex=$(printf '\033[<0;%d;%dm' "$mouse_column" "$mouse_row" | od -An -tx1 | tr -d ' \n')
+            [[ $(jq -r '.byte_input_resize_evidence.mouse_navigation.down_hex' <<< "$record") == "$mouse_down_hex" ]] || refuse "mouse-down bytes differ from observed target"
+            [[ $(jq -r '.byte_input_resize_evidence.mouse_navigation.up_hex' <<< "$record") == "$mouse_up_hex" ]] || refuse "mouse-up bytes differ from observed target"
+            while IFS= read -r capture_record; do
+                capture_prefix=$(jq -er '.probe' <<< "$capture_record") || refuse "missing observed capture identity"
+                [[ "$capture_prefix" =~ ^[A-Za-z0-9._-]+$ ]] || refuse "invalid capture identity"
+                [[ $(sha256sum "$artifact_directory/$capture_prefix-terminal.txt" | cut -d ' ' -f 1) == "$(jq -r '.terminal_sha256' <<< "$capture_record")" ]] || refuse "changed serialized terminal capture"
+                [[ $(sha256sum "$artifact_directory/$capture_prefix-screen.txt" | cut -d ' ' -f 1) == "$(jq -r '.presented_sha256' <<< "$capture_record")" ]] || refuse "changed presented interaction capture"
+                jq -e --argjson capture "$capture_record" \
+                    '."x-scriptbots-frame-size" == $capture.presented_frame_size and ."x-scriptbots-frame-tick" == ($capture.presented_tick | tostring)' \
+                    "$artifact_directory/$capture_prefix-headers.json" >/dev/null || refuse "presented interaction headers differ"
+            done < <(jq -c 'select(.kind == "observed_capture")' "$artifact_directory/interaction-events.jsonl")
+            local footer_row footer_status_row footer_divider footer_status stale_file before_file
+            while IFS= read -r interaction_record; do
+                capture_prefix=$(jq -er '.probe' <<< "$interaction_record") || refuse "missing resize identity"
+                footer_row=$(jq -er '.footer_geometry.terminal.divider_row + 1' <<< "$interaction_record") || refuse "missing footer row"
+                footer_status_row=$(jq -er '.footer_geometry.terminal.status_row + 1' <<< "$interaction_record") || refuse "missing status row"
+                footer_divider=$(printf '%*s' "$(jq -r '.width' <<< "$interaction_record")" '' | tr ' ' '-')
+                footer_status=$(jq -er '.footer_geometry.terminal.status_text' <<< "$interaction_record") || refuse "missing footer status"
+                for interaction_file in "$capture_prefix-terminal.txt" "$capture_prefix-screen.txt"; do
+                    [[ $(sed -n "${footer_row}p" "$artifact_directory/$interaction_file") == "$footer_divider" ]] || refuse "new-size terminal divider was not observed"
+                    [[ $(sed -n "${footer_status_row}p" "$artifact_directory/$interaction_file") == "$footer_status" ]] || refuse "new-size terminal status was not observed"
+                done
+                before_file=$(jq -er '.stale_cell_control.actual_before.terminal_file' <<< "$interaction_record") || refuse "missing old-cell observation"
+                stale_file=$(jq -er '.stale_cell_control.terminal_file' <<< "$interaction_record") || refuse "missing stale-cell control"
+                [[ $(sha256sum "$artifact_directory/$before_file" | cut -d ' ' -f 1) == "$(jq -r '.stale_cell_control.actual_before.terminal_sha256' <<< "$interaction_record")" ]] || refuse "changed old terminal cells"
+                [[ $(sha256sum "$artifact_directory/$stale_file" | cut -d ' ' -f 1) == "$(jq -r '.stale_cell_control.terminal_sha256' <<< "$interaction_record")" ]] || refuse "changed stale-cell control"
+                rg -Fq 'SYSTEM DIAGNOSTICS & PIPELINE HEALTH' "$artifact_directory/$stale_file" || refuse "stale control lost the original heading"
+                [[ $(sed -n "${footer_row}p" "$artifact_directory/$stale_file") != "$footer_divider" ]] || refuse "stale cells passed the new footer observation"
+            done < <(jq -c '.byte_input_resize_evidence.observed_resize_probes[]' <<< "$record")
+            for interaction_file in interaction-responsive-terminal.txt interaction-responsive-screen.txt; do
+                rg -Fq "Build: $expected" "$artifact_directory/$interaction_file" || refuse "missing source-bound responsive terminal"
+            done
             if [[ $(jq -r '.capability_profile' <<< "$record") == truecolor ]]; then
                 local provider_file provider_hash provider_record
                 while IFS= read -r provider_record; do
