@@ -315,7 +315,10 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
     assert_eq!(initial_agent_count, AGENT_COUNT);
     let population_minimum = world.config().population_minimum;
     assert_eq!(population_minimum, AGENT_COUNT);
-    assert!(!world.config().closed, "production replenishment is enabled");
+    assert!(
+        !world.config().closed,
+        "production replenishment is enabled"
+    );
     let persistence = world
         .bind_persistence(Box::new(scriptbots_core::NullPersistence))
         .expect("persistence binding");
