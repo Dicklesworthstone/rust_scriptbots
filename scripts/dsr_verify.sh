@@ -68,6 +68,7 @@ verify_evidence() {
             | length == 3 and ([.[].fault] | sort) == ["panic", "renderer", "subscription"]
             and all(.[]; .source_commit == $source and .fault_observed == true
                 and .raw_mode_observed == true and .terminal_attributes_restored == true
+                and .alternate_screen_entered == true
                 and .alternate_screen_restored == true)
         ' "$directory/terminal-unit-tests.log" >/dev/null || refuse "missing source-bound actual PTY fault restoration"
         while IFS= read -r record; do

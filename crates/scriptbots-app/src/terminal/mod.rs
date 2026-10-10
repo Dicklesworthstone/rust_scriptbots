@@ -7211,7 +7211,7 @@ impl TerminalBrainInspectionCache {
     fn from_projection(
         projection: scriptbots_runtime::BrainProjection,
         world: &RenderSnapshot,
-        agent_uid: AgentUid,
+        agent_uid: scriptbots_core::AgentUid,
     ) -> Self {
         let coherent = projection.source.matches_snapshot(world);
         let response = projection.inspection;
@@ -15708,8 +15708,6 @@ mod tests {
         use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        assert!(matches!(case, "panic" | "subscription" | "renderer"));
-
         struct FaultModel<'a> {
             live: LiveTerminalModel<'a>,
             case: String,
@@ -15736,9 +15734,10 @@ mod tests {
             }
 
             fn view(&self, frame: &mut ftui::render::frame::Frame) {
-                if self.case == "panic" && self.triggered.load(Ordering::Acquire) {
-                    panic!("injected actual model-view panic");
-                }
+                assert!(
+                    self.case != "panic" || !self.triggered.load(Ordering::Acquire),
+                    "injected actual model-view panic"
+                );
                 self.live.view(frame);
                 let marker = if self.triggered.load(Ordering::Acquire) {
                     "FAULT-PROBE-TRIGGERED"
@@ -15812,6 +15811,7 @@ mod tests {
             }
         }
 
+        assert!(matches!(case, "panic" | "subscription" | "renderer"));
         let host = TerminalTestHost::running_frame(command_characterization_world());
         let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
@@ -15828,6 +15828,10 @@ mod tests {
             let mut guard = TerminalModeGuard::begin_with(CrosstermRestore, || Ok(()), || Ok(()))
                 .expect("real outer restoration guard");
             guard.mark_cursor_hidden();
+            let config = ProgramConfig {
+                screen_mode: ftui::ScreenMode::AltScreen,
+                ..ProgramConfig::default()
+            };
             if case == "renderer" {
                 let features = ftui::runtime::BackendFeatures::default();
                 let session = ftui::TerminalSession::new(ftui::SessionOptions {
@@ -15851,7 +15855,7 @@ mod tests {
                     events,
                     features,
                     writer,
-                    ProgramConfig::default(),
+                    config,
                 )
                 .expect("real runtime with observed failing writer");
                 let run_result = program.run();
@@ -15859,7 +15863,7 @@ mod tests {
                 let error = run_result.expect_err("presentation failure must propagate");
                 assert!(error.to_string().contains("presentation write failure"));
             } else {
-                let mut program = Program::with_config(model, ProgramConfig::default())
+                let mut program = Program::with_config(model, config)
                     .expect("real FrankenTUI runtime");
                 let run_result = program.run();
                 if case == "subscription" {
@@ -15920,7 +15924,10 @@ for case in ('panic', 'subscription', 'renderer'):
                 assert process.poll() is None, 'child exited before actual presentation'
                 if select.select([master], [], [], 0.05)[0]:
                     raw.extend(os.read(master, 65536))
+                assert len(raw) < 2_000_000, 'bounded startup transcript exceeded'
             assert b'FAULT-PROBE-READY' in raw, 'first actual frame was not observed'
+            alternate_entered = b'\x1b[?1049h' in raw
+            assert alternate_entered, 'fault must happen after actual alternate-screen entry'
             raw_mode = not (termios.tcgetattr(slave)[3] & termios.ICANON)
             assert raw_mode, 'fault must happen after observed raw-mode startup'
             os.write(master, b'F')
@@ -15934,7 +15941,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 raw.extend(os.read(master, 65536))
             fault_observed = ('terminal-fault-observed:' + case).encode() in raw
             restored = termios.tcgetattr(slave) == initial
-            alternate_restored = b'\x1b[?1049l' in raw
+            alternate_restored = raw.rfind(b'\x1b[?1049l') > raw.rfind(b'\x1b[?1049h') >= 0
             assert fault_observed, 'named fault was not actually observed'
             assert restored, 'actual terminal attributes were not restored'
             assert alternate_restored, 'actual alternate screen was not restored'
@@ -15955,6 +15962,7 @@ for case in ('panic', 'subscription', 'renderer'):
                       'fault': case, 'fault_observed': fault_observed,
                       'raw_mode_observed': raw_mode,
                       'terminal_attributes_restored': restored,
+                      'alternate_screen_entered': alternate_entered,
                       'alternate_screen_restored': alternate_restored,
                       'transcript_sha256': hashlib.sha256(raw).hexdigest(),
                       'attributes_sha256': hashlib.sha256((directory / 'terminal-attributes.json').read_bytes()).hexdigest(),
