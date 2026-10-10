@@ -1007,9 +1007,8 @@ impl Model for FrankenTuiModel {
             }
             ShellMessage::CreateCheckpoint => {
                 if !self.has_receipt_capacity() {
-                    self.status_message = Some(
-                        "Checkpoint not requested: unfinished receipt history is full".into(),
-                    );
+                    self.status_message =
+                        Some("Checkpoint not requested: unfinished receipt history is full".into());
                     return Cmd::none();
                 }
                 let Some(next_request) = self.command_counter.checked_add(1) else {

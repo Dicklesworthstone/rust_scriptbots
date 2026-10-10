@@ -947,10 +947,10 @@ impl LiveLineages {
                 return false;
             }
         };
-        if !origins.starts_with(self.genesis_prefix.as_slice()) || (self.genesis_sealed && !sealed) {
-            self.error = Some(
-                "Canonical genesis origin prefix changed; completeness unavailable".into(),
-            );
+        if !origins.starts_with(self.genesis_prefix.as_slice()) || (self.genesis_sealed && !sealed)
+        {
+            self.error =
+                Some("Canonical genesis origin prefix changed; completeness unavailable".into());
             return false;
         }
         if origins.len() > Self::MAX_NODES {
@@ -1301,7 +1301,9 @@ pub enum TerminalCommandError {
     #[error("command not submitted: unfinished receipt history is full")]
     ReceiptHistoryFull,
     /// No additional exact envelope can be retained after ambiguous admission.
-    #[error("command not submitted: unresolved queue is full; Ctrl+R retries the oldest exact command")]
+    #[error(
+        "command not submitted: unresolved queue is full; Ctrl+R retries the oldest exact command"
+    )]
     UnresolvedCommandsFull,
 }
 
@@ -16721,7 +16723,10 @@ for case in ('panic', 'subscription', 'renderer'):
         ));
         assert!(simulator.model().failure.borrow().is_some());
         assert!(!simulator.is_running(), "error hook requests quit");
-        assert!(!simulator.is_shutdown(), "simulator quit does not run shutdown");
+        assert!(
+            !simulator.is_shutdown(),
+            "simulator quit does not run shutdown"
+        );
         simulator.shutdown();
         assert!(simulator.is_shutdown());
         assert!(simulator.model().app.borrow().frankentui.shutdown_called);
@@ -16766,7 +16771,9 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(empty_replay.first_divergence.is_none());
         assert!(matches!(
             science_service_messages(&handle, ShellRoute::Experiments, 2).as_slice(),
-            [ShellMessage::SetExperimentsData(ScreenDataState::Empty { .. })]
+            [ShellMessage::SetExperimentsData(
+                ScreenDataState::Empty { .. }
+            )]
         ));
 
         let checkpoint = handle
@@ -17402,10 +17409,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 app.speed_multiplier, 1.0,
                 "admission cannot mutate renderer playback"
             );
-            let receipt = app
-                .frankentui
-                .receipt_for(&id)
-                .expect("unresolved receipt");
+            let receipt = app.frankentui.receipt_for(&id).expect("unresolved receipt");
             assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Pending);
             assert_eq!(receipt.journal_state, None);
 
@@ -17418,10 +17422,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 "an exact retry must not admit another command identity"
             );
             app.refresh_command_receipts();
-            let receipt = app
-                .frankentui
-                .receipt_for(&id)
-                .expect("actual application");
+            let receipt = app.frankentui.receipt_for(&id).expect("actual application");
             assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
             assert_eq!(receipt.journal_state, Some(JournalState::Pending));
             assert!(app.unresolved_commands.is_empty());
@@ -17437,7 +17438,10 @@ for case in ('panic', 'subscription', 'renderer'):
                 finished.journal_state = Some(JournalState::NotRequired);
                 assert!(app.frankentui.record_receipt(finished));
             }
-            assert_eq!(app.frankentui.receipts.len(), frankentui_shell::MAX_RECEIPTS);
+            assert_eq!(
+                app.frankentui.receipts.len(),
+                frankentui_shell::MAX_RECEIPTS
+            );
             assert_eq!(
                 app.frankentui
                     .receipt_for(&id)
@@ -17581,7 +17585,10 @@ for case in ('panic', 'subscription', 'renderer'):
         let id = app
             .submit_with_visible_receipt(ControlCommand::SetSpeed(2.5))
             .expect("a real command may use the finished history slot");
-        assert_eq!(app.frankentui.receipts.len(), frankentui_shell::MAX_RECEIPTS);
+        assert_eq!(
+            app.frankentui.receipts.len(),
+            frankentui_shell::MAX_RECEIPTS
+        );
         driver
             .step(ManualInstant::from_nanos(1))
             .expect("owner applies the admitted command after capacity recovers");
@@ -22136,7 +22143,10 @@ for case in ('panic', 'subscription', 'renderer'):
             .unresolved_commands
             .back()
             .expect("unphased disconnection retains the exact unresolved envelope");
-        assert_eq!(latest.command_id, unresolved.envelope.command_id.to_string());
+        assert_eq!(
+            latest.command_id,
+            unresolved.envelope.command_id.to_string()
+        );
         assert_eq!(unresolved.envelope.command, HostCommand::Pause);
     }
 

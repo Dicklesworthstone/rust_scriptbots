@@ -5206,7 +5206,10 @@ mod tests {
             .to_vec();
         assert_eq!(actual_origins.len(), 2);
         assert_eq!(actual_origins[0].agent_uid, founder_uid);
-        assert_eq!(actual_origins[0].origin, scriptbots_core::BirthOrigin::Seeded);
+        assert_eq!(
+            actual_origins[0].origin,
+            scriptbots_core::BirthOrigin::Seeded
+        );
         assert_eq!(
             actual_origins[1].origin,
             scriptbots_core::BirthOrigin::Injected
