@@ -8759,7 +8759,7 @@ pub trait WorldPersistence: Send {
 }
 
 /// Payload-free state of the world's current persistence boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistenceBoundaryStatus {
     /// No immutable batch has been staged for the current tick.
     Open {
