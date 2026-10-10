@@ -6924,8 +6924,15 @@ impl PersistedCheckpointRecord {
     /// Decode the science component of a validated world or host checkpoint.
     /// This view alone does not restore a host or resume its persistence session.
     pub fn world_checkpoint(&self) -> Result<scriptbots_core::WorldCheckpointV1, StorageError> {
-        if self.format == format!("{}+postcard_hex", scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA) {
-            return self.host_checkpoint().map(|checkpoint| checkpoint.world_checkpoint().clone());
+        if self.format
+            == format!(
+                "{}+postcard_hex",
+                scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
+            )
+        {
+            return self
+                .host_checkpoint()
+                .map(|checkpoint| checkpoint.world_checkpoint().clone());
         }
         let bytes = self.validated_payload(
             scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA,
@@ -6960,13 +6967,18 @@ impl PersistedCheckpointRecord {
     fn validate_tick(&self, payload_tick: u64) -> Result<(), StorageError> {
         if self.tick != payload_tick {
             return Err(self.invalid_payload(format!(
-                "row tick {} differs from payload tick {payload_tick}", self.tick,
+                "row tick {} differs from payload tick {payload_tick}",
+                self.tick,
             )));
         }
         Ok(())
     }
 
-    fn validated_payload(&self, schema: &str, maximum_bytes: usize) -> Result<Vec<u8>, StorageError> {
+    fn validated_payload(
+        &self,
+        schema: &str,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, StorageError> {
         let invalid = |reason: String| StorageError::InvalidData {
             context: "checkpoints.payload",
             reason: format!("checkpoint {}: {reason}", self.checkpoint_id),
@@ -14640,29 +14652,38 @@ impl Storage {
         self.insert_checkpoint_record(&record)
     }
 
-    fn retained_checkpoint(&self, checkpoint_id: &str) -> Result<Option<PersistedCheckpointRecord>, StorageError> {
+    fn retained_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<PersistedCheckpointRecord>, StorageError> {
         let existing = self.connection()?.query_with_params(
             "SELECT tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json
              FROM checkpoints WHERE run_id = ?1 AND checkpoint_id = ?2",
             &[sqlite_run_id(self.run_id), checkpoint_id.into()],
         )?;
-        existing.first().map(|row| {
-            Ok(PersistedCheckpointRecord {
-                checkpoint_id: checkpoint_id.to_owned(),
-                tick: checked_u64("checkpoints.tick", decode(row, 0, "checkpoints.tick")?)?,
-                checkpoint_ordinal: checked_u64(
-                    "checkpoints.checkpoint_ordinal",
-                    decode(row, 1, "checkpoints.checkpoint_ordinal")?,
-                )?,
-                format: decode(row, 2, "checkpoints.format")?,
-                payload: decode(row, 3, "checkpoints.payload")?,
-                payload_digest: decode(row, 4, "checkpoints.payload_digest")?,
-                metadata_json: decode(row, 5, "checkpoints.metadata_json")?,
+        existing
+            .first()
+            .map(|row| {
+                Ok(PersistedCheckpointRecord {
+                    checkpoint_id: checkpoint_id.to_owned(),
+                    tick: checked_u64("checkpoints.tick", decode(row, 0, "checkpoints.tick")?)?,
+                    checkpoint_ordinal: checked_u64(
+                        "checkpoints.checkpoint_ordinal",
+                        decode(row, 1, "checkpoints.checkpoint_ordinal")?,
+                    )?,
+                    format: decode(row, 2, "checkpoints.format")?,
+                    payload: decode(row, 3, "checkpoints.payload")?,
+                    payload_digest: decode(row, 4, "checkpoints.payload_digest")?,
+                    metadata_json: decode(row, 5, "checkpoints.metadata_json")?,
+                })
             })
-        }).transpose()
+            .transpose()
     }
 
-    fn insert_checkpoint_record(&mut self, record: &PersistedCheckpointRecord) -> Result<(), StorageError> {
+    fn insert_checkpoint_record(
+        &mut self,
+        record: &PersistedCheckpointRecord,
+    ) -> Result<(), StorageError> {
         let checkpoint_id = record.checkpoint_id.as_str();
         let checkpoint_ordinal = record.checkpoint_ordinal;
         if let Some(retained) = self.retained_checkpoint(checkpoint_id)? {
@@ -14785,15 +14806,28 @@ impl Storage {
         if watermarks.admitted != watermarks.applied
             || (self.file_backed() && watermarks.durable != watermarks.admitted)
         {
-            return Err(refuse("science persistence has not reached the checkpoint commitment cut".to_owned()));
+            return Err(refuse(
+                "science persistence has not reached the checkpoint commitment cut".to_owned(),
+            ));
         }
-        let last_admitted_tick = watermarks.admitted
-            .map(|batch_id| self.batch_status(batch_id).and_then(|status| {
-                status.map(|status| status.tick).ok_or_else(|| refuse("admitted science batch has no ledger identity".to_owned()))
-            }))
+        let last_admitted_tick = watermarks
+            .admitted
+            .map(|batch_id| {
+                self.batch_status(batch_id).and_then(|status| {
+                    status.map(|status| status.tick).ok_or_else(|| {
+                        refuse("admitted science batch has no ledger identity".to_owned())
+                    })
+                })
+            })
             .transpose()?;
-        if last_admitted_tick != checkpoint.persistence_last_admitted_tick().map(|tick| tick.0) {
-            return Err(refuse("host admission cursor differs from the actual science ledger".to_owned()));
+        if last_admitted_tick
+            != checkpoint
+                .persistence_last_admitted_tick()
+                .map(|tick| tick.0)
+        {
+            return Err(refuse(
+                "host admission cursor differs from the actual science ledger".to_owned(),
+            ));
         }
         let cut = checkpoint.journal_cut();
         let expected_requirement = if self.file_backed() {
@@ -14801,25 +14835,49 @@ impl Storage {
         } else {
             ShutdownCommitRequirement::CommittedVolatile
         };
-        if cut.commitment_requirement != expected_requirement || cut.last_journal_sequence == u64::MAX {
-            return Err(refuse("checkpoint commitment or next journal sequence is incompatible with this worker".to_owned()));
+        if cut.commitment_requirement != expected_requirement
+            || cut.last_journal_sequence == u64::MAX
+        {
+            return Err(refuse(
+                "checkpoint commitment or next journal sequence is incompatible with this worker"
+                    .to_owned(),
+            ));
         }
-        let progress = Self::load_host_journal_progress(self.connection()?, self.run_id, cut.session_id)?
-            .ok_or_else(|| refuse("checkpoint host session has no registered journal".to_owned()))?;
-        let expected = (cut.last_journal_sequence, cut.last_scientific_event_sequence);
-        let mut stages = vec![HostJournalState::Admitted, HostJournalState::Applied, HostJournalState::CommittedVolatile];
-        if self.file_backed() { stages.push(HostJournalState::Durable); }
-        if progress.shutdown_sequence.is_some() || stages.into_iter().any(|stage| progress.prefixes(stage) != expected) {
+        let progress =
+            Self::load_host_journal_progress(self.connection()?, self.run_id, cut.session_id)?
+                .ok_or_else(|| {
+                    refuse("checkpoint host session has no registered journal".to_owned())
+                })?;
+        let expected = (
+            cut.last_journal_sequence,
+            cut.last_scientific_event_sequence,
+        );
+        let mut stages = vec![
+            HostJournalState::Admitted,
+            HostJournalState::Applied,
+            HostJournalState::CommittedVolatile,
+        ];
+        if self.file_backed() {
+            stages.push(HostJournalState::Durable);
+        }
+        if progress.shutdown_sequence.is_some()
+            || stages
+                .into_iter()
+                .any(|stage| progress.prefixes(stage) != expected)
+        {
             return Err(refuse("journal/event commitment prefixes differ from the exact host cut, or the session has shut down".to_owned()));
         }
-        Ok((HostCheckpointStorageCut {
-            schema_version: 1,
-            run_id: self.run_id.to_string(),
-            admitted: watermarks.admitted.map(PersistenceBatchId::get),
-            applied: watermarks.applied.map(PersistenceBatchId::get),
-            durable: watermarks.durable.map(PersistenceBatchId::get),
-            last_admitted_tick,
-        }, watermarks))
+        Ok((
+            HostCheckpointStorageCut {
+                schema_version: 1,
+                run_id: self.run_id.to_string(),
+                admitted: watermarks.admitted.map(PersistenceBatchId::get),
+                applied: watermarks.applied.map(PersistenceBatchId::get),
+                durable: watermarks.durable.map(PersistenceBatchId::get),
+                last_admitted_tick,
+            },
+            watermarks,
+        ))
     }
 
     fn record_host_checkpoint(
@@ -14835,19 +14893,27 @@ impl Storage {
             });
         }
         let (cut, watermarks) = self.host_checkpoint_storage_cut(checkpoint)?;
-        let mut metadata = metadata.as_object().cloned().ok_or_else(|| StorageError::InvalidData {
-            context: "checkpoints.metadata",
-            reason: "host checkpoint metadata must be an object".to_owned(),
-        })?;
+        let mut metadata =
+            metadata
+                .as_object()
+                .cloned()
+                .ok_or_else(|| StorageError::InvalidData {
+                    context: "checkpoints.metadata",
+                    reason: "host checkpoint metadata must be an object".to_owned(),
+                })?;
         if metadata.contains_key("host_storage_cut") {
             return Err(StorageError::InvalidData {
                 context: "checkpoints.metadata.host_storage_cut",
                 reason: "the storage cut is derived by the connection owner".to_owned(),
             });
         }
-        metadata.insert("host_storage_cut".to_owned(), serde_json::to_value(&cut).map_err(|error| StorageError::InvalidData {
-            context: "checkpoints.metadata.host_storage_cut", reason: error.to_string(),
-        })?);
+        metadata.insert(
+            "host_storage_cut".to_owned(),
+            serde_json::to_value(&cut).map_err(|error| StorageError::InvalidData {
+                context: "checkpoints.metadata.host_storage_cut",
+                reason: error.to_string(),
+            })?,
+        );
         let ordinal = match self.retained_checkpoint(checkpoint_id)? {
             Some(record) => record.checkpoint_ordinal,
             None => {
@@ -14855,31 +14921,51 @@ impl Storage {
                     "SELECT COALESCE(MAX(checkpoint_ordinal) + 1, 0) FROM checkpoints WHERE run_id = ?1",
                     &[sqlite_run_id(self.run_id)],
                 )?;
-                checked_u64("checkpoints.next_ordinal", decode(&row, 0, "checkpoints.next_ordinal")?)?
+                checked_u64(
+                    "checkpoints.next_ordinal",
+                    decode(&row, 0, "checkpoints.next_ordinal")?,
+                )?
             }
         };
-        let encoded = checkpoint.encode().map_err(|error| StorageError::InvalidData {
-            context: "checkpoints.host_payload", reason: error.to_string(),
-        })?;
+        let encoded = checkpoint
+            .encode()
+            .map_err(|error| StorageError::InvalidData {
+                context: "checkpoints.host_payload",
+                reason: error.to_string(),
+            })?;
         let record = PersistedCheckpointRecord {
-            checkpoint_id: checkpoint_id.to_owned(), tick: checkpoint.tick().0, checkpoint_ordinal: ordinal,
-            format: format!("{}+postcard_hex", scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA),
+            checkpoint_id: checkpoint_id.to_owned(),
+            tick: checkpoint.tick().0,
+            checkpoint_ordinal: ordinal,
+            format: format!(
+                "{}+postcard_hex",
+                scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
+            ),
             payload: journal::encode_lower_hex(&encoded),
             payload_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
             metadata_json: Value::Object(metadata).to_string(),
         };
         record.host_checkpoint()?;
         self.insert_checkpoint_record(&record)?;
-        let retained = self.retained_checkpoint(checkpoint_id)?.ok_or_else(|| StorageError::InvalidData {
-            context: "checkpoints.host_readback", reason: "checkpoint insert has no retained row".to_owned(),
-        })?;
+        let retained =
+            self.retained_checkpoint(checkpoint_id)?
+                .ok_or_else(|| StorageError::InvalidData {
+                    context: "checkpoints.host_readback",
+                    reason: "checkpoint insert has no retained row".to_owned(),
+                })?;
         if retained != record {
             return Err(StorageError::InvalidData {
-                context: "checkpoints.host_readback", reason: "retained checkpoint differs from the exact submitted artifact".to_owned(),
+                context: "checkpoints.host_readback",
+                reason: "retained checkpoint differs from the exact submitted artifact".to_owned(),
             });
         }
         retained.host_checkpoint()?;
-        Ok(HostCheckpointReceipt { run_id: self.run_id, record: retained, watermarks, journal_cut: checkpoint.journal_cut() })
+        Ok(HostCheckpointReceipt {
+            run_id: self.run_id,
+            record: retained,
+            watermarks,
+            journal_cut: checkpoint.journal_cut(),
+        })
     }
 
     fn validate_host_checkpoint_continuation(
@@ -14888,20 +14974,35 @@ impl Storage {
     ) -> Result<scriptbots_runtime::HostJournalCutV1, StorageError> {
         let checkpoint = record.host_checkpoint()?;
         let refused = |reason: &str| StorageError::InvalidData {
-            context: "checkpoints.host_continuation", reason: reason.to_owned(),
+            context: "checkpoints.host_continuation",
+            reason: reason.to_owned(),
         };
         if self.retained_checkpoint(&record.checkpoint_id)?.as_ref() != Some(record) {
-            return Err(refused("the requested artifact does not match the retained run checkpoint"));
+            return Err(refused(
+                "the requested artifact does not match the retained run checkpoint",
+            ));
         }
-        let metadata: Value = serde_json::from_str(&record.metadata_json).map_err(|error| StorageError::InvalidData {
-            context: "checkpoints.metadata", reason: error.to_string(),
+        let metadata: Value = serde_json::from_str(&record.metadata_json).map_err(|error| {
+            StorageError::InvalidData {
+                context: "checkpoints.metadata",
+                reason: error.to_string(),
+            }
         })?;
-        let retained_cut: HostCheckpointStorageCut = serde_json::from_value(metadata.get("host_storage_cut").cloned()
-            .ok_or_else(|| refused("host checkpoint has no storage-owned continuation cut"))?)
-            .map_err(|error| StorageError::InvalidData { context: "checkpoints.metadata.host_storage_cut", reason: error.to_string() })?;
+        let retained_cut: HostCheckpointStorageCut = serde_json::from_value(
+            metadata
+                .get("host_storage_cut")
+                .cloned()
+                .ok_or_else(|| refused("host checkpoint has no storage-owned continuation cut"))?,
+        )
+        .map_err(|error| StorageError::InvalidData {
+            context: "checkpoints.metadata.host_storage_cut",
+            reason: error.to_string(),
+        })?;
         let (actual_cut, _) = self.host_checkpoint_storage_cut(&checkpoint)?;
         if retained_cut != actual_cut {
-            return Err(refused("run identity or actual science prefixes differ from the retained checkpoint cut"));
+            return Err(refused(
+                "run identity or actual science prefixes differ from the retained checkpoint cut",
+            ));
         }
         self.validate_host_journal_invariants()?;
         Ok(checkpoint.journal_cut())
@@ -22936,32 +23037,58 @@ impl StorageCheckpointWriter {
         metadata: &Value,
     ) -> Result<HostCheckpointReceipt, StorageError> {
         let (reply, receiver) = xchan::bounded(1);
-        match self.tx.send_timeout(StorageCommand::RecordHostCheckpoint {
-            checkpoint_id: checkpoint_id.to_owned(), checkpoint: Box::new(checkpoint.clone()),
-            metadata: metadata.clone(), reply,
-        }, self.enqueue) {
+        match self.tx.send_timeout(
+            StorageCommand::RecordHostCheckpoint {
+                checkpoint_id: checkpoint_id.to_owned(),
+                checkpoint: Box::new(checkpoint.clone()),
+                metadata: metadata.clone(),
+                reply,
+            },
+            self.enqueue,
+        ) {
             Ok(()) => {}
-            Err(xchan::SendTimeoutError::Timeout(_)) => return Err(StorageError::Worker(StorageWorkerError::Timeout {
-                operation: StorageOperation::Persist, phase: StorageWaitPhase::CommandEnqueue,
-                path: self.path.to_string(), tick: Some(checkpoint.tick().0), waited: self.enqueue,
-                commit_state: FailureCommitState::NotAdmitted,
-            })),
-            Err(xchan::SendTimeoutError::Disconnected(_)) => return Err(StorageError::Worker(StorageWorkerError::Channel {
-                operation: StorageOperation::Persist, path: self.path.to_string(), tick: Some(checkpoint.tick().0),
-                commit_state: FailureCommitState::NotAdmitted, detail: "host checkpoint worker disconnected before enqueue".to_owned(),
-            })),
+            Err(xchan::SendTimeoutError::Timeout(_)) => {
+                return Err(StorageError::Worker(StorageWorkerError::Timeout {
+                    operation: StorageOperation::Persist,
+                    phase: StorageWaitPhase::CommandEnqueue,
+                    path: self.path.to_string(),
+                    tick: Some(checkpoint.tick().0),
+                    waited: self.enqueue,
+                    commit_state: FailureCommitState::NotAdmitted,
+                }));
+            }
+            Err(xchan::SendTimeoutError::Disconnected(_)) => {
+                return Err(StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Persist,
+                    path: self.path.to_string(),
+                    tick: Some(checkpoint.tick().0),
+                    commit_state: FailureCommitState::NotAdmitted,
+                    detail: "host checkpoint worker disconnected before enqueue".to_owned(),
+                }));
+            }
         }
         match receiver.recv_timeout(self.reply) {
             Ok(result) => result,
-            Err(xchan::RecvTimeoutError::Timeout) => Err(StorageError::Worker(StorageWorkerError::Timeout {
-                operation: StorageOperation::Persist, phase: StorageWaitPhase::Acknowledgement,
-                path: self.path.to_string(), tick: Some(checkpoint.tick().0), waited: self.reply,
-                commit_state: FailureCommitState::Indeterminate,
-            })),
-            Err(xchan::RecvTimeoutError::Disconnected) => Err(StorageError::Worker(StorageWorkerError::Channel {
-                operation: StorageOperation::Persist, path: self.path.to_string(), tick: Some(checkpoint.tick().0),
-                commit_state: FailureCommitState::Indeterminate, detail: "host checkpoint worker disconnected before readback acknowledgement".to_owned(),
-            })),
+            Err(xchan::RecvTimeoutError::Timeout) => {
+                Err(StorageError::Worker(StorageWorkerError::Timeout {
+                    operation: StorageOperation::Persist,
+                    phase: StorageWaitPhase::Acknowledgement,
+                    path: self.path.to_string(),
+                    tick: Some(checkpoint.tick().0),
+                    waited: self.reply,
+                    commit_state: FailureCommitState::Indeterminate,
+                }))
+            }
+            Err(xchan::RecvTimeoutError::Disconnected) => {
+                Err(StorageError::Worker(StorageWorkerError::Channel {
+                    operation: StorageOperation::Persist,
+                    path: self.path.to_string(),
+                    tick: Some(checkpoint.tick().0),
+                    commit_state: FailureCommitState::Indeterminate,
+                    detail: "host checkpoint worker disconnected before readback acknowledgement"
+                        .to_owned(),
+                }))
+            }
         }
     }
 
@@ -24777,7 +24904,11 @@ impl StoragePipeline {
             });
         }
         let host_checkpoint = checkpoint.host_checkpoint()?;
-        self.open_journal_port(host_checkpoint.session_id(), options, Some(Box::new(checkpoint.clone())))
+        self.open_journal_port(
+            host_checkpoint.session_id(),
+            options,
+            Some(Box::new(checkpoint.clone())),
+        )
     }
 
     fn open_journal_port(
@@ -24786,7 +24917,14 @@ impl StoragePipeline {
         options: StorageJournalOptions,
         continuation: Option<Box<PersistedCheckpointRecord>>,
     ) -> Result<StorageJournalPort, StorageError> {
-        let continuation_cut = continuation.as_ref().map(|record| record.host_checkpoint().map(|checkpoint| checkpoint.journal_cut())).transpose()?;
+        let continuation_cut = continuation
+            .as_ref()
+            .map(|record| {
+                record
+                    .host_checkpoint()
+                    .map(|checkpoint| checkpoint.journal_cut())
+            })
+            .transpose()?;
         let options = options
             .validate()
             .map_err(|reason| StorageError::InvalidData {
@@ -24885,7 +25023,8 @@ impl StoragePipeline {
                 &publisher,
                 options,
                 shutdown_requirement,
-            ).with_continuation_cut(continuation_cut)?),
+            )
+            .with_continuation_cut(continuation_cut)?),
             Ok(Err(error)) => {
                 shared.cancel_after(0);
                 Err(error)
@@ -25619,7 +25758,8 @@ fn storage_worker(
                     })
                 } else {
                     let registration = match continuation.as_deref() {
-                        Some(record) => storage.validate_host_checkpoint_continuation(record)
+                        Some(record) => storage
+                            .validate_host_checkpoint_continuation(record)
                             .and_then(|cut| {
                                 publisher.install_continuation_index()?;
                                 Ok(cut.last_journal_sequence)
@@ -25929,7 +26069,10 @@ fn storage_worker(
                 let _ = reply.send(result);
             }
             StorageCommand::RecordHostCheckpoint {
-                checkpoint_id, checkpoint, metadata, reply,
+                checkpoint_id,
+                checkpoint,
+                metadata,
+                reply,
             } => {
                 if let Err(error) = flush_worker_storage(&mut storage, &mut state, &analytics) {
                     analytics.publish_worker_error(&error, true);
@@ -25942,15 +26085,18 @@ fn storage_worker(
                     Ok(receipt) => {
                         let _ = reply.send(Ok(receipt));
                     }
-                    Err(error @ (StorageError::CheckpointCapacityExceeded { .. }
+                    Err(
+                        error @ (StorageError::CheckpointCapacityExceeded { .. }
                         | StorageError::InvalidData {
-                            context: "checkpoints.host_continuation_cut"
+                            context:
+                                "checkpoints.host_continuation_cut"
                                 | "checkpoints.metadata"
                                 | "checkpoints.metadata.host_storage_cut"
                                 | "checkpoints.host_payload"
                                 | "checkpoints.identity",
                             ..
-                        })) => {
+                        }),
+                    ) => {
                         warn!(%checkpoint_id, %error, "host checkpoint contract or retention refused");
                         let _ = reply.send(Err(error));
                     }
@@ -38351,9 +38497,10 @@ mod tests {
                 scriptbots_core::WorldStepTraceCapture::Complete { .. }
             )));
         }
-        let after_receipt = recovered
-            .checkpoint_writer()
-            .record_host("host-next", &after, &json!({}))?;
+        let after_receipt =
+            recovered
+                .checkpoint_writer()
+                .record_host("host-next", &after, &json!({}))?;
         assert_eq!(
             after_receipt.record.checkpoint_ordinal,
             receipt.record.checkpoint_ordinal + 1
@@ -38586,9 +38733,10 @@ mod tests {
             );
             apply_host_checkpoint_command(&mut frontend, &mut owner, &step, &mut clock);
             let checkpoint = settled_file_host_checkpoint(&mut frontend, &mut owner, &mut clock);
-            let receipt = pipeline
-                .checkpoint_writer()
-                .record_host("cut", &checkpoint, &json!({}))?;
+            let receipt =
+                pipeline
+                    .checkpoint_writer()
+                    .record_host("cut", &checkpoint, &json!({}))?;
             let envelope =
                 CommandEnvelope::new(CommandId::from_client_sequence(session.get(), 2), later);
             apply_host_checkpoint_command(&mut frontend, &mut owner, &envelope, &mut clock);
@@ -38669,7 +38817,10 @@ mod tests {
                 self.inner.borrow_mut().poll_receipts(limit)
             }
 
-            fn event_reader(&self, session_id: HostSessionId) -> Option<Arc<dyn EventJournalReader>> {
+            fn event_reader(
+                &self,
+                session_id: HostSessionId,
+            ) -> Option<Arc<dyn EventJournalReader>> {
                 self.inner.borrow().event_reader(session_id)
             }
 
@@ -38932,7 +39083,11 @@ mod tests {
         let mut observed: ObservedHostWire = postcard::from_bytes(&encoded)?;
         assert_eq!(postcard::to_allocvec(&observed)?, encoded);
         let mut payload: Value = serde_json::from_slice(&observed.payload)?;
-        assert!(payload["next_admission"].as_u64().is_some_and(|value| value > 0));
+        assert!(
+            payload["next_admission"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
         payload["next_admission"] = json!(0);
         observed.payload = serde_json::to_vec(&payload)?;
         observed.payload_blake3 = *blake3::hash(&observed.payload).as_bytes();

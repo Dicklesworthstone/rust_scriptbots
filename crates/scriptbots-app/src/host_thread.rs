@@ -21,9 +21,9 @@ use scriptbots_runtime::channel::{
     ChannelHostDriver, ChannelHostOptions, ChannelHostPort, ChannelRunOutcome, ChannelRunReceipt,
 };
 use scriptbots_runtime::{
-    ApplicationState, CommandEnvelope, CommandId, FixedDeadlineHost, HostCommand, HostCore,
-    HostCoreOptions, HostFault, HostPort, HostSessionId, JournalPort, JournalState,
-    HostCheckpointV1, ManualHostDriver, ManualInstant, ScheduledConfigPatch, ShutdownCommitRequirement,
+    ApplicationState, CommandEnvelope, CommandId, FixedDeadlineHost, HostCheckpointV1, HostCommand,
+    HostCore, HostCoreOptions, HostFault, HostPort, HostSessionId, JournalPort, JournalState,
+    ManualHostDriver, ManualInstant, ScheduledConfigPatch, ShutdownCommitRequirement,
 };
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::{Builder, JoinHandle};
@@ -49,8 +49,14 @@ pub struct HostThread {
 }
 
 enum HostStart {
-    Fresh { options: HostCoreOptions, bootstrap: HostBootstrap },
-    Continued { checkpoint: Box<HostCheckpointV1>, ticks: u64 },
+    Fresh {
+        options: HostCoreOptions,
+        bootstrap: HostBootstrap,
+    },
+    Continued {
+        checkpoint: Box<HostCheckpointV1>,
+        ticks: u64,
+    },
 }
 
 /// Owner observations when the drive loop exits; a fault does not prove finalization.
@@ -117,8 +123,17 @@ impl HostThread {
         channel_options: ChannelHostOptions,
         bootstrap: HostBootstrap,
     ) -> Result<Self> {
-        Self::spawn_owned(session_id, world, persistence, journal, channel_options,
-            HostStart::Fresh { options: core_options, bootstrap })
+        Self::spawn_owned(
+            session_id,
+            world,
+            persistence,
+            journal,
+            channel_options,
+            HostStart::Fresh {
+                options: core_options,
+                bootstrap,
+            },
+        )
     }
 
     /// Rebuild the artifact's owner on its own thread using an already validated
@@ -131,8 +146,17 @@ impl HostThread {
         channel_options: ChannelHostOptions,
         ticks: u64,
     ) -> Result<Self> {
-        Self::spawn_owned(checkpoint.session_id(), world, persistence, journal, channel_options,
-            HostStart::Continued { checkpoint: Box::new(checkpoint), ticks })
+        Self::spawn_owned(
+            checkpoint.session_id(),
+            world,
+            persistence,
+            journal,
+            channel_options,
+            HostStart::Continued {
+                checkpoint: Box::new(checkpoint),
+                ticks,
+            },
+        )
     }
 
     fn spawn_owned(
@@ -202,28 +226,42 @@ impl HostThread {
             let (mut core, ticks, observe) = match start {
                 HostStart::Fresh { options, bootstrap } => {
                     let mut core = HostCore::with_journal_and_persistence(
-                        session_id, world, options, journal, persistence,
-                    ).context("HostCore construction failed")?;
-                    core.install_schedule(bootstrap.schedule, crate::resolve_scheduled_config_patch)
-                        .context("invalid owner scenario schedule")?;
+                        session_id,
+                        world,
+                        options,
+                        journal,
+                        persistence,
+                    )
+                    .context("HostCore construction failed")?;
+                    core.install_schedule(
+                        bootstrap.schedule,
+                        crate::resolve_scheduled_config_patch,
+                    )
+                    .context("invalid owner scenario schedule")?;
                     (core, bootstrap.ticks, bootstrap.on_completed)
                 }
                 HostStart::Continued { checkpoint, ticks } => {
                     let resolver = checkpoint.has_schedule().then_some(
-                        crate::resolve_scheduled_config_patch as scriptbots_runtime::PreparedConfigPatchResolver,
+                        crate::resolve_scheduled_config_patch
+                            as scriptbots_runtime::PreparedConfigPatchResolver,
                     );
                     let core = HostCore::restore_host_checkpoint_v1(
-                        &checkpoint, world, persistence, journal, resolver, ManualInstant::from_nanos(0),
-                    ).context("HostCore checkpoint continuation refused")?;
+                        &checkpoint,
+                        world,
+                        persistence,
+                        journal,
+                        resolver,
+                        ManualInstant::from_nanos(0),
+                    )
+                    .context("HostCore checkpoint continuation refused")?;
                     (core, ticks, None)
                 }
             };
-            let completed = drive_bootstrap(&mut core, ticks, requirement).and_then(|()| {
-                match observe {
+            let completed =
+                drive_bootstrap(&mut core, ticks, requirement).and_then(|()| match observe {
                     Some(observe) => core.with_world(observe),
                     None => Ok(()),
-                }
-            });
+                });
             if let Err(error) = completed {
                 // Preserve the original failure; ordered shutdown attempts to retain the
                 // completed persistence tail before the storage controller closes.
@@ -370,7 +408,8 @@ fn drive_bootstrap(
     let mut port = core.local_port();
     for step in 1..=ticks {
         let before_tick = core.world().tick().0;
-        let sequence = before_tick.checked_add(1)
+        let sequence = before_tick
+            .checked_add(1)
             .context("owner bootstrap or continuation tick sequence overflowed")?;
         let envelope = CommandEnvelope::new(
             CommandId::from_client_sequence(u64::MAX - 1, sequence),

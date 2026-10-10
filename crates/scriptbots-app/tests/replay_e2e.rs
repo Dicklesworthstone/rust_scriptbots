@@ -200,10 +200,13 @@ fn host_database_prefix(database: &Path) -> serde_json::Value {
     let watermarks = reader
         .persistence_watermarks()
         .expect("read actual three science watermarks");
-    let replay = reader.load_replay_events().expect("read actual replay rows");
+    let replay = reader
+        .load_replay_events()
+        .expect("read actual replay rows");
     reader.close().expect("close host science reader");
-    let connection = scriptbots_storage::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .expect("open read-only FrankenSQLite journal connection");
+    let connection =
+        scriptbots_storage::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open read-only FrankenSQLite journal connection");
     let prefixes = connection
         .query(
             "SELECT host_session_id, admitted_journal_prefix, applied_journal_prefix,
@@ -216,7 +219,10 @@ fn host_database_prefix(database: &Path) -> serde_json::Value {
         .iter()
         .map(|row| {
             let fields = (0..9)
-                .map(|index| row.get_typed::<String>(index).expect("journal prefix field"))
+                .map(|index| {
+                    row.get_typed::<String>(index)
+                        .expect("journal prefix field")
+                })
                 .collect::<Vec<_>>();
             let shutdown: Option<String> = row.get_typed(9).expect("shutdown sequence field");
             serde_json::json!({"prefixes": fields, "shutdown_sequence": shutdown})
@@ -257,7 +263,10 @@ fn assert_host_handoff_readback(
 ) -> PersistedCheckpointRecord {
     assert_eq!(report["status"], "handed_off");
     assert_eq!(report["checkpoint_tick"], tick);
-    assert_eq!(report["artifact_path"], database.to_str().expect("UTF-8 path"));
+    assert_eq!(
+        report["artifact_path"],
+        database.to_str().expect("UTF-8 path")
+    );
     assert_eq!(report["root_seed"], SEED);
     let reader = StorageReader::open(database.to_str().expect("UTF-8 path"))
         .expect("open independent host artifact reader");
@@ -380,7 +389,12 @@ fn assert_host_handoff_readback(
     );
     reader.close().expect("close artifact reader");
     let prefix = host_database_prefix(database);
-    assert!(!prefix["replay"].as_array().expect("replay array").is_empty());
+    assert!(
+        !prefix["replay"]
+            .as_array()
+            .expect("replay array")
+            .is_empty()
+    );
     let journal = &prefix["journal"].as_array().expect("journal array")[0];
     assert!(
         journal["shutdown_sequence"].is_null(),
@@ -397,7 +411,10 @@ fn assert_host_handoff_readback(
         assert_eq!(*field, format!("{:016x}", cut.last_journal_sequence));
     }
     for field in &fields[5..9] {
-        assert_eq!(*field, format!("{:016x}", cut.last_scientific_event_sequence));
+        assert_eq!(
+            *field,
+            format!("{:016x}", cut.last_scientific_event_sequence)
+        );
     }
     record
 }
@@ -1211,17 +1228,25 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         assert_host_handoff_readback(&split_db, &continued_report, HOST_CONTINUATION_TICKS);
     assert_eq!(continued_report["session_id"], cut_report["session_id"]);
     assert_eq!(continued_report["run_id"], cut_report["run_id"]);
-    assert_ne!(continued_report["checkpoint_id"], cut_report["checkpoint_id"]);
+    assert_ne!(
+        continued_report["checkpoint_id"],
+        cut_report["checkpoint_id"]
+    );
     assert_eq!(
         continued_report["metadata"]["continued_from_checkpoint"],
         "first-cut"
     );
-    assert_eq!(continued_report["metadata"]["source_tick"], HOST_HANDOFF_TICK);
+    assert_eq!(
+        continued_report["metadata"]["source_tick"],
+        HOST_HANDOFF_TICK
+    );
     assert_eq!(
         continued_report["metadata"]["requested_steps"],
         HOST_CONTINUATION_TICKS - HOST_HANDOFF_TICK
     );
-    let uninterrupted = baseline_record.host_checkpoint().expect("uninterrupted host");
+    let uninterrupted = baseline_record
+        .host_checkpoint()
+        .expect("uninterrupted host");
     let continued = continued_record.host_checkpoint().expect("continued host");
     assert_eq!(
         uninterrupted.world_checkpoint().source_digest(),
@@ -1230,11 +1255,19 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
     );
     assert_eq!(uninterrupted.step_traces(), continued.step_traces());
     assert_eq!(baseline_report["config"], continued_report["config"]);
-    assert_eq!(baseline_report["brain_roster"], continued_report["brain_roster"]);
-    assert_eq!(baseline_report["source_commit"], continued_report["source_commit"]);
+    assert_eq!(
+        baseline_report["brain_roster"],
+        continued_report["brain_roster"]
+    );
+    assert_eq!(
+        baseline_report["source_commit"],
+        continued_report["source_commit"]
+    );
     let reader = StorageReader::open(split_db.to_str().expect("UTF-8 split database"))
         .expect("read retained initial artifact after continuation");
-    let checkpoints = reader.load_checkpoints().expect("both actual host artifacts");
+    let checkpoints = reader
+        .load_checkpoints()
+        .expect("both actual host artifacts");
     assert_eq!(checkpoints.len(), 2);
     assert_eq!(
         checkpoints[0], cut_record,
@@ -1319,7 +1352,10 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         !divergent_output.status.success(),
         "real altered configuration must diverge"
     );
-    let divergent = host_cli_report(&divergent_output, "scriptbots.host-checkpoint-comparison.v1");
+    let divergent = host_cli_report(
+        &divergent_output,
+        "scriptbots.host-checkpoint-comparison.v1",
+    );
     assert_eq!(divergent["status"], "diverged");
     assert_eq!(divergent["compared_tick"], HOST_CONTINUATION_TICKS);
     assert_eq!(
@@ -1328,7 +1364,9 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
     );
     assert_host_comparison_source(&divergent["expected"], &baseline_report);
     assert_host_comparison_source(&divergent["actual"], &perturbed_report);
-    let perturbed = perturbed_record.host_checkpoint().expect("actual perturbed host");
+    let perturbed = perturbed_record
+        .host_checkpoint()
+        .expect("actual perturbed host");
     // The altered configuration is present at the first Sense observation, before actuation.
     let first = &divergent["first_observed_divergence"];
     assert_eq!(first["tick"], 1);
@@ -1354,7 +1392,9 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
     for name in ["corrupt", "truncated"] {
         let database = directory.join(format!("{name}.sqlite"));
         copy_closed_host_database(&source_db, &database);
-        let checkpoint = cut_record.host_checkpoint().expect("validated source artifact");
+        let checkpoint = cut_record
+            .host_checkpoint()
+            .expect("validated source artifact");
         let mut bytes = checkpoint.encode().expect("actual host artifact bytes");
         let original_digest = cut_record.payload_digest.clone();
         let digest = if name == "corrupt" {
@@ -1409,8 +1449,7 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         )
         .expect("retain actual negative prefix observations");
         assert_eq!(
-            after,
-            before,
+            after, before,
             "{name} refusal must leave every observed science/journal prefix and row count unchanged"
         );
         assert!(!stdout_text(&output).contains("\"status\":\"handed_off\""));

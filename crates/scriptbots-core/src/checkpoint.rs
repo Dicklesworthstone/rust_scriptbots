@@ -227,8 +227,14 @@ impl WorldHostCheckpointV1 {
                 self.persistence_boundary,
                 PersistenceBoundaryStatus::Open { tick } | PersistenceBoundaryStatus::Sealed { tick }
                     if tick == world.tick())
-            || self.config_audit.iter().any(|entry| entry.tick > world.tick().0)
-            || self.config_audit.windows(2).any(|pair| pair[0].tick > pair[1].tick)
+            || self
+                .config_audit
+                .iter()
+                .any(|entry| entry.tick > world.tick().0)
+            || self
+                .config_audit
+                .windows(2)
+                .any(|pair| pair[0].tick > pair[1].tick)
             || self.history.iter().any(|summary| {
                 summary.tick > world.tick()
                     || !summary.total_energy.is_finite()
@@ -246,7 +252,10 @@ impl WorldHostCheckpointV1 {
                     || record.tick > world.tick()
                     || intervention_history_kind(&record.kind).is_none()
             })
-            || self.interventions.windows(2).any(|pair| pair[0].seq >= pair[1].seq)
+            || self
+                .interventions
+                .windows(2)
+                .any(|pair| pair[0].seq >= pair[1].seq)
         {
             return contract_error(
                 "host.history",
@@ -267,7 +276,9 @@ impl WorldHostCheckpointV1 {
                     || agent.indicator.color.iter().any(|value| !value.is_finite())
                     || agent.mutation_log.len() > 65_536
             })
-            || self.active_probe.is_some_and(|uid| !expected.contains(&uid))
+            || self
+                .active_probe
+                .is_some_and(|uid| !expected.contains(&uid))
             || self
                 .captured_probe_agents
                 .iter()
@@ -324,8 +335,14 @@ impl WorldHostCheckpointV1 {
             }
         }
         for (path, count) in [
-            ("host.communication_emitted", self.communication_emitted.len()),
-            ("host.communication_realized", self.communication_realized.len()),
+            (
+                "host.communication_emitted",
+                self.communication_emitted.len(),
+            ),
+            (
+                "host.communication_realized",
+                self.communication_realized.len(),
+            ),
             ("host.realized_hearing", self.realized_hearing.len()),
             ("host.agent_stats", self.agent_stats.len()),
         ] {
@@ -345,7 +362,10 @@ impl WorldHostCheckpointV1 {
                     || !observation.hearing.is_finite()
                     || !(0.0..=1.0).contains(&observation.hearing)
             })
-            || self.agent_stats.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || self
+                .agent_stats
+                .windows(2)
+                .any(|pair| pair[0].0 >= pair[1].0)
             || self.agent_stats.iter().any(|(_, stats)| {
                 stats.spiked_ticks > stats.ticks_observed
                     || [
@@ -357,7 +377,9 @@ impl WorldHostCheckpointV1 {
                     ]
                     .into_iter()
                     .any(|value| !value.is_finite())
-                    || stats.last_heading.is_some_and(|heading| !heading.is_finite())
+                    || stats
+                        .last_heading
+                        .is_some_and(|heading| !heading.is_finite())
             })
             || self.resource_report.completed_ticks > world.tick().0
             || self
@@ -429,22 +451,20 @@ impl WorldHostCheckpointV1 {
                     path: "host.archive.grid".to_owned(),
                     detail: error.to_string(),
                 })?;
-            let total = archive.space.total_cells().map_err(|error| {
-                WorldCheckpointError::Contract {
-                    path: "host.archive.grid".to_owned(),
-                    detail: error.to_string(),
-                }
-            })?;
+            let total =
+                archive
+                    .space
+                    .total_cells()
+                    .map_err(|error| WorldCheckpointError::Contract {
+                        path: "host.archive.grid".to_owned(),
+                        detail: error.to_string(),
+                    })?;
             if total != archive.max_archive_cells
                 || u64::try_from(archive.cells.len()).unwrap_or(u64::MAX) > total
                 || archive.current_bytes > archive.max_archive_bytes
-                || archive
-                    .cells
-                    .values()
-                    .fold(0_usize, |size, entry| {
-                        size.saturating_add(entry.approximate_bytes())
-                    })
-                    != archive.current_bytes
+                || archive.cells.values().fold(0_usize, |size, entry| {
+                    size.saturating_add(entry.approximate_bytes())
+                }) != archive.current_bytes
                 || !self.config.archive_enabled
                 || archive.space != self.config.archive_space
                 || archive.quality_metric != self.config.archive_quality_metric
@@ -483,9 +503,10 @@ impl WorldHostCheckpointV1 {
                     .scores
                     .values()
                     .any(|value| !value.is_finite() || *value < 0.0)
-                || novelty.normalized_scores.values().any(|value| {
-                    !value.is_finite() || !(0.0..=1.0).contains(value)
-                })
+                || novelty
+                    .normalized_scores
+                    .values()
+                    .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
                 || [
                     novelty.mean_novelty,
                     novelty.p50_novelty,
@@ -495,10 +516,7 @@ impl WorldHostCheckpointV1 {
                 .into_iter()
                 .any(|value| !value.is_finite() || value < 0.0))
         {
-            return contract_error(
-                "host.novelty",
-                "invalid retained novelty state".to_owned(),
-            );
+            return contract_error("host.novelty", "invalid retained novelty state".to_owned());
         }
         Ok(())
     }
@@ -1311,12 +1329,12 @@ impl WorldState {
             .iter_handles()
             .map(|id| {
                 let uid = uid_for(id)?;
-                let runtime = self.agent_runtime(id).ok_or_else(|| {
-                    WorldCheckpointError::Contract {
-                        path: "host.runtime".to_owned(),
-                        detail: "live agent has no runtime".to_owned(),
-                    }
-                })?;
+                let runtime =
+                    self.agent_runtime(id)
+                        .ok_or_else(|| WorldCheckpointError::Contract {
+                            path: "host.runtime".to_owned(),
+                            detail: "live agent has no runtime".to_owned(),
+                        })?;
                 Ok(AgentObserverV1 {
                     uid,
                     indicator: runtime.indicator,
@@ -1369,7 +1387,10 @@ impl WorldState {
                 self.last_spike_hits,
                 self.last_max_age,
             ),
-            carcass_totals: (self.carcass_health_distributed, self.carcass_reproduction_bonus),
+            carcass_totals: (
+                self.carcass_health_distributed,
+                self.carcass_reproduction_bonus,
+            ),
             combat_counts: (self.combat_spike_attempts, self.combat_spike_hits),
             sense_saturations_total: self.sense_saturations_total,
             capture_budget: self.capture_budget,
@@ -1392,7 +1413,11 @@ impl WorldState {
             realized_hearing_capture_enabled: self.realized_hearing_capture_enabled,
             realized_hearing: self.latest_realized_hearing_observations.clone(),
             communication_emitted: self.communication_emitted_history.iter().copied().collect(),
-            communication_realized: self.communication_realized_history.iter().copied().collect(),
+            communication_realized: self
+                .communication_realized_history
+                .iter()
+                .copied()
+                .collect(),
             communication_report: self.latest_communication_mi_report.clone(),
             last_tick_emitted_sound: self.last_tick_emitted_sound,
             communication_rng: self
@@ -1463,12 +1488,14 @@ impl WorldState {
             .collect();
         for saved in &continuity.agents {
             let id = by_uid[&saved.uid];
-            let runtime = world.runtime.get_mut(id).ok_or_else(|| {
-                WorldCheckpointError::Contract {
-                    path: "host.agents.runtime".to_owned(),
-                    detail: "restored agent has no runtime".to_owned(),
-                }
-            })?;
+            let runtime =
+                world
+                    .runtime
+                    .get_mut(id)
+                    .ok_or_else(|| WorldCheckpointError::Contract {
+                        path: "host.agents.runtime".to_owned(),
+                        detail: "restored agent has no runtime".to_owned(),
+                    })?;
             runtime.indicator = saved.indicator;
             runtime.selection = saved.selection;
             runtime.combat = saved.combat;
@@ -1513,7 +1540,9 @@ impl WorldState {
         world.resource_ledger.enabled = continuity.resource_ledger_enabled;
         world.resource_ledger.report = continuity.resource_report.clone();
         world.realized_hearing_capture_enabled = continuity.realized_hearing_capture_enabled;
-        world.latest_realized_hearing_observations.clone_from(&continuity.realized_hearing);
+        world
+            .latest_realized_hearing_observations
+            .clone_from(&continuity.realized_hearing);
         world.communication_emitted_history =
             continuity.communication_emitted.iter().copied().collect();
         world.communication_realized_history =
@@ -3446,9 +3475,18 @@ mod tests {
                 .as_ref()
                 .map(crate::SmallRngStream::state)
         );
-        assert_eq!(restored.resource_ledger.report, original.resource_ledger.report);
-        assert_eq!(restored.applied_interventions, original.applied_interventions);
-        assert_eq!(restored.next_intervention_seq, original.next_intervention_seq);
+        assert_eq!(
+            restored.resource_ledger.report,
+            original.resource_ledger.report
+        );
+        assert_eq!(
+            restored.applied_interventions,
+            original.applied_interventions
+        );
+        assert_eq!(
+            restored.next_intervention_seq,
+            original.next_intervention_seq
+        );
     }
 
     #[test]
@@ -3615,9 +3653,12 @@ mod tests {
                 .step_traced(&mut perturbed, &mut negative_trace)
                 .expect("actual negative production stages");
             let left = left_trace.latest().expect("actual source stage trace");
-            let right = right_trace.latest().expect("actual continuation stage trace");
+            let right = right_trace
+                .latest()
+                .expect("actual continuation stage trace");
             assert_eq!(
-                left.first_divergence(right).expect("valid stage trace pair"),
+                left.first_divergence(right)
+                    .expect("valid stage trace pair"),
                 None
             );
             assert_eq!(
@@ -3626,7 +3667,8 @@ mod tests {
             );
             assert_host_auxiliary_state_equal(&original, &restored);
             assert_eq!(
-                left.first_divergence(negative_trace.latest().unwrap()).unwrap(),
+                left.first_divergence(negative_trace.latest().unwrap())
+                    .unwrap(),
                 Some(crate::WorldStepTracePoint::Sense)
             );
         }

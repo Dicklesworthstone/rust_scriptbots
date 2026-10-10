@@ -19,11 +19,11 @@ use scriptbots_runtime::{
     CommandLifecycleEvidence, CommandLifecycleTransition, ConfigRevision, ControlRevision,
     EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator, EventCatchUpUnavailableReason,
     EventCommitment, EventJournalReader, EventPage, EventPageSource, EventRetentionSnapshot,
-    EventSequence, EventSequenceRange, HostAccessError, HostCommand, HostJournalCutV1, HostRevisions, HostSessionId,
-    IslandId, JournalAdmission, JournalBatch, JournalBatchId, JournalFailure, JournalPort,
-    JournalReceipt, JournalReceiptState, JournaledScientificEvent, RejectionReason, RunId,
-    ScheduledPatchEvidence, ScientificBoundary, ScientificEvent, ScientificRevision,
-    ShutdownCommitRequirement,
+    EventSequence, EventSequenceRange, HostAccessError, HostCommand, HostJournalCutV1,
+    HostRevisions, HostSessionId, IslandId, JournalAdmission, JournalBatch, JournalBatchId,
+    JournalFailure, JournalPort, JournalReceipt, JournalReceiptState, JournaledScientificEvent,
+    RejectionReason, RunId, ScheduledPatchEvidence, ScientificBoundary, ScientificEvent,
+    ScientificRevision, ShutdownCommitRequirement,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -2678,14 +2678,24 @@ impl JournalReaderPublisher {
     }
 
     pub(super) fn install_continuation_index(&self) -> Result<(), StorageError> {
-        let JournalReaderBackend::File { path, run_id, lease } = &self.inner.backend else {
+        let JournalReaderBackend::File {
+            path,
+            run_id,
+            lease,
+        } = &self.inner.backend
+        else {
             return Err(StorageError::InvalidData {
                 context: "host_journal_reader.continuation",
                 reason: "continuation requires the leased recovered run file".to_owned(),
             });
         };
-        let (available, identities) = load_host_journal_index(path, lease, *run_id,
-            self.inner.session_id, self.inner.identity_capacity)?;
+        let (available, identities) = load_host_journal_index(
+            path,
+            lease,
+            *run_id,
+            self.inner.session_id,
+            self.inner.identity_capacity,
+        )?;
         self.install_recovered_index(available, identities);
         Ok(())
     }
@@ -2974,8 +2984,10 @@ impl JournalSessionShared {
 
     pub(super) fn restore_completed_sequence(&self, sequence: u64) {
         self.completed_sequence.store(sequence, Ordering::Release);
-        self.acknowledged_sequence.store(sequence, Ordering::Release);
-        self.final_accepted_sequence.store(sequence, Ordering::Release);
+        self.acknowledged_sequence
+            .store(sequence, Ordering::Release);
+        self.final_accepted_sequence
+            .store(sequence, Ordering::Release);
     }
 
     pub(super) fn cache_terminal(
@@ -3375,10 +3387,16 @@ impl StorageJournalPort {
         }
     }
 
-    pub(super) fn with_continuation_cut(mut self, cut: Option<HostJournalCutV1>) -> Result<Self, StorageError> {
+    pub(super) fn with_continuation_cut(
+        mut self,
+        cut: Option<HostJournalCutV1>,
+    ) -> Result<Self, StorageError> {
         if let Some(cut) = cut {
-            self.expected_sequence = cut.last_journal_sequence.checked_add(1).ok_or_else(|| StorageError::InvalidData {
-                context: "host_journal_port.continuation", reason: "next journal sequence overflowed".to_owned(),
+            self.expected_sequence = cut.last_journal_sequence.checked_add(1).ok_or_else(|| {
+                StorageError::InvalidData {
+                    context: "host_journal_port.continuation",
+                    reason: "next journal sequence overflowed".to_owned(),
+                }
             })?;
             self.last_accepted_sequence = cut.last_journal_sequence;
             self.continuation_cut = Some(cut);

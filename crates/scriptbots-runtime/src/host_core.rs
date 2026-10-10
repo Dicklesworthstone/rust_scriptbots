@@ -4,8 +4,7 @@ use super::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand, BrainProjection,
     BrainProjectionRequest, BrainProjectionSource, CommandAuthorityLookup, CommandAuthorityMode,
     CommandAuthorityReader, CommandClaimPolicy, CommandEnvelope, CommandId,
-    CommandLifecycleEvidence,
-    CommandLifecycleTransition, CommandStatus, ConfigRevision,
+    CommandLifecycleEvidence, CommandLifecycleTransition, CommandStatus, ConfigRevision,
     ControlRevision, DriveReceipt, EventCatchUp, EventCatchUpGuarantee, EventCatchUpLocator,
     EventCatchUpUnavailableReason, EventCommitment, EventHub, EventJournalReader, EventPage,
     EventPageSource, EventRetentionSnapshot, EventSequence, EventSequenceRange, FoodLayerSnapshot,
@@ -28,8 +27,7 @@ use scriptbots_core::{
     DynamicAgentVisuals, DynamicWorldSnapshot, MigratingAgent, NullPersistence,
     PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError, ScriptBotsConfig,
     SelectionState, Tick, TickSummary, WorldDigestV1, WorldState, WorldStepTrace, WorldStepTracer,
-    apply_control_command,
-    rng_domains::IslandId,
+    apply_control_command, rng_domains::IslandId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
@@ -329,7 +327,10 @@ impl HostCheckpointV1 {
         let bytes = postcard::to_allocvec(&wire)
             .map_err(|error| checkpoint_error("wire.encode", error.to_string()))?;
         if bytes.len() > MAX_HOST_CHECKPOINT_BYTES {
-            return Err(checkpoint_error("wire.size", "host wire exceeds fixed bound"));
+            return Err(checkpoint_error(
+                "wire.size",
+                "host wire exceeds fixed bound",
+            ));
         }
         Ok(bytes)
     }
@@ -337,12 +338,18 @@ impl HostCheckpointV1 {
     /// Decode, checksum, canonicalize and validate both the owner and science layers.
     pub fn decode(bytes: &[u8]) -> Result<Self, HostCheckpointError> {
         if bytes.len() > MAX_HOST_CHECKPOINT_BYTES {
-            return Err(checkpoint_error("wire.size", "host wire exceeds fixed bound"));
+            return Err(checkpoint_error(
+                "wire.size",
+                "host wire exceeds fixed bound",
+            ));
         }
         let (wire, remainder): (HostCheckpointWireV1, _) = postcard::take_from_bytes(bytes)
             .map_err(|error| checkpoint_error("wire.decode", error.to_string()))?;
         if !remainder.is_empty() {
-            return Err(checkpoint_error("wire.trailing", "unconsumed envelope bytes"));
+            return Err(checkpoint_error(
+                "wire.trailing",
+                "unconsumed envelope bytes",
+            ));
         }
         if wire.schema != HOST_CHECKPOINT_V1_SCHEMA
             || wire.codec_version != HOST_CHECKPOINT_V1_CODEC_VERSION
@@ -471,7 +478,9 @@ impl HostCheckpointV1 {
                 .protocol_events
                 .windows(2)
                 .any(|pair| pair[0].sequence.checked_next() != Some(pair[1].sequence))
-            || state.last_arrival.is_some_and(|arrival| arrival.tick > self.tick())
+            || state
+                .last_arrival
+                .is_some_and(|arrival| arrival.tick > self.tick())
             || state.visible_boundary.tick != self.tick()
             || state.visible_boundary.revisions != state.revisions
             || state
@@ -532,13 +541,19 @@ impl HostCheckpointV1 {
             }
             self.validate_terminal_status(&authority.status)?;
             if !ids.insert(authority.status.command_id()) {
-                return Err(checkpoint_error("commands.duplicate", "duplicate command authority"));
+                return Err(checkpoint_error(
+                    "commands.duplicate",
+                    "duplicate command authority",
+                ));
             }
         }
         for archived in &state.archived {
             self.validate_terminal_status(&archived.status)?;
             if !ids.insert(archived.status.command_id()) {
-                return Err(checkpoint_error("commands.duplicate", "duplicate archived identity"));
+                return Err(checkpoint_error(
+                    "commands.duplicate",
+                    "duplicate archived identity",
+                ));
             }
         }
         if state
@@ -599,7 +614,10 @@ impl HostCheckpointV1 {
                 .as_ref()
                 .is_some_and(|remaining| remaining.len() > MAX_HOST_CHECKPOINT_ENTRIES)
         {
-            return Err(checkpoint_error("schedule.capacity", "schedule exceeds fixed bound"));
+            return Err(checkpoint_error(
+                "schedule.capacity",
+                "schedule exceeds fixed bound",
+            ));
         }
         for status in &state.scheduled_patches {
             status
@@ -613,7 +631,10 @@ impl HostCheckpointV1 {
                 || status.batch_id.session_id() != self.session_id()
                 || status.batch_id.sequence() == 0
                 || status.batch_id.sequence() > state.cut.last_journal_sequence
-                || !matches!(status.evidence.outcome, ScheduledPatchOutcome::Applied { .. })
+                || !matches!(
+                    status.evidence.outcome,
+                    ScheduledPatchOutcome::Applied { .. }
+                )
                 || !journal_state_qualifies(&status.journal, state.cut.commitment_requirement)
             {
                 return Err(checkpoint_error(
@@ -654,7 +675,10 @@ impl HostCheckpointV1 {
 fn journal_state_qualifies(state: &JournalState, requirement: ShutdownCommitRequirement) -> bool {
     match requirement {
         ShutdownCommitRequirement::CommittedVolatile => {
-            matches!(state, JournalState::CommittedVolatile | JournalState::Durable)
+            matches!(
+                state,
+                JournalState::CommittedVolatile | JournalState::Durable
+            )
         }
         ShutdownCommitRequirement::Durable => matches!(state, JournalState::Durable),
     }
@@ -1030,8 +1054,8 @@ impl JournalPort for VolatileJournal {
         let expected = self
             .highest_accepted
             .map_or(Some(1), |highest| highest.sequence().checked_add(1));
-        self.continuation_eligible &= expected == Some(batch_id.sequence())
-            && !batch.is_applied_shutdown();
+        self.continuation_eligible &=
+            expected == Some(batch_id.sequence()) && !batch.is_applied_shutdown();
         self.highest_accepted = Some(batch_id);
         self.receipts.push_back(JournalReceipt::new(
             batch_id,
@@ -3631,11 +3655,11 @@ impl HostCore {
         let actual_science = world.capture_checkpoint_quiescent()?;
         let actual_continuity = world.capture_host_continuity_v1(&actual_science)?;
         if actual_science.encode()? != state.world_bytes
-            || serde_json::to_vec(&actual_continuity).map_err(|error| {
-                checkpoint_error("world.continuity.encode", error.to_string())
-            })? != serde_json::to_vec(&state.continuity).map_err(|error| {
-                checkpoint_error("checkpoint.continuity.encode", error.to_string())
-            })?
+            || serde_json::to_vec(&actual_continuity)
+                .map_err(|error| checkpoint_error("world.continuity.encode", error.to_string()))?
+                != serde_json::to_vec(&state.continuity).map_err(|error| {
+                    checkpoint_error("checkpoint.continuity.encode", error.to_string())
+                })?
         {
             return Err(checkpoint_error(
                 "world.continuation",
@@ -6196,7 +6220,9 @@ mod tests {
             let after = restored
                 .capture_host_checkpoint_v1()
                 .expect("settled continued owner cut");
-            let uninterrupted = oracle.capture_host_checkpoint_v1().expect("actual oracle cut");
+            let uninterrupted = oracle
+                .capture_host_checkpoint_v1()
+                .expect("actual oracle cut");
             assert_eq!(after.step_traces(), uninterrupted.step_traces());
             assert_eq!(
                 after.state.scheduled_patches.len(),
@@ -6336,7 +6362,10 @@ mod tests {
                 .drive(ManualInstant::from_nanos(capture_at + offset))
                 .unwrap();
             assert_eq!(resumed.scientific_steps, uninterrupted.scientific_steps);
-            assert_eq!(resumed.automatic_steps_due, uninterrupted.automatic_steps_due);
+            assert_eq!(
+                resumed.automatic_steps_due,
+                uninterrupted.automatic_steps_due
+            );
             assert_eq!(resumed.scientific_steps, usize::from(offset == fraction));
             assert_eq!(
                 restored.scientific_digest_v1().unwrap(),

@@ -4252,7 +4252,9 @@ impl EventHubCheckpointV1 {
             || self.published_total != cut.last_scientific_event_sequence
             || self.entries.len() > capacity
         {
-            return Err(protocol_violation("event checkpoint counter or capacity mismatch"));
+            return Err(protocol_violation(
+                "event checkpoint counter or capacity mismatch",
+            ));
         }
         let mut previous = None;
         for entry in &self.entries {
@@ -4297,9 +4299,9 @@ impl EventHubCheckpointV1 {
             GenesisOrigins::Open { origins } | GenesisOrigins::Sealed { origins } => {
                 let mut uids = std::collections::HashSet::new();
                 if origins.len() > genesis_capacity
-                    || origins.iter().any(|origin| {
-                        origin.tick != Tick::zero() || !uids.insert(origin.agent_uid)
-                    })
+                    || origins
+                        .iter()
+                        .any(|origin| origin.tick != Tick::zero() || !uids.insert(origin.agent_uid))
                     || (matches!(self.genesis, GenesisOrigins::Open { .. }) && tick != Tick::zero())
                 {
                     return Err(protocol_violation(
@@ -4401,7 +4403,9 @@ impl EventHub {
             .lock()
             .map_err(|_| protocol_violation("scientific event checkpoint lock poisoned"))?;
         if state.reserved_front.is_some() {
-            return Err(protocol_violation("scientific event publication is reserved"));
+            return Err(protocol_violation(
+                "scientific event publication is reserved",
+            ));
         }
         let checkpoint = EventHubCheckpointV1 {
             next_sequence: state.next_sequence,

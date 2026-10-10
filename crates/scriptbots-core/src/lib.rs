@@ -15946,12 +15946,16 @@ pub mod narrative {
                             .into_iter()
                             .all(f64::is_finite)
                 })
-                && self.last_emitted.iter().enumerate().all(|(index, (kind, at))| {
-                    *at <= tick.0
-                        && !self.last_emitted[..index]
-                            .iter()
-                            .any(|(previous, _)| previous == kind)
-                })
+                && self
+                    .last_emitted
+                    .iter()
+                    .enumerate()
+                    .all(|(index, (kind, at))| {
+                        *at <= tick.0
+                            && !self.last_emitted[..index]
+                                .iter()
+                                .any(|(previous, _)| previous == kind)
+                    })
         }
 
         /// Recently detected events, oldest first.
@@ -32551,7 +32555,8 @@ impl PersistenceAdmissionSession {
             || last_admitted_tick.is_some_and(|tick| tick > world.tick())
         {
             return Err(PersistenceSessionError::Unavailable {
-                detail: "continuation admission cursor requires a fresh quiescent session".to_owned(),
+                detail: "continuation admission cursor requires a fresh quiescent session"
+                    .to_owned(),
             });
         }
         self.last_admitted_tick = last_admitted_tick;

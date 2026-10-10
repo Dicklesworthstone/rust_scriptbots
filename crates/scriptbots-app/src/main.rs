@@ -499,7 +499,9 @@ fn main() -> Result<()> {
         return continue_host_checkpoint_cli(&cli, path);
     }
     if cli.checkpoint_handoff.is_some() && cli.storage != StorageMode::File {
-        bail!("--checkpoint-handoff requires --storage file for same-run, same-session continuation");
+        bail!(
+            "--checkpoint-handoff requires --storage file for same-run, same-session continuation"
+        );
     }
 
     // Determinism check child mode: run headless and emit JSON, then exit.
@@ -919,7 +921,11 @@ fn main() -> Result<()> {
                 speed_multiplier: 1.0,
             },
             capture_agent_visuals,
-            trace_history_capacity: if cli.checkpoint_handoff.is_some() { 256 } else { 0 },
+            trace_history_capacity: if cli.checkpoint_handoff.is_some() {
+                256
+            } else {
+                0
+            },
             ..Default::default()
         },
         ChannelHostOptions::default(),
@@ -933,7 +939,12 @@ fn main() -> Result<()> {
         }
     };
     if let Some(checkpoint_id) = cli.checkpoint_handoff.as_deref() {
-        return finish_checkpoint_handoff(host, storage_pipeline, checkpoint_id, JsonValue::Object(Default::default()));
+        return finish_checkpoint_handoff(
+            host,
+            storage_pipeline,
+            checkpoint_id,
+            JsonValue::Object(Default::default()),
+        );
     }
     let host_port = host.port();
     let mut control_to_close = None;
@@ -2239,22 +2250,40 @@ fn recover_storage(path: &Path) -> Result<()> {
 }
 
 fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
-    let path = path.to_str().context("host continuation database path is not UTF-8")?;
-    let checkpoint_id = cli.host_checkpoint_id.as_deref().context("--host-checkpoint-id is required")?;
-    let ticks = cli.continue_ticks.context("--continue-ticks is required")?.get();
+    let path = path
+        .to_str()
+        .context("host continuation database path is not UTF-8")?;
+    let checkpoint_id = cli
+        .host_checkpoint_id
+        .as_deref()
+        .context("--host-checkpoint-id is required")?;
+    let ticks = cli
+        .continue_ticks
+        .context("--continue-ticks is required")?
+        .get();
     let reader = StorageReader::open(path).context("failed to read host continuation database")?;
     let run_id = reader.run_id();
-    let record = reader.load_checkpoints()
-        .with_context(|| format!("host checkpoint {checkpoint_id} in {path} failed retained artifact readback"))?
-        .into_iter().find(|record| record.checkpoint_id == checkpoint_id)
+    let record = reader
+        .load_checkpoints()
+        .with_context(|| {
+            format!("host checkpoint {checkpoint_id} in {path} failed retained artifact readback")
+        })?
+        .into_iter()
+        .find(|record| record.checkpoint_id == checkpoint_id)
         .with_context(|| format!("host checkpoint {checkpoint_id} is absent from {path}"))?;
-    let checkpoint = record.host_checkpoint()
-        .with_context(|| format!("host checkpoint {checkpoint_id} in {path} failed artifact validation"))?;
+    let checkpoint = record.host_checkpoint().with_context(|| {
+        format!("host checkpoint {checkpoint_id} in {path} failed artifact validation")
+    })?;
     if !checkpoint.playback().paused {
-        bail!("bounded continuation requires a paused host checkpoint: {checkpoint_id} at tick {} in {path}", checkpoint.tick().0);
+        bail!(
+            "bounded continuation requires a paused host checkpoint: {checkpoint_id} at tick {} in {path}",
+            checkpoint.tick().0
+        );
     }
     let source_tick = checkpoint.tick().0;
-    source_tick.checked_add(ticks).context("host continuation tick limit overflowed")?;
+    source_tick
+        .checked_add(ticks)
+        .context("host continuation tick limit overflowed")?;
     let registry = create_brain_registry_for_config(cli.brain, checkpoint.config())
         .context("failed to prepare the checkpoint's executable brain registry")?;
     let world = checkpoint.restore_world(registry)
@@ -2263,22 +2292,43 @@ fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
     let mut pipeline = StoragePipeline::recover_existing_run(path, run_id)
         .context("host continuation refused leased run recovery")?;
     let prepared = (|| -> Result<HostThread> {
-        let journal = pipeline.continue_journal_port(&record, Default::default())
+        let journal = pipeline
+            .continue_journal_port(&record, Default::default())
             .context("host continuation refused the exact stored journal/science cut")?;
-        let persistence = world.bind_persistence(Box::new(pipeline.sink()))
+        let persistence = world
+            .bind_persistence(Box::new(pipeline.sink()))
             .context("failed to bind continued host persistence ownership")?;
-        HostThread::spawn_from_checkpoint(checkpoint, world, persistence, Box::new(journal),
-            ChannelHostOptions::default(), ticks)
+        HostThread::spawn_from_checkpoint(
+            checkpoint,
+            world,
+            persistence,
+            Box::new(journal),
+            ChannelHostOptions::default(),
+            ticks,
+        )
     })();
     let host = match prepared {
         Ok(host) => host,
-        Err(error) => return finish_with_storage(Err(error), "host continuation startup", || shutdown_storage(&mut pipeline).map(|_| ())),
+        Err(error) => {
+            return finish_with_storage(Err(error), "host continuation startup", || {
+                shutdown_storage(&mut pipeline).map(|_| ())
+            });
+        }
     };
-    let next_id = format!("host-{:016x}-t{}", host.port().session_id().get(), source_tick + ticks);
-    finish_checkpoint_handoff(host, pipeline, &next_id, serde_json::json!({
-        "continued_from_checkpoint": checkpoint_id, "source_tick": source_tick,
-        "requested_steps": ticks,
-    }))
+    let next_id = format!(
+        "host-{:016x}-t{}",
+        host.port().session_id().get(),
+        source_tick + ticks
+    );
+    finish_checkpoint_handoff(
+        host,
+        pipeline,
+        &next_id,
+        serde_json::json!({
+            "continued_from_checkpoint": checkpoint_id, "source_tick": source_tick,
+            "requested_steps": ticks,
+        }),
+    )
 }
 
 fn finish_checkpoint_handoff(
@@ -2290,26 +2340,36 @@ fn finish_checkpoint_handoff(
     let port = host.port();
     let recorded = (|| -> Result<_> {
         if checkpoint_id.trim().is_empty() || checkpoint_id.len() > 1024 {
-            bail!("host checkpoint identity must contain 1..=1024 bytes and non-whitespace content");
+            bail!(
+                "host checkpoint identity must contain 1..=1024 bytes and non-whitespace content"
+            );
         }
-        let checkpoint = port.capture_host_checkpoint_v1()
+        let checkpoint = port
+            .capture_host_checkpoint_v1()
             .context("complete host checkpoint capture refused")?;
         if let (Some(source_tick), Some(steps)) = (
             metadata.get("source_tick").and_then(JsonValue::as_u64),
             metadata.get("requested_steps").and_then(JsonValue::as_u64),
         ) {
-            let expected_tick = source_tick.checked_add(steps)
+            let expected_tick = source_tick
+                .checked_add(steps)
                 .context("host continuation expected tick overflowed")?;
             if checkpoint.tick().0 != expected_tick {
-                bail!("host continuation requested tick {expected_tick} but observed {} before checkpoint {checkpoint_id}", checkpoint.tick().0);
+                bail!(
+                    "host continuation requested tick {expected_tick} but observed {} before checkpoint {checkpoint_id}",
+                    checkpoint.tick().0
+                );
             }
         }
         let receipt = pipeline.checkpoint_writer().record_host(checkpoint_id, &checkpoint, &metadata)
             .context("host checkpoint commitment/readback is unconfirmed; the exact database identity is retained when admitted")?;
-        let handed_off = port.handoff_host_checkpoint_v1()
-            .context("host retirement is unconfirmed; inspect the retained checkpoint before retry")?;
+        let handed_off = port.handoff_host_checkpoint_v1().context(
+            "host retirement is unconfirmed; inspect the retained checkpoint before retry",
+        )?;
         if handed_off.encode()? != checkpoint.encode()? {
-            bail!("retiring host differs from checkpoint {checkpoint_id}; same-session continuation must refuse its stale cut");
+            bail!(
+                "retiring host differs from checkpoint {checkpoint_id}; same-session continuation must refuse its stale cut"
+            );
         }
         Ok((checkpoint, receipt))
     })();
@@ -2329,36 +2389,52 @@ fn finish_checkpoint_handoff(
         }
     };
     if owner.run.outcome != scriptbots_runtime::channel::ChannelRunOutcome::HandedOff {
-        bail!("host checkpoint {checkpoint_id} did not retire by handoff: {:?}", owner.run.outcome);
+        bail!(
+            "host checkpoint {checkpoint_id} did not retire by handoff: {:?}",
+            owner.run.outcome
+        );
     }
     if owner.final_digest? != *checkpoint.world_checkpoint().source_digest()
         || finalized.watermarks != receipt.watermarks
-        || finalized.committed_tick != checkpoint.persistence_last_admitted_tick().map(|tick| tick.0)
+        || finalized.committed_tick
+            != checkpoint
+                .persistence_last_admitted_tick()
+                .map(|tick| tick.0)
     {
-        bail!("host checkpoint {checkpoint_id} owner digest or final science watermarks differ from the recorded cut");
+        bail!(
+            "host checkpoint {checkpoint_id} owner digest or final science watermarks differ from the recorded cut"
+        );
     }
     let reader = StorageReader::open_for_run(pipeline.storage_path(), receipt.run_id)?;
-    let retained = reader.load_checkpoints()?.into_iter().find(|record| record.checkpoint_id == checkpoint_id)
+    let retained = reader
+        .load_checkpoints()?
+        .into_iter()
+        .find(|record| record.checkpoint_id == checkpoint_id)
         .context("handed-off checkpoint disappeared after worker close")?;
-    if retained != receipt.record { bail!("handed-off checkpoint changed after worker close"); }
+    if retained != receipt.record {
+        bail!("handed-off checkpoint changed after worker close");
+    }
     let manifest = reader.run_manifest()?;
     let row_ticks = reader.summary_ticks()?;
     reader.close()?;
-    println!("{}", serde_json::to_string(&serde_json::json!({
-        "schema": "scriptbots.host-checkpoint-handoff.v1", "status": "handed_off",
-        "run_id": receipt.run_id.to_string(), "session_id": checkpoint.session_id().get(),
-        "checkpoint_id": checkpoint_id, "checkpoint_tick": checkpoint.tick().0,
-        "checkpoint_schema": scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA,
-        "checkpoint_format": retained.format, "payload_digest": retained.payload_digest,
-        "artifact_path": pipeline.storage_path(), "root_seed": checkpoint.config().rng_seed,
-        "config": checkpoint.config(), "brain_roster": manifest.brain_roster_json,
-        "source_commit": manifest.source_revision, "boundary_digest": checkpoint.world_checkpoint().source_digest(),
-        "step_traces": checkpoint.step_traces(),
-        "journal_cut": receipt.journal_cut, "persisted_summary_ticks": row_ticks,
-        "watermarks": { "admitted": receipt.watermarks.admitted.map(|id| id.get()),
-            "applied": receipt.watermarks.applied.map(|id| id.get()), "durable": receipt.watermarks.durable.map(|id| id.get()) },
-        "metadata": metadata,
-    }))?);
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema": "scriptbots.host-checkpoint-handoff.v1", "status": "handed_off",
+            "run_id": receipt.run_id.to_string(), "session_id": checkpoint.session_id().get(),
+            "checkpoint_id": checkpoint_id, "checkpoint_tick": checkpoint.tick().0,
+            "checkpoint_schema": scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA,
+            "checkpoint_format": retained.format, "payload_digest": retained.payload_digest,
+            "artifact_path": pipeline.storage_path(), "root_seed": checkpoint.config().rng_seed,
+            "config": checkpoint.config(), "brain_roster": manifest.brain_roster_json,
+            "source_commit": manifest.source_revision, "boundary_digest": checkpoint.world_checkpoint().source_digest(),
+            "step_traces": checkpoint.step_traces(),
+            "journal_cut": receipt.journal_cut, "persisted_summary_ticks": row_ticks,
+            "watermarks": { "admitted": receipt.watermarks.admitted.map(|id| id.get()),
+                "applied": receipt.watermarks.applied.map(|id| id.get()), "durable": receipt.watermarks.durable.map(|id| id.get()) },
+            "metadata": metadata,
+        }))?
+    );
     Ok(())
 }
 
@@ -2367,35 +2443,58 @@ struct HostCheckpointComparisonArtifact {
     provenance: JsonValue,
 }
 
-fn read_host_checkpoint_for_comparison(path: &Path, checkpoint_id: &str) -> Result<HostCheckpointComparisonArtifact> {
-    let path = path.to_str().context("host comparison database path is not UTF-8")?;
+fn read_host_checkpoint_for_comparison(
+    path: &Path,
+    checkpoint_id: &str,
+) -> Result<HostCheckpointComparisonArtifact> {
+    let path = path
+        .to_str()
+        .context("host comparison database path is not UTF-8")?;
     // This lease rejects a live writer and holds the inspected file identity
     // throughout all artifact, ledger and journal reads. A handoff has no Host
     // Shutdown; the existing complete-graph validator does not invent one.
     let reader = StorageReader::open_finished(path)
         .with_context(|| format!("host comparison refused immutable storage at {path}"))?;
     let records = reader.load_checkpoints()?;
-    let record = records.iter().find(|record| record.checkpoint_id == checkpoint_id)
+    let record = records
+        .iter()
+        .find(|record| record.checkpoint_id == checkpoint_id)
         .with_context(|| format!("host checkpoint {checkpoint_id} is absent from {path}"))?;
-    let checkpoint = record.host_checkpoint()
-        .with_context(|| format!("host checkpoint {checkpoint_id} in {path} failed comparison validation"))?;
+    let checkpoint = record.host_checkpoint().with_context(|| {
+        format!("host checkpoint {checkpoint_id} in {path} failed comparison validation")
+    })?;
     let watermarks = reader.persistence_watermarks()?;
     let page = reader.host_journal_session_conformance_page(
-        checkpoint.session_id(), None, 1, scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+        checkpoint.session_id(),
+        None,
+        1,
+        scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
     )?;
     let cut = checkpoint.journal_cut();
     let prefixes_match = |prefixes: scriptbots_storage::HostJournalPrefixes, sequence: u64| {
-        [prefixes.admitted, prefixes.applied, prefixes.committed_volatile, prefixes.durable]
-            .into_iter().all(|prefix| prefix == sequence)
+        [
+            prefixes.admitted,
+            prefixes.applied,
+            prefixes.committed_volatile,
+            prefixes.durable,
+        ]
+        .into_iter()
+        .all(|prefix| prefix == sequence)
     };
     if cut.commitment_requirement != scriptbots_runtime::ShutdownCommitRequirement::Durable
         || page.progress.shutdown.is_some()
         || !prefixes_match(page.progress.journal, cut.last_journal_sequence)
         || !prefixes_match(page.progress.events, cut.last_scientific_event_sequence)
-        || watermarks.admitted != watermarks.applied || watermarks.admitted != watermarks.durable
-        || reader.max_tick()? != checkpoint.persistence_last_admitted_tick().map(|tick| tick.0)
+        || watermarks.admitted != watermarks.applied
+        || watermarks.admitted != watermarks.durable
+        || reader.max_tick()?
+            != checkpoint
+                .persistence_last_admitted_tick()
+                .map(|tick| tick.0)
     {
-        bail!("host checkpoint {checkpoint_id} in {path} differs from its actual durable science/journal cut");
+        bail!(
+            "host checkpoint {checkpoint_id} in {path} differs from its actual durable science/journal cut"
+        );
     }
     let actual_watermarks = serde_json::json!({
         "admitted": watermarks.admitted.map(|id| id.get()),
@@ -2412,15 +2511,27 @@ fn read_host_checkpoint_for_comparison(path: &Path, checkpoint_id: &str) -> Resu
     if metadata.get("host_storage_cut") != Some(&storage_cut) {
         bail!("host checkpoint {checkpoint_id} in {path} has a stale or invalid storage-owned cut");
     }
-    let continuation_source = match (metadata.get("continued_from_checkpoint"), metadata.get("source_tick")) {
+    let continuation_source = match (
+        metadata.get("continued_from_checkpoint"),
+        metadata.get("source_tick"),
+    ) {
         (None, None) => JsonValue::Null,
         (Some(id), Some(tick)) => {
-            let id = id.as_str().context("continued checkpoint source identity is not a string")?;
-            let tick = tick.as_u64().context("continued checkpoint source tick is not an integer")?;
-            let source = records.iter().find(|source| source.checkpoint_id == id)
+            let id = id
+                .as_str()
+                .context("continued checkpoint source identity is not a string")?;
+            let tick = tick
+                .as_u64()
+                .context("continued checkpoint source tick is not an integer")?;
+            let source = records
+                .iter()
+                .find(|source| source.checkpoint_id == id)
                 .context("continued checkpoint source artifact is absent")?;
             let source_host = source.host_checkpoint()?;
-            if source_host.tick().0 != tick || source_host.session_id() != checkpoint.session_id() || tick >= checkpoint.tick().0 {
+            if source_host.tick().0 != tick
+                || source_host.session_id() != checkpoint.session_id()
+                || tick >= checkpoint.tick().0
+            {
                 bail!("continued checkpoint source identity/session/tick is inconsistent");
             }
             serde_json::json!({"checkpoint_id": id, "checkpoint_tick": tick, "payload_digest": source.payload_digest})
@@ -2437,7 +2548,10 @@ fn read_host_checkpoint_for_comparison(path: &Path, checkpoint_id: &str) -> Resu
         "watermarks": actual_watermarks, "journal_cut": cut,
     });
     reader.close()?;
-    Ok(HostCheckpointComparisonArtifact { checkpoint, provenance })
+    Ok(HostCheckpointComparisonArtifact {
+        checkpoint,
+        provenance,
+    })
 }
 
 fn validate_host_checkpoint_comparison_observations(
@@ -2494,25 +2608,50 @@ fn validate_host_checkpoint_comparison_observations(
 }
 
 fn compare_host_checkpoint_cli(cli: &AppCli, expected_path: &Path) -> Result<()> {
-    let expected_id = cli.compare_host_checkpoint_id.as_deref().context("--compare-host-checkpoint-id is required")?;
-    let actual_path = cli.host_candidate_db.as_deref().context("--host-candidate-db is required")?;
-    let actual_id = cli.host_candidate_checkpoint_id.as_deref().context("--host-candidate-checkpoint-id is required")?;
+    let expected_id = cli
+        .compare_host_checkpoint_id
+        .as_deref()
+        .context("--compare-host-checkpoint-id is required")?;
+    let actual_path = cli
+        .host_candidate_db
+        .as_deref()
+        .context("--host-candidate-db is required")?;
+    let actual_id = cli
+        .host_candidate_checkpoint_id
+        .as_deref()
+        .context("--host-candidate-checkpoint-id is required")?;
     let expected = read_host_checkpoint_for_comparison(expected_path, expected_id)?;
     let actual = read_host_checkpoint_for_comparison(actual_path, actual_id)?;
     let tick = expected.checkpoint.tick().0;
     if tick != actual.checkpoint.tick().0 {
-        bail!("host checkpoint comparison ticks differ: expected {tick}, actual {}", actual.checkpoint.tick().0);
+        bail!(
+            "host checkpoint comparison ticks differ: expected {tick}, actual {}",
+            actual.checkpoint.tick().0
+        );
     }
     for artifact in [&expected, &actual] {
         validate_host_checkpoint_comparison_observations(artifact)?;
     }
     let mut divergence = None;
-    for (left, right) in expected.checkpoint.step_traces().iter().zip(actual.checkpoint.step_traces()) {
+    for (left, right) in expected
+        .checkpoint
+        .step_traces()
+        .iter()
+        .zip(actual.checkpoint.step_traces())
+    {
         if let Some(point) = left.first_divergence(right)? {
             let stage = |trace: &scriptbots_core::WorldStepTrace| -> Result<String> {
-                let stage = trace.stages.iter().find(|stage| stage.point == point)
+                let stage = trace
+                    .stages
+                    .iter()
+                    .find(|stage| stage.point == point)
                     .context("validated trace lost its declared stage")?;
-                Ok(stage.capture.as_ref().map_err(|error| anyhow!("trace capture failed: {error:?}"))?.overall.clone())
+                Ok(stage
+                    .capture
+                    .as_ref()
+                    .map_err(|error| anyhow!("trace capture failed: {error:?}"))?
+                    .overall
+                    .clone())
             };
             divergence = Some(serde_json::json!({
                 "tick": left.tick.0, "stage": point.as_str(),
@@ -2532,16 +2671,23 @@ fn compare_host_checkpoint_cli(cli: &AppCli, expected_path: &Path) -> Result<()>
         }));
     }
     let matches = divergence.is_none();
-    println!("{}", serde_json::to_string(&serde_json::json!({
-        "schema": "scriptbots.host-checkpoint-comparison.v1",
-        "status": if matches { "match" } else { "diverged" },
-        "basis": "complete_observed_step_trace_prefix_and_final_boundary",
-        "compared_tick": tick, "compared_trace_ticks": expected.checkpoint.step_traces().len(),
-        "expected": expected.provenance, "actual": actual.provenance,
-        "first_observed_divergence": divergence,
-        "expected_boundary_digest": expected_digest, "actual_boundary_digest": actual_digest,
-    }))?);
-    if !matches { bail!("host checkpoint comparison diverged; see the observed tick/stage and retained artifact identities above"); }
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema": "scriptbots.host-checkpoint-comparison.v1",
+            "status": if matches { "match" } else { "diverged" },
+            "basis": "complete_observed_step_trace_prefix_and_final_boundary",
+            "compared_tick": tick, "compared_trace_ticks": expected.checkpoint.step_traces().len(),
+            "expected": expected.provenance, "actual": actual.provenance,
+            "first_observed_divergence": divergence,
+            "expected_boundary_digest": expected_digest, "actual_boundary_digest": actual_digest,
+        }))?
+    );
+    if !matches {
+        bail!(
+            "host checkpoint comparison diverged; see the observed tick/stage and retained artifact identities above"
+        );
+    }
     Ok(())
 }
 
@@ -8082,14 +8228,16 @@ mod tests {
                     break;
                 }
             }
-            assert!(settled, "the real owner must settle before artifact capture");
+            assert!(
+                settled,
+                "the real owner must settle before artifact capture"
+            );
             let checkpoint = core
                 .capture_host_checkpoint_v1()
                 .expect("actual complete host capture permits qualified coverage gaps");
-            let checkpoint = HostCheckpointV1::decode(
-                &checkpoint.encode().expect("actual artifact encoding"),
-            )
-            .expect("independent validated host decoding");
+            let checkpoint =
+                HostCheckpointV1::decode(&checkpoint.encode().expect("actual artifact encoding"))
+                    .expect("independent validated host decoding");
             assert_eq!(checkpoint.tick().0, 1);
             assert!(checkpoint.world_checkpoint().agent_count() > 0);
             assert_eq!(checkpoint.step_traces().len(), 1);
@@ -8097,7 +8245,10 @@ mod tests {
             assert!(boundary.evaluator_state_covered);
             assert_eq!(boundary.factory_state_covered, !opaque_factory);
             for stage in &checkpoint.step_traces()[0].stages {
-                let capture = stage.capture.as_ref().expect("actual complete stage capture");
+                let capture = stage
+                    .capture
+                    .as_ref()
+                    .expect("actual complete stage capture");
                 assert!(capture.world.evaluator_state_covered);
                 assert_eq!(capture.world.factory_state_covered, !opaque_factory);
             }
@@ -8115,8 +8266,8 @@ mod tests {
                         .uncovered_factory_families,
                     vec!["unused-opaque".to_owned()]
                 );
-                let error = observed
-                    .expect_err("partial actual observations cannot prove equivalence");
+                let error =
+                    observed.expect_err("partial actual observations cannot prove equivalence");
                 let message = format!("{error:#}");
                 assert!(message.contains("observed-owner-control"));
                 assert!(message.contains("boundary equivalence"));
@@ -8132,69 +8283,136 @@ mod tests {
     fn host_checkpoint_cli_accepts_its_modes_and_refuses_competing_or_ignored_flags() {
         with_clean_config_env(|| {
             let launch_variables = [
-                "SCRIPTBOTS_MODE", "SCRIPTBOTS_CONFIG", "SCRIPTBOTS_BOOTSTRAP_TICKS",
-                "SCRIPTBOTS_CHECKPOINT_INTERVAL", "SCRIPTBOTS_CHECKPOINT_MAX_COUNT",
-                "SCRIPTBOTS_CHECKPOINT_MAX_BYTES", "SCRIPTBOTS_SENSE_BACKEND",
+                "SCRIPTBOTS_MODE",
+                "SCRIPTBOTS_CONFIG",
+                "SCRIPTBOTS_BOOTSTRAP_TICKS",
+                "SCRIPTBOTS_CHECKPOINT_INTERVAL",
+                "SCRIPTBOTS_CHECKPOINT_MAX_COUNT",
+                "SCRIPTBOTS_CHECKPOINT_MAX_BYTES",
+                "SCRIPTBOTS_SENSE_BACKEND",
                 "SCRIPTBOTS_ALLOW_APPROXIMATE_SENSE",
             ];
-            let saved_launch: Vec<_> = launch_variables.into_iter()
-                .map(|name| (name, std::env::var(name).ok())).collect();
+            let saved_launch: Vec<_> = launch_variables
+                .into_iter()
+                .map(|name| (name, std::env::var(name).ok()))
+                .collect();
             for (name, _) in &saved_launch {
                 // SAFETY: this serial parser test holds the shared environment lock.
-                unsafe { std::env::remove_var(name); }
+                unsafe {
+                    std::env::remove_var(name);
+                }
             }
             let handoff = AppCli::try_parse_from([
-                "scriptbots-app", "--checkpoint-handoff", "host-at-3",
-                "--bootstrap-ticks", "3", "--brain", "mlp", "--threads", "1",
-            ]).expect("fresh host capture keeps its actual launch controls");
+                "scriptbots-app",
+                "--checkpoint-handoff",
+                "host-at-3",
+                "--bootstrap-ticks",
+                "3",
+                "--brain",
+                "mlp",
+                "--threads",
+                "1",
+            ])
+            .expect("fresh host capture keeps its actual launch controls");
             assert!(storage_owning_startup_requested(&handoff));
             assert_eq!(handoff.checkpoint_handoff.as_deref(), Some("host-at-3"));
             let continuation = [
-                "scriptbots-app", "--continue-host-db", "run.sqlite",
-                "--host-checkpoint-id", "host-at-3", "--continue-ticks", "5",
-                "--brain", "mlp",
+                "scriptbots-app",
+                "--continue-host-db",
+                "run.sqlite",
+                "--host-checkpoint-id",
+                "host-at-3",
+                "--continue-ticks",
+                "5",
+                "--brain",
+                "mlp",
             ];
             let continued = AppCli::try_parse_from(continuation)
                 .expect("implicit defaults do not conflict with captured configuration");
-            assert_eq!(continued.continue_ticks.map(std::num::NonZeroU64::get), Some(5));
+            assert_eq!(
+                continued.continue_ticks.map(std::num::NonZeroU64::get),
+                Some(5)
+            );
             for competing in [
-                vec!["--profile-steps", "1"], vec!["--profile-storage-steps", "1"],
-                vec!["--profile-sweep", "1"], vec!["--config-only"],
-                vec!["--characterize-v0", "1"], vec!["--det-check", "1"],
-                vec!["--det-check-archipelago", "1"], vec!["--create-bundle", "other.sqlite"],
-                vec!["--verify-bundle", "bundle"], vec!["--report-archipelago", "other.sqlite"],
-                vec!["--dump-png", "capture.png"], vec!["--lab-goal", "competing"],
+                vec!["--profile-steps", "1"],
+                vec!["--profile-storage-steps", "1"],
+                vec!["--profile-sweep", "1"],
+                vec!["--config-only"],
+                vec!["--characterize-v0", "1"],
+                vec!["--det-check", "1"],
+                vec!["--det-check-archipelago", "1"],
+                vec!["--create-bundle", "other.sqlite"],
+                vec!["--verify-bundle", "bundle"],
+                vec!["--report-archipelago", "other.sqlite"],
+                vec!["--dump-png", "capture.png"],
+                vec!["--lab-goal", "competing"],
             ] {
                 let mut arguments = vec!["scriptbots-app", "--checkpoint-handoff", "host-at-3"];
                 arguments.extend_from_slice(&competing);
-                assert!(AppCli::try_parse_from(arguments).is_err(), "handoff ignored {competing:?}");
+                assert!(
+                    AppCli::try_parse_from(arguments).is_err(),
+                    "handoff ignored {competing:?}"
+                );
                 let mut arguments = continuation.to_vec();
                 arguments.extend_from_slice(&competing);
-                assert!(AppCli::try_parse_from(arguments).is_err(), "continuation ignored {competing:?}");
+                assert!(
+                    AppCli::try_parse_from(arguments).is_err(),
+                    "continuation ignored {competing:?}"
+                );
             }
             for ignored in [
-                vec!["--set", "food_max=0.2"], vec!["--rng-seed", "999"],
-                vec!["--bootstrap-ticks", "99"], vec!["--checkpoint-max-count", "0"],
-                vec!["--checkpoint-max-bytes", "0"], vec!["--storage", "memory"],
-                vec!["--threads", "8"], vec!["--mode", "terminal"],
-                vec!["--print-config"], vec!["--auto-tune", "10"],
+                vec!["--set", "food_max=0.2"],
+                vec!["--rng-seed", "999"],
+                vec!["--bootstrap-ticks", "99"],
+                vec!["--checkpoint-max-count", "0"],
+                vec!["--checkpoint-max-bytes", "0"],
+                vec!["--storage", "memory"],
+                vec!["--threads", "8"],
+                vec!["--mode", "terminal"],
+                vec!["--print-config"],
+                vec!["--auto-tune", "10"],
             ] {
                 let mut arguments = continuation.to_vec();
                 arguments.extend_from_slice(&ignored);
-                assert!(AppCli::try_parse_from(arguments).is_err(), "continuation ignored {ignored:?}");
+                assert!(
+                    AppCli::try_parse_from(arguments).is_err(),
+                    "continuation ignored {ignored:?}"
+                );
             }
-            assert!(AppCli::try_parse_from([
-                "scriptbots-app", "--continue-host-db", "run.sqlite",
-                "--host-checkpoint-id", "host-at-3", "--continue-ticks", "0",
-            ]).is_err(), "continuation must execute at least one actual science step");
-            assert!(AppCli::try_parse_from([
-                "scriptbots-app", "--continue-host-db", "run.sqlite", "--continue-ticks", "5",
-            ]).is_err(), "continuation must name the exact retained artifact");
+            assert!(
+                AppCli::try_parse_from([
+                    "scriptbots-app",
+                    "--continue-host-db",
+                    "run.sqlite",
+                    "--host-checkpoint-id",
+                    "host-at-3",
+                    "--continue-ticks",
+                    "0",
+                ])
+                .is_err(),
+                "continuation must execute at least one actual science step"
+            );
+            assert!(
+                AppCli::try_parse_from([
+                    "scriptbots-app",
+                    "--continue-host-db",
+                    "run.sqlite",
+                    "--continue-ticks",
+                    "5",
+                ])
+                .is_err(),
+                "continuation must name the exact retained artifact"
+            );
             let comparison = [
-                "scriptbots-app", "--compare-host-db", "baseline.sqlite",
-                "--compare-host-checkpoint-id", "baseline-at-8",
-                "--host-candidate-db", "run.sqlite",
-                "--host-candidate-checkpoint-id", "continued-at-8",
+                "scriptbots-app",
+                "--compare-host-db",
+                "baseline.sqlite",
+                "--compare-host-checkpoint-id",
+                "baseline-at-8",
+                "--host-candidate-db",
+                "run.sqlite",
+                "--host-candidate-checkpoint-id",
+                "continued-at-8",
             ];
             assert!(AppCli::try_parse_from(comparison).is_ok());
             let mut ignored = comparison.to_vec();

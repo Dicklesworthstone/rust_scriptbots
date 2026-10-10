@@ -1063,7 +1063,9 @@ impl ChannelHostDriver {
             return;
         }
         if self.handed_off {
-            let _ = request.reply.send(Err(HostAccessError::Disconnected.into()));
+            let _ = request
+                .reply
+                .send(Err(HostAccessError::Disconnected.into()));
             return;
         }
         let error = match self.host.core().capture_host_checkpoint_v1() {
@@ -1152,9 +1154,8 @@ impl ChannelHostDriver {
     }
 
     fn refuse_handoff_ingress(message: IngressMessage) {
-        let error = || {
-            ChannelHostPort::protocol_violation("owner handoff refused later queued ingress")
-        };
+        let error =
+            || ChannelHostPort::protocol_violation("owner handoff refused later queued ingress");
         match message {
             IngressMessage::BrainProjection { reply, .. } => {
                 let _ = reply.send(Err(error()));
@@ -1341,7 +1342,9 @@ impl ChannelHostDriver {
             let _ = reply.send(Err(HostAccessError::Disconnected));
         }
         for request in std::mem::take(&mut self.parked_host_captures) {
-            let _ = request.reply.send(Err(HostAccessError::Disconnected.into()));
+            let _ = request
+                .reply
+                .send(Err(HostAccessError::Disconnected.into()));
         }
     }
 
