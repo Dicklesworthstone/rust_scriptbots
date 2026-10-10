@@ -21731,7 +21731,8 @@ impl WorldState {
     /// # Errors
     ///
     /// Returns `PersistenceSessionError::ZeroPersistenceInterval` if `persistence_interval` is 0,
-    /// or `PersistenceSessionError::AlreadyBound` if persistence is already bound.
+    /// or `PersistenceSessionError::AlreadyBound` if persistence is already bound. A rejected
+    /// attachment leaves the world's recording configuration and discard marker unchanged.
     pub fn bind_continuation_persistence(
         &mut self,
         sink: Box<dyn WorldPersistence>,
@@ -21741,10 +21742,11 @@ impl WorldState {
         if persistence_interval == 0 {
             return Err(PersistenceSessionError::ZeroPersistenceInterval);
         }
+        let session = self.bind_persistence(sink)?;
         self.config.persistence_interval = persistence_interval;
         self.config.replay_event_tick_cap = replay_event_tick_cap;
         self.persistence_discarded_records_at = None;
-        self.bind_persistence(sink)
+        Ok(session)
     }
 
     fn resource_amounts(&self) -> ResourceAmounts {

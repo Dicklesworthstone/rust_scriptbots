@@ -3992,10 +3992,81 @@ mod tests {
             original.world_digest_v1().expect("original digest")
         );
 
-        // Continuation persistence can be bound on restored world
-        let _session = restored
+        let unbound_config =
+            serde_json::to_value(restored.config()).expect("unbound recording configuration");
+        assert!(matches!(
+            restored.bind_continuation_persistence(Box::new(crate::NullPersistence), 0, 2048),
+            Err(crate::PersistenceSessionError::ZeroPersistenceInterval)
+        ));
+        assert_eq!(
+            serde_json::to_value(restored.config()).expect("configuration after zero interval"),
+            unbound_config
+        );
+
+        let mut session = restored
             .bind_continuation_persistence(Box::new(crate::NullPersistence), 60, 1024)
             .expect("bind continuation persistence");
         assert_eq!(restored.config.persistence_interval, 60);
+        assert_eq!(restored.config.replay_event_tick_cap, 1024);
+        let bound_config =
+            serde_json::to_value(restored.config()).expect("bound recording configuration");
+        let discard_marker = restored.persistence_discarded_records_at;
+        assert!(matches!(
+            restored.bind_continuation_persistence(Box::new(crate::NullPersistence), 120, 2048),
+            Err(crate::PersistenceSessionError::AlreadyBound)
+        ));
+        assert_eq!(
+            serde_json::to_value(restored.config()).expect("configuration after live rejection"),
+            bound_config
+        );
+        assert_eq!(restored.persistence_discarded_records_at, discard_marker);
+        session
+            .step(&mut restored)
+            .expect("the original continuation session remains authoritative");
+        assert_eq!(restored.tick(), Tick(1));
+        drop(session);
+
+        assert!(matches!(
+            restored.bind_continuation_persistence(Box::new(crate::NullPersistence), 120, 2048),
+            Err(crate::PersistenceSessionError::AlreadyBound)
+        ));
+        assert_eq!(
+            serde_json::to_value(restored.config()).expect("configuration after dropped rejection"),
+            bound_config
+        );
+        assert_eq!(restored.tick(), Tick(1));
+    }
+
+    #[test]
+    fn rejected_continuation_bind_preserves_recording_gap_and_bound_session() {
+        let (original, _) = world_with_checkpoint_family();
+        let checkpoint = original.checkpoint_v1().expect("capture source world");
+        let mut restored =
+            WorldState::restore_checkpoint_v1(&checkpoint, prepared_checkpoint_registry())
+                .expect("restore source world");
+        restored.step().expect("complete an actual unrecorded tick");
+        assert_eq!(restored.persistence_discarded_records_at, Some(Tick(1)));
+        let before_config =
+            serde_json::to_value(restored.config()).expect("disabled recording configuration");
+        let mut session = restored
+            .bind_persistence(Box::new(crate::NullPersistence))
+            .expect("claim without clearing the recording gap");
+
+        assert!(matches!(
+            restored.bind_continuation_persistence(Box::new(crate::NullPersistence), 60, 1024),
+            Err(crate::PersistenceSessionError::AlreadyBound)
+        ));
+        assert_eq!(
+            serde_json::to_value(restored.config()).expect("configuration after rejected attach"),
+            before_config
+        );
+        assert_eq!(restored.persistence_discarded_records_at, Some(Tick(1)));
+        assert_eq!(restored.tick(), Tick(1));
+
+        session
+            .step(&mut restored)
+            .expect("the existing owner remains usable after rejection");
+        assert_eq!(restored.tick(), Tick(2));
+        assert_eq!(restored.persistence_discarded_records_at, Some(Tick(1)));
     }
 }
