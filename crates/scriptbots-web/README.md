@@ -9,23 +9,29 @@ rustup target add wasm32-unknown-unknown
 cargo check --target wasm32-unknown-unknown -p scriptbots-web
 ```
 
-To produce the browser package the demo in `web/` loads (`web/pkg/scriptbots_web.js`), use
-either route:
+The package producer uses pinned wasm-pack 0.15.0 and adds standard module,
+declaration, and WASM exports to its generated package metadata. Run packaging
+and browser checks inside the source-pinned DSR profile, with its provisioned tools:
 
 ```bash
-# wasm-pack (the route web/README.md documents)
-wasm-pack build crates/scriptbots-web --target web --out-dir web/pkg -- --locked
-
-# or plain cargo + wasm-bindgen-cli (version must match the locked wasm-bindgen, 0.2.129)
-cargo build --locked --release --target wasm32-unknown-unknown -p scriptbots-web
-wasm-bindgen --target web --out-dir crates/scriptbots-web/web/pkg \
-  target/wasm32-unknown-unknown/release/scriptbots_web.wasm
+bash scripts/package_wasm.sh /absolute/fresh/scriptbots-web-package
+SCRIPTBOTS_WASM_PACKAGE_DIR=/absolute/fresh/scriptbots-web-package \
+  SCRIPTBOTS_WASM_PROOF_DIR=/absolute/existing/dsr-proof \
+  bash scripts/e2e_wasm_browser_stats_dom.sh
 ```
 
-`scripts/e2e_wasm_browser_stats_dom.sh` then drives the demo page in headless Chromium through
-Playwright and checks the live stats DOM (needs `bun` and the `playwright` module). Release-grade
-WASM evidence is DSR-only; an npm package layout is still open (bd-azi3). See `docs/wasm/` for
-the roadmap and research artifacts.
+Both the output directory and its `.wasm-pack` sibling must be absent before a
+build. The sibling retains the original generated metadata and bytes; the final
+package preserves them and includes the project license notices. The demo's
+existing `/pkg` import is served from the selected final package by the smoke.
+
+The browser smoke uses already provisioned Bun and Playwright. It retains the
+three injected DOM contract/scheduling controls, adds actual package loading,
+and checks an isolated corrupted-WASM bootstrap refusal. Existing native/WASM
+parity fixtures and tests remain separate and unchanged. No package-manager
+installation or bundler is required. Original bd-azi3 acceptance remains open
+until the complete source-bound DSR package/browser qualification; source wiring
+and CI feedback are not release evidence. See `docs/wasm/` for the roadmap.
 
 ## Bindings overview
 

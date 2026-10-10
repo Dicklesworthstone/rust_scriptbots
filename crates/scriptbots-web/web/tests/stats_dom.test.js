@@ -1,6 +1,7 @@
 // crates/scriptbots-web/web/tests/stats_dom.test.js
-// Real-browser DOM execution test for the WASM browser stats refresh (bd-2z0.12.6).
+// DOM contract controls (bd-2z0.12.6) and actual packaged WASM loading (bd-azi3).
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -10,6 +11,49 @@ import { chromium } from "playwright";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const webDir = path.resolve(__dirname, "..");
+const packageDir = path.resolve(process.env.SCRIPTBOTS_WASM_PACKAGE_DIR || path.join(webDir, "pkg"));
+
+function readPackage() {
+  const manifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
+  const original = JSON.parse(fs.readFileSync(`${packageDir}.wasm-pack/package.json`, "utf8"));
+  const moduleFile = original.module ?? original.main;
+  const wasmFiles = original.files.filter((file) => file.endsWith(".wasm"));
+  if (wasmFiles.length !== 1 || original.type !== "module") {
+    throw new Error("Expected one WASM binary in the generated ES module package");
+  }
+  const wasmFile = wasmFiles[0];
+  const expectedExports = {
+    ".": { types: `./${original.types}`, import: `./${moduleFile}`, default: `./${moduleFile}` },
+    "./package.json": "./package.json",
+    [`./${wasmFile}`]: `./${wasmFile}`,
+  };
+  if (JSON.stringify(manifest.exports) !== JSON.stringify(expectedExports)) {
+    throw new Error("Package exports do not address the generated module, types, and WASM");
+  }
+  for (const [key, value] of Object.entries(original)) {
+    if (key !== "files" && JSON.stringify(manifest[key]) !== JSON.stringify(value)) {
+      throw new Error(`Generated package metadata was changed: ${key}`);
+    }
+  }
+  for (const file of original.files) {
+    if (!manifest.files.includes(file)) throw new Error(`Generated package file was omitted: ${file}`);
+  }
+  const files = Object.fromEntries(manifest.files.map((file) => {
+    if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(file)) throw new Error(`Unsafe package file: ${file}`);
+    const filePath = path.join(packageDir, file);
+    if (!fs.lstatSync(filePath).isFile()) throw new Error(`Package entry is not a regular file: ${file}`);
+    const bytes = fs.readFileSync(filePath);
+    if (bytes.length === 0) throw new Error(`Empty package file: ${file}`);
+    if (original.files.includes(file) && !bytes.equals(fs.readFileSync(path.join(`${packageDir}.wasm-pack`, file)))) {
+      throw new Error(`Generated package bytes changed: ${file}`);
+    }
+    return [file, { bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") }];
+  }));
+  if (!files[moduleFile] || !files[original.types] || !files[wasmFile]) {
+    throw new Error("Generated module, declarations, or binary is absent from the package files");
+  }
+  return { manifest, moduleFile, typesFile: original.types, wasmFile, files };
+}
 
 const camelCaseWasmModule = `
   export default async function initWasm() { return {}; }
@@ -79,7 +123,7 @@ const snakeCaseWasmModule = `
 /**
  * Creates the HTTP server that serves the production index.html and main.js.
  */
-function createServer() {
+function createServer(packageInfo) {
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
 
@@ -89,6 +133,14 @@ function createServer() {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
+    } else if (url.pathname.startsWith("/pkg/")
+        && (url.pathname === "/pkg/package.json" || Object.hasOwn(packageInfo.files, url.pathname.slice(5)))) {
+      const file = url.pathname.slice(5);
+      const contentType = file.endsWith(".wasm") ? "application/wasm"
+        : file.endsWith(".js") ? "application/javascript; charset=utf-8"
+        : file.endsWith(".json") ? "application/json; charset=utf-8" : "text/plain; charset=utf-8";
+      res.writeHead(200, { "Content-Type": contentType });
+      res.end(fs.readFileSync(path.join(packageDir, file)));
     } else {
       res.writeHead(404);
       res.end("Not found");
@@ -101,16 +153,21 @@ async function runTests() {
     camelCasePositive: null,
     snakeCaseNegative: null,
     schedulingNegative: null,
+    realPackage: null,
     consoleLogs: [],
     pageErrors: [],
   };
 
-  const server = createServer();
+  const packageInfo = readPackage();
+  const server = createServer(packageInfo);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   const baseUrl = `http://127.0.0.1:${port}`;
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.SCRIPTBOTS_CHROMIUM_EXECUTABLE || undefined,
+  });
 
   try {
     // =========================================================================
@@ -405,12 +462,138 @@ async function runTests() {
       await context.close();
     }
 
+    // The production demo loads the exact generated package; no module replacement.
+    {
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      const pageErrors = [];
+      const consoleLogs = [];
+      page.on("pageerror", (err) => pageErrors.push(err.message));
+      page.on("console", (msg) => consoleLogs.push({ type: msg.type(), text: msg.text() }));
+      const moduleUrl = `${baseUrl}/pkg/${packageInfo.moduleFile}`;
+      const wasmUrl = `${baseUrl}/pkg/${packageInfo.wasmFile}`;
+      const [moduleResponse, wasmResponse] = await Promise.all([
+        page.waitForResponse(moduleUrl),
+        page.waitForResponse(wasmUrl),
+        page.goto(`${baseUrl}/`),
+      ]);
+      const loadedFiles = [];
+      for (const [file, response] of [[packageInfo.moduleFile, moduleResponse], [packageInfo.wasmFile, wasmResponse]]) {
+        const bytes = await response.body();
+        const sha256 = createHash("sha256").update(bytes).digest("hex");
+        if (response.status() !== 200 || sha256 !== packageInfo.files[file].sha256) {
+          throw new Error(`Browser did not load the exact generated package bytes: ${file}`);
+        }
+        loadedFiles.push({ file, url: response.url(), status: response.status(), bytes: bytes.length, sha256 });
+      }
+      if (wasmResponse.headers()["content-type"] !== "application/wasm") {
+        throw new Error("Packaged WASM must be served with its streaming MIME type");
+      }
+      const expectedVersion = `${packageInfo.manifest.name} ${packageInfo.manifest.version}`;
+      await page.waitForFunction((version) => document.getElementById("version").textContent === version, expectedVersion);
+      await page.waitForFunction(() => Number(document.getElementById("metric-tick").textContent.replaceAll(",", "")) > 0);
+      const readMetrics = () => page.evaluate(() => Object.fromEntries(
+        ["tick", "population", "tps", "energy", "health", "births", "deaths"].map((field) =>
+          [field, document.getElementById(`metric-${field}`).textContent]),
+      ));
+      const window1 = await readMetrics();
+      const firstTick = Number(window1.tick.replaceAll(",", ""));
+      await page.waitForFunction((tick) => Number(document.getElementById("metric-tick").textContent.replaceAll(",", "")) > tick, firstTick);
+      const window2 = await readMetrics();
+      for (const window of [window1, window2]) {
+        for (const value of Object.values(window)) {
+          if (value.trim().length === 0 || !Number.isFinite(Number(value.replaceAll(",", "")))
+              || Number(value.replaceAll(",", "")) < 0) {
+            throw new Error(`Real packaged simulation produced an invalid DOM metric: ${JSON.stringify(window)}`);
+          }
+        }
+        if (Number(window.tps) <= 0) throw new Error("Real packaged simulation did not advance its TPS window");
+      }
+      const api = await page.evaluate(async () => {
+        const response = await fetch("/pkg/package.json", { signal: AbortSignal.timeout(30_000) });
+        if (!response.ok) throw new Error("The exported package descriptor is unavailable");
+        const manifest = await response.json();
+        const wasm = await import(new URL(manifest.exports["."].import, response.url).href);
+        await wasm.default();
+        const options = { seed: 7, population: 8, seed_strategy: "none", snapshot_format: "json" };
+        const steps = 2;
+        const handle = wasm.init_sim(options);
+        try {
+          const initial = handle.snapshot();
+          const advanced = handle.tick(steps);
+          handle.reset(options.seed);
+          const reset = handle.snapshot();
+          if (initial.tick !== 0 || initial.summary.agentCount !== options.population
+              || initial.agents.length !== options.population || advanced.tick !== initial.tick + steps
+              || reset.tick !== initial.tick || reset.summary.agentCount !== options.population) {
+            throw new Error("Packaged init/snapshot/tick/reset did not preserve their public contracts");
+          }
+          return {
+            package: { name: manifest.name, version: manifest.version, exports: manifest.exports },
+            options, steps,
+            initial: { tick: initial.tick, summary: initial.summary, agentCount: initial.agents.length },
+            advanced: { tick: advanced.tick, summary: advanced.summary, agentCount: advanced.agents.length },
+            reset: { tick: reset.tick, summary: reset.summary, agentCount: reset.agents.length },
+          };
+        } finally {
+          handle.free();
+        }
+      });
+      if (pageErrors.length !== 0 || consoleLogs.some((entry) => entry.text.includes("Failed to initialise wasm module"))) {
+        throw new Error(`Real packaged demo failed: ${JSON.stringify({ pageErrors, consoleLogs })}`);
+      }
+      await context.close();
+
+      // The same actual glue must refuse an invalid WASM version, rather than
+      // allowing the DOM fixture to stand in for a compiled module.
+      const corruptContext = await browser.newContext();
+      const corruptPage = await corruptContext.newPage();
+      const corruptConsole = [];
+      let corruptRequests = 0;
+      corruptPage.on("console", (msg) => corruptConsole.push({ type: msg.type(), text: msg.text() }));
+      await corruptPage.route(wasmUrl, (route) => {
+        corruptRequests += 1;
+        return route.fulfill({ status: 200, contentType: "application/wasm", body: Buffer.from([0, 97, 115, 109, 255, 255, 255, 255]) });
+      });
+      await corruptPage.goto(`${baseUrl}/`);
+      await corruptPage.waitForFunction(() => document.getElementById("log").textContent.includes("Bootstrap failed:"));
+      const corruptDom = await corruptPage.evaluate(() => ({
+        version: document.getElementById("version").textContent,
+        tick: document.getElementById("metric-tick").textContent,
+        population: document.getElementById("metric-population").textContent,
+        log: document.getElementById("log").textContent,
+      }));
+      if (corruptRequests !== 1 || corruptDom.version !== "initializing…" || corruptDom.tick !== "–"
+          || corruptDom.population !== "–" || !corruptConsole.some((entry) =>
+            entry.type === "error" && entry.text.includes("Failed to initialise wasm module") && entry.text.includes("CompileError"))) {
+        throw new Error(`Corrupt packaged WASM did not fail at bootstrap: ${JSON.stringify({ corruptRequests, corruptDom, corruptConsole })}`);
+      }
+      await corruptContext.close();
+      observations.realPackage = {
+        passed: true,
+        directory: packageDir,
+        name: packageInfo.manifest.name,
+        version: packageInfo.manifest.version,
+        exports: packageInfo.manifest.exports,
+        types: packageInfo.typesFile,
+        files: packageInfo.files,
+        loadedFiles,
+        window1, window2, api, pageErrors, consoleLogs,
+        corruptedWasmNegative: { passed: true, requests: corruptRequests, dom: corruptDom, consoleLogs: corruptConsole },
+      };
+    }
+
     // All tests passed successfully!
+    const caseNames = ["camelCasePositive", "snakeCaseNegative", "schedulingNegative", "realPackage"];
+    if (!caseNames.every((name) => observations[name]?.passed === true)) {
+      throw new Error("A required browser case has no successful observation");
+    }
     const result = {
       schema: "scriptbots.browser-stats-dom.v1",
       timestamp: new Date().toISOString(),
       status: "pass",
-      cases_passed: 3,
+      browser: { version: browser.version(), executable: process.env.SCRIPTBOTS_CHROMIUM_EXECUTABLE || null },
+      cases_passed: caseNames.length,
       cases_failed: 0,
       observations,
     };

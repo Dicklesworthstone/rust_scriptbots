@@ -356,7 +356,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
-          toolchain: nightly-2026-07-09
+          toolchain: nightly-2026-08-31
           targets: wasm32-unknown-unknown
 
       # Fail fast before the expensive wasm-pack build: the wasm dependency
@@ -420,6 +420,127 @@ jobs:
           --
           --locked
           --features native-parity-fixture
+
+      # This feedback smoke consumes the produced package through the existing
+      # Canvas demo. Release qualification remains source-bound and DSR-only.
+      - name: Produce browser package and load the demo in pinned Chrome
+        shell: bash
+        env:
+          CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver }}
+          WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ steps.chrome.outputs.webdriver_json }}
+        run: |
+          set -euo pipefail
+          export SCRIPTBOTS_WASM_PACKAGE_DIR="$RUNNER_TEMP/scriptbots-web-package-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bash scripts/package_wasm.sh "$SCRIPTBOTS_WASM_PACKAGE_DIR"
+          python3 -I - <<'PY'
+          import functools, hashlib, http.server, json, math, os, pathlib, socket, subprocess, threading, time
+          import urllib.error, urllib.request
+
+          package = pathlib.Path(os.environ['SCRIPTBOTS_WASM_PACKAGE_DIR'])
+          manifest = json.loads((package / 'package.json').read_text())
+          module = manifest['exports']['.']['import'].removeprefix('./')
+          binaries = [name for name in manifest['files'] if name.endswith('.wasm')]
+          assert len(binaries) == 1, 'Expected one generated WASM binary'
+          expected_version = manifest['name'] + ' ' + manifest['version']
+          served = {}
+
+          class Demo(http.server.SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  if not self.path.startswith('/pkg/'):
+                      return super().do_GET()
+                  name = self.path.removeprefix('/pkg/')
+                  if name not in manifest['files'] + ['package.json']:
+                      return self.send_error(404)
+                  data = (package / name).read_bytes()
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/wasm' if name.endswith('.wasm') else
+                      'application/javascript' if name.endswith('.js') else 'application/json')
+                  self.end_headers()
+                  self.wfile.write(data)
+                  served[name] = {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+
+          server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(
+              Demo, directory='crates/scriptbots-web/web'))
+          thread = threading.Thread(target=server.serve_forever, daemon=True)
+          thread.start()
+          with socket.socket() as reservation:
+              reservation.bind(('127.0.0.1', 0))
+              port = reservation.getsockname()[1]
+          endpoint = 'http://127.0.0.1:' + str(port)
+          client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+          def request(method, route, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(endpoint + route, data=data, method=method,
+                  headers={'Content-Type': 'application/json'})
+              with client.open(req, timeout=35) as response:
+                  return json.load(response)['value']
+
+          log = pathlib.Path(os.environ['RUNNER_TEMP']) / 'scriptbots-package-chromedriver.log'
+          session = None
+          driver_log = None
+          try:
+              driver_log = log.open('x')
+              driver = subprocess.Popen([os.environ['CHROMEDRIVER'], '--port=' + str(port)],
+                  stdout=driver_log, stderr=subprocess.STDOUT)
+              try:
+                  deadline = time.monotonic() + 30
+                  while True:
+                      assert driver.poll() is None, 'ChromeDriver exited during startup'
+                      try:
+                          if request('GET', '/status')['ready']:
+                              break
+                      except urllib.error.URLError:
+                          if time.monotonic() >= deadline:
+                              raise
+                      assert time.monotonic() < deadline, 'ChromeDriver startup timed out'
+                      time.sleep(0.1)
+                  caps = json.loads(pathlib.Path(os.environ['WASM_BINDGEN_TEST_WEBDRIVER_JSON']).read_text())
+                  caps['goog:chromeOptions']['args'] = ['--headless=new', '--disable-dev-shm-usage', '--no-sandbox']
+                  session = request('POST', '/session', {'capabilities': {'alwaysMatch': caps}})['sessionId']
+                  route = '/session/' + session
+                  request('POST', route + '/url', {'url': 'http://127.0.0.1:' + str(server.server_port) + '/'})
+                  windows = []
+                  deadline = time.monotonic() + 30
+                  while len(windows) < 2:
+                      observed = request('POST', route + '/execute/sync', {'script': '''
+                          const text = id => document.getElementById(id).textContent;
+                          return {version:text('version'),tick:text('metric-tick'),tps:text('metric-tps'),log:text('log')};
+                          ''', 'args': []})
+                      assert 'Bootstrap failed:' not in observed['log'], observed
+                      tick = observed['tick'].replace(',', '')
+                      if observed['version'] == expected_version and tick.isdecimal() and int(tick) > 0:
+                          tps = float(observed['tps'].replace(',', ''))
+                          if math.isfinite(tps) and tps > 0 and (not windows or int(tick) > int(windows[-1]['tick'].replace(',', ''))):
+                              windows.append(observed)
+                      assert time.monotonic() < deadline, ('Demo did not advance two stats windows', windows, observed)
+                      time.sleep(0.1)
+                  for name in [module, binaries[0]]:
+                      assert served[name] == {'bytes': (package / name).stat().st_size,
+                          'sha256': hashlib.sha256((package / name).read_bytes()).hexdigest()}, name
+                  result = {'schema': 'scriptbots.package-ci-smoke.v1', 'status': 'pass',
+                      'scope': 'CI feedback only; actual generated package and production Canvas demo',
+                      'package': manifest['name'], 'version': manifest['version'], 'windows': windows,
+                      'served_files': served}
+              finally:
+                  try:
+                      if session is not None:
+                          request('DELETE', '/session/' + session)
+                  finally:
+                      driver.terminate()
+                      try:
+                          driver.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          driver.kill()
+                          driver.wait(timeout=5)
+          finally:
+              server.shutdown()
+              server.server_close()
+              thread.join(timeout=5)
+              if driver_log is not None:
+                  driver_log.close()
+          print(json.dumps(result, sort_keys=True))
+          PY
 
       - name: Prove injected WASM divergence is red
         shell: bash

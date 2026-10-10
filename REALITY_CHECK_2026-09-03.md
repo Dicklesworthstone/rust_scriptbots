@@ -10,7 +10,7 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-10
 
-The source changes through saved commit `1ba852f003305c3e388fcc091b36852e5405b365`
+The source changes through saved commit `5cf4f859c12425349b2215381f34e2600bbc0ec1`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
 consumer finding below describes the initial audited source, not this newer candidate.
@@ -110,12 +110,80 @@ Nested cleanup finally blocks attempt buffered raw and actual termios retention 
 five-second cleanup wait fails; forced cleanup still fails. These are observation repairs with
 no product credit. Static Rust scan exits zero with zero critical, 177 warning and 68 informational
 findings, triaged before banking; the Bash verifier scan exits zero with zero findings. Neither
-is native qualification. R46 terminal is executing at clean `1ba852f0` using independently
-reviewed profile SHA256 `83c0483c2d8311a07e21116e75b30ae90a3a68c2eee9362e90cfba00f730e69e`
-and unique version `terminal-20261010-1ba852f0-r46-hz3`. Workspace and latency lanes remain
-held and must be repinned to the final qualified source. No final pass
-has been observed. R30/R31/R33/R35/R37/R39/R41/R42/R45 never launched. Original acceptance,
+is native qualification. R46 at `1ba852f0` fails formatting before any compilation/tests:
+one latency-fixture assertion needs the native multiline wrap. Exact formatting-only `5cf4f859`
+applies that hunk without semantic changes. Completed R48 terminal at clean `5cf4f859` uses
+independently reviewed profile SHA256 `dce9037bb9575de55973bd263b7cadc3810b171ea86715fa90f1a0fab468f454`
+and unique version `terminal-20261010-5cf4f859-r48-hz3`. Strict workspace Clippy/check, 218
+runtime tests and 312 terminal tests pass. Executable E2E reports four passes and one failure:
+the normal PTY never observes checkpoint Applied within its unchanged 30-second wait. Total:
+534 passed, one failed, six existing ignored; typed failed/1, ten of fourteen gates complete;
+outer DSR failed/6. Smoke, manifests, analyzer and final strict consumer are not reached.
+All 233 proof files independently match their remote hashes at
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-5cf4f859-r48-hz3`;
+all eleven command/source/log identities also match. Workspace and latency lanes remain held.
+No final pass has been observed. R30/R31/R33/R35/R37/R39/R41/R42/R45/R47 never launched. Original acceptance,
 goldens, 16-ms budget, timeouts, gate rosters and dependencies remain unchanged.
+
+R48's normal failure now retains its 16,564-byte raw transcript. Exact parser readback observes
+canonical `CreateCheckpoint` Pending at byte prefix 10,209 and never Applied. The 52,057-byte
+checkpoint file exists, but creation writes it before storage acknowledgment/catalog insertion;
+its existence does not prove those later stages. The retained catalog is the pre-command empty
+response. Both five-second cleanup waits throw; equal termios is observed, while retained terminal
+bytes still have alternate screen active, cursor hidden and capture modes enabled. This failed
+journey does not qualify normal restoration, and independent review supports no observer repair.
+
+The separate R48 file-backed palette journey passes actual checkpoint Pending/Applied,
+three-tick registered MLP experiment completion with canonical `a056b77ad1761fdd`, six provider
+routes, byte inputs/resizes, and its own Shutdown Pending/Durable before alternate-screen leave.
+Finished-database readback observes that exact applied Shutdown command and durable archive.
+The producer-derived digest positives/negatives execute in this journey; the final strict
+consumer's wrong-contract controls remain unexecuted. All three actual fault PTYs positively
+present, observe their requested fault and restore; the renderer probe retains two unexplained
+long frames, approximately 10.3 and 9.0 seconds. No rendering performance is established.
+
+The positive TestBackend E2E eventually passes after unintended ten-second durable-authority
+lookup waits. A contemporaneous 16:47:35–36 UTC snapshot observes its actual storage thread
+in `D` state at `jbd2_log_wait_commit`, with owner/test threads waiting on futexes. The later
+privileged read arrives after those threads exit and retains missing-process errors; it does
+not supply their kernel stacks. Subsequent worker I/O pressure exceeds 80% and the journal
+thread remains stalled. This is an observed ext4 wait for that TestBackend storage thread,
+not a retrospective cause for the earlier normal PTY or all historical journal delays.
+Existing BR-ready `bd-j8o2` is claimed in progress for causal triage. No deadline increase,
+rerun-until-green, process termination or global worker tuning is a fix to this evidence.
+
+R50 on hz2 refuses before formatting or compilation because its SBH command points at the
+absent `/etc/sbh/config.toml`. Qualification is refused/2 and outer DSR failed/6, with zero tests.
+All five native files, four observer files and the launcher log are retained and hash-matched.
+The copied dependency seed independently matches all 2,460 actual payload files. The minimal
+R52 descriptor instead names the existing daemon's `/root/.config/sbh/config.toml`; configuration
+and sacred-catalog preimages are preserved before its narrowly scoped protection calls. Its
+other changes are unique run/profile identities. The original fourteen gates, bounded diagnostic
+observer and deadlines remain identical. R52 starts at 17:43:08 UTC on clean `5cf4f859`, profile
+SHA256 `a1bb4cb84144ad6779d904ef8e9e5c84e01ef0d9402162037c5a6daf4070b0e0`, native UUID
+`53c25559-c536-4334-9672-f69f2ec2d440`. At 17:45:42 its six initial guards pass; compilation
+and tests remain pending. This prerequisite correction establishes no causal fix for `bd-j8o2`.
+
+The `bd-azi3` browser source draft adds a pinned wasm-pack producer, standard module/type/WASM
+exports and license notices while retaining the original generated metadata and bytes in a
+fresh sibling directory. The existing Canvas smoke now serves the actual final package, checks
+loaded glue/WASM hashes, advancing DOM statistics and exported init/snapshot/tick/reset calls,
+then requires the same glue to refuse a corrupt WASM version. All three original injected DOM
+case bodies remain byte-identical (SHA256 `722b18237a0675aabc9e7ed14c5e83706bb06b24d8f19ec23b043e02b299f3f8`).
+Existing pinned ChromeDriver CI gains a separate actual-package Canvas smoke without another
+package manager; its original parity build/tests and divergent-fixture rejection remain. Only
+the WASM job's toolchain pin is aligned with the repository's `nightly-2026-08-31`. Independent
+review identified and corrected an unbounded process-context cleanup wait before banking.
+Pre-bank static UBS scans the two Bash files, JavaScript and exact extracted CI Python:
+exit 1, two critical heuristic hits, 21 warnings and 55 informational observations. Both
+critical hits describe the same explicit ChromeDriver executable environment value supplied
+by the preceding checksummed/pinned CI setup, passed as an argv list without a shell.
+Every finding is read and triaged; loopback fixture reads, fail-on-malformed JSON, guarded
+filenames, intentional DOM assertions and set-e-protected directory changes account for the
+remaining categories. No finding is suppressed. Python runs isolated so optimization environment
+variables cannot erase its assertions; descriptor fetch has an explicit 30-second abort.
+These are source changes: package build, real-browser positives/negatives and native/parity
+qualification at their final source remain pending. No Vite implementation is claimed.
 
 Checked items below name implementation or observations at their stated boundary. They do
 not close a containing Bead. This checklist answers the user's explicit request and retires
@@ -183,7 +251,29 @@ as a working list when its original owners are fully qualified; retained evidenc
   receipt-before-catalog ordering and failure-path raw/attributes retention.
 - [x] Review the complete R46 profile and launch its unchanged fourteen-gate lane on clean
   `1ba852f0`; retain the failed R44 evidence and keep subsequent lanes held.
-- [ ] Execute those repairs in fresh exact-source R46 terminal qualification; require all
+- [x] Read failed R46 formatting before tests, apply the exact native hunk at `5cf4f859`,
+  review the complete R48 profile and launch it with the original fourteen gates.
+- [x] Complete failed R48 at `5cf4f859`, independently match all 233 proof files and eleven
+  command/log identities, and preserve its 534 passes/one failure/six ignored.
+- [x] Observe the actual file-backed checkpoint/experiment/own Shutdown positive journey,
+  including exact terminal receipt order and finished-database readback at `5cf4f859`.
+- [x] Recover the failed normal raw/attributes boundary; independently reject Pending-only
+  output and distinguish equal termios from unobserved alternate/cursor restoration.
+- [x] Claim BR-ready `bd-j8o2` and retain the live TestBackend storage-thread ext4 wait.
+- [x] Review the complete R50 hz2 profile/observer and independently verify clean `5cf4f859`
+  and all 2,460 locked-cache payload files before launch at 17:30 UTC.
+- [x] Retain every R50 native/observer/launcher artifact: actual SBH configuration refusal,
+  native refused/2, outer failed/6, zero compiler commands/tests; no correctness proof exists.
+- [x] Correct the actual missing SBH configuration prerequisite while retaining real protection
+  and all original gates; preserve the refused R50 profile and prepare a new unique run.
+- [x] Independently read the complete minimal R52 descriptor and diff, retain protection preimages,
+  verify its clean source/unused outputs/healthy worker and launch the original terminal lane.
+- [ ] Collect and independently review the complete R52 proof and original acceptance observations.
+- [ ] Locate the outstanding normal checkpoint stage with contemporaneous process/task/file/
+  receipt evidence; keep file synchronization, storage acknowledgment and delivery distinct.
+- [ ] Diagnose the worker's real filesystem stalls without terminating unrelated work or
+  transferring a later test's cause to an earlier failure. Retain original waits and assertions.
+- [ ] Execute repairs in fresh exact-source terminal qualification; require all
   original fourteen gates and the strict artifact consumer, not an older passing subset.
 - [ ] Repin and complete the held workspace lane after terminal qualification; include the
   `276967c8` production death/refill fixture and core fault-feature tests.
@@ -233,6 +323,29 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [ ] Read back actual p50/p95/p99, zero request failures, SSE liveness and same-invocation
   baseline/loaded TPS; record typed results and source-bound raw evidence on `bd-g6wf`/`bd-134`.
 - [ ] Remediate any failed original latency/throughput bound in source before claiming acceptance.
+- [x] Claim original BR-ready `bd-azi3` after reading its full package/demo acceptance and comments.
+- [x] Implement one browser package producer with Cargo-derived name/version/types and exports;
+  retain the existing wasm-pack 0.15.0 and project toolchain pins.
+- [x] Implement the existing demo/smoke connection to the package's actual glue and WASM;
+  preserve the three DOM contract controls and give injected JavaScript no native-WASM credit.
+- [x] Implement actual package load/tick/Canvas stats/API assertions and corrupt-WASM rejection.
+- [x] Add actual-package CI feedback with the existing pinned ChromeDriver and Python tools;
+  retain all original parity and divergence probes and qualify owned-process cleanup in review.
+- [ ] Observe the real package loading, ticking and refreshing production Canvas statistics; reject
+  missing glue/WASM or incorrect export targets. Keep the existing native/WASM parity fixtures.
+- [ ] Execute the pinned DSR package/browser/parity lane and the exact new CI smoke at the new source;
+  retain raw output and the exact package identity. No Vite implementation is claimed.
+- [ ] Finish the current terminal/workspace/load qualification before changing the next
+  scientific consumer; preserve the same-source joined result and each failed run.
+- [ ] Complete original `bd-16g.2.10` accepted narrative logging at the committed live boundary,
+  retaining all eleven canonical fields without emitting speculative replay-page prefixes.
+  This is a useful source connection, but BR currently excludes it from its 35-item ready set
+  through parent `bd-16g.2` blocked on `bd-ji3a`; preserve those edges and inspect that order.
+- [ ] Capture and discriminate narrative dedupe, cooldown, ring wrap, materiality, rejected
+  input and non-cadence/disabled logging, including refused/retried offline replay pages.
+- [ ] Qualify real seeded boom/crash kinds within declared tick windows and a nonempty quiet
+  equilibrium, byte-identical repeats and suppression/duplication/changed-seed controls;
+  retain actual events, structured logs, configuration, command, exit and source identity.
 
 Simulator presentation callbacks remain explicit injected branch observations. They do not
 prove terminal serialization or runtime-selected degradation. Real service and file-backed
@@ -320,6 +433,66 @@ the required pre-commit timing. Subsequent latency and `1301ac49` source scans r
 their commits. The latter exits zero with zero critical, 177 warning and 67 informational
 findings, scoped to existing test assertions, expected errors, JSON accesses, serialized
 environment guards and required evidence output; no native credit or suppression is added.
+
+Bounded continuation inventory — 14:01–17:04 UTC. Actual seven commits are four ENABLERs
+(`1301ac49`, `276967c8`, `1ba852f0`, `5cf4f859`) and three PROCESS commits (`f70286ae`,
+`5e398546`, `eb65788e`); USER=0, UNKNOWN=0. No Bead closes. The observed product increment is
+qualification of the already implemented file-backed checkpoint/experiment/own Shutdown
+journey at R48; the complete frontend still fails qualification. A two-minute demo would show
+that positive journey at its exact revision, with the normal failure disclosed. Omitting process
+work changes no runtime outcome and loses requested failure/TODO provenance. The observer and
+formatting repairs have real R48 consumers; g6 replenishment remains unexecuted. The oldest open
+user goal is July 11's `bd-2z0`, the complete Evolution Lab; full Host/session restore is one
+important unfinished part while this narrower frontend is qualified. Existing agents produced
+native evidence and read-only source/worker diagnoses, no closes. No acceptance was moved to a
+follow-up or replaced with a plan edit. Verdict: DRIFTING; this block delivered no new feature.
+Correction: freeze new audit machinery, preserve R48 as failed, and finish original frontend
+qualification on a healthy existing worker with a bounded causal observer.
+
+Creation worksheet for that observer: running product code does not branch on it. Its consumer
+is the original `bd-2z0.6.8`/`bd-dkd9` verifier and current `bd-j8o2` diagnosis. It gates attribution
+of the observed checkpoint timeout, not an invented feature. R48 lost the failed child's live
+thread/syscall context despite retaining its Pending-only raw bytes. The observer retires when
+its exact qualification process ends; raw evidence remains. This run needs contemporaneous
+PID/start-time/thread/file identity; a bounded external `/proc` reader is the minimal control,
+and post-exit inspection cannot recover it. Current ready causal work and this observer serve
+the same observed blocker; another readiness report would add no capability. Verdict: minimal
+integrity control only, with original acceptance and all waits unchanged.
+
+Honesty inventory for those seven commits, R44/R46/R48 and current four-issue tracker diff:
+
+1. No (checked: complete test diffs); no assertion was skipped, ignored or deleted for a pass.
+2. No (checked: real owner/death/refill and PTY paths); synthetic parser controls remain labelled.
+3. No (checked: complete changed path lists); no golden changed.
+4. Yes: `1ba852f0` changes the strict digest consumer with its observation repair. The producer's
+   declared FNV-1a64 width, independent review and explicit admission/rejection split justify it;
+   no product feature accompanies that change. No timeouts, tolerances or rosters increase.
+5. No (checked: production consumers and fixture diff); replenishment uses ordinary world stages,
+   and requested speed is not claimed as achieved throughput.
+6. No (checked: actual commands/verdicts); R46's zero-test failure earns no test credit.
+7. No (checked: raw logs and command records); all current claims retain their executed boundary.
+8. No (checked: byte readback and fault wording); offline readback is not a new live execution.
+9. No (checked: current front section); R48's failure and missing normal restoration are explicit.
+10. No (checked: command/log exits and collector read errors); errors and stderr remain visible.
+11. No (checked: all 718 records); no closure, scope cut or new follow-up is used to claim success.
+12. No (checked: original acceptance and profile rosters); plan edits record outcomes, not new bars.
+13. No (checked: tracker/status diff); agents did not close their own or another agent's item.
+14. No (checked: dispatches); each names a positive, negative and scope that is not established.
+15. No (checked: complete source diffs, all 233 mirrored R48 files and eleven log identities);
+    reports remain claims until the underlying evidence is read.
+16. No (checked: agent outputs); incomplete positive product owners remain open.
+17. No (checked: source-versus-execution language); shared-source reviews count once.
+18. No (checked: original 14-gate/10-gate rosters and whole-run test totals); no denominator changes.
+19. Yes: repeated qualification and recovery consumed substantial effort without a new feature
+    in this window. The earlier static-scan timing and temporary-cleanup deviations remain
+    disclosed above; another passing subset must not stand in for the full original result.
+20. Strongest evidence is R48's actual file-backed terminal trace plus independently read finished
+    database, bound to `5cf4f859`; it proves that journey and cannot discharge the normal failure.
+
+Disposition: the gate correction's legitimate producer contract and unchanged reject split are
+recorded; full native strict-consumer qualification remains pending. Current failure/partial
+credit is disclosed in place. Gate self-weakening, proof-class inflation, rerun-until-green and
+machinery drift remain named countermeasures. No older-session CASS sweep is claimed here.
 
 This refresh supersedes the October 8 assessment where current source or later retained evidence
 differs. The October 9 implementation and failure records below remain intact. In particular,

@@ -1,22 +1,41 @@
 # ScriptBots Web Demo Harness
 
-Thin Canvas harness for exercising the `scriptbots-web` WASM bindings. The setup intentionally avoids a bundler—build the WASM package with `wasm-pack` and open the page via a static file server.
+Thin Canvas harness for exercising the `scriptbots-web` WASM bindings. The setup
+uses the produced browser package and a static server. It requires no bundler or
+package-manager installation.
 
 ## Build steps
 
 ```bash
-wasm-pack build crates/scriptbots-web --target web --out-dir web/pkg -- --locked
+# Run packaging inside the source-pinned DSR profile. This path and its
+# .wasm-pack sibling must be absent in the fresh checkout.
+bash scripts/package_wasm.sh "$PWD/crates/scriptbots-web/web/pkg"
 
-# Option A: Python http.server
+# Serve the demo and its produced package with the existing Python server.
 cd crates/scriptbots-web/web
 python -m http.server 8000
-
-# Option B: Node (requires npm)
-# npm install --global http-server
-# http-server
 ```
 
 Open `http://localhost:8000/` and the harness will auto-load the wasm module, display build information, and begin ticking.
+
+The producer pins wasm-pack 0.15.0, preserves its original generated output in
+the `.wasm-pack` sibling, and emits package metadata with module/type/WASM exports
+plus license notices. For an external DSR package directory, the existing browser
+smoke serves that exact directory at `/pkg`:
+
+```bash
+SCRIPTBOTS_WASM_PACKAGE_DIR=/absolute/fresh/scriptbots-web-package \
+  SCRIPTBOTS_WASM_PROOF_DIR=/absolute/existing/dsr-proof \
+  bash scripts/e2e_wasm_browser_stats_dom.sh
+```
+
+The smoke retains the three injected DOM controls and adds a real-package case
+with exact loaded-file hashes, progressing DOM metrics, public API calls and an
+isolated corrupt-WASM refusal. It uses already provisioned Bun/Playwright and
+retains raw logs. Packaging/browser acceptance is DSR-only and remains pending
+under bd-azi3 until actual qualification; this setup does not implement Vite.
+The pinned DSR profile can select its provisioned Chrome binary with
+`SCRIPTBOTS_CHROMIUM_EXECUTABLE`; the smoke records the actual browser version.
 
 ### Controls & metrics
 

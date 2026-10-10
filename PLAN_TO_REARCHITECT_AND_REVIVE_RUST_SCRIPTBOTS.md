@@ -40,7 +40,7 @@ Passing server runs do not close the intermittent storage/journal latency invest
 Original owners `bd-2z0.6.8`, `bd-dkd9` and `bd-2z0.5.13` remain open. The current
 execution checklist is the October 10 implementation section of
 `REALITY_CHECK_2026-09-03.md`; it distinguishes saved source from executed qualification.
-The live FrankenTUI runtime/providers are connected through `1ba852f0`. R28 at
+The live FrankenTUI runtime/providers are connected through `5cf4f859`. R28 at
 `f2b0748a3c4208f423d9d6bf894835ad0347f74b` passes strict workspace Clippy/check, 218 runtime
 and 309 terminal tests; all three actual fault PTYs select reduced detail, present, trigger
 their fault and restore. Its executable observer fails before app launch on Python builtin
@@ -65,9 +65,37 @@ Independently reviewed `1ba852f0` derives digest width from the declared Rust in
 and retains positive/malformed/wrong-contract discrimination in the observer and strict consumer.
 It also waits for actual checkpoint Applied before catalog polling and attempts buffered raw/
 actual termios retention even after cleanup exceptions. Original fourteen/ten gates, 16-ms
-budget, timeouts and acceptance remain; R46 terminal is executing at clean `1ba852f0`, workspace/latency stay
-held pending final-source qualification, and R41/R42/R45 never launched. No product credit
+budget, timeouts and acceptance remain. R46 fails one latency-fixture format hunk with zero
+compilation/tests; exact formatting-only `5cf4f859` applies its native suggestion. Completed R48
+passes strict Clippy/check, 218 runtime and 312 terminal tests; E2E has four passes and one
+failure. Its normal checkpoint remains Pending past 30 seconds; the retained file does not
+prove catalog acknowledgment. Raw bytes fail alternate/cursor restoration despite equal
+termios. The separate file-backed checkpoint/MLP experiment/own durable Shutdown journey
+passes, including finished-database readback. All 233 proof files independently hash-match.
+The positive TestBackend passes after real ten-second journal waits; its contemporaneous
+storage thread waits in `D` at `jbd2_log_wait_commit`. Later worker I/O pressure exceeds 80%,
+but that observation does not prove the earlier checkpoint's exact cause. Original ready
+`bd-j8o2` is in progress for causal triage. R48 remains typed failed/1, ten of fourteen steps;
+workspace/latency stay held pending qualification, and R41/R42/R45/R47 never launched. No product credit
 comes from test-observation maintenance.
+
+R50 on the fresh hz2 worker retains a prerequisite refusal at the same clean `5cf4f859`:
+the configured `/etc/sbh/config.toml` is absent, so actual SBH protection fails before any
+formatting, compiler or test command. Native qualification exits refused/2 and outer DSR
+fails/6. The original fourteen gates remain unchanged; no test or product result is added.
+Root and a second reader independently verify all 2,460 copied cache payload files. The
+bounded diagnostic observer exits naturally; the missing configuration needs a concrete
+protection-preserving fix before another unique run. Subsequent browser package work is a
+separate source draft and cannot inherit terminal qualification.
+
+Minimal R52 uses the daemon's existing `/root/.config/sbh/config.toml` and preserves config/
+sacred-catalog preimages plus every original gate/deadline. Its full descriptor and four-line
+diff are independently reviewed; actual clean `5cf4f859` launch is 17:43:08 UTC. Six initial
+guards pass at 17:45:42; compilation/tests and final acceptance remain pending. Browser package
+source separately connects fresh generated metadata/glue/WASM to the existing Canvas smoke
+and CI's pinned ChromeDriver, preserving original DOM controls and native/WASM parity probes.
+Actual package/browser execution is still required under `bd-azi3`; no Vite implementation,
+terminal pass or storage-delay causal fix is credited to this source draft.
 
 External resets at 07:38, 13:40 and 13:50 UTC were recovered by non-destructive fast-forward;
 source/tracker/proofs are retained outside the shared checkout and active edits now use an
@@ -3138,6 +3166,11 @@ resume, replay, and first-divergence verification remain separate open work in t
 ### Phase 5 — Web and External Agents (`P2`)
 
 #### 5.1 renderer-neutral web projection
+
+[Currently In Progress — `bd-azi3`, LilacElm, 2026-10-10: complete the browser package's
+exports/types and connect the existing Canvas smoke to actual generated glue/WASM. The existing
+DOM contract cases inject JavaScript and do not establish packaged-WASM loading. Keep existing
+parity fixtures and pinned tooling; no Vite integration or fresh browser pass is claimed.]
 
 - consume the same snapshot schema;
 - keep browser persistence separate;
