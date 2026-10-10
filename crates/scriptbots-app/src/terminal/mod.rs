@@ -557,9 +557,7 @@ impl Model for LiveTerminalModel<'_> {
         let mut app = self.app.borrow_mut();
         let mut widgets = self.widgets.borrow_mut();
         let area = Rect::new(0, 0, frame.width(), frame.height());
-        widgets
-            .resize(area)
-            .unwrap_or_else(|never| match never {});
+        widgets.resize(area).unwrap_or_else(|never| match never {});
         widgets
             .draw(|legacy| app.draw(legacy))
             .unwrap_or_else(|never| match never {});
