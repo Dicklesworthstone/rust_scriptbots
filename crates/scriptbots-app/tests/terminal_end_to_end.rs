@@ -143,6 +143,14 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
                 );
                 let evidence = &observation["data_provider_evidence"];
                 assert_eq!(evidence["checkpoint"]["new_catalog_entries"], 1);
+                let ordering = &evidence["checkpoint"]["receipt_stream_order"];
+                assert_eq!(ordering["observation_kind"], "decoded_terminal_cells");
+                assert!(
+                    ordering["pending"]["stream_byte_offset"]
+                        .as_u64()
+                        .zip(ordering["applied"]["stream_byte_offset"].as_u64())
+                        .is_some_and(|(pending, applied)| pending > 0 && pending < applied)
+                );
                 assert_eq!(evidence["experiment"]["status"], "completed");
                 assert_eq!(evidence["experiment"]["completed_runs"], 1);
                 assert_eq!(evidence["experiment"]["failed_runs"], 0);
@@ -218,6 +226,9 @@ class TerminalScreen:
         self.color_count = self.truecolor_count = self.attribute_count = 0
         self.pending = ''
         self.decoder = codecs.getincrementaldecoder('utf-8')('strict')
+        self.parsed_bytes = 0
+        self.fed_bytes = 0
+        self.stream_observer = None
 
     def text(self):
         return '\n'.join(''.join(row) for row in self.cells)
@@ -364,6 +375,7 @@ class TerminalScreen:
             raise AssertionError('unsupported CSI: ' + repr(parameters + final))
 
     def feed(self, chunk, final=False):
+        self.fed_bytes += len(chunk)
         data = self.pending + self.decoder.decode(chunk, final=final)
         self.pending = ''
         index = 0
@@ -382,7 +394,18 @@ class TerminalScreen:
                         end += 1
                     if end == len(data):
                         break
-                    self.csi(data[index + 2:end], data[end])
+                    parameters = data[index + 2:end]
+                    was_synchronized = self.synchronized
+                    self.csi(parameters, data[end])
+                    # Observe intermediate decoded cells even when one OS read
+                    # contains multiple updates. SGR reset is a stream boundary,
+                    # not proof of a completed or successfully flushed frame.
+                    if (self.stream_observer is not None and self.alternate
+                            and not self.synchronized
+                            and ((data[end] == 'm' and parameters in ('', '0'))
+                                 or was_synchronized)):
+                        self.stream_observer(self.text(), self.parsed_bytes
+                                             + len(data[:end + 1].encode('utf-8')))
                     index = end + 1
                     continue
                 if kind == ']':
@@ -419,9 +442,34 @@ class TerminalScreen:
             else:
                 self.put(character)
             index += 1
+        self.parsed_bytes += len(data[:index].encode('utf-8'))
         self.pending = data[index:]
+        assert (self.parsed_bytes + len(self.pending.encode('utf-8'))
+                + len(self.decoder.getstate()[0])) == self.fed_bytes, 'terminal byte accounting disagrees with decoded and pending input'
         assert len(self.pending) <= 8192, 'bounded partial terminal sequence exceeded'
         assert not final or not self.pending, 'incomplete terminal sequence at shutdown'
+
+class ReceiptStreamWatch:
+    # At most two observations; this reads actual decoded terminal cells and
+    # never supplies a Model acknowledgement or infers service admission time.
+    def __init__(self, pending, applied):
+        self.markers = {'pending': pending, 'applied': applied}
+        self.observations = {}
+
+    def observe(self, text, offset):
+        rows = [row.rstrip() for row in text.splitlines()]
+        for state, marker in self.markers.items():
+            matches = (marker in rows or (state == 'applied' and ' ' + marker in rows)
+                       or (state == 'pending' and marker + ' (reduced detail)' in rows))
+            if state not in self.observations and matches:
+                self.observations[state] = {'receipt': marker, 'stream_byte_offset': offset,
+                                            'terminal_text': text}
+
+    def verify(self):
+        assert set(self.observations) == set(self.markers), 'both exact terminal receipt identities must be observed'
+        pending, applied = self.observations['pending'], self.observations['applied']
+        assert 0 < pending['stream_byte_offset'] < applied['stream_byte_offset'], 'Pending must precede Applied in the terminal stream'
+        assert self.markers['applied'] not in pending['terminal_text'], 'first Pending observation already contained Applied'
 
 def diagnostics_footer_geometry(text, width, height):
     # Diagnostics rates and queue observations can vary while science is paused.
@@ -509,6 +557,39 @@ def check_parser_guards():
             rejected.append({'case': name, 'exception': type(error).__name__, 'reason': str(error)})
         else:
             raise AssertionError('parser accepted negative control: ' + name)
+    # Synthetic controls discriminate only the ordering observer. They do not
+    # count as live checkpoint or terminal lifecycle observations.
+    pending = '[PENDING] id=checkpoint-request-1 CreateCheckpoint'
+    applied = '[APPLIED] journal=unobserved CreateCheckpoint: applied id=checkpoint-request-1'
+    def receipt_update(marker):
+        return b'\x1b[2J\x1b[H' + marker.encode() + b'\x1b[0m'
+    prefix = b'\x1b[?1049h' + receipt_update('é界')
+    for synchronized in (False, True):
+        updates = [receipt_update(pending), receipt_update(' ' + applied)]
+        if synchronized:
+            updates = [b'\x1b[?2026h' + update + b'\x1b[?2026l' for update in updates]
+        combined = prefix + b''.join(updates)
+        for split in range(len(combined) + 1):
+            parser = TerminalScreen(120, 3)
+            watch = ReceiptStreamWatch(pending, applied)
+            parser.stream_observer = watch.observe
+            parser.feed(combined[:split])
+            parser.feed(combined[split:], final=True)
+            watch.verify()
+            assert parser.parsed_bytes == len(combined)
+            assert watch.observations['pending']['stream_byte_offset'] == len(prefix + updates[0])
+    for name, updates in [('missing-pending', [applied]), ('reversed-order', [applied, pending]),
+                          ('wrong-identity', [pending.replace('request-1', 'request-2'), applied])]:
+        parser = TerminalScreen(120, 3)
+        watch = ReceiptStreamWatch(pending, applied)
+        parser.stream_observer = watch.observe
+        parser.feed(b'\x1b[?1049h' + b''.join(receipt_update(marker) for marker in updates), final=True)
+        try:
+            watch.verify()
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError('receipt observer accepted negative control: ' + name)
     return {'synthetic_parser_controls': True, 'valid_stream_byte_length': len(stream),
             'accepted_cases': accepted, 'rejected_cases': rejected}
 
@@ -792,6 +873,10 @@ for profile in ('truecolor', 'no-color'):
                 catalog_before = json.loads(catalog_before_body)
                 assert catalog_before['total'] == len(catalog_before['items']) == 0, catalog_before
                 before_ids = {item['checkpoint_id'] for item in catalog_before['items']}
+                checkpoint_receipt = '[APPLIED] journal=unobserved CreateCheckpoint: applied id=checkpoint-request-1'
+                checkpoint_watch = ReceiptStreamWatch(
+                    '[PENDING] id=checkpoint-request-1 CreateCheckpoint', checkpoint_receipt)
+                screen.stream_observer = checkpoint_watch.observe
                 send_terminal_input(b'k')
                 def checkpoint_created():
                     body = request_api('/api/v1/checkpoints?limit=32')
@@ -815,11 +900,25 @@ for profile in ('truecolor', 'no-color'):
                 checkpoint_row = re.compile(r'^\s*>\s+' + re.escape(checkpoint['checkpoint_id'])
                                             + r'\s+' + str(checkpoint['tick']) + r'\s', re.MULTILINE)
                 checkpoint_status = 'Checkpoint ' + checkpoint['checkpoint_id'] + ' recorded at tick ' + str(checkpoint['tick'])
-                checkpoint_receipt = '[APPLIED] journal=unobserved CreateCheckpoint: applied id=checkpoint-request-1'
                 capture_provider('checkpoint-positive', replay_title,
                                  lambda text: checkpoint_row.search(text) is not None
                                  and checkpoint_receipt in text
-                                 and checkpoint_status in text)
+                                 and checkpoint_status in text
+                                 and 'applied' in checkpoint_watch.observations)
+                checkpoint_watch.verify()
+                screen.stream_observer = None
+                checkpoint_stream_order = {'observation_kind': 'decoded_terminal_cells'}
+                for state, receipt_observation in checkpoint_watch.observations.items():
+                    filename = 'checkpoint-' + state + '-stream-terminal.txt'
+                    text = receipt_observation['terminal_text'].encode()
+                    retain_response(filename, text)
+                    offset = receipt_observation['stream_byte_offset']
+                    readback = TerminalScreen(120, 36)
+                    readback.feed(raw[:offset], final=True)
+                    assert readback.text().encode() == text, 'retained stream offset does not reproduce its terminal cells'
+                    checkpoint_stream_order[state] = {
+                        'receipt': receipt_observation['receipt'], 'stream_byte_offset': offset,
+                        'terminal_file': filename, 'terminal_sha256': hashlib.sha256(text).hexdigest()}
 
                 # The existing runner seeds 16 registered MLP founders. Bound
                 # its actual three-tick arm without inventing a zero-founder API.
@@ -870,7 +969,8 @@ for profile in ('truecolor', 'no-color'):
                     'checkpoint': {'checkpoint_id': checkpoint['checkpoint_id'], 'tick': checkpoint['tick'],
                                    'byte_size': checkpoint['byte_size'], 'checksum_sha256': checkpoint['checksum_sha256'],
                                    'description': checkpoint['description'], 'new_catalog_entries': checkpoint_created.new_count,
-                                   'visible_application_receipt': checkpoint_receipt},
+                                   'visible_application_receipt': checkpoint_receipt,
+                                   'receipt_stream_order': checkpoint_stream_order},
                     'experiment': {'experiment_id': experiment_id, 'status': experiment['status'],
                                    'total_runs': experiment['total_runs'], 'completed_runs': experiment['completed_runs'],
                                    'failed_runs': experiment['failed_runs'], 'run': run},
