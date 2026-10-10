@@ -339,6 +339,9 @@ replay. Core persistence-disabled checkpoints alone do not complete this task.]
 control-plane latency acceptance through a clean, source-pinned native DSR profile after the
 terminal/workspace qualification releases the worker. Preserve 1,000 agents, 2× available-
 parallelism SSE clients, zero summary failures, p95 <50 ms and throughput degradation <10%.
+Test-only `276967c8` uses production minimum replenishment, a two-case death/refill control
+and actual healthy/unpaused requested ×8 playback observations. Native execution remains
+pending; neither an initial population nor requested ×8 establishes sustained measured load.
 Retain same-invocation baseline/loaded TPS, raw histograms and actual machine/source identities;
 no latency result has been observed yet.]
 

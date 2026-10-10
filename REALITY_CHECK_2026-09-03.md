@@ -10,7 +10,7 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-10
 
-The source changes through saved commit `1301ac49fe3e0af009cc00b056620ba4aad4472d`
+The source changes through saved commit `276967c8acf4428eca673b3fee0875bf8e4e58b4`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
 consumer finding below describes the initial audited source, not this newer candidate.
@@ -84,8 +84,9 @@ expects an obsolete intent row that carries a stale footer suffix. Independently
 test-only `1301ac49` corrects checkpoint and downstream Shutdown Pending expectations to complete
 authoritative summaries. Wrong identity/action/journal, missing Pending/identity, stale suffix
 and reversed order remain rejected. Original observer algorithms, deadlines, final durability,
-restoration and finished-database checks remain. R44 terminal/R45 workspace are being prepared;
-their execution remains pending. R30/R31/R33/R35/R37/R39/R41/R42 never launched. Original acceptance,
+restoration and finished-database checks remain. R44 terminal is executing at `1301ac49`;
+R45 workspace is held at the newer latency-fixture source `276967c8`. No final pass has been
+observed. R30/R31/R33/R35/R37/R39/R41/R42 never launched. Original acceptance,
 goldens, 16-ms budget, timeouts, gate rosters, dependencies and strict artifact consumer remain
 unchanged.
 
@@ -149,7 +150,8 @@ as a working list when its original owners are fully qualified; retained evidenc
   533 passes/two failures/six ignored without qualifying the full lane.
 - [x] Independently review actual failed Pending bytes and bank the exact canonical checkpoint
   and Shutdown observation correction at `1301ac49`, with discriminating negative controls.
-- [ ] Complete fresh R44 terminal/R45 workspace at `1301ac49`; prior subsets do not qualify it.
+- [ ] Complete fresh R44 terminal at `1301ac49` and R45 workspace at `276967c8`;
+  prior subsets do not qualify these sources.
 - [ ] Execute new checkpoint stream ordering and own Shutdown PTY/readback at the final SHA.
 - [ ] Observe current full/reduced final receipts, history saturation and ordinary sequencing.
 - [ ] Execute pending/checkpoint/cancellation/alternation/overlay guards at the final SHA.
@@ -177,8 +179,17 @@ as a working list when its original owners are fully qualified; retained evidenc
   output. Static scan exits zero (zero critical, 46 warning, 35 informational findings).
 - [ ] Qualify the harness repair that observes every actual HTTP/SSE attachment, complete events,
   errors and connection lifetime rather than silently counting requested clients.
+- [x] Independently review and bank `276967c8`: enable existing production minimum replenishment
+  at 1,000 agents, preserve actual healthy/unpaused requested ×8 playback and check all four
+  phase populations. The original 1-ns period and bounded catch-up remain; requested ×8 does
+  not establish eightfold observed throughput. Static scan exits zero with zero critical,
+  61 warning and 36 informational findings, triaged before the frozen source commit.
+- [ ] Execute the two-case production death/refill control: 1,000 actual deaths with minimum
+  zero must leave zero agents; minimum 1,000 must leave 1,000. A numerical latency pass after
+  population collapse does not qualify the original active-load premise.
 - [ ] Retain all raw latency samples, declared versus actual timing denominators, and observed
-  phase-boundary populations; do not claim initial population persists throughout the run.
+  phase-boundary populations, host health and playback; require the actual minimum at every
+  measured boundary and qualify replenishment through the real death/refill control.
 - [x] Review the minimal external source-pinned latency DSR profile, original-bound reader,
   typed manifest/verdict assertion and actual installed native machine/toolchain identity.
 - [ ] Retarget the held latency profile to the exact terminal/workspace-qualified source.
