@@ -88,7 +88,10 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
                 true
             );
             assert_eq!(probe["stale_cell_control"]["full_heading_preserved"], true);
-            assert_eq!(probe["stale_cell_control"]["parser_sequence_accepted"], true);
+            assert_eq!(
+                probe["stale_cell_control"]["parser_sequence_accepted"],
+                true
+            );
             assert_eq!(probe["stale_cell_control"]["rejected"], true);
             assert!(probe["stale_cell_control"]["observed_footer_geometry"].is_null());
         }
@@ -103,8 +106,14 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
                 }),
             Some(vec![Some("down"), Some("up")])
         );
-        assert_eq!(interaction["mouse_navigation"]["observed_route"], "Lineages");
-        assert_eq!(interaction["mouse_navigation"]["observed_sgr_capture"], true);
+        assert_eq!(
+            interaction["mouse_navigation"]["observed_route"],
+            "Lineages"
+        );
+        assert_eq!(
+            interaction["mouse_navigation"]["observed_sgr_capture"],
+            true
+        );
         assert!(
             observation["python_identity"]["executable_sha256"]
                 .as_str()
