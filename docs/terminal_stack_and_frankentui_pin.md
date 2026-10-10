@@ -53,7 +53,7 @@ This document specifies the exact terminal stack modernization and FrankenTUI de
 
 ## 3. Current runtime and qualification
 
-- Source through `cdab86ae` stages bounded commands and checkpoint requests until their
+- Source through `1301ac49` stages bounded commands and checkpoint requests until their
   complete pending identity is visible in a successfully presented frame. Skipped frames,
   insufficient frame size and write failure cannot authorize dispatch. Quit and shutdown
   cancel requests that have not reached the owner.
@@ -75,8 +75,10 @@ This document specifies the exact terminal stack modernization and FrankenTUI de
   218 runtime and 309 terminal tests, but three terminal assertions fail. Independent review
   corroborates their physical-wrap, active-Pending and journal-finality observation defects;
   test-only `cdab86ae` retains wrong-ID, corrupted-cell and unfinished-journal negatives.
-  R40 is executing; full native acceptance remains open. Injected simulator callbacks do not
-  prove terminal writes.
+  R40 passes all 312 terminal units and 218 runtime tests, then fails two executable checkpoint
+  Pending observations. Actual bytes corroborate stale intent literals; reviewed `1301ac49`
+  corrects checkpoint/Shutdown expectations with identity/order/durability guards unchanged.
+  Full native acceptance remains open. Injected simulator callbacks do not prove terminal writes.
 - Linux/unwind production-stack test children do not establish release-abort recovery or
   the separate full storm/TERM/locale/color/signal matrix under `bd-2z0.14.3.5.2`.
 - [The current reality check](../REALITY_CHECK_2026-09-03.md) keeps the granular TODO,

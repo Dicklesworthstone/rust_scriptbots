@@ -18,7 +18,7 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | `ftui` (frankentui) 0.5.0 | direct (`scriptbots-app`) | git rev `15cc6543f76b814394c590f9e7719dedd6684e4c` | `crossterm` | live Program/Model, shared science services and acknowledged receipts; retained Ratatui widgets; native acceptance open (`bd-2z0.6.8`, `bd-dkd9`) |
 | everything else (fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
 
-Terminal source reconciliation, **2026-10-10**, through `cdab86ae`: the actual interactive
+Terminal source reconciliation, **2026-10-10**, through `1301ac49`: the actual interactive
 consumer is FrankenTUI's `Program`; the existing Ratatui widgets render into its frames.
 Its Model connects the real lineage, arena, experiment, replay, environment and diagnostic
 providers. Pending requests require their own successful presentation before dispatch;
@@ -30,6 +30,9 @@ R28 at `f2b0748a` passes 309 terminal tests and all three actual fault PTYs, but
 observer fails before app launch. R32/R36 formatting and R34 Clippy failures run zero tests.
 R38 passes strict workspace Clippy/check and 527 tests but fails three terminal observations;
 their independent review and test-only correction are recorded with the unchanged negative guards.
+R40 at that correction passes 533 tests but fails two executable checkpoint Pending observations.
+Actual serialized bytes corroborate stale intent literals; reviewed `1301ac49` corrects checkpoint
+and Shutdown expectations while preserving exact identity, ordering and final durability.
 The current repairs require fresh exact-source acceptance; simulator callbacks are branch
 fixtures and partial terminal proof does not qualify the dependency migration.
 [The reality check](../REALITY_CHECK_2026-09-03.md)

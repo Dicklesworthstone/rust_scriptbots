@@ -10,7 +10,7 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-10
 
-The source changes through saved commit `cdab86aefa3ddb705727805a18dde5ee502f414f`
+The source changes through saved commit `1301ac49fe3e0af009cc00b056620ba4aad4472d`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
 consumer finding below describes the initial audited source, not this newer candidate.
@@ -70,8 +70,22 @@ checks the exact physical footer row window and candidate payload, rejects a cor
 checks the complete active Pending receipt, and uses the existing final-journal helper with its
 unchanged deadline. Correct wrapped/active/eventually finalized observations are admitted;
 wrong IDs/status, corrupted cells, incomplete frames and unfinished journals remain rejected.
-No product capability is credited to this correction. Pinned R40 terminal is executing at that
-source; R41 workspace remains held. R30/R31/R33/R35/R37/R39 never launched. Original acceptance,
+No product capability is credited to this correction. Completed R40 at `cdab86ae` passes strict
+workspace Clippy/check, 218 runtime tests and all 312 terminal units, including the three corrected
+assertions and actual file-backed receipt tests. All three actual fault PTYs positively present
+and restore. Its executable integration reports three passes and two failures, both at the
+checkpoint Pending observation before experiments, resize or own Shutdown. Total: 533 passed,
+two failed, six existing ignored; typed failed/1, ten of fourteen steps complete. All 157 proof
+files independently match remote/local hashes at
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-cdab86ae-r40-hz3`.
+
+Actual retained bytes contain the complete canonical Pending checkpoint summary; the probe
+expects an obsolete intent row that carries a stale footer suffix. Independently reviewed
+test-only `1301ac49` corrects checkpoint and downstream Shutdown Pending expectations to complete
+authoritative summaries. Wrong identity/action/journal, missing Pending/identity, stale suffix
+and reversed order remain rejected. Original observer algorithms, deadlines, final durability,
+restoration and finished-database checks remain. R44 terminal/R45 workspace are being prepared;
+their execution remains pending. R30/R31/R33/R35/R37/R39/R41/R42 never launched. Original acceptance,
 goldens, 16-ms budget, timeouts, gate rosters, dependencies and strict artifact consumer remain
 unchanged.
 
@@ -131,7 +145,11 @@ as a working list when its original owners are fully qualified; retained evidenc
   67 R38 proof-file hashes and preserve each failed assertion and fault observation.
 - [x] Independently review the three observation repairs and publish their admission/rejection
   split without changing production code, timeouts or acceptance.
-- [ ] Complete R40 at `cdab86ae`; source review and partial R38 successes do not qualify it.
+- [x] Complete failed R40 at `cdab86ae`, retain all 157 matching proof files and record its
+  533 passes/two failures/six ignored without qualifying the full lane.
+- [x] Independently review actual failed Pending bytes and bank the exact canonical checkpoint
+  and Shutdown observation correction at `1301ac49`, with discriminating negative controls.
+- [ ] Complete fresh R44 terminal/R45 workspace at `1301ac49`; prior subsets do not qualify it.
 - [ ] Execute new checkpoint stream ordering and own Shutdown PTY/readback at the final SHA.
 - [ ] Observe current full/reduced final receipts, history saturation and ordinary sequencing.
 - [ ] Execute pending/checkpoint/cancellation/alternation/overlay guards at the final SHA.
@@ -161,7 +179,9 @@ as a working list when its original owners are fully qualified; retained evidenc
   errors and connection lifetime rather than silently counting requested clients.
 - [ ] Retain all raw latency samples, declared versus actual timing denominators, and observed
   phase-boundary populations; do not claim initial population persists throughout the run.
-- [ ] Review its minimal external clean-main DSR profile and actual native machine identity.
+- [x] Review the minimal external source-pinned latency DSR profile, original-bound reader,
+  typed manifest/verdict assertion and actual installed native machine/toolchain identity.
+- [ ] Retarget the held latency profile to the exact terminal/workspace-qualified source.
 - [ ] Execute the exact ignored 1,000-agent test after terminal/workspace qualification releases
   the worker; retain the original 2× available-parallelism SSE load and unchanged bounds.
 - [ ] Read back actual p50/p95/p99, zero request failures, SSE liveness and same-invocation
@@ -236,7 +256,7 @@ with retained-cleanup execution as the countermeasure. Proof-class inflation, go
 gate self-weakening and machinery drift remain forbidden. No older-session CASS search is claimed
 for this bounded inventory. This worksheet remains inside the requested report, not a new system.
 
-Later execution note: R36 and R38 failed as recorded above; `cdab86ae` is test-observation
+Later execution note: R36, R38 and R40 failed as recorded above; `cdab86ae`/`1301ac49` are test-observation
 maintenance, independently reviewed before a fresh unchanged native lane. The latest static
 scan of terminal and latency source exits zero with zero critical, 2,379 warning and 572
 informational findings; compiler phases were explicitly not evaluated. The latency changes
@@ -249,6 +269,11 @@ findings, all read and triaged as test assertions/expected panics, guarded index
 histogram output and existing scoped conversions; no suppression was added. Completed SSE records
 are counted, not certified as arbitrary valid UTF8/JSON payloads. Individual during-load event
 counts may be zero inside the unchanged request window and remain visible in raw output.
+The `cdab86ae` static scan was mistakenly run after banking its commit; it does not satisfy
+the required pre-commit timing. Subsequent latency and `1301ac49` source scans ran before
+their commits. The latter exits zero with zero critical, 177 warning and 67 informational
+findings, scoped to existing test assertions, expected errors, JSON accesses, serialized
+environment guards and required evidence output; no native credit or suppression is added.
 
 This refresh supersedes the October 8 assessment where current source or later retained evidence
 differs. The October 9 implementation and failure records below remain intact. In particular,

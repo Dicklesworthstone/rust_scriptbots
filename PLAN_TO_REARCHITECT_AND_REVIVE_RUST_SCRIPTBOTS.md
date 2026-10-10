@@ -40,7 +40,7 @@ Passing server runs do not close the intermittent storage/journal latency invest
 Original owners `bd-2z0.6.8`, `bd-dkd9` and `bd-2z0.5.13` remain open. The current
 execution checklist is the October 10 implementation section of
 `REALITY_CHECK_2026-09-03.md`; it distinguishes saved source from executed qualification.
-The live FrankenTUI runtime/providers are connected through `cdab86ae`. R28 at
+The live FrankenTUI runtime/providers are connected through `1301ac49`. R28 at
 `f2b0748a3c4208f423d9d6bf894835ad0347f74b` passes strict workspace Clippy/check, 218 runtime
 and 309 terminal tests; all three actual fault PTYs select reduced detail, present, trigger
 their fault and restore. Its executable observer fails before app launch on Python builtin
@@ -52,8 +52,13 @@ formatting repair produces `264be78f`. R38 passes strict workspace Clippy/check 
 tests but fails three terminal assertions (309 pass); all three fault PTYs present, trigger and
 restore. Its complete raw proof is retained. Independently reviewed test-only `cdab86ae` corrects
 physical wrapping, authoritative Pending content and final journal observation; corrupted output,
-wrong IDs and incomplete journal negatives remain. R40 is executing with the original fourteen
-gates, 16-ms budget and strict consumer; R41 workspace is held. Final-source qualification is
+wrong IDs and incomplete journal negatives remain. R40 passes strict Clippy/check, 218 runtime
+and all 312 terminal units, then fails two executable checkpoint Pending observations (three
+integration passes). All 157 proof files are retained and independently hash-matched. Actual
+bytes corroborate the obsolete intent-literal defect; test-only `1301ac49` matches canonical
+Pending summaries for checkpoint and Shutdown while retaining strict identity/order/durability
+guards. R44 terminal/R45 workspace are being prepared with the original fourteen/ten gates,
+16-ms budget and strict consumer; R41/R42 were never launched. Final-source qualification is
 pending, with no product credit from test-observation maintenance.
 
 External resets at 07:38, 13:40 and 13:50 UTC were recovered by non-destructive fast-forward;
