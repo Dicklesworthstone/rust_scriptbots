@@ -101,6 +101,7 @@ for profile in ('truecolor', 'no-color'):
     environment.update(SCRIPTBOTS_MODE='terminal', SCRIPTBOTS_TERMINAL_HEADLESS='0',
                        SCRIPTBOTS_CONTROL_REST_ENABLED='1', SCRIPTBOTS_CONTROL_MCP='disabled',
                        SCRIPTBOTS_CONTROL_REST_ADDR='127.0.0.1:' + str(port),
+                       SCRIPTBOTS_TERMINAL_LOG=str(directory / 'runtime.log'),
                        RUST_LOG='scriptbots::terminal=info', TERM='xterm-256color')
     if profile == 'no-color':
         environment['NO_COLOR'] = '1'
@@ -191,7 +192,8 @@ for profile in ('truecolor', 'no-color'):
                 json.dump({'initial': repr(initial), 'final': repr(termios.tcgetattr(slave))}, attributes)
             os.close(master)
             os.close(slave)
-    lifecycle = (directory / 'stderr.log').read_text(errors='replace')
+    lifecycle_bytes = (directory / 'runtime.log').read_bytes()
+    lifecycle = lifecycle_bytes.decode(errors='replace')
     finalized = 'terminal lifecycle finalized' in lifecycle and 'frankentui' in lifecycle
     assert finalized, 'real FrankenTUI shutdown callback was not observed'
     print(json.dumps({'schema': 'scriptbots.live-tui-pty.v1', 'source_commit': source,
@@ -201,6 +203,7 @@ for profile in ('truecolor', 'no-color'):
                       'terminal_attributes_restored': restored,
                       'alternate_screen_restored': alternate_restored,
                       'frankentui_shutdown_observed': finalized,
+                      'runtime_log_sha256': hashlib.sha256(lifecycle_bytes).hexdigest(),
                       'transcript_sha256': hashlib.sha256(raw).hexdigest(),
                       'artifact_directory': str(directory)}), flush=True)
 "#;

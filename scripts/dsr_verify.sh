@@ -13,7 +13,7 @@ verify_evidence() {
     local required=(formatting fsqlite-pin franken-licenses asupersync-universe wasm-graph)
     case "$lane" in
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
-        terminal) required+=(workspace-check workspace-clippy terminal-unit-tests terminal-end-to-end-tests terminal-smoke-tests) ;;
+        terminal) required+=(workspace-check workspace-clippy terminal-runtime-tests terminal-unit-tests terminal-end-to-end-tests terminal-smoke-tests) ;;
         connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests sensing-manifest-tests manifest-storage-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
         tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli) ;;
         tournament-smoke-and-analytics) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli analytics-pipeline) ;;
@@ -74,11 +74,14 @@ verify_evidence() {
                 and (.observed_science_routes | sort) == ([.observed_screenshot_routes[].route] | sort))
         ' "$directory/terminal-end-to-end-tests.log" >/dev/null || refuse "missing source-bound live terminal and screenshot observations"
         while IFS= read -r record; do
-            local artifact_directory transcript_hash screenshot_hash index
+            local artifact_directory transcript_hash runtime_hash screenshot_hash index
             artifact_directory=$(jq -er '.artifact_directory' <<< "$record") || refuse "missing PTY artifact path"
             [[ "$artifact_directory" = /* && -d "$artifact_directory" ]] || refuse "missing PTY artifacts"
             transcript_hash=$(jq -er '.transcript_sha256' <<< "$record") || refuse "missing PTY transcript identity"
             [[ $(sha256sum "$artifact_directory/terminal.raw" | cut -d ' ' -f 1) == "$transcript_hash" ]] || refuse "changed PTY transcript"
+            runtime_hash=$(jq -er '.runtime_log_sha256' <<< "$record") || refuse "missing runtime log identity"
+            [[ $(sha256sum "$artifact_directory/runtime.log" | cut -d ' ' -f 1) == "$runtime_hash" ]] || refuse "changed runtime lifecycle log"
+            rg -q 'terminal lifecycle finalized' "$artifact_directory/runtime.log" || refuse "missing actual runtime shutdown callback"
             index=4
             while IFS= read -r screenshot_hash; do
                 [[ $(sha256sum "$artifact_directory/screen-$index.txt" | cut -d ' ' -f 1) == "$screenshot_hash" ]] || refuse "changed presented screenshot"
@@ -308,6 +311,7 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
     terminal)
         run_step workspace-check check cargo check --locked --workspace --all-targets
         run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
+        run_step terminal-runtime-tests test cargo test --locked -p scriptbots-runtime --lib channel::tests:: -- --nocapture
         run_step terminal-unit-tests test cargo test --locked -p scriptbots-app --lib terminal:: -- --nocapture
         run_step terminal-end-to-end-tests test cargo test --locked -p scriptbots-app --test terminal_end_to_end -- --nocapture
         run_step terminal-smoke-tests test cargo test --locked -p scriptbots-app --test terminal_smoke -- --nocapture

@@ -297,6 +297,7 @@ pub struct ChannelHostPort {
     events: EventHub,
     session_id: HostSessionId,
     submit_deadline: Duration,
+    caller_deadline: Option<Instant>,
 }
 
 impl Clone for ChannelHostPort {
@@ -309,6 +310,7 @@ impl Clone for ChannelHostPort {
             events: self.events.clone(),
             session_id: self.session_id,
             submit_deadline: self.submit_deadline,
+            caller_deadline: self.caller_deadline,
         }
     }
 }
@@ -335,6 +337,9 @@ impl ChannelHostPort {
     }
 
     fn bounded_before(&self, deadline: Instant) -> Result<Self, HostAccessError> {
+        let deadline = self
+            .caller_deadline
+            .map_or(deadline, |bound| bound.min(deadline));
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(Self::protocol_violation(
@@ -343,7 +348,15 @@ impl ChannelHostPort {
         }
         let mut bounded = self.clone();
         bounded.submit_deadline = bounded.submit_deadline.min(remaining);
+        bounded.caller_deadline = Some(deadline);
         Ok(bounded)
+    }
+
+    fn remaining_budget(&self, started: Instant) -> Duration {
+        let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+        self.caller_deadline.map_or(remaining, |deadline| {
+            remaining.min(deadline.saturating_duration_since(Instant::now()))
+        })
     }
 
     /// Clone the lock-free publication reader without retaining command ingress.
@@ -360,7 +373,7 @@ impl ChannelHostPort {
         let (reply, receiver) = std::sync::mpsc::channel();
         self.enqueue(message(reply), started)?;
         receiver
-            .recv_timeout(self.submit_deadline.saturating_sub(started.elapsed()))
+            .recv_timeout(self.remaining_budget(started))
             .map_err(|error| match error {
                 RecvTimeoutError::Timeout => Self::protocol_violation(format!(
                     "owner inspection reply exceeded {:?}",
@@ -386,6 +399,15 @@ impl ChannelHostPort {
         })
     }
 
+    /// Inspect brains within the caller's remaining UI budget.
+    pub fn project_brain_before(
+        &self,
+        request: &BrainProjectionRequest,
+        deadline: Instant,
+    ) -> Result<BrainProjection, HostAccessError> {
+        self.bounded_before(deadline)?.project_brain(request)
+    }
+
     /// Read one living agent's inspector detail; a deceased UID returns `None`.
     pub fn inspect_agent(
         &self,
@@ -402,6 +424,16 @@ impl ChannelHostPort {
             max_contributors,
             reply,
         })
+    }
+
+    /// Read agent detail within the caller's remaining UI budget.
+    pub fn inspect_agent_before(
+        &self,
+        uid: AgentUid,
+        max_contributors: usize,
+        deadline: Instant,
+    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        self.bounded_before(deadline)?.inspect_agent(uid, max_contributors)
     }
 
     /// Query the owner's debug rows, preserving the query's filters and limit.
@@ -472,7 +504,7 @@ impl ChannelHostPort {
         const RETRY_PARK: Duration = Duration::from_millis(2);
         let mut pending = message;
         loop {
-            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+            let remaining = self.remaining_budget(started);
             if remaining.is_zero() {
                 return Err(Self::protocol_violation(format!(
                     "channel host did not drain ingress within {:?}",
@@ -521,7 +553,7 @@ impl HostPort for ChannelHostPort {
                 }
                 return Err(error);
             }
-            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+            let remaining = self.remaining_budget(started);
             let result = reply_rx
                 .recv_timeout(remaining)
                 .map_err(|error| match error {
@@ -543,7 +575,7 @@ impl HostPort for ChannelHostPort {
                     ..
                 }) => {
                     retrying_authority = true;
-                    let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+                    let remaining = self.remaining_budget(started);
                     if remaining.is_zero() {
                         return Err(Self::command_authority_timeout(
                             command_id,
@@ -585,7 +617,7 @@ impl HostPort for ChannelHostPort {
                 }
                 return Err(error);
             }
-            let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+            let remaining = self.remaining_budget(started);
             let result = reply_rx
                 .recv_timeout(remaining)
                 .map_err(|error| match error {
@@ -602,7 +634,7 @@ impl HostPort for ChannelHostPort {
                         | crate::CommandAuthorityLookupFailure::Capacity { .. },
                     ..
                 }) => {
-                    let remaining = self.submit_deadline.saturating_sub(started.elapsed());
+                    let remaining = self.remaining_budget(started);
                     if remaining.is_zero() {
                         return Err(Self::command_authority_timeout(
                             command_id,
@@ -763,6 +795,7 @@ impl ChannelHostDriver {
             events: host.event_hub(),
             session_id: local.session_id(),
             submit_deadline: options.submit_deadline,
+            caller_deadline: None,
         };
         let last_protocol_event = ProtocolEventSequence::new(0);
         let driver = Self {
@@ -1365,7 +1398,7 @@ mod tests {
         let snapshot = port.snapshot_hub().latest();
         let before = port.scientific_digest_v1().expect("digest before reads");
         let detail = port
-            .inspect_agent(uid, 0)
+            .inspect_agent_before(uid, 0, Instant::now() + Duration::from_secs(1))
             .expect("owner detail")
             .expect("living subject");
         assert_eq!(detail.uid, uid);
@@ -2529,9 +2562,79 @@ mod tests {
             Err(HostAccessError::ProtocolViolation { .. })
         ));
         assert!(matches!(
+            port.inspect_agent_before(AgentUid(1), 0, expired),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        let request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(613),
+            crate::ProjectionRequestRevision::new(1),
+            AgentUid(1),
+        );
+        assert!(matches!(
+            port.project_brain_before(&request, expired),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
             driver.receiver.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn stalled_owner_inspections_respect_caller_budget() {
+        let (driver, port) = ChannelHostDriver::new(
+            test_host(true),
+            ChannelHostOptions {
+                submit_deadline: Duration::from_secs(60),
+                ..fast_options()
+            },
+        )
+        .expect("driver");
+        let started = Instant::now();
+        assert!(matches!(
+            port.inspect_agent_before(AgentUid(1), 0, started + Duration::from_millis(20)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            driver.receiver.try_recv().expect("actual inspector ingress"),
+            IngressMessage::AgentInspection { .. }
+        ));
+        let request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(614),
+            crate::ProjectionRequestRevision::new(1),
+            AgentUid(1),
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            port.project_brain_before(&request, started + Duration::from_millis(20)),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            driver.receiver.try_recv().expect("actual brain ingress"),
+            IngressMessage::BrainProjection { .. }
+        ));
+    }
+
+    #[test]
+    fn bounded_clone_cannot_renew_an_elapsed_caller_deadline() {
+        let (driver, port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("driver");
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let bounded = port.bounded_before(deadline).expect("initial caller budget");
+        while Instant::now() < deadline {
+            std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        assert!(matches!(
+            bounded.inspect_agent(AgentUid(1), 0),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(port.caller_deadline.is_none());
     }
 
     #[test]

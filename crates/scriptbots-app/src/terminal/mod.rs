@@ -115,6 +115,8 @@ const UI_TICK_MILLIS: u64 = 100;
 const DEFAULT_HEADLESS_FRAMES: usize = 12;
 const MAX_HEADLESS_FRAMES: usize = 360;
 const EVENT_LOG_CAPACITY: usize = 16;
+/// Exact envelopes retained while transport cannot establish admission.
+const UNRESOLVED_COMMAND_CAPACITY: usize = 32;
 /// Bounded contributor list requested from `WorldState::explain_sensors`
 /// (bd-16g.4.2); the panel is an on-demand probe, never a population scan.
 const PROBE_MAX_CONTRIBUTORS: usize = 12;
@@ -313,7 +315,7 @@ impl TerminalRenderer {
         guard.mark_cursor_hidden();
         let config = ProgramConfig {
             screen_mode: ftui::runtime::ScreenMode::AltScreen,
-            poll_timeout: self.draw_interval,
+            poll_timeout: self.tick_interval.min(self.draw_interval),
             frame_timing: Some(FrameTimingConfig::new(model.presentation.clone())),
             ..ProgramConfig::default().with_mouse()
         };
@@ -457,12 +459,12 @@ impl Model for LiveTerminalModel<'_> {
         let result = {
             let mut app = self.app.borrow_mut();
             app.frankentui.init();
-            app.interactive_runtime_finished().and_then(|finished| {
+            app.interactive_runtime_finished().map(|finished| {
                 if finished {
-                    Ok(true)
+                    true
                 } else {
                     app.submit_simulation_command(ControlCommand::Resume);
-                    Ok(false)
+                    false
                 }
             })
         };
@@ -584,8 +586,7 @@ impl Model for LiveTerminalModel<'_> {
     fn on_error(&mut self, error: &str) -> Cmd<Self::Message> {
         self.presentation.candidate.store(None);
         self.presentation.completed.store(None);
-        // Never leave a failed renderer's candidate exposed as a presented frame.
-        self.app.borrow().presented_frame.store(None);
+        // Failed candidates never replace the last observed successful presentation.
         self.fail(anyhow!("FrankenTUI runtime error: {error}"))
     }
 
@@ -1226,6 +1227,18 @@ pub enum TerminalCommandError {
     Host(#[from] HostAccessError),
 }
 
+#[derive(Clone)]
+struct UnresolvedTerminalCommand {
+    envelope: CommandEnvelope,
+    action: String,
+}
+
+struct PendingTerminalSelection {
+    command_id: CommandId,
+    update: SelectionUpdate,
+    applied: Option<scriptbots_runtime::AppliedCommand>,
+}
+
 struct TerminalApp<'a> {
     host: ChannelHostPort,
     client: HostClient<ChannelHostPort>,
@@ -1234,11 +1247,12 @@ struct TerminalApp<'a> {
     protocol_cursor: ProtocolEventCursor,
     command_namespace: u64,
     command_sequence: u64,
+    unresolved_commands: VecDeque<UnresolvedTerminalCommand>,
+    pending_selection: Option<PendingTerminalSelection>,
     retained_render: Arc<RenderSnapshot>,
     analytics_provider: SharedAnalytics,
     control: &'a ControlRuntime,
     scenario: Arc<ScenarioIdentityV0>,
-    tick_interval: Duration,
     draw_interval: Duration,
     speed_multiplier: f32,
     paused: bool,
@@ -1299,6 +1313,7 @@ struct TerminalApp<'a> {
     expanded_user_override: bool,
     // Brain view controls
     focused_agent_cursor: usize,
+    manual_focus_cleared: bool,
     activation_layer_index: usize,
     activation_row_offset: usize,
     focus_lock: FocusLockMode,
@@ -1453,11 +1468,12 @@ impl<'a> TerminalApp<'a> {
             protocol_cursor: ProtocolEventCursor::beginning(session_id),
             command_namespace,
             command_sequence: 0,
+            unresolved_commands: VecDeque::with_capacity(UNRESOLVED_COMMAND_CAPACITY),
+            pending_selection: None,
             retained_render,
             analytics_provider: ctx.analytics.clone(),
             control: ctx.control_runtime,
             scenario: Arc::clone(&ctx.scenario),
-            tick_interval: renderer.tick_interval,
             draw_interval: renderer.draw_interval,
             speed_multiplier: 1.0,
             paused: false,
@@ -1491,6 +1507,7 @@ impl<'a> TerminalApp<'a> {
             expanded: false,
             expanded_user_override: false,
             focused_agent_cursor: 0,
+            manual_focus_cleared: false,
             activation_layer_index: 0,
             activation_row_offset: 0,
             focus_lock: FocusLockMode::Manual,
@@ -1732,6 +1749,24 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn submit_with_visible_receipt(&mut self, command: ControlCommand) -> Option<String> {
+        self.submit_with_visible_receipt_before(
+            command,
+            Instant::now() + Duration::from_millis(5),
+        )
+    }
+
+    fn submit_with_visible_receipt_before(
+        &mut self,
+        command: ControlCommand,
+        deadline: Instant,
+    ) -> Option<String> {
+        if self.unresolved_commands.len() == UNRESOLVED_COMMAND_CAPACITY {
+            let message = "Command not submitted: unresolved queue is full; Ctrl+R retries the oldest exact command";
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::SetStatus(message.into()));
+            self.push_toast(message);
+            return None;
+        }
         let action = match &command {
             ControlCommand::UpdateConfig(_) => "UpdateConfig",
             ControlCommand::UpdateSelection(_) => "UpdateSelection",
@@ -1774,14 +1809,32 @@ impl<'a> TerminalApp<'a> {
             ));
         let envelope = CommandEnvelope::new(id, host_command)
             .expecting_control_revision(self.retained_render.revisions.control);
-        // A blocked owner must not freeze input. A lost reply is unresolved,
-        // not rejection: lookup keeps this exact identity without resubmitting.
-        let result = self
-            .client
-            .port()
-            .submit_before(envelope, Instant::now() + Duration::from_millis(5));
+        if let HostCommand::UpdateSelection(update) = &envelope.command {
+            self.pending_selection = Some(PendingTerminalSelection {
+                command_id: id,
+                update: update.clone(),
+                applied: None,
+            });
+        }
+        self.submit_visible_envelope(envelope, action, deadline)
+    }
+
+    fn submit_visible_envelope(
+        &mut self,
+        envelope: CommandEnvelope,
+        action: String,
+        deadline: Instant,
+    ) -> Option<String> {
+        let id = envelope.command_id;
+        // The channel error does not always identify whether enqueue or its
+        // reply failed. Keep the canonical guard and payload until authority
+        // answers, and retry only when the user explicitly requests it.
+        let result = self.host.submit_before(envelope.clone(), deadline);
         match result {
             Ok(status) => {
+                self.unresolved_commands
+                    .retain(|pending| pending.envelope.command_id != id);
+                self.observe_selection_status(&status);
                 let accepted = matches!(
                     status.application(),
                     ApplicationState::Admitted | ApplicationState::Applied(_)
@@ -1799,12 +1852,131 @@ impl<'a> TerminalApp<'a> {
                 accepted.then(|| id.to_string())
             }
             Err(error) => {
-                receipt.action = format!("{action}: admission outcome unresolved ({error})");
+                let definitely_refused = matches!(
+                    error,
+                    HostAccessError::CommandIdCollision { .. }
+                        | HostAccessError::CommandEvidenceBackpressure { .. }
+                        | HostAccessError::CommandEvidenceClosed { .. }
+                );
+                let mut receipt = frankentui_shell::CommandReceiptEntry {
+                    command_id: id.to_string(),
+                    action: action.clone(),
+                    status: frankentui_shell::ReceiptStatusKind::Pending,
+                    journal_state: None,
+                    control_revision: self.retained_render.revisions.control.get(),
+                    scientific_revision: self.retained_render.revisions.scientific.get(),
+                    timestamp_tick: self.snapshot.tick,
+                };
+                if definitely_refused {
+                    self.unresolved_commands
+                        .retain(|pending| pending.envelope.command_id != id);
+                    if self
+                        .pending_selection
+                        .as_ref()
+                        .is_some_and(|pending| pending.command_id == id)
+                    {
+                        self.pending_selection = None;
+                    }
+                    receipt.status = frankentui_shell::ReceiptStatusKind::Failed(format!(
+                        "Submission refused: {error}"
+                    ));
+                } else if !self
+                    .unresolved_commands
+                    .iter()
+                    .any(|pending| pending.envelope.command_id == id)
+                {
+                    self.unresolved_commands
+                        .push_back(UnresolvedTerminalCommand { envelope, action });
+                }
                 self.frankentui
                     .update(frankentui_shell::ShellMessage::CommandReceipt(receipt));
-                Some(id.to_string())
+                if definitely_refused {
+                    None
+                } else {
+                    let message = format!(
+                        "Admission unresolved for {id}: {error}; Ctrl+R retries the exact command"
+                    );
+                    self.frankentui
+                        .update(frankentui_shell::ShellMessage::SetStatus(message.clone()));
+                    self.push_toast(message);
+                    Some(id.to_string())
+                }
             }
         }
+    }
+
+    fn retry_unresolved_command(&mut self) {
+        let Some(pending) = self.unresolved_commands.front().cloned() else {
+            self.push_toast("No unresolved command to retry");
+            return;
+        };
+        let id = pending.envelope.command_id;
+        self.submit_visible_envelope(
+            pending.envelope,
+            pending.action,
+            Instant::now() + Duration::from_millis(5),
+        );
+        self.push_toast(format!("Exact command {id} retried; see its receipt"));
+    }
+
+    fn observe_selection_status(&mut self, status: &CommandStatus) {
+        let Some(pending) = self
+            .pending_selection
+            .as_mut()
+            .filter(|pending| pending.command_id == status.command_id())
+        else {
+            return;
+        };
+        match status.application() {
+            ApplicationState::Applied(applied) => pending.applied = Some(*applied),
+            ApplicationState::Rejected(_) | ApplicationState::Failed(_) => {
+                self.pending_selection = None;
+            }
+            ApplicationState::Admitted => {}
+        }
+    }
+
+    fn reconcile_selection_focus(&mut self, world: &RenderSnapshot) {
+        let Some(pending) = self.pending_selection.as_ref() else {
+            return;
+        };
+        let Some(applied) = pending.applied else {
+            return;
+        };
+        if world.revisions.control < applied.revisions.control {
+            return;
+        }
+        let selected = world
+            .world
+            .agents
+            .iter()
+            .zip(world.agent_selection.iter())
+            .enumerate()
+            .find(|(_, (agent, state))| {
+                pending.update.agent_ids.contains(&agent.id)
+                    && **state == SelectionState::Selected
+            })
+            .map(|(index, _)| index);
+        let cleared = pending.update.mode == SelectionMode::Clear
+            && pending.update.agent_ids.is_empty()
+            && world
+                .agent_selection
+                .iter()
+                .all(|state| *state == SelectionState::None);
+        if let Some(index) = selected {
+            self.focused_agent_cursor = index;
+            self.manual_focus_cleared = false;
+        } else if cleared {
+            self.manual_focus_cleared = true;
+        } else {
+            // A newer publication may describe a different selection. It does
+            // not prove that this request's intended focus is on screen.
+            return;
+        }
+        self.focus_lock = FocusLockMode::Manual;
+        self.activation_layer_index = 0;
+        self.activation_row_offset = 0;
+        self.pending_selection = None;
     }
 
     fn refresh_command_receipts(&mut self) {
@@ -1816,7 +1988,11 @@ impl<'a> TerminalApp<'a> {
             .receipts
             .iter()
             .filter(|entry| {
-                entry
+                matches!(
+                    entry.status,
+                    frankentui_shell::ReceiptStatusKind::Pending
+                        | frankentui_shell::ReceiptStatusKind::Admitted
+                ) || entry
                     .journal_state
                     .as_ref()
                     .is_none_or(|state| matches!(state, JournalState::Pending))
@@ -1829,6 +2005,18 @@ impl<'a> TerminalApp<'a> {
                 .map(|id| (id, entry.action.clone()))
             })
             .collect();
+        for pending in &self.unresolved_commands {
+            let id = pending.envelope.command_id;
+            if !candidates.iter().any(|(candidate, _)| *candidate == id) {
+                candidates.push((id, pending.action.clone()));
+            }
+        }
+        if let Some(pending) = &self.pending_selection
+            && pending.applied.is_none()
+            && !candidates.iter().any(|(id, _)| *id == pending.command_id)
+        {
+            candidates.push((pending.command_id, "UpdateSelection".into()));
+        }
         if !candidates.is_empty() {
             let start = self.receipt_poll_offset % candidates.len();
             candidates.rotate_left(start);
@@ -1840,6 +2028,9 @@ impl<'a> TerminalApp<'a> {
             self.receipt_poll_offset = self.receipt_poll_offset.wrapping_add(1);
             match self.host.command_status_before(id, deadline) {
                 Ok(Some(status)) => {
+                    self.unresolved_commands
+                        .retain(|pending| pending.envelope.command_id != id);
+                    self.observe_selection_status(&status);
                     let receipt = frankentui_shell::CommandReceiptEntry::from_runtime_status(
                         &id,
                         action,
@@ -2902,6 +3093,8 @@ impl<'a> TerminalApp<'a> {
                             (a.position[0], a.position[1])
                         });
                     self.focused_agent_cursor = best_idx;
+                    self.manual_focus_cleared = false;
+                    self.pending_selection = None;
                     self.focus_lock = FocusLockMode::Manual;
                     self.snapshot.focused_agent_uid = Some(uid.0);
                     self.map_pan_offset = norm_pos;
@@ -4750,6 +4943,7 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" space    Toggle pause"),
             Line::raw(" + / -    Adjust speed"),
             Line::raw(" s        Single step"),
+            Line::raw(" Ctrl+R   Retry oldest unresolved command with its original identity"),
             Line::raw(" ? / h    Toggle this help (Esc also closes it; ? is Shift+/)"),
             Line::raw(" : / ^P   Command palette (search every action)"),
             Line::raw(" S        Save ASCII screenshot"),
@@ -5332,10 +5526,17 @@ impl<'a> TerminalApp<'a> {
                 .collect();
             let target_uid =
                 pointer::cycle_stacked_agents(&candidate_uids, self.snapshot.focused_agent_uid);
-            if let Some(uid) = target_uid {
+            if let Some(uid) = target_uid
+                && let Some(agent_id) = self
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.uid == Some(uid))
+                    .map(|agent| agent.id)
+            {
                 self.submit_simulation_command(ControlCommand::UpdateSelection(SelectionUpdate {
                     mode: SelectionMode::Replace,
-                    agent_ids: vec![uid],
+                    agent_ids: vec![agent_id],
                     state: SelectionState::Selected,
                 }));
                 let label = agent_uid_label(Some(uid));
@@ -5575,11 +5776,17 @@ impl<'a> TerminalApp<'a> {
                 if let Some(intent) = self.typed_event_feed.focus_intent_for_selected() {
                     match intent {
                         science_widgets::EventFocusIntent::FocusAgent(uid) => {
-                            if self.snapshot.agents.iter().any(|a| a.uid == Some(uid)) {
+                            if let Some(agent_id) = self
+                                .snapshot
+                                .agents
+                                .iter()
+                                .find(|agent| agent.uid == Some(uid))
+                                .map(|agent| agent.id)
+                            {
                                 self.submit_simulation_command(ControlCommand::UpdateSelection(
                                     SelectionUpdate {
                                         mode: SelectionMode::Replace,
-                                        agent_ids: vec![uid],
+                                        agent_ids: vec![agent_id],
                                         state: SelectionState::Selected,
                                     },
                                 ));
@@ -5804,6 +6011,12 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            self.retry_unresolved_command();
+            return Ok(false);
+        }
         if self.palette_open {
             match key.code {
                 KeyCode::Esc => {
@@ -6125,6 +6338,8 @@ impl<'a> TerminalApp<'a> {
                 if self.rail_visible && !self.snapshot.narrative.is_empty() {
                     self.move_rail_selection(-1);
                 } else {
+                    self.manual_focus_cleared = false;
+                    self.pending_selection = None;
                     self.focused_agent_cursor = self.focused_agent_cursor.saturating_sub(1);
                     self.refresh_snapshot();
                 }
@@ -6133,6 +6348,8 @@ impl<'a> TerminalApp<'a> {
                 if self.rail_visible && !self.snapshot.narrative.is_empty() {
                     self.move_rail_selection(1);
                 } else {
+                    self.manual_focus_cleared = false;
+                    self.pending_selection = None;
                     self.focused_agent_cursor = self.focused_agent_cursor.saturating_add(1);
                     self.refresh_snapshot();
                 }
@@ -6165,6 +6382,8 @@ impl<'a> TerminalApp<'a> {
                 self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Oldest agents");
             }
             (KeyCode::Char('m') | KeyCode::Char('M'), _) => {
+                self.manual_focus_cleared = false;
+                self.pending_selection = None;
                 self.focus_lock = FocusLockMode::Manual;
                 self.refresh_snapshot();
                 self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Manual");
@@ -6290,6 +6509,7 @@ impl<'a> TerminalApp<'a> {
         }
 
         let world = Arc::clone(&self.retained_render);
+        self.reconcile_selection_focus(&world);
         self.paused = world.playback.paused;
         self.speed_multiplier = world.playback.speed_multiplier;
         self.terrain = TerrainView::from_snapshot(&world);
@@ -6298,7 +6518,7 @@ impl<'a> TerminalApp<'a> {
         // Determine focused agent id
         let agent_id_opt = match self.focus_lock {
             FocusLockMode::Manual => {
-                if snap.agent_count > 0 {
+                if !self.manual_focus_cleared && snap.agent_count > 0 {
                     world
                         .world
                         .agents
@@ -6318,13 +6538,15 @@ impl<'a> TerminalApp<'a> {
         };
         if let Some(agent_uid) = agent_id_opt.map(|agent| agent.uid) {
             snap.focused_agent_uid = Some(agent_uid.get());
-            match self.client.port().inspect_agent(
+            let inspection_deadline = Instant::now() + Duration::from_millis(5);
+            match self.client.port().inspect_agent_before(
                 agent_uid,
                 if self.probe_enabled {
                     PROBE_MAX_CONTRIBUTORS
                 } else {
                     0
                 },
+                inspection_deadline,
             ) {
                 Ok(Some(detail)) if detail.source.matches_snapshot(&world) => {
                     snap.focused_brain_bound = detail.brain_bound;
@@ -6357,41 +6579,22 @@ impl<'a> TerminalApp<'a> {
                     ProjectionRequestRevision::new(next_request_revision.get()),
                     agent_uid,
                 );
-                let cache = match self.client.port().project_brain(&request) {
+                let cache = match self
+                    .client
+                    .port()
+                    .project_brain_before(&request, inspection_deadline)
+                {
                     Ok(projection) => {
                         let coherent = projection.source.matches_snapshot(&world);
-                        let response = projection.inspection;
-                        let mut metadata = BrainInspectionViewMetadata {
-                            agent_uid: agent_uid.get(),
-                            source_tick: response.source_tick.0,
-                            request_revision: response.request_revision.get(),
-                            truncated: false,
-                            retained_payload_bytes: response.build.retained_payload_bytes,
-                            ready: false,
-                        };
-                        let layers =
-                            response
-                                .ready_for(agent_uid)
-                                .map_or_else(Vec::new, |telemetry| {
-                                    metadata.truncated = telemetry.inspection.build.truncated;
-                                    metadata.retained_payload_bytes =
-                                        telemetry.inspection.build.retained_payload_bytes;
-                                    metadata.ready = true;
-                                    convert_layers(&telemetry.inspection.activations)
-                                });
-                        let activations = coherent
-                            .then(|| {
-                                response
-                                    .ready_for(agent_uid)
-                                    .map(|telemetry| telemetry.inspection.activations.clone())
-                            })
-                            .flatten();
-                        TerminalBrainInspectionCache {
-                            source_revision: projection.source.published_snapshot,
-                            metadata,
-                            layers,
-                            activations,
+                        let cache = TerminalBrainInspectionCache::from_projection(
+                            projection,
+                            &world,
+                            agent_uid,
+                        );
+                        if coherent {
+                            next_inspection_cache = Some(cache.clone());
                         }
+                        cache
                     }
                     Err(error) => {
                         warn!(
@@ -6418,7 +6621,6 @@ impl<'a> TerminalApp<'a> {
                 snap.brain_layers.clone_from(&cache.layers);
                 snap.brain_inspection = Some(cache.metadata);
                 snap.focused_activations.clone_from(&cache.activations);
-                next_inspection_cache = Some(cache);
             }
         }
 
@@ -6462,7 +6664,7 @@ impl<'a> TerminalApp<'a> {
                     control_revision: world.revisions.control.get(),
                     payload_bytes: bytes,
                     clipped_count: clipped,
-                    is_stale: !ready || src_tick < self.snapshot.tick,
+                    is_stale: !ready || src_tick != self.snapshot.tick,
                 }
             });
 
@@ -6979,6 +7181,39 @@ struct TerminalBrainInspectionCache {
     /// The raw bounded activation snapshot the layer views were converted from;
     /// the attribution panel consumes the connections (bd-16g.4.3).
     activations: Option<BrainActivations>,
+}
+
+impl TerminalBrainInspectionCache {
+    fn from_projection(
+        projection: scriptbots_runtime::BrainProjection,
+        world: &RenderSnapshot,
+        agent_uid: AgentUid,
+    ) -> Self {
+        let coherent = projection.source.matches_snapshot(world);
+        let response = projection.inspection;
+        let mut metadata = BrainInspectionViewMetadata {
+            agent_uid: agent_uid.get(),
+            source_tick: response.source_tick.0,
+            request_revision: response.request_revision.get(),
+            truncated: false,
+            retained_payload_bytes: response.build.retained_payload_bytes,
+            ready: false,
+        };
+        let telemetry = response.ready_for(agent_uid).filter(|_| coherent);
+        let layers = telemetry.map_or_else(Vec::new, |telemetry| {
+            metadata.truncated = telemetry.inspection.build.truncated;
+            metadata.retained_payload_bytes = telemetry.inspection.build.retained_payload_bytes;
+            metadata.ready = true;
+            convert_layers(&telemetry.inspection.activations)
+        });
+        let activations = telemetry.map(|telemetry| telemetry.inspection.activations.clone());
+        Self {
+            source_revision: projection.source.published_snapshot,
+            metadata,
+            layers,
+            activations,
+        }
+    }
 }
 
 impl BrainInspectionViewMetadata {
@@ -15513,7 +15748,10 @@ mod tests {
         }
 
         fn context<'a>(&self, runtime: &'a ControlRuntime) -> RendererContext<'a> {
-            let host = self.port();
+            Self::port_context(self.port(), runtime)
+        }
+
+        fn port_context(host: ChannelHostPort, runtime: &ControlRuntime) -> RendererContext<'_> {
             let submit_port = host.clone();
             let next_id = std::sync::atomic::AtomicU64::new(1);
             RendererContext {
@@ -15766,15 +16004,16 @@ mod tests {
         simulator.capture_frame(80, 24);
         simulator.report_error("injected terminal write failure");
         assert!(simulator.model().presentation.candidate.load().is_none());
-        assert!(
-            simulator
+        assert!(Arc::ptr_eq(
+            &simulator
                 .model()
                 .app
                 .borrow()
                 .presented_frame
-                .load()
-                .is_none()
-        );
+                .load_full()
+                .expect("last successful frame survives a subsequent renderer error"),
+            &presented,
+        ));
         assert!(simulator.model().failure.borrow().is_some());
         assert!(simulator.is_shutdown());
     }
@@ -15884,6 +16123,398 @@ mod tests {
                 .journal_state,
             Some(JournalState::CommittedVolatile)
         ));
+    }
+
+    fn terminal_manual_driver(
+        world: SharedWorld,
+        ingress_capacity: usize,
+    ) -> (scriptbots_runtime::channel::ChannelHostDriver, ChannelHostPort) {
+        let world = Arc::try_unwrap(world)
+            .unwrap_or_else(|_| panic!("manual driver takes sole world ownership"))
+            .into_inner()
+            .expect("fixture world mutex");
+        let core = scriptbots_runtime::HostCore::new(
+            scriptbots_runtime::HostSessionId::new(0x5455_494d),
+            world,
+            scriptbots_runtime::HostCoreOptions {
+                initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                capture_agent_visuals: true,
+                ..scriptbots_runtime::HostCoreOptions::default()
+            },
+        )
+        .expect("real manual owner");
+        scriptbots_runtime::channel::ChannelHostDriver::new(
+            scriptbots_runtime::FixedDeadlineHost::new(core),
+            scriptbots_runtime::channel::ChannelHostOptions {
+                ingress_capacity,
+                submit_deadline: Duration::from_millis(5),
+                ..scriptbots_runtime::channel::ChannelHostOptions::default()
+            },
+        )
+        .expect("real channel driver")
+    }
+
+    #[test]
+    fn live_exact_retry_recovers_expired_full_ingress_and_reply_timeouts_without_second_step() {
+        use ftui::core::event::{Event, KeyCode, KeyEvent, Modifiers};
+        use scriptbots_runtime::ManualInstant;
+
+        for (expired_before_enqueue, full_ingress) in [(true, false), (false, false), (false, true)] {
+            let ingress_capacity = if full_ingress {
+                1
+            } else {
+                scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity
+            };
+            let (mut driver, port) =
+                terminal_manual_driver(command_characterization_world(), ingress_capacity);
+            let (runtime, _) = ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let mut app = TerminalApp::new(
+                &renderer,
+                TerminalTestHost::port_context(port.clone(), &runtime),
+            );
+            if full_ingress {
+                // The real unknown-status lookup fills the sole ingress slot.
+                // The quiescent owner has not consumed that read or any command.
+                let lookup_error = port
+                    .command_status_before(
+                        CommandId::new(999),
+                        Instant::now() + Duration::from_millis(5),
+                    )
+                    .expect_err("the quiescent owner's read reply times out");
+                assert!(
+                    matches!(
+                        lookup_error,
+                        HostAccessError::CommandAuthorityLookup { .. }
+                    ),
+                    "{lookup_error:?}"
+                );
+            }
+            let deadline = if expired_before_enqueue {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_millis(5)
+            };
+            let id = app
+                .submit_with_visible_receipt_before(ControlCommand::Step, deadline)
+                .expect("unresolved identity is retained");
+            let original = app.unresolved_commands[0].envelope.clone();
+            assert_eq!(app.unresolved_commands.len(), 1);
+            assert_eq!(original.command_id.to_string(), id);
+            assert_eq!(original.command, HostCommand::Step);
+            assert_eq!(
+                original.expected_control_revision,
+                Some(ControlRevision::new(0))
+            );
+            assert_eq!(app.command_sequence, 1);
+            assert_eq!(port.snapshot_hub().latest().world.tick, 0);
+            assert!(matches!(
+                app.frankentui
+                    .receipt_for(&id)
+                    .expect("pending receipt")
+                    .status,
+                frankentui_shell::ReceiptStatusKind::Pending
+            ));
+            assert!(
+                app.frankentui
+                    .status_message
+                    .as_deref()
+                    .expect("retry instruction")
+                    .contains("Ctrl+R retries the exact command")
+            );
+            if full_ingress {
+                assert!(
+                    app.frankentui
+                        .status_message
+                        .as_deref()
+                        .expect("actual full-ingress diagnostic")
+                        .contains("channel host did not drain ingress"),
+                    "full-ingress coverage must observe the queue-send timeout"
+                );
+            }
+            if expired_before_enqueue || full_ingress {
+                let idle = driver
+                    .step(ManualInstant::from_nanos(0))
+                    .expect("idle owner");
+                assert_eq!(
+                    idle.admitted, 0,
+                    "expired budget or full ingress cannot enqueue the UI Step"
+                );
+                assert_eq!(port.snapshot_hub().latest().world.tick, 0);
+            }
+
+            // Run the actual key handler on a client thread while this thread
+            // drives the sole owner. No receipt or successful result is injected.
+            app.frankentui.route = frankentui_shell::ShellRoute::Diagnostics;
+            let mut admissions = 0;
+            std::thread::scope(|scope| {
+                let retry = scope.spawn(|| {
+                    app.handle_ftui_event(Event::Key(
+                        KeyEvent::new(KeyCode::Char('r')).with_modifiers(Modifiers::CTRL),
+                    ))
+                    .expect("Ctrl+R retries on science routes")
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !retry.is_finished() {
+                    admissions += driver
+                        .step(ManualInstant::from_nanos(0))
+                        .expect("owner processes exact retry")
+                        .admitted;
+                    assert!(Instant::now() < deadline, "retry caller did not finish");
+                    std::thread::park_timeout(Duration::from_micros(100));
+                }
+                assert!(!retry.join().expect("retry client thread"));
+            });
+            admissions += driver
+                .step(ManualInstant::from_nanos(0))
+                .expect("drain any final queued retry")
+                .admitted;
+            app.refresh_command_receipts();
+            assert_eq!(admissions, 1, "exact retry admits one scientific command");
+            assert_eq!(
+                app.command_sequence, 1,
+                "retry never assigns a new identity"
+            );
+            assert!(app.unresolved_commands.is_empty());
+            let receipt = app
+                .frankentui
+                .receipt_for(&id)
+                .expect("actual owner receipt");
+            assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
+            assert_eq!(receipt.timestamp_tick, 1);
+            assert_eq!(receipt.control_revision, 1);
+            assert_eq!(receipt.scientific_revision, 1);
+            let status = port
+                .command_status_before(
+                    original.command_id,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .expect("real mirrored command status")
+                .expect("the original identity remains authoritative");
+            assert_eq!(status.admission_sequence().expect("one admission").get(), 1);
+            assert_eq!(port.snapshot_hub().latest().world.tick, 1);
+            assert_eq!(
+                port.snapshot_hub().latest().last_applied_command,
+                Some(original.command_id)
+            );
+            app.handle_ftui_event(Event::Key(KeyEvent::new(KeyCode::Char('1'))))
+                .expect("return to Dashboard before using the existing rail control");
+            let before_rail = app.rail_visible;
+            app.handle_ftui_event(Event::Key(KeyEvent::new(KeyCode::Char('r'))))
+                .expect("plain r remains its existing rail control");
+            assert_ne!(app.rail_visible, before_rail);
+        }
+    }
+
+    #[test]
+    fn live_unresolved_commands_are_bounded_without_discarding_exact_envelopes() {
+        let (mut driver, port) = terminal_manual_driver(
+            command_characterization_world(),
+            scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity,
+        );
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            TerminalTestHost::port_context(port.clone(), &runtime),
+        );
+        for _ in 0..UNRESOLVED_COMMAND_CAPACITY {
+            app.submit_with_visible_receipt_before(ControlCommand::Step, Instant::now())
+                .expect("expired attempt retains its exact command");
+        }
+        let retained: Vec<_> = app
+            .unresolved_commands
+            .iter()
+            .map(|pending| pending.envelope.clone())
+            .collect();
+        let sequence = app.command_sequence;
+        assert!(
+            app.submit_with_visible_receipt(ControlCommand::SetSpeed(2.0))
+                .is_none()
+        );
+        assert_eq!(app.command_sequence, sequence);
+        assert_eq!(
+            app.unresolved_commands
+                .iter()
+                .map(|pending| pending.envelope.clone())
+                .collect::<Vec<_>>(),
+            retained
+        );
+        assert!(
+            app.frankentui
+                .status_message
+                .as_deref()
+                .expect("visible refusal")
+                .contains("unresolved queue is full")
+        );
+        assert_eq!(
+            driver
+                .step(scriptbots_runtime::ManualInstant::from_nanos(0))
+                .expect("no expired command reached ingress")
+                .admitted,
+            0
+        );
+        assert_eq!(port.snapshot_hub().latest().world.tick, 0);
+    }
+
+    #[test]
+    fn live_owner_select_clear_and_stale_rejection_preserve_focus_until_observed() {
+        use scriptbots_runtime::ManualInstant;
+
+        let world = command_characterization_world();
+        {
+            let mut world = world.lock().expect("fixture world");
+            for coordinate in [10.0, 30.0] {
+                world
+                    .try_spawn_agent(scriptbots_core::AgentData {
+                        position: Position {
+                            x: coordinate,
+                            y: coordinate,
+                        },
+                        ..scriptbots_core::AgentData::default()
+                    })
+                    .expect("valid selectable agent");
+            }
+        }
+        let (mut driver, port) = terminal_manual_driver(
+            world,
+            scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity,
+        );
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            TerminalTestHost::port_context(port.clone(), &runtime),
+        );
+        let original_focus = app.snapshot.focused_agent_uid;
+        let target = app.snapshot.agents[1].clone();
+        let selection = ControlCommand::UpdateSelection(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: vec![target.id],
+            state: SelectionState::Selected,
+        });
+        assert_ne!(target.id, target.uid.expect("stable target UID"));
+        app.map_area = Some(Rect::new(0, 0, 100, 100));
+        app.handle_mouse_click(30, 30);
+        let select_id = app
+            .pending_selection
+            .as_ref()
+            .expect("click submits a real owner selection")
+            .command_id
+            .to_string();
+        assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+        assert_eq!(
+            app.unresolved_commands[0].envelope.command,
+            HostCommand::try_from(selection.clone()).expect("selection mapping")
+        );
+        assert_eq!(
+            driver
+                .step(ManualInstant::from_nanos(0))
+                .expect("owner selects")
+                .admitted,
+            1
+        );
+        assert_eq!(
+            port.snapshot_hub().latest().agent_selection[1],
+            SelectionState::Selected
+        );
+        app.refresh_snapshot();
+        assert_eq!(
+            app.snapshot.focused_agent_uid, original_focus,
+            "a publication without the actual receipt cannot commit requested focus"
+        );
+        app.refresh_command_receipts();
+        let receipt = app
+            .frankentui
+            .receipt_for(&select_id)
+            .expect("selection receipt");
+        assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
+        assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+        app.refresh_snapshot();
+        assert_eq!(app.snapshot.focused_agent_uid, target.uid);
+        assert!(app.pending_selection.is_none());
+
+        // A later local inspector move must not be overwritten on every refresh
+        // merely because the world's independent selection remains on agent 2.
+        app.rail_visible = false;
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .expect("local inspector navigation");
+        assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+        assert_eq!(
+            port.snapshot_hub().latest().agent_selection[1],
+            SelectionState::Selected
+        );
+        app.refresh_snapshot();
+        assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+
+        let clear_id = app
+            .submit_with_visible_receipt(ControlCommand::UpdateSelection(SelectionUpdate {
+                mode: SelectionMode::Clear,
+                agent_ids: Vec::new(),
+                state: SelectionState::None,
+            }))
+            .expect("clear intent retains its identity");
+        assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+        driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("owner clears");
+        app.refresh_snapshot();
+        assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+        app.refresh_command_receipts();
+        assert_eq!(
+            app.frankentui
+                .receipt_for(&clear_id)
+                .expect("clear receipt")
+                .status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        app.refresh_snapshot();
+        assert_eq!(app.snapshot.focused_agent_uid, None);
+        assert!(
+            port.snapshot_hub()
+                .latest()
+                .agent_selection
+                .iter()
+                .all(|state| *state == SelectionState::None)
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .expect("local navigation restores an inspector focus");
+        assert_eq!(app.snapshot.focused_agent_uid, target.uid);
+        let stale_guard = app.retained_render.revisions.control;
+        assert!(
+            port.submit_before(
+                CommandEnvelope::new(CommandId::new(900), HostCommand::SetSpeed(2.0)),
+                Instant::now() + Duration::from_millis(5),
+            )
+            .is_err()
+        );
+        driver
+            .step(ManualInstant::from_nanos(2))
+            .expect("owner advances control");
+        assert!(port.snapshot_hub().latest().revisions.control > stale_guard);
+        let stale_id = app
+            .submit_with_visible_receipt(selection)
+            .expect("stale guarded intent remains unresolved until owner responds");
+        assert_eq!(app.snapshot.focused_agent_uid, target.uid);
+        driver
+            .step(ManualInstant::from_nanos(3))
+            .expect("owner rejects stale guard");
+        app.refresh_command_receipts();
+        assert!(matches!(
+            app.frankentui
+                .receipt_for(&stale_id)
+                .expect("actual stale rejection")
+                .status,
+            frankentui_shell::ReceiptStatusKind::StaleRevision { .. }
+        ));
+        assert!(app.pending_selection.is_none());
+        app.refresh_snapshot();
+        assert_eq!(app.snapshot.focused_agent_uid, target.uid);
+        assert_eq!(app.snapshot.tick, 0, "selection never advances science");
     }
 
     #[derive(Debug)]
@@ -16128,6 +16759,35 @@ mod tests {
         assert_eq!(second.request_revision, 2);
         assert_ne!(first.agent_uid, second.agent_uid);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let old_publication = app.host.snapshot_hub().latest();
+        let uid = old_publication.world.agents[1].uid;
+        app.submit_and_wait(ControlCommand::SetSpeed(2.0))
+            .expect("real same-tick control revision change");
+        let new_publication = app.host.snapshot_hub().latest();
+        assert_eq!(old_publication.world.tick, new_publication.world.tick);
+        assert_ne!(old_publication.revision, new_publication.revision);
+        let request = BrainProjectionRequest::focused(
+            ProjectionClientId::new(TERMINAL_BRAIN_INSPECTION_CLIENT_ID.get()),
+            ProjectionRequestRevision::new(50),
+            uid,
+        );
+        let projection = app
+            .host
+            .project_brain_before(&request, Instant::now() + Duration::from_secs(1))
+            .expect("real brain response after revision change");
+        let stale = TerminalBrainInspectionCache::from_projection(
+            projection.clone(),
+            &old_publication,
+            uid,
+        );
+        assert!(!stale.metadata.ready);
+        assert!(stale.layers.is_empty());
+        assert!(stale.activations.is_none());
+        let coherent =
+            TerminalBrainInspectionCache::from_projection(projection, &new_publication, uid);
+        assert!(coherent.metadata.ready);
+        assert!(!coherent.layers.is_empty());
+        assert!(coherent.activations.is_some());
         assert_eq!(
             app.host
                 .scientific_digest_v1()
