@@ -15740,12 +15740,18 @@ mod tests {
                     panic!("injected actual model-view panic");
                 }
                 self.live.view(frame);
-                frankentui_shell::print_to_frame(frame, 0, 0, "FAULT-PROBE-READY");
+                let marker = if self.triggered.load(Ordering::Acquire) {
+                    "FAULT-PROBE-TRIGGERED"
+                } else {
+                    "FAULT-PROBE-READY"
+                };
+                frankentui_shell::print_to_frame(frame, 0, 0, marker);
             }
 
             fn subscriptions(
                 &self,
-            ) -> Vec<Box<dyn ftui::runtime::subscription::Subscription<Self::Message>>> {
+            ) -> Vec<Box<dyn ftui::runtime::subscription::Subscription<Self::Message>>>
+            {
                 let mut subscriptions = self.live.subscriptions();
                 if self.case == "subscription" {
                     subscriptions.push(Box::new(FaultSubscription(self.triggered.clone())));
@@ -15794,7 +15800,9 @@ mod tests {
                 if self.triggered.load(Ordering::Acquire)
                     && !self.refused.swap(true, Ordering::AcqRel)
                 {
-                    return Err(io::Error::other("injected actual presentation write failure"));
+                    return Err(io::Error::other(
+                        "injected actual presentation write failure",
+                    ));
                 }
                 self.stdout.write(bytes)
             }
@@ -15817,9 +15825,8 @@ mod tests {
             triggered: triggered.clone(),
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut guard =
-                TerminalModeGuard::begin_with(CrosstermRestore, || Ok(()), || Ok(()))
-                    .expect("real outer restoration guard");
+            let mut guard = TerminalModeGuard::begin_with(CrosstermRestore, || Ok(()), || Ok(()))
+                .expect("real outer restoration guard");
             guard.mark_cursor_hidden();
             if case == "renderer" {
                 let features = ftui::runtime::BackendFeatures::default();
@@ -16602,7 +16609,10 @@ for case in ('panic', 'subscription', 'renderer'):
                 live_diagnostics_golden_fixture(&host, &runtime, name, status, reduced),
             );
             let captured = simulator
-                .capture_frame(LIVE_DIAGNOSTICS_GOLDEN_WIDTH, LIVE_DIAGNOSTICS_GOLDEN_HEIGHT)
+                .capture_frame(
+                    LIVE_DIAGNOSTICS_GOLDEN_WIDTH,
+                    LIVE_DIAGNOSTICS_GOLDEN_HEIGHT,
+                )
                 .clone();
             let actual = captured_live_golden_cells(&captured, simulator.pool());
             let expected = expected_live_golden_cells(rows);
