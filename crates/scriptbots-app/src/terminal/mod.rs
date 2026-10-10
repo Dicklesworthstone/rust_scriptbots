@@ -561,6 +561,9 @@ impl Model for LiveTerminalModel<'_> {
         let mut app = self.app.borrow_mut();
         let mut widgets = self.widgets.borrow_mut();
         let area = Rect::new(0, 0, frame.width(), frame.height());
+        // Terminal::draw reads the backend size during autoresize. Resize both
+        // surfaces so it cannot silently restore the initial 80x24 viewport.
+        widgets.backend_mut().resize(area.width, area.height);
         widgets.resize(area).unwrap_or_else(|never| match never {});
         widgets
             .draw(|legacy| app.draw(legacy))
@@ -911,6 +914,8 @@ impl LiveTerminalModel<'_> {
 struct LiveLineages {
     cursor: scriptbots_runtime::EventCursor,
     graph: scriptbots_core::ancestry::AncestryGraph,
+    genesis_prefix: Arc<Vec<scriptbots_core::BirthRecord>>,
+    genesis_sealed: bool,
     observed_tick: Option<u64>,
     error: Option<String>,
     recent_events: VecDeque<science_screens::LineageEventEntry>,
@@ -923,64 +928,124 @@ impl LiveLineages {
         Self {
             cursor,
             graph: scriptbots_core::ancestry::AncestryGraph::new(),
+            genesis_prefix: Arc::new(Vec::new()),
+            genesis_sealed: false,
             observed_tick: None,
             error: None,
             recent_events: VecDeque::new(),
         }
     }
 
+    fn observe_genesis(&mut self, genesis: &scriptbots_runtime::GenesisOrigins) -> bool {
+        let (origins, sealed) = match genesis {
+            scriptbots_runtime::GenesisOrigins::Open { origins } => (origins, false),
+            scriptbots_runtime::GenesisOrigins::Sealed { origins } => (origins, true),
+            scriptbots_runtime::GenesisOrigins::Unavailable { reason } => {
+                self.error = Some(format!(
+                    "Canonical genesis origins unavailable: {reason:?}; completeness unavailable"
+                ));
+                return false;
+            }
+        };
+        if !origins.starts_with(self.genesis_prefix.as_slice()) || (self.genesis_sealed && !sealed) {
+            self.error = Some(
+                "Canonical genesis origin prefix changed; completeness unavailable".into(),
+            );
+            return false;
+        }
+        if origins.len() > Self::MAX_NODES {
+            self.error = Some(format!(
+                "Live genesis ancestry exceeds {} retained nodes; completeness unavailable",
+                Self::MAX_NODES
+            ));
+            return false;
+        }
+        for (index, birth) in origins.iter().enumerate().skip(self.genesis_prefix.len()) {
+            if birth.tick != scriptbots_core::Tick::zero()
+                || u64::try_from(index).ok() != Some(birth.spawn_ordinal)
+            {
+                self.error = Some("Canonical genesis origin sequence is incomplete".into());
+                return false;
+            }
+            if let Err(error) = self.graph.apply_birth(birth) {
+                self.error = Some(error.to_string());
+                return false;
+            }
+        }
+        self.genesis_prefix = Arc::clone(origins);
+        self.genesis_sealed = sealed;
+        sealed
+    }
+
     fn poll(&mut self, client: &mut HostClient<ChannelHostPort>) {
-        if self.error.is_some() {
+        if self.error.is_some()
+            || !self.observe_genesis(client.port().event_hub().genesis_origins().as_ref())
+        {
             return;
         }
-        match client.read_events(&mut self.cursor, 64) {
-            Ok(scriptbots_runtime::EventPoll::Contiguous(page)) => {
-                for entry in page.events {
-                    let boundary = &entry.event.boundary;
-                    if self.graph.len().saturating_add(boundary.births().len()) > Self::MAX_NODES {
-                        self.error = Some(format!(
-                            "Live ancestry exceeds {} retained nodes; use an offline lineage report",
-                            Self::MAX_NODES
-                        ));
-                        return;
-                    }
-                    for birth in boundary.births() {
-                        if let Err(error) = self.graph.apply_birth(birth) {
-                            self.error = Some(error.to_string());
+        let page = match client.read_events(&mut self.cursor, 64) {
+            Ok(scriptbots_runtime::EventPoll::Contiguous(page)) => page,
+            Ok(scriptbots_runtime::EventPoll::Gap(gap)) => {
+                if let scriptbots_runtime::EventCatchUpState::Available(locator) = gap.catch_up {
+                    match client.catch_up_events(&mut self.cursor, locator, 64) {
+                        Ok(scriptbots_runtime::EventCatchUp::Contiguous(page)) => page,
+                        result => {
+                            self.error = Some(format!(
+                                "Ancestry event history gap: {gap:?}; catch-up {result:?}; completeness unavailable"
+                            ));
                             return;
                         }
                     }
-                    for death in boundary.deaths() {
-                        if let Err(error) = self.graph.apply_death(death) {
-                            self.error = Some(error.to_string());
-                            return;
-                        }
-                    }
-                    let tick = entry.event.tick.0;
-                    if !boundary.births().is_empty() || !boundary.deaths().is_empty() {
-                        if self.recent_events.len() == EVENT_LOG_CAPACITY {
-                            self.recent_events.pop_front();
-                        }
-                        self.recent_events
-                            .push_back(science_screens::LineageEventEntry {
-                                tick,
-                                event_kind: "arrivals/deaths".into(),
-                                description: format!(
-                                    "{} typed arrivals, {} exact deaths",
-                                    boundary.births().len(),
-                                    boundary.deaths().len()
-                                ),
-                            });
-                    }
-                    self.observed_tick = Some(tick);
+                } else {
+                    self.error = Some(format!(
+                        "Ancestry event history gap: {gap:?}; completeness unavailable"
+                    ));
+                    return;
                 }
             }
-            Ok(scriptbots_runtime::EventPoll::Gap(gap)) => {
-                self.error = Some(format!(
-                    "Ancestry event history gap: {gap:?}; completeness unavailable"
-                ));
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
             }
-            Err(error) => self.error = Some(error.to_string()),
+        };
+        for entry in page.events {
+            let boundary = &entry.event.boundary;
+            if self.graph.len().saturating_add(boundary.births().len()) > Self::MAX_NODES {
+                self.error = Some(format!(
+                    "Live ancestry exceeds {} retained nodes; use an offline lineage report",
+                    Self::MAX_NODES
+                ));
+                return;
+            }
+            for birth in boundary.births() {
+                if let Err(error) = self.graph.apply_birth(birth) {
+                    self.error = Some(error.to_string());
+                    return;
+                }
+            }
+            for death in boundary.deaths() {
+                if let Err(error) = self.graph.apply_death(death) {
+                    self.error = Some(error.to_string());
+                    return;
+                }
+            }
+            let tick = entry.event.tick.0;
+            if !boundary.births().is_empty() || !boundary.deaths().is_empty() {
+                if self.recent_events.len() == EVENT_LOG_CAPACITY {
+                    self.recent_events.pop_front();
+                }
+                self.recent_events
+                    .push_back(science_screens::LineageEventEntry {
+                        tick,
+                        event_kind: "arrivals/deaths".into(),
+                        description: format!(
+                            "{} typed arrivals, {} exact deaths",
+                            boundary.births().len(),
+                            boundary.deaths().len()
+                        ),
+                    });
+            }
+            self.observed_tick = Some(tick);
         }
     }
 
@@ -988,6 +1053,11 @@ impl LiveLineages {
         use science_screens::*;
         if let Some(error) = &self.error {
             return ScreenDataState::error(self.cursor.last_seen().get(), error);
+        }
+        if !self.genesis_sealed {
+            return ScreenDataState::empty(
+                "Canonical genesis prefix is open; waiting for the first completed step",
+            );
         }
         if self.observed_tick.is_none() {
             return ScreenDataState::empty("Waiting for the first canonical scientific boundary");
@@ -1227,6 +1297,12 @@ pub enum TerminalCommandError {
     /// Host port access error.
     #[error(transparent)]
     Host(#[from] HostAccessError),
+    /// No finished receipt can be evicted to track another command.
+    #[error("command not submitted: unfinished receipt history is full")]
+    ReceiptHistoryFull,
+    /// No additional exact envelope can be retained after ambiguous admission.
+    #[error("command not submitted: unresolved queue is full; Ctrl+R retries the oldest exact command")]
+    UnresolvedCommandsFull,
 }
 
 #[derive(Clone)]
@@ -1594,7 +1670,21 @@ impl<'a> TerminalApp<'a> {
         &mut self,
         command: ControlCommand,
         expected_control_revision: Option<ControlRevision>,
-    ) -> Result<CommandEnvelope, HostCommandMappingError> {
+    ) -> Result<CommandEnvelope, TerminalCommandError> {
+        if !self.frankentui.has_receipt_capacity() {
+            let message = TerminalCommandError::ReceiptHistoryFull.to_string();
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::SetStatus(message.clone()));
+            self.push_toast(message);
+            return Err(TerminalCommandError::ReceiptHistoryFull);
+        }
+        if self.unresolved_commands.len() == UNRESOLVED_COMMAND_CAPACITY {
+            let message = TerminalCommandError::UnresolvedCommandsFull.to_string();
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::SetStatus(message.clone()));
+            self.push_toast(message);
+            return Err(TerminalCommandError::UnresolvedCommandsFull);
+        }
         let host_command = HostCommand::try_from(command)?;
         let command_id = self.next_command_id();
         let mut envelope = CommandEnvelope::new(command_id, host_command);
@@ -1607,8 +1697,27 @@ impl<'a> TerminalApp<'a> {
     pub fn submit_envelope(
         &mut self,
         envelope: CommandEnvelope,
-    ) -> Result<CommandStatus, HostAccessError> {
+    ) -> Result<CommandStatus, TerminalCommandError> {
         let command_id = envelope.command_id;
+        if !self.frankentui.can_record_receipt(&command_id.to_string()) {
+            let message = TerminalCommandError::ReceiptHistoryFull.to_string();
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::SetStatus(message.clone()));
+            self.push_toast(message);
+            return Err(TerminalCommandError::ReceiptHistoryFull);
+        }
+        if self.unresolved_commands.len() == UNRESOLVED_COMMAND_CAPACITY
+            && !self
+                .unresolved_commands
+                .iter()
+                .any(|pending| pending.envelope.command_id == command_id)
+        {
+            let message = TerminalCommandError::UnresolvedCommandsFull.to_string();
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::SetStatus(message.clone()));
+            self.push_toast(message);
+            return Err(TerminalCommandError::UnresolvedCommandsFull);
+        }
         let action_name = format!("{:?}", envelope.command);
         let expected_revision = envelope.expected_control_revision;
         let snapshot_revision = self.retained_render.revision.get();
@@ -1616,10 +1725,12 @@ impl<'a> TerminalApp<'a> {
         let control_rev = self.retained_render.revisions.control.get();
         let scientific_rev = self.retained_render.revisions.scientific.get();
         let start = Instant::now();
-        let result = self.client.submit(envelope);
+        let result = self.client.submit(envelope.clone());
         let latency = start.elapsed();
         match &result {
             Ok(status) => {
+                self.unresolved_commands
+                    .retain(|pending| pending.envelope.command_id != command_id);
                 info!(
                     %command_id,
                     ?expected_revision,
@@ -1648,19 +1759,50 @@ impl<'a> TerminalApp<'a> {
                     latency_micros = latency.as_micros(),
                     "terminal failed to submit command envelope via HostClient"
                 );
+                let definitely_refused = matches!(
+                    error,
+                    HostAccessError::CommandIdCollision { .. }
+                        | HostAccessError::CommandEvidenceBackpressure { .. }
+                        | HostAccessError::CommandEvidenceClosed { .. }
+                );
+                if !definitely_refused
+                    && !self
+                        .unresolved_commands
+                        .iter()
+                        .any(|pending| pending.envelope.command_id == command_id)
+                {
+                    self.unresolved_commands
+                        .push_back(UnresolvedTerminalCommand {
+                            envelope,
+                            action: action_name.clone(),
+                        });
+                }
                 let entry = frankentui_shell::CommandReceiptEntry {
                     command_id: command_id.to_string(),
                     action: action_name,
-                    status: frankentui_shell::ReceiptStatusKind::Failed(error.to_string()),
+                    status: if definitely_refused {
+                        frankentui_shell::ReceiptStatusKind::Failed(format!(
+                            "Submission refused: {error}"
+                        ))
+                    } else {
+                        frankentui_shell::ReceiptStatusKind::Pending
+                    },
                     journal_state: None,
                     control_revision: control_rev,
                     scientific_revision: scientific_rev,
                     timestamp_tick: tick,
                 };
                 self.frankentui.record_receipt(entry);
+                if !definitely_refused {
+                    let message = format!(
+                        "Admission unresolved for {command_id}: {error}; Ctrl+R retries the exact command"
+                    );
+                    self.frankentui
+                        .update(frankentui_shell::ShellMessage::SetStatus(message));
+                }
             }
         }
-        result
+        result.map_err(TerminalCommandError::Host)
     }
 
     #[allow(dead_code)]
@@ -1774,6 +1916,13 @@ impl<'a> TerminalApp<'a> {
             let message = "Selection not submitted: pending selection queue is full; wait for owner receipts or choose a local focus";
             self.frankentui
                 .update(frankentui_shell::ShellMessage::SetStatus(message.into()));
+            self.push_toast(message);
+            return None;
+        }
+        if !self.frankentui.has_receipt_capacity() {
+            let message = TerminalCommandError::ReceiptHistoryFull.to_string();
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::SetStatus(message.clone()));
             self.push_toast(message);
             return None;
         }
@@ -2008,16 +2157,7 @@ impl<'a> TerminalApp<'a> {
             .frankentui
             .receipts
             .iter()
-            .filter(|entry| {
-                matches!(
-                    entry.status,
-                    frankentui_shell::ReceiptStatusKind::Pending
-                        | frankentui_shell::ReceiptStatusKind::Admitted
-                ) || entry
-                    .journal_state
-                    .as_ref()
-                    .is_none_or(|state| matches!(state, JournalState::Pending))
-            })
+            .filter(|entry| entry.awaits_observation())
             .filter_map(|entry| {
                 serde_json::from_value::<CommandId>(serde_json::Value::String(
                     entry.command_id.clone(),
@@ -6468,6 +6608,7 @@ impl<'a> TerminalApp<'a> {
         let dir = std::path::Path::new("screenshots");
         fs::create_dir_all(dir)?;
 
+        // ubs:ignore[rust.security.non-crypto-random] — filename only; create_new enforces exclusivity.
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
@@ -11155,6 +11296,7 @@ mod tests {
     fn cell_fg(buf: &Buffer, x: u16, y: u16) -> (u8, u8, u8) {
         match buf[(x, y)].style().fg {
             Some(Color::Rgb(r, g, b)) => (r, g, b),
+            // ubs:ignore[rust.ownership.panic-macro] — test asserts the rendered color.
             other => panic!("expected an RGB foreground at ({x},{y}), got {other:?}"),
         }
     }
@@ -11162,6 +11304,7 @@ mod tests {
     fn cell_bg(buf: &Buffer, x: u16, y: u16) -> (u8, u8, u8) {
         match buf[(x, y)].style().bg {
             Some(Color::Rgb(r, g, b)) => (r, g, b),
+            // ubs:ignore[rust.ownership.panic-macro] — test asserts the rendered color.
             other => panic!("expected an RGB background at ({x},{y}), got {other:?}"),
         }
     }
@@ -14106,7 +14249,9 @@ mod tests {
                     let row = text
                         .lines()
                         .find(|line| line.contains(&needle))
-                        .unwrap_or_else(|| panic!("missing {label} mortality row:\n{text}"));
+                        .unwrap_or_else(|| {
+                            panic!("missing {label} mortality row:\n{text}"); // ubs:ignore[rust.ownership.panic-macro] — test requires this row.
+                        });
                     let content = row.trim().trim_matches('│').trim();
                     assert!(
                         content.ends_with(&format!(" {count:>3}")),
@@ -14357,6 +14502,7 @@ mod tests {
                 let fg = palette
                     .mortality_style(cause)
                     .fg
+                    // ubs:ignore[rust.ownership.panic-macro] — test rejects absent death-cause styling.
                     .unwrap_or_else(|| panic!("{cause:?} must carry a colour"));
                 assert!(
                     matches!(fg, Color::Rgb(_, _, _)),
@@ -14561,6 +14707,7 @@ mod tests {
             match status.application() {
                 ApplicationState::Applied(_) => return status,
                 ApplicationState::Admitted => {}
+                // ubs:ignore[rust.ownership.panic-macro] — test rejects a failed owner command.
                 failure => panic!("external-owner command failed: {failure:?}"),
             }
             assert!(
@@ -15141,9 +15288,9 @@ mod tests {
     ///
     /// THE HAZARD THIS EXISTS FOR, which is general and not an ftui quirk: Cargo
     /// only resolves a `[workspace.dependencies]` entry when some crate actually
-    /// depends on it. No workspace crate consumes `ftui.workspace`, so the entry
-    /// is never fetched, never reaches `Cargo.lock`, and a wrong `rev` cannot
-    /// fail any build. **An unconsumed pin is unverified by construction.** The
+    /// depends on it. Before scriptbots-app adopted `ftui.workspace`, the entry
+    /// was never fetched or recorded in `Cargo.lock`, so a wrong `rev` could not
+    /// fail a build. **An unconsumed pin is unverified by construction.** The
     /// previous value, `15cc65438a2095fbe8dd0dfce9adcfc7edab7612`, was not an
     /// object in the upstream repository at all and survived exactly that way —
     /// no amount of compiling could have caught it.
@@ -15674,6 +15821,7 @@ mod tests {
             run_terminal_fault_child(&case);
             return;
         }
+        // ubs:ignore[rust.security.shell-command] — fixed Python probe; variable input is separate argv.
         let output = std::process::Command::new("python3")
             .args(["-c", TERMINAL_FAULT_PTY_PROBE])
             .arg(std::env::current_exe().expect("current test executable"))
@@ -15878,7 +16026,7 @@ mod tests {
                     assert!(program.model().live.app.borrow().frankentui.shutdown_called);
                 } else {
                     run_result.expect("panic fixture must unwind before this returns");
-                    panic!("expected view panic did not occur");
+                    panic!("expected view panic did not occur"); // ubs:ignore[rust.ownership.panic-macro] — test requires the view fault.
                 }
             }
             drop(guard);
@@ -16048,6 +16196,7 @@ for case in ('panic', 'subscription', 'renderer'):
 
         fn with_options(world: SharedWorld, options: scriptbots_runtime::HostCoreOptions) -> Self {
             let world = Arc::try_unwrap(world)
+                // ubs:ignore[rust.ownership.panic-macro] — test requires sole-owner construction.
                 .unwrap_or_else(|_| panic!("terminal fixture must transfer sole world ownership"))
                 .into_inner()
                 .expect("test world mutex");
@@ -16058,7 +16207,9 @@ for case in ('panic', 'subscription', 'renderer'):
                 scriptbots_runtime::HostSessionId::new(0x5455_4954),
                 world,
                 persistence,
-                Box::new(scriptbots_runtime::VolatileJournal::default()),
+                Box::new(scriptbots_runtime::VolatileJournal::with_capacity(
+                    options.volatile_event_history_capacity,
+                )),
                 options,
                 scriptbots_runtime::channel::ChannelHostOptions::default(),
             )
@@ -16117,14 +16268,17 @@ for case in ('panic', 'subscription', 'renderer'):
     #[test]
     fn live_lineages_consume_canonical_founder_arrivals_from_real_owner() {
         let world = command_characterization_world();
-        {
+        let founder_uids = {
             let mut world = world.lock().expect("fixture world");
-            for _ in 0..2 {
-                world
-                    .try_inject_agent(scriptbots_core::AgentData::default())
-                    .expect("valid founding arrival");
-            }
-        }
+            (0..2)
+                .map(|_| {
+                    let agent = world
+                        .try_spawn_agent(scriptbots_core::AgentData::default())
+                        .expect("valid seeded founding arrival");
+                    world.agent_uid(agent).expect("actual founder UID").get()
+                })
+                .collect::<Vec<_>>()
+        };
         let host = TerminalTestHost::take(world);
         let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
@@ -16146,20 +16300,29 @@ for case in ('panic', 'subscription', 'renderer'):
             std::thread::park_timeout(Duration::from_millis(1));
         }
         let science_screens::ScreenDataState::Data(data) = lineage.view_data() else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires canonical lineage data.
             panic!("real canonical births must produce a lineage projection");
         };
         assert_eq!(data.total_founders, Some(2));
         assert_eq!(data.founder_rows.len(), 2);
+        assert_eq!(
+            data.founder_rows
+                .iter()
+                .map(|row| row.founder_uid)
+                .collect::<Vec<_>>(),
+            founder_uids
+        );
         assert!(
             data.founder_rows
                 .iter()
-                .all(|row| row.total_descendants == 0)
+                .all(|row| row.total_descendants == 0 && row.living_descendants == 0)
         );
         assert_eq!(
             data.active_clades, None,
             "founder ancestry is not clade analysis"
         );
         let observed_tick = app.client.port().snapshot_hub().latest().world.tick;
+        let digest = app.client.port().world_digests().expect("owner digests");
         for _ in 0..4 {
             lineage.poll(&mut app.client);
             let _ = lineage.view_data();
@@ -16168,6 +16331,222 @@ for case in ('panic', 'subscription', 'renderer'):
             app.client.port().snapshot_hub().latest().world.tick,
             observed_tick
         );
+        assert_eq!(
+            app.client.port().world_digests().expect("owner digests"),
+            digest
+        );
+    }
+
+    #[test]
+    fn live_lineages_extend_open_genesis_with_real_tick_zero_spawn_once() {
+        let world = command_characterization_world();
+        let founder_uid = {
+            let mut world = world.lock().expect("fixture world");
+            let agent = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("actual seeded founder");
+            world.agent_uid(agent).expect("founder UID")
+        };
+        let host = TerminalTestHost::take(world);
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        let hub = app.client.port().event_hub();
+        let mut lineage = LiveLineages::new(app.client.event_cursor());
+        let first_prefix = hub.genesis_origins();
+        lineage.poll(&mut app.client);
+        assert!(
+            lineage.view_data().is_empty(),
+            "open genesis is not complete"
+        );
+        assert_eq!(lineage.graph.roots(), [founder_uid]);
+        app.submit_and_wait(ControlCommand::SpawnAgent {
+            herbivore_tendency: 0.75,
+        })
+        .expect("real tick-zero spawn");
+        let open = hub.genesis_origins();
+        let scriptbots_runtime::GenesisOrigins::Open { origins } = open.as_ref() else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires the actual open origin prefix.
+            panic!("tick-zero owner must retain an open canonical prefix");
+        };
+        assert_eq!(origins.len(), 2);
+        assert_eq!(origins[0].agent_uid, founder_uid);
+        assert_eq!(origins[0].origin, scriptbots_core::BirthOrigin::Seeded);
+        assert_eq!(origins[1].origin, scriptbots_core::BirthOrigin::Injected);
+        assert_eq!(origins[1].tick, scriptbots_core::Tick::zero());
+        let expected_uids = origins
+            .iter()
+            .map(|row| row.agent_uid.get())
+            .collect::<Vec<_>>();
+        assert_ne!(expected_uids[0], expected_uids[1]);
+        assert!(
+            matches!(
+                first_prefix.as_ref(),
+                scriptbots_runtime::GenesisOrigins::Open { origins } if origins.len() == 1
+            ),
+            "held prefix is immutable"
+        );
+        let digest = app.client.port().world_digests().expect("owner digests");
+        lineage.poll(&mut app.client);
+        lineage.poll(&mut app.client);
+        assert_eq!(lineage.graph.len(), 2);
+        assert!(lineage.view_data().is_empty());
+        assert_eq!(
+            app.client.port().world_digests().expect("owner digests"),
+            digest
+        );
+        app.submit_and_wait(ControlCommand::Step)
+            .expect("first real step");
+        lineage.poll(&mut app.client);
+        let view = lineage.view_data();
+        let data = view.data().expect("complete canonical lineage projection");
+        assert_eq!(data.total_founders, Some(2));
+        assert_eq!(data.observed_tick, Some(1));
+        assert_eq!(
+            data.founder_rows
+                .iter()
+                .map(|row| row.founder_uid)
+                .collect::<Vec<_>>(),
+            expected_uids
+        );
+        assert!(matches!(
+            hub.genesis_origins().as_ref(),
+            scriptbots_runtime::GenesisOrigins::Sealed { origins: sealed }
+                if sealed.as_ref() == origins.as_ref()
+        ));
+        assert_eq!(
+            hub.published_total(),
+            1,
+            "genesis is not a synthetic tick event"
+        );
+    }
+
+    #[test]
+    fn live_lineages_refuse_late_capacity_and_removed_genesis_without_mutating_owner() {
+        for (mode, reason) in [
+            (
+                "late",
+                scriptbots_runtime::GenesisUnavailableReason::AlreadyAdvanced {
+                    tick: scriptbots_core::Tick(1),
+                },
+            ),
+            (
+                "capacity",
+                scriptbots_runtime::GenesisUnavailableReason::CapacityExceeded {
+                    limit: 1,
+                    observed: 2,
+                },
+            ),
+            (
+                "removed",
+                scriptbots_runtime::GenesisUnavailableReason::IncompleteLifecycle,
+            ),
+        ] {
+            let world = command_characterization_world();
+            {
+                let mut world = world.lock().expect("fixture world");
+                let first = world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .expect("first real founder");
+                world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .expect("second real founder");
+                if mode == "late" {
+                    world.step().expect("actual pre-owner step");
+                } else if mode == "removed" {
+                    let uid = world.agent_uid(first).expect("actual removed founder UID");
+                    let _migrant = world.emigrate(uid).expect("actual tick-zero departure");
+                }
+            }
+            let host = TerminalTestHost::with_options(
+                world,
+                scriptbots_runtime::HostCoreOptions {
+                    genesis_origin_capacity: if mode == "capacity" { 1 } else { 2 },
+                    initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    ..scriptbots_runtime::HostCoreOptions::default()
+                },
+            );
+            let mut client = HostClient::new(host.port());
+            let before = client
+                .port()
+                .world_digests()
+                .expect("owner digests before observation");
+            assert_eq!(
+                client.port().event_hub().genesis_origins().as_ref(),
+                &scriptbots_runtime::GenesisOrigins::Unavailable { reason }
+            );
+            let mut lineage = LiveLineages::new(client.event_cursor());
+            lineage.poll(&mut client);
+            assert!(lineage.view_data().is_error());
+            assert_eq!(lineage.graph.len(), 0);
+            assert_eq!(lineage.cursor.last_seen().get(), 0);
+            assert_eq!(
+                client
+                    .port()
+                    .world_digests()
+                    .expect("owner digests after observation"),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn live_lineages_catch_up_retained_events_and_reject_expired_prefix() {
+        for steps in [2, 3] {
+            let host = TerminalTestHost::with_options(
+                command_characterization_world(),
+                scriptbots_runtime::HostCoreOptions {
+                    scientific_event_capacity: 1,
+                    volatile_event_history_capacity: 2,
+                    initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    ..scriptbots_runtime::HostCoreOptions::default()
+                },
+            );
+            let (runtime, _) = ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+            let mut lineage = LiveLineages::new(app.client.event_cursor());
+            for _ in 0..steps {
+                app.submit_and_wait(ControlCommand::Step)
+                    .expect("actual owner step");
+            }
+            let digest = app.client.port().world_digests().expect("owner digests");
+            lineage.poll(&mut app.client);
+            if steps == 2 {
+                assert_eq!(
+                    lineage.observed_tick,
+                    Some(1),
+                    "bounded catch-up reads missing prefix"
+                );
+                lineage.poll(&mut app.client);
+                assert_eq!(lineage.observed_tick, Some(2));
+                assert_eq!(
+                    lineage
+                        .view_data()
+                        .data()
+                        .expect("complete empty ancestry")
+                        .total_founders,
+                    Some(0)
+                );
+            } else {
+                assert!(lineage.view_data().is_error());
+                assert_eq!(
+                    lineage.cursor.last_seen().get(),
+                    0,
+                    "expired prefix is never accepted"
+                );
+            }
+            assert_eq!(
+                app.client.port().world_digests().expect("owner digests"),
+                digest
+            );
+        }
     }
 
     #[test]
@@ -16341,7 +16720,267 @@ for case in ('panic', 'subscription', 'renderer'):
             &presented,
         ));
         assert!(simulator.model().failure.borrow().is_some());
+        assert!(!simulator.is_running(), "error hook requests quit");
+        assert!(!simulator.is_shutdown(), "simulator quit does not run shutdown");
+        simulator.shutdown();
         assert!(simulator.is_shutdown());
+        assert!(simulator.model().app.borrow().frankentui.shutdown_called);
+    }
+
+    #[test]
+    fn live_science_provider_records_match_real_checkpoint_and_completed_experiment() {
+        use crate::control::{
+            CheckpointCreateRequest, ControlHandle, ExperimentCreateRequest, ExperimentVariantDto,
+        };
+        use frankentui_shell::{ShellMessage, ShellRoute};
+        use science_screens::ScreenDataState;
+
+        // Keep artifacts outside the checkout and retain them for independent
+        // inspection. No cleanup guard deletes checkpoint or experiment evidence.
+        let artifacts = std::env::temp_dir().join(format!(
+            "scriptbots-terminal-provider-{}-{:032x}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        eprintln!(
+            "retained terminal provider artifacts: {}",
+            artifacts.display()
+        );
+        let host = TerminalTestHost::take(command_characterization_world());
+        let handle = ControlHandle::new(host.port())
+            .with_artifacts_dir(artifacts.clone())
+            .expect("reserve unique real data-service artifacts");
+        let owner_before = host
+            .port()
+            .scientific_digest_v1()
+            .expect("paused owner digest before service operations");
+
+        let replay_before = science_service_messages(&handle, ShellRoute::Replay, 1);
+        let [ShellMessage::SetReplayData(ScreenDataState::Data(empty_replay))] =
+            replay_before.as_slice()
+        else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires the actual empty catalog.
+            panic!("empty checkpoint catalog must produce its real empty projection");
+        };
+        assert!(empty_replay.checkpoints.is_empty());
+        assert!(empty_replay.first_divergence.is_none());
+        assert!(matches!(
+            science_service_messages(&handle, ShellRoute::Experiments, 2).as_slice(),
+            [ShellMessage::SetExperimentsData(ScreenDataState::Empty { .. })]
+        ));
+
+        let checkpoint = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: Some("terminal provider positive proof".into()),
+                idempotency_key: Some("terminal-provider-checkpoint".into()),
+            })
+            .expect("capture and register actual owner checkpoint");
+        let (artifact, bytes) = handle
+            .read_artifact_bytes(&checkpoint.checkpoint_id)
+            .expect("read and checksum-verify retained checkpoint bytes");
+        let decoded = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+            .expect("decode actual composite owner checkpoint");
+        assert_eq!(artifact.artifact_id, checkpoint.checkpoint_id);
+        assert_eq!(checkpoint.tick, owner_before.tick.0);
+        assert_eq!(decoded.tick().0, checkpoint.tick);
+        assert_eq!(decoded.source_digest(), &owner_before);
+        assert_eq!(checkpoint.byte_size, u64::try_from(bytes.len()).unwrap());
+        assert_eq!(artifact.byte_size, checkpoint.byte_size);
+        assert_eq!(artifact.checksum_blake3, checkpoint.checksum_blake3);
+        assert_eq!(
+            checkpoint.checksum_blake3,
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        assert_ne!(checkpoint.checksum_blake3, decoded.source_digest().overall);
+
+        let replay_messages = science_service_messages(&handle, ShellRoute::Replay, 3);
+        let [ShellMessage::SetReplayData(ScreenDataState::Data(replay))] =
+            replay_messages.as_slice()
+        else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires the created checkpoint.
+            panic!("actual checkpoint must produce a populated replay projection");
+        };
+        assert_eq!(replay.checkpoints.len(), 1);
+        let projected_checkpoint = &replay.checkpoints[0];
+        assert_eq!(projected_checkpoint.checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(projected_checkpoint.tick, checkpoint.tick);
+        assert_eq!(projected_checkpoint.file_size_bytes, checkpoint.byte_size);
+        assert_eq!(projected_checkpoint.agent_count, None);
+        assert_eq!(projected_checkpoint.digest, None);
+        assert_eq!(replay.observed_live_tick, None);
+        assert!(replay.first_divergence.is_none());
+
+        let experiment_id = "terminal-provider";
+        let seed = 77;
+        let ticks = 2;
+        let overrides = serde_json::json!({
+            "world_width": 100,
+            "world_height": 100,
+            "food_cell_size": 50,
+            "population_minimum": 0,
+            "population_spawn_interval": 0,
+        });
+        let created = handle
+            .create_experiment(ExperimentCreateRequest {
+                experiment_id: Some(experiment_id.into()),
+                description: Some("real terminal matched-seed provider proof".into()),
+                variants: vec![
+                    ExperimentVariantDto {
+                        variant_id: "baseline".into(),
+                        brain_family: "mlp".into(),
+                        config_overrides: Some(overrides.clone()),
+                    },
+                    ExperimentVariantDto {
+                        variant_id: "challenger".into(),
+                        brain_family: "dwraon".into(),
+                        config_overrides: Some(overrides),
+                    },
+                ],
+                seeds: vec![seed],
+                ticks_per_run: Some(ticks),
+                max_concurrency: Some(1),
+                idempotency_key: Some("terminal-provider-experiment".into()),
+            })
+            .expect("start actual two-arm matched-seed experiment");
+        assert_eq!(created.experiment_id, experiment_id);
+        assert_eq!(created.total_runs, 2);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let completed = loop {
+            let status = handle
+                .get_experiment(experiment_id)
+                .expect("read actual experiment worker status");
+            assert_eq!(status.failed_runs, 0, "actual worker failures: {status:?}");
+            assert!(
+                status.error_reason.is_none(),
+                "actual worker error: {status:?}"
+            );
+            if status.status == "completed" {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "experiment completion deadline: {status:?}"
+            );
+            std::thread::park_timeout(Duration::from_millis(5));
+        };
+        assert_eq!(completed.experiment_id, experiment_id);
+        assert_eq!(completed.total_runs, 2);
+        assert_eq!(completed.completed_runs, 2);
+        assert_eq!(completed.runs.len(), 2);
+        let experiment_messages = science_service_messages(&handle, ShellRoute::Experiments, 4);
+        let [ShellMessage::SetExperimentsData(ScreenDataState::Data(experiment))] =
+            experiment_messages.as_slice()
+        else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires the completed experiment.
+            panic!("completed actual experiment must produce populated arms");
+        };
+        assert_eq!(experiment.experiment_id, completed.experiment_id);
+        assert_eq!(experiment.batch_status, "completed");
+        assert_eq!(experiment.active_arms.len(), completed.runs.len());
+        assert!(experiment.comparison_summary.is_none());
+        for run in &completed.runs {
+            assert_eq!(run.state, "completed");
+            assert_eq!(run.seed, seed);
+            assert_eq!(run.total_ticks, ticks);
+            let digest = run
+                .final_digest
+                .as_ref()
+                .expect("actual completed science digest");
+            let arm = experiment
+                .active_arms
+                .iter()
+                .find(|arm| arm.variant_id == run.variant_id && arm.seed == run.seed)
+                .expect("exact completed run is projected");
+            assert_eq!(arm.brain_family, run.brain_family);
+            assert_eq!(arm.current_tick, Some(ticks));
+            assert_eq!(arm.target_ticks, ticks);
+            assert_eq!(&arm.digest, digest);
+            assert_ne!(arm.digest, "unavailable");
+            assert_eq!(arm.mean_fitness, None);
+            assert_eq!(arm.uncertainty_ci_95, None);
+        }
+        assert!(
+            completed
+                .runs
+                .iter()
+                .any(|run| run.variant_id == "baseline" && run.brain_family == "mlp.baseline")
+        );
+        assert!(
+            completed
+                .runs
+                .iter()
+                .any(|run| run.variant_id == "challenger" && run.brain_family == "dwraon.baseline")
+        );
+
+        // Direct service-to-view proof. The dummy runtime supplies only a healthy
+        // renderer context; this test does not exercise REST, service tasks, or PTY input.
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let app = TerminalApp::new(&renderer, host.context(&runtime));
+        let mut simulator = ftui::runtime::ProgramSimulator::new(
+            LiveTerminalModel::new(app).expect("actual live terminal model"),
+        );
+        for (route, messages) in [
+            (ShellRoute::Replay, replay_messages),
+            (ShellRoute::Experiments, experiment_messages),
+        ] {
+            {
+                let mut app = simulator.model().app.borrow_mut();
+                app.frankentui.update(ShellMessage::Navigate(route));
+                for mut message in messages {
+                    app.preserve_science_selection(&mut message);
+                    app.frankentui.update(message);
+                }
+            }
+            let frame = simulator.capture_frame(180, 28);
+            let text = frankentui_shell::buffer_to_string(frame);
+            match route {
+                ShellRoute::Replay => {
+                    let row = text
+                        .lines()
+                        .find(|line| line.contains(&checkpoint.checkpoint_id))
+                        .expect("real checkpoint identity is visibly rendered");
+                    assert_eq!(row.matches("unavailable").count(), 2);
+                    assert!(!text.contains(&checkpoint.checksum_blake3));
+                    assert!(!text.contains(&decoded.source_digest().overall));
+                    assert!(text.contains("No replay comparison recorded"));
+                    assert!(text.contains("Observed live tick: 0"));
+                }
+                ShellRoute::Experiments => {
+                    assert!(text.contains(experiment_id));
+                    assert!(text.contains("Batch Status: completed"));
+                    for run in &completed.runs {
+                        let row = text
+                            .lines()
+                            .find(|line| line.contains(&run.variant_id))
+                            .expect("real completed variant is visibly rendered");
+                        assert!(row.contains(&run.brain_family));
+                        assert!(row.contains("77"));
+                        assert!(row.contains("    2/2"));
+                        assert_eq!(row.matches("unavailable").count(), 2);
+                    }
+                }
+                _ => unreachable!("only the two observed provider routes are tested"),
+            }
+        }
+        assert_eq!(
+            host.port()
+                .scientific_digest_v1()
+                .expect("owner digest after service reads and actual views"),
+            owner_before
+        );
+        assert!(
+            artifacts
+                .join(format!("{}.bin", checkpoint.checkpoint_id))
+                .is_file()
+        );
+        assert!(
+            artifacts
+                .join("experiments")
+                .join(experiment_id)
+                .join("status.json")
+                .is_file()
+        );
     }
 
     // Source-derived fixture goldens for the production LiveTerminalModel view,
@@ -16359,7 +16998,7 @@ for case in ('panic', 'subscription', 'renderer'):
         "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
         "",
         "    HOST & STORAGE PIPELINE HEALTH:",
-        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
         "      Introspection Neutrality: not measured",
         "",
@@ -16379,7 +17018,7 @@ for case in ('panic', 'subscription', 'renderer'):
         "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
         "",
         "    HOST & STORAGE PIPELINE HEALTH:",
-        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
         "      Introspection Neutrality: not measured",
         "",
@@ -16399,7 +17038,7 @@ for case in ('panic', 'subscription', 'renderer'):
         "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
         "",
         "    HOST & STORAGE PIPELINE HEALTH:",
-        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
         "      Introspection Neutrality: not measured",
         "",
@@ -16419,7 +17058,7 @@ for case in ('panic', 'subscription', 'renderer'):
         "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
         "",
         "    HOST & STORAGE PIPELINE HEALTH:",
-        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
         "      Introspection Neutrality: not measured",
         "",
@@ -16439,7 +17078,7 @@ for case in ('panic', 'subscription', 'renderer'):
         "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
         "",
         "    HOST & STORAGE PIPELINE HEALTH:",
-        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Admitted Command Queue:  0/8 (0% capacity)",
         "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
         "      Introspection Neutrality: not measured",
         "",
@@ -16623,10 +17262,16 @@ for case in ('panic', 'subscription', 'renderer'):
                 .clone();
             let actual = captured_live_golden_cells(&captured, simulator.pool());
             let expected = expected_live_golden_cells(rows);
-            assert_eq!(
-                actual, expected,
-                "complete production-model fixture frame: {name}"
-            );
+            assert_eq!(actual.len(), expected.len(), "complete frame cell count");
+            for (index, (observed, declared)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    observed,
+                    declared,
+                    "complete production-model fixture {name}, cell ({}, {})",
+                    index % usize::from(LIVE_DIAGNOSTICS_GOLDEN_WIDTH),
+                    index / usize::from(LIVE_DIAGNOSTICS_GOLDEN_WIDTH)
+                );
+            }
             for (prior_name, prior_frame) in &frames {
                 assert_ne!(&actual, prior_frame, "{name} and {prior_name} must differ");
             }
@@ -16710,57 +17355,246 @@ for case in ('panic', 'subscription', 'renderer'):
 
     #[test]
     fn live_receipt_refresh_observes_owner_application_without_extra_science() {
-        let host = TerminalTestHost::take(command_characterization_world());
+        use scriptbots_runtime::ManualInstant;
+
+        for supplied_envelope in [false, true] {
+            let (mut driver, port) = terminal_manual_driver(
+                command_characterization_world(),
+                scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity,
+            );
+            let (runtime, _) = ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let mut app = TerminalApp::new(
+                &renderer,
+                TerminalTestHost::port_context(port.clone(), &runtime),
+            );
+            let initial_tick = app.snapshot.tick;
+            let id = if supplied_envelope {
+                let envelope = app
+                    .prepare_envelope(ControlCommand::SetSpeed(2.5), None)
+                    .expect("prepare actual command identity");
+                let id = envelope.command_id.to_string();
+                assert!(matches!(
+                    app.submit_envelope(envelope.clone()),
+                    Err(TerminalCommandError::Host(
+                        HostAccessError::ProtocolViolation { .. }
+                    ))
+                ));
+                let retained = app
+                    .unresolved_commands
+                    .front()
+                    .expect("retained exact intent");
+                assert_eq!(retained.envelope, envelope);
+                app.retry_unresolved_command();
+                assert_eq!(
+                    app.unresolved_commands
+                        .front()
+                        .expect("retry retains the same canonical envelope")
+                        .envelope,
+                    envelope
+                );
+                id
+            } else {
+                app.submit_with_visible_receipt(ControlCommand::SetSpeed(2.5))
+                    .expect("unresolved real admission retains its identity")
+            };
+            assert_eq!(
+                app.speed_multiplier, 1.0,
+                "admission cannot mutate renderer playback"
+            );
+            let receipt = app
+                .frankentui
+                .receipt_for(&id)
+                .expect("unresolved receipt");
+            assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Pending);
+            assert_eq!(receipt.journal_state, None);
+
+            assert_eq!(
+                driver
+                    .step(ManualInstant::from_nanos(0))
+                    .expect("owner applies the actual queued command")
+                    .admitted,
+                1,
+                "an exact retry must not admit another command identity"
+            );
+            app.refresh_command_receipts();
+            let receipt = app
+                .frankentui
+                .receipt_for(&id)
+                .expect("actual application");
+            assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
+            assert_eq!(receipt.journal_state, Some(JournalState::Pending));
+            assert!(app.unresolved_commands.is_empty());
+
+            // Only history pressure is a fixture. The pending application and
+            // subsequent journal completion both come from the actual owner.
+            for ordinal in 0..frankentui_shell::MAX_RECEIPTS {
+                let mut finished = frankentui_shell::CommandReceiptEntry::new(
+                    format!("fixture-finished-{ordinal}"),
+                    "Fixture history pressure",
+                    frankentui_shell::ReceiptStatusKind::Rejected("fixture refusal".into()),
+                );
+                finished.journal_state = Some(JournalState::NotRequired);
+                assert!(app.frankentui.record_receipt(finished));
+            }
+            assert_eq!(app.frankentui.receipts.len(), frankentui_shell::MAX_RECEIPTS);
+            assert_eq!(
+                app.frankentui
+                    .receipt_for(&id)
+                    .expect("pending journal identity survives history pressure")
+                    .journal_state,
+                Some(JournalState::Pending)
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut owner_time = 1;
+            loop {
+                driver
+                    .step(ManualInstant::from_nanos(owner_time))
+                    .expect("owner polls its independent journal receipt");
+                owner_time += 1;
+                app.refresh_command_receipts();
+                let receipt = app
+                    .frankentui
+                    .receipt_for(&id)
+                    .expect("retained application");
+                assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
+                if receipt.journal_state == Some(JournalState::CommittedVolatile) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "independent journal finality was not observed: {receipt:?}"
+                );
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+            app.maybe_step_simulation(Instant::now());
+            assert_eq!(app.speed_multiplier, 2.5);
+            assert!(
+                app.frankentui.receipt_for(&id).is_some(),
+                "the observed final receipt remains in bounded history"
+            );
+            assert_eq!(
+                app.snapshot.tick, initial_tick,
+                "receipt observation cannot step science"
+            );
+            assert_eq!(port.snapshot_hub().latest().revisions.control.get(), 1);
+        }
+    }
+
+    #[test]
+    fn fixture_unfinished_receipt_history_guards_every_writer_before_owner_admission() {
+        use frankentui_shell::{CommandReceiptEntry, ReceiptStatusKind, ShellMessage};
+        use scriptbots_runtime::ManualInstant;
+
+        let (mut driver, port) = terminal_manual_driver(
+            command_characterization_world(),
+            scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity,
+        );
         let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
-        let initial_tick = app.snapshot.tick;
+        let mut app = TerminalApp::new(
+            &renderer,
+            TerminalTestHost::port_context(port.clone(), &runtime),
+        );
+        // These injected entries test capacity only. Real application and
+        // independent journal finality are exercised in the neighboring test.
+        for ordinal in 0..frankentui_shell::MAX_RECEIPTS {
+            let status = match ordinal % 4 {
+                0 => ReceiptStatusKind::Applied,
+                1 => ReceiptStatusKind::Rejected("fixture rejection".into()),
+                2 => ReceiptStatusKind::Failed("fixture failure".into()),
+                _ => ReceiptStatusKind::Admitted,
+            };
+            let mut receipt = CommandReceiptEntry::new(
+                format!("fixture-unfinished-{ordinal}"),
+                "Fixture unfinished history",
+                status,
+            );
+            receipt.journal_state = Some(if ordinal % 4 == 3 {
+                JournalState::NotRequired
+            } else {
+                JournalState::Pending
+            });
+            assert!(receipt.awaits_observation());
+            assert!(app.frankentui.record_receipt(receipt));
+        }
+        let before_ids: Vec<_> = app
+            .frankentui
+            .receipts
+            .iter()
+            .map(|receipt| receipt.command_id.clone())
+            .collect();
+        let sequence = app.command_sequence;
+        let checkpoint_sequence = app.frankentui.command_counter;
+        assert!(!app.frankentui.has_receipt_capacity());
+        assert!(
+            app.submit_with_visible_receipt(ControlCommand::SetSpeed(2.5))
+                .is_none()
+        );
+        assert!(matches!(
+            app.prepare_envelope(ControlCommand::SetSpeed(2.5), None),
+            Err(TerminalCommandError::ReceiptHistoryFull)
+        ));
+        assert!(matches!(
+            app.submit_envelope(CommandEnvelope::new(
+                CommandId::new(999),
+                HostCommand::SetSpeed(2.5),
+            )),
+            Err(TerminalCommandError::ReceiptHistoryFull)
+        ));
+        app.frankentui.update(ShellMessage::CreateCheckpoint);
+        assert_eq!(app.frankentui.command_counter, checkpoint_sequence);
+        assert_eq!(app.frankentui.drain_effects().count(), 0);
+        assert!(!app.frankentui.record_receipt(CommandReceiptEntry::new(
+            "fixture-overflow",
+            "Fixture overflow",
+            ReceiptStatusKind::Pending,
+        )));
+        assert_eq!(app.command_sequence, sequence);
+        assert!(app.unresolved_commands.is_empty());
+        assert_eq!(
+            app.frankentui
+                .receipts
+                .iter()
+                .map(|receipt| receipt.command_id.clone())
+                .collect::<Vec<_>>(),
+            before_ids
+        );
+        assert_eq!(
+            driver
+                .step(ManualInstant::from_nanos(0))
+                .expect("refused commands cannot reach the owner")
+                .admitted,
+            0
+        );
+        assert_eq!(port.snapshot_hub().latest().revisions.control.get(), 0);
+        assert_eq!(port.snapshot_hub().latest().world.tick.0, 0);
+
+        // A fixture finalization frees a safe slot; existing IDs may always
+        // advance while full. It does not supply any real journal result.
+        let mut finished = app.frankentui.receipts[0].clone();
+        finished.journal_state = Some(JournalState::NotRequired);
+        assert!(app.frankentui.can_record_receipt(&finished.command_id));
+        assert!(app.frankentui.record_receipt(finished));
+        assert!(app.frankentui.has_receipt_capacity());
         let id = app
             .submit_with_visible_receipt(ControlCommand::SetSpeed(2.5))
-            .expect("real admission");
+            .expect("a real command may use the finished history slot");
+        assert_eq!(app.frankentui.receipts.len(), frankentui_shell::MAX_RECEIPTS);
+        driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("owner applies the admitted command after capacity recovers");
+        app.refresh_command_receipts();
         assert_eq!(
-            app.speed_multiplier, 1.0,
-            "admission cannot mutate renderer playback"
-        );
-        assert!(matches!(
             app.frankentui
-                .receipts
-                .back()
-                .expect("actual admission receipt")
+                .receipt_for(&id)
+                .expect("actual application")
                 .status,
-            frankentui_shell::ReceiptStatusKind::Pending
-                | frankentui_shell::ReceiptStatusKind::Admitted
-                | frankentui_shell::ReceiptStatusKind::Applied
-        ));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            app.refresh_command_receipts();
-            if app.frankentui.receipts.iter().any(|receipt| {
-                receipt.command_id == id
-                    && matches!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied)
-            }) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "owner application was not observed"
-            );
-            std::thread::park_timeout(Duration::from_millis(1));
-        }
-        app.maybe_step_simulation(Instant::now());
-        assert_eq!(app.speed_multiplier, 2.5);
-        assert_eq!(
-            app.snapshot.tick, initial_tick,
-            "receipt observation cannot step science"
+            ReceiptStatusKind::Applied
         );
-        assert!(matches!(
-            app.frankentui
-                .receipts
-                .back()
-                .expect("observed receipt")
-                .journal_state,
-            Some(JournalState::CommittedVolatile)
-        ));
+        assert_eq!(port.snapshot_hub().latest().revisions.control.get(), 1);
+        assert_eq!(port.snapshot_hub().latest().world.tick.0, 0);
     }
 
     fn terminal_manual_driver(
@@ -16771,6 +17605,7 @@ for case in ('panic', 'subscription', 'renderer'):
         ChannelHostPort,
     ) {
         let world = Arc::try_unwrap(world)
+            // ubs:ignore[rust.ownership.panic-macro] — test requires sole-owner construction.
             .unwrap_or_else(|_| panic!("manual driver takes sole world ownership"))
             .into_inner()
             .expect("fixture world mutex");
@@ -18249,6 +19084,7 @@ for case in ('panic', 'subscription', 'renderer'):
             std::fs::write(path, candidate).expect("write regenerated golden");
             // Deliberately not a silent success: a run that rewrote the committed
             // evidence must say so, or a stray env var looks like a passing test.
+            // ubs:ignore[rust.ownership.panic-macro] — golden rewrite must fail this test.
             panic!(
                 "RUST_REGEN_GOLDEN was set: rewrote {} ({} bytes). Review the diff \
                  and re-run WITHOUT the variable to verify.",
@@ -18258,6 +19094,7 @@ for case in ('panic', 'subscription', 'renderer'):
         }
 
         let Ok(golden) = std::fs::read_to_string(path) else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires a committed expectation.
             panic!(
                 "no committed golden at {}. It is NOT created automatically. Review \
                  the candidate below, save it to that path, and commit it:\n\n{candidate}",
@@ -19007,6 +19844,7 @@ for case in ('panic', 'subscription', 'renderer'):
             let evidence = HeadlessBufferEvidence::inspect(&buffer, tick, &layout)
                 .expect("capability frame must be inspectable");
             if let Some(previous) = seen.insert(evidence.full_cell_fnv1a64.clone(), row.label) {
+                // ubs:ignore[rust.ownership.panic-macro] — test rejects identical capability rows.
                 panic!(
                     "capability tiers {previous:?} and {:?} rendered the SAME frame \
                      ({}). Two tiers that cannot be told apart mean the renderer did \
@@ -21291,12 +22129,15 @@ for case in ('panic', 'subscription', 'renderer'):
             ),
             "expected Disconnected error after host shutdown, got {disconnect_result:?}"
         );
-        assert!(app.frankentui.has_failed_receipt());
         let latest = app.frankentui.latest_receipt().expect("latest receipt");
-        assert!(matches!(
-            latest.status,
-            frankentui_shell::ReceiptStatusKind::Failed(_)
-        ));
+        assert_eq!(latest.status, frankentui_shell::ReceiptStatusKind::Pending);
+        assert_eq!(latest.journal_state, None);
+        let unresolved = app
+            .unresolved_commands
+            .back()
+            .expect("unphased disconnection retains the exact unresolved envelope");
+        assert_eq!(latest.command_id, unresolved.envelope.command_id.to_string());
+        assert_eq!(unresolved.envelope.command, HostCommand::Pause);
     }
 
     #[test]
@@ -22697,7 +23538,29 @@ for case in ('panic', 'subscription', 'renderer'):
                 submitted.command_id.clone(),
             ))
             .expect("receipt carries the runtime command identity");
-            let applied = wait_for_terminal_receipt(app, &submitted.command_id);
+            let application = wait_for_terminal_receipt(app, &submitted.command_id);
+            assert_eq!(
+                application.status,
+                frankentui_shell::ReceiptStatusKind::Applied
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let applied = loop {
+                app.refresh_command_receipts();
+                let receipt = app
+                    .frankentui
+                    .receipt_for(&submitted.command_id)
+                    .expect("the applied identity remains retained")
+                    .clone();
+                assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
+                if receipt.journal_state == Some(JournalState::CommittedVolatile) {
+                    break receipt;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "independent journal finality was not observed: {receipt:?}"
+                );
+                std::thread::park_timeout(Duration::from_millis(1));
+            };
             assert_eq!(applied.status, frankentui_shell::ReceiptStatusKind::Applied);
             assert_eq!(applied.journal_state, Some(JournalState::CommittedVolatile));
             let owner_status = app
@@ -22710,6 +23573,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 ApplicationState::Applied(_)
             ));
             assert_eq!(owner_status.command_id(), command_id);
+            assert_eq!(owner_status.journal(), &JournalState::CommittedVolatile);
             assert_eq!(
                 app.host.snapshot_hub().latest().world.agents.len(),
                 before.world.agents.len() + 1,

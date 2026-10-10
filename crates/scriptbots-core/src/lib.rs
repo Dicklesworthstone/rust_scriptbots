@@ -4781,6 +4781,7 @@ const fn derive_eye_channel_indices() -> [[usize; 4]; NUM_EYES] {
                 SensorKind::EyeRed => 1,
                 SensorKind::EyeGreen => 2,
                 SensorKind::EyeBlue => 3,
+                // ubs:ignore[rust.ownership.panic-macro] — const sensor-layout validation rejects an invalid eye owner at build time.
                 _ => panic!("non-eye sensor channel carries an eye owner"),
             };
             assert!(
@@ -21701,6 +21702,24 @@ impl WorldState {
             last_admitted_tick: None,
             binding: Arc::clone(&self.persistence_binding),
         })
+    }
+
+    /// Borrow the exact tick-zero arrival prefix while its complete lifecycle is retained.
+    ///
+    /// This is an open genesis observation, not a completed tick. A late-start world,
+    /// drained origins, or any death/removal refuses completeness rather than deriving
+    /// parents or survival from the current population snapshot.
+    #[must_use]
+    pub fn genesis_origin_records(&self) -> Option<&[BirthRecord]> {
+        if self.tick != Tick::zero()
+            || !self.pending_death_records.is_empty()
+            || !self.pending_deaths.is_empty()
+            || self.pending_birth_records.len() != self.agents.len()
+            || u64::try_from(self.pending_birth_records.len()).ok() != Some(self.next_spawn_ordinal)
+        {
+            return None;
+        }
+        Some(&self.pending_birth_records)
     }
 
     /// Attach an external persistence session to a restored world with an explicit cadence and replay cap.
@@ -39706,6 +39725,7 @@ mod tests {
             } else if child_fov == secondary_fov {
                 1
             } else {
+                // ubs:ignore[rust.ownership.panic-macro] — test rejects offspring FOV outside both complete parental vectors.
                 panic!("FOV crossover split a parent vector at seed {seed}: {child_fov:?}");
             };
             let child_direction = child.eye_direction.map(f32::to_bits);
@@ -39714,6 +39734,7 @@ mod tests {
             } else if child_direction == secondary_direction {
                 1
             } else {
+                // ubs:ignore[rust.ownership.panic-macro] — test rejects offspring direction outside both complete parental vectors.
                 panic!(
                     "direction crossover split a parent vector at seed {seed}: {child_direction:?}"
                 );
@@ -43567,9 +43588,11 @@ mod tests {
             let registration = registry.register_family("fixture-kind", Box::new(family));
             match registration {
                 Err(BrainProtocolError::InvalidHeredityCapability { detail, .. }) => detail,
+                // ubs:ignore[rust.ownership.panic-macro] — test rejects a different error for a malformed heredity declaration.
                 Err(other) => panic!("expected invalid heredity declaration, found {other:?}"),
                 Ok(_) => match registry.heredity_capabilities() {
                     Err(BrainProtocolError::InvalidHeredityCapability { detail, .. }) => detail,
+                    // ubs:ignore[rust.ownership.panic-macro] — test rejects acceptance or a different error for a false declaration.
                     other => panic!("expected invalid heredity declaration, found {other:?}"),
                 },
             }
@@ -43674,6 +43697,7 @@ mod tests {
             }
             match registry.heredity_capabilities() {
                 Err(BrainProtocolError::InvalidHeredityCapability { identity, .. }) => identity,
+                // ubs:ignore[rust.ownership.panic-macro] — test requires deterministic rejection of the undeclared capabilities.
                 other => panic!("expected deterministic capability rejection, found {other:?}"),
             }
         }
@@ -43761,6 +43785,7 @@ mod tests {
             mutation_trials, ..
         } = &left.descriptors[0].capability
         else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires the registered locus-capable fixture before checking trial groups.
             panic!("fixture capability was not locus-capable");
         };
         assert_eq!(
@@ -43840,6 +43865,7 @@ mod tests {
             mutation_trials, ..
         } = &snapshot.descriptors[0].capability
         else {
+            // ubs:ignore[rust.ownership.panic-macro] — test rejects loss of the actual registered locus capability during read-only projection.
             panic!("fixture capability was not retained");
         };
         assert_eq!(
@@ -44162,6 +44188,7 @@ mod tests {
             let agent = protocol_fixture_parent(&mut world, key, 41);
             let runtime = world.agent_runtime_mut(agent).expect("runtime");
             let BrainBinding::Protocol { evaluator, .. } = &mut runtime.brain else {
+                // ubs:ignore[rust.ownership.panic-macro] — test requires a protocol fixture before injecting the typed evaluator fault.
                 panic!("fixture must be protocol bound");
             };
             let fault = BrainExecutionFault::NonFiniteState { index: 17, bits };
@@ -47699,6 +47726,7 @@ mod tests {
             world.latched_step_error(),
             Some(WorldStepError::ScientificState(
                 ScientificStateError::PersistenceBoundaryUnresolved { ref path, tick: 1 }
+            // ubs:ignore[rust.security.constant-time-compare] — compares a public diagnostic call-site label, not a secret or token.
             )) if path == "world.step"
         ));
         assert!(matches!(
@@ -48643,7 +48671,9 @@ mod tests {
         const ROOT_SEED: u64 = 0xD157_AA7E;
         const STEPS: u64 = 5;
 
+        // ubs:ignore[rust.security.non-crypto-random] — fixed-seed reproduction-admission draws test deterministic simulation behavior.
         let draws = (0..STEPS)
+            // ubs:ignore[rust.security.non-crypto-random] — ordinals address simulation RNG draws; this mapping generates no credentials.
             .map(|ordinal| {
                 let mut rng = agent_substream(
                     ROOT_SEED,
@@ -48651,6 +48681,7 @@ mod tests {
                     AgentRngOperationV1::ReproductionAdmission,
                     ordinal,
                 );
+                // ubs:ignore[rust.security.non-crypto-random] — this uniform simulation draw sets a test reproduction rejection probability.
                 rng.random_range(0.0..1.0)
             })
             .collect::<Vec<_>>();
@@ -50393,6 +50424,7 @@ mod tests {
             let mut direct = ScriptBotsConfig::default();
             preset.apply_to_config(&mut direct);
             if let Err(error) = direct.validate() {
+                // ubs:ignore[rust.ownership.panic-macro] — test rejects any preset that fails configuration validation on real defaults.
                 panic!("{} on the default config: {error}", preset.as_str());
             }
 

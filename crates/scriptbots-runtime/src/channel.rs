@@ -365,6 +365,12 @@ impl ChannelHostPort {
         self.snapshots.clone()
     }
 
+    /// Clone the detached canonical event and genesis reader without command ingress.
+    #[must_use]
+    pub fn event_hub(&self) -> EventHub {
+        self.events.clone()
+    }
+
     fn read_owner<R>(
         &self,
         message: impl FnOnce(Sender<Result<R, HostAccessError>>) -> IngressMessage,
@@ -2181,6 +2187,7 @@ mod tests {
         let resolved = wait_resolved(&mut port, CommandId::new(31));
         match resolved.application() {
             ApplicationState::Rejected(RejectionReason::ControlRevisionConflict { .. }) => {}
+            // ubs:ignore[rust.ownership.panic-macro] — test requires the revision conflict.
             other => panic!("expected control-revision conflict, got {other:?}"),
         }
         assert!(resolved.admission_sequence().is_some());
@@ -2199,6 +2206,7 @@ mod tests {
             .expect("submit");
         match status.application() {
             ApplicationState::Rejected(RejectionReason::Validation { .. }) => {}
+            // ubs:ignore[rust.ownership.panic-macro] — test requires the validation failure.
             other => panic!("expected validation rejection, got {other:?}"),
         }
         assert!(status.admission_sequence().is_none());
@@ -2502,6 +2510,7 @@ mod tests {
             | IngressMessage::WorldDigests { .. }
             | IngressMessage::CaptureCheckpoint { .. }
             | IngressMessage::ScientificDigest { .. } => {
+                // ubs:ignore[rust.ownership.panic-macro] — test requires the submission message.
                 panic!("expected command submission")
             }
         }
@@ -2683,6 +2692,7 @@ mod tests {
             | IngressMessage::WorldDigests { .. }
             | IngressMessage::CaptureCheckpoint { .. }
             | IngressMessage::ScientificDigest { .. } => {
+                // ubs:ignore[rust.ownership.panic-macro] — test requires the status lookup.
                 panic!("expected command-status lookup")
             }
         }

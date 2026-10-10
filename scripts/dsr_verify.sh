@@ -88,6 +88,24 @@ verify_evidence() {
                 and .binary_source_observed == true
                 and (if .capability_profile == "truecolor" then .observed_truecolor_sgr_count > 0
                      else .observed_color_sgr_count == 0 end)
+                and (if .capability_profile == "truecolor" then
+                    .data_provider_evidence as $e
+                    | $e.checkpoint.new_catalog_entries == 1 and $e.checkpoint.byte_size > 0
+                    and $e.checkpoint.visible_application_receipt == "[APPLIED] journal=unobserved CreateCheckpoint: applied id=checkpoint-request-1"
+                    and ($e.checkpoint.checkpoint_id | type) == "string"
+                    and $e.experiment.status == "completed" and $e.experiment.total_runs == 1
+                    and $e.experiment.completed_runs == 1 and $e.experiment.failed_runs == 0
+                    and $e.experiment.run.state == "completed" and $e.experiment.run.total_ticks == 3
+                    and ($e.experiment.run.final_digest | test("^[0-9a-f]{64}$"))
+                    and $e.refresh.pause_receipt.application_state == "applied"
+                    and $e.refresh.step_receipt.application_state == "applied"
+                    and $e.refresh.after_tick == ($e.refresh.before_tick + 1)
+                    and $e.refresh.after_snapshot_revision > $e.refresh.before_snapshot_revision
+                    and $e.refresh.paused_before == true and $e.refresh.paused_after == true
+                    and $e.refresh.terminal_input_count_during_change == 0
+                    and ($e.artifacts | length) > 0
+                    and ([$e.artifacts[].file] | length) == ([$e.artifacts[].file] | unique | length)
+                  else .data_provider_evidence == null end)
                 and .raw_mode_observed == true and .terminal_attributes_restored == true
                 and .alternate_screen_restored == true and .frankentui_shutdown_observed == true
                 and (.observed_science_routes | length) > 0
@@ -111,6 +129,26 @@ verify_evidence() {
                 [[ $(sha256sum "$artifact_directory/terminal-screen-$index.txt" | cut -d ' ' -f 1) == "$terminal_hash" ]] || refuse "changed observed terminal screen"
                 index=$((index + 1))
             done < <(jq -c '.observed_screenshot_routes[]' <<< "$record")
+            if [[ $(jq -r '.capability_profile' <<< "$record") == truecolor ]]; then
+                local provider_file provider_hash provider_record
+                while IFS= read -r provider_record; do
+                    provider_file=$(jq -er '.file' <<< "$provider_record") || refuse "missing provider artifact filename"
+                    [[ "$provider_file" =~ ^[A-Za-z0-9._-]+$ ]] || refuse "invalid provider artifact filename"
+                    provider_hash=$(jq -er '.sha256' <<< "$provider_record") || refuse "missing provider artifact identity"
+                    [[ $(sha256sum "$artifact_directory/$provider_file" | cut -d ' ' -f 1) == "$provider_hash" ]] || refuse "changed provider observation"
+                done < <(jq -c '.data_provider_evidence.artifacts[]' <<< "$record")
+                jq -e '.total == 0 and (.items | length) == 0' "$artifact_directory/checkpoint-catalog-before.json" >/dev/null || refuse "checkpoint catalog was not initially empty"
+                jq -e --arg id "$(jq -r '.data_provider_evidence.checkpoint.checkpoint_id' <<< "$record")" \
+                    '.total == 1 and (.items | length) == 1 and .items[0].checkpoint_id == $id' \
+                    "$artifact_directory/checkpoint-catalog-after.json" >/dev/null || refuse "new checkpoint observation differs"
+                for provider_file in checkpoint-positive-terminal.txt checkpoint-positive-screen.txt; do
+                    rg -Fq -- "$(jq -r '.data_provider_evidence.checkpoint.visible_application_receipt' <<< "$record")" "$artifact_directory/$provider_file" || refuse "missing visible checkpoint application receipt"
+                    rg -Fq -- "Checkpoint $(jq -r '.data_provider_evidence.checkpoint.checkpoint_id' <<< "$record") recorded at tick $(jq -r '.data_provider_evidence.checkpoint.tick' <<< "$record")" "$artifact_directory/$provider_file" || refuse "missing visible checkpoint result identity"
+                done
+                jq -e --arg id "$(jq -r '.data_provider_evidence.experiment.experiment_id' <<< "$record")" \
+                    '.experiment_id == $id and .status == "completed" and .completed_runs == 1 and .failed_runs == 0 and (.runs | length) == 1' \
+                    "$artifact_directory/experiment-completed.json" >/dev/null || refuse "completed experiment observation differs"
+            fi
         done < <(jq -R -c 'fromjson? | select(.schema == "scriptbots.live-tui-pty.v1")' "$directory/terminal-end-to-end-tests.log")
     fi
     if [[ "$lane" == connectivity ]]; then
@@ -335,7 +373,7 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
     terminal)
         run_step workspace-check check cargo check --locked --workspace --all-targets
         run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
-        run_step terminal-runtime-tests test cargo test --locked -p scriptbots-runtime --lib channel::tests:: -- --nocapture
+        run_step terminal-runtime-tests test cargo test --locked -p scriptbots-runtime --lib -- --nocapture
         run_step terminal-unit-tests test cargo test --locked -p scriptbots-app --lib terminal:: -- --nocapture
         run_step terminal-end-to-end-tests test cargo test --locked -p scriptbots-app --test terminal_end_to_end -- --nocapture
         run_step terminal-smoke-tests test cargo test --locked -p scriptbots-app --test terminal_smoke -- --nocapture
@@ -392,7 +430,7 @@ run_step analytics-binary check cargo build --locked -p scriptbots-analytics --b
 cmp "$SCRIPTBOTS_VERIFY_PROFILE" "$proof_dir/profile.yaml"
 [[ $(git rev-parse HEAD) == "$actual_commit" && -z $(git status --porcelain --untracked-files=all) ]]
 jq -n --arg source "$actual_commit" --arg lane "$SCRIPTBOTS_VERIFY_LANE" --arg target "$actual_target" --argjson completed_steps "$steps" \
-    '{schema:"scriptbots.verification.v1",status:"pass",source:$source,lane:$lane,target:$target,exit_code:0,completed_steps:$completed_steps,scope:"named correctness lane only; no GUI, PTY, browser or performance claim"}' > "$proof_dir/verdict.json"
+    '{schema:"scriptbots.verification.v1",status:"pass",source:$source,lane:$lane,target:$target,exit_code:0,completed_steps:$completed_steps,scope:"named correctness lane only; terminal lane includes local PTY; no hardware GUI, browser, full research journey or performance claim"}' > "$proof_dir/verdict.json"
 jq -e --arg source "$SCRIPTBOTS_EXPECTED_COMMIT" --arg lane "$SCRIPTBOTS_VERIFY_LANE" \
     '.status == "pass" and .exit_code == 0 and .source == $source and .lane == $lane and .completed_steps > 0' "$proof_dir/verdict.json"
 verify_evidence "$proof_dir" "$SCRIPTBOTS_EXPECTED_COMMIT" "$SCRIPTBOTS_VERIFY_LANE"

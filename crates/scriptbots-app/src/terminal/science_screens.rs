@@ -1053,7 +1053,7 @@ pub fn render_diagnostics_screen(
                 .filter(|capacity| *capacity > 0)
                 .map(|capacity| (data.host_queue_depth as f32 / capacity as f32) * 100.0);
             let queue_str = format!(
-                "    Host Ingress Queue: {:>2}/{} ({} capacity)",
+                "    Admitted Command Queue: {:>2}/{} ({} capacity)",
                 data.host_queue_depth,
                 observation_text(data.host_queue_capacity, |value| value.to_string()),
                 observation_text(q_ratio, |value| format!("{value:.0}%"))
@@ -1586,7 +1586,7 @@ mod tests {
             2
         );
         assert_eq!(
-            row(&frame, "Host Ingress Queue")
+            row(&frame, "Admitted Command Queue")
                 .matches("unavailable")
                 .count(),
             2
@@ -1657,8 +1657,8 @@ mod tests {
             ShellRoute::Diagnostics,
             ShellMessage::SetDiagnosticsData(ScreenDataState::Data(data)),
         );
-        assert!(row(&frame, "Host Ingress Queue").contains("0/0 (unavailable capacity)"));
-        assert!(!row(&frame, "Host Ingress Queue").contains("0%"));
+        assert!(row(&frame, "Admitted Command Queue").contains("0/0 (unavailable capacity)"));
+        assert!(!row(&frame, "Admitted Command Queue").contains("0%"));
         assert!(frame.contains("Introspection Neutrality: ✗ FAILED"));
         assert!(!frame.contains("CONFIRMED"));
         assert!(!frame.contains("Introspection mutated simulation state"));

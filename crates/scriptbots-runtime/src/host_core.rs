@@ -75,6 +75,8 @@ pub struct HostCoreOptions {
     pub protocol_event_capacity: usize,
     /// Canonical scientific records retained by the detached latest hot ring.
     pub scientific_event_capacity: usize,
+    /// Maximum canonical tick-zero origins retained by the detached genesis observer.
+    pub genesis_origin_capacity: usize,
     /// Exact committed batches retained by the default live-memory catch-up journal.
     pub volatile_event_history_capacity: usize,
     /// Whether each publication carries per-agent visual detail.
@@ -101,6 +103,7 @@ impl Default for HostCoreOptions {
             snapshot_interval_ticks: DEFAULT_SNAPSHOT_INTERVAL_TICKS,
             protocol_event_capacity: DEFAULT_PROTOCOL_EVENT_CAPACITY,
             scientific_event_capacity: DEFAULT_SCIENTIFIC_EVENT_CAPACITY,
+            genesis_origin_capacity: 16_384,
             volatile_event_history_capacity: DEFAULT_VOLATILE_EVENT_HISTORY_CAPACITY,
             capture_agent_visuals: false,
         }
@@ -2184,6 +2187,7 @@ impl HostCore {
         journal: Box<dyn JournalPort>,
         events: EventHub,
     ) -> Result<Self, HostCoreBuildError> {
+        events.refresh_genesis_origins(&world, options.genesis_origin_capacity);
         let revisions = HostRevisions {
             control: ControlRevision::new(0),
             scientific: ScientificRevision::new(world.tick().0),
@@ -3538,6 +3542,10 @@ impl HostCore {
     }
 
     fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
+        if self.world.tick() == Tick::zero() {
+            self.events
+                .refresh_genesis_origins(&self.world, self.options.genesis_origin_capacity);
+        }
         let revision = self.next_snapshot;
         let following_revision = revision
             .checked_next()
@@ -4192,6 +4200,10 @@ impl HostCore {
             .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
         // A cadence batch seals this tick before shutdown can add a replay anchor.
         // The request is consumed only when the completed persistence batch is ready.
+        if self.world.tick() == Tick::zero() {
+            self.events
+                .refresh_genesis_origins(&self.world, self.options.genesis_origin_capacity);
+        }
         self.world.request_replay_world_digest();
         let completion = match self.persistence.step_outcome(&mut self.world) {
             Ok(completion) => completion,
@@ -4212,6 +4224,7 @@ impl HostCore {
             }
         };
         self.playback.paused = true;
+        self.events.seal_genesis_origins();
         self.cadence_credit = 0;
         let scriptbots_core::StepCompletion {
             outcome,
@@ -4600,6 +4613,10 @@ impl HostCore {
             .scientific
             .checked_next()
             .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
+        if self.world.tick() == Tick::zero() {
+            self.events
+                .refresh_genesis_origins(&self.world, self.options.genesis_origin_capacity);
+        }
         self.world.request_replay_world_digest();
         let completion = match self.persistence.step_outcome(&mut self.world) {
             Ok(completion) => completion,
@@ -4613,6 +4630,7 @@ impl HostCore {
                 return Ok(ApplyResult::blocked());
             }
         };
+        self.events.seal_genesis_origins();
         let scriptbots_core::StepCompletion {
             outcome,
             fault: completed_fault,
@@ -4960,6 +4978,11 @@ fn validate_options(options: HostCoreOptions) -> Result<(), HostCoreBuildError> 
             message: "scientific_event_capacity must be nonzero".to_owned(),
         });
     }
+    if options.genesis_origin_capacity == 0 {
+        return Err(HostCoreBuildError::InvalidOptions {
+            message: "genesis_origin_capacity must be nonzero".to_owned(),
+        });
+    }
     if options.protocol_event_capacity == 0 {
         return Err(HostCoreBuildError::InvalidOptions {
             message: "protocol_event_capacity must be nonzero".to_owned(),
@@ -5149,9 +5172,83 @@ mod tests {
             snapshot_interval_ticks: 1,
             protocol_event_capacity: 256,
             scientific_event_capacity: 64,
+            genesis_origin_capacity: 16_384,
             volatile_event_history_capacity: 512,
             capture_agent_visuals: false,
         }
+    }
+
+    #[test]
+    fn genesis_origins_retain_real_seed_and_tick_zero_spawn_without_changing_tick_deltas() {
+        let mut world = world(0);
+        let founder = world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("actual seeded founder");
+        let founder_uid = world.agent_uid(founder).expect("actual founder UID");
+        let mut core = HostCore::new(HostSessionId::new(0x4745_4e45), world, options(true))
+            .expect("real genesis owner");
+        let hub = core.event_hub();
+        let held_initial = hub.genesis_origins();
+        let mut port = core.local_port();
+        submit(
+            &mut port,
+            1,
+            HostCommand::SpawnAgent {
+                herbivore_tendency: 0.75,
+            },
+        );
+        core.drive(ManualInstant::from_nanos(0))
+            .expect("real tick-zero command boundary");
+        let actual_origins = core
+            .world
+            .genesis_origin_records()
+            .expect("actual canonical pending origins")
+            .to_vec();
+        assert_eq!(actual_origins.len(), 2);
+        assert_eq!(actual_origins[0].agent_uid, founder_uid);
+        assert_eq!(actual_origins[0].origin, scriptbots_core::BirthOrigin::Seeded);
+        assert_eq!(
+            actual_origins[1].origin,
+            scriptbots_core::BirthOrigin::Injected
+        );
+        assert_ne!(actual_origins[0].agent_uid, actual_origins[1].agent_uid);
+        assert!(matches!(
+            held_initial.as_ref(),
+            crate::GenesisOrigins::Open { origins }
+                if origins.len() == 1 && origins[0].agent_uid == founder_uid
+        ));
+        assert!(matches!(
+            hub.genesis_origins().as_ref(),
+            crate::GenesisOrigins::Open { origins }
+                if origins.as_ref() == &actual_origins
+        ));
+        assert_eq!(core.world_tick(), Tick::zero());
+        assert_eq!(hub.published_total(), 0);
+        submit(&mut port, 2, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(1))
+            .expect("first actual step");
+        let digest = core.scientific_digest_v1().expect("owner science digest");
+        assert!(matches!(
+            hub.genesis_origins().as_ref(),
+            crate::GenesisOrigins::Sealed { origins }
+                if origins.as_ref() == &actual_origins
+        ));
+        assert_eq!(hub.published_total(), 1);
+        let crate::EventPoll::Contiguous(page) = hub
+            .poll(crate::EventCursor::beginning(core.session_id), 1)
+            .expect("actual first scientific event")
+        else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires retained canonical tick one.
+            panic!("first scientific event must remain contiguous");
+        };
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.tick, Tick(1));
+        assert!(page.events[0].event.boundary.births().is_empty());
+        assert_eq!(page.events[0].event.boundary.summary().births, 0);
+        assert_eq!(
+            core.scientific_digest_v1().expect("owner science digest"),
+            digest
+        );
     }
 
     fn host(paused: bool) -> (HostCore, LocalHostPort) {
@@ -5179,6 +5276,7 @@ mod tests {
     fn applied(status: &CommandStatus) -> AppliedCommand {
         match status.application() {
             ApplicationState::Applied(applied) => *applied,
+            // ubs:ignore[rust.ownership.panic-macro] — test helper requires real application.
             application => panic!("expected applied status, got {application:?}"),
         }
     }
@@ -5977,7 +6075,10 @@ mod tests {
                     &projection_matrix_request(client),
                     ProjectionLimits::default(),
                 )
-                .unwrap_or_else(|error| panic!("projection client {client} failed: {error}"));
+                .unwrap_or_else(|error| {
+                    // ubs:ignore[rust.ownership.panic-macro] — matrix test fails on projection error.
+                    panic!("projection client {client} failed: {error}")
+                });
             assert_eq!(projection.source.snapshot, source.revision);
             assert_eq!(projection.source.host, revisions_before);
             if client == 0 {
@@ -6732,7 +6833,10 @@ mod tests {
                     0,
                     Generation(0),
                 ))
-                .unwrap_or_else(|error| panic!("snapshot agent {ordinal} failed: {error}"));
+                .unwrap_or_else(|error| {
+                    // ubs:ignore[rust.ownership.panic-macro] — measurement fixture requires spawning.
+                    panic!("snapshot agent {ordinal} failed: {error}")
+                });
         }
     }
 
@@ -7076,6 +7180,7 @@ mod tests {
                 let projection = fanout_broker
                     .project(&source, &projection_matrix_request(client), limits)
                     .unwrap_or_else(|error| {
+                        // ubs:ignore[rust.ownership.panic-macro] — fanout test requires every projection.
                         panic!("cold fanout projection {client} failed: {error}")
                     });
                 fanout_agents_examined =
@@ -7317,12 +7422,14 @@ mod tests {
         {
             crate::EventPoll::Gap(gap) => gap,
             other @ crate::EventPoll::Contiguous(_) => {
+                // ubs:ignore[rust.ownership.panic-macro] — test requires observed hot-ring expiry.
                 panic!("wrapped hot ring must report a gap, got {other:?}")
             }
         };
         let locator = match gap.catch_up {
             crate::EventCatchUpState::Available(locator) => locator,
             other @ crate::EventCatchUpState::Unavailable(_) => {
+                // ubs:ignore[rust.ownership.panic-macro] — test requires retained live catch-up.
                 panic!("lightweight live catch-up must be available, got {other:?}")
             }
         };
@@ -7349,6 +7456,7 @@ mod tests {
             .catch_up_events(&mut slow, locator, 1)
             .expect("catch up after config churn");
         let EventCatchUp::Contiguous(page) = caught_up else {
+            // ubs:ignore[rust.ownership.panic-macro] — test rejects loss after actual config churn.
             panic!("committed scientific record must survive config churn");
         };
         assert_eq!(page.source, EventPageSource::LiveMemory);
@@ -8157,6 +8265,7 @@ mod tests {
             .take(2)
             .collect::<Vec<_>>();
         let [target, second_parent] = handles.as_slice() else {
+            // ubs:ignore[rust.ownership.panic-macro] — test fixture requires distinct real parents.
             panic!("deterministic host needs two live agents");
         };
         let target = *target;
@@ -8368,11 +8477,13 @@ mod tests {
                             overloaded += 1;
                             assert_eq!(result.admission_sequence(), None);
                         }
+                        // ubs:ignore[rust.ownership.panic-macro] — test rejects untyped burst outcomes.
                         other => panic!("unexpected burst result: {other:?}"),
                     },
                     Err(HostAccessError::CommandEvidenceBackpressure { capacity: 32 }) => {
                         evidence_backpressured += 1;
                     }
+                    // ubs:ignore[rust.ownership.panic-macro] — test rejects untyped ingress failures.
                     Err(other) => panic!("unexpected burst error: {other:?}"),
                 }
             }
@@ -9288,6 +9399,7 @@ mod tests {
 
             let mut changed = envelope.clone();
             let HostCommand::UpdateConfig(config) = &mut changed.command else {
+                // ubs:ignore[rust.ownership.panic-macro] — collision test requires its actual config.
                 panic!("test envelope is an update-config command");
             };
             config.initial_food = f32::from_bits(0x7fc0_0002);
@@ -9647,6 +9759,7 @@ mod tests {
         {
             crate::EventPoll::Gap(gap) => gap,
             other @ crate::EventPoll::Contiguous(_) => {
+                // ubs:ignore[rust.ownership.panic-macro] — test requires observed missing prefix.
                 panic!("slow cursor must receive a gap, got {other:?}")
             }
         };
@@ -9659,6 +9772,7 @@ mod tests {
         let locator = match gap.catch_up {
             crate::EventCatchUpState::Available(locator) => locator,
             other @ crate::EventCatchUpState::Unavailable(_) => {
+                // ubs:ignore[rust.ownership.panic-macro] — test requires a real memory locator.
                 panic!("live memory locator expected, got {other:?}")
             }
         };
@@ -9667,6 +9781,7 @@ mod tests {
             .catch_up_events(&mut slow, locator, 1)
             .expect("live memory catch-up");
         let crate::EventCatchUp::Contiguous(page) = caught_up else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires actual retained catch-up.
             panic!("live memory catch-up must be contiguous");
         };
         assert_eq!(page.source, EventPageSource::LiveMemory);
@@ -9682,6 +9797,7 @@ mod tests {
             .read_events(&mut slow, usize::MAX)
             .expect("hot suffix")
         else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires catch-up to rejoin live events.
             panic!("caught-up cursor must rejoin hot ring");
         };
         assert_eq!(
@@ -9696,6 +9812,7 @@ mod tests {
             .read_events(&mut slow, usize::MAX)
             .expect("duplicate tip poll")
         else {
+            // ubs:ignore[rust.ownership.panic-macro] — test rejects a gap at the observed tip.
             panic!("tip poll must remain contiguous");
         };
         assert_eq!(duplicate.events, Vec::<JournaledScientificEvent>::new());
@@ -9741,12 +9858,14 @@ mod tests {
         {
             crate::EventPoll::Gap(gap) => gap,
             other @ crate::EventPoll::Contiguous(_) => {
+                // ubs:ignore[rust.ownership.panic-macro] — public frontend test requires ring expiry.
                 panic!("wrapped live frontend must observe a gap, got {other:?}")
             }
         };
         let live_locator = match live_gap.catch_up {
             crate::EventCatchUpState::Available(locator) => locator,
             other @ crate::EventCatchUpState::Unavailable(_) => {
+                // ubs:ignore[rust.ownership.panic-macro] — public frontend test requires its locator.
                 panic!("live frontend must receive a catch-up locator, got {other:?}")
             }
         };
@@ -9754,6 +9873,7 @@ mod tests {
             .catch_up_events(live_locator, 1)
             .expect("public live frontend catch-up")
         else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires actual frontend catch-up.
             panic!("live frontend catch-up must be contiguous");
         };
         assert_eq!(caught_up.source, EventPageSource::LiveMemory);
@@ -9763,6 +9883,7 @@ mod tests {
             .read_events(1)
             .expect("public live frontend hot suffix")
         else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires resumed live frontend events.
             panic!("live frontend must rejoin the hot ring");
         };
         assert_eq!(live_hot.events.len(), 1);
@@ -9805,6 +9926,7 @@ mod tests {
         {
             crate::EventPoll::Gap(gap) => gap,
             other @ crate::EventPoll::Contiguous(_) => {
+                // ubs:ignore[rust.ownership.panic-macro] — no-reader test requires explicit gap.
                 panic!("no-reader frontend must observe a gap, got {other:?}")
             }
         };
@@ -9819,6 +9941,7 @@ mod tests {
             .read_events(1)
             .expect("public hot read after accepting gap")
         else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires explicit gap acceptance.
             panic!("accepted no-reader gap must resume at the hot ring");
         };
         assert_eq!(unavailable_hot.events.len(), 1);

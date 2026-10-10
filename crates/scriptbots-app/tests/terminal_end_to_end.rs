@@ -28,6 +28,7 @@ static ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 #[cfg(target_os = "linux")]
 #[test]
 fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
+    // ubs:ignore[rust.security.shell-command] — fixed Python probe; variable input is separate argv.
     let output = std::process::Command::new("python3")
         .args(["-c", LIVE_TERMINAL_PTY_PROBE])
         .arg(env!("CARGO_BIN_EXE_scriptbots-app"))
@@ -63,13 +64,37 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
             option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable")
         );
         match observation["capability_profile"].as_str() {
-            Some("truecolor") => assert!(
-                observation["observed_truecolor_sgr_count"]
-                    .as_u64()
-                    .is_some_and(|count| count > 0),
-                "truecolor must be observed in actual terminal output"
-            ),
+            Some("truecolor") => {
+                assert!(
+                    observation["observed_truecolor_sgr_count"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0),
+                    "truecolor must be observed in actual terminal output"
+                );
+                let evidence = &observation["data_provider_evidence"];
+                assert_eq!(evidence["checkpoint"]["new_catalog_entries"], 1);
+                assert_eq!(evidence["experiment"]["status"], "completed");
+                assert_eq!(evidence["experiment"]["completed_runs"], 1);
+                assert_eq!(evidence["experiment"]["failed_runs"], 0);
+                assert_eq!(evidence["refresh"]["terminal_input_count_during_change"], 0);
+                assert_eq!(
+                    evidence["refresh"]["pause_receipt"]["application_state"],
+                    "applied"
+                );
+                assert_eq!(
+                    evidence["refresh"]["step_receipt"]["application_state"],
+                    "applied"
+                );
+                assert!(evidence["refresh"]["before_tick"].is_u64());
+                assert_eq!(
+                    evidence["refresh"]["after_tick"].as_u64(),
+                    evidence["refresh"]["before_tick"]
+                        .as_u64()
+                        .and_then(|tick| tick.checked_add(1))
+                );
+            }
             Some("no-color") => assert_eq!(observation["observed_color_sgr_count"], 0),
+            // ubs:ignore[rust.ownership.panic-macro] — test requires a declared capability label.
             profile => panic!("unexpected capability profile: {profile:?}"),
         }
         assert_eq!(
@@ -307,6 +332,7 @@ for profile in ('truecolor', 'no-color'):
                    if not key.startswith(('SCRIPTBOTS_', 'SB_'))}
     environment.update(SCRIPTBOTS_MODE='terminal', SCRIPTBOTS_TERMINAL_HEADLESS='0',
                        SCRIPTBOTS_TERMINAL_EMOJI='0',
+                       SCRIPTBOTS_ARTIFACTS_DIR=str(directory / 'artifacts'),
                        SCRIPTBOTS_CONTROL_REST_ENABLED='1', SCRIPTBOTS_CONTROL_MCP='disabled',
                        SCRIPTBOTS_CONTROL_REST_ADDR='127.0.0.1:' + str(port),
                        SCRIPTBOTS_TERMINAL_LOG=str(directory / 'runtime.log'),
@@ -325,6 +351,8 @@ for profile in ('truecolor', 'no-color'):
     observed = []
     screenshots = []
     binary_source = None
+    data_provider_evidence = None
+    terminal_input_count = 0
     with open(directory / 'stderr.log', 'xb') as log:
         process = subprocess.Popen(
             [binary, '--storage', 'memory', '--bootstrap-ticks', '0', '--threads', '1',
@@ -338,6 +366,10 @@ for profile in ('truecolor', 'no-color'):
             raw.extend(chunk)
             assert len(raw) <= 2_000_000, 'bounded PTY transcript exceeded'
             screen.feed(chunk)
+        def send_terminal_input(data):
+            global terminal_input_count
+            assert os.write(master, data) == len(data), 'incomplete terminal input write'
+            terminal_input_count += 1
         def pump_until(predicate, description):
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -353,7 +385,7 @@ for profile in ('truecolor', 'no-color'):
             pump_until(lambda: not (termios.tcgetattr(slave)[3] & termios.ICANON), 'raw-mode startup')
             raw_mode = not (termios.tcgetattr(slave)[3] & termios.ICANON)
             for key, title in routes:
-                os.write(master, key.encode())
+                send_terminal_input(key.encode())
                 pump_until(lambda: screen.alternate and not screen.synchronized
                            and title in screen.text(), title)
                 observed.append(title)
@@ -390,7 +422,219 @@ for profile in ('truecolor', 'no-color'):
                         pass
                     return False
                 pump_until(screenshot_matches, 'presented screenshot for ' + title)
-            os.write(master, b'q')
+            if profile == 'truecolor':
+                evidence_artifacts = []
+                http_log_bytes = 0
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with open(directory / 'provider-http.jsonl', 'xb'):
+                    pass
+
+                def retain_response(filename, body):
+                    with open(directory / filename, 'xb') as artifact:
+                        artifact.write(body)
+                    evidence_artifacts.append({'file': filename, 'sha256': hashlib.sha256(body).hexdigest()})
+
+                def request_api(path, payload=None, allow_not_presented=False):
+                    global http_log_bytes
+                    request_body = None if payload is None else json.dumps(payload, sort_keys=True).encode()
+                    headers = {'User-Agent': 'OpenAI File Downloader, XaiImageApiFetch/1.0'}
+                    if request_body is not None:
+                        headers['Content-Type'] = 'application/json'
+                    request = urllib.request.Request('http://127.0.0.1:' + str(port) + path,
+                                                     data=request_body, headers=headers)
+                    try:
+                        response = opener.open(request, timeout=2)
+                    except urllib.error.HTTPError as error:
+                        response = error
+                    with response:
+                        body = response.read(200_001)
+                        assert len(body) <= 200_000, 'bounded API response exceeded: ' + path
+                        record = json.dumps({'method': request.get_method(), 'path': path,
+                                             'status': response.status, 'headers': response.getheaders(),
+                                             'request_body': None if request_body is None else request_body.decode(),
+                                             'response_body': body.decode()}).encode() + b'\n'
+                        http_log_bytes += len(record)
+                        assert http_log_bytes <= 8_000_000, 'bounded provider HTTP evidence exceeded'
+                        with open(directory / 'provider-http.jsonl', 'ab') as http_log:
+                            http_log.write(record)
+                        if allow_not_presented and response.status == 409:
+                            return None
+                        expected_status = 201 if path == '/api/v1/experiments' and payload is not None else 200
+                        assert response.status == expected_status, (path, response.status, body.decode())
+                    return body
+
+                def applied_receipt(admission, filename):
+                    command_id = admission['command_id']
+                    def applied():
+                        body = request_api('/api/control/status/' + command_id)
+                        receipt = json.loads(body)
+                        assert receipt['command_id'] == command_id, 'owner returned a different command identity'
+                        assert receipt['application_state'] not in ('rejected', 'failed'), receipt
+                        if receipt['application_state'] == 'applied':
+                            retain_response(filename, body)
+                            applied.result = receipt
+                            return True
+                        return False
+                    pump_until(applied, 'actual owner application of ' + command_id)
+                    return applied.result
+
+                def header_state(text):
+                    first_row = text.splitlines()[0] if text else ''
+                    match = re.search(r'\| Tick: (\d+) \| Pop: \d+ \| (PAUSED|RUNNING)\b', first_row)
+                    return None if match is None else {'tick': int(match[1]), 'paused': match[2] == 'PAUSED'}
+
+                def owner_publication(command_id, filename, matches):
+                    def published():
+                        body = request_api('/api/status')
+                        owner = json.loads(body)
+                        if owner['last_applied_command'] != command_id or not matches(owner):
+                            return False
+                        retain_response(filename, body)
+                        published.result = owner
+                        return True
+                    pump_until(published, 'actual owner publication for ' + command_id)
+                    return published.result
+
+                def capture_provider(prefix, title, matches):
+                    def capture():
+                        terminal_text = screen.text()
+                        if not screen.alternate or screen.synchronized or title not in terminal_text or not matches(terminal_text):
+                            return False
+                        body = request_api('/api/screenshot/ascii', allow_not_presented=True)
+                        if body is None:
+                            return False
+                        presented_text = body.decode()
+                        if title not in presented_text or not matches(presented_text):
+                            return False
+                        retain_response(prefix + '-terminal.txt', terminal_text.encode())
+                        retain_response(prefix + '-screen.txt', body)
+                        return True
+                    pump_until(capture, 'actual terminal and presented capture for ' + prefix)
+
+                # REST owner changes cannot wake the UI by supplying keyboard
+                # input. Its real Every subscription must observe the publication.
+                input_count_before = terminal_input_count
+                pause_body = request_api('/api/control/pause', {})
+                retain_response('refresh-pause-response.json', pause_body)
+                pause_receipt = applied_receipt(json.loads(pause_body), 'refresh-pause-receipt.json')
+                before = owner_publication(pause_receipt['command_id'], 'refresh-before-owner.json',
+                                           lambda owner: owner['paused'] is True)
+                diagnostic_title = routes[-1][1]
+                capture_provider('refresh-before', diagnostic_title,
+                                 lambda text: header_state(text) == {'tick': before['tick'], 'paused': True})
+                step_body = request_api('/api/control/step', {'count': 1})
+                retain_response('refresh-step-response.json', step_body)
+                step_receipt = applied_receipt(json.loads(step_body), 'refresh-step-receipt.json')
+                after = owner_publication(step_receipt['command_id'], 'refresh-after-owner.json',
+                                          lambda owner: owner['paused'] is True and owner['tick'] == before['tick'] + 1
+                                          and owner['snapshot_revision'] > before['snapshot_revision'])
+                assert step_receipt['scientific_revision'] > pause_receipt['scientific_revision'], (pause_receipt, step_receipt)
+                capture_provider('refresh-after', diagnostic_title,
+                                 lambda text: header_state(text) == {'tick': after['tick'], 'paused': True})
+                input_count_during_change = terminal_input_count - input_count_before
+                assert input_count_during_change == 0, 'terminal input masked the periodic refresh observation'
+
+                # A checkpoint is created only by k through the live service
+                # command. REST observes the resulting catalog; it never seeds it.
+                send_terminal_input(b'7')
+                replay_title = routes[3][1]
+                pump_until(lambda: screen.alternate and not screen.synchronized
+                           and replay_title in screen.text(), 'Replay before checkpoint creation')
+                catalog_before_body = request_api('/api/v1/checkpoints?limit=32')
+                retain_response('checkpoint-catalog-before.json', catalog_before_body)
+                catalog_before = json.loads(catalog_before_body)
+                assert catalog_before['total'] == len(catalog_before['items']) == 0, catalog_before
+                before_ids = {item['checkpoint_id'] for item in catalog_before['items']}
+                send_terminal_input(b'k')
+                def checkpoint_created():
+                    body = request_api('/api/v1/checkpoints?limit=32')
+                    catalog = json.loads(body)
+                    new_checkpoints = [item for item in catalog['items'] if item['checkpoint_id'] not in before_ids]
+                    if not new_checkpoints:
+                        return False
+                    assert catalog['total'] == len(catalog['items']) == 1, catalog
+                    assert len(new_checkpoints) == 1, catalog
+                    retain_response('checkpoint-catalog-after.json', body)
+                    checkpoint_created.result = new_checkpoints[0]
+                    checkpoint_created.new_count = len(new_checkpoints)
+                    return True
+                pump_until(checkpoint_created, 'terminal-created checkpoint in actual REST catalog')
+                checkpoint = checkpoint_created.result
+                assert checkpoint['description'] == 'Interactive terminal checkpoint', checkpoint
+                assert checkpoint['tick'] == after['tick'] and checkpoint['byte_size'] > 0, checkpoint
+                checkpoint_body = request_api('/api/v1/checkpoints/' + checkpoint['checkpoint_id'])
+                retain_response('checkpoint-metadata.json', checkpoint_body)
+                assert json.loads(checkpoint_body) == checkpoint, 'catalog and checkpoint lookup disagree'
+                checkpoint_row = re.compile(r'^\s*>\s+' + re.escape(checkpoint['checkpoint_id'])
+                                            + r'\s+' + str(checkpoint['tick']) + r'\s', re.MULTILINE)
+                checkpoint_status = 'Checkpoint ' + checkpoint['checkpoint_id'] + ' recorded at tick ' + str(checkpoint['tick'])
+                checkpoint_receipt = '[APPLIED] journal=unobserved CreateCheckpoint: applied id=checkpoint-request-1'
+                capture_provider('checkpoint-positive', replay_title,
+                                 lambda text: checkpoint_row.search(text) is not None
+                                 and checkpoint_receipt in text
+                                 and checkpoint_status in text)
+
+                # The existing runner seeds 16 registered MLP founders. Bound
+                # its actual three-tick arm without inventing a zero-founder API.
+                experiment_request = {'description': 'Live terminal data provider probe',
+                                      'variants': [{'variant_id': 'pty_mlp', 'brain_family': 'mlp',
+                                                    'config_overrides': {'world_width': 512,
+                                                                         'world_height': 512,
+                                                                         'food_cell_size': 128,
+                                                                         'population_minimum': 0,
+                                                                         'population_spawn_interval': 0}}],
+                                      'seeds': [41], 'ticks_per_run': 3, 'max_concurrency': 1}
+                retain_response('experiment-request.json', json.dumps(experiment_request, sort_keys=True).encode())
+                experiment_created_body = request_api('/api/v1/experiments', experiment_request)
+                retain_response('experiment-created.json', experiment_created_body)
+                experiment_id = json.loads(experiment_created_body)['experiment_id']
+                assert experiment_id, 'experiment creation omitted its identity'
+                def experiment_completed():
+                    body = request_api('/api/v1/experiments/' + experiment_id)
+                    status = json.loads(body)
+                    assert status['experiment_id'] == experiment_id, status
+                    assert status['failed_runs'] == 0 and status['status'] not in ('failed', 'cancelled', 'stopped'), status
+                    assert status['error_reason'] is None, status
+                    if status['status'] != 'completed':
+                        return False
+                    assert status['total_runs'] == status['completed_runs'] == len(status['runs']) == 1, status
+                    run = status['runs'][0]
+                    assert run['variant_id'] == 'pty_mlp' and run['brain_family'] == 'mlp.baseline', run
+                    assert run['state'] == 'completed' and run['seed'] == 41 and run['total_ticks'] == 3, run
+                    assert re.fullmatch(r'[0-9a-f]{64}', run['final_digest']) and run['bundle_path'], run
+                    assert run['error_reason'] is None, run
+                    retain_response('experiment-completed.json', body)
+                    experiment_completed.result = status
+                    return True
+                pump_until(experiment_completed, 'actual completed three-tick MLP experiment')
+                experiment = experiment_completed.result
+                run = experiment['runs'][0]
+                send_terminal_input(b'6')
+                experiment_title = routes[2][1]
+                batch_row = re.compile(r'Experiment ID:\s*' + re.escape(experiment_id) + r'\s+Batch Status: completed\b')
+                arm_row = re.compile(r'^\s*>\s+' + re.escape(run['variant_id']) + r'\s+'
+                                     + re.escape(run['brain_family']) + r'\s+' + str(run['seed'])
+                                     + r'\s+' + str(run['total_ticks']) + '/' + str(run['total_ticks']) + r'\s', re.MULTILINE)
+                capture_provider('experiment-positive', experiment_title,
+                                 lambda text: batch_row.search(text) is not None and arm_row.search(text) is not None)
+                evidence_artifacts.append({'file': 'provider-http.jsonl',
+                                           'sha256': hashlib.sha256((directory / 'provider-http.jsonl').read_bytes()).hexdigest()})
+                data_provider_evidence = {
+                    'checkpoint': {'checkpoint_id': checkpoint['checkpoint_id'], 'tick': checkpoint['tick'],
+                                   'byte_size': checkpoint['byte_size'], 'checksum_sha256': checkpoint['checksum_sha256'],
+                                   'description': checkpoint['description'], 'new_catalog_entries': checkpoint_created.new_count,
+                                   'visible_application_receipt': checkpoint_receipt},
+                    'experiment': {'experiment_id': experiment_id, 'status': experiment['status'],
+                                   'total_runs': experiment['total_runs'], 'completed_runs': experiment['completed_runs'],
+                                   'failed_runs': experiment['failed_runs'], 'run': run},
+                    'refresh': {'before_tick': before['tick'], 'after_tick': after['tick'],
+                                'before_snapshot_revision': before['snapshot_revision'],
+                                'after_snapshot_revision': after['snapshot_revision'],
+                                'paused_before': before['paused'], 'paused_after': after['paused'],
+                                'pause_receipt': pause_receipt, 'step_receipt': step_receipt,
+                                'terminal_input_count_during_change': input_count_during_change},
+                    'artifacts': evidence_artifacts}
+            send_terminal_input(b'q')
             deadline = time.monotonic() + 30
             while process.poll() is None and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.05)[0]:
@@ -432,6 +676,7 @@ for profile in ('truecolor', 'no-color'):
                       'binary_source_observed': binary_source is not None,
                       'capability_profile': profile, 'observed_science_routes': observed,
                       'observed_screenshot_routes': screenshots,
+                      'data_provider_evidence': data_provider_evidence,
                       'observed_color_sgr_count': screen.color_count,
                       'observed_truecolor_sgr_count': screen.truecolor_count,
                       'observed_style_sgr_count': screen.attribute_count,

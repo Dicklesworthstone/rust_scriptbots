@@ -69,9 +69,9 @@ ft-core = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/fran
 ft-kernel-cpu = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-nn = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
 ft-optim = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "e4c6bdd5ec629ae70b40da9314da345ade012ca7", default-features = false }
-# PREPARED, NOT ADOPTED (bd-phj8). No workspace crate consumes `ftui.workspace`,
-# so Cargo never resolves this entry and a wrong `rev` cannot fail a build — which
-# is exactly how the previous value survived: it was
+# Consumed by scriptbots-app's live Program/Model and simulator (bd-2z0.6.8).
+# Cargo.lock resolves this exact source; full lifecycle qualification remains open.
+# The previous unconsumed entry evaded Cargo's resolution checks and held
 # `15cc65438a2095fbe8dd0dfce9adcfc7edab7612`, an object that does not exist
 # upstream. Note the shared `15cc6543` prefix with the real commit: a short SHA
 # expanded with a fabricated tail. Corrected to the verified object from

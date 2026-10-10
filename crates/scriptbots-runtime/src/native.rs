@@ -1993,6 +1993,7 @@ mod tests {
                             .try_submit(envelope)
                             .expect("panic hook command must remain in native ingress");
                     }
+                    // ubs:ignore[rust.ownership.panic-macro] — injects journal unwind to test native envelope retention.
                     panic!("injected native journal panic");
                 }
             }
@@ -2136,6 +2137,7 @@ mod tests {
             snapshot_interval_ticks: 1,
             protocol_event_capacity: 256,
             scientific_event_capacity: 64,
+            genesis_origin_capacity: 16_384,
             volatile_event_history_capacity: 512,
             capture_agent_visuals: false,
         }
@@ -2342,6 +2344,7 @@ mod tests {
             .expect("first detached scientific-event poll")
         {
             EventPoll::Contiguous(page) => page,
+            // ubs:ignore[rust.ownership.panic-macro] — requires the first detached reader to remain contiguous after owner drop.
             EventPoll::Gap(gap) => panic!("unexpected first detached event gap: {gap:?}"),
         };
         let second_page = match events
@@ -2349,6 +2352,7 @@ mod tests {
             .expect("second detached scientific-event poll")
         {
             EventPoll::Contiguous(page) => page,
+            // ubs:ignore[rust.ownership.panic-macro] — requires the second detached reader to remain contiguous after owner drop.
             EventPoll::Gap(gap) => panic!("unexpected second detached event gap: {gap:?}"),
         };
         assert_eq!(second_page, first_page);
@@ -2423,6 +2427,7 @@ mod tests {
             NativeRunOutcome::Cancelled {
                 shutdown_command_id,
             } => shutdown_command_id,
+            // ubs:ignore[rust.ownership.panic-macro] — requires native cancellation for manual/native journal-trace parity.
             other => panic!("unexpected native parity outcome: {other:?}"),
         };
         assert_eq!(native.metrics().deadline_wakes, 1);
@@ -3150,6 +3155,7 @@ mod tests {
             NativeRunOutcome::Stopped {
                 shutdown_command_id,
             } => shutdown_command_id,
+            // ubs:ignore[rust.ownership.panic-macro] — requires valid shutdown after stale CAS rejection reopens ingress.
             other => panic!("unexpected stale-CAS outcome: {other:?}"),
         };
         assert_eq!(shutdown_command_id, followup_id);
@@ -3187,6 +3193,7 @@ mod tests {
             NativeRunOutcome::Cancelled {
                 shutdown_command_id,
             } => shutdown_command_id,
+            // ubs:ignore[rust.ownership.panic-macro] — requires cancellation to replace the pre-admitted stale shutdown.
             other => panic!("unexpected stale-cancellation outcome: {other:?}"),
         };
         assert_ne!(shutdown_command_id, stale.command_id);
@@ -3422,6 +3429,7 @@ mod tests {
             .expect("first post-owner scientific-event poll")
         {
             EventPoll::Contiguous(page) => page,
+            // ubs:ignore[rust.ownership.panic-macro] — requires the first event reader to survive native owner drop without a gap.
             EventPoll::Gap(gap) => panic!("unexpected first post-owner event gap: {gap:?}"),
         };
         let second_page = match events
@@ -3429,6 +3437,7 @@ mod tests {
             .expect("second post-owner scientific-event poll")
         {
             EventPoll::Contiguous(page) => page,
+            // ubs:ignore[rust.ownership.panic-macro] — requires the second event reader to survive native owner drop without a gap.
             EventPoll::Gap(gap) => panic!("unexpected second post-owner event gap: {gap:?}"),
         };
         assert_eq!(second_page, first_page);
@@ -3530,6 +3539,7 @@ mod tests {
             NativeRunOutcome::ControllerDisconnected {
                 shutdown_command_id,
             } => shutdown_command_id,
+            // ubs:ignore[rust.ownership.panic-macro] — requires disconnect to install a fresh fail-safe shutdown identity.
             other => panic!("unexpected stale-disconnect outcome: {other:?}"),
         };
         assert_ne!(fail_safe_id, stale.command_id);
@@ -3591,6 +3601,7 @@ mod tests {
             NativeRunOutcome::ControllerDisconnected {
                 shutdown_command_id,
             } => shutdown_command_id,
+            // ubs:ignore[rust.ownership.panic-macro] — requires disconnect provenance after journal-full recovery.
             other => panic!("unexpected delayed stale-disconnect outcome: {other:?}"),
         };
         assert!(blocked.load(Ordering::Acquire));
@@ -3798,6 +3809,7 @@ mod tests {
                 assert_eq!(waited_nanos, 20);
                 pending_batch
             }
+            // ubs:ignore[rust.ownership.panic-macro] — requires the exact bounded provisional shutdown timeout outcome.
             other => panic!("unexpected provisional-timeout result: {other:?}"),
         };
         assert!(pending_batch.is_some());

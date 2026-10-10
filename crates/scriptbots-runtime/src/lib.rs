@@ -4244,6 +4244,50 @@ pub struct EventHub {
     reader: Option<Arc<dyn EventJournalReader>>,
     state: Arc<Mutex<EventHubState>>,
     hot: Arc<ArcSwap<EventHotView>>,
+    genesis: Arc<ArcSwap<GenesisOrigins>>,
+}
+
+/// Actual tick-zero arrival records retained separately from completed scientific ticks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenesisOrigins {
+    /// The owner can still append real arrivals before its first step.
+    Open {
+        /// Immutable canonical origin prefix, in insertion order.
+        origins: Arc<Vec<BirthRecord>>,
+    },
+    /// The exact origin prefix captured before the first successful step.
+    Sealed {
+        /// Immutable canonical origins, independent of persistence cadence.
+        origins: Arc<Vec<BirthRecord>>,
+    },
+    /// Complete initial ancestry cannot be established from retained canonical records.
+    Unavailable {
+        /// The observation that prevents a completeness claim.
+        reason: GenesisUnavailableReason,
+    },
+}
+
+/// Why the detached genesis observer cannot establish a complete origin prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenesisUnavailableReason {
+    /// No owner observation has been supplied to this hub.
+    NotObserved,
+    /// The owner was constructed after tick zero.
+    AlreadyAdvanced {
+        /// Actual initial owner tick.
+        tick: Tick,
+    },
+    /// Origins were drained or a tick-zero death/removal makes births alone incomplete.
+    IncompleteLifecycle,
+    /// The actual prefix exceeds the configured retention bound.
+    CapacityExceeded {
+        /// Configured maximum retained origins.
+        limit: usize,
+        /// Actual pending origin count.
+        observed: usize,
+    },
+    /// Previously observed origin records changed or disappeared.
+    PrefixChanged,
 }
 
 impl fmt::Debug for EventHub {
@@ -4296,7 +4340,74 @@ impl EventHub {
             reader,
             state: Arc::new(Mutex::new(state)),
             hot,
+            genesis: Arc::new(ArcSwap::from_pointee(GenesisOrigins::Unavailable {
+                reason: GenesisUnavailableReason::NotObserved,
+            })),
         })
+    }
+
+    /// Read immutable genesis evidence without owner ingress or a mutable-world lock.
+    #[must_use]
+    pub fn genesis_origins(&self) -> Arc<GenesisOrigins> {
+        self.genesis.load_full()
+    }
+
+    pub(crate) fn refresh_genesis_origins(
+        &self,
+        world: &scriptbots_core::WorldState,
+        capacity: usize,
+    ) {
+        let previous = self.genesis.load_full();
+        if matches!(previous.as_ref(), GenesisOrigins::Sealed { .. })
+            || matches!(
+                previous.as_ref(),
+                GenesisOrigins::Unavailable { reason }
+                    if *reason != GenesisUnavailableReason::NotObserved
+            )
+        {
+            return;
+        }
+        let observation = if world.tick() != Tick::zero() {
+            GenesisOrigins::Unavailable {
+                reason: GenesisUnavailableReason::AlreadyAdvanced { tick: world.tick() },
+            }
+        } else if let Some(origins) = world.genesis_origin_records() {
+            if origins.len() > capacity {
+                GenesisOrigins::Unavailable {
+                    reason: GenesisUnavailableReason::CapacityExceeded {
+                        limit: capacity,
+                        observed: origins.len(),
+                    },
+                }
+            } else if let GenesisOrigins::Open { origins: prefix } = previous.as_ref()
+                && !origins.starts_with(prefix.as_slice())
+            {
+                GenesisOrigins::Unavailable {
+                    reason: GenesisUnavailableReason::PrefixChanged,
+                }
+            } else if let GenesisOrigins::Open { origins: prefix } = previous.as_ref()
+                && origins.len() == prefix.len()
+            {
+                return;
+            } else {
+                GenesisOrigins::Open {
+                    origins: Arc::new(origins.to_vec()),
+                }
+            }
+        } else {
+            GenesisOrigins::Unavailable {
+                reason: GenesisUnavailableReason::IncompleteLifecycle,
+            }
+        };
+        self.genesis.store(Arc::new(observation));
+    }
+
+    pub(crate) fn seal_genesis_origins(&self) {
+        if let GenesisOrigins::Open { origins } = self.genesis.load_full().as_ref() {
+            self.genesis.store(Arc::new(GenesisOrigins::Sealed {
+                origins: Arc::clone(origins),
+            }));
+        }
     }
 
     /// Stable host session published by this hub.

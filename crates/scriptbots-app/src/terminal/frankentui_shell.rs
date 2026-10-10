@@ -34,7 +34,7 @@ pub fn print_to_frame(frame: &mut Frame, x: u16, y: u16, text: &str) {
 }
 
 /// Maximum number of receipts retained in the shell history.
-const MAX_RECEIPTS: usize = 32;
+pub(super) const MAX_RECEIPTS: usize = 32;
 
 /// Maximum number of effects awaiting the live adapter. Overflow rejects the
 /// new intent without discarding any previously queued work.
@@ -245,6 +245,14 @@ impl CommandReceiptEntry {
             scientific_revision,
             timestamp_tick: tick,
         }
+    }
+
+    /// Application completion and journal finality are independent observations.
+    pub fn awaits_observation(&self) -> bool {
+        matches!(
+            self.status,
+            ReceiptStatusKind::Pending | ReceiptStatusKind::Admitted
+        ) || matches!(self.journal_state, Some(JournalState::Pending))
     }
 
     pub fn badge(&self) -> &'static str {
@@ -498,21 +506,47 @@ impl FrankenTuiModel {
         true
     }
 
-    /// Record a command receipt into bounded history, replacing any existing entry
-    /// with the same command ID so status transitions in-place.
-    pub fn record_receipt(&mut self, receipt: CommandReceiptEntry) {
+    /// Whether a new command can retain its receipt without losing unfinished work.
+    pub fn has_receipt_capacity(&self) -> bool {
+        self.receipts.len() < MAX_RECEIPTS
+            || self
+                .receipts
+                .iter()
+                .any(|receipt| !receipt.awaits_observation())
+    }
+
+    /// Existing identities can advance even while every receipt slot is unfinished.
+    pub fn can_record_receipt(&self, command_id: &str) -> bool {
+        self.receipts
+            .iter()
+            .any(|receipt| receipt.command_id == command_id)
+            || self.has_receipt_capacity()
+    }
+
+    /// Record observed status in bounded history, evicting only finished entries.
+    pub fn record_receipt(&mut self, receipt: CommandReceiptEntry) -> bool {
         if let Some(existing) = self
             .receipts
             .iter_mut()
             .find(|r| r.command_id == receipt.command_id)
         {
             *existing = receipt;
-            return;
+            return true;
         }
         if self.receipts.len() >= MAX_RECEIPTS {
-            self.receipts.pop_front();
+            let Some(finished) = self
+                .receipts
+                .iter()
+                .position(|entry| !entry.awaits_observation())
+            else {
+                self.status_message =
+                    Some("Receipt unavailable: unfinished receipt history is full".into());
+                return false;
+            };
+            self.receipts.remove(finished);
         }
         self.receipts.push_back(receipt);
+        true
     }
 
     /// Ingest updated snapshot telemetry from HostClient.
@@ -777,7 +811,9 @@ impl Model for FrankenTuiModel {
                 let status = receipt.status.clone();
                 let cmd_id = receipt.command_id.clone();
                 let control_revision = receipt.control_revision;
-                self.record_receipt(receipt);
+                if !self.record_receipt(receipt) {
+                    return Cmd::none();
+                }
 
                 match &status {
                     ReceiptStatusKind::Applied | ReceiptStatusKind::Durable => {
@@ -822,7 +858,9 @@ impl Model for FrankenTuiModel {
                     scientific_revision: self.scientific_revision,
                     timestamp_tick: self.tick,
                 };
-                self.record_receipt(stale_receipt);
+                if !self.record_receipt(stale_receipt) {
+                    return Cmd::none();
+                }
                 self.control_revision = observed;
                 self.status_message = Some(format!(
                     "⚠ Reconciled stale revision for {command_id} -> rev {observed}"
@@ -968,6 +1006,12 @@ impl Model for FrankenTuiModel {
                 Cmd::none()
             }
             ShellMessage::CreateCheckpoint => {
+                if !self.has_receipt_capacity() {
+                    self.status_message = Some(
+                        "Checkpoint not requested: unfinished receipt history is full".into(),
+                    );
+                    return Cmd::none();
+                }
                 let Some(next_request) = self.command_counter.checked_add(1) else {
                     self.status_message =
                         Some("Checkpoint unavailable: request IDs exhausted".into());
@@ -2367,6 +2411,7 @@ mod tests {
                 crate::terminal::TerminalModeGuard::begin_with(restore, || Ok(()), || Ok(()))
                     .unwrap();
             guard.mark_cursor_hidden();
+            // ubs:ignore[rust.ownership.panic-macro] — deliberate restoration-test panic.
             panic!("simulated terminal panic");
         });
         assert!(
@@ -2641,6 +2686,7 @@ mod tests {
             assert_eq!(*query_id, 1);
             assert!(operation.contains("Phenotype clustering"));
         } else {
+            // ubs:ignore[rust.ownership.panic-macro] — test rejects the wrong query state.
             panic!("Expected Loading state");
         }
 
@@ -2654,6 +2700,7 @@ mod tests {
         if let ScreenDataState::Empty { message } = &harness.model().science.lineages {
             assert!(message.contains("Query 1 cancelled"));
         } else {
+            // ubs:ignore[rust.ownership.panic-macro] — test requires query cancellation.
             panic!("Expected Empty state after cancellation");
         }
 
@@ -2739,7 +2786,7 @@ mod tests {
         assert_eq!(harness.model().route, ShellRoute::Replay);
         let replay_frame = harness.capture_frame_str(80, 24);
         assert!(replay_frame.contains("observed-checkpoint"));
-        assert!(replay_frame.contains("Tick 250"));
+        assert!(replay_frame.contains("Observed live tick: 250"));
 
         // 2. Branch intent does not create a branch or success receipt.
         harness.inject_key(KeyCode::Char('n'));
@@ -3119,7 +3166,7 @@ mod tests {
         let diag_frame = harness.capture_frame_str(80, 24);
         assert!(diag_frame.contains("SYSTEM DIAGNOSTICS & PIPELINE HEALTH"));
         assert!(diag_frame.contains("59.8 TPS"));
-        assert!(diag_frame.contains("Host Ingress Queue:  4/64"));
+        assert!(diag_frame.contains("Admitted Command Queue:  4/64"));
         assert!(diag_frame.contains("Committed Tick 400"));
         assert!(diag_frame.contains("Introspection Neutrality: ✓ CONFIRMED"));
         assert!(diag_frame.contains("Brains"));
