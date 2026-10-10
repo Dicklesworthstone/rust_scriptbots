@@ -55,7 +55,7 @@ const LIFECYCLE_COMMAND_NAMESPACE: u64 = u64::MAX;
 /// Full owner checkpoint schema; distinct from the science-only core schema.
 pub const HOST_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.host-checkpoint.v1";
 /// Canonical envelope revision for [`HostCheckpointV1`].
-pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 1;
+pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 2;
 /// Actual envelope, payload and corruption-checksum codecs.
 pub const HOST_CHECKPOINT_V1_CODEC: &str = "postcard-envelope+json+blake3-v1";
 /// Fixed resource ceiling for a complete encoded host artifact.
@@ -396,6 +396,14 @@ impl HostCheckpointV1 {
             }
         }
         state.continuity.validate(&self.world)?;
+        let sealed_current_tick = state.continuity.persistence_boundary_status()
+            == (scriptbots_core::PersistenceBoundaryStatus::Sealed { tick: self.tick() });
+        if sealed_current_tick != (state.persistence_last_admitted_tick == Some(self.tick())) {
+            return Err(checkpoint_error(
+                "persistence.boundary",
+                "sealed boundary and owner admission cursor disagree",
+            ));
+        }
         self.validate_owner_counters()?;
         self.validate_command_history()?;
         self.validate_schedule()?;
@@ -6236,6 +6244,263 @@ mod tests {
     }
 
     #[test]
+    fn full_host_checkpoint_preserves_disabled_recording_gap() {
+        let make_owner = || {
+            let mut config = continuation_world().config().clone();
+            config.persistence_interval = 0;
+            let mut world = WorldState::new(config).expect("disabled-recording world");
+            for _ in 0..3 {
+                world.try_spawn_agent(AgentData::default()).unwrap();
+            }
+            HostCore::new(HostSessionId::new(0xc018), world, options(true)).unwrap()
+        };
+        let mut original = make_owner();
+        let mut oracle = make_owner();
+        let step = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+        settle_continuation_command(&mut original, step.clone(), 10);
+        settle_continuation_command(&mut oracle, step, 10);
+        let checkpoint = original.capture_host_checkpoint_v1().unwrap();
+        assert_eq!(checkpoint.tick(), Tick(1));
+        assert_eq!(checkpoint.world_checkpoint().agent_count(), 3);
+        assert_eq!(
+            checkpoint.state.continuity.persistence_discarded_records_at(),
+            Some(Tick(1))
+        );
+        assert_eq!(checkpoint.persistence_last_admitted_tick(), None);
+        let wire = checkpoint.encode().unwrap();
+        let decoded = HostCheckpointV1::decode(&wire).unwrap();
+        assert_eq!(decoded.encode().unwrap(), wire);
+        let world = decoded
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        let mut restored = HostCore::restore_host_checkpoint_v1(
+            &decoded,
+            world,
+            persistence,
+            original.journal,
+            None,
+            ManualInstant::from_nanos(1_000),
+        )
+        .unwrap();
+        let revisions = oracle.revisions;
+        let audit = oracle.world.config_audit().to_vec();
+        let config = oracle.world.config().clone();
+        let mut enabled = config.clone();
+        enabled.persistence_interval = 1;
+        enabled.food_max *= 0.9;
+        let enable = CommandEnvelope::new(
+            CommandId::new(2),
+            HostCommand::UpdateConfig(Box::new(enabled)),
+        );
+        settle_continuation_command(&mut oracle, enable.clone(), 20);
+        settle_continuation_command(&mut restored, enable, 1_010);
+        let expected = ApplicationState::Failed(ApplicationFailure {
+            code: "config_application".to_owned(),
+            message: ScientificStateError::PersistenceHistoryGap {
+                path: "config.persistence_interval".to_owned(),
+                discarded_at_tick: 1,
+            }
+            .to_string(),
+        });
+        for owner in [&mut oracle, &mut restored] {
+            let status = owner.local_port().command_status(CommandId::new(2)).unwrap();
+            let status = status.expect("actual enable command retains its identity");
+            assert_eq!(status.application(), &expected);
+            assert_eq!(status.journal(), &JournalState::CommittedVolatile);
+            assert_eq!(owner.revisions, revisions);
+            assert_eq!(owner.world.config(), &config);
+            assert_eq!(owner.world.config_audit(), audit.as_slice());
+            assert_eq!(owner.persistence.last_admitted_tick(), None);
+            assert!(!owner.persistence.has_pending_batch());
+            assert!(
+                owner
+                    .persistence
+                    .stage_final_batch(&mut owner.world)
+                    .unwrap()
+                    .is_none()
+            );
+            let after = owner.capture_host_checkpoint_v1().unwrap();
+            assert_eq!(
+                after.state.continuity.persistence_discarded_records_at(),
+                Some(Tick(1))
+            );
+        }
+        assert_continued_owner_outputs(&restored, &oracle);
+    }
+
+    #[test]
+    fn full_host_checkpoint_preserves_never_discarded_recording_boundary() {
+        let mut original = continuation_owner(0xc019);
+        let mut oracle = continuation_owner(0xc019);
+        let step = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+        settle_continuation_command(&mut original, step.clone(), 10);
+        settle_continuation_command(&mut oracle, step, 10);
+        let mut disabled = original.world.config().clone();
+        disabled.persistence_interval = 0;
+        let disable = CommandEnvelope::new(
+            CommandId::new(2),
+            HostCommand::UpdateConfig(Box::new(disabled)),
+        );
+        settle_continuation_command(&mut original, disable.clone(), 20);
+        settle_continuation_command(&mut oracle, disable, 20);
+        for owner in [&original, &oracle] {
+            let status = owner.local_port().command_status(CommandId::new(2)).unwrap();
+            assert!(matches!(
+                status.unwrap().application(),
+                ApplicationState::Applied(_)
+            ));
+            assert_eq!(owner.world_tick(), Tick(1));
+            assert_eq!(owner.world.config().persistence_interval, 0);
+        }
+        let checkpoint = original.capture_host_checkpoint_v1().unwrap();
+        assert_eq!(
+            checkpoint.state.continuity.persistence_discarded_records_at(),
+            None
+        );
+        assert_eq!(checkpoint.config().persistence_interval, 0);
+        assert_eq!(checkpoint.persistence_last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(
+            checkpoint.state.continuity.persistence_boundary_status(),
+            scriptbots_core::PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+        );
+        let wire = checkpoint.encode().unwrap();
+        let decoded = HostCheckpointV1::decode(&wire).unwrap();
+        assert_eq!(decoded.encode().unwrap(), wire);
+        let world = decoded
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        let mut restored = HostCore::restore_host_checkpoint_v1(
+            &decoded,
+            world,
+            persistence,
+            original.journal,
+            Some(resolve_test_schedule),
+            ManualInstant::from_nanos(1_000),
+        )
+        .unwrap();
+        let revision = oracle.revisions.config;
+        let audit_len = oracle.world.config_audit().len();
+        let mut enabled = oracle.world.config().clone();
+        enabled.persistence_interval = 1;
+        enabled.food_max = 0.75;
+        let enable = CommandEnvelope::new(
+            CommandId::new(3),
+            HostCommand::UpdateConfig(Box::new(enabled)),
+        );
+        settle_continuation_command(&mut oracle, enable.clone(), 30);
+        settle_continuation_command(&mut restored, enable, 1_010);
+        for owner in [&oracle, &restored] {
+            let status = owner.local_port().command_status(CommandId::new(3)).unwrap();
+            assert!(matches!(
+                status.unwrap().application(),
+                ApplicationState::Applied(_)
+            ));
+            assert_eq!(owner.revisions.config, revision.checked_next().unwrap());
+            assert_eq!(owner.world.config_audit().len(), audit_len + 1);
+            assert_eq!(owner.persistence.last_admitted_tick(), Some(Tick(1)));
+            assert_eq!(owner.world_tick(), Tick(1));
+            assert_eq!(owner.world.config().persistence_interval, 1);
+            let after = owner.capture_host_checkpoint_v1().unwrap();
+            assert_eq!(
+                after.state.continuity.persistence_discarded_records_at(),
+                None
+            );
+        }
+        assert_continued_owner_outputs(&restored, &oracle);
+    }
+
+    #[test]
+    fn full_host_checkpoint_refuses_rehashed_persistence_boundary_and_gap() {
+        let mut owner = continuation_owner(0xc01a);
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            10,
+        );
+        let checkpoint = owner.capture_host_checkpoint_v1().unwrap();
+        let bytes = checkpoint.encode().unwrap();
+        assert_eq!(
+            HostCheckpointV1::decode(&bytes).unwrap().encode().unwrap(),
+            bytes
+        );
+        assert_eq!(
+            checkpoint.persistence_last_admitted_tick(),
+            Some(checkpoint.tick())
+        );
+        assert_eq!(
+            checkpoint.state.continuity.persistence_boundary_status(),
+            scriptbots_core::PersistenceBoundaryStatus::Sealed {
+                tick: checkpoint.tick()
+            }
+        );
+        for change_boundary in [true, false] {
+            let mut wire: HostCheckpointWireV1 = postcard::from_bytes(&bytes).unwrap();
+            let mut payload: serde_json::Value = serde_json::from_slice(&wire.payload).unwrap();
+            if change_boundary {
+                payload["continuity"]["persistence_boundary"] = serde_json::to_value(
+                    scriptbots_core::PersistenceBoundaryStatus::Open {
+                        tick: checkpoint.tick(),
+                    },
+                )
+                .unwrap();
+            } else {
+                payload["persistence_last_admitted_tick"] = serde_json::Value::Null;
+            }
+            wire.payload = serde_json::to_vec(&payload).unwrap();
+            wire.payload_blake3 = *blake3::hash(&wire.payload).as_bytes();
+            assert!(matches!(
+                HostCheckpointV1::decode(&postcard::to_allocvec(&wire).unwrap()),
+                Err(HostCheckpointError::Contract {
+                    path: "persistence.boundary",
+                    ..
+                })
+            ));
+        }
+        let mut config = continuation_world().config().clone();
+        config.persistence_interval = 0;
+        let world = WorldState::new(config).unwrap();
+        let mut disabled = HostCore::new(HostSessionId::new(0xc01b), world, options(true)).unwrap();
+        let pristine = disabled.capture_host_checkpoint_v1().unwrap();
+        assert_eq!(
+            pristine.state.continuity.persistence_discarded_records_at(),
+            None
+        );
+        assert_eq!(
+            HostCheckpointV1::decode(&pristine.encode().unwrap())
+                .unwrap()
+                .tick(),
+            Tick::zero()
+        );
+        settle_continuation_command(
+            &mut disabled,
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            10,
+        );
+        let discarded = disabled.capture_host_checkpoint_v1().unwrap();
+        let encoded = discarded.encode().unwrap();
+        assert_eq!(
+            HostCheckpointV1::decode(&encoded).unwrap().encode().unwrap(),
+            encoded
+        );
+        for marker in [None, Some(Tick::zero()), Some(Tick(2))] {
+            let mut wire: HostCheckpointWireV1 = postcard::from_bytes(&encoded).unwrap();
+            let mut payload: serde_json::Value = serde_json::from_slice(&wire.payload).unwrap();
+            payload["continuity"]["persistence_discarded_records_at"] =
+                serde_json::to_value(marker).unwrap();
+            wire.payload = serde_json::to_vec(&payload).unwrap();
+            wire.payload_blake3 = *blake3::hash(&wire.payload).as_bytes();
+            assert!(matches!(
+                HostCheckpointV1::decode(&postcard::to_allocvec(&wire).unwrap()),
+                Err(HostCheckpointError::World(
+                    scriptbots_core::WorldCheckpointError::Contract { path, .. }
+                )) if path == "host.persistence_discarded_records_at"
+            ));
+        }
+    }
+
+    #[test]
     fn full_host_checkpoint_refuses_fresh_and_same_tick_advanced_journals() {
         let mut original = continuation_owner(0xc014);
         settle_continuation_command(
@@ -6416,6 +6681,10 @@ mod tests {
             (
                 HOST_CHECKPOINT_V1_SCHEMA,
                 HOST_CHECKPOINT_V1_CODEC_VERSION + 1,
+            ),
+            (
+                HOST_CHECKPOINT_V1_SCHEMA,
+                HOST_CHECKPOINT_V1_CODEC_VERSION.checked_sub(1).unwrap(),
             ),
         ] {
             let changed = HostCheckpointWireV1 {

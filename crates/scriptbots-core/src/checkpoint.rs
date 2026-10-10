@@ -101,6 +101,7 @@ pub struct WorldHostCheckpointV1 {
     config: ScriptBotsConfig,
     config_revision: u64,
     persistence_boundary: PersistenceBoundaryStatus,
+    persistence_discarded_records_at: Option<Tick>,
     cadence: TickCadence,
     food_profiles: Vec<FoodCellProfile>,
     temperature: Option<crate::ScalarField>,
@@ -193,6 +194,18 @@ impl WorldHostCheckpointV1 {
         self.config_revision
     }
 
+    /// Actual admission state of the captured world's current tick.
+    #[must_use]
+    pub const fn persistence_boundary_status(&self) -> PersistenceBoundaryStatus {
+        self.persistence_boundary
+    }
+
+    /// First completed tick whose records were discarded with recording disabled.
+    #[must_use]
+    pub const fn persistence_discarded_records_at(&self) -> Option<Tick> {
+        self.persistence_discarded_records_at
+    }
+
     /// Validate this companion against its independently validated science checkpoint.
     pub fn validate(&self, world: &WorldCheckpointV1) -> Result<(), WorldCheckpointError> {
         self.config.validate()?;
@@ -208,6 +221,20 @@ impl WorldHostCheckpointV1 {
             return contract_error(
                 "host.config",
                 "raw configuration differs from science".to_owned(),
+            );
+        }
+        let discarded_disabled_boundary = self.config.persistence_interval == 0
+            && world.tick() != Tick::zero()
+            && self.persistence_boundary
+                == (PersistenceBoundaryStatus::Open { tick: world.tick() });
+        if (discarded_disabled_boundary && self.persistence_discarded_records_at.is_none())
+            || self.persistence_discarded_records_at.is_some_and(|tick| {
+                tick == Tick::zero() || tick > world.tick() || self.config.persistence_interval != 0
+            })
+        {
+            return contract_error(
+                "host.persistence_discarded_records_at",
+                "recording gap must name a completed disabled-recording tick".to_owned(),
             );
         }
         ensure_count_bound(
@@ -1349,6 +1376,7 @@ impl WorldState {
             config: self.config.clone(),
             config_revision: self.config_revision,
             persistence_boundary: self.persistence_boundary,
+            persistence_discarded_records_at: self.persistence_discarded_records_at,
             cadence: self.cadence.clone(),
             food_profiles: self.food_profiles.clone(),
             temperature: self.temperature.clone(),
@@ -1568,9 +1596,7 @@ impl WorldState {
         world.archive_evaluations = continuity.archive_evaluations;
         world.novelty_state = continuity.novelty_state.clone();
         world.consecutive_zero_novelty_samples = continuity.consecutive_zero_novelty_samples;
-        // The raw recording configuration is part of the full host companion. A caller-bound
-        // continuation will own the next batch; the science-only discard marker is inapplicable.
-        world.persistence_discarded_records_at = None;
+        world.persistence_discarded_records_at = continuity.persistence_discarded_records_at;
         Ok(world)
     }
 
