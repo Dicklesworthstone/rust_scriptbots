@@ -96,6 +96,119 @@ fn percentile(sorted: &[Duration], quantile: f64) -> Duration {
     sorted[rank.min(sorted.len() - 1)]
 }
 
+#[derive(Default)]
+struct SseClientState {
+    attached: AtomicBool,
+    events: AtomicU64,
+    ended: AtomicBool,
+}
+
+/// Count completed data events after HTTP transfer decoding, including records
+/// whose fields or line endings cross response-body chunks.
+#[derive(Default)]
+struct SseEventCounter {
+    line: Vec<u8>,
+    has_data: bool,
+    previous_cr: bool,
+}
+
+impl SseEventCounter {
+    fn push(&mut self, bytes: &[u8]) -> u64 {
+        let mut completed = 0;
+        for &byte in bytes {
+            if byte == b'\n' && self.previous_cr {
+                self.previous_cr = false;
+                continue;
+            }
+            self.previous_cr = byte == b'\r';
+            if byte == b'\r' || byte == b'\n' {
+                if self.line.is_empty() {
+                    completed += u64::from(self.has_data);
+                    self.has_data = false;
+                } else if self.line == b"data" || self.line.starts_with(b"data:") {
+                    self.has_data = true;
+                }
+                self.line.clear();
+            } else {
+                self.line.push(byte);
+            }
+        }
+        completed
+    }
+}
+
+fn read_sse_client(
+    address: std::net::SocketAddr,
+    path: &str,
+    stop: &AtomicBool,
+    state: &SseClientState,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .get(format!("http://{address}{path}"))
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .send(),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(format!("SSE HTTP status {}", response.status()));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if content_type.and_then(|value| value.split(';').next()) != Some("text/event-stream") {
+            return Err(format!("SSE content type {content_type:?}"));
+        }
+        state.attached.store(true, Ordering::Release);
+        let mut counter = SseEventCounter::default();
+        while !stop.load(Ordering::Acquire) {
+            match tokio::time::timeout(Duration::from_millis(500), response.chunk()).await {
+                Ok(Ok(Some(bytes))) => {
+                    state
+                        .events
+                        .fetch_add(counter.push(&bytes), Ordering::Release);
+                }
+                Ok(Ok(None)) => return Err("SSE body ended before requested stop".to_owned()),
+                Ok(Err(error)) => return Err(error.to_string()),
+                // An idle poll is distinct from a transport error or EOF.
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn sse_data_events_require_complete_records_across_body_splits() {
+    let bytes = b": data: keepalive\r\n\r\ndata: first\r\ndata: second\r\n\r\ndata\n\n";
+    for split in 0..=bytes.len() {
+        let mut counter = SseEventCounter::default();
+        assert_eq!(
+            counter.push(&bytes[..split]) + counter.push(&bytes[split..]),
+            2
+        );
+    }
+    let mut counter = SseEventCounter::default();
+    assert_eq!(counter.push(b"data: unfinished\n"), 0);
+    assert_eq!(counter.push(b"\n"), 1);
+    assert_eq!(counter.push(b": data: comment\n\n"), 0);
+}
+
 #[test]
 fn status_http_returns_the_published_boundary_before_the_parked_owner_is_released() {
     let mut world = WorldState::new(ScriptBotsConfig {
@@ -168,6 +281,8 @@ fn status_http_returns_the_published_boundary_before_the_parked_owner_is_release
 #[ignore = "DSR latency lane (bd-134): 1k agents, saturating SSE clients, wall-clock acceptance numbers"]
 fn control_plane_latency_holds_under_stepping_and_sse_load() {
     let world = populated_world();
+    let initial_agent_count = world.agents().len();
+    assert_eq!(initial_agent_count, AGENT_COUNT);
     let persistence = world
         .bind_persistence(Box::new(scriptbots_core::NullPersistence))
         .expect("persistence binding");
@@ -199,49 +314,51 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
 
     let stop = Arc::new(AtomicBool::new(false));
 
+    // A real 404 from this server must not count as an attached SSE client.
+    let refused = SseClientState::default();
+    let error = read_sse_client(rest_address, "/api/missing-latency-probe", &stop, &refused)
+        .expect_err("non-SSE HTTP response is refused");
+    assert!(error.contains("404"), "{error}");
+    assert!(!refused.attached.load(Ordering::Acquire));
+    assert_eq!(refused.events.load(Ordering::Acquire), 0);
+
     // Phase A: unloaded baseline throughput.
-    let baseline_start = snapshots.latest().world.tick;
+    let baseline_begin = Instant::now();
+    let baseline_start = snapshots.latest();
     std::thread::sleep(Duration::from_secs(PHASE_SECONDS));
-    let baseline_ticks = snapshots.latest().world.tick - baseline_start;
+    let baseline_end = snapshots.latest();
+    let baseline_ticks = baseline_end.world.tick - baseline_start.world.tick;
+    let baseline_actual_elapsed = baseline_begin.elapsed();
 
     // Phase B: saturate with SSE clients, then measure request latencies.
     let client_count = 2 * std::thread::available_parallelism().map_or(4, usize::from);
-    let sse_events = Arc::new(AtomicU64::new(0));
+    let mut sse_states = Vec::with_capacity(client_count);
     let mut sse_clients = Vec::new();
     for _ in 0..client_count {
         let stop = Arc::clone(&stop);
-        let sse_events = Arc::clone(&sse_events);
+        let state = Arc::new(SseClientState::default());
+        sse_states.push(Arc::clone(&state));
         sse_clients.push(std::thread::spawn(move || {
-            let Ok(mut stream) = TcpStream::connect(rest_address) else {
-                return;
-            };
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let request = format!(
-                "GET /api/ticks/stream HTTP/1.1\r\nHost: {rest_address}\r\nAccept: text/event-stream\r\n\r\n"
-            );
-            if stream.write_all(request.as_bytes()).is_err() {
-                return;
-            }
-            let mut buffer = [0_u8; 4096];
-            while !stop.load(Ordering::Relaxed) {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        let chunk = String::from_utf8_lossy(&buffer[..read]);
-                        sse_events
-                            .fetch_add(chunk.matches("data:").count() as u64, Ordering::Relaxed);
-                    }
-                    // Timeouts just mean no event inside the poll window.
-                    Err(_) => {}
-                }
-            }
+            let result = read_sse_client(rest_address, "/api/ticks/stream", &stop, &state);
+            state.ended.store(true, Ordering::Release);
+            result
         }));
     }
 
     // Let the SSE herd attach before measuring.
     std::thread::sleep(Duration::from_millis(750));
+    let before_load: Vec<_> = sse_states
+        .iter()
+        .map(|state| {
+            (
+                state.attached.load(Ordering::Acquire),
+                state.ended.load(Ordering::Acquire),
+                state.events.load(Ordering::Acquire),
+            )
+        })
+        .collect();
 
-    let loaded_start_ticks = snapshots.latest().world.tick;
+    let loaded_start_snapshot = snapshots.latest();
     let loaded_start = Instant::now();
     let mut latencies = Vec::with_capacity(MEASURED_REQUESTS);
     let mut failures = 0_usize;
@@ -254,13 +371,29 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
             Ok(_) | Err(_) => failures += 1,
         }
     }
-    let loaded_elapsed = loaded_start.elapsed().max(Duration::from_millis(1));
-    let loaded_ticks = snapshots.latest().world.tick - loaded_start_ticks;
+    let loaded_actual_elapsed = loaded_start.elapsed();
+    let loaded_elapsed = loaded_actual_elapsed.max(Duration::from_millis(1));
+    let loaded_end_snapshot = snapshots.latest();
+    let loaded_ticks = loaded_end_snapshot.world.tick - loaded_start_snapshot.world.tick;
+    let after_load: Vec<_> = sse_states
+        .iter()
+        .map(|state| {
+            (
+                state.ended.load(Ordering::Acquire),
+                state.events.load(Ordering::Acquire),
+            )
+        })
+        .collect();
 
-    stop.store(true, Ordering::Relaxed);
-    for client in sse_clients {
-        client.join().expect("SSE client joins");
-    }
+    stop.store(true, Ordering::Release);
+    let client_results: Vec<_> = sse_clients
+        .into_iter()
+        .map(|client| {
+            client
+                .join()
+                .unwrap_or_else(|_| Err("SSE client panicked".to_owned()))
+        })
+        .collect();
     runtime.shutdown().expect("REST shutdown");
     drop(submit);
     host.join().expect("owner shutdown");
@@ -276,11 +409,31 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
     } else {
         0.0
     };
+    let sse_events: u64 = after_load.iter().map(|(_, events)| events).sum();
+    let per_client: Vec<_> = before_load
+        .iter()
+        .zip(&after_load)
+        .zip(&client_results)
+        .enumerate()
+        .map(|(index, ((before, after), result))| {
+            let &(attached, ended_before, events_before) = before;
+            let &(ended_after, events_after) = after;
+            serde_json::json!({
+                "index": index,
+                "http_200_attached": attached,
+                "ended_before_load": ended_before,
+                "ended_before_load_completed": ended_after,
+                "events_before_load": events_before,
+                "events_during_load": events_after - events_before,
+                "stream_error": result.as_ref().err(),
+            })
+        })
+        .collect();
 
     // The bead requires the histogram table in the failure output; println!
     // is captured by the harness and replayed exactly when an assert fires.
     println!("control-plane latency harness (bd-134)");
-    println!("  agents: {AGENT_COUNT}  sse-clients: {client_count}");
+    println!("  initial agents: {initial_agent_count}  sse-clients: {client_count}");
     println!("  endpoint                requests  fail  p50        p95        p99");
     println!(
         "  /api/ticks/latest       {:>8}  {failures:>4}  {p50:>9.2?}  {p95:>9.2?}  {p99:>9.2?}",
@@ -290,9 +443,32 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
         "  tick throughput: baseline {baseline_tps:.1} tps -> loaded {loaded_tps:.1} tps ({:.1}% degradation)",
         degradation * 100.0
     );
+    println!("  sse events observed across clients: {sse_events}");
+    // Preserve the original acceptance denominators while exposing actual
+    // elapsed intervals and raw samples for independent interpretation.
     println!(
-        "  sse events observed across clients: {}",
-        sse_events.load(Ordering::Relaxed)
+        "{}",
+        serde_json::json!({
+            "schema": "scriptbots.control-plane-latency.v1",
+            "agent_count": initial_agent_count,
+            "agent_count_scope": "initial population; phase-boundary populations retained",
+            "baseline_start_agent_count": baseline_start.world.summary.agent_count,
+            "baseline_end_agent_count": baseline_end.world.summary.agent_count,
+            "loaded_start_agent_count": loaded_start_snapshot.world.summary.agent_count,
+            "loaded_end_agent_count": loaded_end_snapshot.world.summary.agent_count,
+            "measured_requests": latencies.len(),
+            "failed_requests": failures,
+            "latencies_ns": latencies.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
+            "p50_ns": p50.as_nanos(), "p95_ns": p95.as_nanos(), "p99_ns": p99.as_nanos(),
+            "baseline_ticks": baseline_ticks,
+            "baseline_elapsed_ns": Duration::from_secs(PHASE_SECONDS).as_nanos(),
+            "baseline_actual_elapsed_ns": baseline_actual_elapsed.as_nanos(),
+            "loaded_ticks": loaded_ticks,
+            "loaded_elapsed_ns": loaded_elapsed.as_nanos(),
+            "loaded_actual_elapsed_ns": loaded_actual_elapsed.as_nanos(),
+            "baseline_tps": baseline_tps, "loaded_tps": loaded_tps, "degradation": degradation,
+            "expected_sse_clients": client_count, "per_client": per_client,
+        })
     );
 
     assert_eq!(
@@ -304,8 +480,17 @@ fn control_plane_latency_holds_under_stepping_and_sse_load() {
         "both phases must observe actual science progress"
     );
     assert!(
-        sse_events.load(Ordering::Relaxed) > 0,
+        sse_events > 0,
         "the SSE streams must stay live while the simulation steps"
+    );
+    let attached_and_live = before_load
+        .iter()
+        .all(|&(attached, ended, events)| attached && !ended && events > 0);
+    assert!(
+        attached_and_live
+            && after_load.iter().all(|&(ended, _)| !ended)
+            && client_results.iter().all(Result::is_ok),
+        "every requested SSE client must attach, receive complete data events and stay connected: {per_client:?}"
     );
     assert!(
         p95 < LATENCY_P95_BUDGET,
