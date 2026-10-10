@@ -34,6 +34,8 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         .arg(env!("CARGO_BIN_EXE_scriptbots-app"))
         .arg(option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable"))
         .arg("quit")
+        .arg(scriptbots_core::WORLD_DIGEST_V1_ALGORITHM)
+        .arg(u64::BITS.to_string())
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -202,6 +204,8 @@ fn live_palette_shutdown_serializes_its_durable_receipt_before_restoration() -> 
         .arg(env!("CARGO_BIN_EXE_scriptbots-app"))
         .arg(option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable"))
         .arg("shutdown")
+        .arg(scriptbots_core::WORLD_DIGEST_V1_ALGORITHM)
+        .arg(u64::BITS.to_string())
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -277,8 +281,35 @@ import codecs, fcntl, hashlib, json, os, pathlib, pty, re, select, signal
 import socket, struct, subprocess, sys, tempfile, termios, time, urllib.error, urllib.request
 import unicodedata
 
-binary, source, exit_action = sys.argv[1:]
+binary, source, exit_action, digest_algorithm, digest_bit_width = sys.argv[1:]
 assert exit_action in ('quit', 'shutdown'), 'undeclared terminal exit journey'
+digest_bit_width = int(digest_bit_width)
+assert digest_algorithm == 'fnv1a' + str(digest_bit_width) + '-v0', 'digest algorithm disagrees with its Rust integer type'
+assert digest_bit_width > 0 and digest_bit_width % 4 == 0, 'digest cannot be represented by whole hexadecimal digits'
+digest_hex_digits = digest_bit_width // 4
+def experiment_digest_matches(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{' + str(digest_hex_digits) + '}', value) is not None
+
+digest_accepted_cases = [
+    {'case': 'zero', 'value': '0' * digest_hex_digits},
+    {'case': 'maximum', 'value': 'f' * digest_hex_digits},
+    {'case': 'mixed', 'value': format((1 << digest_bit_width) - 2, '0' + str(digest_hex_digits) + 'x')},
+]
+digest_rejected_cases = [
+    {'case': 'short', 'value': '0' * (digest_hex_digits - 1)},
+    {'case': 'long', 'value': '0' * (digest_hex_digits + 1)},
+    {'case': 'sha256_width', 'value': '0' * (hashlib.sha256().digest_size * 2)},
+    {'case': 'uppercase', 'value': 'F' * digest_hex_digits},
+    {'case': 'nonhex', 'value': 'g' * digest_hex_digits},
+    {'case': 'missing', 'value': None},
+]
+for case in digest_accepted_cases:
+    assert experiment_digest_matches(case['value']), ('digest guard rejected its positive control', case)
+for case in digest_rejected_cases:
+    assert not experiment_digest_matches(case['value']), ('digest guard accepted its negative control', case)
+digest_contract = {'algorithm': digest_algorithm, 'bit_width': digest_bit_width,
+                   'hexadecimal_digits': digest_hex_digits,
+                   'accepted_cases': digest_accepted_cases, 'rejected_cases': digest_rejected_cases}
 routes = [
     ('4', 'LINEAGES & PHYLOGENY LAB'),
     ('5', 'BRAIN ARENA & EVALUATOR COHORTS'),
@@ -999,6 +1030,11 @@ for profile in profiles:
                 screen.stream_observer = checkpoint_watch.observe
                 send_terminal_input(b'k')
                 def checkpoint_created():
+                    # Creation holds retention through its file/database work.
+                    # Keep pumping the actual receipt before consulting that
+                    # catalog; an absent Applied row still fails the same deadline.
+                    if 'applied' not in checkpoint_watch.observations:
+                        return False
                     body = request_api('/api/v1/checkpoints?limit=32')
                     catalog = json.loads(body)
                     new_checkpoints = [item for item in catalog['items'] if item['checkpoint_id'] not in before_ids]
@@ -1067,7 +1103,7 @@ for profile in profiles:
                     run = status['runs'][0]
                     assert run['variant_id'] == 'pty_mlp' and run['brain_family'] == 'mlp.baseline', run
                     assert run['state'] == 'completed' and run['seed'] == 41 and run['total_ticks'] == 3, run
-                    assert re.fullmatch(r'[0-9a-f]{64}', run['final_digest']) and run['bundle_path'], run
+                    assert experiment_digest_matches(run['final_digest']) and run['bundle_path'], run
                     assert run['error_reason'] is None, run
                     retain_response('experiment-completed.json', body)
                     experiment_completed.result = status
@@ -1093,7 +1129,8 @@ for profile in profiles:
                                    'receipt_stream_order': checkpoint_stream_order},
                     'experiment': {'experiment_id': experiment_id, 'status': experiment['status'],
                                    'total_runs': experiment['total_runs'], 'completed_runs': experiment['completed_runs'],
-                                   'failed_runs': experiment['failed_runs'], 'run': run},
+                                   'failed_runs': experiment['failed_runs'], 'run': run,
+                                   'digest_contract': digest_contract},
                     'refresh': {'before_tick': before['tick'], 'after_tick': after['tick'],
                                 'before_snapshot_revision': before['snapshot_revision'],
                                 'after_snapshot_revision': after['snapshot_revision'],
@@ -1448,19 +1485,27 @@ for profile in profiles:
             else:
                 assert screen.color_count == 0, 'NO_COLOR emitted non-default SGR colors'
         finally:
-            if process.poll() is None:
-                process.send_signal(signal.SIGTERM)
+            try:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+            finally:
                 try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-            with open(directory / 'terminal.raw', 'xb') as transcript:
-                transcript.write(raw)
-            with open(directory / 'terminal-attributes.json', 'x') as attributes:
-                json.dump({'initial': repr(initial), 'final': repr(termios.tcgetattr(slave))}, attributes)
-            os.close(master)
-            os.close(slave)
+                    with open(directory / 'terminal.raw', 'xb') as transcript:
+                        transcript.write(raw)
+                finally:
+                    try:
+                        with open(directory / 'terminal-attributes.json', 'x') as attributes:
+                            json.dump({'initial': repr(initial), 'final': repr(termios.tcgetattr(slave))}, attributes)
+                    finally:
+                        try:
+                            os.close(master)
+                        finally:
+                            os.close(slave)
     lifecycle_bytes = (directory / 'runtime.log').read_bytes()
     lifecycle = lifecycle_bytes.decode(errors='replace')
     finalized = 'terminal lifecycle finalized' in lifecycle and 'frankentui' in lifecycle

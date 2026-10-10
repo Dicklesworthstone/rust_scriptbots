@@ -109,7 +109,17 @@ verify_evidence() {
                     and $e.experiment.status == "completed" and $e.experiment.total_runs == 1
                     and $e.experiment.completed_runs == 1 and $e.experiment.failed_runs == 0
                     and $e.experiment.run.state == "completed" and $e.experiment.run.total_ticks == 3
-                    and ($e.experiment.run.final_digest | test("^[0-9a-f]{64}$"))
+                    and ($e.experiment.digest_contract as $digest
+                        | $digest.algorithm == "fnv1a64-v0"
+                        and $digest.bit_width == ($digest.algorithm | capture("^fnv1a(?<bits>[0-9]+)-v0$").bits | tonumber)
+                        and $digest.hexadecimal_digits == ($digest.bit_width / 4)
+                        and ($e.experiment.run.final_digest | test("^[0-9a-f]{" + ($digest.hexadecimal_digits | tostring) + "}$"))
+                        and ([$digest.accepted_cases[].case] | sort) == ["maximum","mixed","zero"]
+                        and all($digest.accepted_cases[]; .value | test("^[0-9a-f]{" + ($digest.hexadecimal_digits | tostring) + "}$"))
+                        and ([$digest.rejected_cases[].case] | sort) == ["long","missing","nonhex","sha256_width","short","uppercase"]
+                        and all($digest.rejected_cases[]; if (.value | type) == "string"
+                            then (.value | test("^[0-9a-f]{" + ($digest.hexadecimal_digits | tostring) + "}$") | not)
+                            else true end))
                     and $e.refresh.pause_receipt.application_state == "applied"
                     and $e.refresh.step_receipt.application_state == "applied"
                     and $e.refresh.after_tick == ($e.refresh.before_tick + 1)
