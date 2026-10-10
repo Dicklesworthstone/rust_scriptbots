@@ -64,9 +64,29 @@ verify_evidence() {
     [[ $(sed -n 's/^host: //p' "$directory/rustc.txt") == "$target" ]] || refuse "compiler target mismatch"
     if [[ "$lane" == terminal ]]; then
         jq -R -s -e --arg source "$expected" '
+            split("\n") | map(fromjson? | select(.schema == "scriptbots.live-tui-fault-pty.v1"))
+            | length == 3 and ([.[].fault] | sort) == ["panic", "renderer", "subscription"]
+            and all(.[]; .source_commit == $source and .fault_observed == true
+                and .raw_mode_observed == true and .terminal_attributes_restored == true
+                and .alternate_screen_restored == true)
+        ' "$directory/terminal-unit-tests.log" >/dev/null || refuse "missing source-bound actual PTY fault restoration"
+        while IFS= read -r record; do
+            local fault_directory fault_transcript_hash fault_attributes_hash
+            fault_directory=$(jq -er '.artifact_directory' <<< "$record") || refuse "missing fault PTY artifact path"
+            [[ "$fault_directory" = /* && -d "$fault_directory" ]] || refuse "missing fault PTY artifacts"
+            fault_transcript_hash=$(jq -er '.transcript_sha256' <<< "$record") || refuse "missing fault PTY transcript identity"
+            [[ $(sha256sum "$fault_directory/terminal.raw" | cut -d ' ' -f 1) == "$fault_transcript_hash" ]] || refuse "changed fault PTY transcript"
+            fault_attributes_hash=$(jq -er '.attributes_sha256' <<< "$record") || refuse "missing fault PTY attributes identity"
+            [[ $(sha256sum "$fault_directory/terminal-attributes.json" | cut -d ' ' -f 1) == "$fault_attributes_hash" ]] || refuse "changed fault PTY attributes"
+            jq -e '.initial == .final' "$fault_directory/terminal-attributes.json" >/dev/null || refuse "fault PTY attributes differ"
+        done < <(jq -R -c 'fromjson? | select(.schema == "scriptbots.live-tui-fault-pty.v1")' "$directory/terminal-unit-tests.log")
+        jq -R -s -e --arg source "$expected" '
             split("\n") | map(fromjson? | select(.schema == "scriptbots.live-tui-pty.v1"))
             | length == 2 and ([.[].capability_profile] | sort) == ["no-color", "truecolor"]
             and all(.[]; .source_commit == $source and .exit_code == 0
+                and .binary_source_observed == true
+                and (if .capability_profile == "truecolor" then .observed_truecolor_sgr_count > 0
+                     else .observed_color_sgr_count == 0 end)
                 and .raw_mode_observed == true and .terminal_attributes_restored == true
                 and .alternate_screen_restored == true and .frankentui_shutdown_observed == true
                 and (.observed_science_routes | length) > 0
@@ -74,7 +94,7 @@ verify_evidence() {
                 and (.observed_science_routes | sort) == ([.observed_screenshot_routes[].route] | sort))
         ' "$directory/terminal-end-to-end-tests.log" >/dev/null || refuse "missing source-bound live terminal and screenshot observations"
         while IFS= read -r record; do
-            local artifact_directory transcript_hash runtime_hash screenshot_hash index
+            local artifact_directory transcript_hash runtime_hash screenshot_hash terminal_hash index screen_record
             artifact_directory=$(jq -er '.artifact_directory' <<< "$record") || refuse "missing PTY artifact path"
             [[ "$artifact_directory" = /* && -d "$artifact_directory" ]] || refuse "missing PTY artifacts"
             transcript_hash=$(jq -er '.transcript_sha256' <<< "$record") || refuse "missing PTY transcript identity"
@@ -83,10 +103,13 @@ verify_evidence() {
             [[ $(sha256sum "$artifact_directory/runtime.log" | cut -d ' ' -f 1) == "$runtime_hash" ]] || refuse "changed runtime lifecycle log"
             rg -q 'terminal lifecycle finalized' "$artifact_directory/runtime.log" || refuse "missing actual runtime shutdown callback"
             index=4
-            while IFS= read -r screenshot_hash; do
+            while IFS= read -r screen_record; do
+                screenshot_hash=$(jq -er '.sha256' <<< "$screen_record") || refuse "missing presented screenshot identity"
                 [[ $(sha256sum "$artifact_directory/screen-$index.txt" | cut -d ' ' -f 1) == "$screenshot_hash" ]] || refuse "changed presented screenshot"
+                terminal_hash=$(jq -er '.terminal_sha256' <<< "$screen_record") || refuse "missing observed terminal screen identity"
+                [[ $(sha256sum "$artifact_directory/terminal-screen-$index.txt" | cut -d ' ' -f 1) == "$terminal_hash" ]] || refuse "changed observed terminal screen"
                 index=$((index + 1))
-            done < <(jq -r '.observed_screenshot_routes[].sha256' <<< "$record")
+            done < <(jq -c '.observed_screenshot_routes[]' <<< "$record")
         done < <(jq -R -c 'fromjson? | select(.schema == "scriptbots.live-tui-pty.v1")' "$directory/terminal-end-to-end-tests.log")
     fi
     if [[ "$lane" == connectivity ]]; then

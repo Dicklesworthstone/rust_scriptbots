@@ -117,6 +117,8 @@ const MAX_HEADLESS_FRAMES: usize = 360;
 const EVENT_LOG_CAPACITY: usize = 16;
 /// Exact envelopes retained while transport cannot establish admission.
 const UNRESOLVED_COMMAND_CAPACITY: usize = 32;
+/// Selection outcomes awaiting an owner publication or a local focus override.
+const PENDING_SELECTION_CAPACITY: usize = 32;
 /// Bounded contributor list requested from `WorldState::explain_sensors`
 /// (bd-16g.4.2); the panel is an on-demand probe, never a population scan.
 const PROBE_MAX_CONTRIBUTORS: usize = 12;
@@ -1248,7 +1250,8 @@ struct TerminalApp<'a> {
     command_namespace: u64,
     command_sequence: u64,
     unresolved_commands: VecDeque<UnresolvedTerminalCommand>,
-    pending_selection: Option<PendingTerminalSelection>,
+    pending_selections: VecDeque<PendingTerminalSelection>,
+    selection_observation_revision: Option<ControlRevision>,
     retained_render: Arc<RenderSnapshot>,
     analytics_provider: SharedAnalytics,
     control: &'a ControlRuntime,
@@ -1469,7 +1472,8 @@ impl<'a> TerminalApp<'a> {
             command_namespace,
             command_sequence: 0,
             unresolved_commands: VecDeque::with_capacity(UNRESOLVED_COMMAND_CAPACITY),
-            pending_selection: None,
+            pending_selections: VecDeque::with_capacity(PENDING_SELECTION_CAPACITY),
+            selection_observation_revision: None,
             retained_render,
             analytics_provider: ctx.analytics.clone(),
             control: ctx.control_runtime,
@@ -1764,6 +1768,15 @@ impl<'a> TerminalApp<'a> {
             self.push_toast(message);
             return None;
         }
+        if matches!(&command, ControlCommand::UpdateSelection(_))
+            && self.pending_selections.len() == PENDING_SELECTION_CAPACITY
+        {
+            let message = "Selection not submitted: pending selection queue is full; wait for owner receipts or choose a local focus";
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::SetStatus(message.into()));
+            self.push_toast(message);
+            return None;
+        }
         let action = match &command {
             ControlCommand::UpdateConfig(_) => "UpdateConfig",
             ControlCommand::UpdateSelection(_) => "UpdateSelection",
@@ -1807,7 +1820,7 @@ impl<'a> TerminalApp<'a> {
         let envelope = CommandEnvelope::new(id, host_command)
             .expecting_control_revision(self.retained_render.revisions.control);
         if let HostCommand::UpdateSelection(update) = &envelope.command {
-            self.pending_selection = Some(PendingTerminalSelection {
+            self.pending_selections.push_back(PendingTerminalSelection {
                 command_id: id,
                 update: update.clone(),
                 applied: None,
@@ -1867,13 +1880,8 @@ impl<'a> TerminalApp<'a> {
                 if definitely_refused {
                     self.unresolved_commands
                         .retain(|pending| pending.envelope.command_id != id);
-                    if self
-                        .pending_selection
-                        .as_ref()
-                        .is_some_and(|pending| pending.command_id == id)
-                    {
-                        self.pending_selection = None;
-                    }
+                    self.pending_selections
+                        .retain(|pending| pending.command_id != id);
                     receipt.status = frankentui_shell::ReceiptStatusKind::Failed(format!(
                         "Submission refused: {error}"
                     ));
@@ -1917,32 +1925,43 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn observe_selection_status(&mut self, status: &CommandStatus) {
-        let Some(pending) = self
-            .pending_selection
-            .as_mut()
-            .filter(|pending| pending.command_id == status.command_id())
-        else {
-            return;
-        };
         match status.application() {
-            ApplicationState::Applied(applied) => pending.applied = Some(*applied),
+            ApplicationState::Applied(applied) => {
+                if let Some(pending) = self
+                    .pending_selections
+                    .iter_mut()
+                    .find(|pending| pending.command_id == status.command_id())
+                {
+                    pending.applied = Some(*applied);
+                }
+            }
             ApplicationState::Rejected(_) | ApplicationState::Failed(_) => {
-                self.pending_selection = None;
+                self.pending_selections
+                    .retain(|pending| pending.command_id != status.command_id());
             }
             ApplicationState::Admitted => {}
         }
     }
 
     fn reconcile_selection_focus(&mut self, world: &RenderSnapshot) {
-        let Some(pending) = self.pending_selection.as_ref() else {
+        let observed_revision = self.selection_observation_revision;
+        let Some((pending, applied)) = self
+            .pending_selections
+            .iter()
+            .filter_map(|pending| pending.applied.map(|applied| (pending, applied)))
+            .filter(|(_, applied)| {
+                applied.revisions.control <= world.revisions.control
+                    && observed_revision.is_none_or(|observed| applied.revisions.control > observed)
+            })
+            .max_by_key(|(_, applied)| applied.revisions.control)
+        else {
+            self.pending_selections.retain(|pending| {
+                pending.applied.is_none_or(|applied| {
+                    observed_revision.is_none_or(|observed| applied.revisions.control > observed)
+                })
+            });
             return;
         };
-        let Some(applied) = pending.applied else {
-            return;
-        };
-        if world.revisions.control < applied.revisions.control {
-            return;
-        }
         let selected = world
             .world
             .agents
@@ -1964,15 +1983,21 @@ impl<'a> TerminalApp<'a> {
             self.manual_focus_cleared = false;
         } else if cleared {
             self.manual_focus_cleared = true;
-        } else {
-            // A newer publication may describe a different selection. It does
-            // not prove that this request's intended focus is on screen.
-            return;
         }
-        self.focus_lock = FocusLockMode::Manual;
-        self.activation_layer_index = 0;
-        self.activation_row_offset = 0;
-        self.pending_selection = None;
+        if selected.is_some() || cleared {
+            self.focus_lock = FocusLockMode::Manual;
+            self.activation_layer_index = 0;
+            self.activation_row_offset = 0;
+        }
+        // A latest-value publication may skip an earlier selection boundary.
+        // Receipt arrival order must never revive that older focus, including
+        // when the newer selection was superseded outside this frontend.
+        self.selection_observation_revision = Some(applied.revisions.control);
+        self.pending_selections.retain(|pending| {
+            pending
+                .applied
+                .is_none_or(|record| record.revisions.control > applied.revisions.control)
+        });
     }
 
     fn refresh_command_receipts(&mut self) {
@@ -2007,11 +2032,12 @@ impl<'a> TerminalApp<'a> {
                 candidates.push((id, pending.action.clone()));
             }
         }
-        if let Some(pending) = &self.pending_selection
-            && pending.applied.is_none()
-            && !candidates.iter().any(|(id, _)| *id == pending.command_id)
-        {
-            candidates.push((pending.command_id, "UpdateSelection".into()));
+        for pending in &self.pending_selections {
+            if pending.applied.is_none()
+                && !candidates.iter().any(|(id, _)| *id == pending.command_id)
+            {
+                candidates.push((pending.command_id, "UpdateSelection".into()));
+            }
         }
         if !candidates.is_empty() {
             let start = self.receipt_poll_offset % candidates.len();
@@ -3090,7 +3116,7 @@ impl<'a> TerminalApp<'a> {
                         });
                     self.focused_agent_cursor = best_idx;
                     self.manual_focus_cleared = false;
-                    self.pending_selection = None;
+                    self.pending_selections.clear();
                     self.focus_lock = FocusLockMode::Manual;
                     self.snapshot.focused_agent_uid = Some(uid.0);
                     self.map_pan_offset = norm_pos;
@@ -5723,11 +5749,13 @@ impl<'a> TerminalApp<'a> {
                 });
             }
             CommandPaletteAction::FocusTopPredator => {
+                self.pending_selections.clear();
                 self.focus_lock = FocusLockMode::TopPredator;
                 self.refresh_snapshot();
                 self.push_toast("Focus: Top Predator");
             }
             CommandPaletteAction::FocusOldest => {
+                self.pending_selections.clear();
                 self.focus_lock = FocusLockMode::Oldest;
                 self.refresh_snapshot();
                 self.push_toast("Focus: Oldest");
@@ -6335,7 +6363,7 @@ impl<'a> TerminalApp<'a> {
                     self.move_rail_selection(-1);
                 } else {
                     self.manual_focus_cleared = false;
-                    self.pending_selection = None;
+                    self.pending_selections.clear();
                     self.focused_agent_cursor = self.focused_agent_cursor.saturating_sub(1);
                     self.refresh_snapshot();
                 }
@@ -6345,7 +6373,7 @@ impl<'a> TerminalApp<'a> {
                     self.move_rail_selection(1);
                 } else {
                     self.manual_focus_cleared = false;
-                    self.pending_selection = None;
+                    self.pending_selections.clear();
                     self.focused_agent_cursor = self.focused_agent_cursor.saturating_add(1);
                     self.refresh_snapshot();
                 }
@@ -6368,18 +6396,20 @@ impl<'a> TerminalApp<'a> {
             // was unreachable by construction, not merely missing
             // (bd-2z0.14.2.2).
             (KeyCode::Char('t') | KeyCode::Char('T'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.pending_selections.clear();
                 self.focus_lock = FocusLockMode::TopPredator;
                 self.refresh_snapshot();
                 self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Top predators");
             }
             (KeyCode::Char('o') | KeyCode::Char('O'), _) => {
+                self.pending_selections.clear();
                 self.focus_lock = FocusLockMode::Oldest;
                 self.refresh_snapshot();
                 self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Oldest agents");
             }
             (KeyCode::Char('m') | KeyCode::Char('M'), _) => {
                 self.manual_focus_cleared = false;
-                self.pending_selection = None;
+                self.pending_selections.clear();
                 self.focus_lock = FocusLockMode::Manual;
                 self.refresh_snapshot();
                 self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Manual");
@@ -15636,6 +15666,294 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_terminal_faults_restore_actual_pty() {
+        const CHILD_CASE: &str = "SCRIPTBOTS_TEST_TERMINAL_FAULT_CASE";
+        if let Ok(case) = std::env::var(CHILD_CASE) {
+            run_terminal_fault_child(&case);
+            return;
+        }
+        let output = std::process::Command::new("python3")
+            .args(["-c", TERMINAL_FAULT_PTY_PROBE])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .arg(CHILD_CASE)
+            .arg(option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable"))
+            .output()
+            .expect("launch actual PTY fault observer");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("{stdout}");
+        assert!(
+            output.status.success(),
+            "actual PTY fault observer failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let observations: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(observations.len(), 3);
+        for observation in observations {
+            assert_eq!(observation["schema"], "scriptbots.live-tui-fault-pty.v1");
+            assert_eq!(observation["raw_mode_observed"], true);
+            assert_eq!(observation["terminal_attributes_restored"], true);
+            assert_eq!(observation["alternate_screen_restored"], true);
+            assert_eq!(observation["fault_observed"], true);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_terminal_fault_child(case: &str) {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        assert!(matches!(case, "panic" | "subscription" | "renderer"));
+
+        struct FaultModel<'a> {
+            live: LiveTerminalModel<'a>,
+            case: String,
+            triggered: Arc<AtomicBool>,
+        }
+
+        impl Model for FaultModel<'_> {
+            type Message = LiveTerminalMessage;
+
+            fn init(&mut self) -> Cmd<Self::Message> {
+                self.live.init()
+            }
+
+            fn update(&mut self, message: Self::Message) -> Cmd<Self::Message> {
+                if matches!(
+                    &message,
+                    LiveTerminalMessage::Event(ftui::core::event::Event::Key(key))
+                        if key.code == ftui::core::event::KeyCode::Char('F')
+                ) {
+                    self.triggered.store(true, Ordering::Release);
+                    return Cmd::none();
+                }
+                self.live.update(message)
+            }
+
+            fn view(&self, frame: &mut ftui::render::frame::Frame) {
+                if self.case == "panic" && self.triggered.load(Ordering::Acquire) {
+                    panic!("injected actual model-view panic");
+                }
+                self.live.view(frame);
+                frankentui_shell::print_to_frame(frame, 0, 0, "FAULT-PROBE-READY");
+            }
+
+            fn subscriptions(
+                &self,
+            ) -> Vec<Box<dyn ftui::runtime::subscription::Subscription<Self::Message>>> {
+                let mut subscriptions = self.live.subscriptions();
+                if self.case == "subscription" {
+                    subscriptions.push(Box::new(FaultSubscription(self.triggered.clone())));
+                }
+                subscriptions
+            }
+
+            fn on_error(&mut self, error: &str) -> Cmd<Self::Message> {
+                self.live.on_error(error)
+            }
+
+            fn on_shutdown(&mut self) -> Cmd<Self::Message> {
+                self.live.on_shutdown()
+            }
+        }
+
+        struct FaultSubscription(Arc<AtomicBool>);
+
+        impl ftui::runtime::subscription::Subscription<LiveTerminalMessage> for FaultSubscription {
+            fn id(&self) -> ftui::runtime::subscription::SubId {
+                0xfa
+            }
+
+            fn run(
+                &self,
+                _sender: std::sync::mpsc::Sender<LiveTerminalMessage>,
+                stop: ftui::runtime::subscription::StopSignal,
+            ) {
+                while !stop.wait_timeout(Duration::from_millis(1)) {
+                    assert!(
+                        !self.0.load(Ordering::Acquire),
+                        "injected actual subscription panic"
+                    );
+                }
+            }
+        }
+
+        struct FaultWriter {
+            stdout: io::Stdout,
+            triggered: Arc<AtomicBool>,
+            refused: Arc<AtomicBool>,
+        }
+
+        impl Write for FaultWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.triggered.load(Ordering::Acquire)
+                    && !self.refused.swap(true, Ordering::AcqRel)
+                {
+                    return Err(io::Error::other("injected actual presentation write failure"));
+                }
+                self.stdout.write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.stdout.flush()
+            }
+        }
+
+        let host = TerminalTestHost::running_frame(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let live = LiveTerminalModel::new(TerminalApp::new(&renderer, host.context(&runtime)))
+            .expect("actual live model");
+        let triggered = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        let model = FaultModel {
+            live,
+            case: case.into(),
+            triggered: triggered.clone(),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard =
+                TerminalModeGuard::begin_with(CrosstermRestore, || Ok(()), || Ok(()))
+                    .expect("real outer restoration guard");
+            guard.mark_cursor_hidden();
+            if case == "renderer" {
+                let features = ftui::runtime::BackendFeatures::default();
+                let session = ftui::TerminalSession::new(ftui::SessionOptions {
+                    alternate_screen: true,
+                    ..ftui::SessionOptions::default()
+                })
+                .expect("real terminal session");
+                let events = ftui::runtime::CrosstermEventSource::new(session, features);
+                let writer = ftui::TerminalWriter::new(
+                    FaultWriter {
+                        stdout: io::stdout(),
+                        triggered,
+                        refused: refused.clone(),
+                    },
+                    ftui::ScreenMode::AltScreen,
+                    ftui::UiAnchor::Bottom,
+                    ftui::TerminalCapabilities::with_overrides(),
+                );
+                let mut program = Program::with_event_source(
+                    model,
+                    events,
+                    features,
+                    writer,
+                    ProgramConfig::default(),
+                )
+                .expect("real runtime with observed failing writer");
+                let run_result = program.run();
+                assert!(refused.load(Ordering::Acquire), "writer failure must fire");
+                let error = run_result.expect_err("presentation failure must propagate");
+                assert!(error.to_string().contains("presentation write failure"));
+            } else {
+                let mut program = Program::with_config(model, ProgramConfig::default())
+                    .expect("real FrankenTUI runtime");
+                let run_result = program.run();
+                if case == "subscription" {
+                    run_result.expect("handled subscription failure completes lifecycle");
+                    let error = program
+                        .model()
+                        .live
+                        .failure
+                        .borrow_mut()
+                        .take()
+                        .expect("real live error hook observed subscription failure");
+                    assert!(error.to_string().contains("subscription"));
+                    assert!(program.model().live.app.borrow().frankentui.shutdown_called);
+                } else {
+                    run_result.expect("panic fixture must unwind before this returns");
+                    panic!("expected view panic did not occur");
+                }
+            }
+            drop(guard);
+        }));
+        if case == "panic" {
+            let panic = result.expect_err("actual view panic must escape runtime");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"injected actual model-view panic")
+            );
+        } else {
+            result.expect("non-panic fault path must preserve its observed error");
+        }
+        println!("terminal-fault-observed:{case}");
+    }
+
+    #[cfg(target_os = "linux")]
+    const TERMINAL_FAULT_PTY_PROBE: &str = r#"
+import fcntl, hashlib, json, os, pathlib, pty, select, signal
+import struct, subprocess, sys, tempfile, termios, time
+
+binary, case_variable, source = sys.argv[1:]
+for case in ('panic', 'subscription', 'renderer'):
+    directory = pathlib.Path(tempfile.mkdtemp(prefix='terminal-fault-' + case + '-'))
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
+    initial = termios.tcgetattr(slave)
+    environment = dict(os.environ, TERM='xterm-256color')
+    environment[case_variable] = case
+    def controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    raw = bytearray()
+    with open(directory / 'stderr.log', 'xb') as log:
+        process = subprocess.Popen(
+            [binary, '--exact', 'terminal::tests::live_terminal_faults_restore_actual_pty', '--nocapture'],
+            stdin=slave, stdout=slave, stderr=log, env=environment,
+            preexec_fn=controlling_terminal)
+        try:
+            deadline = time.monotonic() + 30
+            while b'FAULT-PROBE-READY' not in raw and time.monotonic() < deadline:
+                assert process.poll() is None, 'child exited before actual presentation'
+                if select.select([master], [], [], 0.05)[0]:
+                    raw.extend(os.read(master, 65536))
+            assert b'FAULT-PROBE-READY' in raw, 'first actual frame was not observed'
+            raw_mode = not (termios.tcgetattr(slave)[3] & termios.ICANON)
+            assert raw_mode, 'fault must happen after observed raw-mode startup'
+            os.write(master, b'F')
+            deadline = time.monotonic() + 30
+            while process.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    raw.extend(os.read(master, 65536))
+                assert len(raw) < 2_000_000, 'bounded fault transcript exceeded'
+            assert process.poll() == 0, 'fault child failed or did not finish'
+            while select.select([master], [], [], 0)[0]:
+                raw.extend(os.read(master, 65536))
+            fault_observed = ('terminal-fault-observed:' + case).encode() in raw
+            restored = termios.tcgetattr(slave) == initial
+            alternate_restored = b'\x1b[?1049l' in raw
+            assert fault_observed, 'named fault was not actually observed'
+            assert restored, 'actual terminal attributes were not restored'
+            assert alternate_restored, 'actual alternate screen was not restored'
+        finally:
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            (directory / 'terminal.raw').write_bytes(raw)
+            with open(directory / 'terminal-attributes.json', 'x') as attributes:
+                json.dump({'initial': repr(initial), 'final': repr(termios.tcgetattr(slave))}, attributes)
+            os.close(master)
+            os.close(slave)
+    print(json.dumps({'schema': 'scriptbots.live-tui-fault-pty.v1', 'source_commit': source,
+                      'fault': case, 'fault_observed': fault_observed,
+                      'raw_mode_observed': raw_mode,
+                      'terminal_attributes_restored': restored,
+                      'alternate_screen_restored': alternate_restored,
+                      'transcript_sha256': hashlib.sha256(raw).hexdigest(),
+                      'attributes_sha256': hashlib.sha256((directory / 'terminal-attributes.json').read_bytes()).hexdigest(),
+                      'artifact_directory': str(directory)}), flush=True)
+"#;
+
     #[test]
     fn terminal_headless_boolean_vocabulary_is_explicit() {
         for raw in ["1", "true", "TRUE", " yes ", "on"] {
@@ -16010,6 +16328,315 @@ mod tests {
         ));
         assert!(simulator.model().failure.borrow().is_some());
         assert!(simulator.is_shutdown());
+    }
+
+    // Source-derived fixture goldens for the production LiveTerminalModel view,
+    // not observations of a PTY, host receipt, throughput, or scientific comparison.
+    // Each row is fixed here; only trailing blank cells are expanded to the declared
+    // width. No update mode can replace an expectation with captured output.
+    const LIVE_DIAGNOSTICS_GOLDEN_WIDTH: u16 = 100;
+    const LIVE_DIAGNOSTICS_GOLDEN_HEIGHT: u16 = 18;
+    const LIVE_DIAGNOSTICS_NORMAL: [&str; LIVE_DIAGNOSTICS_GOLDEN_HEIGHT as usize] = [
+        " [ScriptBots Evolution Lab] [?]Help | Tick: 0 | Pop: 0 | PAUSED",
+        " Tabs: [1]Dash [2]World [3]Insp [4]Lin [5]Brain [6]Exp [7]Repl [8]Env*[9]Diag*",
+        "[DURABLE] journal=durable SetSpeed: applied id=normal",
+        "  SYSTEM DIAGNOSTICS & PIPELINE HEALTH",
+        "",
+        "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
+        "",
+        "    HOST & STORAGE PIPELINE HEALTH:",
+        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "      Introspection Neutrality: not measured",
+        "",
+        "    SIMULATION STAGE LATENCIES (ms):",
+        "      fixture                0.25 ms",
+        "",
+        "",
+        "----------------------------------------------------------------------------------------------------",
+        " ✓ OK: Command normal applied (rev 3)",
+    ];
+    const LIVE_DIAGNOSTICS_REDUCED: [&str; LIVE_DIAGNOSTICS_GOLDEN_HEIGHT as usize] = [
+        " [ScriptBots Evolution Lab] [?]Help | Tick: 0 | Pop: 0 | PAUSED",
+        " Tabs: [1]Dash [2]World [3]Insp [4]Lin [5]Brain [6]Exp [7]Repl [8]Env*[9]Diag*",
+        "[DURABLE] journal=durable SetSpeed: applied id=reduced",
+        "  SYSTEM DIAGNOSTICS & PIPELINE HEALTH",
+        "",
+        "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
+        "",
+        "    HOST & STORAGE PIPELINE HEALTH:",
+        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "      Introspection Neutrality: not measured",
+        "",
+        "    SIMULATION STAGE LATENCIES (ms):",
+        "      fixture                0.25 ms",
+        "",
+        "",
+        "----------------------------------------------------------------------------------------------------",
+        " [REDUCED CAPABILITY] [REDUCED-CAPABILITY MODE ACTIVATED]",
+    ];
+    const LIVE_DIAGNOSTICS_REJECTED: [&str; LIVE_DIAGNOSTICS_GOLDEN_HEIGHT as usize] = [
+        " [ScriptBots Evolution Lab] [?]Help | Tick: 0 | Pop: 0 | PAUSED",
+        " Tabs: [1]Dash [2]World [3]Insp [4]Lin [5]Brain [6]Exp [7]Repl [8]Env*[9]Diag*",
+        "[REJECTED] journal=durable SetSpeed: rejected: quota exceeded id=rejected",
+        "  SYSTEM DIAGNOSTICS & PIPELINE HEALTH",
+        "",
+        "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
+        "",
+        "    HOST & STORAGE PIPELINE HEALTH:",
+        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "      Introspection Neutrality: not measured",
+        "",
+        "    SIMULATION STAGE LATENCIES (ms):",
+        "      fixture                0.25 ms",
+        "",
+        "",
+        "----------------------------------------------------------------------------------------------------",
+        " ✗ REJECTED: Command rejected rejected: quota exceeded",
+    ];
+    const LIVE_DIAGNOSTICS_STALE: [&str; LIVE_DIAGNOSTICS_GOLDEN_HEIGHT as usize] = [
+        " [ScriptBots Evolution Lab] [?]Help | Tick: 0 | Pop: 0 | PAUSED",
+        " Tabs: [1]Dash [2]World [3]Insp [4]Lin [5]Brain [6]Exp [7]Repl [8]Env*[9]Diag*",
+        "[STALE_REV] journal=durable SetSpeed: stale revision: expected 8, observed 10 id=stale",
+        "  SYSTEM DIAGNOSTICS & PIPELINE HEALTH",
+        "",
+        "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
+        "",
+        "    HOST & STORAGE PIPELINE HEALTH:",
+        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "      Introspection Neutrality: not measured",
+        "",
+        "    SIMULATION STAGE LATENCIES (ms):",
+        "      fixture                0.25 ms",
+        "",
+        "",
+        "----------------------------------------------------------------------------------------------------",
+        " ⚠ STALE REVISION: Command stale expected rev 8 but observed 10",
+    ];
+    const LIVE_DIAGNOSTICS_FAILED: [&str; LIVE_DIAGNOSTICS_GOLDEN_HEIGHT as usize] = [
+        " [ScriptBots Evolution Lab] [?]Help | Tick: 0 | Pop: 0 | PAUSED",
+        " Tabs: [1]Dash [2]World [3]Insp [4]Lin [5]Brain [6]Exp [7]Repl [8]Env*[9]Diag*",
+        "[FAILED] journal=durable SetSpeed: failed: speed must be positive id=failed",
+        "  SYSTEM DIAGNOSTICS & PIPELINE HEALTH",
+        "",
+        "    Simulation Rate: unavailable  Render Refresh: 0.0 FPS  Build: fixture",
+        "",
+        "    HOST & STORAGE PIPELINE HEALTH:",
+        "      Host Ingress Queue:  0/8 (0% capacity)",
+        "      Analytics Snapshot: Committed Tick 0       Uncommitted: unavailable",
+        "      Introspection Neutrality: not measured",
+        "",
+        "    SIMULATION STAGE LATENCIES (ms):",
+        "      fixture                0.25 ms",
+        "",
+        "",
+        "----------------------------------------------------------------------------------------------------",
+        " ✗ FAILED: Command failed failed: speed must be positive",
+    ];
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct LiveGoldenCell {
+        symbol: String,
+        width: usize,
+        fg: ftui::render::cell::PackedRgba,
+        bg: ftui::render::cell::PackedRgba,
+        attrs: ftui::render::cell::CellAttrs,
+    }
+
+    fn expected_live_golden_cells(
+        rows: &[&str; LIVE_DIAGNOSTICS_GOLDEN_HEIGHT as usize],
+    ) -> Vec<LiveGoldenCell> {
+        use ftui::render::cell::{CellAttrs, PackedRgba, StyleFlags};
+        let mut cells = Vec::new();
+        for row in rows {
+            let written = row.chars().count();
+            assert!(written <= usize::from(LIVE_DIAGNOSTICS_GOLDEN_WIDTH));
+            for ch in row.chars().chain(std::iter::repeat_n(
+                ' ',
+                usize::from(LIVE_DIAGNOSTICS_GOLDEN_WIDTH) - written,
+            )) {
+                cells.push(LiveGoldenCell {
+                    symbol: ch.to_string(),
+                    width: 1,
+                    fg: PackedRgba::rgb(248, 250, 252),
+                    bg: PackedRgba::rgb(15, 23, 42),
+                    attrs: CellAttrs::new(StyleFlags::empty(), CellAttrs::LINK_ID_NONE),
+                });
+            }
+        }
+        cells
+    }
+
+    fn captured_live_golden_cells(
+        buffer: &ftui::render::buffer::Buffer,
+        pool: &ftui::render::grapheme_pool::GraphemePool,
+    ) -> Vec<LiveGoldenCell> {
+        assert_eq!(buffer.width(), LIVE_DIAGNOSTICS_GOLDEN_WIDTH);
+        assert_eq!(buffer.height(), LIVE_DIAGNOSTICS_GOLDEN_HEIGHT);
+        let mut cells = Vec::new();
+        for y in 0..buffer.height() {
+            for x in 0..buffer.width() {
+                let cell = buffer.get(x, y).expect("complete captured frame cell");
+                let symbol = if let Some(id) = cell.content.grapheme_id() {
+                    pool.get(id).expect("captured grapheme resolves").to_owned()
+                } else if let Some(ch) = cell.content.as_char() {
+                    ch.to_string()
+                } else {
+                    format!("unwritten or continuation cell {:?}", cell.content)
+                };
+                cells.push(LiveGoldenCell {
+                    symbol,
+                    width: cell.content.width(),
+                    fg: cell.fg,
+                    bg: cell.bg,
+                    attrs: cell.attrs,
+                });
+            }
+        }
+        cells
+    }
+
+    fn live_diagnostics_golden_fixture<'a>(
+        host: &TerminalTestHost,
+        runtime: &'a ControlRuntime,
+        name: &str,
+        status: frankentui_shell::ReceiptStatusKind,
+        reduced: bool,
+    ) -> LiveTerminalModel<'a> {
+        use frankentui_shell::{CommandReceiptEntry, ShellMessage, ShellRoute};
+        use science_screens::{DiagnosticsViewData, ScreenDataState};
+        use scriptbots_runtime::JournalState;
+
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(runtime));
+        app.palette = Palette::test_backend_evidence();
+        let model = LiveTerminalModel::new(app).expect("production live model");
+        // View-only simulator evidence: fixture receipts and diagnostics are
+        // supplied explicitly; Model::init would resume the real paused owner.
+        {
+            let mut app = model.app.borrow_mut();
+            app.frankentui
+                .update(ShellMessage::Navigate(ShellRoute::Diagnostics));
+            app.frankentui
+                .update(ShellMessage::SetDiagnosticsData(ScreenDataState::Data(
+                    DiagnosticsViewData {
+                        host_queue_depth: 0,
+                        host_queue_capacity: Some(8),
+                        analytics_committed_tick: Some(0),
+                        storage_uncommitted_records: None,
+                        snapshot_timings_ms: vec![("fixture".into(), 0.25)],
+                        sim_tick_hz: None,
+                        render_fps: Some(0.0),
+                        build_commit: "fixture".into(),
+                        digest_neutrality_verified: None,
+                    },
+                )));
+            app.frankentui
+                .update(ShellMessage::CommandReceipt(CommandReceiptEntry {
+                    command_id: name.into(),
+                    action: "SetSpeed".into(),
+                    status,
+                    journal_state: Some(JournalState::Durable),
+                    control_revision: 3,
+                    scientific_revision: 0,
+                    timestamp_tick: 0,
+                }));
+            app.frankentui.update(ShellMessage::CapabilityChanged {
+                reduced_color: reduced,
+                reduced_motion: false,
+            });
+        }
+        model
+    }
+
+    #[test]
+    fn live_model_diagnostics_complete_frame_fixture_goldens_discriminate_all_states() {
+        use frankentui_shell::ReceiptStatusKind;
+
+        let mut frames = Vec::new();
+        for (name, status, reduced, rows) in [
+            (
+                "normal",
+                ReceiptStatusKind::Durable,
+                false,
+                &LIVE_DIAGNOSTICS_NORMAL,
+            ),
+            (
+                "reduced",
+                ReceiptStatusKind::Durable,
+                true,
+                &LIVE_DIAGNOSTICS_REDUCED,
+            ),
+            (
+                "rejected",
+                ReceiptStatusKind::Rejected("quota exceeded".into()),
+                false,
+                &LIVE_DIAGNOSTICS_REJECTED,
+            ),
+            (
+                "stale",
+                ReceiptStatusKind::StaleRevision {
+                    observed: 10,
+                    expected: 8,
+                },
+                false,
+                &LIVE_DIAGNOSTICS_STALE,
+            ),
+            (
+                "failed",
+                ReceiptStatusKind::Failed("speed must be positive".into()),
+                false,
+                &LIVE_DIAGNOSTICS_FAILED,
+            ),
+        ] {
+            let host = TerminalTestHost::take(command_characterization_world());
+            let (runtime, _) = ControlRuntime::dummy();
+            let digest_before = host
+                .port()
+                .scientific_digest_v1()
+                .expect("owner digest before view");
+            let mut simulator = ftui::runtime::ProgramSimulator::new(
+                live_diagnostics_golden_fixture(&host, &runtime, name, status, reduced),
+            );
+            let captured = simulator
+                .capture_frame(LIVE_DIAGNOSTICS_GOLDEN_WIDTH, LIVE_DIAGNOSTICS_GOLDEN_HEIGHT)
+                .clone();
+            let actual = captured_live_golden_cells(&captured, simulator.pool());
+            let expected = expected_live_golden_cells(rows);
+            assert_eq!(
+                actual, expected,
+                "complete production-model fixture frame: {name}"
+            );
+            for (prior_name, prior_frame) in &frames {
+                assert_ne!(&actual, prior_frame, "{name} and {prior_name} must differ");
+            }
+            let mut perturbed = captured.clone();
+            let mut changed = *perturbed.get(0, 4).expect("a blank body cell");
+            changed.content = ftui::render::cell::CellContent::from_char('X');
+            perturbed.set_raw(0, 4, changed);
+            assert_ne!(
+                captured_live_golden_cells(&perturbed, simulator.pool()),
+                expected
+            );
+            let mut perturbed = captured.clone();
+            changed = *perturbed.get(0, 4).expect("a blank styled cell");
+            changed.fg = ftui::render::cell::PackedRgba::rgb(255, 0, 0);
+            perturbed.set_raw(0, 4, changed);
+            assert_ne!(
+                captured_live_golden_cells(&perturbed, simulator.pool()),
+                expected
+            );
+            assert_eq!(
+                host.port()
+                    .scientific_digest_v1()
+                    .expect("owner digest after view"),
+                digest_before
+            );
+            frames.push((name, actual));
+        }
     }
 
     #[test]
@@ -16392,8 +17019,8 @@ mod tests {
         app.map_area = Some(Rect::new(0, 0, 100, 100));
         app.handle_mouse_click(30, 30);
         let select_id = app
-            .pending_selection
-            .as_ref()
+            .pending_selections
+            .back()
             .expect("click submits a real owner selection")
             .command_id
             .to_string();
@@ -16427,7 +17054,7 @@ mod tests {
         assert_eq!(app.snapshot.focused_agent_uid, original_focus);
         app.refresh_snapshot();
         assert_eq!(app.snapshot.focused_agent_uid, target.uid);
-        assert!(app.pending_selection.is_none());
+        assert!(app.pending_selections.is_empty());
 
         // A later local inspector move must not be overwritten on every refresh
         // merely because the world's independent selection remains on agent 2.
@@ -16503,10 +17130,226 @@ mod tests {
                 .status,
             frankentui_shell::ReceiptStatusKind::StaleRevision { .. }
         ));
-        assert!(app.pending_selection.is_none());
+        assert!(app.pending_selections.is_empty());
         app.refresh_snapshot();
         assert_eq!(app.snapshot.focused_agent_uid, target.uid);
         assert_eq!(app.snapshot.tick, 0, "selection never advances science");
+    }
+
+    #[test]
+    fn live_rapid_selection_rejection_preserves_applied_focus_and_owner_order() {
+        use scriptbots_runtime::ManualInstant;
+
+        for second_is_stale in [true, false] {
+            let world = command_characterization_world();
+            {
+                let mut world = world.lock().expect("fixture world");
+                for coordinate in [10.0, 30.0, 50.0] {
+                    world
+                        .try_spawn_agent(scriptbots_core::AgentData {
+                            position: Position {
+                                x: coordinate,
+                                y: coordinate,
+                            },
+                            ..scriptbots_core::AgentData::default()
+                        })
+                        .expect("valid selectable agent");
+                }
+            }
+            let (mut driver, port) = terminal_manual_driver(
+                world,
+                scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity,
+            );
+            let (runtime, _) = ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let mut app = TerminalApp::new(
+                &renderer,
+                TerminalTestHost::port_context(port.clone(), &runtime),
+            );
+            let original_focus = app.snapshot.focused_agent_uid;
+            let first = app.snapshot.agents[1].clone();
+            let second = app.snapshot.agents[2].clone();
+            app.map_area = Some(Rect::new(0, 0, 100, 100));
+            app.handle_mouse_click(30, 30);
+            let first_id = app
+                .pending_selections
+                .back()
+                .expect("first click")
+                .command_id;
+            assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+
+            if !second_is_stale {
+                driver
+                    .step(ManualInstant::from_nanos(0))
+                    .expect("owner applies first selection");
+                // Observe its publication, but leave application receipts for
+                // the later shared refresh. The first focus is still pending.
+                app.refresh_snapshot();
+                assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+            }
+            if second_is_stale {
+                app.handle_mouse_click(50, 50);
+            } else {
+                app.submit_with_visible_receipt(ControlCommand::UpdateSelection(SelectionUpdate {
+                    mode: SelectionMode::Add,
+                    agent_ids: vec![second.id],
+                    state: SelectionState::Selected,
+                }))
+                .expect("second guarded selection intent");
+            }
+            let second_id = app
+                .pending_selections
+                .back()
+                .expect("second selection")
+                .command_id;
+            assert_ne!(first_id, second_id);
+            assert_eq!(app.pending_selections.len(), 2);
+            assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+            driver
+                .step(ManualInstant::from_nanos(1))
+                .expect("owner applies or rejects the queued selections");
+            app.refresh_snapshot();
+            assert_eq!(app.snapshot.focused_agent_uid, original_focus);
+
+            // The newest receipt is polled first; application order comes from
+            // actual owner revisions rather than arrival or insertion order.
+            app.receipt_poll_offset = 1;
+            app.refresh_command_receipts();
+            let first_receipt = app
+                .frankentui
+                .receipt_for(&first_id.to_string())
+                .expect("actual first application");
+            assert_eq!(
+                first_receipt.status,
+                frankentui_shell::ReceiptStatusKind::Applied
+            );
+            assert_eq!(first_receipt.control_revision, 1);
+            let second_receipt = app
+                .frankentui
+                .receipt_for(&second_id.to_string())
+                .expect("actual second result");
+            if second_is_stale {
+                assert_eq!(
+                    second_receipt.status,
+                    frankentui_shell::ReceiptStatusKind::StaleRevision {
+                        expected: 0,
+                        observed: 1,
+                    }
+                );
+                assert_eq!(app.pending_selections.len(), 1);
+            } else {
+                assert_eq!(
+                    second_receipt.status,
+                    frankentui_shell::ReceiptStatusKind::Applied
+                );
+                assert_eq!(second_receipt.control_revision, 2);
+                assert_eq!(app.pending_selections.len(), 2);
+            }
+            app.refresh_snapshot();
+            let expected_focus = if second_is_stale {
+                first.uid
+            } else {
+                second.uid
+            };
+            assert_eq!(app.snapshot.focused_agent_uid, expected_focus);
+            assert!(app.pending_selections.is_empty());
+            assert_eq!(
+                port.snapshot_hub().latest().agent_selection[1],
+                SelectionState::Selected
+            );
+            if !second_is_stale {
+                assert_eq!(
+                    port.snapshot_hub().latest().agent_selection[2],
+                    SelectionState::Selected
+                );
+                let older = port
+                    .command_status_before(first_id, Instant::now() + Duration::from_millis(5))
+                    .expect("real older owner status")
+                    .expect("the first identity remains authoritative");
+                app.observe_selection_status(&older);
+                app.refresh_snapshot();
+                assert_eq!(app.snapshot.focused_agent_uid, second.uid);
+            }
+            app.rail_visible = false;
+            app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+                .expect("later local inspector override");
+            let local_focus = app.snapshot.focused_agent_uid;
+            app.refresh_command_receipts();
+            app.refresh_snapshot();
+            assert_eq!(app.snapshot.focused_agent_uid, local_focus);
+            assert_eq!(app.snapshot.tick, 0, "selection cannot advance science");
+        }
+    }
+
+    #[test]
+    fn live_pending_selection_capacity_refuses_before_id_allocation_and_recovers() {
+        use scriptbots_runtime::ManualInstant;
+
+        let (mut driver, port) = terminal_manual_driver(
+            command_characterization_world(),
+            scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity,
+        );
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            TerminalTestHost::port_context(port.clone(), &runtime),
+        );
+        let clear = ControlCommand::UpdateSelection(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: SelectionState::None,
+        });
+        for _ in 0..PENDING_SELECTION_CAPACITY {
+            app.submit_with_visible_receipt(clear.clone())
+                .expect("selection intent retains its identity");
+            driver
+                .step(ManualInstant::from_nanos(0))
+                .expect("actual owner applies the selection");
+            app.refresh_command_receipts();
+            assert!(app.unresolved_commands.is_empty());
+            // Retain the real publication without reconciling presentation,
+            // as the batch-command barrier does before returning to painting.
+            app.retained_render = app
+                .client
+                .poll_snapshot(&mut app.snapshot_subscription)
+                .expect("real owner publication")
+                .expect("each applied selection publishes its new revision");
+        }
+        assert_eq!(app.pending_selections.len(), PENDING_SELECTION_CAPACITY);
+        let before_ids: Vec<_> = app
+            .pending_selections
+            .iter()
+            .map(|pending| pending.command_id)
+            .collect();
+        let sequence = app.command_sequence;
+        assert!(app.submit_with_visible_receipt(clear).is_none());
+        assert_eq!(app.command_sequence, sequence);
+        assert!(app.unresolved_commands.is_empty());
+        assert_eq!(
+            app.pending_selections
+                .iter()
+                .map(|pending| pending.command_id)
+                .collect::<Vec<_>>(),
+            before_ids
+        );
+        assert!(
+            app.frankentui
+                .status_message
+                .as_deref()
+                .expect("visible capacity refusal")
+                .contains("pending selection queue is full")
+        );
+        assert_eq!(
+            driver
+                .step(ManualInstant::from_nanos(0))
+                .expect("the refused intent cannot reach ingress")
+                .admitted,
+            0
+        );
+        app.refresh_snapshot();
+        assert!(app.pending_selections.is_empty());
+        assert_eq!(app.snapshot.tick, 0);
     }
 
     #[derive(Debug)]

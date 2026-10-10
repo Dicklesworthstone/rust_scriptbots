@@ -45,11 +45,7 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
-    assert_eq!(
-        observations.len(),
-        2,
-        "both capability profiles must execute"
-    );
+    assert_eq!(observations.len(), 2, "both capability profiles must execute");
     for observation in observations {
         assert_eq!(observation["schema"], "scriptbots.live-tui-pty.v1");
         assert_eq!(observation["exit_code"], 0);
@@ -57,6 +53,21 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         assert_eq!(observation["terminal_attributes_restored"], true);
         assert_eq!(observation["alternate_screen_restored"], true);
         assert_eq!(observation["frankentui_shutdown_observed"], true);
+        assert_eq!(observation["binary_source_observed"], true);
+        assert_eq!(
+            observation["source_commit"],
+            option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable")
+        );
+        match observation["capability_profile"].as_str() {
+            Some("truecolor") => assert!(
+                observation["observed_truecolor_sgr_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "truecolor must be observed in actual terminal output"
+            ),
+            Some("no-color") => assert_eq!(observation["observed_color_sgr_count"], 0),
+            profile => panic!("unexpected capability profile: {profile:?}"),
+        }
         assert_eq!(
             observation["observed_screenshot_routes"]
                 .as_array()
@@ -75,8 +86,9 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 const LIVE_TERMINAL_PTY_PROBE: &str = r#"
-import fcntl, hashlib, json, os, pathlib, pty, re, select, signal
+import codecs, fcntl, hashlib, json, os, pathlib, pty, re, select, signal
 import socket, struct, subprocess, sys, tempfile, termios, time, urllib.error, urllib.request
+import unicodedata
 
 binary, source = sys.argv[1:]
 routes = [
@@ -87,7 +99,198 @@ routes = [
     ('8', 'ENVIRONMENT, HYDROLOGY & BIOME LAYERS'),
     ('9', 'SYSTEM DIAGNOSTICS & PIPELINE HEALTH'),
 ]
-escape = re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)')
+class TerminalScreen:
+    # The pinned presenter emits differential cursor-addressed updates. Keep the
+    # actual visible cells instead of treating its output as an append-only log.
+    def __init__(self, width, height):
+        self.width, self.height = width, height
+        self.cells = [[' '] * width for _ in range(height)]
+        self.x = self.y = 0
+        self.saved = (0, 0)
+        self.scroll_top, self.scroll_bottom = 0, height - 1
+        self.wrap_pending = False
+        self.autowrap = True
+        self.alternate = False
+        self.alternate_entered = self.alternate_left = False
+        self.synchronized = False
+        self.color_count = self.truecolor_count = self.attribute_count = 0
+        self.pending = ''
+        self.decoder = codecs.getincrementaldecoder('utf-8')('strict')
+
+    def text(self):
+        return '\n'.join(''.join(row) for row in self.cells)
+
+    def position(self, x, y):
+        self.x = max(0, min(self.width - 1, x))
+        self.y = max(0, min(self.height - 1, y))
+        self.wrap_pending = False
+
+    def line_feed(self):
+        self.wrap_pending = False
+        if self.y == self.scroll_bottom:
+            self.cells[self.scroll_top:self.scroll_bottom + 1] = (
+                self.cells[self.scroll_top + 1:self.scroll_bottom + 1]
+                + [[' '] * self.width])
+        else:
+            self.y = min(self.height - 1, self.y + 1)
+
+    def put(self, character):
+        if unicodedata.category(character) in ('Mn', 'Me'):
+            if self.x > 0 or self.wrap_pending:
+                column = self.x if self.wrap_pending else self.x - 1
+                self.cells[self.y][column] += character
+            return
+        if unicodedata.category(character) == 'Cf':
+            raise AssertionError('unsupported terminal format character: ' + repr(character))
+        width = 2 if unicodedata.east_asian_width(character) in ('W', 'F') else 1
+        if self.autowrap and (self.wrap_pending or self.x + width > self.width):
+            self.line_feed()
+            self.x = 0
+        self.cells[self.y][self.x] = character
+        if width == 2 and self.x + 1 < self.width:
+            self.cells[self.y][self.x + 1] = ''
+        following = self.x + width
+        self.wrap_pending = following >= self.width
+        self.x = min(self.width - 1, following)
+
+    def sgr(self, values):
+        index = 0
+        while index < len(values):
+            code = values[index]
+            if code in (38, 48):
+                assert index + 1 < len(values), 'incomplete extended SGR color'
+                mode = values[index + 1]
+                count = 3 if mode == 2 else 1 if mode == 5 else 0
+                assert count and index + 2 + count <= len(values), 'unsupported SGR color'
+                assert all(0 <= value <= 255 for value in values[index + 2:index + 2 + count])
+                self.color_count += 1
+                self.truecolor_count += int(mode == 2)
+                index += count + 2
+                continue
+            if 30 <= code <= 37 or 40 <= code <= 47 or 90 <= code <= 97 or 100 <= code <= 107:
+                self.color_count += 1
+            elif code in (1, 2, 3, 4, 5, 7, 8, 9, 22, 23, 24, 25, 27, 28, 29):
+                self.attribute_count += 1
+            elif code not in (0, 39, 49):
+                raise AssertionError('unsupported SGR attribute: ' + str(code))
+            index += 1
+
+    def csi(self, parameters, final):
+        if parameters.startswith('?') and final in ('h', 'l'):
+            modes = [int(value) for value in parameters[1:].split(';')]
+            allowed = {7, 25, 1000, 1001, 1002, 1003, 1004, 1005, 1006,
+                       1015, 1016, 1049, 2004, 2026}
+            assert set(modes) <= allowed, 'unsupported terminal mode: ' + parameters + final
+            for mode in modes:
+                enabled = final == 'h'
+                if mode == 7:
+                    self.autowrap = enabled
+                elif mode == 1049:
+                    self.alternate = enabled
+                    if enabled:
+                        self.alternate_entered = True
+                        self.cells = [[' '] * self.width for _ in range(self.height)]
+                        self.position(0, 0)
+                    else:
+                        self.alternate_left = True
+                elif mode == 2026:
+                    self.synchronized = enabled
+            return
+        if final == 'u' and parameters in ('>15', '<'):
+            return  # Pinned session's Kitty keyboard push/pop; no screen effect.
+        assert re.fullmatch(r'[0-9;]*', parameters), 'unsupported CSI: ' + parameters + final
+        values = [int(value or 0) for value in parameters.split(';')]
+        amount = values[0] or 1
+        if final in ('H', 'f') and len(values) <= 2:
+            self.position((values[1] or 1) - 1 if len(values) == 2 else 0, amount - 1)
+        elif final == 'G' and len(values) == 1:
+            self.position(amount - 1, self.y)
+        elif final in ('A', 'B', 'C', 'D') and len(values) == 1:
+            self.position(self.x + (amount if final == 'C' else -amount if final == 'D' else 0),
+                          self.y + (amount if final == 'B' else -amount if final == 'A' else 0))
+        elif final == 'm':
+            self.sgr(values)
+        elif final in ('J', 'K') and len(values) == 1:
+            mode = values[0]
+            assert mode in (0, 1, 2) or (final == 'J' and mode == 3), 'unsupported erase mode'
+            if mode == 3:
+                return  # Erases scrollback; the bounded visible screen is unchanged.
+            rows = range(self.height) if final == 'J' else [self.y]
+            for row in rows:
+                for column in range(self.width):
+                    current = (row, column)
+                    cursor = (self.y, self.x)
+                    if mode == 2 or (mode == 0 and current >= cursor) or (mode == 1 and current <= cursor):
+                        self.cells[row][column] = ' '
+        elif final == 'r' and len(values) <= 2:
+            top = (values[0] or 1) - 1
+            bottom = (values[1] or self.height) - 1 if len(values) == 2 else self.height - 1
+            assert 0 <= top < bottom < self.height, 'unsupported scroll margins'
+            self.scroll_top, self.scroll_bottom = top, bottom
+            self.position(0, 0)
+        else:
+            raise AssertionError('unsupported CSI: ' + repr(parameters + final))
+
+    def feed(self, chunk, final=False):
+        data = self.pending + self.decoder.decode(chunk, final=final)
+        self.pending = ''
+        index = 0
+        while index < len(data):
+            character = data[index]
+            if character == '\x1b':
+                start = index
+                if index + 1 == len(data):
+                    break
+                kind = data[index + 1]
+                if kind == '[':
+                    end = index + 2
+                    while end < len(data) and not ('@' <= data[end] <= '~'):
+                        assert ' ' <= data[end] <= '?', 'invalid CSI byte'
+                        assert end - start < 256, 'bounded CSI exceeded'
+                        end += 1
+                    if end == len(data):
+                        break
+                    self.csi(data[index + 2:end], data[end])
+                    index = end + 1
+                    continue
+                if kind == ']':
+                    end = index + 2
+                    while end < len(data) and data[end] != '\x07' and data[end:end + 2] != '\x1b\\':
+                        assert end - start < 8192, 'bounded OSC exceeded'
+                        end += 1
+                    if end == len(data) or (data[end] == '\x1b' and end + 1 == len(data)):
+                        break
+                    payload = data[index + 2:end]
+                    assert payload.startswith('8;'), 'unsupported OSC: ' + repr(payload)
+                    index = end + (1 if data[end] == '\x07' else 2)
+                    continue
+                if kind == '7':
+                    self.saved = (self.x, self.y)
+                elif kind == '8':
+                    self.position(*self.saved)
+                else:
+                    raise AssertionError('unsupported escape: ' + repr(data[index:index + 2]))
+                index += 2
+                continue
+            if character == '\r':
+                self.position(0, self.y)
+            elif character == '\n':
+                self.line_feed()
+            elif character == '\b':
+                self.position(self.x - 1, self.y)
+            elif character == '\t':
+                self.position((self.x // 8 + 1) * 8, self.y)
+            elif character == '\x07':
+                pass
+            elif ord(character) < 32 or ord(character) == 127:
+                raise AssertionError('unsupported terminal control: ' + repr(character))
+            else:
+                self.put(character)
+            index += 1
+        self.pending = data[index:]
+        assert len(self.pending) <= 8192, 'bounded partial terminal sequence exceeded'
+        assert not final or not self.pending, 'incomplete terminal sequence at shutdown'
+
 for profile in ('truecolor', 'no-color'):
     directory = pathlib.Path(tempfile.mkdtemp(prefix='live-tui-' + profile + '-'))
     master, slave = pty.openpty()
@@ -99,6 +302,7 @@ for profile in ('truecolor', 'no-color'):
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith(('SCRIPTBOTS_', 'SB_'))}
     environment.update(SCRIPTBOTS_MODE='terminal', SCRIPTBOTS_TERMINAL_HEADLESS='0',
+                       SCRIPTBOTS_TERMINAL_EMOJI='0',
                        SCRIPTBOTS_CONTROL_REST_ENABLED='1', SCRIPTBOTS_CONTROL_MCP='disabled',
                        SCRIPTBOTS_CONTROL_REST_ADDR='127.0.0.1:' + str(port),
                        SCRIPTBOTS_TERMINAL_LOG=str(directory / 'runtime.log'),
@@ -113,8 +317,10 @@ for profile in ('truecolor', 'no-color'):
         os.setsid()
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
     raw = bytearray()
+    screen = TerminalScreen(120, 36)
     observed = []
     screenshots = []
+    binary_source = None
     with open(directory / 'stderr.log', 'xb') as log:
         process = subprocess.Popen(
             [binary, '--storage', 'memory', '--bootstrap-ticks', '0', '--threads', '1',
@@ -123,6 +329,11 @@ for profile in ('truecolor', 'no-color'):
              '--set', 'persistence_interval=0', '--checkpoint-interval', '0'],
             stdin=slave, stdout=slave, stderr=log, cwd=directory, env=environment,
             preexec_fn=controlling_terminal)
+        def read_terminal():
+            chunk = os.read(master, 65536)
+            raw.extend(chunk)
+            assert len(raw) <= 2_000_000, 'bounded PTY transcript exceeded'
+            screen.feed(chunk)
         def pump_until(predicate, description):
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -131,20 +342,19 @@ for profile in ('truecolor', 'no-color'):
                 if process.poll() is not None:
                     raise AssertionError('terminal exited during ' + description)
                 if select.select([master], [], [], 0.05)[0]:
-                    raw.extend(os.read(master, 65536))
-                if len(raw) > 2_000_000:
-                    raise AssertionError('bounded PTY transcript exceeded')
+                    read_terminal()
             raise AssertionError('timeout during ' + description)
         try:
-            pump_until(lambda: b'\x1b[?1049h' in raw, 'alternate-screen startup')
+            pump_until(lambda: screen.alternate_entered, 'alternate-screen startup')
             pump_until(lambda: not (termios.tcgetattr(slave)[3] & termios.ICANON), 'raw-mode startup')
             raw_mode = not (termios.tcgetattr(slave)[3] & termios.ICANON)
             for key, title in routes:
-                start = len(raw)
                 os.write(master, key.encode())
-                pump_until(lambda: title.encode() in escape.sub(b'', bytes(raw[start:])), title)
+                pump_until(lambda: screen.alternate and not screen.synchronized
+                           and title in screen.text(), title)
                 observed.append(title)
                 def screenshot_matches():
+                    global binary_source
                     try:
                         request = urllib.request.Request(
                             'http://127.0.0.1:' + str(port) + '/api/screenshot/ascii',
@@ -152,10 +362,22 @@ for profile in ('truecolor', 'no-color'):
                         with urllib.request.urlopen(
                                 request, timeout=0.2) as response:
                             body = response.read(200_000)
-                        if title.encode() in body:
+                        terminal_text = screen.text()
+                        if title.encode() in body and title in terminal_text and not screen.synchronized:
+                            if key == '9':
+                                child_source = re.search(r'\bBuild: ([0-9a-f]{40})\b', terminal_text)
+                                rest_source = re.search(rb'\bBuild: ([0-9a-f]{40})\b', body)
+                                if child_source is None or rest_source is None:
+                                    return False
+                                assert child_source[1] == source == rest_source[1].decode(), 'child build source mismatch'
+                                binary_source = child_source[1]
+                            terminal_bytes = terminal_text.encode()
                             with open(directory / ('screen-' + key + '.txt'), 'xb') as screenshot:
                                 screenshot.write(body)
-                            screenshots.append({'route': title, 'sha256': hashlib.sha256(body).hexdigest()})
+                            with open(directory / ('terminal-screen-' + key + '.txt'), 'xb') as terminal_capture:
+                                terminal_capture.write(terminal_bytes)
+                            screenshots.append({'route': title, 'sha256': hashlib.sha256(body).hexdigest(),
+                                                'terminal_sha256': hashlib.sha256(terminal_bytes).hexdigest()})
                             return True
                     except urllib.error.HTTPError as error:
                         if error.code != 409:
@@ -168,16 +390,22 @@ for profile in ('truecolor', 'no-color'):
             deadline = time.monotonic() + 30
             while process.poll() is None and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.05)[0]:
-                    raw.extend(os.read(master, 65536))
+                    read_terminal()
             if process.poll() is None:
                 raise AssertionError('terminal quit did not finish ordered shutdown')
             while select.select([master], [], [], 0)[0]:
-                raw.extend(os.read(master, 65536))
+                read_terminal()
+            screen.feed(b'', final=True)
             restored = termios.tcgetattr(slave) == initial
-            alternate_restored = b'\x1b[?1049l' in raw
+            alternate_restored = screen.alternate_left and not screen.alternate
             assert process.returncode == 0, process.returncode
             assert restored, 'termios attributes were not restored'
             assert alternate_restored, 'alternate screen was not restored'
+            assert binary_source == source, 'actual child build source was not observed'
+            if profile == 'truecolor':
+                assert screen.truecolor_count > 0, 'actual truecolor SGR was not emitted'
+            else:
+                assert screen.color_count == 0, 'NO_COLOR emitted non-default SGR colors'
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
@@ -196,9 +424,13 @@ for profile in ('truecolor', 'no-color'):
     lifecycle = lifecycle_bytes.decode(errors='replace')
     finalized = 'terminal lifecycle finalized' in lifecycle and 'frankentui' in lifecycle
     assert finalized, 'real FrankenTUI shutdown callback was not observed'
-    print(json.dumps({'schema': 'scriptbots.live-tui-pty.v1', 'source_commit': source,
+    print(json.dumps({'schema': 'scriptbots.live-tui-pty.v1', 'source_commit': binary_source,
+                      'binary_source_observed': binary_source is not None,
                       'capability_profile': profile, 'observed_science_routes': observed,
                       'observed_screenshot_routes': screenshots,
+                      'observed_color_sgr_count': screen.color_count,
+                      'observed_truecolor_sgr_count': screen.truecolor_count,
+                      'observed_style_sgr_count': screen.attribute_count,
                       'exit_code': process.returncode, 'raw_mode_observed': raw_mode,
                       'terminal_attributes_restored': restored,
                       'alternate_screen_restored': alternate_restored,
