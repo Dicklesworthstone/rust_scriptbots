@@ -20100,7 +20100,10 @@ for case in ('panic', 'subscription', 'renderer'):
             .join()
             .expect("owner shutdown");
         simulator.send(LiveTerminalMessage::Refresh);
-        assert!(simulator.is_running(), "Stopped alone cannot authorize exit");
+        assert!(
+            simulator.is_running(),
+            "Stopped alone cannot authorize exit"
+        );
         let receipt = simulator
             .model()
             .app
@@ -20243,9 +20246,16 @@ for case in ('panic', 'subscription', 'renderer'):
         simulator.send(LiveTerminalMessage::Refresh);
         {
             let app = simulator.model().app.borrow();
-            assert_eq!(app.shutdown_request.map(|id| id.to_string()), Some(id.clone()));
             assert_eq!(
-                app.unpresented_commands.front().unwrap().envelope.command_id,
+                app.shutdown_request.map(|id| id.to_string()),
+                Some(id.clone())
+            );
+            assert_eq!(
+                app.unpresented_commands
+                    .front()
+                    .unwrap()
+                    .envelope
+                    .command_id,
                 next_id
             );
             assert!(app.host.command_status(next_id).unwrap().is_none());
@@ -20254,7 +20264,10 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(refusal.contains(&receipt.summary()));
         simulator_presentation_callback(simulator.model(), 1);
         simulator.send(LiveTerminalMessage::Refresh);
-        assert!(simulator.is_running(), "refusal cannot manufacture shutdown");
+        assert!(
+            simulator.is_running(),
+            "refusal cannot manufacture shutdown"
+        );
         {
             let app = simulator.model().app.borrow();
             assert!(app.shutdown_request.is_none());
