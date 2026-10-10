@@ -10,7 +10,7 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-10
 
-The source changes through saved commit `276967c8acf4428eca673b3fee0875bf8e4e58b4`
+The source changes through saved commit `1ba852f003305c3e388fcc091b36852e5405b365`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
 consumer finding below describes the initial audited source, not this newer candidate.
@@ -84,11 +84,38 @@ expects an obsolete intent row that carries a stale footer suffix. Independently
 test-only `1301ac49` corrects checkpoint and downstream Shutdown Pending expectations to complete
 authoritative summaries. Wrong identity/action/journal, missing Pending/identity, stale suffix
 and reversed order remain rejected. Original observer algorithms, deadlines, final durability,
-restoration and finished-database checks remain. R44 terminal is executing at `1301ac49`;
-R45 workspace is held at the newer latency-fixture source `276967c8`. No final pass has been
-observed. R30/R31/R33/R35/R37/R39/R41/R42 never launched. Original acceptance,
-goldens, 16-ms budget, timeouts, gate rosters, dependencies and strict artifact consumer remain
-unchanged.
+restoration and finished-database checks remain. Completed R44 at `1301ac49` passes strict
+workspace Clippy/check, 218 runtime and 312 terminal units, including actual fault presentation
+and restoration. Executable E2E reports three passes and two failures: a checkpoint catalog GET
+times out awaiting response headers; the other journey reaches a completed real experiment but
+rejects its canonical `a056b77ad1761fdd` digest because the observer expects 64 hexadecimal
+characters. Total: 533 passed, two failed, six existing ignored; typed failed/1, ten of fourteen
+gates complete. All 160 existing proof files independently match remote/local hashes at
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-1301ac49-r44-hz3`.
+The failed normal child has no raw transcript or attributes file: cleanup throws before those
+writes. Retention of existing files does not recover the missing observations or establish
+PTY backpressure as the timeout cause.
+
+Independently reviewed `1ba852f0` corrects the experiment observer and strict consumer to the
+declared FNV-1a64 producer. Rust supplies its actual algorithm and `u64::BITS`; hexadecimal width
+is derived from that declaration. Zero/maximum/mixed positives and short/long/SHA256-width/
+uppercase/nonhex/null negatives remain explicit. Source guards also bind bit count and digit
+width to the selected algorithm, preventing a fabricated 256-bit or 64-digit contract from
+describing FNV-1a64; these current controls still require native execution. The corrected format
+admits canonical scientific digests and rejects the unrelated hash width formerly demanded;
+artifact SHA256 checks remain unchanged. The checkpoint
+observer waits for its actual decoded Applied receipt before consulting the catalog that creation
+can hold, retaining every catalog/identity/order assertion and the same 30-second/2-second waits.
+Nested cleanup finally blocks attempt buffered raw and actual termios retention even if either
+five-second cleanup wait fails; forced cleanup still fails. These are observation repairs with
+no product credit. Static Rust scan exits zero with zero critical, 177 warning and 68 informational
+findings, triaged before banking; the Bash verifier scan exits zero with zero findings. Neither
+is native qualification. R46 terminal is executing at clean `1ba852f0` using independently
+reviewed profile SHA256 `83c0483c2d8311a07e21116e75b30ae90a3a68c2eee9362e90cfba00f730e69e`
+and unique version `terminal-20261010-1ba852f0-r46-hz3`. Workspace and latency lanes remain
+held and must be repinned to the final qualified source. No final pass
+has been observed. R30/R31/R33/R35/R37/R39/R41/R42/R45 never launched. Original acceptance,
+goldens, 16-ms budget, timeouts, gate rosters and dependencies remain unchanged.
 
 Checked items below name implementation or observations at their stated boundary. They do
 not close a containing Bead. This checklist answers the user's explicit request and retires
@@ -150,8 +177,16 @@ as a working list when its original owners are fully qualified; retained evidenc
   533 passes/two failures/six ignored without qualifying the full lane.
 - [x] Independently review actual failed Pending bytes and bank the exact canonical checkpoint
   and Shutdown observation correction at `1301ac49`, with discriminating negative controls.
-- [ ] Complete fresh R44 terminal at `1301ac49` and R45 workspace at `276967c8`;
-  prior subsets do not qualify these sources.
+- [x] Complete failed R44 terminal at `1301ac49`, independently match all 160 existing proof
+  files and eleven command/log identities, and retain the missing first-child transcript gap.
+- [x] Independently review and bank `1ba852f0` producer-derived digest observations, checkpoint
+  receipt-before-catalog ordering and failure-path raw/attributes retention.
+- [x] Review the complete R46 profile and launch its unchanged fourteen-gate lane on clean
+  `1ba852f0`; retain the failed R44 evidence and keep subsequent lanes held.
+- [ ] Execute those repairs in fresh exact-source R46 terminal qualification; require all
+  original fourteen gates and the strict artifact consumer, not an older passing subset.
+- [ ] Repin and complete the held workspace lane after terminal qualification; include the
+  `276967c8` production death/refill fixture and core fault-feature tests.
 - [ ] Execute new checkpoint stream ordering and own Shutdown PTY/readback at the final SHA.
 - [ ] Observe current full/reduced final receipts, history saturation and ordinary sequencing.
 - [ ] Execute pending/checkpoint/cancellation/alternation/overlay guards at the final SHA.

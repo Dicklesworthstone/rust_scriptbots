@@ -40,7 +40,7 @@ Passing server runs do not close the intermittent storage/journal latency invest
 Original owners `bd-2z0.6.8`, `bd-dkd9` and `bd-2z0.5.13` remain open. The current
 execution checklist is the October 10 implementation section of
 `REALITY_CHECK_2026-09-03.md`; it distinguishes saved source from executed qualification.
-The live FrankenTUI runtime/providers are connected through `1301ac49`. R28 at
+The live FrankenTUI runtime/providers are connected through `1ba852f0`. R28 at
 `f2b0748a3c4208f423d9d6bf894835ad0347f74b` passes strict workspace Clippy/check, 218 runtime
 and 309 terminal tests; all three actual fault PTYs select reduced detail, present, trigger
 their fault and restore. Its executable observer fails before app launch on Python builtin
@@ -57,9 +57,17 @@ and all 312 terminal units, then fails two executable checkpoint Pending observa
 integration passes). All 157 proof files are retained and independently hash-matched. Actual
 bytes corroborate the obsolete intent-literal defect; test-only `1301ac49` matches canonical
 Pending summaries for checkpoint and Shutdown while retaining strict identity/order/durability
-guards. R44 terminal/R45 workspace are being prepared with the original fourteen/ten gates,
-16-ms budget and strict consumer; R41/R42 were never launched. Final-source qualification is
-pending, with no product credit from test-observation maintenance.
+guards. R44 at `1301ac49` passes strict Clippy/check, 218 runtime and 312 terminal units, then
+fails a checkpoint HTTP timeout and an experiment digest-width observer mismatch (three E2E
+passes, two failures). All 160 existing proof files independently match their remote hashes;
+the failed normal child has no raw/attributes because cleanup throws before those writes.
+Independently reviewed `1ba852f0` derives digest width from the declared Rust integer/algorithm
+and retains positive/malformed/wrong-contract discrimination in the observer and strict consumer.
+It also waits for actual checkpoint Applied before catalog polling and attempts buffered raw/
+actual termios retention even after cleanup exceptions. Original fourteen/ten gates, 16-ms
+budget, timeouts and acceptance remain; R46 terminal is executing at clean `1ba852f0`, workspace/latency stay
+held pending final-source qualification, and R41/R42/R45 never launched. No product credit
+comes from test-observation maintenance.
 
 External resets at 07:38, 13:40 and 13:50 UTC were recovered by non-destructive fast-forward;
 source/tracker/proofs are retained outside the shared checkout and active edits now use an
