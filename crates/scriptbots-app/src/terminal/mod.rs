@@ -15850,14 +15850,9 @@ mod tests {
                     ftui::UiAnchor::Bottom,
                     ftui::TerminalCapabilities::with_overrides(),
                 );
-                let mut program = Program::with_event_source(
-                    model,
-                    events,
-                    features,
-                    writer,
-                    config,
-                )
-                .expect("real runtime with observed failing writer");
+                let mut program =
+                    Program::with_event_source(model, events, features, writer, config)
+                        .expect("real runtime with observed failing writer");
                 let run_result = program.run();
                 assert!(refused.load(Ordering::Acquire), "writer failure must fire");
                 let error = run_result.expect_err("presentation failure must propagate");
@@ -15875,7 +15870,11 @@ mod tests {
                         .borrow_mut()
                         .take()
                         .expect("real live error hook observed subscription failure");
-                    assert!(error.to_string().contains("subscription"));
+                    assert_eq!(
+                        error.to_string(),
+                        "subscription 250 failed: injected actual subscription panic"
+                    );
+                    assert!(program.model().triggered.load(Ordering::Acquire));
                     assert!(program.model().live.app.borrow().frankentui.shutdown_called);
                 } else {
                     run_result.expect("panic fixture must unwind before this returns");
