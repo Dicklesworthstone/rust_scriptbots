@@ -35,6 +35,23 @@ Passing server runs do not close the intermittent storage/journal latency invest
 
 **Primary outcome:** turn the repository into a deterministic, genuinely evolving artificial-life laboratory with one correct simulation runtime, a polished FrankenTUI interface, a real GPU desktop interface, trustworthy replay/experiments, and tests that exercise the actual shipped paths.
 
+### Implementation pass — 2026-10-10, LilacElm [Currently In Progress]
+
+Original owners `bd-2z0.6.8`, `bd-dkd9` and `bd-2z0.5.13` remain open. The current
+execution checklist is the October 10 implementation section of
+`REALITY_CHECK_2026-09-03.md`; it distinguishes saved source from executed qualification.
+The live FrankenTUI runtime/providers are connected in the retained candidates. R24 at
+`c4011d523af99a4c380619af43faa3a321102a2d` passes workspace compilation, strict Clippy,
+218 runtime tests and 303 terminal tests, but fails one actual PTY fault test before
+the executable lanes. Its 212 render candidates all skip presentation. The next source
+change consumes the runtime's quality policy through a shared reachable `EssentialOnly`
+configuration, preserving the 16-ms budget and original acceptance gates.
+
+The reset at 07:38 UTC was recovered by a non-destructive fast-forward; the saved pending
+patch was restored byte-identically. Beads reconciliation preserves 718 issues with zero
+conflicts or deletions. No containing Bead closes on partial source or an older passing
+subset. Full Host/session continuation and exact-source native qualification remain required.
+
 ### Implementation pass — 2026-10-09, LavenderLion [Currently In Progress]
 
 This is the user's requested granular execution checklist. Original Bead criteria and

@@ -15,8 +15,19 @@ in doubt: code/Cargo.lock > beads (`br show bd-2js6` and its notes) > this doc.
 | `franken-kernel` / `-evidence` / `-decision` 0.5.0 | transitive | crates.io | n/a | in tree via fsqlite/asupersync |
 | `fastmcp-rust` 0.10.0 | direct (`scriptbots-app`) | crates.io exact `=0.10.0` | existing default features; custom MCP HTTP dispatch remains legacy 2024 | published family shares Asupersync 0.5; native protocol/lifecycle validation pending |
 | `ft-*` (frankentorch) 0.1.0 | direct optional via `scriptbots-brain-ml` (`ft-api`, `ft-core`, `ft-kernel-cpu`, `ft-nn`, `ft-optim`) | git rev `e4c6bdd5ec629ae70b40da9314da345ade012ca7` | `brain-ft` (non-default) | code-first FtBrain implemented; bd-2z0.3.12.3 compile/determinism/benchmark proof pending |
-| `ftui` (frankentui) 0.5.0 | direct (`scriptbots-app`) | git rev `15cc6543f76b814394c590f9e7719dedd6684e4c` | `crossterm` | Evolution Lab TUI shell, receipts, and ProgramSimulator harness (bd-2z0.6.8); legacy Ratatui fallback retained |
+| `ftui` (frankentui) 0.5.0 | direct (`scriptbots-app`) | git rev `15cc6543f76b814394c590f9e7719dedd6684e4c` | `crossterm` | live Program/Model, shared science services and acknowledged receipts; retained Ratatui widgets; native acceptance open (`bd-2z0.6.8`, `bd-dkd9`) |
 | everything else (fnx, frankenpandas, fsci, fnp) | **not in tree** | planned pins in `docs/licenses.md` §2 | admission beads below | planned |
+
+Terminal source reconciliation, **2026-10-10**, through `121a309c`: the actual interactive
+consumer is FrankenTUI's `Program`; the existing Ratatui widgets render into its frames.
+Its Model connects the real lineage, arena, experiment, replay, environment and diagnostic
+providers. Pending requests require their own successful presentation before dispatch;
+application and durable journal observations remain distinct. Production and fault probes
+allow the governor to reach the labeled `EssentialOnly` view with the unchanged 16 ms budget.
+The completed R24 proof at `c4011d52` fails actual PTY fault readiness after 303 passing
+terminal tests. New-source fallback timing and complete native acceptance are pending;
+simulator callbacks are branch fixtures. [The reality check](../REALITY_CHECK_2026-09-03.md)
+retains the exact proof boundaries and outstanding work.
 
 ## 2. Verdicts (with the one-paragraph why)
 

@@ -18,9 +18,11 @@ This document specifies the exact terminal stack modernization and FrankenTUI de
 - **Default Features**: `false`
 - **Enabled Features**: `["crossterm"]`
 - **Adoption status**: **ADOPTED IN SCRIPTBOTS-APP (bd-2z0.6.8).** Consumed by
-  `scriptbots-app` (`ftui.workspace = true`) for the real FrankenTUI Model shell,
-  command receipts, and ProgramSimulator harness. Pinned revision resolves in
-  `Cargo.lock`. Legacy Ratatui TUI fallback is retained in accordance with Rule 1.
+  `scriptbots-app` (`ftui.workspace = true`) for the actual interactive `Program` and
+  `Model`, shared science providers, command receipts and ProgramSimulator harness.
+  Pinned revision resolves in `Cargo.lock`. Existing Ratatui widgets render into
+  FrankenTUI frames; their source is retained. Adoption does not close the original
+  native acceptance under `bd-2z0.6.8` or the actual PTY byte/resize work under `bd-dkd9`.
 
 > **Why the revision was wrong, recorded so it is not repeated (bd-phj8).** This
 > field previously read `15cc65438a2095fbe8dd0dfce9adcfc7edab7612`, which is not
@@ -43,13 +45,27 @@ This document specifies the exact terminal stack modernization and FrankenTUI de
 | Dependency | Version / Source | Role | Status |
 | :--- | :--- | :--- | :--- |
 | `ftui` | `=0.5.0` (`rev = "15cc6543..."`) | Pinned FrankenTUI engine | Pinned in `Cargo.toml` |
-| `ratatui` | `0.30.0-alpha.5` | Legacy Ratatui TUI fallback | Retained (`bd-2z0.6.1`) |
+| `ratatui` | `0.30.0-alpha.5` | Retained widgets and headless buffer adapter | Consumed by the live FrankenTUI Model (`bd-2z0.6.1`) |
 | `crossterm` | `0.27` | Terminal raw mode & backend | Active |
 | `supports-color` | `3.0.2` | Color level detection | Active |
 
 ---
 
-## 3. Rollback & Legacy Compatibility
+## 3. Current runtime and qualification
 
-- The legacy Ratatui adapter in `scriptbots-app/src/terminal/mod.rs` is retained as a compatibility fallback.
-- No legacy code is removed without explicit deletion permission.
+- Source through `121a309c` stages bounded commands and checkpoint requests until their
+  complete pending identity is visible in a successfully presented frame. Skipped frames,
+  insufficient frame size and write failure cannot authorize dispatch. Quit and shutdown
+  cancel requests that have not reached the owner.
+- A wrapped pending label removes the covered pointer bindings and cancels an active
+  gesture. Command/checkpoint presentation alternates when both queues have work.
+- The shared production and fault-probe configuration lets the existing governor select
+  `EssentialOnly`; it retains the 16 ms budget and original skip policy. The reduced view
+  identifies its quality level and preserves pending receipts.
+- Completed R24 at `c4011d52` passes formatting, dependency guards, all-target check,
+  strict Clippy, 218 runtime tests and 303 terminal tests. One actual PTY fault test fails
+  before its requested fault fires: 212 candidates render over budget and none presents.
+  This is failed native acceptance. New-source runtime-selected fallback and full terminal
+  execution remain pending; injected simulator callbacks do not prove terminal writes.
+- [The current reality check](../REALITY_CHECK_2026-09-03.md) keeps the granular TODO,
+  exact proof identities and original acceptance owners. No source files were removed.

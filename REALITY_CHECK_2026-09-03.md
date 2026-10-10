@@ -8,6 +8,85 @@ user journey: a useful live frontend, a responsive durable run, a trustworthy co
 qualified scientific results and an independently verifiable release. The cinematic hardware-GPU
 meadow and durable browser laboratory also remain unfinished.**
 
+### Current implementation and granular TODO — 2026-10-10
+
+The source changes through saved commit `b4f1989509c870223753b7002a7835d516e53e08`
+connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
+legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
+consumer finding below describes the initial audited source, not this newer candidate.
+Full original acceptance remains open; no overall product or performance pass is claimed.
+
+R24 is bound to `c4011d523af99a4c380619af43faa3a321102a2d`, before the latest file-backed
+receipt and pending-presentation changes. Formatting, four integration guards, exact ftui
+metadata, workspace all-target check and strict Clippy pass. Runtime tests: 218 passed,
+zero failed, six existing ignored. Terminal tests: 303 passed, one failed. Typed verifier:
+failed/1, nine completed steps; outer DSR failed/6. Executable E2E, smoke, manifests and
+analyzer were not reached. Raw artifacts remain under
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-c4011d52-r24-hz3`.
+
+The failed actual PTY fault test records 212 over-budget render candidates, all with zero
+presentation time. Construction/init complete, but the requested fault never fires. Source
+review found the adapter's `EssentialOnly` fallback unreachable under the pinned governor's
+default `SimpleBorders` floor. The shared production/fault-probe configuration now permits
+that quality level; its native timing and actual presentation are still unobserved.
+
+Checked items below name implementation or observations at their stated boundary. They do
+not close a containing Bead. This checklist answers the user's explicit request and retires
+as a working list when its original owners are fully qualified; retained evidence stays.
+
+- [x] Read the complete repository AGENTS/README and perform the vision-to-consumer audit.
+- [x] Record that the required suite-wide `/data/projects/AGENTS.md` is absent.
+- [x] Preserve original acceptance for `bd-2z0.6.8`, `bd-dkd9` and `bd-2z0.5.13`.
+- [x] Restore saved commits by fast-forward after the external shared reset.
+- [x] Restore pending patch tree `3976100c` byte-identically before further manual edits.
+- [x] Recover newer Beads comments through a zero-conflict, zero-deletion 718-issue merge.
+- [x] Verify the active dependency graph has zero cycles.
+- [x] Repair the mailbox's observed unused-page corruption using a verified external copy;
+  compare every table value and schema/column/index/foreign-key property before promotion,
+  retain original files by in-place rename, then observe live full integrity and lease writes.
+- [x] Connect the actual ftui lifecycle and preserve the legacy map/inspector/capture path.
+- [x] Connect real lineage, arena, experiments, replay, environment and diagnostics providers.
+- [x] Preserve canonical tick-zero ancestry and bounded catch-up/missing-prefix refusal.
+- [x] Repair mouse coordinates from actual physical cells and retain positive controls.
+- [x] Keep independent owner application and journal finality separate in receipts.
+- [x] Add a real file-backed receipt/application/durability/exact-retry/database-readback test
+  at `b4f19895`; this test is not executed in R24.
+- [ ] Execute that new test natively and retain its actual phase/readback artifacts.
+- [x] Stage bounded live commands until their exact pending identity is observed in a
+  successfully presented candidate; poll/retry paths cannot bypass the barrier.
+- [x] Give checkpoint captures their own pending presentation barrier.
+- [x] Cancel unsubmitted commands/captures on quit, failure and shutdown.
+- [x] Save discriminating small/skipped-frame and stale-guard preservation cases.
+- [x] Alternate command/checkpoint preference and add a real-service two-kind sequence.
+- [x] Remove pointer bindings covered by the wrapped pending overlay; add an actual
+  small-frame palette positive control, overlap observation and gesture-cancellation guard.
+- [x] Preserve the reduced-detail qualifier when a pending footer covers the budget banner.
+- [x] Configure both production and fault probes to allow the same `EssentialOnly` fallback,
+  keeping the default governor enabled, frame budget, skip policy and thresholds unchanged.
+- [ ] Observe actual Program-selected fallback and positive presentation in the native PTY.
+- [ ] Execute pending/checkpoint/cancellation/alternation/overlay guards at the final SHA.
+- [ ] Complete all fourteen original terminal DSR steps, including three actual fault modes,
+  executable E2E, smoke, manifests and analyzer; accept only the source-bound typed pass.
+- [ ] Complete a fresh workspace DSR lane, including core `economy-faults` and analyzer.
+- [ ] Execute the latest one-shot continuation-binding rejection/configuration/gap guards.
+- [x] Keep full Host/session continuation capability false while only world restore exists.
+- [x] Acquire the persistence binding before mutating recording settings or the gap marker.
+- [ ] Implement and qualify full Host/session continuation: command/event counters, deadlines,
+  configuration revisions, deduplication, journal prefixes, audit and persistence watermarks.
+- [ ] Compare uninterrupted and restored sessions through the original named positive probe.
+- [ ] Retain broad PTY/capability matrix and full research-journey criteria with their owners.
+- [ ] Attach exact source/profile/raw proof identities to the existing Beads.
+- [ ] Close only owners whose complete original acceptance is observed.
+- [ ] Reconcile current README/terminal/integration adoption wording with actual source and
+  native evidence; do not imply full session continuation or scientific publication.
+- [ ] Review immutable source/doc/tracker hunks and commit separate synchronized exports.
+- [ ] Resolve the existing coordinated push hold and publish main plus its legacy mirror.
+- [ ] Resume authoritative ready-work triage after these original integration blockers clear.
+
+Simulator presentation callbacks remain explicit injected branch observations. They do not
+prove terminal serialization or runtime-selected degradation. Real service and file-backed
+tests establish their named boundaries only after execution; source review is not execution.
+
 This refresh supersedes the October 8 assessment where current source or later retained evidence
 differs. The October 9 implementation and failure records below remain intact. In particular,
 authority/Origin enforcement, aggregate checkpoint retention and leased finished-database bundle

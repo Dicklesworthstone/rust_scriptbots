@@ -140,6 +140,13 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, schema-v1 lifecycle evidence, opaque client ports, cursors, manual-drive contract, sole-owner `HostCore`, pure fixed-deadline driver, and optional current-thread Asupersync lifecycle are implemented. The app uses `HostCore` through its owner thread and channel ports. The `bd-2z0.5.2` lifecycle work and the `bd-pcfj` frontend cutover are closed.
 - `scriptbots-render`: GPUI World + tabbed Lab windows with camera controls, selection highlights, scrollable diagnostics, and optional `kira` audio.
 - `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The full cross-feature/platform startup matrix remains a Phase 0.4 acceptance gate.
+- Interactive terminal mode now runs the pinned FrankenTUI `Program` with the actual
+  simulation owner and shared control services. It preserves the existing map and inspector
+  widgets and adds live lineage, brain-arena, experiment, replay, environment and diagnostic
+  views. Native terminal acceptance remains open under `bd-2z0.6.8` and `bd-dkd9`; the latest
+  completed lane passed 303 terminal tests and failed the actual PTY fault-readiness test.
+  See [the current implementation and TODO](REALITY_CHECK_2026-09-03.md) for exact revisions,
+  retained evidence and remaining qualification.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.
 - `scriptbots-brain-neuro`: NeuroFlow-backed brain available behind the `neuro` feature (runtime toggles below).
 - `scriptbots-storage`: the exact FrankenSQLite source is pinned; its bounded worker now has a file-backed durable outbox, stable per-batch identities, monotonic admitted/applied/durable watermarks, ordered startup recovery, controller wait deadlines, supervised worker ownership, exact recovery identity/schema proof, and a V6 run-scoped base schema with V7 canonical host archives. Code-first V8 domain-event and V9 command-lifecycle projections are committed under `bd-2z0.5.2`, with centralized DSR proof pending. Same-thread writes use the same outbox protocol, and terminal receipt/join errors preserve one exact typed root cause. Pairwise combat and food-share edges are projected into indexed SQL with stable UIDs, bounded window sampling, and persisted completeness counters. Deadlines do not cancel an in-flight database call or bound the supervised reaper. Hard-bounded SQL reads are refused before opening the database; frontends use immutable analytics snapshots, while offline/reporting SQL uses the synchronous, create-free, read-only `StorageReader` with explicitly unbounded execution. Strict-run host policy and product checkpoint/replay integration remain open. Run bundles are implemented: `RunBundleV1` (`scriptbots.run-bundle.v1`) with `bundle::create_run_bundle`, `create_run_bundle_from_artifacts`, and `verify_run_bundle`, surfaced as `--create-bundle`/`--bundle-output` and `--verify-bundle`; the two competing implementations were converged under `bd-4d9j`.
@@ -199,10 +206,17 @@ RUST_LOG=info cargo run -p scriptbots-app
 ```
 
 #### Terminal-only mode
-- Force the emoji TUI renderer (useful on headless machines):
+- Start the interactive terminal laboratory:
   ```bash
   SCRIPTBOTS_MODE=terminal cargo run -p scriptbots-app
   ```
+- Use `4`–`9` for Lineages, Brain Arena, Experiments, Replay, Environment and Diagnostics;
+  the map, inspector, command palette, help and screenshot controls remain available.
+  Command and checkpoint requests wait for their complete pending identity to be presented
+  before dispatch. `Ctrl+R` retries an ambiguously admitted command using its exact original
+  envelope; application and journal durability are shown separately. Under render pressure,
+  the runtime may select a labeled reduced-detail view. These paths are implemented; their
+  current native and cross-platform qualification is tracked in the linked reality check.
 - Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
 - Auto-mode policy overrides:
   - `SCRIPTBOTS_FORCE_TERMINAL=1` → choose terminal in Auto mode even when a display server is present.
@@ -1033,10 +1047,14 @@ MCP quickstart:
   - ✅ Headless runner and CLI event comparison that refuses vacuous nonzero runs.
   - ✅ Production RNG, brain-output, action and world-digest event instrumentation, with the action cap budgeted per tick (`bd-a9h1`).
   - ✅ Mock-free positive and perturbed-candidate event-replay test implementation in `crates/scriptbots-app/tests/replay_e2e.rs`; this is separate from checkpoint-start replay.
-  - ✅ Persistence-disabled core science checkpoint with strict restore and next-transition proof; production resume remains planned.
-- **Planned**
+  - ✅ Core science checkpoint with strict restore and next-transition proof. Its envelope excludes host/session ownership and retained frontend history.
   - ✅ Checkpoint-start replay: `--checkpoint-start` restores the latest valid checkpoint before the replay limit and verifies the run from its tick (`bd-2z0.5.13`). Interactive runs record one automatically every `--checkpoint-interval` ticks (default 1000, `0` disables, env `SCRIPTBOTS_CHECKPOINT_INTERVAL`) together with a canonical world digest, so interactive and server runs can be replay-verified; REST (`POST /api/v1/checkpoints`) and MCP (`checkpoint_create`) add checkpoints on demand. All go through the storage worker (`bd-1dvs`).
-  - ❌ Full host/session restore (storage ownership, analytics history, UI state) from a checkpoint.
+- **Planned**
+  - ❌ Full host/session restore: command ordering, exact retry identities, revisions,
+    schedule position, configuration audit and persistence ownership/watermarks. The
+    original `bd-2z0.5.13` acceptance remains open. Emitted and persisted manifests keep
+    `checkpoint_replay_guarantee=false` until that complete boundary is implemented and
+    verified; the independently supported restorable RNG capability remains enabled.
   - ❌ Branch/diff workflows comparing Rust vs. Rust PR builds vs. the legacy C++ baseline.
   - ❌ FrankenSQLite-backed analysis views for quick triage of regressions and experiment outcomes.
 - **Use cases**
