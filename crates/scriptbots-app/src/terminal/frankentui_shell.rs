@@ -1,11 +1,9 @@
 //! FrankenTUI Model shell, command receipts, and ProgramSimulator harness (bd-2z0.6.8 / bd-2z0.6.3).
 //!
-//! Integrates the approved FrankenTUI `Model/update/view/subscription` lifecycle into
-//! ScriptBots, routes mutating actions through `HostClient` control envelopes with
-//! visible receipt state transitions (`Pending` -> `Admitted` -> `Applied` / `Durable` /
-//! `Rejected` / `Failed` / `StaleRevision`), preserves terminal RAII restoration on quit,
-//! panic, subscription failure, and renderer errors, and provides a deterministic
-//! `ProgramSimulator` test harness that operates without a live `WorldState`.
+//! The read-only model queues typed effects for the live adapter and displays
+//! observed host receipts. Application and journal outcomes remain separate;
+//! creating an intent does not create a checkpoint, branch, comparison or export.
+//! The deterministic `ProgramSimulator` harness operates without a live world.
 
 use super::science_screens::{self, *};
 use super::science_widgets::*;
@@ -13,6 +11,7 @@ use crate::control::CommandStatusDto;
 use ftui::core::event::{Event, KeyCode, KeyEvent};
 use ftui::render::buffer::Buffer;
 use ftui::render::cell::Cell;
+use ftui::render::drawing::Draw;
 use ftui::render::frame::Frame;
 use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
 use ftui::runtime::{Cmd, Model, ProgramSimulator};
@@ -25,22 +24,41 @@ use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-/// Helper to render an ASCII/UTF-8 string directly onto the frame buffer.
+/// Render text within the row's cell bounds, preserving complete Unicode graphemes.
 pub fn print_to_frame(frame: &mut Frame, x: u16, y: u16, text: &str) {
-    if y >= frame.height() {
+    let width = frame.width();
+    if x >= width || y >= frame.height() {
         return;
     }
-    let max_w = frame.width();
-    for (i, ch) in text.chars().enumerate() {
-        let col = x + i as u16;
-        if col < max_w {
-            frame.buffer.set_raw(col, y, Cell::from_char(ch));
-        }
-    }
+    frame.print_text_clipped(x, y, text, Cell::default(), width);
 }
 
 /// Maximum number of receipts retained in the shell history.
 const MAX_RECEIPTS: usize = 32;
+
+/// Maximum number of effects awaiting the live adapter. Overflow rejects the
+/// new intent without discarding any previously queued work.
+const MAX_PENDING_EFFECTS: usize = 32;
+
+/// Work requested by the model and performed by the live adapter.
+#[derive(Debug, Clone)]
+pub enum ShellEffect {
+    SubmitCommand(ControlCommand),
+    CreateCheckpoint {
+        request_id: String,
+    },
+    BranchCheckpoint {
+        checkpoint_id: String,
+        branch_name: String,
+    },
+    CompareExperiments {
+        baseline: String,
+        challenger: String,
+    },
+    ExportScreenData {
+        format: String,
+    },
+}
 
 /// View routes in the FrankenTUI Evolution Lab shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +146,9 @@ pub struct CommandReceiptEntry {
     pub command_id: String,
     pub action: String,
     pub status: ReceiptStatusKind,
+    /// Actual runtime journal state, independent of whether application succeeded.
+    /// Locally queued intents have no observed journal state.
+    pub journal_state: Option<JournalState>,
     pub control_revision: u64,
     pub scientific_revision: u64,
     pub timestamp_tick: u64,
@@ -143,6 +164,7 @@ impl CommandReceiptEntry {
             command_id: command_id.into(),
             action: action.into(),
             status,
+            journal_state: None,
             control_revision: 0,
             scientific_revision: 0,
             timestamp_tick: 0,
@@ -166,6 +188,14 @@ impl CommandReceiptEntry {
             command_id: dto.command_id.clone(),
             action: action.into(),
             status,
+            journal_state: match dto.journal_state.as_str() {
+                "not_required" => Some(JournalState::NotRequired),
+                "pending" => Some(JournalState::Pending),
+                "committed_volatile" => Some(JournalState::CommittedVolatile),
+                "durable" => Some(JournalState::Durable),
+                // The DTO does not carry JournalFailure diagnostic details.
+                _ => None,
+            },
             control_revision: dto.control_revision,
             scientific_revision: dto.scientific_revision,
             timestamp_tick: tick,
@@ -180,31 +210,29 @@ impl CommandReceiptEntry {
         control_revision: u64,
         scientific_revision: u64,
     ) -> Self {
-        let receipt_status = if matches!(status.journal(), JournalState::Durable) {
-            ReceiptStatusKind::Durable
-        } else {
-            match status.application() {
-                ApplicationState::Applied(_) => ReceiptStatusKind::Applied,
-                ApplicationState::Admitted => ReceiptStatusKind::Admitted,
-                ApplicationState::Rejected(RejectionReason::ControlRevisionConflict {
-                    expected,
-                    actual,
-                }) => ReceiptStatusKind::StaleRevision {
-                    expected: expected.get(),
-                    observed: actual.get(),
-                },
-                ApplicationState::Rejected(reason) => {
-                    ReceiptStatusKind::Rejected(format!("{reason:?}"))
-                }
-                ApplicationState::Failed(failure) => {
-                    ReceiptStatusKind::Failed(format!("{failure:?}"))
-                }
+        let receipt_status = match status.application() {
+            ApplicationState::Applied(_) if matches!(status.journal(), JournalState::Durable) => {
+                ReceiptStatusKind::Durable
             }
+            ApplicationState::Applied(_) => ReceiptStatusKind::Applied,
+            ApplicationState::Admitted => ReceiptStatusKind::Admitted,
+            ApplicationState::Rejected(RejectionReason::ControlRevisionConflict {
+                expected,
+                actual,
+            }) => ReceiptStatusKind::StaleRevision {
+                expected: expected.get(),
+                observed: actual.get(),
+            },
+            ApplicationState::Rejected(reason) => {
+                ReceiptStatusKind::Rejected(format!("{reason:?}"))
+            }
+            ApplicationState::Failed(failure) => ReceiptStatusKind::Failed(format!("{failure:?}")),
         };
         Self {
             command_id: command_id.to_string(),
             action: action.into(),
             status: receipt_status,
+            journal_state: Some(status.journal().clone()),
             control_revision,
             scientific_revision,
             timestamp_tick: tick,
@@ -221,6 +249,44 @@ impl CommandReceiptEntry {
             ReceiptStatusKind::Failed(_) => "[FAILED]",
             ReceiptStatusKind::StaleRevision { .. } => "[STALE_REV]",
         }
+    }
+
+    pub fn journal_label(&self) -> &'static str {
+        match self.journal_state.as_ref() {
+            Some(JournalState::NotRequired) => "not_required",
+            Some(JournalState::Pending) => "pending",
+            Some(JournalState::CommittedVolatile) => "volatile",
+            Some(JournalState::Durable) => "durable",
+            Some(JournalState::Failed(_)) => "failed",
+            None => "unobserved",
+        }
+    }
+
+    /// One-line observation for shared receipt strips and the retained native panels.
+    /// The command journal never replaces its independent application outcome.
+    pub fn summary(&self) -> String {
+        let application = match &self.status {
+            ReceiptStatusKind::Pending => "awaiting execution".into(),
+            ReceiptStatusKind::Admitted => "admitted".into(),
+            ReceiptStatusKind::Applied | ReceiptStatusKind::Durable => "applied".into(),
+            ReceiptStatusKind::Rejected(reason) => format!("rejected: {reason}"),
+            ReceiptStatusKind::Failed(error) => format!("failed: {error}"),
+            ReceiptStatusKind::StaleRevision { observed, expected } => {
+                format!("stale revision: expected {expected}, observed {observed}")
+            }
+        };
+        let journal = match &self.journal_state {
+            Some(JournalState::Failed(failure)) => {
+                format!("failed ({}: {})", failure.code, failure.message)
+            }
+            _ => self.journal_label().into(),
+        };
+        format!(
+            "{} journal={journal} {}: {application} id={}",
+            self.badge(),
+            self.action,
+            self.command_id
+        )
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -358,6 +424,7 @@ pub struct FrankenTuiModel {
     pub errors: Vec<String>,
     pub shutdown_called: bool,
     pub command_counter: u64,
+    effects: VecDeque<ShellEffect>,
     pub science: ScienceScreensState,
     pub chart_data: ScienceChartData,
     pub event_feed: TypedEventFeedData,
@@ -386,6 +453,7 @@ impl Default for FrankenTuiModel {
             errors: Vec::new(),
             shutdown_called: false,
             command_counter: 0,
+            effects: VecDeque::with_capacity(MAX_PENDING_EFFECTS),
             science: ScienceScreensState::default(),
             chart_data: ScienceChartData::default(),
             event_feed: TypedEventFeedData::default(),
@@ -405,6 +473,21 @@ impl FrankenTuiModel {
             route,
             ..Self::default()
         }
+    }
+
+    /// Drain pending work once, in input order. The adapter owns execution and
+    /// sends observed results back through the model's receipt/data messages.
+    pub fn drain_effects(&mut self) -> impl Iterator<Item = ShellEffect> + '_ {
+        self.effects.drain(..)
+    }
+
+    fn enqueue_effect(&mut self, effect: ShellEffect) -> bool {
+        if self.effects.len() >= MAX_PENDING_EFFECTS {
+            self.status_message = Some("Action unavailable: pending effect queue is full".into());
+            return false;
+        }
+        self.effects.push_back(effect);
+        true
     }
 
     /// Record a command receipt into bounded history, replacing any existing entry
@@ -440,19 +523,6 @@ impl FrankenTuiModel {
         self.food_energy = food_energy;
         self.control_revision = control_revision;
         self.scientific_revision = scientific_revision;
-        self.chart_data.push_sample(
-            ChartSample {
-                tick,
-                population: agent_count as u64,
-                avg_energy: food_energy,
-                births: 0,
-                deaths: 0,
-            },
-            tick,
-        );
-        self.watermark_status.applied_tick = tick;
-        self.watermark_status.applied_scientific_revision = scientific_revision;
-        self.watermark_status.admitted_control_revision = control_revision;
     }
 
     /// Ingest a science chart sample into the rolling window.
@@ -486,6 +556,11 @@ impl FrankenTuiModel {
 
     pub fn latest_receipt(&self) -> Option<&CommandReceiptEntry> {
         self.receipts.back()
+    }
+
+    /// Latest observed receipt, including application and journal diagnostic detail.
+    pub fn latest_receipt_summary(&self) -> Option<String> {
+        self.latest_receipt().map(CommandReceiptEntry::summary)
     }
 
     pub fn receipt_for(&self, command_id: &str) -> Option<&CommandReceiptEntry> {
@@ -589,33 +664,39 @@ impl Model for FrankenTuiModel {
                         .replay
                         .data()
                         .and_then(|r| r.checkpoints.get(r.selected_checkpoint_index))
-                        .map(|c| c.checkpoint_id.clone())
-                        .unwrap_or_else(|| format!("cp-tick-{}", self.tick));
-                    self.update(ShellMessage::BranchCheckpoint {
-                        checkpoint_id: cp_id,
-                        branch_name: format!("branch-rev-{}", self.control_revision + 1),
-                    })
+                        .map(|c| c.checkpoint_id.clone());
+                    if let Some(checkpoint_id) = cp_id {
+                        self.update(ShellMessage::BranchCheckpoint {
+                            checkpoint_id,
+                            branch_name: format!("branch-rev-{}", self.control_revision),
+                        })
+                    } else {
+                        self.status_message =
+                            Some("Branch unavailable: no checkpoint is selected".into());
+                        Cmd::none()
+                    }
                 }
                 KeyCode::Char('c') | KeyCode::Char('C') => {
-                    let (b, c) = self
-                        .science
-                        .experiments
-                        .data()
-                        .and_then(|e| {
-                            if e.active_arms.len() >= 2 {
-                                Some((
-                                    e.active_arms[0].variant_id.clone(),
-                                    e.active_arms[1].variant_id.clone(),
-                                ))
-                            } else {
-                                None
-                            }
+                    let arms = self.science.experiments.data().and_then(|e| {
+                        if e.active_arms.len() >= 2 {
+                            Some((
+                                e.active_arms[0].variant_id.clone(),
+                                e.active_arms[1].variant_id.clone(),
+                            ))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((baseline, challenger)) = arms {
+                        self.update(ShellMessage::CompareExperiments {
+                            baseline,
+                            challenger,
                         })
-                        .unwrap_or_else(|| ("baseline-mlp".into(), "challenger-dwraon".into()));
-                    self.update(ShellMessage::CompareExperiments {
-                        baseline: b,
-                        challenger: c,
-                    })
+                    } else {
+                        self.status_message =
+                            Some("Comparison unavailable: two experiment arms are required".into());
+                        Cmd::none()
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.update(ShellMessage::SelectNextItem),
                 KeyCode::Up => self.update(ShellMessage::SelectPreviousItem),
@@ -662,8 +743,6 @@ impl Model for FrankenTuiModel {
                 Cmd::none()
             }
             ShellMessage::SubmitCommand(cmd) => {
-                self.command_counter += 1;
-                let command_id = format!("cmd-{}", self.command_counter);
                 let action_name = match &cmd {
                     ControlCommand::Pause => "Pause",
                     ControlCommand::Resume => "Resume",
@@ -679,16 +758,10 @@ impl Model for FrankenTuiModel {
                     ControlCommand::ApplyMap(_) => "ApplyMap",
                     ControlCommand::Intervention(_) => "Intervention",
                 };
-                let pending_receipt = CommandReceiptEntry {
-                    command_id: command_id.clone(),
-                    action: action_name.to_string(),
-                    status: ReceiptStatusKind::Pending,
-                    control_revision: self.control_revision,
-                    scientific_revision: self.scientific_revision,
-                    timestamp_tick: self.tick,
-                };
-                self.record_receipt(pending_receipt);
-                self.status_message = Some(format!("Pending: command {command_id} submitted"));
+                if self.enqueue_effect(ShellEffect::SubmitCommand(cmd)) {
+                    self.status_message =
+                        Some(format!("Pending: {action_name} awaiting host submission"));
+                }
                 Cmd::none()
             }
             ShellMessage::CommandReceipt(receipt) => {
@@ -735,6 +808,7 @@ impl Model for FrankenTuiModel {
                     command_id: command_id.clone(),
                     action: "Reconcile".into(),
                     status: ReceiptStatusKind::StaleRevision { observed, expected },
+                    journal_state: None,
                     control_revision: observed,
                     scientific_revision: self.scientific_revision,
                     timestamp_tick: self.tick,
@@ -885,47 +959,30 @@ impl Model for FrankenTuiModel {
                 Cmd::none()
             }
             ShellMessage::CreateCheckpoint => {
-                self.command_counter += 1;
-                let command_id = format!("cmd-cp-{}", self.command_counter);
-                let cp_id = format!("cp-tick-{}", self.tick);
-                let digest = format!("{:016x}", 0x5c81_7b07_0000_0000u64 | self.tick);
-
-                if let ScreenDataState::Data(replay_data) = &mut self.science.replay {
-                    replay_data.checkpoints.push(CheckpointViewEntry {
-                        checkpoint_id: cp_id.clone(),
-                        tick: self.tick,
-                        agent_count: self.agent_count,
-                        digest: digest.clone(),
-                        file_size_bytes: 65536,
-                    });
-                } else {
-                    self.science.replay = ScreenDataState::Data(ReplayViewData {
-                        checkpoints: vec![CheckpointViewEntry {
-                            checkpoint_id: cp_id.clone(),
-                            tick: self.tick,
-                            agent_count: self.agent_count,
-                            digest: digest.clone(),
-                            file_size_bytes: 65536,
-                        }],
-                        current_replay_tick: self.tick,
-                        first_divergence: None,
-                        selected_checkpoint_index: 0,
-                        export_receipt: None,
-                    });
+                let Some(next_request) = self.command_counter.checked_add(1) else {
+                    self.status_message =
+                        Some("Checkpoint unavailable: request IDs exhausted".into());
+                    return Cmd::none();
+                };
+                let request_id = format!("checkpoint-request-{next_request}");
+                if !self.enqueue_effect(ShellEffect::CreateCheckpoint {
+                    request_id: request_id.clone(),
+                }) {
+                    return Cmd::none();
                 }
-
+                self.command_counter = next_request;
                 let receipt = CommandReceiptEntry {
-                    command_id: command_id.clone(),
+                    command_id: request_id.clone(),
                     action: "CreateCheckpoint".into(),
-                    status: ReceiptStatusKind::Durable,
-                    control_revision: self.control_revision + 1,
+                    status: ReceiptStatusKind::Pending,
+                    journal_state: None,
+                    control_revision: self.control_revision,
                     scientific_revision: self.scientific_revision,
                     timestamp_tick: self.tick,
                 };
                 self.record_receipt(receipt);
                 self.status_message = Some(format!(
-                    "✓ Checkpoint {cp_id} recorded at tick {}",
-                    self.tick
+                    "Pending: checkpoint {request_id} awaiting host result"
                 ));
                 Cmd::none()
             }
@@ -933,93 +990,47 @@ impl Model for FrankenTuiModel {
                 checkpoint_id,
                 branch_name,
             } => {
-                self.command_counter += 1;
-                let command_id = format!("cmd-branch-{}", self.command_counter);
-                self.science
-                    .branch_history
-                    .push(format!("{branch_name}<-{checkpoint_id}"));
-                let receipt = CommandReceiptEntry {
-                    command_id: command_id.clone(),
-                    action: "BranchCheckpoint".into(),
-                    status: ReceiptStatusKind::Durable,
-                    control_revision: self.control_revision + 1,
-                    scientific_revision: self.scientific_revision,
-                    timestamp_tick: self.tick,
-                };
-                self.record_receipt(receipt);
-                self.status_message = Some(format!(
-                    "✓ Created branch '{branch_name}' from {checkpoint_id}"
-                ));
+                if self.enqueue_effect(ShellEffect::BranchCheckpoint {
+                    checkpoint_id,
+                    branch_name,
+                }) {
+                    self.status_message =
+                        Some("Pending: branch request awaiting host result".into());
+                }
                 Cmd::none()
             }
             ShellMessage::CompareExperiments {
                 baseline,
                 challenger,
             } => {
-                if let ScreenDataState::Data(exp_data) = &mut self.science.experiments {
-                    let m1 = exp_data
-                        .active_arms
-                        .iter()
-                        .find(|a| a.variant_id == baseline)
-                        .map(|a| a.mean_fitness)
-                        .unwrap_or(1.25);
-                    let m2 = exp_data
-                        .active_arms
-                        .iter()
-                        .find(|a| a.variant_id == challenger)
-                        .map(|a| a.mean_fitness)
-                        .unwrap_or(1.85);
-                    let diff = m2 - m1;
-                    let hedges_g: f32 = diff / 0.45;
-                    let p_val: f32 =
-                        (1.0_f32 / (1.0_f32 + hedges_g.abs())).clamp(0.001_f32, 0.5_f32);
-                    let verdict = if hedges_g > 0.8 {
-                        "Significant advantage (Large effect)"
-                    } else if hedges_g > 0.2 {
-                        "Moderate advantage"
-                    } else if hedges_g < -0.2 {
-                        "Significant disadvantage"
-                    } else {
-                        "Indistinguishable from baseline"
-                    };
-                    exp_data.comparison_summary = Some(ExperimentComparisonSummary {
-                        baseline_arm: baseline.clone(),
-                        challenger_arm: challenger.clone(),
-                        effect_size_hedges_g: hedges_g,
-                        p_value_estimate: p_val,
-                        verdict: verdict.into(),
-                    });
-                    self.status_message = Some(format!(
-                        "✓ Compared {baseline} vs {challenger}: g={hedges_g:+.2}"
-                    ));
-                } else {
-                    self.status_message = Some(format!(
-                        "No experiment data available to compare {baseline} vs {challenger}"
-                    ));
+                if self.enqueue_effect(ShellEffect::CompareExperiments {
+                    baseline,
+                    challenger,
+                }) {
+                    self.status_message =
+                        Some("Pending: comparison awaiting measured statistical result".into());
                 }
                 Cmd::none()
             }
             ShellMessage::ExportScreenData { format } => {
-                let artifact_name = format!(
-                    "export-tick-{}-{}.{}",
-                    self.tick,
-                    self.route.name().to_lowercase(),
-                    format
-                );
-                self.science.export_history.push(artifact_name.clone());
-                if let ScreenDataState::Data(replay_data) = &mut self.science.replay {
-                    replay_data.export_receipt = Some(artifact_name.clone());
+                if self.enqueue_effect(ShellEffect::ExportScreenData { format }) {
+                    self.status_message =
+                        Some("Pending: export awaiting artifact write result".into());
                 }
-                self.status_message = Some(format!("✓ Exported {artifact_name}"));
                 Cmd::none()
             }
             ShellMessage::SelectNextItem => {
                 match self.route {
                     ShellRoute::Lineages => {
-                        if let ScreenDataState::Data(d) = &mut self.science.lineages
-                            && !d.clades.is_empty()
-                        {
-                            d.selected_index = (d.selected_index + 1) % d.clades.len();
+                        if let ScreenDataState::Data(d) = &mut self.science.lineages {
+                            let count = if d.founder_rows.is_empty() {
+                                d.clades.len()
+                            } else {
+                                d.founder_rows.len()
+                            };
+                            if count > 0 {
+                                d.selected_index = (d.selected_index % count + 1) % count;
+                            }
                         }
                     }
                     ShellRoute::BrainArena => {
@@ -1055,14 +1066,20 @@ impl Model for FrankenTuiModel {
             ShellMessage::SelectPreviousItem => {
                 match self.route {
                     ShellRoute::Lineages => {
-                        if let ScreenDataState::Data(d) = &mut self.science.lineages
-                            && !d.clades.is_empty()
-                        {
-                            d.selected_index = if d.selected_index == 0 {
-                                d.clades.len() - 1
+                        if let ScreenDataState::Data(d) = &mut self.science.lineages {
+                            let count = if d.founder_rows.is_empty() {
+                                d.clades.len()
                             } else {
-                                d.selected_index - 1
+                                d.founder_rows.len()
                             };
+                            if count > 0 {
+                                let selected = d.selected_index % count;
+                                d.selected_index = if selected == 0 {
+                                    count - 1
+                                } else {
+                                    selected - 1
+                                };
+                            }
                         }
                     }
                     ShellRoute::BrainArena => {
@@ -1208,10 +1225,14 @@ impl Model for FrankenTuiModel {
             print_to_frame(frame, 0, 1, &tabs);
         }
 
-        // Header Divider
+        // Shared receipt strip remains visible while navigating science screens.
         let divider: String = "-".repeat(width as usize);
         if height > 2 {
-            print_to_frame(frame, 0, 2, &divider);
+            if let Some(summary) = self.latest_receipt_summary() {
+                print_to_frame(frame, 0, 2, &summary);
+            } else {
+                print_to_frame(frame, 0, 2, &divider);
+            }
         }
 
         // 2. Active Route Display
@@ -1312,8 +1333,9 @@ impl Model for FrankenTuiModel {
                                     break;
                                 }
                                 let line = format!(
-                                    "  {} {:<12} {:<10} Tick: {:<6} Rev: {}",
+                                    "  {} Journal: {} {:<12} {:<10} Tick: {:<6} Rev: {}",
                                     r.badge(),
+                                    r.journal_label(),
                                     r.action,
                                     r.command_id,
                                     r.timestamp_tick,
@@ -1333,7 +1355,7 @@ impl Model for FrankenTuiModel {
                             "WORLD CANVAS PRESENTATION (Decoupled Snapshot)",
                         );
                         let info = format!(
-                            "  World Bounds: 100x100  Agents Rendered: {}  Zoom: 1.0x",
+                            "  Snapshot Population: {}  World bounds supplied by live canvas",
                             self.agent_count
                         );
                         print_to_frame(frame, 2, 5, &info);
@@ -1341,13 +1363,13 @@ impl Model for FrankenTuiModel {
                             frame,
                             2,
                             6,
-                            "  Terrain Layer: Continental Torus  Hydrology: Active Currents",
+                            "  Terrain and hydrology details require the live snapshot renderer",
                         );
                         print_to_frame(
                             frame,
                             2,
                             8,
-                            "  [Spatial presentation rendered via immutable HostClient snapshots]",
+                            "  [Live canvas displays the immutable HostClient snapshot]",
                         );
                     }
                 }
@@ -1355,7 +1377,7 @@ impl Model for FrankenTuiModel {
                     if height > 3 {
                         print_to_frame(frame, 2, 3, "AGENT INSPECTOR");
                         let sel = format!(
-                            "  Selected Agent Cursor: 0  Active Population: {}",
+                            "  Active Population: {}  Selection supplied by live inspector",
                             self.agent_count
                         );
                         print_to_frame(frame, 2, 5, &sel);
@@ -1363,13 +1385,13 @@ impl Model for FrankenTuiModel {
                             frame,
                             2,
                             6,
-                            "  Sensory Inputs: 8 channels (Eyes, Scent, Health, Energy)",
+                            "  Sensor details are available when selected-agent telemetry is supplied",
                         );
                         print_to_frame(
                             frame,
                             2,
                             7,
-                            "  Brain Architecture: Pluggable Evaluator (MLP / DWRAON / Neuro)",
+                            "  Brain telemetry below contains only supplied activation observations",
                         );
                         if height > 12 {
                             self.brain_grid.render_ftui(
@@ -1587,6 +1609,7 @@ mod tests {
             command_id: "cmd-1".into(),
             action: "Step".into(),
             status: ReceiptStatusKind::Durable,
+            journal_state: Some(JournalState::Durable),
             control_revision: 1,
             scientific_revision: 10,
             timestamp_tick: 5,
@@ -1601,19 +1624,26 @@ mod tests {
     #[test]
     fn test_mutating_action_transitions_through_receipt_states() {
         let mut model = FrankenTuiModel::new();
-        // 1. Submit command (creates Pending receipt, NO direct world mutation or stepping)
+        // 1. Queue intent without inventing a host command identity or stepping.
         model.update(ShellMessage::SubmitCommand(ControlCommand::Step));
-        assert_eq!(model.receipts.len(), 1);
-        assert_eq!(model.receipts[0].command_id, "cmd-1");
-        assert_eq!(model.receipts[0].status, ReceiptStatusKind::Pending);
+        assert!(model.receipts.is_empty());
+        let effects: Vec<_> = model.drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::SubmitCommand(ControlCommand::Step)]
+        ));
         assert_eq!(
             model.tick, 0,
             "SubmitCommand must not optimistically advance ticks"
         );
 
-        // 2. Admission receipt from host
-        let mut admitted = model.receipts[0].clone();
-        admitted.status = ReceiptStatusKind::Admitted;
+        // 2. Adapter supplies the actual host identity and admission receipt.
+        let mut admitted = CommandReceiptEntry::new(
+            CommandId::new(17).to_string(),
+            "Step",
+            ReceiptStatusKind::Admitted,
+        );
+        admitted.journal_state = Some(JournalState::Pending);
         admitted.control_revision = 1;
         model.update(ShellMessage::CommandReceipt(admitted));
         assert_eq!(model.receipts[0].status, ReceiptStatusKind::Admitted);
@@ -1633,6 +1663,7 @@ mod tests {
         // 4. Durability receipt from storage worker
         let mut durable = model.receipts[0].clone();
         durable.status = ReceiptStatusKind::Durable;
+        durable.journal_state = Some(JournalState::Durable);
         model.update(ShellMessage::CommandReceipt(durable));
         assert_eq!(model.receipts[0].status, ReceiptStatusKind::Durable);
         assert!(model.receipts[0].is_terminal());
@@ -1643,7 +1674,8 @@ mod tests {
         let mut model = FrankenTuiModel::new();
         // Submit command
         model.update(ShellMessage::SubmitCommand(ControlCommand::Resume));
-        let cmd_id = model.receipts[0].command_id.clone();
+        assert!(model.receipts.is_empty());
+        let cmd_id = CommandId::new(18).to_string();
 
         // Host rejects due to stale revision
         model.update(ShellMessage::RecoverStaleRevision {
@@ -1668,6 +1700,7 @@ mod tests {
             command_id: "cmd-reject".into(),
             action: "SpawnAgent".into(),
             status: ReceiptStatusKind::Rejected("capacity exceeded".into()),
+            journal_state: Some(JournalState::Durable),
             control_revision: 42,
             scientific_revision: 10,
             timestamp_tick: 5,
@@ -1684,6 +1717,7 @@ mod tests {
             command_id: "cmd-fail".into(),
             action: "UpdateConfig".into(),
             status: ReceiptStatusKind::Failed("malformed config payload".into()),
+            journal_state: Some(JournalState::Durable),
             control_revision: 1,
             scientific_revision: 1,
             timestamp_tick: 1,
@@ -1691,6 +1725,321 @@ mod tests {
         model.update(ShellMessage::CommandReceipt(fail_receipt));
         assert!(model.has_failed_receipt());
         assert!(model.status_message.as_ref().unwrap().contains("FAILED"));
+    }
+
+    #[test]
+    fn test_runtime_receipts_preserve_application_when_journal_is_durable() {
+        use scriptbots_runtime::{
+            AdmissionSequence, ApplicationFailure, AppliedCommand, ControlRevision, HostRevisions,
+        };
+
+        let cases = [
+            (
+                Some(AdmissionSequence::new(1)),
+                ApplicationState::Applied(AppliedCommand {
+                    tick: scriptbots_core::Tick(7),
+                    revisions: HostRevisions::default(),
+                }),
+                ReceiptStatusKind::Durable,
+                "[DURABLE]",
+            ),
+            (
+                None,
+                ApplicationState::Rejected(RejectionReason::Validation {
+                    message: "invalid mutation rate".into(),
+                }),
+                ReceiptStatusKind::Rejected(
+                    "Validation { message: \"invalid mutation rate\" }".into(),
+                ),
+                "[REJECTED]",
+            ),
+            (
+                Some(AdmissionSequence::new(2)),
+                ApplicationState::Failed(ApplicationFailure {
+                    code: "apply_failed".into(),
+                    message: "mutation failed".into(),
+                }),
+                ReceiptStatusKind::Failed(
+                    "ApplicationFailure { code: \"apply_failed\", message: \"mutation failed\" }"
+                        .into(),
+                ),
+                "[FAILED]",
+            ),
+            (
+                Some(AdmissionSequence::new(3)),
+                ApplicationState::Rejected(RejectionReason::ControlRevisionConflict {
+                    expected: ControlRevision::new(5),
+                    actual: ControlRevision::new(8),
+                }),
+                ReceiptStatusKind::StaleRevision {
+                    expected: 5,
+                    observed: 8,
+                },
+                "[STALE_REV]",
+            ),
+        ];
+        for (index, (admission, application, expected, badge)) in cases.into_iter().enumerate() {
+            let command_id = CommandId::new(index as u128 + 1);
+            let runtime_status =
+                CommandStatus::try_new(command_id, admission, application, JournalState::Durable)
+                    .expect("valid two-axis runtime status");
+            let receipt = CommandReceiptEntry::from_runtime_status(
+                &command_id,
+                "Resume",
+                &runtime_status,
+                7,
+                8,
+                7,
+            );
+            assert_eq!(receipt.status, expected);
+            assert_eq!(receipt.journal_state, Some(JournalState::Durable));
+            assert_eq!(receipt.badge(), badge);
+            let mut harness = FrankenTuiSimulatorHarness::new();
+            harness.init();
+            harness.dispatch(ShellMessage::CommandReceipt(receipt));
+            assert_eq!(harness.model().paused, index != 0);
+            let frame = harness.capture_frame_str(100, 24);
+            assert!(frame.contains(badge));
+            assert!(frame.contains("Journal: durable"));
+        }
+    }
+
+    #[test]
+    fn test_effect_queue_is_bounded_and_drains_once_without_losing_admitted_intents() {
+        let mut model = FrankenTuiModel::new();
+        for _ in 0..MAX_PENDING_EFFECTS {
+            model.update(ShellMessage::SubmitCommand(ControlCommand::Step));
+        }
+        model.update(ShellMessage::SubmitCommand(ControlCommand::Resume));
+        assert!(
+            model
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("queue is full")
+        );
+        assert!(model.receipts.is_empty());
+        let effects: Vec<_> = model.drain_effects().collect();
+        assert_eq!(effects.len(), MAX_PENDING_EFFECTS);
+        assert!(
+            effects
+                .iter()
+                .all(|effect| matches!(effect, ShellEffect::SubmitCommand(ControlCommand::Step)))
+        );
+        assert_eq!(model.drain_effects().count(), 0);
+        model.update(ShellMessage::SubmitCommand(ControlCommand::Resume));
+        assert!(matches!(
+            model.drain_effects().next(),
+            Some(ShellEffect::SubmitCommand(ControlCommand::Resume))
+        ));
+    }
+
+    #[test]
+    fn test_snapshot_does_not_invent_chart_measurements_or_storage_watermarks() {
+        let mut model = FrankenTuiModel::new();
+        model.ingest_chart_sample(
+            ChartSample {
+                tick: 24,
+                population: 10,
+                avg_energy: 2.0,
+                births: 3,
+                deaths: 1,
+            },
+            24,
+        );
+        model.update_watermarks(23, 22, 20, None);
+        let chart = model.chart_data.clone();
+        let watermarks = model.watermark_status.clone();
+        model.update_from_snapshot(25, 1, 12, 40.0, 8, 25);
+        assert_eq!(model.chart_data.samples, chart.samples);
+        assert_eq!(model.chart_data.last_snapshot_tick, chart.last_snapshot_tick);
+        assert_eq!(model.watermark_status, watermarks);
+        assert_eq!(model.tick, 25);
+        assert_eq!(model.food_energy, 40.0);
+    }
+
+    #[test]
+    fn test_checkpoint_queue_refusal_and_request_exhaustion_create_no_artifact_or_receipt() {
+        let mut model = FrankenTuiModel::new();
+        for _ in 0..MAX_PENDING_EFFECTS {
+            model.update(ShellMessage::SubmitCommand(ControlCommand::Step));
+        }
+        model.update(ShellMessage::CreateCheckpoint);
+        assert!(model.receipts.is_empty());
+        assert!(model.science.replay.is_empty());
+        assert_eq!(model.command_counter, 0);
+        assert_eq!(model.drain_effects().count(), MAX_PENDING_EFFECTS);
+        model.command_counter = u64::MAX;
+        model.update(ShellMessage::CreateCheckpoint);
+        assert!(model.receipts.is_empty());
+        assert!(model.science.replay.is_empty());
+        assert_eq!(model.drain_effects().count(), 0);
+        assert!(
+            model
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("request IDs exhausted")
+        );
+    }
+
+    #[test]
+    fn test_founder_lineage_selection_tracks_visible_rows_and_handles_empty_data() {
+        let mut model = FrankenTuiModel::with_route(ShellRoute::Lineages);
+        model.update(ShellMessage::SetLineagesData(ScreenDataState::Data(
+            LineagesViewData {
+                founder_rows: vec![
+                    FounderLineageRow {
+                        founder_uid: 1,
+                        living_descendants: 3,
+                        total_descendants: 4,
+                        contribution_share: 0.6,
+                    },
+                    FounderLineageRow {
+                        founder_uid: 2,
+                        living_descendants: 2,
+                        total_descendants: 2,
+                        contribution_share: 0.4,
+                    },
+                ],
+                ..LineagesViewData::default()
+            },
+        )));
+        model.update(ShellMessage::SelectNextItem);
+        assert_eq!(model.science.lineages.data().unwrap().selected_index, 1);
+        model.update(ShellMessage::SelectNextItem);
+        assert_eq!(model.science.lineages.data().unwrap().selected_index, 0);
+        model.update(ShellMessage::SelectPreviousItem);
+        assert_eq!(model.science.lineages.data().unwrap().selected_index, 1);
+        model.update(ShellMessage::SetLineagesData(ScreenDataState::Data(
+            LineagesViewData::default(),
+        )));
+        model.update(ShellMessage::SelectNextItem);
+        model.update(ShellMessage::SelectPreviousItem);
+        assert_eq!(model.science.lineages.data().unwrap().selected_index, 0);
+    }
+
+    #[test]
+    fn test_common_receipt_strip_shows_both_axes_on_every_route() {
+        // Injected model receipts exercise presentation; live host delivery is
+        // verified separately by the adapter tests.
+        for route in ShellRoute::all_screens() {
+            let mut harness =
+                FrankenTuiSimulatorHarness::with_model(FrankenTuiModel::with_route(*route));
+            harness.init();
+            let mut receipt = CommandReceiptEntry::new(
+                CommandId::new(55).to_string(),
+                "Step",
+                ReceiptStatusKind::Pending,
+            );
+            harness.dispatch(ShellMessage::CommandReceipt(receipt.clone()));
+            let frame = harness.capture_frame(100, 24);
+            let row = buffer_row_text(frame, 2);
+            assert!(row.contains("[PENDING] journal=unobserved"), "{route:?}: {row}");
+            assert!(row.contains("awaiting execution"));
+
+            receipt.status = ReceiptStatusKind::Rejected("quota".into());
+            receipt.journal_state = Some(JournalState::Durable);
+            harness.dispatch(ShellMessage::CommandReceipt(receipt));
+            let frame = harness.capture_frame(100, 24);
+            let row = buffer_row_text(frame, 2);
+            assert!(row.contains("[REJECTED] journal=durable"), "{route:?}: {row}");
+            assert!(row.contains("rejected: quota"));
+            assert!(!row.contains("[DURABLE]"));
+            assert_eq!(harness.model().receipts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_receipt_summary_preserves_application_success_and_journal_failure_detail() {
+        use scriptbots_runtime::{AdmissionSequence, AppliedCommand, HostRevisions, JournalFailure};
+
+        let command_id = CommandId::new(56);
+        let status = CommandStatus::try_new(
+            command_id,
+            Some(AdmissionSequence::new(1)),
+            ApplicationState::Applied(AppliedCommand {
+                tick: scriptbots_core::Tick(7),
+                revisions: HostRevisions::default(),
+            }),
+            JournalState::Failed(JournalFailure {
+                code: "disk_full".into(),
+                message: "journal write refused".into(),
+            }),
+        )
+        .expect("application and journal failure are independent");
+        let receipt =
+            CommandReceiptEntry::from_runtime_status(&command_id, "Step", &status, 7, 0, 0);
+        let mut model = FrankenTuiModel::new();
+        assert_eq!(model.latest_receipt_summary(), None);
+        model.record_receipt(receipt);
+        let summary = model.latest_receipt_summary().unwrap();
+        assert!(summary.contains("[APPLIED]"));
+        assert!(summary.contains("journal=failed (disk_full: journal write refused)"));
+        assert!(summary.contains("Step: applied"));
+        assert!(summary.contains(&command_id.to_string()));
+        assert!(!summary.contains("[FAILED]"));
+    }
+
+    #[test]
+    fn test_print_to_frame_clips_long_input_and_out_of_bounds_coordinates() {
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = Frame::new(4, 2, &mut pool);
+        print_to_frame(&mut frame, 0, 1, "keep");
+        // A cast of the character index would wrap this final 'z' onto column zero.
+        let mut text = "a".repeat(usize::from(u16::MAX) + 1);
+        text.push('z');
+        print_to_frame(&mut frame, 0, 0, &text);
+        assert_eq!(buffer_row_text(&frame.buffer, 0), "aaaa");
+        assert_eq!(buffer_row_text(&frame.buffer, 1), "keep");
+        print_to_frame(&mut frame, u16::MAX, 0, &text);
+        print_to_frame(&mut frame, 0, u16::MAX, &text);
+        print_to_frame(&mut frame, 4, 1, "bad");
+        assert_eq!(buffer_row_text(&frame.buffer, 0), "aaaa");
+        assert_eq!(buffer_row_text(&frame.buffer, 1), "keep");
+    }
+
+    #[test]
+    fn test_print_to_frame_preserves_wide_and_compound_graphemes_at_cell_boundaries() {
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = Frame::new(4, 3, &mut pool);
+        print_to_frame(&mut frame, 0, 0, "界X");
+        let head = frame.buffer.get(0, 0).unwrap();
+        assert_eq!(head.content.width(), 2);
+        assert_eq!(frame.pool.get(head.content.grapheme_id().unwrap()), Some("界"));
+        assert!(frame.buffer.get(1, 0).unwrap().is_continuation());
+        assert_eq!(frame.buffer.get(2, 0).unwrap().content.as_char(), Some('X'));
+        print_to_frame(&mut frame, 3, 0, "界");
+        assert!(frame.buffer.get(3, 0).unwrap().is_empty());
+
+        print_to_frame(&mut frame, 1, 1, "👍🏽Z");
+        let head = frame.buffer.get(1, 1).unwrap();
+        assert_eq!(head.content.width(), 2);
+        assert_eq!(frame.pool.get(head.content.grapheme_id().unwrap()), Some("👍🏽"));
+        assert!(frame.buffer.get(2, 1).unwrap().is_continuation());
+        assert_eq!(frame.buffer.get(3, 1).unwrap().content.as_char(), Some('Z'));
+
+        print_to_frame(&mut frame, 3, 2, "👍🏽");
+        assert!(frame.buffer.get(3, 2).unwrap().is_empty());
+        print_to_frame(&mut frame, 2, 2, "e\u{301}!");
+        let head = frame.buffer.get(2, 2).unwrap();
+        assert_eq!(head.content.width(), 1);
+        assert_eq!(frame.pool.get(head.content.grapheme_id().unwrap()), Some("e\u{301}"));
+        assert_eq!(frame.buffer.get(3, 2).unwrap().content.as_char(), Some('!'));
+    }
+
+    #[test]
+    fn test_print_to_frame_near_maximum_u16_width_never_wraps_to_row_start() {
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = Frame::new(u16::MAX, 1, &mut pool);
+        print_to_frame(&mut frame, u16::MAX - 1, 0, "界");
+        assert!(frame.buffer.get(u16::MAX - 1, 0).unwrap().is_empty());
+        print_to_frame(&mut frame, u16::MAX - 1, 0, "ABC");
+        assert_eq!(
+            frame.buffer.get(u16::MAX - 1, 0).unwrap().content.as_char(),
+            Some('A')
+        );
+        assert!(frame.buffer.get(0, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -1794,6 +2143,7 @@ mod tests {
             command_id: "cmd-1".into(),
             action: "Resume".into(),
             status: ReceiptStatusKind::Durable,
+            journal_state: Some(JournalState::Durable),
             control_revision: 3,
             scientific_revision: 120,
             timestamp_tick: 120,
@@ -1821,6 +2171,7 @@ mod tests {
             command_id: "cmd-rej".into(),
             action: "SpawnAgent".into(),
             status: ReceiptStatusKind::Rejected("quota exceeded".into()),
+            journal_state: Some(JournalState::Durable),
             control_revision: 3,
             scientific_revision: 120,
             timestamp_tick: 120,
@@ -1848,6 +2199,7 @@ mod tests {
             command_id: "cmd-fail".into(),
             action: "SetSpeed".into(),
             status: ReceiptStatusKind::Failed("speed must be positive".into()),
+            journal_state: Some(JournalState::Durable),
             control_revision: 3,
             scientific_revision: 120,
             timestamp_tick: 120,
@@ -1939,7 +2291,8 @@ mod tests {
     }
 
     #[test]
-    fn test_program_simulator_command_palette_and_acknowledged_receipts_e2e() {
+    fn test_program_simulator_injected_command_receipts_and_palette() {
+        // Injected model lifecycle coverage; this does not prove live host transmission.
         let mut harness = FrankenTuiSimulatorHarness::new();
         harness.init();
 
@@ -1956,14 +2309,20 @@ mod tests {
 
         // 2. Flow 1: Accepted, Applied, and Durable Mutating Control Flow
         harness.dispatch(ShellMessage::SubmitCommand(ControlCommand::Pause));
-        assert!(harness.model().has_pending_receipts());
-        let cmd1_id = harness.model().latest_receipt().unwrap().command_id.clone();
+        assert!(harness.model().receipts.is_empty());
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::SubmitCommand(ControlCommand::Pause)]
+        ));
+        let cmd1_id = CommandId::new(19).to_string();
 
         // Host admission
         harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
             command_id: cmd1_id.clone(),
             action: "Pause".into(),
             status: ReceiptStatusKind::Admitted,
+            journal_state: Some(JournalState::Pending),
             control_revision: 5,
             scientific_revision: 100,
             timestamp_tick: 100,
@@ -1978,6 +2337,7 @@ mod tests {
             command_id: cmd1_id.clone(),
             action: "Pause".into(),
             status: ReceiptStatusKind::Applied,
+            journal_state: Some(JournalState::Pending),
             control_revision: 5,
             scientific_revision: 100,
             timestamp_tick: 100,
@@ -1992,6 +2352,7 @@ mod tests {
             command_id: cmd1_id.clone(),
             action: "Pause".into(),
             status: ReceiptStatusKind::Durable,
+            journal_state: Some(JournalState::Durable),
             control_revision: 5,
             scientific_revision: 100,
             timestamp_tick: 100,
@@ -2005,11 +2366,17 @@ mod tests {
         harness.dispatch(ShellMessage::SubmitCommand(ControlCommand::SpawnAgent {
             herbivore_tendency: 0.5,
         }));
-        let cmd2_id = harness.model().latest_receipt().unwrap().command_id.clone();
+        let cmd2_id = CommandId::new(20).to_string();
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::SubmitCommand(ControlCommand::SpawnAgent { .. })]
+        ));
         harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
             command_id: cmd2_id.clone(),
             action: "SpawnAgent".into(),
             status: ReceiptStatusKind::Rejected("maximum population capacity reached".into()),
+            journal_state: Some(JournalState::Durable),
             control_revision: 5,
             scientific_revision: 100,
             timestamp_tick: 100,
@@ -2040,6 +2407,7 @@ mod tests {
             command_id: "cmd-queue-fail".into(),
             action: "SetSpeed".into(),
             status: ReceiptStatusKind::Failed("HostClient queue full: depth 64 exceeded".into()),
+            journal_state: None,
             control_revision: 5,
             scientific_revision: 100,
             timestamp_tick: 100,
@@ -2210,7 +2578,9 @@ mod tests {
     }
 
     #[test]
-    fn test_interactive_workflows_checkpoint_branch_compare_export() {
+    fn test_model_science_workflows_wait_for_observed_results() {
+        // ProgramSimulator covers intent delivery and injected result presentation;
+        // live artifact creation and scientific comparison need adapter verification.
         let mut harness = FrankenTuiSimulatorHarness::new();
         harness.init();
 
@@ -2223,42 +2593,73 @@ mod tests {
             scientific_revision: 250,
         });
 
-        // 1. Checkpoint Creation Workflow
+        // 1. A checkpoint intent has no artifact or durability before the callback.
         harness.inject_key(KeyCode::Char('k'));
-        assert!(harness.model().receipt_for("cmd-cp-1").is_some());
+        let request_id = "checkpoint-request-1";
         assert_eq!(
-            harness.model().receipt_for("cmd-cp-1").unwrap().action,
+            harness.model().receipt_for(request_id).unwrap().action,
             "CreateCheckpoint"
         );
         assert_eq!(
-            harness.model().receipt_for("cmd-cp-1").unwrap().status,
-            ReceiptStatusKind::Durable
+            harness.model().receipt_for(request_id).unwrap().status,
+            ReceiptStatusKind::Pending
         );
+        assert_eq!(
+            harness.model().receipt_for(request_id).unwrap().journal_state,
+            None
+        );
+        assert!(harness.model().science.replay.is_empty());
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::CreateCheckpoint { request_id }] if request_id == "checkpoint-request-1"
+        ));
 
-        // Verify replay screen contains the checkpoint
+        // An observed adapter result supplies the actual artifact metadata.
+        harness.dispatch(ShellMessage::SetReplayData(ScreenDataState::Data(
+            ReplayViewData {
+                checkpoints: vec![CheckpointViewEntry {
+                    checkpoint_id: "observed-checkpoint".into(),
+                    tick: 250,
+                    agent_count: Some(120),
+                    digest: Some("observed-world-digest".into()),
+                    file_size_bytes: 12345,
+                }],
+                current_replay_tick: 250,
+                first_divergence: None,
+                selected_checkpoint_index: 0,
+                export_receipt: None,
+            },
+        )));
+        harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry::new(
+            request_id,
+            "CreateCheckpoint",
+            ReceiptStatusKind::Applied,
+        )));
         harness.inject_key(KeyCode::Char('7'));
         assert_eq!(harness.model().route, ShellRoute::Replay);
         let replay_frame = harness.capture_frame_str(80, 24);
-        assert!(replay_frame.contains("cp-tick-250"));
+        assert!(replay_frame.contains("observed-checkpoint"));
         assert!(replay_frame.contains("Tick 250"));
 
-        // 2. Branch Checkpoint Workflow
+        // 2. Branch intent does not create a branch or success receipt.
         harness.inject_key(KeyCode::Char('n'));
-        assert!(harness.model().receipt_for("cmd-branch-2").is_some());
-        assert_eq!(
-            harness.model().receipt_for("cmd-branch-2").unwrap().action,
-            "BranchCheckpoint"
-        );
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::BranchCheckpoint { checkpoint_id, .. }]
+                if checkpoint_id == "observed-checkpoint"
+        ));
         assert!(
             harness
                 .model()
                 .status_message
                 .as_ref()
                 .unwrap()
-                .contains("Created branch")
+                .contains("awaiting host result")
         );
-        assert_eq!(harness.model().science.branch_history.len(), 1);
-        assert!(harness.model().science.branch_history[0].contains("branch-rev-11<-cp-tick-250"));
+        assert!(harness.model().science.branch_history.is_empty());
+        assert_eq!(harness.model().receipts.len(), 1);
 
         // 3. Experiments Arm Comparison Workflow
         harness.inject_key(KeyCode::Char('6'));
@@ -2272,20 +2673,20 @@ mod tests {
                     variant_id: "arm-mlp".into(),
                     brain_family: "MLP".into(),
                     seed: 1001,
-                    current_tick: 250,
+                    current_tick: Some(250),
                     target_ticks: 1000,
-                    mean_fitness: 1.20,
-                    uncertainty_ci_95: (1.10, 1.30),
+                    mean_fitness: Some(1.20),
+                    uncertainty_ci_95: Some((1.10, 1.30)),
                     digest: "a1b2c3d4e5f60001".into(),
                 },
                 ExperimentArmView {
                     variant_id: "arm-dwraon".into(),
                     brain_family: "DWRAON".into(),
                     seed: 1001,
-                    current_tick: 250,
+                    current_tick: Some(250),
                     target_ticks: 1000,
-                    mean_fitness: 1.95,
-                    uncertainty_ci_95: (1.80, 2.10),
+                    mean_fitness: Some(1.95),
+                    uncertainty_ci_95: Some((1.80, 2.10)),
                     digest: "a1b2c3d4e5f60002".into(),
                 },
             ],
@@ -2296,13 +2697,42 @@ mod tests {
             exp_data,
         )));
 
-        // Run comparison via 'c' key
+        // A comparison intent cannot derive significance from two summary means.
         harness.inject_key(KeyCode::Char('c'));
-        let exp_frame = harness.capture_frame_str(80, 24);
-        assert!(exp_frame.contains("Baseline: arm-mlp"));
-        assert!(exp_frame.contains("Challenger: arm-dwraon"));
-        assert!(exp_frame.contains("Hedges' g:"));
-        assert!(exp_frame.contains("Significant advantage"));
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::CompareExperiments { baseline, challenger }]
+                if baseline == "arm-mlp" && challenger == "arm-dwraon"
+        ));
+        assert!(
+            harness
+                .model()
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_summary
+                .is_none()
+        );
+        let exp_frame = harness.capture_frame_str(100, 24);
+        assert!(!exp_frame.contains("Hedges' g:"));
+        assert!(!exp_frame.contains("Significant advantage"));
+
+        let mut observed_experiments = harness.model().science.experiments.data().unwrap().clone();
+        observed_experiments.comparison_summary = Some(ExperimentComparisonSummary {
+            baseline_arm: "arm-mlp".into(),
+            challenger_arm: "arm-dwraon".into(),
+            effect_size_hedges_g: 0.38,
+            p_value_estimate: 0.16,
+            verdict: "Observed comparison fixture".into(),
+        });
+        harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+            observed_experiments,
+        )));
+        let exp_frame = harness.capture_frame_str(100, 24);
+        assert!(exp_frame.contains("Hedges' g: +0.380"));
+        assert!(exp_frame.contains("Observed comparison fixture"));
 
         // Test cursor navigation in experiments table
         harness.inject_key(KeyCode::Down);
@@ -2328,14 +2758,19 @@ mod tests {
             0
         );
 
-        // 4. Export Artifact Workflow
+        // 4. An export intent cannot claim a file write.
         harness.dispatch(ShellMessage::ExportScreenData {
             format: "bundle".into(),
         });
-        assert_eq!(harness.model().science.export_history.len(), 1);
-        assert!(
-            harness.model().science.export_history[0]
-                .contains("export-tick-250-experiments.bundle")
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::ExportScreenData { format }] if format == "bundle"
+        ));
+        assert!(harness.model().science.export_history.is_empty());
+        assert_eq!(
+            harness.model().science.replay.data().unwrap().export_receipt,
+            None
         );
         assert!(
             harness
@@ -2343,7 +2778,7 @@ mod tests {
                 .status_message
                 .as_ref()
                 .unwrap()
-                .contains("✓ Exported")
+                .contains("awaiting artifact write result")
         );
     }
 
@@ -2384,9 +2819,11 @@ mod tests {
         }];
         harness.dispatch(ShellMessage::SetLineagesData(ScreenDataState::Data(
             LineagesViewData {
-                total_founders: 2,
-                active_clades: 2,
-                extinct_clades: 0,
+                total_founders: Some(2),
+                active_clades: Some(2),
+                extinct_clades: Some(0),
+                founder_rows: Vec::new(),
+                observed_tick: None,
                 clades,
                 recent_events: events,
                 selected_index: 0,
@@ -2406,14 +2843,14 @@ mod tests {
             BrainFamilyCohort {
                 family: "MLP".into(),
                 agent_count: 50,
-                mean_fitness: 1.45,
-                mean_eval_nanos: 820,
+                mean_fitness: Some(1.45),
+                mean_eval_nanos: Some(820),
             },
             BrainFamilyCohort {
                 family: "DWRAON".into(),
                 agent_count: 50,
-                mean_fitness: 2.10,
-                mean_eval_nanos: 1450,
+                mean_fitness: Some(2.10),
+                mean_eval_nanos: Some(1450),
             },
         ];
         let selected_brain = BrainInspectionSummary {
@@ -2430,7 +2867,7 @@ mod tests {
             BrainArenaViewData {
                 family_breakdown: cohorts,
                 selected_brain: Some(selected_brain),
-                total_evaluations: 25000,
+                total_evaluations: Some(25000),
                 selected_family_index: 0,
             },
         )));
@@ -2451,20 +2888,20 @@ mod tests {
                     variant_id: "arm-mlp".into(),
                     brain_family: "MLP".into(),
                     seed: 1001,
-                    current_tick: 500,
+                    current_tick: Some(500),
                     target_ticks: 1000,
-                    mean_fitness: 1.25,
-                    uncertainty_ci_95: (1.15, 1.35),
+                    mean_fitness: Some(1.25),
+                    uncertainty_ci_95: Some((1.15, 1.35)),
                     digest: "beef0001".into(),
                 },
                 ExperimentArmView {
                     variant_id: "arm-dwraon".into(),
                     brain_family: "DWRAON".into(),
                     seed: 1001,
-                    current_tick: 500,
+                    current_tick: Some(500),
                     target_ticks: 1000,
-                    mean_fitness: 2.10,
-                    uncertainty_ci_95: (1.95, 2.25),
+                    mean_fitness: Some(2.10),
+                    uncertainty_ci_95: Some((1.95, 2.25)),
                     digest: "beef0002".into(),
                 },
             ],
@@ -2495,15 +2932,15 @@ mod tests {
                 CheckpointViewEntry {
                     checkpoint_id: "cp-tick-100".into(),
                     tick: 100,
-                    agent_count: 50,
-                    digest: "5c817b0700000064".into(),
+                    agent_count: Some(50),
+                    digest: Some("5c817b0700000064".into()),
                     file_size_bytes: 32768,
                 },
                 CheckpointViewEntry {
                     checkpoint_id: "cp-tick-200".into(),
                     tick: 200,
-                    agent_count: 75,
-                    digest: "5c817b07000000c8".into(),
+                    agent_count: Some(75),
+                    digest: Some("5c817b07000000c8".into()),
                     file_size_bytes: 49152,
                 },
             ],
@@ -2521,7 +2958,9 @@ mod tests {
         assert!(replay_frame.contains("Replay Scrubber: Tick 150"));
         assert!(replay_frame.contains("cp-tick-100"));
         assert!(replay_frame.contains("cp-tick-200"));
-        assert!(replay_frame.contains("Determinism verified: zero state divergences"));
+        assert!(
+            replay_frame.contains("No replay comparison recorded; divergence status unavailable")
+        );
         assert!(replay_frame.contains("export-tick-200-replay.bundle"));
 
         // Screen 5: Environment Data Golden
@@ -2532,11 +2971,11 @@ mod tests {
                 ("Water".into(), 0.25),
                 ("Forest".into(), 0.15),
             ],
-            mean_fertility: 0.82,
-            mean_temperature: 21.5,
+            mean_fertility: Some(0.82),
+            mean_temperature: Some(21.5),
             total_food_energy: 4200.0,
-            current_flow_rate: 1.45,
-            active_hazards: vec!["Seasonal drought in East quadrant".into()],
+            current_flow_rate: Some(1.45),
+            reported_timed_interventions: vec!["Seasonal drought in East quadrant".into()],
             regrowth_rate: 0.25,
         };
         harness.dispatch(ShellMessage::SetEnvironmentData(ScreenDataState::Data(
@@ -2555,18 +2994,18 @@ mod tests {
         // Screen 6: Diagnostics Data Golden
         let diag_data = DiagnosticsViewData {
             host_queue_depth: 4,
-            host_queue_capacity: 64,
-            storage_watermark_tick: 400,
-            storage_uncommitted_records: 0,
+            host_queue_capacity: Some(64),
+            analytics_committed_tick: Some(400),
+            storage_uncommitted_records: Some(0),
             snapshot_timings_ms: vec![
                 ("Sensors".into(), 0.35),
                 ("Brains".into(), 1.12),
                 ("Physics".into(), 0.40),
             ],
-            sim_tick_hz: 59.8,
-            render_fps: 60.0,
+            sim_tick_hz: Some(59.8),
+            render_fps: Some(60.0),
             build_commit: "git-9af1b0be".into(),
-            digest_neutrality_verified: true,
+            digest_neutrality_verified: Some(true),
         };
         harness.dispatch(ShellMessage::SetDiagnosticsData(ScreenDataState::Data(
             diag_data,
@@ -2576,7 +3015,7 @@ mod tests {
         assert!(diag_frame.contains("SYSTEM DIAGNOSTICS & PIPELINE HEALTH"));
         assert!(diag_frame.contains("59.8 TPS"));
         assert!(diag_frame.contains("Host Ingress Queue:  4/64"));
-        assert!(diag_frame.contains("Watermark Tick 400"));
+        assert!(diag_frame.contains("Committed Tick 400"));
         assert!(diag_frame.contains("Introspection Neutrality: ✓ CONFIRMED"));
         assert!(diag_frame.contains("Brains"));
 
@@ -2733,7 +3172,8 @@ mod tests {
     }
 
     #[test]
-    fn test_headless_journey_science_lab_workflow() {
+    fn test_program_simulator_science_lab_intents_do_not_claim_completion() {
+        // This is a model fixture journey, not a live scientific run or artifact proof.
         let mut harness = FrankenTuiSimulatorHarness::new();
         harness.init();
 
@@ -2760,11 +3200,29 @@ mod tests {
         // Step 3: Checkpoint simulation
         harness.inject_key(KeyCode::Char('k'));
         assert!(harness.model().latest_receipt().unwrap().action == "CreateCheckpoint");
+        assert_eq!(
+            harness.model().latest_receipt().unwrap().status,
+            ReceiptStatusKind::Pending
+        );
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::CreateCheckpoint { .. }]
+        ));
 
         // Step 4: Branch from checkpoint
         harness.inject_key(KeyCode::Char('7')); // Replay
         harness.inject_key(KeyCode::Char('n')); // Branch
-        assert!(!harness.model().science.branch_history.is_empty());
+        assert!(harness.model().science.branch_history.is_empty());
+        assert_eq!(harness.model_mut().drain_effects().count(), 0);
+        assert!(
+            harness
+                .model()
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("no checkpoint is selected")
+        );
 
         // Step 5: Compare experiment arms
         harness.inject_key(KeyCode::Char('6')); // Experiments
@@ -2776,20 +3234,20 @@ mod tests {
                     variant_id: "baseline-mlp".into(),
                     brain_family: "MLP".into(),
                     seed: 42,
-                    current_tick: 100,
+                    current_tick: Some(100),
                     target_ticks: 500,
-                    mean_fitness: 1.10,
-                    uncertainty_ci_95: (0.95, 1.25),
+                    mean_fitness: Some(1.10),
+                    uncertainty_ci_95: Some((0.95, 1.25)),
                     digest: "01010101".into(),
                 },
                 ExperimentArmView {
                     variant_id: "challenger-dwraon".into(),
                     brain_family: "DWRAON".into(),
                     seed: 42,
-                    current_tick: 100,
+                    current_tick: Some(100),
                     target_ticks: 500,
-                    mean_fitness: 1.80,
-                    uncertainty_ci_95: (1.65, 1.95),
+                    mean_fitness: Some(1.80),
+                    uncertainty_ci_95: Some((1.65, 1.95)),
                     digest: "02020202".into(),
                 },
             ],
@@ -2808,14 +3266,24 @@ mod tests {
                 .data()
                 .unwrap()
                 .comparison_summary
-                .is_some()
+                .is_none()
         );
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::CompareExperiments { .. }]
+        ));
 
         // Step 6: Export replay bundle
         harness.dispatch(ShellMessage::ExportScreenData {
             format: "tar.gz".into(),
         });
-        assert_eq!(harness.model().science.export_history.len(), 1);
+        assert!(harness.model().science.export_history.is_empty());
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert!(matches!(
+            effects.as_slice(),
+            [ShellEffect::ExportScreenData { format }] if format == "tar.gz"
+        ));
 
         // Step 7: Clean exit
         harness.dispatch(ShellMessage::Quit);

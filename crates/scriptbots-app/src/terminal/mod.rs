@@ -1,10 +1,11 @@
 use std::{
+    cell::RefCell,
     cmp::{Ordering, Reverse},
     collections::{HashMap, VecDeque},
     f32::consts::{PI, TAU},
     ffi::OsStr,
     fs::{self, File},
-    io::{self, Stdout},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -16,15 +17,13 @@ use subcell::{ColorDepth, Layer, SubCellBuffer, SubCellMode, quantize};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use crossterm::{
-    event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
-    },
+    event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
+use ftui::runtime::{Cmd, Model, Program, ProgramConfig};
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     buffer::{Buffer, CellDiffOption},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -304,124 +303,698 @@ fn terminal_session_log_path() -> PathBuf {
 
 impl TerminalRenderer {
     fn run_interactive(&self, ctx: RendererContext<'_>) -> Result<()> {
-        let mut stdout = io::stdout();
-        // Establish the guard immediately after raw mode succeeds. If entering
-        // the alternate screen fails, `begin_with` drops the partially armed
-        // guard and restores raw mode before returning the original error.
-        let mut guard = TerminalModeGuard::begin_with(CrosstermRestore, enable_raw_mode, || {
-            execute!(stdout, EnterAlternateScreen)
-        })?;
-
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend).context("failed to build terminal backend")?;
-        // Showing an already-visible cursor is harmless; pre-arm restoration
-        // in case the hide sequence applies before a flush error is reported.
+        let model = LiveTerminalModel::new(TerminalApp::new(self, ctx))?;
+        // FrankenTUI owns raw mode, input, presentation and subscriptions. Keep
+        // the existing idempotent restoration guard as an outer unwind boundary.
+        let mut guard = TerminalModeGuard::begin_with(CrosstermRestore, || Ok(()), || Ok(()))?;
         guard.mark_cursor_hidden();
-        terminal.hide_cursor().ok();
-
-        let result = run_event_loop(self, &mut terminal, ctx);
-
-        drop(terminal);
+        let config = ProgramConfig {
+            screen_mode: ftui::runtime::ScreenMode::AltScreen,
+            poll_timeout: self.draw_interval,
+            ..ProgramConfig::default().with_mouse()
+        };
+        let mut program = Program::with_config(model, config)
+            .context("failed to start FrankenTUI terminal runtime")?;
+        let result = program.run();
+        let failure = program.model().failure.borrow_mut().take();
+        drop(program);
         drop(guard);
-
-        result
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        result.context("FrankenTUI terminal runtime failed")
     }
 }
 
-fn run_event_loop(
-    renderer: &TerminalRenderer,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ctx: RendererContext<'_>,
-) -> Result<()> {
-    let mut app = TerminalApp::new(renderer, ctx);
-    if app.interactive_runtime_finished()? {
-        return Ok(());
+enum LiveTerminalMessage {
+    Event(ftui::core::event::Event),
+    Refresh,
+    ServiceData {
+        route: frankentui_shell::ShellRoute,
+        generation: u64,
+        messages: Vec<frankentui_shell::ShellMessage>,
+    },
+    Checkpoint {
+        request_id: String,
+        result: std::result::Result<crate::control::CheckpointMetadataDto, String>,
+    },
+}
+
+impl From<ftui::core::event::Event> for LiveTerminalMessage {
+    fn from(event: ftui::core::event::Event) -> Self {
+        Self::Event(event)
     }
-    if let Err(error) = app.submit_and_wait(ControlCommand::Resume) {
-        // Shutdown can finish between the precheck and Resume admission.
-        // Reconcile only interactive startup; batch callers retain the error.
-        if app.interactive_runtime_finished()? {
-            return Ok(());
-        }
-        return Err(error);
+}
+
+/// One live FrankenTUI lifecycle. Existing widgets paint into an offscreen
+/// buffer; only FrankenTUI writes to the terminal. This preserves the canvas
+/// and inspector while science routes consume the actual shell `view`.
+struct LiveTerminalModel<'a> {
+    app: RefCell<TerminalApp<'a>>,
+    widgets: RefCell<Terminal<ratatui::backend::TestBackend>>,
+    awaiting_presentation: RefCell<Option<(u64, Buffer)>>,
+    failure: RefCell<Option<anyhow::Error>>,
+    service_generation: u64,
+    service_in_flight: Option<(frankentui_shell::ShellRoute, u64)>,
+    last_service_poll: Option<Instant>,
+    lineage: LiveLineages,
+}
+
+impl<'a> LiveTerminalModel<'a> {
+    fn new(mut app: TerminalApp<'a>) -> Result<Self> {
+        app.frankentui
+            .update(frankentui_shell::ShellMessage::CapabilityChanged {
+                reduced_color: !app.palette.has_color(),
+                reduced_motion: app.motion.is_reduced(),
+            });
+        let lineage = LiveLineages::new(app.client.event_cursor());
+        Ok(Self {
+            app: RefCell::new(app),
+            widgets: RefCell::new(Terminal::new(ratatui::backend::TestBackend::new(80, 24))?),
+            awaiting_presentation: RefCell::new(None),
+            failure: RefCell::new(None),
+            service_generation: 0,
+            service_in_flight: None,
+            last_service_poll: None,
+            lineage,
+        })
     }
 
-    loop {
-        if app.interactive_runtime_finished()? {
-            break;
+    fn fail(&self, error: anyhow::Error) -> Cmd<LiveTerminalMessage> {
+        self.app.borrow_mut().frankentui.on_error(&error.to_string());
+        if self.failure.borrow().is_none() {
+            *self.failure.borrow_mut() = Some(error);
         }
-        let now = Instant::now();
-        app.maybe_step_simulation(now);
+        Cmd::quit()
+    }
 
-        if now.duration_since(app.last_draw) >= app.draw_interval {
-            // Publish the frame that is now on screen so
-            // GET /api/screenshot/ascii can serve exactly it. The clone is bounded
-            // by the terminal size and happens at most once per draw_interval, not
-            // once per event-loop iteration.
-            let mut presented: Option<Buffer> = None;
-            terminal.draw(|frame| {
-                app.draw(frame);
-                presented = Some(frame.buffer_mut().clone());
-            })?;
-            app.last_draw = Instant::now();
-            app.publish_presented_frame(presented);
-        }
-
-        let next_draw_due = app.last_draw + app.draw_interval;
-        let next_sim_due = app.last_tick + app.tick_interval;
-        let now = Instant::now();
-        let sleep_for = next_draw_due
-            .saturating_duration_since(now)
-            .min(next_sim_due.saturating_duration_since(now));
-
-        if event::poll(sleep_for)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if app.handle_key(key)? {
-                        break;
+    fn acknowledge_presentation(&self) {
+        // update is reached only after the previous view and terminal write
+        // succeeded. A failed write goes to on_error and discards this buffer.
+        if let Some((tick, buffer)) = self.awaiting_presentation.borrow_mut().take() {
+            let mut app = self.app.borrow_mut();
+            app.presented_frame
+                .store(Some(Arc::new(crate::servers::PresentedTerminalFrame {
+                    tick,
+                    buffer: buffer.clone(),
+                })));
+            if app.export_requested() {
+                match app.write_frame_export(&buffer, tick) {
+                    Ok((path, _, hash)) => app.push_event(
+                        tick,
+                        EventKind::Info,
+                        format!("Saved frame {} ({hash})", path.display()),
+                    ),
+                    Err(error) => {
+                        app.export_requested = false;
+                        app.push_event(tick, EventKind::Info, format!("Screenshot failed: {error}"));
                     }
                 }
-                Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse)?;
-                }
-                _ => {}
             }
         }
+    }
+}
 
-        // Serve a screenshot request from the frame that is ACTUALLY ON SCREEN.
-        // Drawing here and capturing that same buffer is what makes the exported
-        // file equal to the displayed one by construction, rather than by a
-        // second rasterization that could disagree (bd-2z0.14.2.6).
-        if app.export_requested() {
-            let mut displayed: Option<Buffer> = None;
-            terminal.draw(|frame| {
-                app.draw(frame);
-                displayed = Some(frame.buffer_mut().clone());
-            })?;
-            app.last_draw = Instant::now();
-            if let Some(buffer) = displayed {
-                let tick = app.snapshot.tick;
-                match app.write_frame_export(&buffer) {
-                    Ok((ansi_path, _, hash)) => {
-                        let name = ansi_path
-                            .file_name()
-                            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                        app.push_event(
-                            tick,
-                            EventKind::Info,
-                            format!("Saved frame {name} ({hash})"),
+impl Model for LiveTerminalModel<'_> {
+    type Message = LiveTerminalMessage;
+
+    fn init(&mut self) -> Cmd<Self::Message> {
+        let result = {
+            let mut app = self.app.borrow_mut();
+            app.frankentui.init();
+            app.interactive_runtime_finished().and_then(|finished| {
+                if finished {
+                    Ok(true)
+                } else {
+                    app.submit_simulation_command(ControlCommand::Resume);
+                    Ok(false)
+                }
+            })
+        };
+        match result {
+            Ok(true) => Cmd::quit(),
+            Ok(false) => Cmd::msg(LiveTerminalMessage::Refresh),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn update(&mut self, message: Self::Message) -> Cmd<Self::Message> {
+        self.acknowledge_presentation();
+        if self.failure.borrow().is_some() {
+            return Cmd::quit();
+        }
+        let result = {
+            let mut app = self.app.borrow_mut();
+            match message {
+                LiveTerminalMessage::Event(event) => app.handle_ftui_event(event),
+                LiveTerminalMessage::Refresh => {
+                    app.maybe_step_simulation(Instant::now());
+                    app.refresh_command_receipts();
+                    app.refresh_science_snapshot();
+                    self.lineage.poll(&mut app.client);
+                    app.interactive_runtime_finished()
+                }
+                LiveTerminalMessage::ServiceData {
+                    route,
+                    generation,
+                    messages,
+                } => {
+                    if self.service_in_flight == Some((route, generation)) {
+                        self.service_in_flight = None;
+                        if app.frankentui.route == route {
+                            for mut message in messages {
+                                app.preserve_science_selection(&mut message);
+                                app.frankentui.update(message);
+                            }
+                        }
+                    }
+                    Ok(false)
+                }
+                LiveTerminalMessage::Checkpoint { request_id, result } => {
+                    app.record_checkpoint_result(request_id, result);
+                    Ok(false)
+                }
+            }
+        };
+        match result {
+            Ok(true) => return Cmd::quit(),
+            Err(error) => return self.fail(error),
+            Ok(false) => {}
+        }
+        self.service_commands()
+    }
+
+    fn view(&self, frame: &mut ftui::render::frame::Frame) {
+        let mut app = self.app.borrow_mut();
+        let mut widgets = self.widgets.borrow_mut();
+        let area = Rect::new(0, 0, frame.width(), frame.height());
+        let result = widgets
+            .resize(area)
+            .and_then(|()| widgets.draw(|legacy| app.draw(legacy)).map(|_| ()));
+        if let Err(error) = result {
+            drop(app);
+            let _ = self.fail(error.into());
+            return;
+        }
+        let buffer = widgets.backend().buffer();
+        copy_widgets_to_ftui(buffer, frame);
+        app.last_draw = Instant::now();
+        *self.awaiting_presentation.borrow_mut() = Some((app.snapshot.tick, buffer.clone()));
+    }
+
+    fn subscriptions(&self) -> Vec<Box<dyn ftui::runtime::subscription::Subscription<Self::Message>>> {
+        vec![Box::new(ftui::runtime::Every::new(
+            self.app.borrow().draw_interval,
+            || LiveTerminalMessage::Refresh,
+        ))]
+    }
+
+    fn on_error(&mut self, error: &str) -> Cmd<Self::Message> {
+        self.awaiting_presentation.borrow_mut().take();
+        // Never leave a failed renderer's candidate exposed as a presented frame.
+        self.app.borrow().presented_frame.store(None);
+        self.fail(anyhow!("FrankenTUI runtime error: {error}"))
+    }
+
+    fn on_shutdown(&mut self) -> Cmd<Self::Message> {
+        if self.failure.borrow().is_none() {
+            self.acknowledge_presentation();
+        }
+        self.app.borrow_mut().frankentui.on_shutdown();
+        info!(
+            target: "scriptbots::terminal",
+            runtime = "frankentui",
+            failed = self.failure.borrow().is_some(),
+            "terminal lifecycle finalized"
+        );
+        Cmd::none()
+    }
+}
+
+fn terminal_modifiers(modifiers: ftui::core::event::Modifiers) -> KeyModifiers {
+    use ftui::core::event::Modifiers as M;
+    let mut result = KeyModifiers::empty();
+    for (source, target) in [
+        (M::SHIFT, KeyModifiers::SHIFT),
+        (M::CTRL, KeyModifiers::CONTROL),
+        (M::ALT, KeyModifiers::ALT),
+        (M::SUPER, KeyModifiers::SUPER),
+    ] {
+        if modifiers.contains(source) {
+            result |= target;
+        }
+    }
+    result
+}
+
+fn terminal_key(key: ftui::core::event::KeyEvent) -> Option<KeyEvent> {
+    use ftui::core::event::{KeyCode as K, KeyEventKind as Kind};
+    let code = match key.code {
+        K::Char(c) => KeyCode::Char(c),
+        K::Enter => KeyCode::Enter,
+        K::Escape => KeyCode::Esc,
+        K::Backspace => KeyCode::Backspace,
+        K::Tab => KeyCode::Tab,
+        K::BackTab => KeyCode::BackTab,
+        K::Delete => KeyCode::Delete,
+        K::Insert => KeyCode::Insert,
+        K::Home => KeyCode::Home,
+        K::End => KeyCode::End,
+        K::PageUp => KeyCode::PageUp,
+        K::PageDown => KeyCode::PageDown,
+        K::Up => KeyCode::Up,
+        K::Down => KeyCode::Down,
+        K::Left => KeyCode::Left,
+        K::Right => KeyCode::Right,
+        K::F(n) => KeyCode::F(n),
+        K::Null => KeyCode::Null,
+        K::MediaPlayPause | K::MediaStop | K::MediaNextTrack | K::MediaPrevTrack => return None,
+    };
+    let kind = match key.kind {
+        Kind::Press => KeyEventKind::Press,
+        Kind::Repeat => KeyEventKind::Repeat,
+        Kind::Release => KeyEventKind::Release,
+    };
+    Some(KeyEvent::new_with_kind(
+        code,
+        terminal_modifiers(key.modifiers),
+        kind,
+    ))
+}
+
+fn terminal_mouse(mouse: ftui::core::event::MouseEvent) -> MouseEvent {
+    use ftui::core::event::{MouseButton as B, MouseEventKind as K};
+    let button = |button| match button {
+        B::Left => crossterm::event::MouseButton::Left,
+        B::Right => crossterm::event::MouseButton::Right,
+        B::Middle => crossterm::event::MouseButton::Middle,
+    };
+    let kind = match mouse.kind {
+        K::Down(b) => MouseEventKind::Down(button(b)),
+        K::Up(b) => MouseEventKind::Up(button(b)),
+        K::Drag(b) => MouseEventKind::Drag(button(b)),
+        K::Moved => MouseEventKind::Moved,
+        K::ScrollUp => MouseEventKind::ScrollUp,
+        K::ScrollDown => MouseEventKind::ScrollDown,
+        K::ScrollLeft => MouseEventKind::ScrollLeft,
+        K::ScrollRight => MouseEventKind::ScrollRight,
+    };
+    MouseEvent {
+        kind,
+        column: mouse.x,
+        row: mouse.y,
+        modifiers: terminal_modifiers(mouse.modifiers),
+    }
+}
+
+fn ftui_color(color: Color) -> ftui::render::cell::PackedRgba {
+    use ftui::render::cell::PackedRgba as R;
+    let index = match color {
+        Color::Reset => return R::TRANSPARENT,
+        Color::Rgb(r, g, b) => return R::rgb(r, g, b),
+        Color::Indexed(i) => i,
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+    };
+    if index < 16 {
+        const ANSI: [[u8; 3]; 16] = [
+            [0, 0, 0],
+            [128, 0, 0],
+            [0, 128, 0],
+            [128, 128, 0],
+            [0, 0, 128],
+            [128, 0, 128],
+            [0, 128, 128],
+            [192, 192, 192],
+            [128, 128, 128],
+            [255, 0, 0],
+            [0, 255, 0],
+            [255, 255, 0],
+            [0, 0, 255],
+            [255, 0, 255],
+            [0, 255, 255],
+            [255, 255, 255],
+        ];
+        let [r, g, b] = ANSI[usize::from(index)];
+        R::rgb(r, g, b)
+    } else if index < 232 {
+        let n = index - 16;
+        let component = |n: u8| if n == 0 { 0 } else { 55 + n * 40 };
+        R::rgb(component(n / 36), component((n / 6) % 6), component(n % 6))
+    } else {
+        let gray = 8 + (index - 232) * 10;
+        R::rgb(gray, gray, gray)
+    }
+}
+
+fn copy_widgets_to_ftui(source: &Buffer, target: &mut ftui::render::frame::Frame) {
+    use ftui::render::cell::{Cell, CellAttrs, CellContent, GraphemeId, StyleFlags};
+    for y in 0..source.area.height.min(target.height()) {
+        let mut x = 0;
+        while x < source.area.width.min(target.width()) {
+            let source_cell = &source[(source.area.x + x, source.area.y + y)];
+            let symbol = source_cell.symbol();
+            let width = match source_cell.diff_option {
+                CellDiffOption::ForcedWidth(width) => width.get(),
+                _ => u16::try_from(ftui::core::text_width::display_width(symbol)).unwrap_or(u16::MAX),
+            }
+            .max(1);
+            let visible_width = width.min(target.width() - x);
+            let content = if symbol.is_empty()
+                || width > visible_width
+                || width > u16::from(GraphemeId::MAX_WIDTH)
+            {
+                CellContent::from_char(' ')
+            } else if width == 1 && symbol.len() == 1 && symbol.is_ascii() {
+                CellContent::from_char(char::from(symbol.as_bytes()[0]))
+            } else {
+                CellContent::from_grapheme(target.intern_with_width(
+                    symbol,
+                    u8::try_from(width).expect("width fits the grapheme declaration"),
+                ))
+            };
+            let mut flags = StyleFlags::empty();
+            for (source_flag, target_flag) in [
+                (Modifier::BOLD, StyleFlags::BOLD),
+                (Modifier::DIM, StyleFlags::DIM),
+                (Modifier::ITALIC, StyleFlags::ITALIC),
+                (Modifier::UNDERLINED, StyleFlags::UNDERLINE),
+                (Modifier::REVERSED, StyleFlags::REVERSE),
+                (Modifier::CROSSED_OUT, StyleFlags::STRIKETHROUGH),
+                (Modifier::HIDDEN, StyleFlags::HIDDEN),
+            ] {
+                if source_cell.modifier.contains(source_flag) {
+                    flags |= target_flag;
+                }
+            }
+            target.buffer.set_raw(
+                x,
+                y,
+                Cell {
+                    content,
+                    fg: ftui_color(source_cell.fg),
+                    bg: ftui_color(source_cell.bg),
+                    attrs: CellAttrs::new(flags, CellAttrs::LINK_ID_NONE),
+                },
+            );
+            for continuation in 1..visible_width {
+                target
+                    .buffer
+                    .set_raw(x + continuation, y, Cell::CONTINUATION);
+            }
+            x += visible_width;
+        }
+    }
+}
+
+impl LiveTerminalModel<'_> {
+    fn service_commands(&mut self) -> Cmd<LiveTerminalMessage> {
+        use frankentui_shell::{ShellEffect, ShellMessage, ShellRoute};
+        let mut commands = Vec::new();
+        let mut app = self.app.borrow_mut();
+        let effects: Vec<_> = app.frankentui.drain_effects().collect();
+        for effect in effects {
+            match effect {
+                ShellEffect::SubmitCommand(command) => app.submit_simulation_command(command),
+                ShellEffect::CreateCheckpoint { request_id } => {
+                    if let Some(handle) = app.control.control_handle() {
+                        commands.push(Cmd::task(move || {
+                            let result = handle
+                                .create_checkpoint(crate::control::CheckpointCreateRequest {
+                                    description: Some("Interactive terminal checkpoint".into()),
+                                    idempotency_key: Some(request_id.clone()),
+                                })
+                                .map_err(|error| error.to_string());
+                            LiveTerminalMessage::Checkpoint { request_id, result }
+                        }));
+                    } else {
+                        app.record_checkpoint_result(
+                            request_id,
+                            Err("Control data services are disabled".into()),
                         );
                     }
-                    Err(err) => {
-                        app.export_requested = false;
-                        app.push_event(tick, EventKind::Info, format!("Screenshot failed: {err}"));
+                }
+                ShellEffect::BranchCheckpoint {
+                    checkpoint_id,
+                    branch_name,
+                } => {
+                    app.frankentui.update(ShellMessage::SetStatus(format!(
+                        "Branch {branch_name} from {checkpoint_id} unavailable: full host/session restore is not implemented"
+                    )));
+                }
+                ShellEffect::CompareExperiments {
+                    baseline,
+                    challenger,
+                } => {
+                    app.frankentui.update(ShellMessage::SetStatus(format!(
+                        "Comparison {baseline} / {challenger} requires measured matched-seed report data; no result computed"
+                    )));
+                }
+                ShellEffect::ExportScreenData { format } => {
+                    if matches!(format.as_str(), "ascii" | "ansi" | "txt") {
+                        app.export_requested = true;
+                    } else {
+                        app.frankentui.update(ShellMessage::SetStatus(format!(
+                            "Live {format} export unavailable; S saves the presented frame"
+                        )));
                     }
                 }
             }
         }
+        let route = app.frankentui.route;
+        if self.service_in_flight.is_none()
+            && self
+                .last_service_poll
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+            && matches!(
+                route,
+                ShellRoute::Lineages | ShellRoute::Experiments | ShellRoute::Replay
+            )
+        {
+            self.last_service_poll = Some(Instant::now());
+            self.service_generation = self.service_generation.saturating_add(1);
+            let generation = self.service_generation;
+            if route == ShellRoute::Lineages {
+                let lineage = self.lineage.clone();
+                self.service_in_flight = Some((route, generation));
+                commands.push(Cmd::task(move || LiveTerminalMessage::ServiceData {
+                    route,
+                    generation,
+                    messages: vec![ShellMessage::SetLineagesData(lineage.view_data())],
+                }));
+            } else if let Some(handle) = app.control.control_handle() {
+                self.service_in_flight = Some((route, generation));
+                commands.push(Cmd::task(move || LiveTerminalMessage::ServiceData {
+                    route,
+                    generation,
+                    messages: science_service_messages(&handle, route, generation),
+                }));
+            } else {
+                app.frankentui.update(match route {
+                    ShellRoute::Experiments => ShellMessage::SetExperimentsData(
+                        science_screens::ScreenDataState::empty("Control data services are disabled"),
+                    ),
+                    _ => ShellMessage::SetReplayData(science_screens::ScreenDataState::empty(
+                        "Control data services are disabled",
+                    )),
+                });
+            }
+        }
+        Cmd::batch(commands)
+    }
+}
+
+/// A bounded observer of the exact host birth/death stream. Gaps and capacity
+/// limits are visible failures of this projection, never reconstructed parents.
+#[derive(Clone)]
+struct LiveLineages {
+    cursor: scriptbots_runtime::EventCursor,
+    graph: scriptbots_core::ancestry::AncestryGraph,
+    observed_tick: Option<u64>,
+    error: Option<String>,
+    recent_events: VecDeque<science_screens::LineageEventEntry>,
+}
+
+impl LiveLineages {
+    const MAX_NODES: usize = 16_384;
+
+    fn new(cursor: scriptbots_runtime::EventCursor) -> Self {
+        Self {
+            cursor,
+            graph: scriptbots_core::ancestry::AncestryGraph::new(),
+            observed_tick: None,
+            error: None,
+            recent_events: VecDeque::new(),
+        }
     }
 
-    Ok(())
+    fn poll(&mut self, client: &mut HostClient<ChannelHostPort>) {
+        if self.error.is_some() {
+            return;
+        }
+        match client.read_events(&mut self.cursor, 64) {
+            Ok(scriptbots_runtime::EventPoll::Contiguous(page)) => {
+                for entry in page.events {
+                    let boundary = &entry.event.boundary;
+                    if self.graph.len().saturating_add(boundary.births().len()) > Self::MAX_NODES {
+                        self.error = Some(format!(
+                            "Live ancestry exceeds {} retained nodes; use an offline lineage report",
+                            Self::MAX_NODES
+                        ));
+                        return;
+                    }
+                    for birth in boundary.births() {
+                        if let Err(error) = self.graph.apply_birth(birth) {
+                            self.error = Some(error.to_string());
+                            return;
+                        }
+                    }
+                    for death in boundary.deaths() {
+                        if let Err(error) = self.graph.apply_death(death) {
+                            self.error = Some(error.to_string());
+                            return;
+                        }
+                    }
+                    let tick = entry.event.tick.0;
+                    if !boundary.births().is_empty() || !boundary.deaths().is_empty() {
+                        if self.recent_events.len() == EVENT_LOG_CAPACITY {
+                            self.recent_events.pop_front();
+                        }
+                        self.recent_events.push_back(science_screens::LineageEventEntry {
+                            tick,
+                            event_kind: "arrivals/deaths".into(),
+                            description: format!(
+                                "{} typed arrivals, {} exact deaths",
+                                boundary.births().len(),
+                                boundary.deaths().len()
+                            ),
+                        });
+                    }
+                    self.observed_tick = Some(tick);
+                }
+            }
+            Ok(scriptbots_runtime::EventPoll::Gap(gap)) => {
+                self.error = Some(format!(
+                    "Ancestry event history gap: {gap:?}; completeness unavailable"
+                ));
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn view_data(&self) -> science_screens::ScreenDataState<science_screens::LineagesViewData> {
+        use science_screens::*;
+        if let Some(error) = &self.error {
+            return ScreenDataState::error(self.cursor.last_seen().get(), error);
+        }
+        if self.observed_tick.is_none() {
+            return ScreenDataState::empty("Waiting for the first canonical scientific boundary");
+        }
+        let contributions = self.graph.compute_founder_contributions();
+        ScreenDataState::Data(LineagesViewData {
+            total_founders: Some(contributions.len()),
+            active_clades: None,
+            extinct_clades: None,
+            clades: Vec::new(),
+            founder_rows: contributions
+                .into_iter()
+                .take(32)
+                .map(|row| FounderLineageRow {
+                    founder_uid: row.founder_uid.get(),
+                    total_descendants: row.total_descendants,
+                    living_descendants: row.living_descendants,
+                    contribution_share: row.contribution_share,
+                })
+                .collect(),
+            observed_tick: self.observed_tick,
+            recent_events: self.recent_events.iter().cloned().collect(),
+            selected_index: 0,
+        })
+    }
+}
+
+fn science_service_messages(
+    handle: &crate::control::ControlHandle,
+    route: frankentui_shell::ShellRoute,
+    query_id: u64,
+) -> Vec<frankentui_shell::ShellMessage> {
+    use frankentui_shell::{ShellMessage, ShellRoute};
+    use science_screens::*;
+    vec![match route {
+        ShellRoute::Experiments => {
+            let result = handle.list_experiments(Some(1), None).and_then(|page| {
+                page.items
+                    .first()
+                    .map(|item| handle.get_experiment(&item.experiment_id))
+                    .transpose()
+            });
+            let data = match result {
+                Ok(Some(batch)) => ScreenDataState::Data(ExperimentsViewData {
+                    experiment_id: batch.experiment_id,
+                    batch_status: batch
+                        .error_reason
+                        .map_or(batch.status, |error| format!("Failed: {error}")),
+                    active_arms: batch
+                        .runs
+                        .into_iter()
+                        .take(32)
+                        .map(|run| ExperimentArmView {
+                            variant_id: run.variant_id,
+                            brain_family: run.brain_family,
+                            seed: run.seed,
+                            current_tick: (run.state == "completed").then_some(run.total_ticks),
+                            target_ticks: run.total_ticks,
+                            mean_fitness: None,
+                            uncertainty_ci_95: None,
+                            digest: run.final_digest.unwrap_or_else(|| "unavailable".into()),
+                        })
+                        .collect(),
+                    selected_arm_index: 0,
+                    comparison_summary: None,
+                }),
+                Ok(None) => ScreenDataState::empty(
+                    "No experiment batches created; use REST/MCP experiment_create",
+                ),
+                Err(error) => ScreenDataState::error(query_id, error.to_string()),
+            };
+            ShellMessage::SetExperimentsData(data)
+        }
+        ShellRoute::Replay => {
+            let data = match handle.list_checkpoints(Some(32), None) {
+                Ok(page) => ScreenDataState::Data(ReplayViewData {
+                    checkpoints: page
+                        .items
+                        .into_iter()
+                        .map(|checkpoint| CheckpointViewEntry {
+                            checkpoint_id: checkpoint.checkpoint_id,
+                            tick: checkpoint.tick,
+                            agent_count: None,
+                            digest: None,
+                            file_size_bytes: checkpoint.byte_size,
+                        })
+                        .collect(),
+                    ..ReplayViewData::default()
+                }),
+                Err(error) => ScreenDataState::error(query_id, error.to_string()),
+            };
+            ShellMessage::SetReplayData(data)
+        }
+        _ => return Vec::new(),
+    }]
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -699,6 +1272,7 @@ struct TerminalApp<'a> {
     /// Whether the tiled archipelago view is active instead of the single-world terrain map (bd-16g.5.5.4).
     archipelago_view: bool,
     pub frankentui: frankentui_shell::FrankenTuiModel,
+    receipt_poll_offset: usize,
     /// Cached layout hit regions for O(1) hit testing and picking (bd-2z0.14.2.5).
     pub hit_regions: HitRegionMap,
     /// Explicit pointer gesture state machine (bd-2z0.14.2.5).
@@ -861,6 +1435,7 @@ impl<'a> TerminalApp<'a> {
             sub_step: 0,
             archipelago_view: false,
             frankentui: frankentui_shell::FrankenTuiModel::new(),
+            receipt_poll_offset: 0,
             hit_regions: HitRegionMap::default(),
             pointer_gesture: PointerGestureState::default(),
             hover_stabilizer: HoverStabilizer::new(),
@@ -973,6 +1548,7 @@ impl<'a> TerminalApp<'a> {
                     command_id: command_id.to_string(),
                     action: action_name,
                     status: frankentui_shell::ReceiptStatusKind::Failed(error.to_string()),
+                    journal_state: None,
                     control_revision: control_rev,
                     scientific_revision: scientific_rev,
                     timestamp_tick: tick,
@@ -1064,7 +1640,7 @@ impl<'a> TerminalApp<'a> {
     /// `ControlHandle`). A second `HostClient` envelope used to follow it, so every
     /// palette spawn, speed change or pause reached the owner twice.
     fn submit_simulation_command(&mut self, command: ControlCommand) {
-        match (self.command_submit.as_ref())(command) {
+        match self.submit_with_visible_receipt(command) {
             Some(receipt) => debug!(%receipt, "simulation command submitted to the owner"),
             None => {
                 warn!("terminal renderer failed to enqueue simulation command");
@@ -1072,6 +1648,96 @@ impl<'a> TerminalApp<'a> {
                     self.paused = snapshot.playback.paused;
                     self.speed_multiplier = snapshot.playback.speed_multiplier;
                 }
+            }
+        }
+    }
+
+    fn submit_with_visible_receipt(&mut self, command: ControlCommand) -> Option<String> {
+        let action = match &command {
+            ControlCommand::UpdateConfig(_) => "UpdateConfig",
+            ControlCommand::UpdateSelection(_) => "UpdateSelection",
+            ControlCommand::AdjustAgentMutationRates { .. } => "AdjustAgentMutationRates",
+            ControlCommand::SpawnAgent { .. } => "SpawnAgent",
+            ControlCommand::SpawnCrossover { .. } => "SpawnCrossover",
+            ControlCommand::UpdateSimulation(_) => "UpdateSimulation",
+            ControlCommand::Pause => "Pause",
+            ControlCommand::Resume => "Resume",
+            ControlCommand::Step => "Step",
+            ControlCommand::SetSpeed(_) => "SetSpeed",
+            ControlCommand::Shutdown => "Shutdown",
+            ControlCommand::ApplyMap(_) => "ApplyMap",
+            ControlCommand::Intervention(_) => "Intervention",
+        }
+        .to_owned();
+        let receipt = (self.command_submit.as_ref())(command);
+        if let Some(id) = &receipt {
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::CommandReceipt(
+                    frankentui_shell::CommandReceiptEntry {
+                        command_id: id.clone(),
+                        action,
+                        status: frankentui_shell::ReceiptStatusKind::Pending,
+                        journal_state: None,
+                        control_revision: self.retained_render.revisions.control.get(),
+                        scientific_revision: self.retained_render.revisions.scientific.get(),
+                        timestamp_tick: self.snapshot.tick,
+                    },
+                ));
+        } else {
+            self.frankentui
+                .update(frankentui_shell::ShellMessage::SetStatus(format!(
+                    "{action}: command admission unavailable; no application observed"
+                )));
+        }
+        receipt
+    }
+
+    fn refresh_command_receipts(&mut self) {
+        // Share one UI budget across lookups; a busy durable-authority lookup
+        // must leave a command unresolved without freezing terminal input.
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let mut candidates: Vec<_> = self
+            .frankentui
+            .receipts
+            .iter()
+            .filter(|entry| {
+                entry
+                    .journal_state
+                    .as_ref()
+                    .is_none_or(|state| matches!(state, JournalState::Pending))
+            })
+            .filter_map(|entry| {
+                serde_json::from_value::<CommandId>(serde_json::Value::String(
+                    entry.command_id.clone(),
+                ))
+                .ok()
+                .map(|id| (id, entry.action.clone()))
+            })
+            .collect();
+        if !candidates.is_empty() {
+            let start = self.receipt_poll_offset % candidates.len();
+            candidates.rotate_left(start);
+        }
+        for (id, action) in candidates {
+            if Instant::now() >= deadline {
+                break;
+            }
+            self.receipt_poll_offset = self.receipt_poll_offset.wrapping_add(1);
+            match self.host.command_status_before(id, deadline) {
+                Ok(Some(status)) => {
+                    let receipt = frankentui_shell::CommandReceiptEntry::from_runtime_status(
+                        &id,
+                        action,
+                        &status,
+                        self.snapshot.tick,
+                        self.retained_render.revisions.control.get(),
+                        self.retained_render.revisions.scientific.get(),
+                    );
+                    self.frankentui
+                        .update(frankentui_shell::ShellMessage::CommandReceipt(receipt));
+                }
+                Ok(None) => {}
+                Err(error) => debug!(%id, %error, "terminal receipt remains unresolved"),
             }
         }
     }
@@ -1092,7 +1758,7 @@ impl<'a> TerminalApp<'a> {
             step_once: false,
         });
         // One submission only; see `submit_simulation_command`.
-        if let Some(receipt) = (self.command_submit.as_ref())(command) {
+        if let Some(receipt) = self.submit_with_visible_receipt(command) {
             debug!(%receipt, "playback request submitted to the owner");
             self.push_toast(format!("{action} request submitted"));
         } else {
@@ -1224,7 +1890,7 @@ impl<'a> TerminalApp<'a> {
         }
         config.render.theme = Some(theme.to_config());
         let command = ControlCommand::UpdateConfig(Box::new(config));
-        if let Some(receipt) = (self.command_submit.as_ref())(command) {
+        if let Some(receipt) = self.submit_with_visible_receipt(command) {
             info!(
                 theme = theme.label(),
                 %receipt,
@@ -1384,6 +2050,9 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
+        if self.draw_science_route(frame) {
+            return;
+        }
         if !self.paused && !self.motion.is_reduced() {
             self.sub_step = (self.sub_step + 1) % 16;
         }
@@ -1532,6 +2201,324 @@ impl<'a> TerminalApp<'a> {
         }
         if let Some(tooltip) = &self.hover_tooltip {
             self.draw_hover_tooltip(frame, tooltip, frame.area());
+        }
+        if let Some(receipt) = self.frankentui.latest_receipt_summary() {
+            let area = frame.area();
+            if area.height > 0 {
+                frame.render_widget(
+                    Paragraph::new(receipt).style(
+                        Style::default()
+                            .fg(self.palette.theme().text)
+                            .bg(self.palette.theme().surface),
+                    ),
+                    Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+                );
+            }
+        }
+    }
+
+    fn draw_science_route(&mut self, frame: &mut Frame<'_>) -> bool {
+        use frankentui_shell::ShellRoute;
+        if matches!(
+            self.frankentui.route,
+            ShellRoute::Dashboard
+                | ShellRoute::WorldCanvas
+                | ShellRoute::Inspector
+                | ShellRoute::HelpOverlay
+        ) {
+            return false;
+        }
+        // The old map is not on this screen: its hit regions must not select an
+        // invisible agent or resize a nonexistent splitter after navigation.
+        self.hit_regions = HitRegionMap::default();
+        self.map_area = None;
+        self.hover_tooltip = None;
+        let area = frame.area();
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut science = ftui::render::frame::Frame::new(area.width, area.height, &mut pool);
+        self.frankentui.view(&mut science);
+        frame.render_widget(Clear, area);
+        let theme = self.palette.theme();
+        let style = Style::default().fg(theme.text).bg(theme.surface);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = science.buffer.get(x, y) {
+                    let symbol = cell.content.grapheme_id().map_or_else(
+                        || {
+                            cell.content
+                                .as_char()
+                                .map_or_else(|| " ".into(), |ch| ch.to_string())
+                        },
+                        |id| science.pool.get(id).unwrap_or(" ").to_owned(),
+                    );
+                    let target = &mut frame.buffer_mut()[(area.x + x, area.y + y)];
+                    target.set_symbol(&symbol).set_style(style);
+                    if cell.content.is_continuation() {
+                        target.set_diff_option(CellDiffOption::Skip);
+                    }
+                }
+            }
+        }
+        if self.help_visible {
+            self.draw_help(frame);
+        }
+        if self.palette_open {
+            self.draw_command_palette(frame, area);
+        }
+        self.draw_toasts(frame, area);
+        true
+    }
+
+    fn handle_ftui_event(&mut self, event: ftui::core::event::Event) -> Result<bool> {
+        use frankentui_shell::{ShellMessage, ShellRoute};
+        use ftui::core::event::{Event as E, KeyCode as K, KeyEventKind as Kind, Modifiers};
+        match event {
+            E::Key(key) if key.kind == Kind::Press => {
+                if !self.palette_open && !self.help_visible && key.modifiers == Modifiers::NONE {
+                    if let K::Char(number @ '1'..='9') = key.code {
+                        let route = ShellRoute::all_screens()[number as usize - '1' as usize];
+                        self.frankentui.update(ShellMessage::Navigate(route));
+                        self.pointer_gesture.cancel("science route changed");
+                        self.hit_regions = HitRegionMap::default();
+                        self.map_area = None;
+                        self.hover_tooltip = None;
+                        self.refresh_science_snapshot();
+                        return Ok(false);
+                    }
+                    if !matches!(
+                        self.frankentui.route,
+                        ShellRoute::Dashboard
+                            | ShellRoute::WorldCanvas
+                            | ShellRoute::Inspector
+                            | ShellRoute::HelpOverlay
+                    ) {
+                        let message = match key.code {
+                            K::Up => Some(ShellMessage::SelectPreviousItem),
+                            K::Down => Some(ShellMessage::SelectNextItem),
+                            K::Char('k') => Some(ShellMessage::CreateCheckpoint),
+                            K::Char('x') => Some(ShellMessage::CancelActiveQuery),
+                            K::Escape => Some(ShellMessage::Navigate(ShellRoute::Dashboard)),
+                            _ => None,
+                        };
+                        if let Some(message) = message {
+                            self.frankentui.update(message);
+                            return Ok(false);
+                        }
+                    }
+                }
+                if let Some(key) = terminal_key(key) {
+                    self.handle_key(key)
+                } else {
+                    Ok(false)
+                }
+            }
+            E::Mouse(mouse) => {
+                self.handle_mouse(terminal_mouse(mouse))?;
+                Ok(false)
+            }
+            E::Paste(paste) if self.palette_open => {
+                self.palette_query
+                    .extend(paste.text.chars().filter(|ch| !ch.is_control()).take(256));
+                self.palette_selected_index = 0;
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn record_checkpoint_result(
+        &mut self,
+        request_id: String,
+        result: std::result::Result<crate::control::CheckpointMetadataDto, String>,
+    ) {
+        use frankentui_shell::{CommandReceiptEntry, ReceiptStatusKind, ShellMessage};
+        let (status, message) = match result {
+            Ok(checkpoint) => (
+                ReceiptStatusKind::Applied,
+                format!(
+                    "Checkpoint {} recorded at tick {} ({} bytes); artifact checksum {}",
+                    checkpoint.checkpoint_id,
+                    checkpoint.tick,
+                    checkpoint.byte_size,
+                    checkpoint.checksum_blake3
+                ),
+            ),
+            Err(error) => (
+                ReceiptStatusKind::Failed(error.clone()),
+                format!("Checkpoint failed: {error}"),
+            ),
+        };
+        self.frankentui
+            .update(ShellMessage::CommandReceipt(CommandReceiptEntry {
+                command_id: request_id,
+                action: "CreateCheckpoint".into(),
+                status,
+                journal_state: None,
+                control_revision: self.retained_render.revisions.control.get(),
+                scientific_revision: self.retained_render.revisions.scientific.get(),
+                timestamp_tick: self.snapshot.tick,
+            }));
+        self.frankentui.update(ShellMessage::SetStatus(message));
+    }
+
+    fn refresh_science_snapshot(&mut self) {
+        use frankentui_shell::{ShellMessage, ShellRoute};
+        use science_screens::*;
+        let message = match self.frankentui.route {
+            ShellRoute::BrainArena => {
+                let mut cohorts = std::collections::BTreeMap::new();
+                for agent in &self.retained_render.world.agents {
+                    *cohorts.entry(agent.brain_key).or_insert(0) += 1;
+                }
+                let selected_brain = self.snapshot.focused_agent_uid.and_then(|uid| {
+                    self.snapshot
+                        .brain_inspection
+                        .filter(|inspection| {
+                            inspection.ready
+                                && inspection.source_tick == self.snapshot.tick
+                                && inspection.agent_uid == uid
+                        })
+                        .map(|_| BrainInspectionSummary {
+                            agent_id: uid,
+                            family: self
+                                .snapshot
+                                .agents
+                                .iter()
+                                .find(|agent| agent.uid == Some(uid))
+                                .and_then(|agent| agent.brain_key)
+                                .map_or_else(
+                                    || "unbound".into(),
+                                    |key| format!("Registry key {key}"),
+                                ),
+                            layer_shapes: self
+                                .snapshot
+                                .brain_layers
+                                .iter()
+                                .map(|layer| format!("{}x{}", layer.width, layer.height))
+                                .collect(),
+                            top_sensor_attributions: Vec::new(),
+                            effective_outputs: Vec::new(),
+                        })
+                });
+                ShellMessage::SetBrainArenaData(ScreenDataState::Data(BrainArenaViewData {
+                    family_breakdown: cohorts
+                        .into_iter()
+                        .map(|(key, count)| BrainFamilyCohort {
+                            family: key.map_or_else(
+                                || "unbound".into(),
+                                |key| format!("Registry key {key}"),
+                            ),
+                            agent_count: count,
+                            mean_fitness: None,
+                            mean_eval_nanos: None,
+                        })
+                        .collect(),
+                    selected_brain,
+                    total_evaluations: None,
+                    selected_family_index: self
+                        .frankentui
+                        .science
+                        .brain_arena
+                        .data()
+                        .map_or(0, |data| data.selected_family_index),
+                }))
+            }
+            ShellRoute::Environment => {
+                let snapshot = &self.retained_render;
+                let tiles = &snapshot.layers.terrain.tiles;
+                let mut counts = std::collections::BTreeMap::new();
+                for tile in tiles {
+                    *counts.entry(format!("{:?}", tile.kind)).or_insert(0_usize) += 1;
+                }
+                ShellMessage::SetEnvironmentData(ScreenDataState::Data(EnvironmentViewData {
+                    world_size: (snapshot.world.world.width, snapshot.world.world.height),
+                    terrain_distribution: counts
+                        .into_iter()
+                        .map(|(kind, count)| (kind, count as f32 / tiles.len() as f32))
+                        .collect(),
+                    mean_fertility: None,
+                    mean_temperature: None,
+                    total_food_energy: snapshot.layers.food.cells.iter().sum(),
+                    current_flow_rate: None,
+                    reported_timed_interventions: snapshot
+                        .applied_interventions
+                        .iter()
+                        .rev()
+                        .filter(|event| {
+                            !event.expired
+                                && event
+                                    .expires_at
+                                    .is_some_and(|expiry| expiry.0 > self.snapshot.tick)
+                        })
+                        .take(8)
+                        .map(|event| {
+                            format!(
+                                "{}: applied t{}, expires t{}",
+                                event.kind,
+                                event.tick.0,
+                                event.expires_at.expect("filtered expiry").0
+                            )
+                        })
+                        .collect(),
+                    regrowth_rate: snapshot.config.food_regrowth_rate,
+                }))
+            }
+            ShellRoute::Diagnostics => {
+                let analytics = self.analytics_provider.snapshot();
+                ShellMessage::SetDiagnosticsData(ScreenDataState::Data(DiagnosticsViewData {
+                    host_queue_depth: self.retained_render.command_queue_depth,
+                    host_queue_capacity: None,
+                    analytics_committed_tick: analytics.committed_tick,
+                    storage_uncommitted_records: None,
+                    snapshot_timings_ms: Vec::new(),
+                    sim_tick_hz: None,
+                    render_fps: None,
+                    build_commit: option_env!("SCRIPTBOTS_SOURCE_REVISION")
+                        .unwrap_or("unavailable")
+                        .into(),
+                    digest_neutrality_verified: None,
+                }))
+            }
+            _ => return,
+        };
+        self.frankentui.update(message);
+    }
+
+    fn preserve_science_selection(&self, message: &mut frankentui_shell::ShellMessage) {
+        use frankentui_shell::ShellMessage;
+        use science_screens::ScreenDataState;
+        match message {
+            ShellMessage::SetLineagesData(ScreenDataState::Data(data)) => {
+                let previous = self
+                    .frankentui
+                    .science
+                    .lineages
+                    .data()
+                    .map_or(0, |previous| previous.selected_index);
+                data.selected_index = previous.min(data.founder_rows.len().saturating_sub(1));
+            }
+            ShellMessage::SetExperimentsData(ScreenDataState::Data(data)) => {
+                let previous = self
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .map_or(0, |previous| previous.selected_arm_index);
+                data.selected_arm_index = previous.min(data.active_arms.len().saturating_sub(1));
+            }
+            ShellMessage::SetReplayData(ScreenDataState::Data(data)) => {
+                let previous = self
+                    .frankentui
+                    .science
+                    .replay
+                    .data()
+                    .map_or(0, |previous| previous.selected_checkpoint_index);
+                data.selected_checkpoint_index =
+                    previous.min(data.checkpoints.len().saturating_sub(1));
+                // This is the observed live tick, not a replay comparison result.
+                data.current_replay_tick = self.snapshot.tick;
+            }
+            _ => {}
         }
     }
 
@@ -5137,21 +6124,24 @@ impl<'a> TerminalApp<'a> {
     /// (bd-2z0.14.2.6). The frame identity is the SAME FNV-1a64 the headless
     /// evidence contract already publishes, so an export and a headless report of
     /// one frame cannot disagree.
-    fn write_frame_export(&mut self, buffer: &Buffer) -> Result<(PathBuf, PathBuf, String)> {
+    fn write_frame_export(&mut self, buffer: &Buffer, tick: u64) -> Result<(PathBuf, PathBuf, String)> {
         use std::io::Write;
 
         self.export_requested = false;
         let dir = std::path::Path::new("screenshots");
         fs::create_dir_all(dir)?;
 
-        let tick = self.snapshot.tick;
-        let ansi_path = dir.join(format!("frame_{tick}.ans"));
-        let text_path = dir.join(format!("frame_{tick}.txt"));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let stem = format!("frame_{tick}_{}_{nonce}", std::process::id());
+        let ansi_path = dir.join(format!("{stem}.ans"));
+        let text_path = dir.join(format!("{stem}.txt"));
 
         let ansi = export::buffer_to_ansi(buffer);
         let plain = export::buffer_to_plain_text(buffer);
-        File::create(&ansi_path)?.write_all(ansi.as_bytes())?;
-        File::create(&text_path)?.write_all(plain.as_bytes())?;
+        File::create_new(&ansi_path)?.write_all(ansi.as_bytes())?;
+        File::create_new(&text_path)?.write_all(plain.as_bytes())?;
 
         let layout = self.frame_layout(buffer.area);
         let evidence = HeadlessBufferEvidence::inspect(buffer, tick, &layout)?;
@@ -14383,6 +15373,240 @@ mod tests {
                     .expect("terminal host joins after all client ports drop");
             }
         }
+    }
+
+    #[test]
+    fn live_lineages_consume_canonical_founder_arrivals_from_real_owner() {
+        let world = command_characterization_world();
+        {
+            let mut world = world.lock().expect("fixture world");
+            for _ in 0..2 {
+                world
+                    .try_inject_agent(scriptbots_core::AgentData::default())
+                    .expect("valid founding arrival");
+            }
+        }
+        let host = TerminalTestHost::take(world);
+        let runtime = ControlRuntime::stub();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        let mut lineage = LiveLineages::new(app.client.event_cursor());
+        assert!(matches!(lineage.view_data(), science_screens::ScreenDataState::Empty { .. }));
+        app.submit_and_wait(ControlCommand::Step).expect("one owner tick");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lineage.observed_tick.is_none() {
+            lineage.poll(&mut app.client);
+            assert!(Instant::now() < deadline, "canonical boundary was not observed");
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let science_screens::ScreenDataState::Data(data) = lineage.view_data() else {
+            panic!("real canonical births must produce a lineage projection");
+        };
+        assert_eq!(data.total_founders, Some(2));
+        assert_eq!(data.founder_rows.len(), 2);
+        assert!(data.founder_rows.iter().all(|row| row.total_descendants == 1));
+        assert_eq!(data.active_clades, None, "founder ancestry is not clade analysis");
+        let observed_tick = app.client.port().snapshot_hub().latest().world.world.tick;
+        for _ in 0..4 {
+            lineage.poll(&mut app.client);
+            let _ = lineage.view_data();
+        }
+        assert_eq!(app.client.port().snapshot_hub().latest().world.world.tick, observed_tick);
+    }
+
+    #[test]
+    fn live_model_navigation_uses_science_views_and_preserves_legacy_widgets() {
+        use frankentui_shell::ShellRoute;
+        let host = TerminalTestHost::take(command_characterization_world());
+        let runtime = ControlRuntime::stub();
+        let renderer = TerminalRenderer::default();
+        let app = TerminalApp::new(&renderer, host.context(&runtime));
+        let initial_tick = app.snapshot.tick;
+        let mut simulator = ftui::runtime::ProgramSimulator::new(
+            LiveTerminalModel::new(app).expect("live terminal model"),
+        );
+        for (key, route, title) in [
+            ('4', ShellRoute::Lineages, "LINEAGES & PHYLOGENY LAB"),
+            ('5', ShellRoute::BrainArena, "BRAIN ARENA & EVALUATOR COHORTS"),
+            ('6', ShellRoute::Experiments, "MATCHED-SEED EXPERIMENTS"),
+            ('7', ShellRoute::Replay, "DETERMINISTIC REPLAY"),
+            ('8', ShellRoute::Environment, "ENVIRONMENT, HYDROLOGY"),
+            ('9', ShellRoute::Diagnostics, "SYSTEM DIAGNOSTICS"),
+        ] {
+            simulator.inject_event(ftui::core::event::Event::Key(
+                ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char(key)),
+            ));
+            let frame = simulator.capture_frame(120, 36);
+            assert!(frankentui_shell::buffer_to_string(frame).contains(title));
+            let app = simulator.model().app.borrow();
+            assert_eq!(app.frankentui.route, route);
+            assert!(app.map_area.is_none(), "old canvas must not remain clickable");
+            assert!(app.hit_regions.header_targets.is_empty());
+            assert_eq!(
+                app.snapshot.tick, initial_tick,
+                "navigation cannot advance science"
+            );
+        }
+        simulator.inject_event(ftui::core::event::Event::Key(
+            ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char('1')),
+        ));
+        simulator.capture_frame(120, 36);
+        let app = simulator.model().app.borrow();
+        let text =
+            export::buffer_to_plain_text(simulator.model().widgets.borrow().backend().buffer());
+        assert_eq!(app.frankentui.route, ShellRoute::Dashboard);
+        assert!(
+            app.map_area.is_some(),
+            "preserved world canvas must be live again"
+        );
+        assert!(!text.contains("SYSTEM DIAGNOSTICS"));
+    }
+
+    #[test]
+    fn live_model_only_publishes_acknowledged_frame_and_discards_failed_candidate() {
+        let host = TerminalTestHost::take(command_characterization_world());
+        let runtime = ControlRuntime::stub();
+        let renderer = TerminalRenderer::default();
+        let app = TerminalApp::new(&renderer, host.context(&runtime));
+        let mut simulator = ftui::runtime::ProgramSimulator::new(
+            LiveTerminalModel::new(app).expect("live terminal model"),
+        );
+        simulator.capture_frame(120, 36);
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .presented_frame
+                .load()
+                .is_none()
+        );
+        let (painted_tick, painted_buffer) = simulator
+            .model()
+            .awaiting_presentation
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("painted candidate");
+        // Metadata must describe the painted frame even if a later observation
+        // advances before the presentation acknowledgement is consumed.
+        simulator.model().app.borrow_mut().snapshot.tick = painted_tick + 1;
+        simulator.model().acknowledge_presentation();
+        let app = simulator.model().app.borrow();
+        let presented = app.presented_frame.load_full().expect("acknowledged frame");
+        assert_eq!(presented.tick, painted_tick);
+        assert_eq!(presented.buffer, painted_buffer);
+        drop(app);
+        simulator.capture_frame(80, 24);
+        simulator.report_error("injected terminal write failure");
+        assert!(simulator.model().awaiting_presentation.borrow().is_none());
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .presented_frame
+                .load()
+                .is_none()
+        );
+        assert!(simulator.model().failure.borrow().is_some());
+        assert!(simulator.is_shutdown());
+    }
+
+    #[test]
+    fn widget_bridge_preserves_unicode_styles_and_refuses_partial_wide_cells() {
+        let mut source = Buffer::empty(Rect::new(0, 0, 8, 1));
+        source.set_string(
+            0,
+            0,
+            "A界e\u{301}",
+            Style::default().fg(Color::Rgb(9, 20, 30)),
+        );
+        source[(0, 0)].set_style(Style::default().add_modifier(Modifier::BOLD));
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = ftui::render::frame::Frame::new(8, 1, &mut pool);
+        copy_widgets_to_ftui(&source, &mut frame);
+        assert_eq!(
+            frame.buffer.get(0, 0).expect("ASCII").content.as_char(),
+            Some('A')
+        );
+        let wide = frame.buffer.get(1, 0).expect("wide cell");
+        let wide_id = wide.content.grapheme_id().expect("pooled wide cell");
+        assert_eq!(frame.pool.get(wide_id), Some("界"));
+        assert!(frame.buffer.get(2, 0).expect("continuation").is_continuation());
+        assert!(
+            frame
+                .buffer
+                .get(0, 0)
+                .expect("styled cell")
+                .attrs
+                .flags()
+                .contains(ftui::render::cell::StyleFlags::BOLD)
+        );
+        let combining = frame.buffer.get(3, 0).expect("combining cell");
+        let combining_id = combining.content.grapheme_id().expect("combined grapheme");
+        assert_eq!(frame.pool.get(combining_id), Some("e\u{301}"));
+        let mut clipped = ftui::render::frame::Frame::new(2, 1, &mut pool);
+        copy_widgets_to_ftui(&source, &mut clipped);
+        assert_eq!(
+            clipped
+                .buffer
+                .get(1, 0)
+                .expect("clipped cell")
+                .content
+                .as_char(),
+            Some(' ')
+        );
+    }
+
+    #[test]
+    fn live_receipt_refresh_observes_owner_application_without_extra_science() {
+        let host = TerminalTestHost::take(command_characterization_world());
+        let runtime = ControlRuntime::stub();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        let initial_tick = app.snapshot.tick;
+        let id = app
+            .submit_with_visible_receipt(ControlCommand::SetSpeed(2.5))
+            .expect("real admission");
+        assert_eq!(
+            app.speed_multiplier, 1.0,
+            "admission cannot mutate renderer playback"
+        );
+        assert_eq!(
+            app.frankentui
+                .receipts
+                .back()
+                .expect("pending receipt")
+                .status,
+            frankentui_shell::ReceiptStatusKind::Pending
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.refresh_command_receipts();
+            if app.frankentui.receipts.iter().any(|receipt| {
+                receipt.command_id == id
+                    && matches!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied)
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "owner application was not observed");
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        app.maybe_step_simulation(Instant::now());
+        assert_eq!(app.speed_multiplier, 2.5);
+        assert_eq!(
+            app.snapshot.tick, initial_tick,
+            "receipt observation cannot step science"
+        );
+        assert!(matches!(
+            app.frankentui
+                .receipts
+                .back()
+                .expect("observed receipt")
+                .journal_state,
+            Some(JournalState::CommittedVolatile)
+        ));
     }
 
     #[derive(Debug)]

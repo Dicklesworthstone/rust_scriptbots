@@ -13,6 +13,7 @@
 //! and renders to deterministic testable frame buffers.
 
 use ftui::render::cell::Cell;
+use ftui::render::drawing::Draw;
 use ftui::render::frame::Frame;
 use serde::{Deserialize, Serialize};
 
@@ -128,13 +129,24 @@ pub struct LineageEventEntry {
     pub description: String,
 }
 
+/// Descendant counts and contribution observed in the canonical ancestry graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FounderLineageRow {
+    pub founder_uid: u64,
+    pub living_descendants: usize,
+    pub total_descendants: usize,
+    pub contribution_share: f32,
+}
+
 /// View data for the Lineages science screen.
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LineagesViewData {
-    pub total_founders: usize,
-    pub active_clades: usize,
-    pub extinct_clades: usize,
+    pub total_founders: Option<usize>,
+    pub active_clades: Option<usize>,
+    pub extinct_clades: Option<usize>,
     pub clades: Vec<CladeEntry>,
+    pub founder_rows: Vec<FounderLineageRow>,
+    pub observed_tick: Option<u64>,
     pub recent_events: Vec<LineageEventEntry>,
     pub selected_index: usize,
 }
@@ -148,8 +160,8 @@ pub struct LineagesViewData {
 pub struct BrainFamilyCohort {
     pub family: String,
     pub agent_count: usize,
-    pub mean_fitness: f32,
-    pub mean_eval_nanos: u64,
+    pub mean_fitness: Option<f32>,
+    pub mean_eval_nanos: Option<u64>,
 }
 
 /// Inspected brain layer and sensor attribution telemetry.
@@ -167,7 +179,7 @@ pub struct BrainInspectionSummary {
 pub struct BrainArenaViewData {
     pub family_breakdown: Vec<BrainFamilyCohort>,
     pub selected_brain: Option<BrainInspectionSummary>,
-    pub total_evaluations: u64,
+    pub total_evaluations: Option<u64>,
     pub selected_family_index: usize,
 }
 
@@ -181,10 +193,10 @@ pub struct ExperimentArmView {
     pub variant_id: String,
     pub brain_family: String,
     pub seed: u64,
-    pub current_tick: u64,
+    pub current_tick: Option<u64>,
     pub target_ticks: u64,
-    pub mean_fitness: f32,
-    pub uncertainty_ci_95: (f32, f32),
+    pub mean_fitness: Option<f32>,
+    pub uncertainty_ci_95: Option<(f32, f32)>,
     pub digest: String,
 }
 
@@ -229,8 +241,9 @@ impl Default for ExperimentsViewData {
 pub struct CheckpointViewEntry {
     pub checkpoint_id: String,
     pub tick: u64,
-    pub agent_count: usize,
-    pub digest: String,
+    pub agent_count: Option<usize>,
+    /// Scientific state digest, when recorded separately from the artifact checksum.
+    pub digest: Option<String>,
     pub file_size_bytes: u64,
 }
 
@@ -262,11 +275,12 @@ pub struct ReplayViewData {
 pub struct EnvironmentViewData {
     pub world_size: (u32, u32),
     pub terrain_distribution: Vec<(String, f32)>,
-    pub mean_fertility: f32,
-    pub mean_temperature: f32,
+    pub mean_fertility: Option<f32>,
+    pub mean_temperature: Option<f32>,
     pub total_food_energy: f32,
-    pub current_flow_rate: f32,
-    pub active_hazards: Vec<String>,
+    pub current_flow_rate: Option<f32>,
+    /// Reported timed intervention labels, rather than a census of environmental hazards.
+    pub reported_timed_interventions: Vec<String>,
     pub regrowth_rate: f32,
 }
 
@@ -275,11 +289,11 @@ impl Default for EnvironmentViewData {
         Self {
             world_size: (100, 100),
             terrain_distribution: Vec::new(),
-            mean_fertility: 0.0,
-            mean_temperature: 0.0,
+            mean_fertility: None,
+            mean_temperature: None,
             total_food_energy: 0.0,
-            current_flow_rate: 0.0,
-            active_hazards: Vec::new(),
+            current_flow_rate: None,
+            reported_timed_interventions: Vec::new(),
             regrowth_rate: 0.0,
         }
     }
@@ -293,28 +307,29 @@ impl Default for EnvironmentViewData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticsViewData {
     pub host_queue_depth: usize,
-    pub host_queue_capacity: usize,
-    pub storage_watermark_tick: u64,
-    pub storage_uncommitted_records: usize,
+    pub host_queue_capacity: Option<usize>,
+    /// Latest analytics snapshot committed tick; this is not the durable storage watermark.
+    pub analytics_committed_tick: Option<u64>,
+    pub storage_uncommitted_records: Option<usize>,
     pub snapshot_timings_ms: Vec<(String, f32)>,
-    pub sim_tick_hz: f32,
-    pub render_fps: f32,
+    pub sim_tick_hz: Option<f32>,
+    pub render_fps: Option<f32>,
     pub build_commit: String,
-    pub digest_neutrality_verified: bool,
+    pub digest_neutrality_verified: Option<bool>,
 }
 
 impl Default for DiagnosticsViewData {
     fn default() -> Self {
         Self {
             host_queue_depth: 0,
-            host_queue_capacity: 64,
-            storage_watermark_tick: 0,
-            storage_uncommitted_records: 0,
+            host_queue_capacity: None,
+            analytics_committed_tick: None,
+            storage_uncommitted_records: None,
             snapshot_timings_ms: Vec::new(),
-            sim_tick_hz: 0.0,
-            render_fps: 0.0,
+            sim_tick_hz: None,
+            render_fps: None,
             build_commit: "unknown".into(),
-            digest_neutrality_verified: true,
+            digest_neutrality_verified: None,
         }
     }
 }
@@ -393,22 +408,30 @@ impl ScienceScreensState {
 // Screen Renderers
 // ---------------------------------------------------------------------------
 
-fn print_text(frame: &mut Frame, x: u16, y: u16, text: &str) {
-    if y >= frame.height() {
+const SCIENCE_TABLE_ROWS: usize = 5;
+
+fn first_visible_table_index(selected_index: usize) -> usize {
+    selected_index.saturating_sub(SCIENCE_TABLE_ROWS - 1)
+}
+
+fn observation_text<T>(value: Option<T>, format_value: impl FnOnce(T) -> String) -> String {
+    value.map_or_else(|| "unavailable".into(), format_value)
+}
+
+fn print_text(frame: &mut Frame, x: u16, y: u32, text: &str) {
+    let Ok(y) = u16::try_from(y) else {
+        return;
+    };
+    let max_w = frame.width();
+    if y >= frame.height() || x >= max_w {
         return;
     }
-    let max_w = frame.width();
-    for (i, ch) in text.chars().enumerate() {
-        let col = x + i as u16;
-        if col < max_w {
-            frame.buffer.set_raw(col, y, Cell::from_char(ch));
-        }
-    }
+    frame.print_text_clipped(x, y, text, Cell::default(), max_w);
 }
 
 fn render_state_banner(
     frame: &mut Frame,
-    y: u16,
+    y: u32,
     empty_msg: Option<&str>,
     loading_op: Option<(u64, &str)>,
     err: Option<(u64, &str)>,
@@ -441,6 +464,7 @@ pub fn render_lineages_screen(
     state: &ScreenDataState<LineagesViewData>,
     y_start: u16,
 ) {
+    let y_start = u32::from(y_start);
     print_text(frame, 2, y_start, "LINEAGES & PHYLOGENY LAB");
     match state {
         ScreenDataState::Empty { message } => {
@@ -458,69 +482,114 @@ pub fn render_lineages_screen(
         ScreenDataState::Data(data) => {
             let summary = format!(
                 "  Total Founders: {:<5} Active Clades: {:<5} Extinct Clades: {:<5}",
-                data.total_founders, data.active_clades, data.extinct_clades
+                observation_text(data.total_founders, |value| value.to_string()),
+                observation_text(data.active_clades, |value| value.to_string()),
+                observation_text(data.extinct_clades, |value| value.to_string())
             );
             print_text(frame, 2, y_start + 2, &summary);
 
-            print_text(
-                frame,
-                2,
-                y_start + 4,
-                "  CLADE TABLE (Deterministic Phylogeny Sort):",
-            );
-            print_text(
-                frame,
-                4,
-                y_start + 5,
-                "  ID   Name             Founder  Pop    Peak   Origin  Diet   Fitness",
-            );
-            print_text(
-                frame,
-                4,
-                y_start + 6,
-                "  -------------------------------------------------------------------",
-            );
-
-            if data.clades.is_empty() {
-                print_text(frame, 6, y_start + 7, "(No clades segmented yet)");
-            } else {
-                for (idx, clade) in data.clades.iter().take(5).enumerate() {
-                    let row = y_start + 7 + idx as u16;
+            if !data.founder_rows.is_empty() {
+                let observed_tick = observation_text(data.observed_tick, |value| value.to_string());
+                print_text(frame, 2, y_start + 4, "  FOUNDER DESCENDANTS");
+                print_text(
+                    frame,
+                    4,
+                    y_start + 5,
+                    "  Founder UID      Living Descendants  Total Descendants  Contribution Share",
+                );
+                print_text(
+                    frame,
+                    4,
+                    y_start + 6,
+                    &format!("  canonical arrivals/deaths through tick {observed_tick}"),
+                );
+                let rows =
+                    (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+                let founders = data
+                    .founder_rows
+                    .iter()
+                    .enumerate()
+                    .skip(first_visible_table_index(data.selected_index));
+                for (row, (idx, founder)) in rows.zip(founders) {
                     let cursor = if idx == data.selected_index { ">" } else { " " };
-                    let diet_str = if clade.mean_diet < 0.35 {
-                        "Plant"
-                    } else if clade.mean_diet > 0.65 {
-                        "Pred "
-                    } else {
-                        "Omni "
-                    };
                     let line = format!(
-                        " {} {:<4} {:<16} {:<8} {:<6} {:<6} {:<7} {:<6} {:.2}",
+                        " {} {:<16} {:<19} {:<18} {:.3}",
                         cursor,
-                        clade.species_id,
-                        clade.name,
-                        clade.founder_id,
-                        clade.population,
-                        clade.peak_population,
-                        clade.origin_tick,
-                        diet_str,
-                        clade.fitness_score
+                        founder.founder_uid,
+                        founder.living_descendants,
+                        founder.total_descendants,
+                        founder.contribution_share
                     );
                     print_text(frame, 4, row, &line);
+                }
+            } else {
+                print_text(
+                    frame,
+                    2,
+                    y_start + 4,
+                    "  CLADE TABLE (Deterministic Phylogeny Sort):",
+                );
+                print_text(
+                    frame,
+                    4,
+                    y_start + 5,
+                    "  ID   Name             Founder  Pop    Peak   Origin  Diet   Fitness",
+                );
+                print_text(
+                    frame,
+                    4,
+                    y_start + 6,
+                    "  -------------------------------------------------------------------",
+                );
+
+                if data.clades.is_empty() {
+                    print_text(frame, 6, y_start + 7, "(No clades segmented yet)");
+                } else {
+                    let rows = (y_start.saturating_add(7)..u32::from(frame.height()))
+                        .take(SCIENCE_TABLE_ROWS);
+                    let clades = data
+                        .clades
+                        .iter()
+                        .enumerate()
+                        .skip(first_visible_table_index(data.selected_index));
+                    for (row, (idx, clade)) in rows.zip(clades) {
+                        let cursor = if idx == data.selected_index { ">" } else { " " };
+                        let diet_str = if clade.mean_diet < 0.35 {
+                            "Plant"
+                        } else if clade.mean_diet > 0.65 {
+                            "Pred "
+                        } else {
+                            "Omni "
+                        };
+                        let line = format!(
+                            " {} {:<4} {:<16} {:<8} {:<6} {:<6} {:<7} {:<6} {:.2}",
+                            cursor,
+                            clade.species_id,
+                            clade.name,
+                            clade.founder_id,
+                            clade.population,
+                            clade.peak_population,
+                            clade.origin_tick,
+                            diet_str,
+                            clade.fitness_score
+                        );
+                        print_text(frame, 4, row, &line);
+                    }
                 }
             }
 
             let events_y = y_start + 13;
             print_text(frame, 2, events_y, "  RECENT PHYLOGENY EVENTS:");
             if data.recent_events.is_empty() {
-                print_text(frame, 4, events_y + 1, "  (No speciation events recorded)");
+                print_text(frame, 4, events_y + 1, "  (No lineage events reported)");
             } else {
-                for (idx, ev) in data.recent_events.iter().take(3).enumerate() {
+                let rows = (events_y.saturating_add(1)..u32::from(frame.height())).take(3);
+                for (row, ev) in rows.zip(&data.recent_events) {
                     let line = format!(
                         "  Tick {:<6} [{:<10}] {}",
                         ev.tick, ev.event_kind, ev.description
                     );
-                    print_text(frame, 4, events_y + 1 + idx as u16, &line);
+                    print_text(frame, 4, row, &line);
                 }
             }
         }
@@ -533,6 +602,7 @@ pub fn render_brain_arena_screen(
     state: &ScreenDataState<BrainArenaViewData>,
     y_start: u16,
 ) {
+    let y_start = u32::from(y_start);
     print_text(frame, 2, y_start, "BRAIN ARENA & EVALUATOR COHORTS");
     match state {
         ScreenDataState::Empty { message } => {
@@ -550,7 +620,7 @@ pub fn render_brain_arena_screen(
         ScreenDataState::Data(data) => {
             let header = format!(
                 "  Total Brain Evaluations: {:<10} Cohort Families: {}",
-                data.total_evaluations,
+                observation_text(data.total_evaluations, |value| value.to_string()),
                 data.family_breakdown.len()
             );
             print_text(frame, 2, y_start + 2, &header);
@@ -572,20 +642,26 @@ pub fn render_brain_arena_screen(
             if data.family_breakdown.is_empty() {
                 print_text(frame, 6, y_start + 7, "(No family cohorts active)");
             } else {
-                for (idx, cohort) in data.family_breakdown.iter().enumerate() {
-                    let row = y_start + 7 + idx as u16;
+                let rows =
+                    (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+                let cohorts = data
+                    .family_breakdown
+                    .iter()
+                    .enumerate()
+                    .skip(first_visible_table_index(data.selected_family_index));
+                for (row, (idx, cohort)) in rows.zip(cohorts) {
                     let cursor = if idx == data.selected_family_index {
                         ">"
                     } else {
                         " "
                     };
                     let line = format!(
-                        " {} {:<14} {:<7} {:.3}         {} ns",
+                        " {} {:<14} {:<7} {:<12} {}",
                         cursor,
                         cohort.family,
                         cohort.agent_count,
-                        cohort.mean_fitness,
-                        cohort.mean_eval_nanos
+                        observation_text(cohort.mean_fitness, |value| format!("{value:.3}")),
+                        observation_text(cohort.mean_eval_nanos, |value| format!("{value} ns"))
                     );
                     print_text(frame, 4, row, &line);
                 }
@@ -646,6 +722,7 @@ pub fn render_experiments_screen(
     state: &ScreenDataState<ExperimentsViewData>,
     y_start: u16,
 ) {
+    let y_start = u32::from(y_start);
     print_text(
         frame,
         2,
@@ -689,24 +766,31 @@ pub fn render_experiments_screen(
             if data.active_arms.is_empty() {
                 print_text(frame, 6, y_start + 7, "(No experiment arms defined)");
             } else {
-                for (idx, arm) in data.active_arms.iter().enumerate() {
-                    let row = y_start + 7 + idx as u16;
+                let rows =
+                    (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+                let arms = data
+                    .active_arms
+                    .iter()
+                    .enumerate()
+                    .skip(first_visible_table_index(data.selected_arm_index));
+                for (row, (idx, arm)) in rows.zip(arms) {
                     let cursor = if idx == data.selected_arm_index {
                         ">"
                     } else {
                         " "
                     };
                     let line = format!(
-                        " {} {:<14} {:<10} {:<7} {:>5}/{:<5}   {:.2}     [{:.2}, {:.2}]",
+                        " {} {:<14} {:<10} {:<7} {:>5}/{:<5}   {:<11} {}",
                         cursor,
                         arm.variant_id,
                         arm.brain_family,
                         arm.seed,
-                        arm.current_tick,
+                        observation_text(arm.current_tick, |value| value.to_string()),
                         arm.target_ticks,
-                        arm.mean_fitness,
-                        arm.uncertainty_ci_95.0,
-                        arm.uncertainty_ci_95.1
+                        observation_text(arm.mean_fitness, |value| format!("{value:.2}")),
+                        observation_text(arm.uncertainty_ci_95, |(low, high)| {
+                            format!("[{low:.2}, {high:.2}]")
+                        })
                     );
                     print_text(frame, 4, row, &line);
                 }
@@ -747,6 +831,7 @@ pub fn render_replay_screen(
     state: &ScreenDataState<ReplayViewData>,
     y_start: u16,
 ) {
+    let y_start = u32::from(y_start);
     print_text(
         frame,
         2,
@@ -796,8 +881,14 @@ pub fn render_replay_screen(
                     "(No checkpoints recorded. Press [K] to create one)",
                 );
             } else {
-                for (idx, cp) in data.checkpoints.iter().enumerate() {
-                    let row = y_start + 7 + idx as u16;
+                let rows =
+                    (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+                let checkpoints = data
+                    .checkpoints
+                    .iter()
+                    .enumerate()
+                    .skip(first_visible_table_index(data.selected_checkpoint_index));
+                for (row, (idx, cp)) in rows.zip(checkpoints) {
                     let cursor = if idx == data.selected_checkpoint_index {
                         ">"
                     } else {
@@ -806,7 +897,12 @@ pub fn render_replay_screen(
                     let kb = cp.file_size_bytes / 1024;
                     let line = format!(
                         " {} {:<19} {:<7} {:<7} {:<8}  {:.12}",
-                        cursor, cp.checkpoint_id, cp.tick, cp.agent_count, kb, cp.digest
+                        cursor,
+                        cp.checkpoint_id,
+                        cp.tick,
+                        observation_text(cp.agent_count, |value| value.to_string()),
+                        kb,
+                        cp.digest.as_deref().unwrap_or("unavailable")
                     );
                     print_text(frame, 4, row, &line);
                 }
@@ -843,7 +939,7 @@ pub fn render_replay_screen(
                     frame,
                     4,
                     div_y + 1,
-                    "  ✓ Determinism verified: zero state divergences detected across replay stream",
+                    "  No replay comparison recorded; divergence status unavailable",
                 );
             }
 
@@ -860,6 +956,7 @@ pub fn render_environment_screen(
     state: &ScreenDataState<EnvironmentViewData>,
     y_start: u16,
 ) {
+    let y_start = u32::from(y_start);
     print_text(frame, 2, y_start, "ENVIRONMENT, HYDROLOGY & BIOME LAYERS");
     match state {
         ScreenDataState::Empty { message } => {
@@ -876,38 +973,43 @@ pub fn render_environment_screen(
         }
         ScreenDataState::Data(data) => {
             let dim = format!(
-                "  World Grid: {}x{} Torus  Food Energy Pool: {:.1}  Regrowth: {:.2}/tick",
+                "  World Grid: {}x{}  Food Energy Pool: {:.1}  Regrowth: {:.2}/tick",
                 data.world_size.0, data.world_size.1, data.total_food_energy, data.regrowth_rate
             );
             print_text(frame, 2, y_start + 2, &dim);
 
             print_text(frame, 2, y_start + 4, "  TERRAIN COMPOSITION:");
-            for (idx, (t_name, pct)) in data.terrain_distribution.iter().enumerate() {
+            let rows =
+                (y_start.saturating_add(5)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
+            for (row, (t_name, pct)) in rows.zip(&data.terrain_distribution) {
                 let bar_len = (*pct * 20.0).clamp(0.0, 20.0) as usize;
                 let bar = "#".repeat(bar_len);
                 let line = format!("    {:<12} [{:<20}] {:>5.1}%", t_name, bar, pct * 100.0);
-                print_text(frame, 2, y_start + 5 + idx as u16, &line);
+                print_text(frame, 2, row, &line);
             }
 
             let hydro_y = y_start + 10;
             print_text(frame, 2, hydro_y, "  HYDROLOGY & CLIMATE TELEMETRY:");
             let metrics = format!(
-                "    Mean Fertility: {:.2}  Temperature: {:.1}°C  Current Velocity: {:.2} m/s",
-                data.mean_fertility, data.mean_temperature, data.current_flow_rate
+                "    Mean Fertility: {}  Temperature: {}  Current Flow: {}",
+                observation_text(data.mean_fertility, |value| format!("{value:.2}")),
+                observation_text(data.mean_temperature, |value| format!("{value:.1}")),
+                observation_text(data.current_flow_rate, |value| format!("{value:.2}"))
             );
             print_text(frame, 2, hydro_y + 1, &metrics);
 
-            print_text(frame, 2, hydro_y + 3, "  ACTIVE ENVIRONMENTAL HAZARDS:");
-            if data.active_hazards.is_empty() {
+            print_text(frame, 2, hydro_y + 3, "  REPORTED TIMED INTERVENTIONS:");
+            if data.reported_timed_interventions.is_empty() {
                 print_text(
                     frame,
                     4,
                     hydro_y + 4,
-                    "  (No hazards active - benign climate)",
+                    "  (No timed interventions reported in current snapshot)",
                 );
             } else {
-                for (idx, hazard) in data.active_hazards.iter().enumerate() {
-                    print_text(frame, 4, hydro_y + 4 + idx as u16, &format!("  • {hazard}"));
+                let rows = hydro_y.saturating_add(4)..u32::from(frame.height());
+                for (row, intervention) in rows.zip(&data.reported_timed_interventions) {
+                    print_text(frame, 4, row, &format!("  • {intervention}"));
                 }
             }
         }
@@ -920,6 +1022,7 @@ pub fn render_diagnostics_screen(
     state: &ScreenDataState<DiagnosticsViewData>,
     y_start: u16,
 ) {
+    let y_start = u32::from(y_start);
     print_text(frame, 2, y_start, "SYSTEM DIAGNOSTICS & PIPELINE HEALTH");
     match state {
         ScreenDataState::Empty { message } => {
@@ -936,42 +1039,562 @@ pub fn render_diagnostics_screen(
         }
         ScreenDataState::Data(data) => {
             let perf = format!(
-                "  Simulation Rate: {:>5.1} TPS  Render Refresh: {:>5.1} FPS  Build: {}",
-                data.sim_tick_hz, data.render_fps, data.build_commit
+                "  Simulation Rate: {}  Render Refresh: {}  Build: {}",
+                observation_text(data.sim_tick_hz, |value| format!("{value:.1} TPS")),
+                observation_text(data.render_fps, |value| format!("{value:.1} FPS")),
+                data.build_commit
             );
             print_text(frame, 2, y_start + 2, &perf);
 
             print_text(frame, 2, y_start + 4, "  HOST & STORAGE PIPELINE HEALTH:");
-            let q_ratio = if data.host_queue_capacity > 0 {
-                (data.host_queue_depth as f32 / data.host_queue_capacity as f32) * 100.0
-            } else {
-                0.0
-            };
+            let q_ratio = data
+                .host_queue_capacity
+                .filter(|capacity| *capacity > 0)
+                .map(|capacity| (data.host_queue_depth as f32 / capacity as f32) * 100.0);
             let queue_str = format!(
-                "    Host Ingress Queue: {:>2}/{} ({:.0}% capacity)",
-                data.host_queue_depth, data.host_queue_capacity, q_ratio
+                "    Host Ingress Queue: {:>2}/{} ({} capacity)",
+                data.host_queue_depth,
+                observation_text(data.host_queue_capacity, |value| value.to_string()),
+                observation_text(q_ratio, |value| format!("{value:.0}%"))
             );
             print_text(frame, 2, y_start + 5, &queue_str);
 
             let storage_str = format!(
-                "    FrankenSQLite Journal: Watermark Tick {:<7} Uncommitted: {}",
-                data.storage_watermark_tick, data.storage_uncommitted_records
+                "    Analytics Snapshot: Committed Tick {:<7} Uncommitted: {}",
+                observation_text(data.analytics_committed_tick, |value| value.to_string()),
+                observation_text(data.storage_uncommitted_records, |value| value.to_string())
             );
             print_text(frame, 2, y_start + 6, &storage_str);
 
-            let neutrality_str = if data.digest_neutrality_verified {
-                "    Introspection Neutrality: ✓ CONFIRMED (Zero science digest corruption)"
-            } else {
-                "    Introspection Neutrality: ✗ FAILED (Introspection mutated simulation state!)"
+            let neutrality_str = match data.digest_neutrality_verified {
+                Some(true) => {
+                    "    Introspection Neutrality: ✓ CONFIRMED (Compared science digests match)"
+                }
+                Some(false) => {
+                    "    Introspection Neutrality: ✗ FAILED (Compared science digests differ)"
+                }
+                None => "    Introspection Neutrality: not measured",
             };
             print_text(frame, 2, y_start + 7, neutrality_str);
 
             let timing_y = y_start + 9;
             print_text(frame, 2, timing_y, "  SIMULATION STAGE LATENCIES (ms):");
-            for (idx, (stage, ms)) in data.snapshot_timings_ms.iter().enumerate() {
+            let rows = timing_y.saturating_add(1)..u32::from(frame.height());
+            for (row, (stage, ms)) in rows.zip(&data.snapshot_timings_ms) {
                 let line = format!("    {:<20} {:>6.2} ms", stage, ms);
-                print_text(frame, 2, timing_y + 1 + idx as u16, &line);
+                print_text(frame, 2, row, &line);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::frankentui_shell::{FrankenTuiSimulatorHarness, ShellMessage, ShellRoute};
+    use ftui::render::grapheme_pool::GraphemePool;
+
+    fn render(route: ShellRoute, message: ShellMessage) -> String {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.init();
+        harness.dispatch(message);
+        harness.dispatch(ShellMessage::Navigate(route));
+        harness.capture_frame_str(180, 40)
+    }
+
+    fn row<'a>(frame: &'a str, label: &str) -> &'a str {
+        frame
+            .lines()
+            .find(|line| line.contains(label))
+            .expect("expected rendered observation row")
+    }
+
+    #[test]
+    fn long_text_stops_at_the_frame_edge_without_wrapping_indices() {
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(8, 2, &mut pool);
+        for y in 0..frame.height() {
+            for x in 0..frame.width() {
+                frame.buffer.set_raw(x, y, Cell::from_char('-'));
+            }
+        }
+        let long_text = "x".repeat(usize::from(u16::MAX) + 2);
+        print_text(&mut frame, 2, 0, &long_text);
+        for x in 0..frame.width() {
+            let expected = if x < 2 { '-' } else { 'x' };
+            assert_eq!(
+                frame.buffer.get(x, 0).expect("row zero cell").content.as_char(),
+                Some(expected)
+            );
+            assert_eq!(
+                frame.buffer.get(x, 1).expect("row one cell").content.as_char(),
+                Some('-')
+            );
+        }
+        let before = frame.buffer.clone();
+        print_text(&mut frame, u16::MAX, 0, "out of bounds");
+        print_text(&mut frame, 0, u32::from(u16::MAX), "out of bounds");
+        print_text(&mut frame, 0, u32::MAX, "out of bounds");
+        assert!(frame.buffer.content_eq(&before));
+    }
+
+    #[test]
+    fn offscreen_science_sections_do_not_wrap_vertical_offsets() {
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(8, 2, &mut pool);
+        frame.buffer.set_raw(0, 0, Cell::from_char('S'));
+        let before = frame.buffer.clone();
+        render_lineages_screen(
+            &mut frame,
+            &ScreenDataState::Data(LineagesViewData::default()),
+            u16::MAX,
+        );
+        render_brain_arena_screen(
+            &mut frame,
+            &ScreenDataState::Data(BrainArenaViewData::default()),
+            u16::MAX,
+        );
+        render_experiments_screen(
+            &mut frame,
+            &ScreenDataState::Data(ExperimentsViewData::default()),
+            u16::MAX,
+        );
+        render_replay_screen(
+            &mut frame,
+            &ScreenDataState::Data(ReplayViewData::default()),
+            u16::MAX,
+        );
+        render_environment_screen(
+            &mut frame,
+            &ScreenDataState::Data(EnvironmentViewData::default()),
+            u16::MAX,
+        );
+        render_diagnostics_screen(
+            &mut frame,
+            &ScreenDataState::Data(DiagnosticsViewData::default()),
+            u16::MAX,
+        );
+        assert!(frame.buffer.content_eq(&before));
+    }
+
+    #[test]
+    fn text_keeps_combining_graphemes_and_clips_whole_wide_characters() {
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(7, 3, &mut pool);
+        print_text(&mut frame, 0, 0, "e\u{301}中Z");
+        let combining = frame
+            .buffer
+            .get(0, 0)
+            .expect("combining grapheme cell")
+            .content
+            .grapheme_id()
+            .expect("combining sequence stays in one grapheme");
+        assert_eq!(frame.pool.get(combining), Some("e\u{301}"));
+        let wide = frame
+            .buffer
+            .get(1, 0)
+            .expect("wide grapheme cell")
+            .content
+            .grapheme_id()
+            .expect("wide character keeps its display width");
+        assert_eq!(frame.pool.get(wide), Some("中"));
+        assert!(frame.buffer.get(2, 0).expect("wide tail").is_continuation());
+        assert_eq!(
+            frame.buffer.get(3, 0).expect("following character").content.as_char(),
+            Some('Z')
+        );
+
+        frame.buffer.set_raw(6, 1, Cell::from_char('-'));
+        print_text(&mut frame, 6, 1, "中Z");
+        assert_eq!(
+            frame.buffer.get(6, 1).expect("last column").content.as_char(),
+            Some('-'),
+            "a two-cell character cannot be clipped into a single cell"
+        );
+        print_text(&mut frame, 5, 2, "中Z");
+        let wide = frame
+            .buffer
+            .get(5, 2)
+            .expect("fitting wide character")
+            .content
+            .grapheme_id()
+            .expect("wide character remains whole");
+        assert_eq!(frame.pool.get(wide), Some("中"));
+        assert!(frame.buffer.get(6, 2).expect("last column tail").is_continuation());
+    }
+
+    #[test]
+    fn oversized_cohort_list_cannot_wrap_into_headers_or_inspection() {
+        let cohort = BrainFamilyCohort {
+            family: "regular-cohort".into(),
+            agent_count: 1,
+            mean_fitness: None,
+            mean_eval_nanos: None,
+        };
+        let mut cohorts = vec![cohort; usize::from(u16::MAX) + 2];
+        cohorts.last_mut().expect("last cohort").family = "late-wrapped-cohort".into();
+        let mut data = BrainArenaViewData {
+            family_breakdown: cohorts,
+            ..BrainArenaViewData::default()
+        };
+        let frame = render(
+            ShellRoute::BrainArena,
+            ShellMessage::SetBrainArenaData(ScreenDataState::Data(data.clone())),
+        );
+        assert!(frame.contains("BRAIN ARENA & EVALUATOR COHORTS"));
+        assert!(frame.contains("SELECTED BRAIN ACTIVATION & TOP-K ATTRIBUTIONS"));
+        assert!(frame.contains("regular-cohort"));
+        assert!(!frame.contains("late-wrapped-cohort"));
+
+        data.selected_family_index = data.family_breakdown.len() - 1;
+        let frame = render(
+            ShellRoute::BrainArena,
+            ShellMessage::SetBrainArenaData(ScreenDataState::Data(data)),
+        );
+        assert!(row(&frame, "late-wrapped-cohort").trim_start().starts_with('>'));
+        assert!(frame.contains("BRAIN ARENA & EVALUATOR COHORTS"));
+        assert!(frame.contains("SELECTED BRAIN ACTIVATION & TOP-K ATTRIBUTIONS"));
+    }
+
+    #[test]
+    fn lineage_founder_observations_do_not_invent_species_or_clade_counts() {
+        let data = LineagesViewData {
+            total_founders: Some(1),
+            founder_rows: vec![FounderLineageRow {
+                founder_uid: 42,
+                living_descendants: 2,
+                total_descendants: 3,
+                contribution_share: 0.375,
+            }],
+            observed_tick: Some(12),
+            ..LineagesViewData::default()
+        };
+        let frame = render(
+            ShellRoute::Lineages,
+            ShellMessage::SetLineagesData(ScreenDataState::Data(data.clone())),
+        );
+        assert!(frame.contains("Total Founders: 1"));
+        assert_eq!(row(&frame, "Active Clades").matches("unavailable").count(), 2);
+        assert!(frame.contains("canonical arrivals/deaths through tick 12"));
+        assert!(frame.contains("Founder UID"));
+        assert_eq!(
+            row(&frame, "42").split_whitespace().collect::<Vec<_>>(),
+            [">", "42", "2", "3", "0.375"]
+        );
+        assert!(!frame.contains("CLADE TABLE"));
+        assert!(!frame.contains("Diet"));
+
+        let encoded = serde_json::to_value(&data).expect("serialize founder observations");
+        assert_eq!(encoded["total_founders"], 1);
+        assert!(encoded["active_clades"].is_null());
+        assert!(encoded["extinct_clades"].is_null());
+        assert_eq!(encoded["founder_rows"][0]["founder_uid"], 42);
+        assert_eq!(encoded["observed_tick"], 12);
+        assert_eq!(
+            serde_json::from_value::<LineagesViewData>(encoded)
+                .expect("deserialize founder observations"),
+            data
+        );
+
+        let unbounded = LineagesViewData {
+            observed_tick: None,
+            ..data
+        };
+        let frame = render(
+            ShellRoute::Lineages,
+            ShellMessage::SetLineagesData(ScreenDataState::Data(unbounded)),
+        );
+        assert!(frame.contains("canonical arrivals/deaths through tick unavailable"));
+        assert!(!frame.contains("through tick 0)"));
+    }
+
+    #[test]
+    fn brain_arena_distinguishes_measured_zero_from_missing_observations() {
+        let data = BrainArenaViewData {
+            family_breakdown: vec![
+                BrainFamilyCohort {
+                    family: "measured".into(),
+                    agent_count: 0,
+                    mean_fitness: Some(0.0),
+                    mean_eval_nanos: Some(0),
+                },
+                BrainFamilyCohort {
+                    family: "missing".into(),
+                    agent_count: 7,
+                    mean_fitness: None,
+                    mean_eval_nanos: None,
+                },
+            ],
+            total_evaluations: Some(0),
+            ..BrainArenaViewData::default()
+        };
+        let frame = render(
+            ShellRoute::BrainArena,
+            ShellMessage::SetBrainArenaData(ScreenDataState::Data(data.clone())),
+        );
+        assert!(row(&frame, "measured").contains("0.000"));
+        assert!(row(&frame, "measured").contains("0 ns"));
+        assert!(!row(&frame, "measured").contains("unavailable"));
+        assert_eq!(row(&frame, "missing").matches("unavailable").count(), 2);
+        assert!(!row(&frame, "missing").contains("0 ns"));
+        assert!(row(&frame, "Total Brain Evaluations").contains("0"));
+
+        let encoded = serde_json::to_value(&data).expect("serialize brain measurements");
+        assert_eq!(encoded["family_breakdown"][0]["mean_fitness"], 0.0);
+        assert_eq!(encoded["family_breakdown"][0]["mean_eval_nanos"], 0);
+        assert!(encoded["family_breakdown"][1]["mean_fitness"].is_null());
+        assert!(encoded["family_breakdown"][1]["mean_eval_nanos"].is_null());
+        assert_eq!(
+            serde_json::from_value::<BrainArenaViewData>(encoded)
+                .expect("deserialize brain measurements"),
+            data
+        );
+
+        let frame = render(
+            ShellRoute::BrainArena,
+            ShellMessage::SetBrainArenaData(ScreenDataState::Data(BrainArenaViewData::default())),
+        );
+        assert!(row(&frame, "Total Brain Evaluations").contains("unavailable"));
+    }
+
+    #[test]
+    fn experiment_progress_fitness_and_interval_require_observations() {
+        let data = ExperimentsViewData {
+            active_arms: vec![
+                ExperimentArmView {
+                    variant_id: "measured-arm".into(),
+                    brain_family: "MLP".into(),
+                    seed: 7,
+                    current_tick: Some(0),
+                    target_ticks: 100,
+                    mean_fitness: Some(0.0),
+                    uncertainty_ci_95: Some((0.0, 0.0)),
+                    digest: String::new(),
+                },
+                ExperimentArmView {
+                    variant_id: "missing-arm".into(),
+                    brain_family: "DWRAON".into(),
+                    seed: 7,
+                    current_tick: None,
+                    target_ticks: 100,
+                    mean_fitness: None,
+                    uncertainty_ci_95: None,
+                    digest: String::new(),
+                },
+            ],
+            ..ExperimentsViewData::default()
+        };
+        let frame = render(
+            ShellRoute::Experiments,
+            ShellMessage::SetExperimentsData(ScreenDataState::Data(data.clone())),
+        );
+        assert!(row(&frame, "measured-arm").contains("0/100"));
+        assert!(row(&frame, "measured-arm").contains("[0.00, 0.00]"));
+        assert!(!row(&frame, "measured-arm").contains("unavailable"));
+        assert_eq!(row(&frame, "missing-arm").matches("unavailable").count(), 3);
+        assert!(!row(&frame, "missing-arm").contains("0/100"));
+        assert!(!row(&frame, "missing-arm").contains("[0.00, 0.00]"));
+
+        let encoded = serde_json::to_value(&data).expect("serialize experiment measurements");
+        assert_eq!(encoded["active_arms"][0]["current_tick"], 0);
+        assert!(encoded["active_arms"][1]["current_tick"].is_null());
+        assert_eq!(encoded["active_arms"][0]["mean_fitness"], 0.0);
+        assert!(encoded["active_arms"][1]["mean_fitness"].is_null());
+        assert_eq!(encoded["active_arms"][0]["uncertainty_ci_95"][0], 0.0);
+        assert!(encoded["active_arms"][1]["uncertainty_ci_95"].is_null());
+        assert_eq!(
+            serde_json::from_value::<ExperimentsViewData>(encoded)
+                .expect("deserialize experiment measurements"),
+            data
+        );
+    }
+
+    #[test]
+    fn checkpoint_catalog_does_not_invent_population_digest_or_replay_verification() {
+        let data = ReplayViewData {
+            checkpoints: vec![
+                CheckpointViewEntry {
+                    checkpoint_id: "measured-cp".into(),
+                    tick: 0,
+                    agent_count: Some(0),
+                    digest: Some("science12345678".into()),
+                    file_size_bytes: 1024,
+                },
+                CheckpointViewEntry {
+                    checkpoint_id: "missing-cp".into(),
+                    tick: 10,
+                    agent_count: None,
+                    digest: None,
+                    file_size_bytes: 2048,
+                },
+            ],
+            ..ReplayViewData::default()
+        };
+        let frame = render(
+            ShellRoute::Replay,
+            ShellMessage::SetReplayData(ScreenDataState::Data(data.clone())),
+        );
+        assert!(row(&frame, "measured-cp").contains("science12345"));
+        assert!(!row(&frame, "measured-cp").contains("unavailable"));
+        assert_eq!(row(&frame, "missing-cp").matches("unavailable").count(), 2);
+        assert!(frame.contains("No replay comparison recorded; divergence status unavailable"));
+        assert!(!frame.contains("Determinism verified"));
+
+        let encoded = serde_json::to_value(&data).expect("serialize checkpoint observations");
+        assert_eq!(encoded["checkpoints"][0]["agent_count"], 0);
+        assert!(encoded["checkpoints"][1]["agent_count"].is_null());
+        assert_eq!(encoded["checkpoints"][0]["digest"], "science12345678");
+        assert!(encoded["checkpoints"][1]["digest"].is_null());
+        assert_eq!(
+            serde_json::from_value::<ReplayViewData>(encoded)
+                .expect("deserialize checkpoint observations"),
+            data
+        );
+
+        let divergence = ReplayViewData {
+            first_divergence: Some(ReplayDivergenceInfo {
+                divergence_tick: 12,
+                expected_digest: "expected-science".into(),
+                observed_digest: "observed-science".into(),
+                falsified_subsystem: "genome".into(),
+            }),
+            ..ReplayViewData::default()
+        };
+        let frame = render(
+            ShellRoute::Replay,
+            ShellMessage::SetReplayData(ScreenDataState::Data(divergence)),
+        );
+        assert!(frame.contains("DIVERGENCE DETECTED at Tick 12"));
+        assert!(frame.contains("expected-science"));
+        assert!(frame.contains("observed-science"));
+        assert!(!frame.contains("No replay comparison recorded"));
+    }
+
+    #[test]
+    fn environment_missing_telemetry_does_not_establish_climate_units_or_wrap_policy() {
+        let missing = EnvironmentViewData::default();
+        let frame = render(
+            ShellRoute::Environment,
+            ShellMessage::SetEnvironmentData(ScreenDataState::Data(missing.clone())),
+        );
+        assert_eq!(row(&frame, "Mean Fertility").matches("unavailable").count(), 3);
+        assert!(frame.contains("No timed interventions reported in current snapshot"));
+        for unsupported in ["Torus", "benign climate", "°C", "m/s"] {
+            assert!(!frame.contains(unsupported));
+        }
+        let measured = EnvironmentViewData {
+            mean_fertility: Some(0.0),
+            mean_temperature: Some(0.0),
+            current_flow_rate: Some(0.0),
+            ..missing.clone()
+        };
+        let frame = render(
+            ShellRoute::Environment,
+            ShellMessage::SetEnvironmentData(ScreenDataState::Data(measured.clone())),
+        );
+        assert!(frame.contains("Mean Fertility: 0.00"));
+        assert!(frame.contains("Temperature: 0.0"));
+        assert!(frame.contains("Current Flow: 0.00"));
+        assert!(!row(&frame, "Mean Fertility").contains("unavailable"));
+
+        let absent =
+            serde_json::to_value(&missing).expect("serialize absent environment telemetry");
+        let observed = serde_json::to_value(&measured).expect("serialize environment measurements");
+        for field in ["mean_fertility", "mean_temperature", "current_flow_rate"] {
+            assert!(absent[field].is_null());
+            assert_eq!(observed[field], 0.0);
+        }
+        assert_eq!(
+            serde_json::from_value::<EnvironmentViewData>(observed)
+                .expect("deserialize environment measurements"),
+            measured
+        );
+    }
+
+    #[test]
+    fn diagnostics_missing_measurements_remain_unavailable_and_neutrality_unmeasured() {
+        let missing = DiagnosticsViewData::default();
+        let frame = render(
+            ShellRoute::Diagnostics,
+            ShellMessage::SetDiagnosticsData(ScreenDataState::Data(missing.clone())),
+        );
+        assert_eq!(row(&frame, "Simulation Rate").matches("unavailable").count(), 2);
+        assert_eq!(
+            row(&frame, "Host Ingress Queue")
+                .matches("unavailable")
+                .count(),
+            2
+        );
+        assert_eq!(
+            row(&frame, "Analytics Snapshot")
+                .matches("unavailable")
+                .count(),
+            2
+        );
+        assert!(frame.contains("Introspection Neutrality: not measured"));
+        for fabricated in ["0.0 TPS", "0.0 FPS", "CONFIRMED", "FAILED"] {
+            assert!(!frame.contains(fabricated));
+        }
+
+        let measured = DiagnosticsViewData {
+            host_queue_capacity: Some(64),
+            analytics_committed_tick: Some(0),
+            storage_uncommitted_records: Some(0),
+            sim_tick_hz: Some(0.0),
+            render_fps: Some(0.0),
+            digest_neutrality_verified: Some(true),
+            ..missing.clone()
+        };
+        let frame = render(
+            ShellRoute::Diagnostics,
+            ShellMessage::SetDiagnosticsData(ScreenDataState::Data(measured.clone())),
+        );
+        assert!(frame.contains("Simulation Rate: 0.0 TPS"));
+        assert!(frame.contains("Render Refresh: 0.0 FPS"));
+        assert!(frame.contains("Uncommitted: 0"));
+        assert!(frame.contains("0% capacity"));
+        assert!(frame.contains("Introspection Neutrality: ✓ CONFIRMED"));
+        assert!(!frame.contains("unavailable"));
+
+        let absent = serde_json::to_value(&missing).expect("serialize absent diagnostics");
+        let observed = serde_json::to_value(&measured).expect("serialize measured diagnostics");
+        for field in [
+            "host_queue_capacity",
+            "analytics_committed_tick",
+            "storage_uncommitted_records",
+            "sim_tick_hz",
+            "render_fps",
+            "digest_neutrality_verified",
+        ] {
+            assert!(absent[field].is_null());
+        }
+        assert_eq!(observed["analytics_committed_tick"], 0);
+        assert_eq!(observed["storage_uncommitted_records"], 0);
+        assert_eq!(observed["sim_tick_hz"], 0.0);
+        assert_eq!(observed["render_fps"], 0.0);
+        assert_eq!(observed["digest_neutrality_verified"], true);
+        assert_eq!(
+            serde_json::from_value::<DiagnosticsViewData>(observed)
+                .expect("deserialize measured diagnostics"),
+            measured
+        );
+    }
+
+    #[test]
+    fn diagnostics_zero_capacity_and_failed_comparison_do_not_report_success() {
+        let data = DiagnosticsViewData {
+            host_queue_capacity: Some(0),
+            digest_neutrality_verified: Some(false),
+            ..DiagnosticsViewData::default()
+        };
+        let frame = render(
+            ShellRoute::Diagnostics,
+            ShellMessage::SetDiagnosticsData(ScreenDataState::Data(data)),
+        );
+        assert!(row(&frame, "Host Ingress Queue").contains("0/0 (unavailable capacity)"));
+        assert!(!row(&frame, "Host Ingress Queue").contains("0%"));
+        assert!(frame.contains("Introspection Neutrality: ✗ FAILED"));
+        assert!(!frame.contains("CONFIRMED"));
+        assert!(!frame.contains("Introspection mutated simulation state"));
     }
 }

@@ -13,6 +13,7 @@ verify_evidence() {
     local required=(formatting fsqlite-pin franken-licenses asupersync-universe wasm-graph)
     case "$lane" in
         workspace) required+=(workspace-check workspace-clippy workspace-tests core-economy-faults) ;;
+        terminal) required+=(workspace-check workspace-clippy terminal-unit-tests terminal-end-to-end-tests terminal-smoke-tests) ;;
         connectivity) required+=(workspace-check workspace-clippy storage-checkpoint-tests checkpoint-unit-tests sensing-manifest-tests manifest-storage-tests bundle-tests control-unit-tests control-process-tests replay-process-tests) ;;
         tournament-smoke|tournament-full) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli) ;;
         tournament-smoke-and-analytics) required+=(workspace-check workspace-clippy assembly-tests tournament-tests tournament-cli analytics-pipeline) ;;
@@ -158,7 +159,7 @@ fi
 proof_version=${1:-}
 [[ "$proof_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || refuse "missing or unsafe proof version"
 [[ ${SCRIPTBOTS_EXPECTED_COMMIT:-} =~ ^[0-9a-f]{40}$ ]] || refuse "missing pinned source commit"
-[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == connectivity || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-full || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke-and-analytics || ${SCRIPTBOTS_VERIFY_LANE:-} == analytics || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
+[[ ${SCRIPTBOTS_VERIFY_LANE:-} == workspace || ${SCRIPTBOTS_VERIFY_LANE:-} == terminal || ${SCRIPTBOTS_VERIFY_LANE:-} == connectivity || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-full || ${SCRIPTBOTS_VERIFY_LANE:-} == tournament-smoke-and-analytics || ${SCRIPTBOTS_VERIFY_LANE:-} == analytics || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs || ${SCRIPTBOTS_VERIFY_LANE:-} == recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == graphs-and-recipes || ${SCRIPTBOTS_VERIFY_LANE:-} == archipelago || ${SCRIPTBOTS_VERIFY_LANE:-} == server ]] || refuse "unknown correctness lane"
 [[ ${RCH_DISABLED:-} == 1 && ${RCH_CARGO_WRAPPER_BYPASS:-} == 1 ]] || refuse "invoke through the native DSR profile"
 [[ ${SCRIPTBOTS_VERIFY_PROFILE:-} = /* && -f "$SCRIPTBOTS_VERIFY_PROFILE" ]] || refuse "missing materialized DSR profile"
 [[ ${SCRIPTBOTS_PROOF_ROOT:-} = /* && -d "$SCRIPTBOTS_PROOF_ROOT" ]] || refuse "missing external proof root"
@@ -279,6 +280,13 @@ case "$SCRIPTBOTS_VERIFY_LANE" in
         run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
         run_step workspace-tests test cargo test --locked --workspace -- --nocapture
         run_step core-economy-faults test cargo test --locked -p scriptbots-core --features economy-faults -- --nocapture
+        ;;
+    terminal)
+        run_step workspace-check check cargo check --locked --workspace --all-targets
+        run_step workspace-clippy check cargo clippy --locked --workspace --all-targets -- -D warnings
+        run_step terminal-unit-tests test cargo test --locked -p scriptbots-app --lib terminal:: -- --nocapture
+        run_step terminal-end-to-end-tests test cargo test --locked -p scriptbots-app --test terminal_end_to_end -- --nocapture
+        run_step terminal-smoke-tests test cargo test --locked -p scriptbots-app --test terminal_smoke -- --nocapture
         ;;
     connectivity)
         # Fold into bd-2z0.19's composed acceptance when bounded retention is delivered.

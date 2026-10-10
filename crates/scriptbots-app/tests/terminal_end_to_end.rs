@@ -23,6 +23,147 @@ use tempfile::tempdir;
 
 static ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Exercise the shipped interactive entry point with a controlling terminal.
+/// Keep raw output and termios observations under the DSR proof's scratch root.
+#[cfg(target_os = "linux")]
+#[test]
+fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
+    let output = std::process::Command::new("python3")
+        .args(["-c", LIVE_TERMINAL_PTY_PROBE])
+        .arg(env!("CARGO_BIN_EXE_scriptbots-app"))
+        .arg(option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable"))
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("{stdout}");
+    assert!(
+        output.status.success(),
+        "actual PTY probe failed: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    let observations: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(observations.len(), 2, "both capability profiles must execute");
+    for observation in observations {
+        assert_eq!(observation["schema"], "scriptbots.live-tui-pty.v1");
+        assert_eq!(observation["exit_code"], 0);
+        assert_eq!(observation["raw_mode_observed"], true);
+        assert_eq!(observation["terminal_attributes_restored"], true);
+        assert_eq!(observation["alternate_screen_restored"], true);
+        assert_eq!(observation["frankentui_shutdown_observed"], true);
+        assert_eq!(observation["observed_science_routes"].as_array().map(Vec::len), Some(6));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const LIVE_TERMINAL_PTY_PROBE: &str = r#"
+import fcntl, hashlib, json, os, pathlib, pty, re, select, signal
+import struct, subprocess, sys, tempfile, termios, time
+
+binary, source = sys.argv[1:]
+routes = [
+    ('4', 'LINEAGES & PHYLOGENY LAB'),
+    ('5', 'BRAIN ARENA & EVALUATOR COHORTS'),
+    ('6', 'MATCHED-SEED EXPERIMENTS & INTERVENTIONS'),
+    ('7', 'DETERMINISTIC REPLAY & FIRST-DIVERGENCE TRACKER'),
+    ('8', 'ENVIRONMENT, HYDROLOGY & BIOME LAYERS'),
+    ('9', 'SYSTEM DIAGNOSTICS & PIPELINE HEALTH'),
+]
+escape = re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)')
+for profile in ('truecolor', 'no-color'):
+    directory = pathlib.Path(tempfile.mkdtemp(prefix='live-tui-' + profile + '-'))
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
+    initial = termios.tcgetattr(slave)
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('SCRIPTBOTS_', 'SB_'))}
+    environment.update(SCRIPTBOTS_MODE='terminal', SCRIPTBOTS_TERMINAL_HEADLESS='0',
+                       SCRIPTBOTS_CONTROL_REST_ENABLED='0', SCRIPTBOTS_CONTROL_MCP='disabled',
+                       RUST_LOG='scriptbots::terminal=info', TERM='xterm-256color')
+    if profile == 'no-color':
+        environment['NO_COLOR'] = '1'
+        environment.pop('COLORTERM', None)
+    else:
+        environment.pop('NO_COLOR', None)
+        environment['COLORTERM'] = 'truecolor'
+    def controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    raw = bytearray()
+    observed = []
+    with open(directory / 'stderr.log', 'xb') as log:
+        process = subprocess.Popen(
+            [binary, '--storage', 'memory', '--bootstrap-ticks', '0', '--threads', '1',
+             '--set', 'world_width=100', '--set', 'world_height=100',
+             '--set', 'food_cell_size=50', '--set', 'population_minimum=0',
+             '--set', 'persistence_interval=0', '--checkpoint-interval', '0'],
+            stdin=slave, stdout=slave, stderr=log, cwd=directory, env=environment,
+            preexec_fn=controlling_terminal)
+        def pump_until(predicate, description):
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if predicate():
+                    return
+                if process.poll() is not None:
+                    raise AssertionError('terminal exited during ' + description)
+                if select.select([master], [], [], 0.05)[0]:
+                    raw.extend(os.read(master, 65536))
+                if len(raw) > 2_000_000:
+                    raise AssertionError('bounded PTY transcript exceeded')
+            raise AssertionError('timeout during ' + description)
+        try:
+            pump_until(lambda: b'\x1b[?1049h' in raw, 'alternate-screen startup')
+            pump_until(lambda: not (termios.tcgetattr(slave)[3] & termios.ICANON), 'raw-mode startup')
+            raw_mode = not (termios.tcgetattr(slave)[3] & termios.ICANON)
+            for key, title in routes:
+                start = len(raw)
+                os.write(master, key.encode())
+                pump_until(lambda: title.encode() in escape.sub(b'', bytes(raw[start:])), title)
+                observed.append(title)
+            os.write(master, b'q')
+            deadline = time.monotonic() + 30
+            while process.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    raw.extend(os.read(master, 65536))
+            if process.poll() is None:
+                raise AssertionError('terminal quit did not finish ordered shutdown')
+            while select.select([master], [], [], 0)[0]:
+                raw.extend(os.read(master, 65536))
+            restored = termios.tcgetattr(slave) == initial
+            alternate_restored = b'\x1b[?1049l' in raw
+            assert process.returncode == 0, process.returncode
+            assert restored, 'termios attributes were not restored'
+            assert alternate_restored, 'alternate screen was not restored'
+        finally:
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            with open(directory / 'terminal.raw', 'xb') as transcript:
+                transcript.write(raw)
+            with open(directory / 'terminal-attributes.json', 'x') as attributes:
+                json.dump({'initial': repr(initial), 'final': repr(termios.tcgetattr(slave))}, attributes)
+            os.close(master)
+            os.close(slave)
+    lifecycle = (directory / 'stderr.log').read_text(errors='replace')
+    finalized = 'terminal lifecycle finalized' in lifecycle and 'frankentui' in lifecycle
+    assert finalized, 'real FrankenTUI shutdown callback was not observed'
+    print(json.dumps({'schema': 'scriptbots.live-tui-pty.v1', 'source_commit': source,
+                      'capability_profile': profile, 'observed_science_routes': observed,
+                      'exit_code': process.returncode, 'raw_mode_observed': raw_mode,
+                      'terminal_attributes_restored': restored,
+                      'alternate_screen_restored': alternate_restored,
+                      'frankentui_shutdown_observed': finalized,
+                      'transcript_sha256': hashlib.sha256(raw).hexdigest(),
+                      'artifact_directory': str(directory)}), flush=True)
+"#;
+
 const HOST_SESSION: HostSessionId = HostSessionId::new(0x7e2e);
 
 fn terminal_host(
