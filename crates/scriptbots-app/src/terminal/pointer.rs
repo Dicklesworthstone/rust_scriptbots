@@ -9,6 +9,7 @@
 //! - Clamped splitter resizing between map canvas and sidebar columns.
 //! - Status toggle targets in header for pause, speed, theme, and palette.
 
+use super::command_palette::CommandPaletteAction;
 use crossterm::event::MouseButton;
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,8 @@ pub struct HitRegionMap {
     pub probe_rect: Option<Rect>,
     pub sidebar_panels: Vec<(SidebarPanelKind, Rect)>,
     pub palette_rect: Option<Rect>,
+    /// Filtered indices and actions of the rows actually drawn in the viewport.
+    pub palette_items: Vec<(usize, CommandPaletteAction)>,
     pub help_rect: Option<Rect>,
 }
 
@@ -811,6 +814,7 @@ mod tests {
                 assert!((fx - 0.5083).abs() < 0.01);
                 assert!((fy - 0.525).abs() < 0.01);
             }
+            // ubs:ignore[rust.ownership.panic-macro] — test must reject a wrong semantic hit region.
             other => panic!("expected HitRegion::Map, got {other:?}"),
         }
 

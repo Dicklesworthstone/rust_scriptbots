@@ -2010,13 +2010,13 @@ mod tests {
                 founder_rows: vec![
                     FounderLineageRow {
                         founder_uid: 1,
-                        living_descendants: 3,
+                        descendants_without_recorded_death: 3,
                         total_descendants: 4,
                         contribution_share: 0.6,
                     },
                     FounderLineageRow {
                         founder_uid: 2,
-                        living_descendants: 2,
+                        descendants_without_recorded_death: 2,
                         total_descendants: 2,
                         contribution_share: 0.4,
                     },

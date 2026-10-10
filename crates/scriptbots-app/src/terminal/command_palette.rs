@@ -169,10 +169,9 @@ pub type CommandPaletteEntry = CommandPaletteItem;
 ///
 /// Drives palette search, help overlay, keyboard shortcuts, and mouse selection.
 ///
-/// A `keybind_hint` names the key the live terminal HUD actually binds to the same action, or
-/// is empty for a palette-only action. Hints here once advertised the FrankenTUI shell's keys
-/// (`1 / D`, `4 / L`, ...), which in the HUD do something else or nothing; the shell's screen
-/// routes are not rendered in the live terminal (bd-2z0.6.8), so they are not listed.
+/// A `keybind_hint` names the key the live terminal binds to the same action, or
+/// is empty for a palette-only action. The live model consumes the numeric
+/// navigation bindings before dispatching the existing widget-specific keys.
 #[must_use]
 pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
     vec![
@@ -262,6 +261,70 @@ pub fn all_command_palette_items() -> Vec<CommandPaletteItem> {
             keybind_hint: "Shift+S",
             category: "Export",
             action: CommandPaletteAction::ExportAsciiScreenshot,
+        },
+        // Routes rendered by the actual live FrankenTUI model.
+        CommandPaletteItem {
+            id: "navigation.dashboard",
+            label: "Open Dashboard",
+            keybind_hint: "1",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateDashboard,
+        },
+        CommandPaletteItem {
+            id: "navigation.world",
+            label: "Open World Canvas",
+            keybind_hint: "2",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateWorld,
+        },
+        CommandPaletteItem {
+            id: "navigation.inspector",
+            label: "Open Agent Inspector",
+            keybind_hint: "3",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateInspector,
+        },
+        CommandPaletteItem {
+            id: "navigation.lineages",
+            label: "Open Lineages and Phylogeny",
+            keybind_hint: "4",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateLineages,
+        },
+        CommandPaletteItem {
+            id: "navigation.brain_arena",
+            label: "Open Brain Arena",
+            keybind_hint: "5",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateBrainArena,
+        },
+        CommandPaletteItem {
+            id: "navigation.experiments",
+            label: "Open Experiments",
+            keybind_hint: "6",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateExperiments,
+        },
+        CommandPaletteItem {
+            id: "navigation.replay",
+            label: "Open Replay and Checkpoints",
+            keybind_hint: "7",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateReplay,
+        },
+        CommandPaletteItem {
+            id: "navigation.environment",
+            label: "Open Environment and Biomes",
+            keybind_hint: "8",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateEnvironment,
+        },
+        CommandPaletteItem {
+            id: "navigation.diagnostics",
+            label: "Open Diagnostics",
+            keybind_hint: "9",
+            category: "Navigation",
+            action: CommandPaletteAction::NavigateDiagnostics,
         },
         CommandPaletteItem {
             id: "nav.toggle_archipelago",

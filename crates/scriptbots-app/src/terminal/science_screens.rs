@@ -133,7 +133,9 @@ pub struct LineageEventEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FounderLineageRow {
     pub founder_uid: u64,
-    pub living_descendants: usize,
+    /// Descendants with no death in the retained birth/death stream. Migration
+    /// is not observed by this graph, so this is not a local population census.
+    pub descendants_without_recorded_death: usize,
     pub total_descendants: usize,
     pub contribution_share: f32,
 }
@@ -491,18 +493,25 @@ pub fn render_lineages_screen(
 
             if !data.founder_rows.is_empty() {
                 let observed_tick = observation_text(data.observed_tick, |value| value.to_string());
-                print_text(frame, 2, y_start + 4, "  FOUNDER DESCENDANTS");
+                print_text(
+                    frame,
+                    2,
+                    y_start + 4,
+                    "  FOUNDER DESCENDANTS (recorded births/deaths)",
+                );
                 print_text(
                     frame,
                     4,
                     y_start + 5,
-                    "  Founder UID      Living Descendants  Total Descendants  Contribution Share",
+                    "  Founder UID      No Recorded Death   Total Descendants  Contribution Share",
                 );
                 print_text(
                     frame,
                     4,
                     y_start + 6,
-                    &format!("  canonical arrivals/deaths through tick {observed_tick}"),
+                    &format!(
+                        "  canonical arrivals/deaths through tick {observed_tick}; migration unobserved"
+                    ),
                 );
                 let rows =
                     (y_start.saturating_add(7)..u32::from(frame.height())).take(SCIENCE_TABLE_ROWS);
@@ -517,7 +526,7 @@ pub fn render_lineages_screen(
                         " {} {:<16} {:<19} {:<18} {:.3}",
                         cursor,
                         founder.founder_uid,
-                        founder.living_descendants,
+                        founder.descendants_without_recorded_death,
                         founder.total_descendants,
                         founder.contribution_share
                     );
@@ -1293,7 +1302,7 @@ mod tests {
             total_founders: Some(1),
             founder_rows: vec![FounderLineageRow {
                 founder_uid: 42,
-                living_descendants: 2,
+                descendants_without_recorded_death: 2,
                 total_descendants: 3,
                 contribution_share: 0.375,
             }],
@@ -1310,6 +1319,9 @@ mod tests {
             2
         );
         assert!(frame.contains("canonical arrivals/deaths through tick 12"));
+        assert!(frame.contains("migration unobserved"));
+        assert!(frame.contains("No Recorded Death"));
+        assert!(!frame.contains("Living Descendants"));
         assert!(frame.contains("Founder UID"));
         assert_eq!(
             row(&frame, "42").split_whitespace().collect::<Vec<_>>(),
@@ -1323,6 +1335,10 @@ mod tests {
         assert!(encoded["active_clades"].is_null());
         assert!(encoded["extinct_clades"].is_null());
         assert_eq!(encoded["founder_rows"][0]["founder_uid"], 42);
+        assert_eq!(
+            encoded["founder_rows"][0]["descendants_without_recorded_death"],
+            2
+        );
         assert_eq!(encoded["observed_tick"], 12);
         assert_eq!(
             serde_json::from_value::<LineagesViewData>(encoded)

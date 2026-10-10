@@ -1070,11 +1070,10 @@ impl LiveLineages {
             clades: Vec::new(),
             founder_rows: contributions
                 .into_iter()
-                .take(32)
                 .map(|row| FounderLineageRow {
                     founder_uid: row.founder_uid.get(),
                     total_descendants: row.total_descendants,
-                    living_descendants: row.living_descendants,
+                    descendants_without_recorded_death: row.living_descendants,
                     contribution_share: row.contribution_share,
                 })
                 .collect(),
@@ -2787,6 +2786,8 @@ impl<'a> TerminalApp<'a> {
                 Ok(false)
             }
             E::Paste(paste) if self.palette_open => {
+                self.hit_regions.palette_rect = None;
+                self.hit_regions.palette_items.clear();
                 self.palette_query
                     .extend(paste.text.chars().filter(|ch| !ch.is_control()).take(256));
                 self.palette_selected_index = 0;
@@ -5447,32 +5448,24 @@ impl<'a> TerminalApp<'a> {
 
     /// Handle click inside or outside the command palette modal.
     fn handle_palette_mouse_click(&mut self, col: u16, row: u16) {
-        let width = 56u16.min(self.map_area.map_or(80, |a| a.width).saturating_sub(4));
-        let height = 18u16.min(self.map_area.map_or(24, |a| a.height).saturating_sub(4));
-        let area_w = self.map_area.map_or(80, |a| a.width);
-        let area_h = self.map_area.map_or(24, |a| a.height);
-        let area_x = self.map_area.map_or(0, |a| a.x);
-        let area_y = self.map_area.map_or(0, |a| a.y);
-        let x = area_x + (area_w.saturating_sub(width)) / 2;
-        let y = area_y + (area_h.saturating_sub(height)) / 2;
-
-        if col >= x && col < x + width && row >= y && row < y + height {
-            if row > y && row < y + height - 2 {
-                let item_idx = (row - y - 1) as usize;
-                let items = all_command_palette_items();
-                let matches = fuzzy_match_command_palette_rich(
-                    &items,
-                    &self.palette_query,
-                    &self.palette_recent_actions,
-                );
-                if item_idx < matches.len() {
-                    let action = matches[item_idx].item.action;
-                    self.palette_selected_index = item_idx;
-                    self.execute_palette_action(action);
-                    self.palette_open = false;
-                }
-            }
-        } else {
+        let Some(area) = self.hit_regions.palette_rect else {
+            return;
+        };
+        let position = ratatui::layout::Position::new(col, row);
+        if !area.contains(position) {
+            self.palette_open = false;
+            return;
+        }
+        let content = area.inner(ratatui::layout::Margin::new(1, 1));
+        if content.contains(position)
+            && let Some((item_idx, action)) = self
+                .hit_regions
+                .palette_items
+                .get(usize::from(row - content.y))
+                .copied()
+        {
+            self.palette_selected_index = item_idx;
+            self.execute_palette_action(action);
             self.palette_open = false;
         }
     }
@@ -6073,11 +6066,17 @@ impl<'a> TerminalApp<'a> {
         let selected_idx = self
             .palette_selected_index
             .min(matches.len().saturating_sub(1));
+        let visible_rows = usize::from(palette_area.height.saturating_sub(2));
+        let first_visible = selected_idx.saturating_sub(visible_rows.saturating_sub(1));
+        self.hit_regions.palette_items.clear();
 
         let list_items: Vec<ListItem<'_>> = matches
             .iter()
             .enumerate()
+            .skip(first_visible)
+            .take(visible_rows)
             .map(|(idx, m)| {
+                self.hit_regions.palette_items.push((idx, m.item.action));
                 let is_selected = idx == selected_idx;
                 let prefix = if is_selected { "> " } else { "  " };
                 let item = m.item;
@@ -6184,6 +6183,8 @@ impl<'a> TerminalApp<'a> {
             return Ok(false);
         }
         if self.palette_open {
+            self.hit_regions.palette_rect = None;
+            self.hit_regions.palette_items.clear();
             match key.code {
                 KeyCode::Esc => {
                     self.palette_open = false;
@@ -6264,6 +6265,8 @@ impl<'a> TerminalApp<'a> {
             (KeyCode::Char('p') | KeyCode::Char('P'), KeyModifiers::CONTROL)
             | (KeyCode::Char(':'), KeyModifiers::NONE) => {
                 self.palette_open = !self.palette_open;
+                self.hit_regions.palette_rect = None;
+                self.hit_regions.palette_items.clear();
                 self.palette_query.clear();
                 self.palette_selected_index = 0;
                 return Ok(false);
@@ -16269,10 +16272,11 @@ for case in ('panic', 'subscription', 'renderer'):
 
     #[test]
     fn live_lineages_consume_canonical_founder_arrivals_from_real_owner() {
+        const FOUNDER_COUNT: usize = 33;
         let world = command_characterization_world();
         let founder_uids = {
             let mut world = world.lock().expect("fixture world");
-            (0..2)
+            (0..FOUNDER_COUNT)
                 .map(|_| {
                     let agent = world
                         .try_spawn_agent(scriptbots_core::AgentData::default())
@@ -16305,8 +16309,8 @@ for case in ('panic', 'subscription', 'renderer'):
             // ubs:ignore[rust.ownership.panic-macro] — test requires canonical lineage data.
             panic!("real canonical births must produce a lineage projection");
         };
-        assert_eq!(data.total_founders, Some(2));
-        assert_eq!(data.founder_rows.len(), 2);
+        assert_eq!(data.total_founders, Some(founder_uids.len()));
+        assert_eq!(data.founder_rows.len(), founder_uids.len());
         assert_eq!(
             data.founder_rows
                 .iter()
@@ -16317,7 +16321,9 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(
             data.founder_rows
                 .iter()
-                .all(|row| row.total_descendants == 0 && row.living_descendants == 0)
+                .all(|row| {
+                    row.total_descendants == 0 && row.descendants_without_recorded_death == 0
+                })
         );
         assert_eq!(
             data.active_clades, None,
@@ -16337,6 +16343,67 @@ for case in ('panic', 'subscription', 'renderer'):
             app.client.port().world_digests().expect("owner digests"),
             digest
         );
+
+        app.frankentui
+            .update(frankentui_shell::ShellMessage::Navigate(
+                frankentui_shell::ShellRoute::Lineages,
+            ));
+        app.frankentui
+            .update(frankentui_shell::ShellMessage::SetLineagesData(
+                science_screens::ScreenDataState::Data(data),
+            ));
+        let mut model = LiveTerminalModel::new(app).expect("actual live lineage model");
+        model.lineage = lineage;
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        for (index, uid) in founder_uids.iter().enumerate() {
+            simulator.send(LiveTerminalMessage::Refresh);
+            let frame = simulator.capture_frame(120, 36);
+            assert!(
+                frankentui_shell::buffer_to_string(frame).contains(&format!(" > {uid:<16}")),
+                "every retained founder must be visibly selectable, including index {index}"
+            );
+            assert_eq!(
+                simulator
+                    .model()
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .lineages
+                    .data()
+                    .expect("real founder rows survive refresh")
+                    .selected_index,
+                index
+            );
+            simulator.inject_event(ftui::core::event::Event::Key(
+                ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Down),
+            ));
+        }
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .science
+                .lineages
+                .data()
+                .expect("complete founder rows")
+                .selected_index,
+            0,
+            "next wraps only after the actual last founder"
+        );
+        simulator.inject_event(ftui::core::event::Event::Key(
+            ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Up),
+        ));
+        simulator.send(LiveTerminalMessage::Refresh);
+        let frame = simulator.capture_frame(120, 36);
+        assert!(frankentui_shell::buffer_to_string(frame).contains(&format!(
+            " > {:<16}",
+            founder_uids.last().expect("actual last founder")
+        )));
+        assert_eq!(host.port().snapshot_hub().latest().world.tick, observed_tick);
+        assert_eq!(host.port().world_digests().expect("owner digests"), digest);
     }
 
     #[test]
@@ -16644,6 +16711,198 @@ for case in ('panic', 'subscription', 'renderer'):
         assert!(app.map_area.is_none());
         assert!(app.host.snapshot_hub().latest().playback.paused);
         assert_eq!(app.host.snapshot_hub().latest().world.tick, 0);
+    }
+
+    #[test]
+    fn live_palette_mouse_uses_displayed_science_view_and_scrolled_rows() {
+        use ftui::core::event::{Event, Modifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        for (width, height) in [(120, 36), (240, 50), (64, 24)] {
+            let host = TerminalTestHost::take(command_characterization_world());
+            let before = host.port().world_digests().expect("initial owner digests");
+            let (runtime, _) = ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+            app.navigate_route(frankentui_shell::ShellRoute::Lineages);
+            app.palette_open = true;
+            let items = all_command_palette_items();
+            let matches = fuzzy_match_command_palette_rich(&items, "", &[]);
+            let diagnostics_index = matches
+                .iter()
+                .position(|entry| entry.item.action == CommandPaletteAction::NavigateDiagnostics)
+                .expect("the actual live navigation registry contains Diagnostics");
+            app.palette_selected_index = diagnostics_index;
+            app.handle_mouse_click(40, 5);
+            assert!(app.palette_open, "unpainted bounds cannot imply an action");
+            assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::Lineages);
+
+            let mut simulator = ftui::runtime::ProgramSimulator::new(
+                LiveTerminalModel::new(app).expect("actual live palette model"),
+            );
+            let text =
+                frankentui_shell::buffer_to_string(simulator.capture_frame(width, height));
+            let (row, column) = text
+                .lines()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    line.find("> [Navigation] Open Diagnostics")
+                        .map(|column| (row, column))
+                })
+                .expect("the selected action beyond the first viewport is visibly rendered");
+            let row = u16::try_from(row).expect("actual terminal row");
+            let column = u16::try_from(column).expect("actual terminal column");
+            let area = {
+                let app = simulator.model().app.borrow();
+                assert!(
+                    app.map_area.is_none(),
+                    "science views have no old map bounds"
+                );
+                assert!(
+                    app.hit_regions
+                        .palette_items
+                        .first()
+                        .is_some_and(|(index, _)| *index > 0)
+                );
+                app.hit_regions.palette_rect.expect("actual rendered modal")
+            };
+            assert_eq!(row, area.bottom() - 2, "the final content row is clickable");
+            simulator.inject_event(Event::Key(ftui::core::event::KeyEvent::new(
+                ftui::core::event::KeyCode::Char('z'),
+            )));
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                simulator.inject_event(Event::Mouse(MouseEvent::new(kind, column, row)));
+            }
+            {
+                let app = simulator.model().app.borrow();
+                assert!(
+                    app.palette_open,
+                    "changed input invalidates old displayed actions"
+                );
+                assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::Lineages);
+                assert!(app.hit_regions.palette_items.is_empty());
+            }
+            simulator.inject_event(Event::Key(ftui::core::event::KeyEvent::new(
+                ftui::core::event::KeyCode::Backspace,
+            )));
+            for _ in 0..diagnostics_index {
+                simulator.inject_event(Event::Key(ftui::core::event::KeyEvent::new(
+                    ftui::core::event::KeyCode::Down,
+                )));
+            }
+            let refreshed =
+                frankentui_shell::buffer_to_string(simulator.capture_frame(width, height));
+            assert_eq!(
+                refreshed
+                    .lines()
+                    .nth(usize::from(row))
+                    .and_then(|line| line.find("> [Navigation] Open Diagnostics")),
+                Some(usize::from(column)),
+                "keyboard selection must restore the displayed action at its actual coordinates"
+            );
+            for (column, expected_open) in [(area.x, true), (column, false)] {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    simulator.inject_event(Event::Mouse(MouseEvent {
+                        kind,
+                        x: column,
+                        y: row,
+                        modifiers: Modifiers::NONE,
+                    }));
+                }
+                let app = simulator.model().app.borrow();
+                assert_eq!(app.palette_open, expected_open);
+                assert_eq!(
+                    app.frankentui.route,
+                    if expected_open {
+                        frankentui_shell::ShellRoute::Lineages
+                    } else {
+                        frankentui_shell::ShellRoute::Diagnostics
+                    },
+                    "border clicks preserve the view; displayed action clicks navigate"
+                );
+            }
+            assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
+            assert_eq!(host.port().world_digests().expect("owner digests"), before);
+        }
+    }
+
+    #[test]
+    fn live_navigation_registry_hints_reach_the_declared_routes() {
+        use frankentui_shell::ShellRoute;
+
+        let host = TerminalTestHost::take(command_characterization_world());
+        let before = host.port().world_digests().expect("initial owner digests");
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut simulator = ftui::runtime::ProgramSimulator::new(
+            LiveTerminalModel::new(TerminalApp::new(&renderer, host.context(&runtime)))
+                .expect("actual live navigation model"),
+        );
+        let items = all_command_palette_items();
+        for (action, hint, route) in [
+            (
+                CommandPaletteAction::NavigateDashboard,
+                "1",
+                ShellRoute::Dashboard,
+            ),
+            (
+                CommandPaletteAction::NavigateWorld,
+                "2",
+                ShellRoute::WorldCanvas,
+            ),
+            (
+                CommandPaletteAction::NavigateInspector,
+                "3",
+                ShellRoute::Inspector,
+            ),
+            (
+                CommandPaletteAction::NavigateLineages,
+                "4",
+                ShellRoute::Lineages,
+            ),
+            (
+                CommandPaletteAction::NavigateBrainArena,
+                "5",
+                ShellRoute::BrainArena,
+            ),
+            (
+                CommandPaletteAction::NavigateExperiments,
+                "6",
+                ShellRoute::Experiments,
+            ),
+            (CommandPaletteAction::NavigateReplay, "7", ShellRoute::Replay),
+            (
+                CommandPaletteAction::NavigateEnvironment,
+                "8",
+                ShellRoute::Environment,
+            ),
+            (
+                CommandPaletteAction::NavigateDiagnostics,
+                "9",
+                ShellRoute::Diagnostics,
+            ),
+        ] {
+            let item = items
+                .iter()
+                .find(|item| item.action == action)
+                .expect("every rendered route is reachable from the actual registry");
+            assert_eq!(item.category, "Navigation");
+            assert_eq!(item.keybind_hint, hint);
+            simulator.inject_event(ftui::core::event::Event::Key(
+                ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char(
+                    item.keybind_hint.chars().next().expect("actual route hint"),
+                )),
+            ));
+            simulator.capture_frame(120, 36);
+            assert_eq!(simulator.model().app.borrow().frankentui.route, route);
+        }
+        assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
+        assert_eq!(host.port().world_digests().expect("owner digests"), before);
     }
 
     #[test]
@@ -17573,7 +17832,7 @@ for case in ('panic', 'subscription', 'renderer'):
             0
         );
         assert_eq!(port.snapshot_hub().latest().revisions.control.get(), 0);
-        assert_eq!(port.snapshot_hub().latest().world.tick.0, 0);
+        assert_eq!(port.snapshot_hub().latest().world.tick, 0);
 
         // A fixture finalization frees a safe slot; existing IDs may always
         // advance while full. It does not supply any real journal result.
@@ -17601,7 +17860,7 @@ for case in ('panic', 'subscription', 'renderer'):
             ReceiptStatusKind::Applied
         );
         assert_eq!(port.snapshot_hub().latest().revisions.control.get(), 1);
-        assert_eq!(port.snapshot_hub().latest().world.tick.0, 0);
+        assert_eq!(port.snapshot_hub().latest().world.tick, 0);
     }
 
     fn terminal_manual_driver(
@@ -22938,7 +23197,11 @@ for case in ('panic', 'subscription', 'renderer'):
         assert_eq!(app.palette_query, "s");
 
         // 6. Mouse click outside palette dismisses it
-        app.map_area = Some(Rect::new(0, 0, 80, 24));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("actual widget viewport");
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("paint palette");
         app.handle_mouse_click(0, 0); // (0, 0) is outside centered palette
         assert!(!app.palette_open, "Click outside palette must dismiss it");
 
@@ -22948,10 +23211,12 @@ for case in ('panic', 'subscription', 'renderer'):
         let all_items = all_command_palette_items();
         let matched = fuzzy_match_command_palette(&all_items, "speed");
         assert!(!matched.is_empty());
-        // Centered palette y calculation: 24 height -> y = (24 - 16) / 2 = 4.
-        // First item is at row 5 (y + 1).
-        let clicked_col = 40;
-        let clicked_row = 5;
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("paint filtered palette");
+        let area = app.hit_regions.palette_rect.expect("actual painted modal");
+        let clicked_col = area.x + 1;
+        let clicked_row = area.y + 1;
         app.handle_mouse_click(clicked_col, clicked_row);
         assert!(
             !app.palette_open,
@@ -22974,24 +23239,28 @@ for case in ('panic', 'subscription', 'renderer'):
     #[test]
     fn test_command_palette_and_help_parity() {
         let items = all_command_palette_items();
-        // Every domain is represented. (This was `items.len() >= 25`, a count that ten entries
-        // satisfied while doing nothing in the live HUD -- screens it never renders.)
+        // Every registry domain has a consumer in the actual live terminal.
         let categories: std::collections::BTreeSet<&str> =
             items.iter().map(|item| item.category).collect();
         for domain in [
-            "Playback", "Scenario", "Export", "View", "Science", "System",
+            "Playback",
+            "Scenario",
+            "Export",
+            "Navigation",
+            "View",
+            "Science",
+            "System",
         ] {
             assert!(
                 categories.contains(domain),
                 "Command registry must cover the {domain} domain"
             );
         }
-        // A hint is a key the live HUD binds to the same action, or empty. Hints once named
-        // FrankenTUI shell keys (`1 / D`, `4 / L`, `F12`, ...) that do something else or
-        // nothing here. A new binding must be added both to `handle_key` and to this list.
-        const HUD_BINDINGS: [&str; 17] = [
+        // Navigation hint consumers are exercised through the real live model above.
+        // Remaining hints belong to the preserved widget-specific bindings.
+        const HUD_BINDINGS: &[&str] = &[
             "Space", "s", "+", "-", "Shift+S", "a", "r", "t", "o", "i", "w", "f", "Enter",
-            "Ctrl+T", "p / c", "?", "q / Esc",
+            "Ctrl+T", "p / c", "?", "q / Esc", "1", "2", "3", "4", "5", "6", "7", "8", "9",
         ];
         for item in &items {
             assert!(
