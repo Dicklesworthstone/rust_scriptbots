@@ -3543,11 +3543,15 @@ impl HostCore {
             .count()
     }
 
-    fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
+    fn refresh_open_genesis_origins(&self) {
         if self.world.tick() == Tick::zero() {
             self.events
                 .refresh_genesis_origins(&self.world, self.options.genesis_origin_capacity);
         }
+    }
+
+    fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
+        self.refresh_open_genesis_origins();
         let revision = self.next_snapshot;
         let following_revision = revision
             .checked_next()
@@ -4202,10 +4206,7 @@ impl HostCore {
             .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
         // A cadence batch seals this tick before shutdown can add a replay anchor.
         // The request is consumed only when the completed persistence batch is ready.
-        if self.world.tick() == Tick::zero() {
-            self.events
-                .refresh_genesis_origins(&self.world, self.options.genesis_origin_capacity);
-        }
+        self.refresh_open_genesis_origins();
         self.world.request_replay_world_digest();
         let completion = match self.persistence.step_outcome(&mut self.world) {
             Ok(completion) => completion,
@@ -4615,10 +4616,7 @@ impl HostCore {
             .scientific
             .checked_next()
             .ok_or_else(|| protocol_violation("scientific revision exhausted"))?;
-        if self.world.tick() == Tick::zero() {
-            self.events
-                .refresh_genesis_origins(&self.world, self.options.genesis_origin_capacity);
-        }
+        self.refresh_open_genesis_origins();
         self.world.request_replay_world_digest();
         let completion = match self.persistence.step_outcome(&mut self.world) {
             Ok(completion) => completion,
