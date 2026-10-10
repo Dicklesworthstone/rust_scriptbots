@@ -2478,16 +2478,22 @@ fn bootstrap_world(
     // Bind manifest inputs to the same requested count passed to the owner.
     scenario.bootstrap_ticks = bootstrap_ticks;
     let (root_seed, generated_seed) = materialize_run_seed(&mut config);
+    let color_stdout = std::env::var_os("NO_COLOR").is_none()
+        && supports_color::on_cached(supports_color::Stream::Stdout).is_some();
     if generated_seed {
         info!(
             root_seed,
             "Generated and pinned the run's previously unspecified scientific seed"
         );
-        println!(
-            "{} Run seed: {}",
-            "◆".bright_blue().bold(),
-            root_seed.to_string().cyan()
-        );
+        if color_stdout {
+            println!(
+                "{} Run seed: {}",
+                "◆".bright_blue().bold(),
+                root_seed.to_string().cyan()
+            );
+        } else {
+            println!("◆ Run seed: {root_seed}");
+        }
     }
 
     #[cfg(feature = "neuro")]
@@ -2574,12 +2580,16 @@ fn bootstrap_world(
     let run_id = pipeline.run_id();
     if let Some(storage_path) = storage_path.as_deref() {
         info!(path = %storage_path, "Selected unique FrankenSQLite run database");
-        println!(
-            "{} Run {} database: {}",
-            "◆".bright_blue().bold(),
-            run_id.to_string().cyan(),
-            storage_path.cyan()
-        );
+        if color_stdout {
+            println!(
+                "{} Run {} database: {}",
+                "◆".bright_blue().bold(),
+                run_id.to_string().cyan(),
+                storage_path.cyan()
+            );
+        } else {
+            println!("◆ Run {run_id} database: {storage_path}");
+        }
     } else {
         info!(%run_id, "Selected volatile in-memory FrankenSQLite storage");
     }

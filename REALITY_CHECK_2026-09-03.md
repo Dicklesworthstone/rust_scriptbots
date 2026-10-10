@@ -161,8 +161,43 @@ and sacred-catalog preimages are preserved before its narrowly scoped protection
 other changes are unique run/profile identities. The original fourteen gates, bounded diagnostic
 observer and deadlines remain identical. R52 starts at 17:43:08 UTC on clean `5cf4f859`, profile
 SHA256 `a1bb4cb84144ad6779d904ef8e9e5c84e01ef0d9402162037c5a6daf4070b0e0`, native UUID
-`53c25559-c536-4334-9672-f69f2ec2d440`. At 17:45:42 its six initial guards pass; compilation
-and tests remain pending. This prerequisite correction establishes no causal fix for `bd-j8o2`.
+`53c25559-c536-4334-9672-f69f2ec2d440`. R52 completes **failed**, inner exit 1 with ten of
+fourteen gates complete; outer DSR exits 6. Strict workspace Clippy/check pass, runtime tests
+218 pass with six existing ignored, terminal units 312 pass and executable E2E four pass/one
+fail. Smoke, manifests, analyzer and final strict consumer remain unexecuted. Root independently
+matches all 400 retained files to the remote inventory, including 389 qualification artifacts,
+five native files, four observer files, launcher and staged cache receipt. All eleven command/log
+identities match. The normal truecolor journey observes its real checkpoint Pending at byte
+9,668 then Applied at 10,155, a completed three-tick MLP experiment, input/resize and terminal
+restoration. Its separate file-backed own Shutdown journey observes Pending 49,598, Durable
+51,005 and alternate leave 51,149, then reads the exact applied command from the finished database.
+All three actual fault PTYs observe their fault and restoration; their retained frames are Full,
+so this run does not establish runtime-selected reduced rendering. This prerequisite correction
+establishes no causal fix for `bd-j8o2`.
+
+R52 fails the original `NO_COLOR` guard. The actual 40,540-byte failed transcript, SHA256
+`a90306064db1e2c0739d1dc0ff9485b0a4aaf31b210cdce9eb16cab98fc3cb2f`, contains startup blue/cyan
+at offsets 4/32 and fullscreen RGB at offsets 188/207. Source readback identifies unconditional
+seed styling and the widget bridge feeding explicit theme colors to the pinned presenter.
+The current correction captures the opt-out once, gates seed/database output and clears cell
+foreground/background/underline colors after all overlays, before output and frame capture.
+It preserves symbols, attributes and the deterministic colored fixtures. A real Model test
+checks colored positives against monochrome output/capture and cell/attribute preservation.
+Independent source review supports this boundary; original real-PTY color assertions, goldens,
+16-ms budget and deadlines remain unchanged. The correction still requires native execution.
+Static UBS reads both complete changed Rust files: exit 1, four critical heuristic observations,
+2,989 warnings and 865 informational observations. The four critical sites are unchanged:
+three subprocess executables come directly from `std::env::current_exe()`, and the remaining
+comparison is a test's public admission-state string, not a secret. All reported categories
+and supplied samples are reviewed; assertions/expected errors belong to inline tests, buffer
+indices are bounded and explicit color output is the CLI's intended surface. Nothing is
+suppressed, and no formatter/compiler/test result is inferred from this static scan.
+
+R52's retained kernel observer also samples the separate TestBackend storage thread in
+`D` state at 17:56:13 and 17:56:26. Its readable stack binds `fsync` through ext4 to
+`jbd2_log_wait_commit`; syscall descriptor 7 maps to `terminal_control.sqlite-wal-cert`.
+These two separated samples do not establish a continuous wait, and neither belongs to the
+failed NO_COLOR child. Low contemporaneous aggregate I/O pressure does not resolve `bd-j8o2`.
 
 The `bd-azi3` browser source draft adds a pinned wasm-pack producer, standard module/type/WASM
 exports and license notices while retaining the original generated metadata and bytes in a
@@ -184,6 +219,15 @@ remaining categories. No finding is suppressed. Python runs isolated so optimiza
 variables cannot erase its assertions; descriptor fetch has an explicit 30-second abort.
 These are source changes: package build, real-browser positives/negatives and native/parity
 qualification at their final source remain pending. No Vite implementation is claimed.
+
+Browser source is banked at `34323f4b`. Its first R53 DSR attempt, UUID
+`eb807b86-42eb-4184-93a2-942367df0f95`, stops before any qualification phase on an unbound
+profile version variable. Outer retention/cache settings were also omitted from the launcher:
+DSR copied the ambient cache and removed its temporary stage on failure. Surviving raw native,
+result and launcher files are preserved; the missing stage is recorded rather than reconstructed.
+These are avoidable launch preparation errors and establish no browser or package result.
+A new descriptor must use DSR's actual version substitution and launcher-level retention,
+locked seed and timeout settings before the unchanged package/browser/parity phases execute.
 
 Checked items below name implementation or observations at their stated boundary. They do
 not close a containing Bead. This checklist answers the user's explicit request and retires
@@ -268,7 +312,14 @@ as a working list when its original owners are fully qualified; retained evidenc
   and all original gates; preserve the refused R50 profile and prepare a new unique run.
 - [x] Independently read the complete minimal R52 descriptor and diff, retain protection preimages,
   verify its clean source/unused outputs/healthy worker and launch the original terminal lane.
-- [ ] Collect and independently review the complete R52 proof and original acceptance observations.
+- [x] Collect and independently review all 400 R52 files and exact original acceptance observations;
+  retain its 534 passes/one failure/six existing ignored and unexecuted final gates.
+- [x] Trace R52's actual NO_COLOR startup and fullscreen escapes to both production emitters.
+- [x] Correct both emitters in source and add output/capture cell-and-attribute discrimination;
+  preserve the original PTY color guard, colored goldens, budget and deadlines.
+- [ ] Execute the new Model test and unchanged truecolor/NO_COLOR PTY journeys at the final source.
+- [x] Retain R53's pre-test version-binding failure and disclose its missing temporary stage.
+- [ ] Qualify the actual browser package in a new version-bound, retention-enabled DSR run.
 - [ ] Locate the outstanding normal checkpoint stage with contemporaneous process/task/file/
   receipt evidence; keep file synchronization, storage acknowledgment and delivery distinct.
 - [ ] Diagnose the worker's real filesystem stalls without terminating unrelated work or

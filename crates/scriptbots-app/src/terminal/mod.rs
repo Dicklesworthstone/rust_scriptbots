@@ -799,6 +799,16 @@ impl Model for LiveTerminalModel<'_> {
                     receipt_visible = true;
                     app.exclude_pointer_overlay(overlay);
                 }
+                // The pinned presenter serializes explicit cell colors even
+                // when its capability probe reports NO_COLOR. Apply the user's
+                // opt-out after every widget/overlay, before capture and output.
+                if app.palette.no_color {
+                    for cell in &mut legacy.buffer_mut().content {
+                        cell.fg = Color::Reset;
+                        cell.bg = Color::Reset;
+                        cell.underline_color = Color::Reset;
+                    }
+                }
             })
             .unwrap_or_else(|never| match never {});
         let buffer = widgets.backend().buffer();
@@ -9647,6 +9657,7 @@ impl CuratedThemeId {
 
 struct Palette {
     level: Option<ColorLevel>,
+    no_color: bool,
     emoji: bool,
     emoji_narrow: bool,
     mode: TerminalPaletteMode,
@@ -9773,6 +9784,9 @@ impl Palette {
     fn test_backend_evidence() -> Self {
         Self {
             level: None,
+            // This branch fixture pins widget styles, independently of the
+            // controller's terminal and environment. Actual PTYs probe policy.
+            no_color: false,
             emoji: false,
             emoji_narrow: false,
             mode: TerminalPaletteMode::Natural,
@@ -10021,7 +10035,12 @@ impl Palette {
         }
     }
     fn detect() -> Self {
-        let level = on_cached(Stream::Stdout);
+        let no_color = std::env::var_os("NO_COLOR").is_some();
+        let level = if no_color {
+            None
+        } else {
+            on_cached(Stream::Stdout)
+        };
         let emoji = {
             if let Ok(raw) = std::env::var("SCRIPTBOTS_TERMINAL_EMOJI") {
                 let v = raw.to_ascii_lowercase();
@@ -10057,6 +10076,7 @@ impl Palette {
             .unwrap_or(TerminalPaletteMode::Natural);
         Self {
             level,
+            no_color,
             emoji,
             emoji_narrow: false,
             // `default()`, not a restated literal. This read CyberpunkAurora
@@ -10312,7 +10332,7 @@ impl Palette {
             ColorSupport::from_level(self.level),
             &env_lower("TERM"),
             &locale_lower(),
-            std::env::var_os("NO_COLOR").is_some(),
+            self.no_color,
         )
     }
 
@@ -18962,6 +18982,58 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
+    fn live_no_color_preserves_cells_and_attributes_in_frame_and_candidate() {
+        use ftui::render::cell::{PackedRgba, StyleFlags};
+
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.palette = Palette::test_backend_evidence();
+        let model = LiveTerminalModel::new(app).expect("production live model");
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut colored = ftui::render::frame::Frame::new(100, 30, &mut pool);
+        model.view(&mut colored);
+        let mut colored_cells = Vec::new();
+        for y in 0..colored.height() {
+            for x in 0..colored.width() {
+                colored_cells.push(*colored.buffer.get(x, y).expect("colored frame cell"));
+            }
+        }
+        assert!(colored_cells.iter().any(|cell| cell.fg.a() > 0));
+        assert!(colored_cells.iter().any(|cell| cell.bg.a() > 0));
+        assert!(
+            colored_cells
+                .iter()
+                .any(|cell| cell.attrs.flags().contains(StyleFlags::BOLD))
+        );
+        model.app.borrow_mut().palette.no_color = true;
+        let mut monochrome = ftui::render::frame::Frame::new(100, 30, &mut pool);
+        model.view(&mut monochrome);
+        for y in 0..monochrome.height() {
+            for x in 0..monochrome.width() {
+                let actual = monochrome.buffer.get(x, y).expect("monochrome frame cell");
+                let index = usize::from(y) * usize::from(monochrome.width()) + usize::from(x);
+                let previous = &colored_cells[index];
+                assert_eq!(actual.content, previous.content);
+                assert_eq!(actual.attrs, previous.attrs);
+                assert_eq!(actual.fg, PackedRgba::TRANSPARENT);
+                assert_eq!(actual.bg, PackedRgba::TRANSPARENT);
+            }
+        }
+        let capture = model
+            .presentation
+            .candidate
+            .load_full()
+            .expect("actual presentation candidate");
+        for cell in &capture.frame.buffer.content {
+            assert_eq!(cell.fg, Color::Reset);
+            assert_eq!(cell.bg, Color::Reset);
+            assert_eq!(cell.underline_color, Color::Reset);
+        }
+    }
+
+    #[test]
     fn widget_bridge_preserves_unicode_styles_and_refuses_partial_wide_cells() {
         let mut source = Buffer::empty(Rect::new(0, 0, 8, 1));
         source.set_string(
@@ -24514,6 +24586,7 @@ for case in ('panic', 'subscription', 'renderer'):
             for mode in palettes {
                 let p = Palette {
                     level: on_cached(Stream::Stdout),
+                    no_color: false,
                     emoji: true,
                     emoji_narrow: false,
                     mode,

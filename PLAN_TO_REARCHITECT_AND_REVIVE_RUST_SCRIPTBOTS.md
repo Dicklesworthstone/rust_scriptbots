@@ -90,12 +90,23 @@ separate source draft and cannot inherit terminal qualification.
 
 Minimal R52 uses the daemon's existing `/root/.config/sbh/config.toml` and preserves config/
 sacred-catalog preimages plus every original gate/deadline. Its full descriptor and four-line
-diff are independently reviewed; actual clean `5cf4f859` launch is 17:43:08 UTC. Six initial
-guards pass at 17:45:42; compilation/tests and final acceptance remain pending. Browser package
-source separately connects fresh generated metadata/glue/WASM to the existing Canvas smoke
+diff are independently reviewed; actual clean `5cf4f859` launch is 17:43:08 UTC. Completed R52
+passes strict Clippy/check, 218 runtime tests, 312 terminal units and four E2E tests; one E2E
+fails the unchanged NO_COLOR guard. The actual normal truecolor checkpoint/experiment/input/
+resize/restoration journey and separate file-backed own durable Shutdown/readback pass.
+All 400 emitted files independently hash-match; final gates remain unexecuted. Raw startup
+blue/cyan and fullscreen RGB identify two actual emitters. Current source gates startup styling
+and clears all cell colors after overlays before presentation/capture, with a real Model
+positive/negative check. Original colored goldens, PTY assertions, budget and deadlines stay intact;
+the correction requires fresh exact-source qualification. Browser package source at `34323f4b`
+separately connects fresh generated metadata/glue/WASM to the existing Canvas smoke
 and CI's pinned ChromeDriver, preserving original DOM controls and native/WASM parity probes.
 Actual package/browser execution is still required under `bd-azi3`; no Vite implementation,
-terminal pass or storage-delay causal fix is credited to this source draft.
+terminal pass or storage-delay causal fix is credited to this source draft. R53 stops before
+tests on an unbound profile version. Its launcher also omitted stage retention and the selected
+cache seed; surviving failure logs remain, but the temporary stage was removed by DSR.
+Corrected DSR substitution and explicit outer retention/seed/timeout settings are prerequisites
+for the unchanged browser qualification phases.
 
 External resets at 07:38, 13:40 and 13:50 UTC were recovered by non-destructive fast-forward;
 source/tracker/proofs are retained outside the shared checkout and active edits now use an
