@@ -24,6 +24,7 @@ use scriptbots_runtime::RunId;
 use scriptbots_storage::StorageReader;
 
 fn run_dir(label: &str) -> PathBuf {
+    // ubs:ignore[rust.security.non-crypto-random] — unique test directory suffix, not a security token.
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
@@ -120,7 +121,7 @@ fn manifest_digest_for_test(manifest: &RunManifestV3) -> String {
 }
 
 #[test]
-fn persisted_manifests_advertise_verified_checkpoint_continuation() {
+fn persisted_manifests_withhold_unverified_host_session_continuation() {
     let mut previous_roster = None;
     for brain in ["mlp", "mixed"] {
         let dir = run_dir(&format!("checkpoint_guarantee_{brain}"));
@@ -155,8 +156,8 @@ fn persisted_manifests_advertise_verified_checkpoint_continuation() {
             // Missing/null/string values must not pass either.
             assert_eq!(
                 manifest["limitations"]["checkpoint_replay_guarantee"].as_bool(),
-                Some(true),
-                "{location} must advertise checkpoint-start replay: {manifest}"
+                Some(false),
+                "{location} must not advertise unverified full host/session continuation: {manifest}"
             );
             assert_eq!(
                 manifest["limitations"]["rng_state_restorable"].as_bool(),

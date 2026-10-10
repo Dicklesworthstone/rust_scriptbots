@@ -613,8 +613,9 @@ pub struct CharacterizationLimitationsV0 {
     pub source_identity: String,
     pub evaluator_state_covered: bool,
     pub rng_state_restorable: bool,
-    /// Whether the product can continue this run from a persisted checkpoint.
-    /// Restorable domain RNG state alone does not establish that guarantee.
+    /// Whether the product can continue this run's full host/session boundary
+    /// from a persisted checkpoint. Core science replay and restorable domain
+    /// RNG state alone do not establish that guarantee.
     pub checkpoint_replay_guarantee: bool,
     pub comparison_lane: String,
     pub superseded_by: String,
@@ -630,8 +631,8 @@ impl Default for CharacterizationLimitationsV0 {
                     .to_owned(),
             evaluator_state_covered: false,
             rng_state_restorable: true,
-            // Checkpoint-start replay is verified in production persistence and replay (bd-2z0.5.13).
-            checkpoint_replay_guarantee: true,
+            // Core replay exists; full host/session continuation remains open (bd-2z0.5.13).
+            checkpoint_replay_guarantee: false,
             comparison_lane: "same pinned toolchain, target, features, and thread lane".to_owned(),
             superseded_by: "WorldDigestV1".to_owned(),
         }
@@ -2170,6 +2171,7 @@ pub fn write_atomic_manifest_sidecar(
         })?;
     }
 
+    // ubs:ignore[rust.security.non-crypto-random] — manifest temporary filename suffix, not a security token.
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -2563,8 +2565,8 @@ mod characterization_tests {
             serde_json::from_slice(&encoded).expect("manifest schema");
         assert_eq!(
             encoded_value["limitations"]["checkpoint_replay_guarantee"].as_bool(),
-            Some(true),
-            "a launch manifest accurately advertises verified product checkpoint continuation"
+            Some(false),
+            "core science replay must not advertise unverified full host/session continuation"
         );
         assert_eq!(
             encoded_value["limitations"]["rng_state_restorable"].as_bool(),
