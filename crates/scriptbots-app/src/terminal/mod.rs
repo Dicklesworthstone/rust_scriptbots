@@ -15911,7 +15911,10 @@ mod tests {
             type Message = LiveTerminalMessage;
 
             fn init(&mut self) -> Cmd<Self::Message> {
-                self.live.init()
+                eprintln!("fault-probe init started: {}", self.case);
+                let command = self.live.init();
+                eprintln!("fault-probe init completed: {}", self.case);
+                command
             }
 
             fn update(&mut self, message: Self::Message) -> Cmd<Self::Message> {
@@ -15927,6 +15930,8 @@ mod tests {
             }
 
             fn view(&self, frame: &mut ftui::render::frame::Frame) {
+                let started = Instant::now();
+                eprintln!("fault-probe view started: {}", self.case);
                 assert!(
                     self.case != "panic" || !self.triggered.load(Ordering::Acquire),
                     "injected actual model-view panic"
@@ -15938,6 +15943,11 @@ mod tests {
                     "FAULT-PROBE-READY"
                 };
                 frankentui_shell::print_to_frame(frame, 0, 0, marker);
+                eprintln!(
+                    "fault-probe view completed: {} elapsed_us={}",
+                    self.case,
+                    started.elapsed().as_micros()
+                );
             }
 
             fn subscriptions(
@@ -15961,6 +15971,18 @@ mod tests {
         }
 
         struct FaultSubscription(Arc<AtomicBool>);
+
+        struct FaultPresentation(Arc<TerminalPresentationObserver>);
+
+        impl FrameTimingSink for FaultPresentation {
+            fn record_frame(&self, timing: &FrameTiming) {
+                eprintln!(
+                    "fault-probe frame={} render_us={} present_us={} total_us={}",
+                    timing.frame_idx, timing.render_us, timing.present_us, timing.total_us
+                );
+                self.0.record_frame(timing);
+            }
+        }
 
         impl ftui::runtime::subscription::Subscription<LiveTerminalMessage> for FaultSubscription {
             fn id(&self) -> ftui::runtime::subscription::SubId {
@@ -16023,8 +16045,12 @@ mod tests {
             guard.mark_cursor_hidden();
             let config = ProgramConfig {
                 screen_mode: ftui::ScreenMode::AltScreen,
+                frame_timing: Some(FrameTimingConfig::new(Arc::new(FaultPresentation(
+                    model.live.presentation.clone(),
+                )))),
                 ..ProgramConfig::default()
             };
+            eprintln!("fault-probe program construction started: {case}");
             if case == "renderer" {
                 let features = ftui::runtime::BackendFeatures::default();
                 let session = ftui::TerminalSession::new(ftui::SessionOptions {
@@ -16046,6 +16072,7 @@ mod tests {
                 let mut program =
                     Program::with_event_source(model, events, features, writer, config)
                         .expect("real runtime with observed failing writer");
+                eprintln!("fault-probe program construction completed: {case}");
                 let run_result = program.run();
                 assert!(refused.load(Ordering::Acquire), "writer failure must fire");
                 let error = run_result.expect_err("presentation failure must propagate");
@@ -16053,6 +16080,7 @@ mod tests {
             } else {
                 let mut program =
                     Program::with_config(model, config).expect("real FrankenTUI runtime");
+                eprintln!("fault-probe program construction completed: {case}");
                 let run_result = program.run();
                 if case == "subscription" {
                     run_result.expect("handled subscription failure completes lifecycle");
@@ -16162,6 +16190,9 @@ for case in ('panic', 'subscription', 'renderer'):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
+            while select.select([master], [], [], 0)[0]:
+                raw.extend(os.read(master, 65536))
+                assert len(raw) < 2_000_000, 'bounded cleanup transcript exceeded'
             (directory / 'terminal.raw').write_bytes(raw)
             with open(directory / 'terminal-attributes.json', 'x') as attributes:
                 json.dump({'initial': repr(initial), 'final': repr(termios.tcgetattr(slave))}, attributes)
@@ -16697,6 +16728,29 @@ for case in ('panic', 'subscription', 'renderer'):
         model.acknowledge_presentation();
     }
 
+    // Inspection strings omit interned grapheme cells. Mouse coordinates must
+    // come from the actual cells, including the columns occupied by borders.
+    fn ascii_label_coordinates(
+        buffer: &ftui::render::buffer::Buffer,
+        label: &str,
+    ) -> Option<(u16, u16)> {
+        assert!(!label.is_empty() && label.is_ascii());
+        let label_width = u16::try_from(label.len()).expect("bounded ASCII label");
+        let last_column = buffer.width().checked_sub(label_width)?;
+        for row in 0..buffer.height() {
+            for column in 0..=last_column {
+                if label.chars().zip(column..).all(|(character, x)| {
+                    buffer
+                        .get(x, row)
+                        .is_some_and(|cell| cell.content.as_char() == Some(character))
+                }) {
+                    return Some((row, column));
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn live_model_navigation_uses_science_views_and_preserves_legacy_widgets() {
         use frankentui_shell::ShellRoute;
@@ -16820,7 +16874,11 @@ for case in ('panic', 'subscription', 'renderer'):
             let mut simulator = ftui::runtime::ProgramSimulator::new(
                 LiveTerminalModel::new(app).expect("actual live palette model"),
             );
-            let text = frankentui_shell::buffer_to_string(simulator.capture_frame(width, height));
+            let (row, column) = ascii_label_coordinates(
+                simulator.capture_frame(width, height),
+                "> [Navigation] Open Diagnostics",
+            )
+            .expect("the selected action beyond the first viewport is visibly rendered");
             assert!(
                 simulator
                     .model()
@@ -16831,16 +16889,6 @@ for case in ('panic', 'subscription', 'renderer'):
                     .is_none()
             );
             simulator_presentation_callback(simulator.model(), 1);
-            let (row, column) = text
-                .lines()
-                .enumerate()
-                .find_map(|(row, line)| {
-                    line.find("> [Navigation] Open Diagnostics")
-                        .map(|column| (row, column))
-                })
-                .expect("the selected action beyond the first viewport is visibly rendered");
-            let row = u16::try_from(row).expect("actual terminal row");
-            let column = u16::try_from(column).expect("actual terminal column");
             let area = {
                 let app = simulator.model().app.borrow();
                 assert!(
@@ -16855,6 +16903,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 );
                 app.hit_regions.palette_rect.expect("actual rendered modal")
             };
+            assert!(column > area.x, "the action probe must avoid the border");
             assert_eq!(row, area.bottom() - 2, "the final content row is clickable");
             simulator.inject_event(Event::Key(ftui::core::event::KeyEvent::new(
                 ftui::core::event::KeyCode::Char('z'),
@@ -16882,15 +16931,14 @@ for case in ('panic', 'subscription', 'renderer'):
                     ftui::core::event::KeyCode::Down,
                 )));
             }
-            let refreshed =
-                frankentui_shell::buffer_to_string(simulator.capture_frame(width, height));
+            let refreshed = ascii_label_coordinates(
+                simulator.capture_frame(width, height),
+                "> [Navigation] Open Diagnostics",
+            );
             simulator_presentation_callback(simulator.model(), 1);
             assert_eq!(
-                refreshed
-                    .lines()
-                    .nth(usize::from(row))
-                    .and_then(|line| line.find("> [Navigation] Open Diagnostics")),
-                Some(usize::from(column)),
+                refreshed,
+                Some((row, column)),
                 "keyboard selection must restore the displayed action at its actual coordinates"
             );
             for (column, expected_open) in [(area.x, true), (column, false)] {
@@ -16939,17 +16987,11 @@ for case in ('panic', 'subscription', 'renderer'):
         let mut simulator = ftui::runtime::ProgramSimulator::new(
             LiveTerminalModel::new(app).expect("live palette model"),
         );
-        let shown = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
-        let (row, column) = shown
-            .lines()
-            .enumerate()
-            .find_map(|(row, line)| {
-                line.find("> [Navigation] Open Lineages")
-                    .map(|column| (row, column))
-            })
-            .expect("the prior candidate actually contains the distinct Lineages action");
-        let row = u16::try_from(row).expect("actual palette row");
-        let column = u16::try_from(column).expect("actual palette column");
+        let (row, column) = ascii_label_coordinates(
+            simulator.capture_frame(120, 36),
+            "> [Navigation] Open Lineages",
+        )
+        .expect("the prior candidate actually contains the distinct Lineages action");
         simulator_presentation_callback(simulator.model(), 1);
         let last_presented = simulator
             .model()
@@ -16964,11 +17006,13 @@ for case in ('panic', 'subscription', 'renderer'):
         for character in "Open Diagnostics".chars() {
             simulator.inject_event(Event::Key(KeyEvent::new(KeyCode::Char(character))));
         }
-        let unshown = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
-        assert!(
-            unshown.lines().nth(usize::from(row)).is_some_and(|line| {
-                line.find("> [Navigation] Open Diagnostics") == Some(usize::from(column))
-            }),
+        let unshown = ascii_label_coordinates(
+            simulator.capture_frame(120, 36),
+            "> [Navigation] Open Diagnostics",
+        );
+        assert_eq!(
+            unshown,
+            Some((row, column)),
             "the skipped candidate changes the action at the same painted coordinates"
         );
         simulator_presentation_callback(simulator.model(), 0);
@@ -17023,17 +17067,11 @@ for case in ('panic', 'subscription', 'renderer'):
         let mut simulator = ftui::runtime::ProgramSimulator::new(
             LiveTerminalModel::new(app).expect("actual legacy palette model"),
         );
-        let shown = frankentui_shell::buffer_to_string(simulator.capture_frame(64, 24));
-        let (row, column) = shown
-            .lines()
-            .enumerate()
-            .find_map(|(row, line)| {
-                line.find("> [Navigation] Open Diagnostics")
-                    .map(|column| (row, column))
-            })
-            .expect("the larger legacy frame actually paints the modal action");
-        let row = u16::try_from(row).expect("actual modal row");
-        let column = u16::try_from(column).expect("actual modal column");
+        let (row, column) = ascii_label_coordinates(
+            simulator.capture_frame(64, 24),
+            "> [Navigation] Open Diagnostics",
+        )
+        .expect("the larger legacy frame actually paints the modal action");
         assert!(row < 9, "old bounds overlap the next tiny viewport");
         simulator_presentation_callback(simulator.model(), 1);
         let tiny = frankentui_shell::buffer_to_string(simulator.capture_frame(64, 9));
@@ -21498,7 +21536,24 @@ for case in ('panic', 'subscription', 'renderer'):
             .expect("a finite speed reaches real owner admission");
         let receipt = wait_for_terminal_receipt(&mut app, &valid_id);
         assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
-        assert_eq!(receipt.journal_state, Some(JournalState::CommittedVolatile));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.refresh_command_receipts();
+            let receipt = app
+                .frankentui
+                .receipt_for(&valid_id)
+                .expect("the applied identity remains visible through journal finality");
+            assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
+            if receipt.journal_state == Some(JournalState::CommittedVolatile) {
+                break;
+            }
+            assert_eq!(receipt.journal_state, Some(JournalState::Pending));
+            assert!(
+                Instant::now() < deadline,
+                "the applied speed command's independent journal did not commit: {receipt:?}"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
         let applied = app.host.snapshot_hub().latest();
         assert_eq!(applied.playback.speed_multiplier, 0.75);
         assert!(applied.revisions.control > before.revisions.control);
