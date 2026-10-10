@@ -1773,7 +1773,9 @@ impl<'a> TerminalApp<'a> {
             }
         };
         self.frankentui
-            .update(frankentui_shell::ShellMessage::CommandReceipt(receipt.clone()));
+            .update(frankentui_shell::ShellMessage::CommandReceipt(
+                receipt.clone(),
+            ));
         let envelope = CommandEnvelope::new(id, host_command)
             .expecting_control_revision(self.retained_render.revisions.control);
         // A blocked owner must not freeze input. A lost reply is unresolved,
@@ -5341,7 +5343,9 @@ impl<'a> TerminalApp<'a> {
                     state: SelectionState::Selected,
                 }));
                 let label = agent_uid_label(Some(uid));
-                self.push_toast(format!("Selection of Agent #{label} requested; see receipt"));
+                self.push_toast(format!(
+                    "Selection of Agent #{label} requested; see receipt"
+                ));
                 self.refresh_snapshot();
             }
         }
@@ -14304,7 +14308,10 @@ mod tests {
                 ApplicationState::Admitted => {}
                 failure => panic!("external-owner command failed: {failure:?}"),
             }
-            assert!(Instant::now() < deadline, "real owner did not apply command");
+            assert!(
+                Instant::now() < deadline,
+                "real owner did not apply command"
+            );
             std::thread::park_timeout(Duration::from_millis(1));
             status = app
                 .host
@@ -20454,7 +20461,10 @@ mod tests {
             expected: cached_revision.get(),
             observed: before_rejections.revisions.control.get(),
         };
-        assert_eq!(wait_for_terminal_receipt(&mut app, &palette_id).status, stale);
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &palette_id).status,
+            stale
+        );
         assert!(
             !app.paused,
             "a rejected palette pause preserves observed playback"
@@ -20500,10 +20510,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
             .expect("space is handled");
-        assert!(
-            app.paused,
-            "keyboard submission is not observed resumption"
-        );
+        assert!(app.paused, "keyboard submission is not observed resumption");
         let keyboard_resume_id = app
             .frankentui
             .latest_receipt()

@@ -45,7 +45,11 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
-    assert_eq!(observations.len(), 2, "both capability profiles must execute");
+    assert_eq!(
+        observations.len(),
+        2,
+        "both capability profiles must execute"
+    );
     for observation in observations {
         assert_eq!(observation["schema"], "scriptbots.live-tui-pty.v1");
         assert_eq!(observation["exit_code"], 0);

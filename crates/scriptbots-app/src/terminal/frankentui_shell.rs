@@ -1856,14 +1856,8 @@ mod tests {
             )
             .expect("valid applied status");
             // The snapshot cache still precedes the owner's application boundary.
-            let receipt = CommandReceiptEntry::from_runtime_status(
-                &command_id,
-                "Step",
-                &applied,
-                40,
-                5,
-                40,
-            );
+            let receipt =
+                CommandReceiptEntry::from_runtime_status(&command_id, "Step", &applied, 40, 5, 40);
             assert_eq!(receipt.status, expected);
             assert_eq!(receipt.timestamp_tick, 41);
             assert_eq!(receipt.control_revision, 8);
