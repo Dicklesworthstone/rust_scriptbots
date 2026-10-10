@@ -69,7 +69,9 @@ verify_evidence() {
             and all(.[]; .source_commit == $source and .fault_observed == true
                 and .raw_mode_observed == true and .terminal_attributes_restored == true
                 and .alternate_screen_entered == true
-                and .alternate_screen_restored == true)
+                and .alternate_screen_restored == true
+                and .cursor_hidden_observed == true and .cursor_visible_at_exit == true
+                and .enabled_capture_modes_at_exit == [])
         ' "$directory/terminal-unit-tests.log" >/dev/null || refuse "missing source-bound actual PTY fault restoration"
         while IFS= read -r record; do
             local fault_directory fault_transcript_hash fault_attributes_hash
@@ -108,6 +110,8 @@ verify_evidence() {
                   else .data_provider_evidence == null end)
                 and .raw_mode_observed == true and .terminal_attributes_restored == true
                 and .alternate_screen_restored == true and .frankentui_shutdown_observed == true
+                and .cursor_hidden_observed == true and .cursor_visible_at_exit == true
+                and .enabled_capture_modes_at_exit == []
                 and (.observed_science_routes | length) > 0
                 and (.observed_science_routes | length) == (.observed_science_routes | unique | length)
                 and (.observed_science_routes | sort) == ([.observed_screenshot_routes[].route] | sort))

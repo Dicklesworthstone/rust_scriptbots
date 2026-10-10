@@ -15852,6 +15852,12 @@ mod tests {
             assert_eq!(observation["raw_mode_observed"], true);
             assert_eq!(observation["terminal_attributes_restored"], true);
             assert_eq!(observation["alternate_screen_restored"], true);
+            assert_eq!(observation["cursor_hidden_observed"], true);
+            assert_eq!(observation["cursor_visible_at_exit"], true);
+            assert_eq!(
+                observation["enabled_capture_modes_at_exit"],
+                serde_json::json!([])
+            );
             assert_eq!(observation["fault_observed"], true);
         }
     }
@@ -16050,10 +16056,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     const TERMINAL_FAULT_PTY_PROBE: &str = r#"
-import fcntl, hashlib, json, os, pathlib, pty, select, signal
+import fcntl, hashlib, json, os, pathlib, pty, re, select, signal
 import struct, subprocess, sys, tempfile, termios, time
 
 binary, case_variable, source = sys.argv[1:]
+def cursor_visible_after_hide(transcript):
+    return transcript.rfind(b'\x1b[?25h') > transcript.rfind(b'\x1b[?25l') >= 0
+
 for case in ('panic', 'subscription', 'renderer'):
     directory = pathlib.Path(tempfile.mkdtemp(prefix='terminal-fault-' + case + '-'))
     master, slave = pty.openpty()
@@ -16082,6 +16091,8 @@ for case in ('panic', 'subscription', 'renderer'):
             assert alternate_entered, 'fault must happen after actual alternate-screen entry'
             raw_mode = not (termios.tcgetattr(slave)[3] & termios.ICANON)
             assert raw_mode, 'fault must happen after observed raw-mode startup'
+            cursor_hidden = b'\x1b[?25l' in raw
+            assert cursor_hidden, 'fault must happen after observed cursor hiding'
             os.write(master, b'F')
             deadline = time.monotonic() + 30
             while process.poll() is None and time.monotonic() < deadline:
@@ -16094,9 +16105,21 @@ for case in ('panic', 'subscription', 'renderer'):
             fault_observed = ('terminal-fault-observed:' + case).encode() in raw
             restored = termios.tcgetattr(slave) == initial
             alternate_restored = raw.rfind(b'\x1b[?1049l') > raw.rfind(b'\x1b[?1049h') >= 0
+            cursor_visible = cursor_visible_after_hide(raw)
+            enabled_capture_modes = set()
+            for parameters, operation in re.findall(rb'\x1b\[\?([0-9;]+)([hl])', raw):
+                for mode in map(int, parameters.split(b';')):
+                    if mode not in (7, 25):
+                        if operation == b'h':
+                            enabled_capture_modes.add(mode)
+                        else:
+                            enabled_capture_modes.discard(mode)
             assert fault_observed, 'named fault was not actually observed'
             assert restored, 'actual terminal attributes were not restored'
             assert alternate_restored, 'actual alternate screen was not restored'
+            assert cursor_visible, 'cursor was not visibly restored after the fault'
+            assert not enabled_capture_modes, 'capture modes remained enabled after the fault'
+            assert not cursor_visible_after_hide(raw.replace(b'\x1b[?25h', b'')), 'missing-show guard failed'
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
@@ -16116,6 +16139,9 @@ for case in ('panic', 'subscription', 'renderer'):
                       'terminal_attributes_restored': restored,
                       'alternate_screen_entered': alternate_entered,
                       'alternate_screen_restored': alternate_restored,
+                      'cursor_hidden_observed': cursor_hidden,
+                      'cursor_visible_at_exit': cursor_visible,
+                      'enabled_capture_modes_at_exit': sorted(enabled_capture_modes),
                       'transcript_sha256': hashlib.sha256(raw).hexdigest(),
                       'attributes_sha256': hashlib.sha256((directory / 'terminal-attributes.json').read_bytes()).hexdigest(),
                       'artifact_directory': str(directory)}), flush=True)
@@ -16318,13 +16344,9 @@ for case in ('panic', 'subscription', 'renderer'):
                 .collect::<Vec<_>>(),
             founder_uids
         );
-        assert!(
-            data.founder_rows
-                .iter()
-                .all(|row| {
-                    row.total_descendants == 0 && row.descendants_without_recorded_death == 0
-                })
-        );
+        assert!(data.founder_rows.iter().all(|row| {
+            row.total_descendants == 0 && row.descendants_without_recorded_death == 0
+        }));
         assert_eq!(
             data.active_clades, None,
             "founder ancestry is not clade analysis"
@@ -16402,7 +16424,10 @@ for case in ('panic', 'subscription', 'renderer'):
             " > {:<16}",
             founder_uids.last().expect("actual last founder")
         )));
-        assert_eq!(host.port().snapshot_hub().latest().world.tick, observed_tick);
+        assert_eq!(
+            host.port().snapshot_hub().latest().world.tick,
+            observed_tick
+        );
         assert_eq!(host.port().world_digests().expect("owner digests"), digest);
     }
 
@@ -16739,8 +16764,7 @@ for case in ('panic', 'subscription', 'renderer'):
             let mut simulator = ftui::runtime::ProgramSimulator::new(
                 LiveTerminalModel::new(app).expect("actual live palette model"),
             );
-            let text =
-                frankentui_shell::buffer_to_string(simulator.capture_frame(width, height));
+            let text = frankentui_shell::buffer_to_string(simulator.capture_frame(width, height));
             let (row, column) = text
                 .lines()
                 .enumerate()
@@ -16875,7 +16899,11 @@ for case in ('panic', 'subscription', 'renderer'):
                 "6",
                 ShellRoute::Experiments,
             ),
-            (CommandPaletteAction::NavigateReplay, "7", ShellRoute::Replay),
+            (
+                CommandPaletteAction::NavigateReplay,
+                "7",
+                ShellRoute::Replay,
+            ),
             (
                 CommandPaletteAction::NavigateEnvironment,
                 "8",

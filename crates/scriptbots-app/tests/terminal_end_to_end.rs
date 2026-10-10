@@ -57,6 +57,12 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         assert_eq!(observation["raw_mode_observed"], true);
         assert_eq!(observation["terminal_attributes_restored"], true);
         assert_eq!(observation["alternate_screen_restored"], true);
+        assert_eq!(observation["cursor_hidden_observed"], true);
+        assert_eq!(observation["cursor_visible_at_exit"], true);
+        assert_eq!(
+            observation["enabled_capture_modes_at_exit"],
+            serde_json::json!([])
+        );
         assert_eq!(observation["frankentui_shutdown_observed"], true);
         assert_eq!(observation["binary_source_observed"], true);
         assert_eq!(
@@ -142,6 +148,9 @@ class TerminalScreen:
         self.alternate = False
         self.alternate_entered = self.alternate_left = False
         self.synchronized = False
+        self.cursor_visible = True
+        self.cursor_hidden_observed = self.cursor_show_observed = False
+        self.enabled_capture_modes = set()
         self.color_count = self.truecolor_count = self.attribute_count = 0
         self.pending = ''
         self.decoder = codecs.getincrementaldecoder('utf-8')('strict')
@@ -212,8 +221,17 @@ class TerminalScreen:
             assert set(modes) <= allowed, 'unsupported terminal mode: ' + parameters + final
             for mode in modes:
                 enabled = final == 'h'
+                if mode not in (7, 25):
+                    if enabled:
+                        self.enabled_capture_modes.add(mode)
+                    else:
+                        self.enabled_capture_modes.discard(mode)
                 if mode == 7:
                     self.autowrap = enabled
+                elif mode == 25:
+                    self.cursor_visible = enabled
+                    self.cursor_hidden_observed |= not enabled
+                    self.cursor_show_observed |= enabled
                 elif mode == 1049:
                     self.alternate = enabled
                     if enabled:
@@ -649,6 +667,9 @@ for profile in ('truecolor', 'no-color'):
             assert process.returncode == 0, process.returncode
             assert restored, 'termios attributes were not restored'
             assert alternate_restored, 'alternate screen was not restored'
+            assert screen.cursor_hidden_observed, 'actual cursor hiding was not observed'
+            assert screen.cursor_show_observed and screen.cursor_visible, 'cursor was not visible after quit'
+            assert not screen.enabled_capture_modes, 'capture modes remained enabled after quit'
             assert binary_source == source, 'actual child build source was not observed'
             if profile == 'truecolor':
                 assert screen.truecolor_count > 0, 'actual truecolor SGR was not emitted'
@@ -683,6 +704,9 @@ for profile in ('truecolor', 'no-color'):
                       'exit_code': process.returncode, 'raw_mode_observed': raw_mode,
                       'terminal_attributes_restored': restored,
                       'alternate_screen_restored': alternate_restored,
+                      'cursor_hidden_observed': screen.cursor_hidden_observed,
+                      'cursor_visible_at_exit': screen.cursor_show_observed and screen.cursor_visible,
+                      'enabled_capture_modes_at_exit': sorted(screen.enabled_capture_modes),
                       'frankentui_shutdown_observed': finalized,
                       'runtime_log_sha256': hashlib.sha256(lifecycle_bytes).hexdigest(),
                       'transcript_sha256': hashlib.sha256(raw).hexdigest(),
