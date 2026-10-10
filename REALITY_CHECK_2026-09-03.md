@@ -10,7 +10,7 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-10
 
-The source changes through saved commit `b49008cc6170b6032bd0fe3e30ebbb9ff2cbd22a`
+The source changes through saved commit `cdab86aefa3ddb705727805a18dde5ee502f414f`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
 consumer finding below describes the initial audited source, not this newer candidate.
@@ -49,15 +49,31 @@ steps complete and zero tests run. Its complete proof is retained at
 `/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-69bdeb60-r34-hz3`;
 Clippy log SHA256 is `5ace159221c6c6113dbd9aedf1f8151f8c0df543e012198630393c8f5ede21b9`.
 
-The current `b49008cc` fixes that borrow and the original-acceptance gap where a queued Pending
+`b49008cc` fixes that borrow and the original-acceptance gap where a queued Pending
 overlay hid an earlier final result. One active request now retains its exact receipt through
 positive final presentation before the next request can dispatch. Bounded-history eviction pins
 that receipt; actual checkpoint catalog ID/tick content survives another queued `k` and reduced
 rendering. Independent source review finds no further material original terminal blocker.
 Source review and the static precursor scan (zero critical, 2,628 warnings, 575 informational)
-are not native qualification. Fresh R36 terminal and R37 workspace profiles are being prepared;
-R30/R31/R33/R35 were held and never launched. No original acceptance, golden, budget, timeout or
-strict artifact consumer was weakened.
+are not native qualification. R36 fails formatting with zero tests; `264be78f` applies its exact
+formatting diff. R38 at that source passes strict workspace Clippy/check and 218 runtime tests,
+but terminal tests report 309 passed and three failed. All three actual fault PTYs positively
+present, observe their fault and restore. Total: 527 passed, three failed, six existing ignored;
+typed failed/1, nine of fourteen gates complete. E2E, smoke, manifests, analyzer and final strict
+consumer are not reached. All 67 retained proof files independently match their remote hashes at
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/terminal-20261010-264be78f-r38-hz3`.
+
+Independent review identifies three assertion-observation defects: an unbroken string cannot
+match a physically wrapped receipt; an active Pending receipt uses its complete authoritative
+summary; and an application-only wait does not establish journal finality. Test-only `cdab86ae`
+checks the exact physical footer row window and candidate payload, rejects a corrupted glyph,
+checks the complete active Pending receipt, and uses the existing final-journal helper with its
+unchanged deadline. Correct wrapped/active/eventually finalized observations are admitted;
+wrong IDs/status, corrupted cells, incomplete frames and unfinished journals remain rejected.
+No product capability is credited to this correction. Pinned R40 terminal is executing at that
+source; R41 workspace remains held. R30/R31/R33/R35/R37/R39 never launched. Original acceptance,
+goldens, 16-ms budget, timeouts, gate rosters, dependencies and strict artifact consumer remain
+unchanged.
 
 Checked items below name implementation or observations at their stated boundary. They do
 not close a containing Bead. This checklist answers the user's explicit request and retires
@@ -111,6 +127,11 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Add real-owner mixed-history saturation, skipped/tiny-frame and release-positive controls.
 - [x] Correct R34's mutable-borrow error and the new field-borrow overlap without changing guards.
 - [x] Review every frozen source hunk, obtain independent source review and retain a source bundle.
+- [x] Read back failed R36/R38 commands, typed verdicts and raw logs; independently match all
+  67 R38 proof-file hashes and preserve each failed assertion and fault observation.
+- [x] Independently review the three observation repairs and publish their admission/rejection
+  split without changing production code, timeouts or acceptance.
+- [ ] Complete R40 at `cdab86ae`; source review and partial R38 successes do not qualify it.
 - [ ] Execute new checkpoint stream ordering and own Shutdown PTY/readback at the final SHA.
 - [ ] Observe current full/reduced final receipts, history saturation and ordinary sequencing.
 - [ ] Execute pending/checkpoint/cancellation/alternation/overlay guards at the final SHA.
@@ -133,6 +154,13 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [ ] Resolve the existing coordinated push hold and publish main plus its legacy mirror.
 - [ ] Resume authoritative ready-work triage after these original integration blockers clear.
 - [x] Claim original `bd-g6wf` after reading its complete latency acceptance and committed harness.
+- [x] Bank independently reviewed test-only `87e9f4e2`: HTTP200/SSE attachment, complete-record
+  counters, observed client lifetime/errors, real-server 404 negative and raw timing/population
+  output. Static scan exits zero (zero critical, 46 warning, 35 informational findings).
+- [ ] Qualify the harness repair that observes every actual HTTP/SSE attachment, complete events,
+  errors and connection lifetime rather than silently counting requested clients.
+- [ ] Retain all raw latency samples, declared versus actual timing denominators, and observed
+  phase-boundary populations; do not claim initial population persists throughout the run.
 - [ ] Review its minimal external clean-main DSR profile and actual native machine identity.
 - [ ] Execute the exact ignored 1,000-agent test after terminal/workspace qualification releases
   the worker; retain the original 2× available-parallelism SSE load and unchanged bounds.
@@ -207,6 +235,20 @@ Disposition: stale claims corrected and disclosed in place; automatic temporary 
 with retained-cleanup execution as the countermeasure. Proof-class inflation, golden regeneration,
 gate self-weakening and machinery drift remain forbidden. No older-session CASS search is claimed
 for this bounded inventory. This worksheet remains inside the requested report, not a new system.
+
+Later execution note: R36 and R38 failed as recorded above; `cdab86ae` is test-observation
+maintenance, independently reviewed before a fresh unchanged native lane. The latest static
+scan of terminal and latency source exits zero with zero critical, 2,379 warning and 572
+informational findings; compiler phases were explicitly not evaluated. The latency changes
+remain unqualified. An agent's first hardware probe accidentally requested an unpinned March
+nightly and triggered rustup installation; it changed no project source or tests, was stopped
+as a workflow, and the installed files remain. Later probes use the existing pinned August
+toolchain binaries without installation. This is an execution deviation, not capability work.
+The final latency-source static scan is separate: zero critical, 46 warnings and 35 informational
+findings, all read and triaged as test assertions/expected panics, guarded indexing, required
+histogram output and existing scoped conversions; no suppression was added. Completed SSE records
+are counted, not certified as arbitrary valid UTF8/JSON payloads. Individual during-load event
+counts may be zero inside the unchanged request window and remain visible in raw output.
 
 This refresh supersedes the October 8 assessment where current source or later retained evidence
 differs. The October 9 implementation and failure records below remain intact. In particular,

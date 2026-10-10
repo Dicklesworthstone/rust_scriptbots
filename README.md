@@ -147,8 +147,9 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
   and exact final-result presentation before the next request; checkpoint details survive
   reduced rendering and queued input. Native acceptance remains open under `bd-2z0.6.8` and
   `bd-dkd9`. R28 passed 309 terminal tests and all three fault PTYs, then failed the executable
-  observer before app launch. The subsequent R34 stopped at a borrow error with zero tests;
-  repaired `b49008cc` requires fresh native qualification.
+  observer before app launch. R38 later passed strict workspace Clippy/check and 527 tests but
+  failed three terminal assertions. Their independently reviewed observation repair at
+  `cdab86ae` requires fresh complete native qualification.
   See [the current implementation and TODO](REALITY_CHECK_2026-09-03.md) for exact revisions,
   retained evidence and remaining qualification.
 - `scriptbots-brain`: MLP and DWRAON implementations are enabled by default; Assembly remains experimental; registry wiring is present.

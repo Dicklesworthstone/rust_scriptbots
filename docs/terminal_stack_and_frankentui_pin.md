@@ -53,7 +53,7 @@ This document specifies the exact terminal stack modernization and FrankenTUI de
 
 ## 3. Current runtime and qualification
 
-- Source through `b49008cc` stages bounded commands and checkpoint requests until their
+- Source through `cdab86ae` stages bounded commands and checkpoint requests until their
   complete pending identity is visible in a successfully presented frame. Skipped frames,
   insufficient frame size and write failure cannot authorize dispatch. Quit and shutdown
   cancel requests that have not reached the owner.
@@ -71,8 +71,12 @@ This document specifies the exact terminal stack modernization and FrankenTUI de
   strict Clippy, 218 runtime tests and 309 terminal tests. All three actual fault PTYs
   select reduced detail, positively present, trigger their fault and restore. The executable
   observer then fails before app launch on builtin Python module identity. R32 fails formatting
-  and R34 fails Clippy with zero tests. Current observer and receipt repairs require fresh
-  complete native acceptance; injected simulator callbacks do not prove terminal writes.
+  and R34 fails Clippy with zero tests. R36 fails formatting; R38 passes strict Clippy/check,
+  218 runtime and 309 terminal tests, but three terminal assertions fail. Independent review
+  corroborates their physical-wrap, active-Pending and journal-finality observation defects;
+  test-only `cdab86ae` retains wrong-ID, corrupted-cell and unfinished-journal negatives.
+  R40 is executing; full native acceptance remains open. Injected simulator callbacks do not
+  prove terminal writes.
 - Linux/unwind production-stack test children do not establish release-abort recovery or
   the separate full storm/TERM/locale/color/signal matrix under `bd-2z0.14.3.5.2`.
 - [The current reality check](../REALITY_CHECK_2026-09-03.md) keeps the granular TODO,

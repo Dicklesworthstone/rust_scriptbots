@@ -40,15 +40,21 @@ Passing server runs do not close the intermittent storage/journal latency invest
 Original owners `bd-2z0.6.8`, `bd-dkd9` and `bd-2z0.5.13` remain open. The current
 execution checklist is the October 10 implementation section of
 `REALITY_CHECK_2026-09-03.md`; it distinguishes saved source from executed qualification.
-The live FrankenTUI runtime/providers are connected through `b49008cc`. R28 at
+The live FrankenTUI runtime/providers are connected through `cdab86ae`. R28 at
 `f2b0748a3c4208f423d9d6bf894835ad0347f74b` passes strict workspace Clippy/check, 218 runtime
 and 309 terminal tests; all three actual fault PTYs select reduced detail, present, trigger
 their fault and restore. Its executable observer fails before app launch on Python builtin
 module identity, so only ten of fourteen gates complete. R32 fails formatting; R34 at
 `69bdeb60` fails Clippy on a mutable-borrow error; neither runs tests. Current source repairs
 that error, observer portability/framing, own Shutdown final presentation and ordinary queued
-final-result visibility/history retention. R36 terminal and R37 workspace retain the original
-gates, 16-ms budget and strict artifact consumer; final-source qualification remains pending.
+final-result visibility/history retention. R36 fails formatting with zero tests; its exact
+formatting repair produces `264be78f`. R38 passes strict workspace Clippy/check and 218 runtime
+tests but fails three terminal assertions (309 pass); all three fault PTYs present, trigger and
+restore. Its complete raw proof is retained. Independently reviewed test-only `cdab86ae` corrects
+physical wrapping, authoritative Pending content and final journal observation; corrupted output,
+wrong IDs and incomplete journal negatives remain. R40 is executing with the original fourteen
+gates, 16-ms budget and strict consumer; R41 workspace is held. Final-source qualification is
+pending, with no product credit from test-observation maintenance.
 
 External resets at 07:38, 13:40 and 13:50 UTC were recovered by non-destructive fast-forward;
 source/tracker/proofs are retained outside the shared checkout and active edits now use an
