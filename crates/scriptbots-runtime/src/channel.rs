@@ -433,7 +433,8 @@ impl ChannelHostPort {
         max_contributors: usize,
         deadline: Instant,
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
-        self.bounded_before(deadline)?.inspect_agent(uid, max_contributors)
+        self.bounded_before(deadline)?
+            .inspect_agent(uid, max_contributors)
     }
 
     /// Query the owner's debug rows, preserving the query's filters and limit.
@@ -2597,7 +2598,10 @@ mod tests {
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
-            driver.receiver.try_recv().expect("actual inspector ingress"),
+            driver
+                .receiver
+                .try_recv()
+                .expect("actual inspector ingress"),
             IngressMessage::AgentInspection { .. }
         ));
         let request = BrainProjectionRequest::focused(
@@ -2622,7 +2626,9 @@ mod tests {
         let (driver, port) =
             ChannelHostDriver::new(test_host(true), fast_options()).expect("driver");
         let deadline = Instant::now() + Duration::from_millis(20);
-        let bounded = port.bounded_before(deadline).expect("initial caller budget");
+        let bounded = port
+            .bounded_before(deadline)
+            .expect("initial caller budget");
         while Instant::now() < deadline {
             std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
         }

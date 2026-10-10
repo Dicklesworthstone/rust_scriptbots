@@ -1749,10 +1749,7 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn submit_with_visible_receipt(&mut self, command: ControlCommand) -> Option<String> {
-        self.submit_with_visible_receipt_before(
-            command,
-            Instant::now() + Duration::from_millis(5),
-        )
+        self.submit_with_visible_receipt_before(command, Instant::now() + Duration::from_millis(5))
     }
 
     fn submit_with_visible_receipt_before(
@@ -1953,8 +1950,7 @@ impl<'a> TerminalApp<'a> {
             .zip(world.agent_selection.iter())
             .enumerate()
             .find(|(_, (agent, state))| {
-                pending.update.agent_ids.contains(&agent.id)
-                    && **state == SelectionState::Selected
+                pending.update.agent_ids.contains(&agent.id) && **state == SelectionState::Selected
             })
             .map(|(index, _)| index);
         let cleared = pending.update.mode == SelectionMode::Clear
@@ -6587,9 +6583,7 @@ impl<'a> TerminalApp<'a> {
                     Ok(projection) => {
                         let coherent = projection.source.matches_snapshot(&world);
                         let cache = TerminalBrainInspectionCache::from_projection(
-                            projection,
-                            &world,
-                            agent_uid,
+                            projection, &world, agent_uid,
                         );
                         if coherent {
                             next_inspection_cache = Some(cache.clone());
@@ -16128,7 +16122,10 @@ mod tests {
     fn terminal_manual_driver(
         world: SharedWorld,
         ingress_capacity: usize,
-    ) -> (scriptbots_runtime::channel::ChannelHostDriver, ChannelHostPort) {
+    ) -> (
+        scriptbots_runtime::channel::ChannelHostDriver,
+        ChannelHostPort,
+    ) {
         let world = Arc::try_unwrap(world)
             .unwrap_or_else(|_| panic!("manual driver takes sole world ownership"))
             .into_inner()
@@ -16162,7 +16159,8 @@ mod tests {
         use ftui::core::event::{Event, KeyCode, KeyEvent, Modifiers};
         use scriptbots_runtime::ManualInstant;
 
-        for (expired_before_enqueue, full_ingress) in [(true, false), (false, false), (false, true)] {
+        for (expired_before_enqueue, full_ingress) in [(true, false), (false, false), (false, true)]
+        {
             let ingress_capacity = if full_ingress {
                 1
             } else {
@@ -16186,10 +16184,7 @@ mod tests {
                     )
                     .expect_err("the quiescent owner's read reply times out");
                 assert!(
-                    matches!(
-                        lookup_error,
-                        HostAccessError::CommandAuthorityLookup { .. }
-                    ),
+                    matches!(lookup_error, HostAccessError::CommandAuthorityLookup { .. }),
                     "{lookup_error:?}"
                 );
             }
@@ -16288,10 +16283,7 @@ mod tests {
             assert_eq!(receipt.control_revision, 1);
             assert_eq!(receipt.scientific_revision, 1);
             let status = port
-                .command_status_before(
-                    original.command_id,
-                    Instant::now() + Duration::from_secs(1),
-                )
+                .command_status_before(original.command_id, Instant::now() + Duration::from_secs(1))
                 .expect("real mirrored command status")
                 .expect("the original identity remains authoritative");
             assert_eq!(status.admission_sequence().expect("one admission").get(), 1);
