@@ -132,6 +132,13 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [ ] Review immutable source/doc/tracker hunks and commit separate synchronized exports.
 - [ ] Resolve the existing coordinated push hold and publish main plus its legacy mirror.
 - [ ] Resume authoritative ready-work triage after these original integration blockers clear.
+- [x] Claim original `bd-g6wf` after reading its complete latency acceptance and committed harness.
+- [ ] Review its minimal external clean-main DSR profile and actual native machine identity.
+- [ ] Execute the exact ignored 1,000-agent test after terminal/workspace qualification releases
+  the worker; retain the original 2× available-parallelism SSE load and unchanged bounds.
+- [ ] Read back actual p50/p95/p99, zero request failures, SSE liveness and same-invocation
+  baseline/loaded TPS; record typed results and source-bound raw evidence on `bd-g6wf`/`bd-134`.
+- [ ] Remediate any failed original latency/throughput bound in source before claiming acceptance.
 
 Simulator presentation callbacks remain explicit injected branch observations. They do not
 prove terminal serialization or runtime-selected degradation. Real service and file-backed

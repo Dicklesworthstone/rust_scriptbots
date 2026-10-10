@@ -324,6 +324,13 @@ persistence boundary with host journal, command and schedule state; restore that
 and start replay at its saved tick. Preserve corruption/first-divergence controls and tick-zero
 replay. Core persistence-disabled checkpoints alone do not complete this task.]
 
+[Currently In Progress — `bd-g6wf`, LilacElm, 2026-10-10: execute the existing ignored
+control-plane latency acceptance through a clean, source-pinned native DSR profile after the
+terminal/workspace qualification releases the worker. Preserve 1,000 agents, 2× available-
+parallelism SSE clients, zero summary failures, p95 <50 ms and throughput degradation <10%.
+Retain same-invocation baseline/loaded TPS, raw histograms and actual machine/source identities;
+no latency result has been observed yet.]
+
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
 
 **Persistence decision (2026-07-11):** FrankenSQLite is the only embedded database backend. The former DuckDB architecture is retired in full; no dual-backend abstraction, compatibility shim, or legacy file migration is retained. The migration is complete only when source, manifests, lockfile, tests, CLI/help, CI, and active documentation all use the exact-revision `fsqlite` public facade and a repository-wide search finds no live DuckDB integration.
