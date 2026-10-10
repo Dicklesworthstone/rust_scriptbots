@@ -16924,7 +16924,9 @@ for case in ('panic', 'subscription', 'renderer'):
 
     #[test]
     fn skipped_palette_candidate_cannot_install_unshown_mouse_action() {
-        use ftui::core::event::{Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+        use ftui::core::event::{
+            Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind,
+        };
 
         let host = TerminalTestHost::take(command_characterization_world());
         let before = host.port().world_digests().expect("initial owner digests");
@@ -16999,7 +17001,10 @@ for case in ('panic', 'subscription', 'renderer'):
         }
         let app = simulator.model().app.borrow();
         assert!(!app.palette_open, "the same row works after presentation");
-        assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::Diagnostics);
+        assert_eq!(
+            app.frankentui.route,
+            frankentui_shell::ShellRoute::Diagnostics
+        );
         assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
         assert_eq!(host.port().world_digests().expect("owner digests"), before);
     }
@@ -17047,7 +17052,10 @@ for case in ('panic', 'subscription', 'renderer'):
         }
         let app = simulator.model().app.borrow();
         assert!(app.palette_open);
-        assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::Dashboard);
+        assert_eq!(
+            app.frankentui.route,
+            frankentui_shell::ShellRoute::Dashboard
+        );
         assert!(app.frankentui.receipts.is_empty());
         assert_eq!(host.port().snapshot_hub().latest().world.tick, 0);
         assert_eq!(host.port().world_digests().expect("owner digests"), before);

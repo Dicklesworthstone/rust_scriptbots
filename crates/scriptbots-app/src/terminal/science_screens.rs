@@ -658,11 +658,14 @@ pub fn render_brain_arena_screen(
                 let content_end = u32::from(frame.height().saturating_sub(SHELL_FOOTER_ROWS));
                 let rows = (y_start.saturating_add(7)..content_end).take(SCIENCE_TABLE_ROWS);
                 let visible_rows = rows.clone().count();
-                let cohorts = data
-                    .family_breakdown
-                    .iter()
-                    .enumerate()
-                    .skip(first_visible_table_index(data.selected_family_index, visible_rows));
+                let cohorts =
+                    data.family_breakdown
+                        .iter()
+                        .enumerate()
+                        .skip(first_visible_table_index(
+                            data.selected_family_index,
+                            visible_rows,
+                        ));
                 for (row, (idx, cohort)) in rows.zip(cohorts) {
                     let cursor = if idx == data.selected_family_index {
                         ">"
@@ -787,7 +790,10 @@ pub fn render_experiments_screen(
                     .active_arms
                     .iter()
                     .enumerate()
-                    .skip(first_visible_table_index(data.selected_arm_index, visible_rows));
+                    .skip(first_visible_table_index(
+                        data.selected_arm_index,
+                        visible_rows,
+                    ));
                 for (row, (idx, arm)) in rows.zip(arms) {
                     let cursor = if idx == data.selected_arm_index {
                         ">"
@@ -899,11 +905,14 @@ pub fn render_replay_screen(
                 let content_end = u32::from(frame.height().saturating_sub(SHELL_FOOTER_ROWS));
                 let rows = (y_start.saturating_add(7)..content_end).take(SCIENCE_TABLE_ROWS);
                 let visible_rows = rows.clone().count();
-                let checkpoints = data
-                    .checkpoints
-                    .iter()
-                    .enumerate()
-                    .skip(first_visible_table_index(data.selected_checkpoint_index, visible_rows));
+                let checkpoints =
+                    data.checkpoints
+                        .iter()
+                        .enumerate()
+                        .skip(first_visible_table_index(
+                            data.selected_checkpoint_index,
+                            visible_rows,
+                        ));
                 for (row, (idx, cp)) in rows.zip(checkpoints) {
                     let cursor = if idx == data.selected_checkpoint_index {
                         ">"
