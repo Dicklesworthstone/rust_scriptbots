@@ -640,7 +640,7 @@ def check_parser_guards():
             raise AssertionError('parser accepted negative control: ' + name)
     # Synthetic controls discriminate only the ordering observer. They do not
     # count as live checkpoint or terminal lifecycle observations.
-    pending = '[PENDING] id=checkpoint-request-1 CreateCheckpoint'
+    pending = '[PENDING] journal=unobserved CreateCheckpoint: awaiting execution id=checkpoint-request-1'
     applied = '[APPLIED] journal=unobserved CreateCheckpoint: applied id=checkpoint-request-1'
     def receipt_update(marker):
         return b'\x1b[2J\x1b[H' + marker.encode() + b'\x1b[0m'
@@ -664,7 +664,11 @@ def check_parser_guards():
     reduced_watch.observe(applied + ' (reduced detail)', 2)
     reduced_watch.verify()
     for name, updates in [('missing-pending', [applied]), ('reversed-order', [applied, pending]),
-                          ('wrong-identity', [pending.replace('request-1', 'request-2'), applied])]:
+                          ('wrong-identity', [pending.replace('request-1', 'request-2'), applied]),
+                          ('wrong-action', [pending.replace('CreateCheckpoint', 'Shutdown'), applied]),
+                          ('wrong-journal', [pending.replace('journal=unobserved', 'journal=durable'), applied]),
+                          ('incomplete-pending', [pending.rsplit(' id=', 1)[0], applied]),
+                          ('pending-with-stale-suffix', [pending + ' host result', applied])]:
         parser = TerminalScreen(120, 3)
         watch = ReceiptStreamWatch(pending, applied)
         parser.stream_observer = watch.observe
@@ -990,7 +994,8 @@ for profile in profiles:
                 before_ids = {item['checkpoint_id'] for item in catalog_before['items']}
                 checkpoint_receipt = '[APPLIED] journal=unobserved CreateCheckpoint: applied id=checkpoint-request-1'
                 checkpoint_watch = ReceiptStreamWatch(
-                    '[PENDING] id=checkpoint-request-1 CreateCheckpoint', checkpoint_receipt)
+                    '[PENDING] journal=unobserved CreateCheckpoint: awaiting execution id=checkpoint-request-1',
+                    checkpoint_receipt)
                 screen.stream_observer = checkpoint_watch.observe
                 send_terminal_input(b'k')
                 def checkpoint_created():
@@ -1374,13 +1379,13 @@ for profile in profiles:
                 def observe_shutdown(text, offset):
                     if shutdown_holder['watch'] is None:
                         matches = [match for row in text.splitlines()
-                                   if (match := re.fullmatch(r'\[PENDING\] id=(\S+) Shutdown(?: \(reduced detail\))?', row.rstrip()))]
+                                   if (match := re.fullmatch(r'\[PENDING\] journal=unobserved Shutdown: awaiting execution id=(\S+)(?: \(reduced detail\))?', row.rstrip()))]
                         assert len(matches) <= 1, 'ambiguous own Shutdown receipt'
                         if matches:
                             command_id = matches[0][1]
                             shutdown_holder['command_id'] = command_id
                             shutdown_holder['watch'] = ReceiptStreamWatch(
-                                '[PENDING] id=' + command_id + ' Shutdown',
+                                '[PENDING] journal=unobserved Shutdown: awaiting execution id=' + command_id,
                                 '[DURABLE] journal=durable Shutdown: applied id=' + command_id)
                     if shutdown_holder['watch'] is not None:
                         shutdown_holder['watch'].observe(text, offset)
