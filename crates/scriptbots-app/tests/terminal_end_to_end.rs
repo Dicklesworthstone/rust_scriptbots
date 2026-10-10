@@ -33,10 +33,12 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         .args(["-c", LIVE_TERMINAL_PTY_PROBE])
         .arg(env!("CARGO_BIN_EXE_scriptbots-app"))
         .arg(option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable"))
+        .arg("quit")
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    println!("{stdout}");
+    // Keep the first JSON record separate from libtest's progress prefix.
+    println!("\n{stdout}");
     assert!(
         output.status.success(),
         "actual PTY probe failed: {}\n{stdout}\n{stderr}",
@@ -192,12 +194,91 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn live_palette_shutdown_serializes_its_durable_receipt_before_restoration() -> Result<()> {
+    // ubs:ignore[rust.security.shell-command] — fixed Python probe; variable input is separate argv.
+    let output = std::process::Command::new("python3")
+        .args(["-c", LIVE_TERMINAL_PTY_PROBE])
+        .arg(env!("CARGO_BIN_EXE_scriptbots-app"))
+        .arg(option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable"))
+        .arg("shutdown")
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("\n{stdout}");
+    assert!(
+        output.status.success(),
+        "actual palette Shutdown probe failed: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    let observations: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(observations.len(), 1);
+    let observation = &observations[0];
+    assert_eq!(observation["schema"], "scriptbots.live-tui-shutdown-pty.v1");
+    assert_eq!(observation["exit_code"], 0);
+    assert_eq!(observation["terminal_attributes_restored"], true);
+    assert_eq!(observation["alternate_screen_restored"], true);
+    assert_eq!(observation["cursor_visible_at_exit"], true);
+    assert_eq!(
+        observation["enabled_capture_modes_at_exit"],
+        serde_json::json!([])
+    );
+    let shutdown = &observation["shutdown_evidence"];
+    assert_eq!(shutdown["observation_kind"], "decoded_terminal_cells");
+    let pending_offset = shutdown["pending"]["stream_byte_offset"].as_u64().unwrap();
+    let durable_offset = shutdown["applied"]["stream_byte_offset"].as_u64().unwrap();
+    let restoration_offset = shutdown["alternate_leave_stream_prefix_length"]
+        .as_u64()
+        .unwrap();
+    assert!(0 < pending_offset && pending_offset < durable_offset);
+    assert!(durable_offset <= restoration_offset);
+    let id: scriptbots_runtime::CommandId = serde_json::from_value(shutdown["command_id"].clone())?;
+    let database = std::path::Path::new(
+        shutdown["database"]
+            .as_str()
+            .expect("actual retained run database"),
+    );
+    let reader = StorageReader::open_finished(database.to_str().unwrap())?;
+    let sessions = reader.host_journal_sessions()?;
+    assert_eq!(sessions.len(), 1);
+    let record = reader.command_journal_record(sessions[0], id)?;
+    assert!(matches!(
+        record.lifecycle.envelope().command,
+        scriptbots_runtime::HostCommand::Shutdown
+    ));
+    assert_eq!(record.lifecycle.envelope().command_id, id);
+    assert!(record.lifecycle.is_applied_shutdown());
+    assert_eq!(
+        record.terminal_boundary.tick.0,
+        observation["byte_input_resize_evidence"]["after_owner"]["tick"]
+            .as_u64()
+            .expect("observed paused owner tick")
+    );
+    reader.close()?;
+    println!(
+        "\n{}",
+        serde_json::json!({
+            "schema": "scriptbots.live-tui-shutdown-readback.v1",
+            "source_commit": option_env!("SCRIPTBOTS_SOURCE_REVISION").unwrap_or("unavailable"),
+            "database": database, "session_id": sessions[0],
+            "command": record.lifecycle.envelope(),
+            "archive_payload_digest": record.archive_payload_digest,
+        })
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 const LIVE_TERMINAL_PTY_PROBE: &str = r#"
 import codecs, fcntl, hashlib, json, os, pathlib, pty, re, select, signal
 import socket, struct, subprocess, sys, tempfile, termios, time, urllib.error, urllib.request
 import unicodedata
 
-binary, source = sys.argv[1:]
+binary, source, exit_action = sys.argv[1:]
+assert exit_action in ('quit', 'shutdown'), 'undeclared terminal exit journey'
 routes = [
     ('4', 'LINEAGES & PHYLOGENY LAB'),
     ('5', 'BRAIN ARENA & EVALUATOR COHORTS'),
@@ -460,7 +541,7 @@ class ReceiptStreamWatch:
         rows = [row.rstrip() for row in text.splitlines()]
         for state, marker in self.markers.items():
             matches = (marker in rows or (state == 'applied' and ' ' + marker in rows)
-                       or (state == 'pending' and marker + ' (reduced detail)' in rows))
+                       or marker + ' (reduced detail)' in rows)
             if state not in self.observations and matches:
                 self.observations[state] = {'receipt': marker, 'stream_byte_offset': offset,
                                             'terminal_text': text}
@@ -578,6 +659,10 @@ def check_parser_guards():
             watch.verify()
             assert parser.parsed_bytes == len(combined)
             assert watch.observations['pending']['stream_byte_offset'] == len(prefix + updates[0])
+    reduced_watch = ReceiptStreamWatch(pending, applied)
+    reduced_watch.observe(pending + ' (reduced detail)', 1)
+    reduced_watch.observe(applied + ' (reduced detail)', 2)
+    reduced_watch.verify()
     for name, updates in [('missing-pending', [applied]), ('reversed-order', [applied, pending]),
                           ('wrong-identity', [pending.replace('request-1', 'request-2'), applied])]:
         parser = TerminalScreen(120, 3)
@@ -599,12 +684,37 @@ python_identity = {'executable': os.path.realpath(sys.executable), 'version': sy
                    'platform': sys.platform, 'unicode_version': unicodedata.unidata_version,
                    'stdlib_modules': {}}
 python_identity['executable_sha256'] = hashlib.sha256(pathlib.Path(python_identity['executable']).read_bytes()).hexdigest()
+# Built-in and frozen modules originate in the interpreter, not a module file
+# (PEP 451). Keep its entry-point identity and any actually mapped libpython
+# images; a shared build must not masquerade as an executable-only interpreter.
+interpreter_libraries = set()
+for mapping in pathlib.Path('/proc/self/maps').read_text().splitlines():
+    fields = mapping.split(None, 5)
+    if len(fields) == 6 and fields[5].startswith('/'):
+        path = pathlib.Path(fields[5].removesuffix(' (deleted)'))
+        if re.fullmatch(r'libpython[0-9.]+[a-z]*\.so(?:\.[0-9]+)*', path.name):
+            assert not fields[5].endswith(' (deleted)'), 'mapped interpreter library has been deleted'
+            interpreter_libraries.add(path.resolve(strict=True))
+python_identity['mapped_interpreter_libraries'] = [
+    {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    for path in sorted(interpreter_libraries)]
 for module in (pty, termios, fcntl, codecs, unicodedata):
-    module_path = pathlib.Path(module.__file__).resolve()
+    spec = module.__spec__
+    assert spec is not None and spec.name == module.__name__, 'module lacks its import identity'
+    if spec.origin in ('built-in', 'frozen'):
+        assert not spec.has_location, 'interpreter module unexpectedly declares a file location'
+        module_path = pathlib.Path(python_identity['executable'])
+        carrier = 'interpreter-entry-point'
+    else:
+        assert spec.has_location and spec.origin == module.__file__, 'module file disagrees with its import origin'
+        module_path = pathlib.Path(module.__file__).resolve(strict=True)
+        carrier = 'module-file'
     python_identity['stdlib_modules'][module.__name__] = {
+        'origin': spec.origin, 'code_carrier_kind': carrier,
         'path': str(module_path), 'sha256': hashlib.sha256(module_path.read_bytes()).hexdigest()}
 
-for profile in ('truecolor', 'no-color'):
+profiles = ('truecolor', 'no-color') if exit_action == 'quit' else ('truecolor',)
+for profile in profiles:
     directory = pathlib.Path(tempfile.mkdtemp(prefix='live-tui-' + profile + '-'))
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
@@ -621,6 +731,10 @@ for profile in ('truecolor', 'no-color'):
                        SCRIPTBOTS_CONTROL_REST_ADDR='127.0.0.1:' + str(port),
                        SCRIPTBOTS_TERMINAL_LOG=str(directory / 'runtime.log'),
                        RUST_LOG='scriptbots::terminal=info', TERM='xterm-256color')
+    storage_mode = 'memory'
+    if exit_action == 'shutdown':
+        storage_mode = 'file'
+        environment['SCRIPTBOTS_STORAGE_PATH'] = str(directory / 'shutdown.sqlite')
     if profile == 'no-color':
         environment['NO_COLOR'] = '1'
         environment.pop('COLORTERM', None)
@@ -637,6 +751,7 @@ for profile in ('truecolor', 'no-color'):
     binary_source = None
     data_provider_evidence = None
     interaction_evidence = None
+    shutdown_evidence = None
     interaction_artifacts = []
     interaction_events = []
     interaction_log_bytes = 0
@@ -661,7 +776,7 @@ for profile in ('truecolor', 'no-color'):
         interaction_events.append(event)
     with open(directory / 'stderr.log', 'xb') as log:
         process = subprocess.Popen(
-            [binary, '--storage', 'memory', '--bootstrap-ticks', '0', '--threads', '1',
+            [binary, '--storage', storage_mode, '--bootstrap-ticks', '0', '--threads', '1',
              '--set', 'world_width=100', '--set', 'world_height=100',
              '--set', 'food_cell_size=50', '--set', 'population_minimum=0',
              '--set', 'persistence_interval=0', '--checkpoint-interval', '0'],
@@ -1243,7 +1358,34 @@ for profile in ('truecolor', 'no-color'):
                                              if event['kind'] in ('observed_resize', 'observed_arrow',
                                                                   'observed_mouse_navigation')])}
             retain_interaction('interaction-results.json', json.dumps(interaction_evidence, sort_keys=True).encode())
-            send_terminal_input(b'q')
+            if exit_action == 'quit':
+                send_terminal_input(b'q')
+            else:
+                send_terminal_input(b'\x10')
+                capture_interaction('shutdown-palette-open', palette_title,
+                                    lambda text: selected_palette_row(text) is not None)
+                send_terminal_input(b'Shutdown and Exit Simulation')
+                shutdown_title = 'Command Palette: "Shutdown and Exit Simulation"'
+                shutdown_item = '[System] Shutdown and Exit Simulation'
+                capture_interaction('shutdown-palette-target', shutdown_title,
+                                    lambda text: selected_palette_row(text) is not None
+                                    and shutdown_item in selected_palette_row(text)[1])
+                shutdown_holder = {'watch': None}
+                def observe_shutdown(text, offset):
+                    if shutdown_holder['watch'] is None:
+                        matches = [match for row in text.splitlines()
+                                   if (match := re.fullmatch(r'\[PENDING\] id=(\S+) Shutdown(?: \(reduced detail\))?', row.rstrip()))]
+                        assert len(matches) <= 1, 'ambiguous own Shutdown receipt'
+                        if matches:
+                            command_id = matches[0][1]
+                            shutdown_holder['command_id'] = command_id
+                            shutdown_holder['watch'] = ReceiptStreamWatch(
+                                '[PENDING] id=' + command_id + ' Shutdown',
+                                '[DURABLE] journal=durable Shutdown: applied id=' + command_id)
+                    if shutdown_holder['watch'] is not None:
+                        shutdown_holder['watch'].observe(text, offset)
+                screen.stream_observer = observe_shutdown
+                send_terminal_input(b'\r')
             deadline = time.monotonic() + 30
             while process.poll() is None and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.05)[0]:
@@ -1262,6 +1404,40 @@ for profile in ('truecolor', 'no-color'):
             assert screen.cursor_show_observed and screen.cursor_visible, 'cursor was not visible after quit'
             assert not screen.enabled_capture_modes, 'capture modes remained enabled after quit'
             assert binary_source == source, 'actual child build source was not observed'
+            if exit_action == 'shutdown':
+                watch = shutdown_holder['watch']
+                assert watch is not None, 'own Shutdown Pending was not serialized'
+                watch.verify()
+                restoration_offset = raw.rfind(b'\x1b[?1049l')
+                assert watch.observations['applied']['stream_byte_offset'] <= restoration_offset, 'durable Shutdown receipt was not serialized before restoration'
+                shutdown_evidence = {'observation_kind': 'decoded_terminal_cells',
+                                     'command_id': shutdown_holder['command_id'],
+                                     'database': str(directory / 'shutdown.sqlite'),
+                                     'alternate_leave_stream_prefix_length': restoration_offset}
+                for state, observed_receipt in watch.observations.items():
+                    filename = 'shutdown-' + state + '-terminal.txt'
+                    observed_bytes = observed_receipt['terminal_text'].encode()
+                    retain_interaction(filename, observed_bytes)
+                    replay = TerminalScreen(120, 36)
+                    # This continuation has already resized; replay every
+                    # observed resize at its actual stream position below.
+                    position = 0
+                    for event in interaction_events:
+                        if event['kind'] != 'requested_resize':
+                            continue
+                        boundary = event['transcript_offset']
+                        if boundary >= observed_receipt['stream_byte_offset']:
+                            break
+                        replay.feed(raw[position:boundary])
+                        replay.resize(event['width'], event['height'])
+                        position = boundary
+                    replay.feed(raw[position:observed_receipt['stream_byte_offset']], final=True)
+                    assert replay.text() == observed_receipt['terminal_text'], 'Shutdown stream prefix does not reconstruct its observed cells'
+                    shutdown_evidence[state] = {
+                        'receipt': observed_receipt['receipt'],
+                        'stream_byte_offset': observed_receipt['stream_byte_offset'],
+                        'terminal_file': filename,
+                        'terminal_sha256': hashlib.sha256(observed_bytes).hexdigest()}
             if profile == 'truecolor':
                 assert screen.truecolor_count > 0, 'actual truecolor SGR was not emitted'
             else:
@@ -1288,7 +1464,8 @@ for profile in ('truecolor', 'no-color'):
         interaction_artifacts.append({'file': filename,
                                       'sha256': hashlib.sha256((directory / filename).read_bytes()).hexdigest()})
     interaction_evidence['artifacts'] = interaction_artifacts
-    print(json.dumps({'schema': 'scriptbots.live-tui-pty.v1', 'source_commit': binary_source,
+    schema = 'scriptbots.live-tui-pty.v1' if exit_action == 'quit' else 'scriptbots.live-tui-shutdown-pty.v1'
+    print(json.dumps({'schema': schema, 'source_commit': binary_source,
                       'binary_source_observed': binary_source is not None,
                       'capability_profile': profile, 'observed_science_routes': observed,
                       'observed_screenshot_routes': screenshots,
@@ -1296,6 +1473,7 @@ for profile in ('truecolor', 'no-color'):
                       'python_identity': python_identity,
                       'parser_guard_evidence': parser_guard_evidence,
                       'byte_input_resize_evidence': interaction_evidence,
+                      'shutdown_evidence': shutdown_evidence,
                       'observed_color_sgr_count': screen.color_count,
                       'observed_truecolor_sgr_count': screen.truecolor_count,
                       'observed_style_sgr_count': screen.attribute_count,
