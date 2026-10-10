@@ -21,7 +21,10 @@ use crossterm::{
     execute,
     terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
-use ftui::runtime::{Cmd, Model, Program, ProgramConfig};
+use ftui::runtime::{
+    Cmd, Model, Program, ProgramConfig,
+    program::{FrameTiming, FrameTimingConfig, FrameTimingSink},
+};
 use ratatui::{
     Frame, Terminal,
     buffer::{Buffer, CellDiffOption},
@@ -61,7 +64,7 @@ use tracing::{debug, info, warn};
 #[cfg(test)]
 use crate::SharedWorld;
 use crate::{
-    CommandSubmit, ControlRuntime, ScenarioIdentityV0, SharedAnalytics,
+    ControlRuntime, ScenarioIdentityV0, SharedAnalytics,
     renderer::{Renderer, RendererContext},
 };
 
@@ -311,6 +314,7 @@ impl TerminalRenderer {
         let config = ProgramConfig {
             screen_mode: ftui::runtime::ScreenMode::AltScreen,
             poll_timeout: self.draw_interval,
+            frame_timing: Some(FrameTimingConfig::new(model.presentation.clone())),
             ..ProgramConfig::default().with_mouse()
         };
         let mut program = Program::with_config(model, config)
@@ -352,12 +356,35 @@ impl From<ftui::core::event::Event> for LiveTerminalMessage {
 struct LiveTerminalModel<'a> {
     app: RefCell<TerminalApp<'a>>,
     widgets: RefCell<Terminal<ratatui::backend::TestBackend>>,
-    awaiting_presentation: RefCell<Option<(u64, Buffer)>>,
+    presentation: Arc<TerminalPresentationObserver>,
     failure: RefCell<Option<anyhow::Error>>,
     service_generation: u64,
     service_in_flight: Option<(frankentui_shell::ShellRoute, u64)>,
+    cancelled_service_route: Option<frankentui_shell::ShellRoute>,
+    checkpoint_in_flight: bool,
     last_service_poll: Option<Instant>,
     lineage: LiveLineages,
+}
+
+/// Observe the pinned runtime's successful presentation branch. An exhausted
+/// render budget reports zero presentation time; it cannot publish its candidate.
+struct TerminalPresentationObserver {
+    candidate: crate::servers::SharedPresentedFrame,
+    completed: crate::servers::SharedPresentedFrame,
+    presented: crate::servers::SharedPresentedFrame,
+}
+
+impl FrameTimingSink for TerminalPresentationObserver {
+    fn record_frame(&self, timing: &FrameTiming) {
+        if let Some(frame) = self.candidate.swap(None)
+            && timing.present_us > 0
+        {
+            // A successful sub-microsecond write is conservatively left
+            // uncaptured: zero time does not distinguish it from a skipped write.
+            self.presented.store(Some(frame.clone()));
+            self.completed.store(Some(frame));
+        }
+    }
 }
 
 impl<'a> LiveTerminalModel<'a> {
@@ -368,20 +395,30 @@ impl<'a> LiveTerminalModel<'a> {
                 reduced_motion: app.motion.is_reduced(),
             });
         let lineage = LiveLineages::new(app.client.event_cursor());
+        let presentation = Arc::new(TerminalPresentationObserver {
+            candidate: Arc::new(arc_swap::ArcSwapOption::empty()),
+            completed: Arc::new(arc_swap::ArcSwapOption::empty()),
+            presented: app.presented_frame.clone(),
+        });
         Ok(Self {
             app: RefCell::new(app),
             widgets: RefCell::new(Terminal::new(ratatui::backend::TestBackend::new(80, 24))?),
-            awaiting_presentation: RefCell::new(None),
+            presentation,
             failure: RefCell::new(None),
             service_generation: 0,
             service_in_flight: None,
+            cancelled_service_route: None,
+            checkpoint_in_flight: false,
             last_service_poll: None,
             lineage,
         })
     }
 
     fn fail(&self, error: anyhow::Error) -> Cmd<LiveTerminalMessage> {
-        self.app.borrow_mut().frankentui.on_error(&error.to_string());
+        self.app
+            .borrow_mut()
+            .frankentui
+            .on_error(&error.to_string());
         if self.failure.borrow().is_none() {
             *self.failure.borrow_mut() = Some(error);
         }
@@ -389,17 +426,11 @@ impl<'a> LiveTerminalModel<'a> {
     }
 
     fn acknowledge_presentation(&self) {
-        // update is reached only after the previous view and terminal write
-        // succeeded. A failed write goes to on_error and discards this buffer.
-        if let Some((tick, buffer)) = self.awaiting_presentation.borrow_mut().take() {
+        if let Some(frame) = self.presentation.completed.swap(None) {
             let mut app = self.app.borrow_mut();
-            app.presented_frame
-                .store(Some(Arc::new(crate::servers::PresentedTerminalFrame {
-                    tick,
-                    buffer: buffer.clone(),
-                })));
+            let tick = frame.tick;
             if app.export_requested() {
-                match app.write_frame_export(&buffer, tick) {
+                match app.write_frame_export(&frame.buffer, tick) {
                     Ok((path, _, hash)) => app.push_event(
                         tick,
                         EventKind::Info,
@@ -407,7 +438,11 @@ impl<'a> LiveTerminalModel<'a> {
                     ),
                     Err(error) => {
                         app.export_requested = false;
-                        app.push_event(tick, EventKind::Info, format!("Screenshot failed: {error}"));
+                        app.push_event(
+                            tick,
+                            EventKind::Info,
+                            format!("Screenshot failed: {error}"),
+                        );
                     }
                 }
             }
@@ -446,7 +481,38 @@ impl Model for LiveTerminalModel<'_> {
         let result = {
             let mut app = self.app.borrow_mut();
             match message {
-                LiveTerminalMessage::Event(event) => app.handle_ftui_event(event),
+                LiveTerminalMessage::Event(event) => {
+                    let mut consumed_refresh = false;
+                    if let ftui::core::event::Event::Key(key) = &event
+                        && key.kind == ftui::core::event::KeyEventKind::Press
+                        && key.modifiers == ftui::core::event::Modifiers::NONE
+                        && !app.palette_open
+                        && !app.help_visible
+                    {
+                        if key.code == ftui::core::event::KeyCode::Char('x')
+                            && self
+                                .service_in_flight
+                                .is_some_and(|(route, _)| route == app.frankentui.route)
+                        {
+                            self.cancelled_service_route = Some(app.frankentui.route);
+                            app.frankentui
+                                .update(frankentui_shell::ShellMessage::SetStatus(
+                                    "Screen query cancelled; its running service result will be discarded. Press r to refresh.".into(),
+                                ));
+                        } else if key.code == ftui::core::event::KeyCode::Char('r')
+                            && self.cancelled_service_route == Some(app.frankentui.route)
+                        {
+                            self.cancelled_service_route = None;
+                            self.last_service_poll = None;
+                            consumed_refresh = true;
+                        }
+                    }
+                    if consumed_refresh {
+                        Ok(false)
+                    } else {
+                        app.handle_ftui_event(event)
+                    }
+                }
                 LiveTerminalMessage::Refresh => {
                     app.maybe_step_simulation(Instant::now());
                     app.refresh_command_receipts();
@@ -461,7 +527,9 @@ impl Model for LiveTerminalModel<'_> {
                 } => {
                     if self.service_in_flight == Some((route, generation)) {
                         self.service_in_flight = None;
-                        if app.frankentui.route == route {
+                        if app.frankentui.route == route
+                            && self.cancelled_service_route != Some(route)
+                        {
                             for mut message in messages {
                                 app.preserve_science_selection(&mut message);
                                 app.frankentui.update(message);
@@ -471,6 +539,7 @@ impl Model for LiveTerminalModel<'_> {
                     Ok(false)
                 }
                 LiveTerminalMessage::Checkpoint { request_id, result } => {
+                    self.checkpoint_in_flight = false;
                     app.record_checkpoint_result(request_id, result);
                     Ok(false)
                 }
@@ -499,10 +568,17 @@ impl Model for LiveTerminalModel<'_> {
         let buffer = widgets.backend().buffer();
         copy_widgets_to_ftui(buffer, frame);
         app.last_draw = Instant::now();
-        *self.awaiting_presentation.borrow_mut() = Some((app.snapshot.tick, buffer.clone()));
+        self.presentation
+            .candidate
+            .store(Some(Arc::new(crate::servers::PresentedTerminalFrame {
+                tick: app.snapshot.tick,
+                buffer: buffer.clone(),
+            })));
     }
 
-    fn subscriptions(&self) -> Vec<Box<dyn ftui::runtime::subscription::Subscription<Self::Message>>> {
+    fn subscriptions(
+        &self,
+    ) -> Vec<Box<dyn ftui::runtime::subscription::Subscription<Self::Message>>> {
         vec![Box::new(ftui::runtime::Every::new(
             self.app.borrow().draw_interval,
             || LiveTerminalMessage::Refresh,
@@ -510,7 +586,8 @@ impl Model for LiveTerminalModel<'_> {
     }
 
     fn on_error(&mut self, error: &str) -> Cmd<Self::Message> {
-        self.awaiting_presentation.borrow_mut().take();
+        self.presentation.candidate.store(None);
+        self.presentation.completed.store(None);
         // Never leave a failed renderer's candidate exposed as a presented frame.
         self.app.borrow().presented_frame.store(None);
         self.fail(anyhow!("FrankenTUI runtime error: {error}"))
@@ -670,7 +747,9 @@ fn copy_widgets_to_ftui(source: &Buffer, target: &mut ftui::render::frame::Frame
             let symbol = source_cell.symbol();
             let width = match source_cell.diff_option {
                 CellDiffOption::ForcedWidth(width) => width.get(),
-                _ => u16::try_from(ftui::core::text_width::display_width(symbol)).unwrap_or(u16::MAX),
+                _ => {
+                    u16::try_from(ftui::core::text_width::display_width(symbol)).unwrap_or(u16::MAX)
+                }
             }
             .max(1);
             let visible_width = width.min(target.width() - x);
@@ -731,7 +810,13 @@ impl LiveTerminalModel<'_> {
             match effect {
                 ShellEffect::SubmitCommand(command) => app.submit_simulation_command(command),
                 ShellEffect::CreateCheckpoint { request_id } => {
-                    if let Some(handle) = app.control.control_handle() {
+                    if self.checkpoint_in_flight {
+                        app.record_checkpoint_result(
+                            request_id,
+                            Err("Another checkpoint capture is still running".into()),
+                        );
+                    } else if let Some(handle) = app.control.control_handle() {
+                        self.checkpoint_in_flight = true;
                         commands.push(Cmd::task(move || {
                             let result = handle
                                 .create_checkpoint(crate::control::CheckpointCreateRequest {
@@ -777,6 +862,7 @@ impl LiveTerminalModel<'_> {
         }
         let route = app.frankentui.route;
         if self.service_in_flight.is_none()
+            && self.cancelled_service_route != Some(route)
             && self
                 .last_service_poll
                 .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
@@ -805,9 +891,11 @@ impl LiveTerminalModel<'_> {
                 }));
             } else {
                 app.frankentui.update(match route {
-                    ShellRoute::Experiments => ShellMessage::SetExperimentsData(
-                        science_screens::ScreenDataState::empty("Control data services are disabled"),
-                    ),
+                    ShellRoute::Experiments => {
+                        ShellMessage::SetExperimentsData(science_screens::ScreenDataState::empty(
+                            "Control data services are disabled",
+                        ))
+                    }
                     _ => ShellMessage::SetReplayData(science_screens::ScreenDataState::empty(
                         "Control data services are disabled",
                     )),
@@ -874,15 +962,16 @@ impl LiveLineages {
                         if self.recent_events.len() == EVENT_LOG_CAPACITY {
                             self.recent_events.pop_front();
                         }
-                        self.recent_events.push_back(science_screens::LineageEventEntry {
-                            tick,
-                            event_kind: "arrivals/deaths".into(),
-                            description: format!(
-                                "{} typed arrivals, {} exact deaths",
-                                boundary.births().len(),
-                                boundary.deaths().len()
-                            ),
-                        });
+                        self.recent_events
+                            .push_back(science_screens::LineageEventEntry {
+                                tick,
+                                event_kind: "arrivals/deaths".into(),
+                                description: format!(
+                                    "{} typed arrivals, {} exact deaths",
+                                    boundary.births().len(),
+                                    boundary.deaths().len()
+                                ),
+                            });
                     }
                     self.observed_tick = Some(tick);
                 }
@@ -1152,7 +1241,6 @@ struct TerminalApp<'a> {
     retained_render: Arc<RenderSnapshot>,
     analytics_provider: SharedAnalytics,
     control: &'a ControlRuntime,
-    command_submit: CommandSubmit,
     scenario: Arc<ScenarioIdentityV0>,
     tick_interval: Duration,
     draw_interval: Duration,
@@ -1285,8 +1373,6 @@ struct TerminalApp<'a> {
     pub focused_panel: Option<SidebarPanelKind>,
     /// Recent command palette actions for MRU ranking and recency pinning (bd-2z0.14.2.5).
     pub palette_recent_actions: Vec<CommandPaletteAction>,
-    /// Last acknowledged control command receipt summary for palette footer (bd-2z0.14.2.5).
-    pub last_command_receipt_summary: Option<String>,
     /// Total width of the body (map + splitter + sidebar) for splitter calculation (bd-2z0.14.2.5).
     pub body_width: u16,
     /// Upgraded science time-series chart with axes, legends, and rolling windows (bd-2z0.14.2.3).
@@ -1374,7 +1460,6 @@ impl<'a> TerminalApp<'a> {
             retained_render,
             analytics_provider: ctx.analytics.clone(),
             control: ctx.control_runtime,
-            command_submit: Arc::clone(&ctx.command_submit),
             scenario: Arc::clone(&ctx.scenario),
             tick_interval: renderer.tick_interval,
             draw_interval: renderer.draw_interval,
@@ -1442,7 +1527,6 @@ impl<'a> TerminalApp<'a> {
             map_split_pct: None,
             focused_panel: None,
             palette_recent_actions: Vec::new(),
-            last_command_receipt_summary: None,
             body_width: 80,
             science_chart: science_widgets::ScienceChartData::new(
                 science_widgets::ChartRollingWindow::Ticks60,
@@ -1482,7 +1566,10 @@ impl<'a> TerminalApp<'a> {
     }
 
     pub fn next_command_id(&mut self) -> CommandId {
-        self.command_sequence = self.command_sequence.saturating_add(1);
+        self.command_sequence = self
+            .command_sequence
+            .checked_add(1)
+            .expect("terminal command identity sequence exhausted");
         CommandId::from_client_sequence(self.command_namespace, self.command_sequence)
     }
 
@@ -1634,16 +1721,12 @@ impl<'a> TerminalApp<'a> {
         terminal_runtime_finished(&snapshot, || self.ensure_control_runtime_running())
     }
 
-    /// Submit one simulation command to the owner exactly once.
-    ///
-    /// `command_submit` is itself a complete host submission (the control runtime's
-    /// `ControlHandle`). A second `HostClient` envelope used to follow it, so every
-    /// palette spawn, speed change or pause reached the owner twice.
+    /// Submit one guarded envelope to the owner, retaining its exact identity.
     fn submit_simulation_command(&mut self, command: ControlCommand) {
         match self.submit_with_visible_receipt(command) {
             Some(receipt) => debug!(%receipt, "simulation command submitted to the owner"),
             None => {
-                warn!("terminal renderer failed to enqueue simulation command");
+                warn!("terminal control request was not accepted; see its receipt");
                 if let Ok(Some(snapshot)) = self.client.latest_snapshot() {
                     self.paused = snapshot.playback.paused;
                     self.speed_multiplier = snapshot.playback.speed_multiplier;
@@ -1669,27 +1752,61 @@ impl<'a> TerminalApp<'a> {
             ControlCommand::Intervention(_) => "Intervention",
         }
         .to_owned();
-        let receipt = (self.command_submit.as_ref())(command);
-        if let Some(id) = &receipt {
-            self.frankentui
-                .update(frankentui_shell::ShellMessage::CommandReceipt(
-                    frankentui_shell::CommandReceiptEntry {
-                        command_id: id.clone(),
-                        action,
-                        status: frankentui_shell::ReceiptStatusKind::Pending,
-                        journal_state: None,
-                        control_revision: self.retained_render.revisions.control.get(),
-                        scientific_revision: self.retained_render.revisions.scientific.get(),
-                        timestamp_tick: self.snapshot.tick,
-                    },
-                ));
-        } else {
-            self.frankentui
-                .update(frankentui_shell::ShellMessage::SetStatus(format!(
-                    "{action}: command admission unavailable; no application observed"
-                )));
+        let id = self.next_command_id();
+        let mut receipt = frankentui_shell::CommandReceiptEntry {
+            command_id: id.to_string(),
+            action: action.clone(),
+            status: frankentui_shell::ReceiptStatusKind::Pending,
+            journal_state: None,
+            control_revision: self.retained_render.revisions.control.get(),
+            scientific_revision: self.retained_render.revisions.scientific.get(),
+            timestamp_tick: self.snapshot.tick,
+        };
+        let host_command = match HostCommand::try_from(command) {
+            Ok(command) => command,
+            Err(error) => {
+                receipt.status =
+                    frankentui_shell::ReceiptStatusKind::Failed(format!("Not submitted: {error}"));
+                self.frankentui
+                    .update(frankentui_shell::ShellMessage::CommandReceipt(receipt));
+                return None;
+            }
+        };
+        self.frankentui
+            .update(frankentui_shell::ShellMessage::CommandReceipt(receipt.clone()));
+        let envelope = CommandEnvelope::new(id, host_command)
+            .expecting_control_revision(self.retained_render.revisions.control);
+        // A blocked owner must not freeze input. A lost reply is unresolved,
+        // not rejection: lookup keeps this exact identity without resubmitting.
+        let result = self
+            .client
+            .port()
+            .submit_before(envelope, Instant::now() + Duration::from_millis(5));
+        match result {
+            Ok(status) => {
+                let accepted = matches!(
+                    status.application(),
+                    ApplicationState::Admitted | ApplicationState::Applied(_)
+                );
+                let receipt = frankentui_shell::CommandReceiptEntry::from_runtime_status(
+                    &id,
+                    action,
+                    &status,
+                    self.snapshot.tick,
+                    self.retained_render.revisions.control.get(),
+                    self.retained_render.revisions.scientific.get(),
+                );
+                self.frankentui
+                    .update(frankentui_shell::ShellMessage::CommandReceipt(receipt));
+                accepted.then(|| id.to_string())
+            }
+            Err(error) => {
+                receipt.action = format!("{action}: admission outcome unresolved ({error})");
+                self.frankentui
+                    .update(frankentui_shell::ShellMessage::CommandReceipt(receipt));
+                Some(id.to_string())
+            }
         }
-        receipt
     }
 
     fn refresh_command_receipts(&mut self) {
@@ -1877,14 +1994,9 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn persist_theme_choice(&mut self, theme: CuratedThemeId) -> Option<String> {
-        let mut port = self.client.port().clone();
-        let mut config = match port.snapshot_after(None) {
-            Ok(Some(snapshot)) => {
-                self.retained_render = Arc::clone(&snapshot);
-                snapshot.config.as_ref().clone()
-            }
-            _ => self.retained_render.config.as_ref().clone(),
-        };
+        // Bind the edit to the exact configuration the user observed. The
+        // revision guard refuses overwriting a concurrent owner's config edit.
+        let mut config = self.retained_render.config.as_ref().clone();
         if config.render.theme == Some(theme.to_config()) {
             return None;
         }
@@ -2269,6 +2381,16 @@ impl<'a> TerminalApp<'a> {
         true
     }
 
+    fn navigate_route(&mut self, route: frankentui_shell::ShellRoute) {
+        self.frankentui
+            .update(frankentui_shell::ShellMessage::Navigate(route));
+        self.pointer_gesture.cancel("science route changed");
+        self.hit_regions = HitRegionMap::default();
+        self.map_area = None;
+        self.hover_tooltip = None;
+        self.refresh_science_snapshot();
+    }
+
     fn handle_ftui_event(&mut self, event: ftui::core::event::Event) -> Result<bool> {
         use frankentui_shell::{ShellMessage, ShellRoute};
         use ftui::core::event::{Event as E, KeyCode as K, KeyEventKind as Kind, Modifiers};
@@ -2277,12 +2399,7 @@ impl<'a> TerminalApp<'a> {
                 if !self.palette_open && !self.help_visible && key.modifiers == Modifiers::NONE {
                     if let K::Char(number @ '1'..='9') = key.code {
                         let route = ShellRoute::all_screens()[number as usize - '1' as usize];
-                        self.frankentui.update(ShellMessage::Navigate(route));
-                        self.pointer_gesture.cancel("science route changed");
-                        self.hit_regions = HitRegionMap::default();
-                        self.map_area = None;
-                        self.hover_tooltip = None;
-                        self.refresh_science_snapshot();
+                        self.navigate_route(route);
                         return Ok(false);
                     }
                     if !matches!(
@@ -2516,7 +2633,7 @@ impl<'a> TerminalApp<'a> {
                 data.selected_checkpoint_index =
                     previous.min(data.checkpoints.len().saturating_sub(1));
                 // This is the observed live tick, not a replay comparison result.
-                data.current_replay_tick = self.snapshot.tick;
+                data.observed_live_tick = Some(self.snapshot.tick);
             }
             _ => {}
         }
@@ -4930,8 +5047,7 @@ impl<'a> TerminalApp<'a> {
                         self.speed_multiplier * 2.0
                     };
                     self.submit_simulation_command(ControlCommand::SetSpeed(next_speed));
-                    self.speed_multiplier = next_speed;
-                    self.push_toast(format!("Speed: {:.1}x", next_speed));
+                    self.push_toast(format!("Target speed: {:.1}x; see receipt", next_speed));
                 }
                 pointer::HeaderHitTarget::PaletteCycle => {
                     self.cycle_accessibility_palette();
@@ -5202,15 +5318,12 @@ impl<'a> TerminalApp<'a> {
         if candidates.is_empty() {
             // Empty-click clearing (bd-2z0.14.2.5)!
             if self.snapshot.focused_agent_uid.is_some() {
-                self.focused_agent_cursor = 0;
-                self.focus_lock = FocusLockMode::Manual;
-                self.snapshot.focused_agent_uid = None;
                 self.submit_simulation_command(ControlCommand::UpdateSelection(SelectionUpdate {
                     mode: SelectionMode::Clear,
                     agent_ids: Vec::new(),
                     state: SelectionState::None,
                 }));
-                self.push_toast("Cleared agent selection");
+                self.push_toast("Clear selection requested; see command receipt");
                 self.refresh_snapshot();
             }
         } else {
@@ -5221,19 +5334,14 @@ impl<'a> TerminalApp<'a> {
                 .collect();
             let target_uid =
                 pointer::cycle_stacked_agents(&candidate_uids, self.snapshot.focused_agent_uid);
-            if let Some(uid) = target_uid
-                && let Some(best_idx) = self.snapshot.agents.iter().position(|a| a.uid == Some(uid))
-            {
-                self.focused_agent_cursor = best_idx;
-                self.focus_lock = FocusLockMode::Manual;
-                self.snapshot.focused_agent_uid = Some(uid);
+            if let Some(uid) = target_uid {
                 self.submit_simulation_command(ControlCommand::UpdateSelection(SelectionUpdate {
                     mode: SelectionMode::Replace,
                     agent_ids: vec![uid],
                     state: SelectionState::Selected,
                 }));
                 let label = agent_uid_label(Some(uid));
-                self.push_toast(format!("Selected Agent #{label}"));
+                self.push_toast(format!("Selection of Agent #{label} requested; see receipt"));
                 self.refresh_snapshot();
             }
         }
@@ -5283,13 +5391,6 @@ impl<'a> TerminalApp<'a> {
         if self.palette_recent_actions.len() > 8 {
             self.palette_recent_actions.truncate(8);
         }
-        if action.is_mutating() {
-            self.last_command_receipt_summary = Some(format!(
-                "Receipt #{:08x}: Acknowledged action {:?}",
-                self.snapshot.tick, action
-            ));
-        }
-
         match action {
             CommandPaletteAction::TogglePause => {
                 self.toggle_pause();
@@ -5367,46 +5468,46 @@ impl<'a> TerminalApp<'a> {
                 self.push_toast("Export requested");
             }
             CommandPaletteAction::NavigateDashboard => {
-                self.frankentui.route = frankentui_shell::ShellRoute::Dashboard;
+                self.navigate_route(frankentui_shell::ShellRoute::Dashboard);
                 self.push_toast("View: Dashboard");
             }
             CommandPaletteAction::NavigateWorld => {
-                self.frankentui.route = frankentui_shell::ShellRoute::WorldCanvas;
+                self.navigate_route(frankentui_shell::ShellRoute::WorldCanvas);
                 self.push_toast("View: World Canvas");
             }
             CommandPaletteAction::NavigateInspector => {
-                self.frankentui.route = frankentui_shell::ShellRoute::Inspector;
+                self.navigate_route(frankentui_shell::ShellRoute::Inspector);
                 self.push_toast("View: Agent Inspector");
             }
             CommandPaletteAction::NavigateLineages => {
-                self.frankentui.route = frankentui_shell::ShellRoute::Lineages;
+                self.navigate_route(frankentui_shell::ShellRoute::Lineages);
                 self.push_toast("View: Lineages & Phylogeny");
             }
             CommandPaletteAction::NavigateBrainArena => {
-                self.frankentui.route = frankentui_shell::ShellRoute::BrainArena;
+                self.navigate_route(frankentui_shell::ShellRoute::BrainArena);
                 self.push_toast("View: Brain Arena");
             }
             CommandPaletteAction::NavigateExperiments => {
-                self.frankentui.route = frankentui_shell::ShellRoute::Experiments;
+                self.navigate_route(frankentui_shell::ShellRoute::Experiments);
                 self.push_toast("View: Experiments");
             }
             CommandPaletteAction::NavigateReplay => {
-                self.frankentui.route = frankentui_shell::ShellRoute::Replay;
+                self.navigate_route(frankentui_shell::ShellRoute::Replay);
                 self.push_toast("View: Replay & Checkpoints");
             }
             CommandPaletteAction::NavigateEnvironment => {
-                self.frankentui.route = frankentui_shell::ShellRoute::Environment;
+                self.navigate_route(frankentui_shell::ShellRoute::Environment);
                 self.push_toast("View: Environment & Biomes");
             }
             CommandPaletteAction::NavigateDiagnostics => {
-                self.frankentui.route = frankentui_shell::ShellRoute::Diagnostics;
+                self.navigate_route(frankentui_shell::ShellRoute::Diagnostics);
                 self.push_toast("View: Diagnostics");
             }
             CommandPaletteAction::ToggleDiagnostics => {
                 if self.frankentui.route == frankentui_shell::ShellRoute::Diagnostics {
-                    self.frankentui.route = frankentui_shell::ShellRoute::Dashboard;
+                    self.navigate_route(frankentui_shell::ShellRoute::Dashboard);
                 } else {
-                    self.frankentui.route = frankentui_shell::ShellRoute::Diagnostics;
+                    self.navigate_route(frankentui_shell::ShellRoute::Diagnostics);
                 }
                 self.push_toast("Diagnostics toggled");
             }
@@ -5474,12 +5575,7 @@ impl<'a> TerminalApp<'a> {
                 if let Some(intent) = self.typed_event_feed.focus_intent_for_selected() {
                     match intent {
                         science_widgets::EventFocusIntent::FocusAgent(uid) => {
-                            if let Some(idx) =
-                                self.snapshot.agents.iter().position(|a| a.uid == Some(uid))
-                            {
-                                self.focused_agent_cursor = idx;
-                                self.focus_lock = FocusLockMode::Manual;
-                                self.snapshot.focused_agent_uid = Some(uid);
+                            if self.snapshot.agents.iter().any(|a| a.uid == Some(uid)) {
                                 self.submit_simulation_command(ControlCommand::UpdateSelection(
                                     SelectionUpdate {
                                         mode: SelectionMode::Replace,
@@ -5488,7 +5584,9 @@ impl<'a> TerminalApp<'a> {
                                     },
                                 ));
                                 let label = agent_uid_label(Some(uid));
-                                self.push_toast(format!("Selected Agent #{label}"));
+                                self.push_toast(format!(
+                                    "Selection of Agent #{label} requested; see receipt"
+                                ));
                                 self.refresh_snapshot();
                             } else {
                                 self.push_toast(format!("Agent #{uid} is no longer active"));
@@ -5585,8 +5683,9 @@ impl<'a> TerminalApp<'a> {
             )
         };
 
-        let receipt_footer = self.last_command_receipt_summary.as_deref().unwrap_or(
-            "Mutating actions submit typed control commands to HostClient with audited receipts",
+        let receipt_summary = self.frankentui.latest_receipt_summary();
+        let receipt_footer = receipt_summary.as_deref().unwrap_or(
+            "Control actions await owner application; outcomes appear in command receipts",
         );
 
         let block = Block::default()
@@ -5803,50 +5902,39 @@ impl<'a> TerminalApp<'a> {
                 self.toggle_pause();
             }
             (KeyCode::Char('+') | KeyCode::Char('='), _) => {
-                self.speed_multiplier = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
-                if self.speed_multiplier > 0.0 {
-                    self.paused = false;
-                }
+                let target_speed = (self.speed_multiplier + 0.5).clamp(0.5, 8.0);
                 self.submit_simulation_command(ControlCommand::UpdateSimulation(
                     SimulationCommand {
-                        paused: Some(self.paused),
-                        speed_multiplier: Some(self.speed_multiplier),
+                        paused: Some(false),
+                        speed_multiplier: Some(target_speed),
                         step_once: false,
                     },
                 ));
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,
-                    format!("Speed x{:.1}", self.speed_multiplier),
+                    format!("Target speed x{target_speed:.1} requested; see receipt"),
                 );
             }
             (KeyCode::Char('-') | KeyCode::Char('_'), _) => {
-                self.speed_multiplier = (self.speed_multiplier - 0.5).max(0.0);
-                if self.speed_multiplier <= 0.0 {
-                    self.paused = true;
-                }
+                let target_speed = (self.speed_multiplier - 0.5).max(0.0);
                 self.submit_simulation_command(ControlCommand::UpdateSimulation(
                     SimulationCommand {
-                        paused: Some(self.paused),
-                        speed_multiplier: Some(self.speed_multiplier),
+                        paused: Some(self.paused || target_speed == 0.0),
+                        speed_multiplier: Some(target_speed),
                         step_once: false,
                     },
                 ));
                 self.push_event(
                     self.snapshot.tick,
                     EventKind::Info,
-                    if self.paused {
-                        "Simulation paused".to_string()
-                    } else {
-                        format!("Speed x{:.1}", self.speed_multiplier)
-                    },
+                    format!("Target speed x{target_speed:.1} requested; see receipt"),
                 );
             }
             (KeyCode::Char('s'), _) => {
                 self.step_once();
-                self.paused = true;
-                self.push_toast("Single-step");
-                self.push_event(self.snapshot.tick, EventKind::Info, "Single-step executed");
+                self.push_toast("Single-step requested; see receipt");
+                self.push_event(self.snapshot.tick, EventKind::Info, "Single-step requested");
             }
             (KeyCode::Char('.'), _) => {
                 self.cycle_eye_selection(true);
@@ -6124,7 +6212,11 @@ impl<'a> TerminalApp<'a> {
     /// (bd-2z0.14.2.6). The frame identity is the SAME FNV-1a64 the headless
     /// evidence contract already publishes, so an export and a headless report of
     /// one frame cannot disagree.
-    fn write_frame_export(&mut self, buffer: &Buffer, tick: u64) -> Result<(PathBuf, PathBuf, String)> {
+    fn write_frame_export(
+        &mut self,
+        buffer: &Buffer,
+        tick: u64,
+    ) -> Result<(PathBuf, PathBuf, String)> {
         use std::io::Write;
 
         self.export_requested = false;
@@ -6564,20 +6656,20 @@ impl<'a> TerminalApp<'a> {
 
         if control.auto_pause_on_spike_hit && self.snapshot.spike_hits > 0 {
             reason = Some(format!(
-                "Auto-pause: spike hits detected ({})",
+                "Auto-pause requested: spike hits detected ({})",
                 self.snapshot.spike_hits
             ));
         } else if let Some(age_limit) = control.auto_pause_age_above {
             if self.snapshot.max_age >= age_limit {
                 reason = Some(format!(
-                    "Auto-pause: max age {} ≥ {}",
+                    "Auto-pause requested: max age {} ≥ {}",
                     self.snapshot.max_age, age_limit
                 ));
             }
         } else if let Some(limit) = control.auto_pause_population_below {
             if self.snapshot.agent_count as u32 <= limit {
                 reason = Some(format!(
-                    "Auto-pause: population {} ≤ {}",
+                    "Auto-pause requested: population {} ≤ {}",
                     self.snapshot.agent_count, limit
                 ));
             }
@@ -6587,10 +6679,8 @@ impl<'a> TerminalApp<'a> {
             if self.last_autopause_tick != Some(self.snapshot.tick) {
                 self.push_event(self.snapshot.tick, EventKind::Info, &reason);
                 self.last_autopause_tick = Some(self.snapshot.tick);
+                self.submit_simulation_command(ControlCommand::Pause);
             }
-            self.paused = true;
-            self.speed_multiplier = 0.0;
-            self.submit_simulation_command(ControlCommand::Pause);
         }
     }
 }
@@ -14158,21 +14248,97 @@ mod tests {
     }
 
     #[test]
-    fn theme_shortcut_reports_when_submission_is_refused() {
+    fn theme_shortcut_reports_a_real_stale_revision_without_persisting_it() {
         with_shortcut_app(|app| {
-            // Inject only the admission refusal; exercise the real key handler
-            // and config-reading path against the fixture's running host.
-            app.command_submit = Arc::new(|_| None);
+            let cached_revision = app.retained_render.revisions.control;
+            apply_terminal_owner_command_without_refresh(app, ControlCommand::SetSpeed(0.75));
+            let before = app.host.snapshot_hub().latest();
+            assert!(before.revisions.control > cached_revision);
+
             app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
                 .expect("ctrl-t is handled");
+            let command_id = app
+                .frankentui
+                .latest_receipt()
+                .expect("the real theme command has an identity")
+                .command_id
+                .clone();
+            let receipt = wait_for_terminal_receipt(app, &command_id);
+
             assert_eq!(
-                app.toasts.back().expect("theme feedback").message,
-                format!(
-                    "Theme: {} (no run update submitted)",
-                    app.palette.theme_id.label()
-                )
+                receipt.status,
+                frankentui_shell::ReceiptStatusKind::StaleRevision {
+                    expected: cached_revision.get(),
+                    observed: before.revisions.control.get(),
+                }
+            );
+            assert_eq!(receipt.badge(), "[STALE_REV]");
+            let after = app.host.snapshot_hub().latest();
+            assert_eq!(after.config.render.theme, before.config.render.theme);
+            assert_eq!(after.revisions, before.revisions);
+            assert_eq!(after.playback, before.playback);
+            assert_ne!(
+                after.config.render.theme,
+                Some(app.palette.theme_id.to_config()),
+                "the local chrome may change, but stale configuration must not be persisted"
             );
         });
+    }
+
+    fn apply_terminal_owner_command_without_refresh(
+        app: &mut TerminalApp<'_>,
+        command: ControlCommand,
+    ) -> CommandStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let envelope = app
+            .prepare_envelope(command, None)
+            .expect("prepare a real external-owner command");
+        let command_id = envelope.command_id;
+        let mut status = app
+            .host
+            .submit_before(envelope, deadline)
+            .expect("real owner admission");
+        loop {
+            match status.application() {
+                ApplicationState::Applied(_) => return status,
+                ApplicationState::Admitted => {}
+                failure => panic!("external-owner command failed: {failure:?}"),
+            }
+            assert!(Instant::now() < deadline, "real owner did not apply command");
+            std::thread::park_timeout(Duration::from_millis(1));
+            status = app
+                .host
+                .command_status_before(command_id, deadline)
+                .expect("real owner status")
+                .expect("the owner retains its command identity");
+        }
+    }
+
+    fn wait_for_terminal_receipt(
+        app: &mut TerminalApp<'_>,
+        command_id: &str,
+    ) -> frankentui_shell::CommandReceiptEntry {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.refresh_command_receipts();
+            let receipt = app
+                .frankentui
+                .receipt_for(command_id)
+                .expect("the terminal retains the submitted command")
+                .clone();
+            if !matches!(
+                &receipt.status,
+                frankentui_shell::ReceiptStatusKind::Pending
+                    | frankentui_shell::ReceiptStatusKind::Admitted
+            ) {
+                return receipt;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal command {command_id} remained unresolved: {receipt:?}"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
     }
 
     fn wait_for_theme(app: &mut TerminalApp<'_>, theme: CuratedThemeId) -> Arc<RenderSnapshot> {
@@ -14283,11 +14449,17 @@ mod tests {
             );
 
             // Now the guard has something to compare against.
+            app.refresh_snapshot();
+            assert_eq!(app.retained_render.config.render.theme, stored);
+            let receipts_before = app.frankentui.receipts.len();
+            let command_sequence_before = app.command_sequence;
             assert!(
                 app.persist_theme_choice(chosen).is_none(),
                 "persisting a theme the config already holds must not enqueue a second \
                  identical config update"
             );
+            assert_eq!(app.frankentui.receipts.len(), receipts_before);
+            assert_eq!(app.command_sequence, command_sequence_before);
         });
     }
 
@@ -15391,12 +15563,19 @@ mod tests {
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         let mut lineage = LiveLineages::new(app.client.event_cursor());
-        assert!(matches!(lineage.view_data(), science_screens::ScreenDataState::Empty { .. }));
-        app.submit_and_wait(ControlCommand::Step).expect("one owner tick");
+        assert!(matches!(
+            lineage.view_data(),
+            science_screens::ScreenDataState::Empty { .. }
+        ));
+        app.submit_and_wait(ControlCommand::Step)
+            .expect("one owner tick");
         let deadline = Instant::now() + Duration::from_secs(5);
         while lineage.observed_tick.is_none() {
             lineage.poll(&mut app.client);
-            assert!(Instant::now() < deadline, "canonical boundary was not observed");
+            assert!(
+                Instant::now() < deadline,
+                "canonical boundary was not observed"
+            );
             std::thread::park_timeout(Duration::from_millis(1));
         }
         let science_screens::ScreenDataState::Data(data) = lineage.view_data() else {
@@ -15404,14 +15583,24 @@ mod tests {
         };
         assert_eq!(data.total_founders, Some(2));
         assert_eq!(data.founder_rows.len(), 2);
-        assert!(data.founder_rows.iter().all(|row| row.total_descendants == 1));
-        assert_eq!(data.active_clades, None, "founder ancestry is not clade analysis");
+        assert!(
+            data.founder_rows
+                .iter()
+                .all(|row| row.total_descendants == 0)
+        );
+        assert_eq!(
+            data.active_clades, None,
+            "founder ancestry is not clade analysis"
+        );
         let observed_tick = app.client.port().snapshot_hub().latest().world.world.tick;
         for _ in 0..4 {
             lineage.poll(&mut app.client);
             let _ = lineage.view_data();
         }
-        assert_eq!(app.client.port().snapshot_hub().latest().world.world.tick, observed_tick);
+        assert_eq!(
+            app.client.port().snapshot_hub().latest().world.world.tick,
+            observed_tick
+        );
     }
 
     #[test]
@@ -15427,7 +15616,11 @@ mod tests {
         );
         for (key, route, title) in [
             ('4', ShellRoute::Lineages, "LINEAGES & PHYLOGENY LAB"),
-            ('5', ShellRoute::BrainArena, "BRAIN ARENA & EVALUATOR COHORTS"),
+            (
+                '5',
+                ShellRoute::BrainArena,
+                "BRAIN ARENA & EVALUATOR COHORTS",
+            ),
             ('6', ShellRoute::Experiments, "MATCHED-SEED EXPERIMENTS"),
             ('7', ShellRoute::Replay, "DETERMINISTIC REPLAY"),
             ('8', ShellRoute::Environment, "ENVIRONMENT, HYDROLOGY"),
@@ -15440,7 +15633,10 @@ mod tests {
             assert!(frankentui_shell::buffer_to_string(frame).contains(title));
             let app = simulator.model().app.borrow();
             assert_eq!(app.frankentui.route, route);
-            assert!(app.map_area.is_none(), "old canvas must not remain clickable");
+            assert!(
+                app.map_area.is_none(),
+                "old canvas must not remain clickable"
+            );
             assert!(app.hit_regions.header_targets.is_empty());
             assert_eq!(
                 app.snapshot.tick, initial_tick,
@@ -15463,6 +15659,46 @@ mod tests {
     }
 
     #[test]
+    fn palette_navigation_clears_click_targets_before_another_input_event() {
+        let host = TerminalTestHost::take(command_characterization_world());
+        let runtime = ControlRuntime::stub();
+        let renderer = TerminalRenderer::default();
+        let app = TerminalApp::new(&renderer, host.context(&runtime));
+        let mut simulator = ftui::runtime::ProgramSimulator::new(
+            LiveTerminalModel::new(app).expect("live terminal model"),
+        );
+        simulator.capture_frame(240, 36);
+        let mut app = simulator.model().app.borrow_mut();
+        let pause_target = app
+            .hit_regions
+            .header_targets
+            .iter()
+            .find(|(target, _)| *target == HeaderHitTarget::PauseToggle)
+            .map(|(_, rect)| *rect)
+            .expect("the legacy view has a real pause target");
+        assert!(app.map_area.is_some());
+        app.execute_palette_action(CommandPaletteAction::NavigateLineages);
+        let receipts_before_click = app.frankentui.receipts.len();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column: pause_target.x,
+                row: pause_target.y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("a subsequent mouse event is handled");
+        }
+        assert_eq!(app.frankentui.receipts.len(), receipts_before_click);
+        assert!(app.hit_regions.header_targets.is_empty());
+        assert!(app.map_area.is_none());
+        assert!(app.host.snapshot_hub().latest().playback.paused);
+        assert_eq!(app.host.snapshot_hub().latest().world.world.tick, 0);
+    }
+
+    #[test]
     fn live_model_only_publishes_acknowledged_frame_and_discards_failed_candidate() {
         let host = TerminalTestHost::take(command_characterization_world());
         let runtime = ControlRuntime::stub();
@@ -15481,25 +15717,52 @@ mod tests {
                 .load()
                 .is_none()
         );
-        let (painted_tick, painted_buffer) = simulator
+        let painted = simulator
             .model()
-            .awaiting_presentation
-            .borrow()
-            .as_ref()
-            .cloned()
+            .presentation
+            .candidate
+            .load_full()
             .expect("painted candidate");
         // Metadata must describe the painted frame even if a later observation
         // advances before the presentation acknowledgement is consumed.
-        simulator.model().app.borrow_mut().snapshot.tick = painted_tick + 1;
+        simulator.model().app.borrow_mut().snapshot.tick = painted.tick + 1;
+        simulator.model().presentation.record_frame(&FrameTiming {
+            frame_idx: 0,
+            update_us: 0,
+            render_us: 1,
+            diff_us: 1,
+            present_us: 1,
+            total_us: 2,
+        });
         simulator.model().acknowledge_presentation();
         let app = simulator.model().app.borrow();
         let presented = app.presented_frame.load_full().expect("acknowledged frame");
-        assert_eq!(presented.tick, painted_tick);
-        assert_eq!(presented.buffer, painted_buffer);
+        assert_eq!(presented.tick, painted.tick);
+        assert_eq!(presented.buffer, painted.buffer);
         drop(app);
         simulator.capture_frame(80, 24);
+        simulator.model().presentation.record_frame(&FrameTiming {
+            frame_idx: 1,
+            update_us: 0,
+            render_us: 1,
+            diff_us: 0,
+            present_us: 0,
+            total_us: 1,
+        });
+        assert!(simulator.model().presentation.candidate.load().is_none());
+        assert!(Arc::ptr_eq(
+            &simulator
+                .model()
+                .app
+                .borrow()
+                .presented_frame
+                .load_full()
+                .expect("last observed frame"),
+            &presented,
+        ));
+        simulator.capture_frame(80, 24);
         simulator.report_error("injected terminal write failure");
-        assert!(simulator.model().awaiting_presentation.borrow().is_none());
+        assert!(simulator.model().presentation.candidate.load().is_none());
         assert!(
             simulator
                 .model()
@@ -15533,7 +15796,13 @@ mod tests {
         let wide = frame.buffer.get(1, 0).expect("wide cell");
         let wide_id = wide.content.grapheme_id().expect("pooled wide cell");
         assert_eq!(frame.pool.get(wide_id), Some("界"));
-        assert!(frame.buffer.get(2, 0).expect("continuation").is_continuation());
+        assert!(
+            frame
+                .buffer
+                .get(2, 0)
+                .expect("continuation")
+                .is_continuation()
+        );
         assert!(
             frame
                 .buffer
@@ -15573,14 +15842,16 @@ mod tests {
             app.speed_multiplier, 1.0,
             "admission cannot mutate renderer playback"
         );
-        assert_eq!(
+        assert!(matches!(
             app.frankentui
                 .receipts
                 .back()
-                .expect("pending receipt")
+                .expect("actual admission receipt")
                 .status,
             frankentui_shell::ReceiptStatusKind::Pending
-        );
+                | frankentui_shell::ReceiptStatusKind::Admitted
+                | frankentui_shell::ReceiptStatusKind::Applied
+        ));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             app.refresh_command_receipts();
@@ -15590,7 +15861,10 @@ mod tests {
             }) {
                 break;
             }
-            assert!(Instant::now() < deadline, "owner application was not observed");
+            assert!(
+                Instant::now() < deadline,
+                "owner application was not observed"
+            );
             std::thread::park_timeout(Duration::from_millis(1));
         }
         app.maybe_step_simulation(Instant::now());
@@ -17621,33 +17895,61 @@ mod tests {
     }
 
     #[test]
-    fn target_queue_full_rejection_does_not_change_tui_playback_state() {
+    fn stale_owner_revision_rejection_does_not_change_tui_playback_state() {
         let world = command_characterization_world();
         let host = TerminalTestHost::take(world);
         let (runtime, _unused_submit) = crate::servers::ControlRuntime::dummy();
-        let (sender, _receiver) = crate::command::create_command_bus(1);
-        sender
-            // The bus now admits under an explicit identity so an applier can
-            // report against it; this fixture only needs the queue full, so the
-            // id is a fixed literal rather than a minted one.
-            .try_send(
-                "test-fill".to_owned(),
-                ControlCommand::UpdateSimulation(SimulationCommand::default()),
-            )
-            .expect("fill command queue");
         let renderer = TerminalRenderer::default();
-        let mut ctx = host.context(&runtime);
-        ctx.command_submit = crate::command::make_command_submit(sender);
-        let mut app = TerminalApp::new(&renderer, ctx);
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         assert!(app.paused);
+        let cached_revision = app.retained_render.revisions.control;
+        apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::SetSpeed(0.75));
+        let before = app.host.snapshot_hub().latest();
+        assert!(before.revisions.control > cached_revision);
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
             .expect("pause key");
+        let command_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("resume request receipt")
+            .command_id
+            .clone();
+        let receipt = wait_for_terminal_receipt(&mut app, &command_id);
 
+        assert_eq!(
+            receipt.status,
+            frankentui_shell::ReceiptStatusKind::StaleRevision {
+                expected: cached_revision.get(),
+                observed: before.revisions.control.get(),
+            }
+        );
         assert!(
             app.paused,
             "a rejected resume must retain the real host's paused playback state"
         );
+        let rejected = app.host.snapshot_hub().latest();
+        assert_eq!(rejected.playback, before.playback);
+        assert_eq!(rejected.revisions, before.revisions);
+
+        app.refresh_snapshot();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("retry after consuming the owner revision");
+        let retry_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("retry receipt")
+            .command_id
+            .clone();
+        assert_ne!(retry_id, command_id, "a new input gets a distinct identity");
+        assert!(app.paused, "submission must not optimistically resume");
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &retry_id).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        assert!(!app.host.snapshot_hub().latest().playback.paused);
+        app.refresh_snapshot();
+        assert!(!app.paused, "observed owner application resumes playback");
     }
 
     #[test]
@@ -18285,10 +18587,37 @@ mod tests {
             .snapshot_after(None)
             .expect("before")
             .expect("publication");
-        assert!(
-            (app.command_submit)(ControlCommand::SetSpeed(f32::NAN)).is_none(),
-            "terminal admitted a non-finite speed command"
-        );
+        for speed in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                app.submit_with_visible_receipt(ControlCommand::SetSpeed(speed))
+                    .is_none(),
+                "terminal admitted non-finite speed {speed}"
+            );
+            let receipt = app
+                .frankentui
+                .latest_receipt()
+                .expect("mapping failure is visible");
+            assert!(
+                matches!(
+                    &receipt.status,
+                    frankentui_shell::ReceiptStatusKind::Failed(message)
+                        if message.contains("Not submitted")
+                ),
+                "the terminal must report a local mapping failure: {receipt:?}"
+            );
+            assert!(receipt.journal_state.is_none());
+            let command_id = serde_json::from_value::<CommandId>(serde_json::Value::String(
+                receipt.command_id.clone(),
+            ))
+            .expect("local command identity");
+            assert!(
+                app.host
+                    .command_status_before(command_id, Instant::now() + Duration::from_secs(10))
+                    .expect("actual owner status lookup")
+                    .is_none(),
+                "failed mapping must not create an owner admission"
+            );
+        }
         let after = app
             .host
             .snapshot_after(None)
@@ -18296,6 +18625,17 @@ mod tests {
             .expect("publication");
         assert_eq!(after.revisions, before.revisions);
         assert_eq!(after.playback, before.playback);
+
+        let valid_id = app
+            .submit_with_visible_receipt(ControlCommand::SetSpeed(0.75))
+            .expect("a finite speed reaches real owner admission");
+        let receipt = wait_for_terminal_receipt(&mut app, &valid_id);
+        assert_eq!(receipt.status, frankentui_shell::ReceiptStatusKind::Applied);
+        assert_eq!(receipt.journal_state, Some(JournalState::CommittedVolatile));
+        let applied = app.host.snapshot_hub().latest();
+        assert_eq!(applied.playback.speed_multiplier, 0.75);
+        assert!(applied.revisions.control > before.revisions.control);
+        assert_eq!(applied.revisions.scientific, before.revisions.scientific);
     }
 
     #[test]
@@ -18323,16 +18663,38 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let host = TerminalTestHost::take(world);
+        let host = TerminalTestHost::running_frame(world);
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
 
         let mut app = TerminalApp::new(&renderer, ctx);
-        app.snapshot.spike_hits = 3;
-        app.paused = false;
+        assert!(!app.paused);
+        assert!(app.frankentui.receipts.is_empty());
         app.evaluate_auto_pause();
-        assert!(app.paused, "should auto-pause on spike hits");
+        assert!(
+            app.frankentui.receipts.is_empty(),
+            "zero spike hits must not request pause"
+        );
+        app.snapshot.spike_hits = 3;
+        app.evaluate_auto_pause();
+        assert!(
+            !app.paused,
+            "a pause request is not an observed paused publication"
+        );
+        let command_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("spike-hit pause request")
+            .command_id
+            .clone();
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &command_id).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        assert!(app.host.snapshot_hub().latest().playback.paused);
+        app.refresh_snapshot();
+        assert!(app.paused, "the real owner pauses after spike-hit feedback");
     }
 
     #[test]
@@ -18342,14 +18704,36 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let host = TerminalTestHost::take(world);
+        let host = TerminalTestHost::running_frame(world);
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
-        app.snapshot.max_age = 12;
-        app.paused = false;
+        assert!(!app.paused);
+        app.snapshot.max_age = 9;
         app.evaluate_auto_pause();
+        assert!(
+            app.frankentui.receipts.is_empty(),
+            "age below the threshold must not pause"
+        );
+        app.snapshot.max_age = 12;
+        app.evaluate_auto_pause();
+        assert!(
+            !app.paused,
+            "age-triggered pause must await an owner publication"
+        );
+        let command_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("age-threshold pause request")
+            .command_id
+            .clone();
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &command_id).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        assert!(app.host.snapshot_hub().latest().playback.paused);
+        app.refresh_snapshot();
         assert!(
             app.paused,
             "should auto-pause when max age exceeds threshold"
@@ -19141,9 +19525,26 @@ mod tests {
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
+        assert!(app.paused);
+        assert_eq!(app.snapshot.agent_count, 3);
+        apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::Resume);
         app.refresh_snapshot();
-        app.paused = false;
-        app.evaluate_auto_pause();
+        assert!(
+            !app.paused,
+            "population pause remains a request until observed"
+        );
+        let command_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("population-threshold pause request")
+            .command_id
+            .clone();
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &command_id).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        assert!(app.host.snapshot_hub().latest().playback.paused);
+        app.refresh_snapshot();
         assert!(
             app.paused,
             "should auto-pause when population below threshold"
@@ -19157,7 +19558,7 @@ mod tests {
         let world = WorldState::new(config).expect("world");
 
         let world = Arc::new(std::sync::Mutex::new(world));
-        let host = TerminalTestHost::take(world);
+        let host = TerminalTestHost::running_frame(world);
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
@@ -19165,17 +19566,35 @@ mod tests {
 
         let initial_events = app.event_log.len();
         app.snapshot.spike_hits = 1;
-        app.paused = false;
         app.evaluate_auto_pause();
         let after_first = app.event_log.len();
+        let command_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("first auto-pause identity")
+            .command_id
+            .clone();
+        let submissions_after_first = app.command_sequence;
+        assert!(!app.paused, "the cached publication remains running");
         // Re-evaluate within the same tick; should not add a duplicate event
         app.evaluate_auto_pause();
         let after_second = app.event_log.len();
 
         assert_eq!(after_first, initial_events + 1);
         assert_eq!(after_second, after_first);
-        assert!(app.paused);
+        assert_eq!(app.command_sequence, submissions_after_first);
+        assert_eq!(app.frankentui.receipts.len(), 1);
+        assert!(
+            !app.paused,
+            "repeated evaluation must not synthesize a pause"
+        );
         assert_eq!(app.last_autopause_tick, Some(app.snapshot.tick));
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &command_id).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        app.refresh_snapshot();
+        assert!(app.paused);
     }
 
     #[test]
@@ -19918,43 +20337,66 @@ mod tests {
     #[test]
     fn pause_and_resume_keep_the_chosen_speed() {
         let world = WorldState::new(ScriptBotsConfig::default()).expect("world");
-        let host = TerminalTestHost::take(Arc::new(std::sync::Mutex::new(world)));
+        let host = TerminalTestHost::running_frame(Arc::new(std::sync::Mutex::new(world)));
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
-        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = Arc::clone(&sent);
-        app.command_submit = Arc::new(move |command| {
-            record.lock().expect("record").push(command);
-            Some("recorded".to_owned())
-        });
-        let last_speed = |sent: &std::sync::Mutex<Vec<ControlCommand>>| match sent
-            .lock()
-            .expect("sent")
-            .last()
-        {
-            Some(ControlCommand::UpdateSimulation(update)) => {
-                (update.paused, update.speed_multiplier)
-            }
-            other => panic!("expected a playback update, got {other:?}"),
-        };
 
         for (speed, resumes_at) in [(2.5_f32, 2.5_f32), (0.5, 0.5), (0.0, 1.0)] {
-            app.speed_multiplier = speed;
-            app.paused = false;
+            apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::SetSpeed(speed));
+            app.refresh_snapshot();
+            assert!(!app.paused);
+            assert_eq!(app.speed_multiplier, speed);
+
             app.toggle_pause();
+            assert!(
+                !app.paused,
+                "pause submission must not change the cached publication"
+            );
+            let pause_id = app
+                .frankentui
+                .latest_receipt()
+                .expect("real pause receipt")
+                .command_id
+                .clone();
             assert_eq!(
-                last_speed(&sent),
-                (Some(true), None),
+                wait_for_terminal_receipt(&mut app, &pause_id).status,
+                frankentui_shell::ReceiptStatusKind::Applied
+            );
+            let paused = app.host.snapshot_hub().latest();
+            assert!(paused.playback.paused);
+            assert_eq!(
+                paused.playback.speed_multiplier, speed,
                 "pausing at x{speed} leaves the speed alone"
             );
-            app.paused = true;
+            app.refresh_snapshot();
+            assert!(app.paused);
+
             app.toggle_pause();
+            assert!(
+                app.paused,
+                "resume submission must not change the cached publication"
+            );
+            let resume_id = app
+                .frankentui
+                .latest_receipt()
+                .expect("real resume receipt")
+                .command_id
+                .clone();
+            assert_ne!(resume_id, pause_id);
             assert_eq!(
-                last_speed(&sent),
-                (Some(false), Some(resumes_at)),
+                wait_for_terminal_receipt(&mut app, &resume_id).status,
+                frankentui_shell::ReceiptStatusKind::Applied
+            );
+            let resumed = app.host.snapshot_hub().latest();
+            assert!(!resumed.playback.paused);
+            assert_eq!(
+                resumed.playback.speed_multiplier, resumes_at,
                 "resuming from x{speed}"
             );
+            app.refresh_snapshot();
+            assert!(!app.paused);
+            assert_eq!(app.speed_multiplier, resumes_at);
         }
     }
 
@@ -19963,45 +20405,117 @@ mod tests {
         let config = ScriptBotsConfig::default();
         let world = WorldState::new(config).expect("world");
         let world = Arc::new(std::sync::Mutex::new(world));
-        let host = TerminalTestHost::take(world);
+        let host = TerminalTestHost::with_options(
+            world,
+            scriptbots_runtime::HostCoreOptions {
+                initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                tick_period_nanos: 3_600_000_000_000,
+                capture_agent_visuals: true,
+                ..scriptbots_runtime::HostCoreOptions::default()
+            },
+        );
         let (runtime, _) = crate::servers::ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
         let ctx = host.context(&runtime);
         let mut app = TerminalApp::new(&renderer, ctx);
 
-        // Receipt admission without owner application must not change the
-        // playback state displayed by either pause entry point.
         assert!(app.paused);
-        app.command_submit = Arc::new(|_| Some("pending-playback".to_owned()));
         app.execute_palette_action(CommandPaletteAction::TogglePause);
         assert!(app.paused, "admission is not observed resumption");
-        assert!(app.host.snapshot_hub().latest().playback.paused);
-        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
-            .expect("space is handled");
-        assert!(app.paused, "keyboard admission is not observed resumption");
+        let resume_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("real palette resume receipt")
+            .command_id
+            .clone();
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &resume_id).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        assert!(!app.host.snapshot_hub().latest().playback.paused);
+        app.refresh_snapshot();
+        assert!(!app.paused, "an owner publication confirms the resume");
 
-        app.command_submit = Arc::new(|_| None);
+        let cached_revision = app.retained_render.revisions.control;
+        apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::SetSpeed(0.75));
+        let before_rejections = app.host.snapshot_hub().latest();
+        assert!(before_rejections.revisions.control > cached_revision);
         app.execute_palette_action(CommandPaletteAction::TogglePause);
+        let palette_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("stale palette receipt")
+            .command_id
+            .clone();
+        let stale = frankentui_shell::ReceiptStatusKind::StaleRevision {
+            expected: cached_revision.get(),
+            observed: before_rejections.revisions.control.get(),
+        };
+        assert_eq!(wait_for_terminal_receipt(&mut app, &palette_id).status, stale);
+        assert!(
+            !app.paused,
+            "a rejected palette pause preserves observed playback"
+        );
+
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
             .expect("space is handled");
-        assert!(app.paused, "rejected requests preserve observed playback");
+        let keyboard_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("stale keyboard receipt")
+            .command_id
+            .clone();
+        assert_ne!(keyboard_id, palette_id);
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &keyboard_id).status,
+            stale
+        );
+        assert!(
+            !app.paused,
+            "a rejected keyboard pause preserves observed playback"
+        );
+        let after_rejections = app.host.snapshot_hub().latest();
+        assert_eq!(after_rejections.playback, before_rejections.playback);
+        assert_eq!(after_rejections.revisions, before_rejections.revisions);
 
-        // A successful owner application, unlike admission, changes the display
-        // when its publication is consumed. Exercise both playback directions.
-        app.submit_and_wait(ControlCommand::Resume)
-            .expect("resume real host");
         app.refresh_snapshot();
         assert!(!app.paused);
-        app.command_submit = Arc::new(|_| Some("pending-pause".to_owned()));
         app.execute_palette_action(CommandPaletteAction::TogglePause);
         assert!(!app.paused, "admission is not observed pausing");
-        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
-            .expect("space is handled");
-        assert!(!app.paused, "keyboard admission is not observed pausing");
-        app.submit_and_wait(ControlCommand::Pause)
-            .expect("pause real host");
+        let pause_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("palette pause after revision recovery")
+            .command_id
+            .clone();
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &pause_id).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
         app.refresh_snapshot();
         assert!(app.paused);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("space is handled");
+        assert!(
+            app.paused,
+            "keyboard submission is not observed resumption"
+        );
+        let keyboard_resume_id = app
+            .frankentui
+            .latest_receipt()
+            .expect("real keyboard resume receipt")
+            .command_id
+            .clone();
+        assert_eq!(
+            wait_for_terminal_receipt(&mut app, &keyboard_resume_id).status,
+            frankentui_shell::ReceiptStatusKind::Applied
+        );
+        app.refresh_snapshot();
+        assert!(!app.paused);
 
         assert_eq!(app.map_zoom_level, 1.0);
         app.zoom_in();
@@ -20557,15 +21071,51 @@ mod tests {
                     .message
                     .contains("request submitted")
             );
+            let pause_toggle_id = app
+                .frankentui
+                .latest_receipt()
+                .expect("header pause-toggle identity")
+                .command_id
+                .clone();
+            assert_eq!(
+                wait_for_terminal_receipt(app, &pause_toggle_id).status,
+                frankentui_shell::ReceiptStatusKind::Applied
+            );
+            app.refresh_snapshot();
 
             // 2. SpeedCycle
             let speed_before = app.speed_multiplier;
+            let expected_speed = if speed_before >= 4.0 {
+                1.0
+            } else {
+                speed_before * 2.0
+            };
             app.handle_pointer_click(pointer::PointerClickEvent {
                 col: 20,
                 row: 1,
                 button: MouseButton::Left,
                 region: HitRegion::Header(Some(HeaderHitTarget::SpeedCycle)),
             });
+            assert_eq!(
+                app.speed_multiplier, speed_before,
+                "a header click must not optimistically replace observed speed"
+            );
+            let speed_id = app
+                .frankentui
+                .latest_receipt()
+                .expect("header speed request identity")
+                .command_id
+                .clone();
+            assert_eq!(
+                wait_for_terminal_receipt(app, &speed_id).status,
+                frankentui_shell::ReceiptStatusKind::Applied
+            );
+            assert_eq!(
+                app.host.snapshot_hub().latest().playback.speed_multiplier,
+                expected_speed
+            );
+            app.refresh_snapshot();
+            assert_eq!(app.speed_multiplier, expected_speed);
             assert_ne!(app.speed_multiplier, speed_before);
 
             // 3. ThemeToggle
@@ -20604,9 +21154,9 @@ mod tests {
     fn test_rich_palette_recency_and_receipt_tracking() {
         with_shortcut_app(|app| {
             assert!(app.palette_recent_actions.is_empty());
-            assert!(app.last_command_receipt_summary.is_none());
+            assert!(app.frankentui.latest_receipt().is_none());
+            let before = app.host.snapshot_hub().latest();
 
-            // Execute an action
             app.execute_palette_action(CommandPaletteAction::SpawnCarnivore);
 
             assert_eq!(app.palette_recent_actions.len(), 1);
@@ -20614,13 +21164,44 @@ mod tests {
                 app.palette_recent_actions[0],
                 CommandPaletteAction::SpawnCarnivore
             );
-            assert!(app.last_command_receipt_summary.is_some());
+            let submitted = app
+                .frankentui
+                .latest_receipt()
+                .expect("the actual owner submission is visible")
+                .clone();
             assert!(
-                app.last_command_receipt_summary
-                    .as_ref()
-                    .unwrap()
-                    .contains("Receipt #")
+                matches!(
+                    &submitted.status,
+                    frankentui_shell::ReceiptStatusKind::Pending
+                        | frankentui_shell::ReceiptStatusKind::Admitted
+                        | frankentui_shell::ReceiptStatusKind::Applied
+                ),
+                "a real submission may already be applied: {submitted:?}"
             );
+            let command_id = serde_json::from_value::<CommandId>(serde_json::Value::String(
+                submitted.command_id.clone(),
+            ))
+            .expect("receipt carries the runtime command identity");
+            let applied = wait_for_terminal_receipt(app, &submitted.command_id);
+            assert_eq!(applied.status, frankentui_shell::ReceiptStatusKind::Applied);
+            assert_eq!(applied.journal_state, Some(JournalState::CommittedVolatile));
+            let owner_status = app
+                .host
+                .command_status_before(command_id, Instant::now() + Duration::from_secs(10))
+                .expect("actual owner status")
+                .expect("actual owner retains the submitted identity");
+            assert!(matches!(
+                owner_status.application(),
+                ApplicationState::Applied(_)
+            ));
+            assert_eq!(owner_status.command_id(), command_id);
+            assert_eq!(
+                app.host.snapshot_hub().latest().world.agents.len(),
+                before.world.agents.len() + 1,
+                "one palette action must produce exactly one real spawn"
+            );
+            assert!(applied.summary().contains("applied"));
+            assert!(!applied.summary().contains("Acknowledged"));
 
             // Open palette and verify match with [Recent]
             app.palette_open = true;

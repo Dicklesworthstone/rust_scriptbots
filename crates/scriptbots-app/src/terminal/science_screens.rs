@@ -260,7 +260,8 @@ pub struct ReplayDivergenceInfo {
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayViewData {
     pub checkpoints: Vec<CheckpointViewEntry>,
-    pub current_replay_tick: u64,
+    /// Latest live host tick observed independently of any replay execution.
+    pub observed_live_tick: Option<u64>,
     pub first_divergence: Option<ReplayDivergenceInfo>,
     pub selected_checkpoint_index: usize,
     pub export_receipt: Option<String>,
@@ -852,12 +853,12 @@ pub fn render_replay_screen(
             render_state_banner(frame, y_start + 2, None, None, Some((*query_id, error)));
         }
         ScreenDataState::Data(data) => {
-            let scrubber = format!(
-                "  Replay Scrubber: Tick {:<8} Checkpoints Available: {}",
-                data.current_replay_tick,
+            let live_observation = format!(
+                "  Observed live tick: {:<11} Checkpoints Available: {}",
+                observation_text(data.observed_live_tick, |value| value.to_string()),
                 data.checkpoints.len()
             );
-            print_text(frame, 2, y_start + 2, &scrubber);
+            print_text(frame, 2, y_start + 2, &live_observation);
 
             print_text(frame, 2, y_start + 4, "  CHECKPOINT PERSISTENCE CATALOG:");
             print_text(
@@ -1123,11 +1124,21 @@ mod tests {
         for x in 0..frame.width() {
             let expected = if x < 2 { '-' } else { 'x' };
             assert_eq!(
-                frame.buffer.get(x, 0).expect("row zero cell").content.as_char(),
+                frame
+                    .buffer
+                    .get(x, 0)
+                    .expect("row zero cell")
+                    .content
+                    .as_char(),
                 Some(expected)
             );
             assert_eq!(
-                frame.buffer.get(x, 1).expect("row one cell").content.as_char(),
+                frame
+                    .buffer
+                    .get(x, 1)
+                    .expect("row one cell")
+                    .content
+                    .as_char(),
                 Some('-')
             );
         }
@@ -1200,14 +1211,24 @@ mod tests {
         assert_eq!(frame.pool.get(wide), Some("中"));
         assert!(frame.buffer.get(2, 0).expect("wide tail").is_continuation());
         assert_eq!(
-            frame.buffer.get(3, 0).expect("following character").content.as_char(),
+            frame
+                .buffer
+                .get(3, 0)
+                .expect("following character")
+                .content
+                .as_char(),
             Some('Z')
         );
 
         frame.buffer.set_raw(6, 1, Cell::from_char('-'));
         print_text(&mut frame, 6, 1, "中Z");
         assert_eq!(
-            frame.buffer.get(6, 1).expect("last column").content.as_char(),
+            frame
+                .buffer
+                .get(6, 1)
+                .expect("last column")
+                .content
+                .as_char(),
             Some('-'),
             "a two-cell character cannot be clipped into a single cell"
         );
@@ -1220,7 +1241,13 @@ mod tests {
             .grapheme_id()
             .expect("wide character remains whole");
         assert_eq!(frame.pool.get(wide), Some("中"));
-        assert!(frame.buffer.get(6, 2).expect("last column tail").is_continuation());
+        assert!(
+            frame
+                .buffer
+                .get(6, 2)
+                .expect("last column tail")
+                .is_continuation()
+        );
     }
 
     #[test]
@@ -1251,7 +1278,11 @@ mod tests {
             ShellRoute::BrainArena,
             ShellMessage::SetBrainArenaData(ScreenDataState::Data(data)),
         );
-        assert!(row(&frame, "late-wrapped-cohort").trim_start().starts_with('>'));
+        assert!(
+            row(&frame, "late-wrapped-cohort")
+                .trim_start()
+                .starts_with('>')
+        );
         assert!(frame.contains("BRAIN ARENA & EVALUATOR COHORTS"));
         assert!(frame.contains("SELECTED BRAIN ACTIVATION & TOP-K ATTRIBUTIONS"));
     }
@@ -1274,7 +1305,10 @@ mod tests {
             ShellMessage::SetLineagesData(ScreenDataState::Data(data.clone())),
         );
         assert!(frame.contains("Total Founders: 1"));
-        assert_eq!(row(&frame, "Active Clades").matches("unavailable").count(), 2);
+        assert_eq!(
+            row(&frame, "Active Clades").matches("unavailable").count(),
+            2
+        );
         assert!(frame.contains("canonical arrivals/deaths through tick 12"));
         assert!(frame.contains("Founder UID"));
         assert_eq!(
@@ -1439,16 +1473,40 @@ mod tests {
         assert_eq!(row(&frame, "missing-cp").matches("unavailable").count(), 2);
         assert!(frame.contains("No replay comparison recorded; divergence status unavailable"));
         assert!(!frame.contains("Determinism verified"));
+        assert!(frame.contains("Observed live tick: unavailable"));
+        assert!(!frame.contains("Replay Scrubber"));
 
         let encoded = serde_json::to_value(&data).expect("serialize checkpoint observations");
         assert_eq!(encoded["checkpoints"][0]["agent_count"], 0);
         assert!(encoded["checkpoints"][1]["agent_count"].is_null());
         assert_eq!(encoded["checkpoints"][0]["digest"], "science12345678");
         assert!(encoded["checkpoints"][1]["digest"].is_null());
+        assert!(encoded["observed_live_tick"].is_null());
         assert_eq!(
             serde_json::from_value::<ReplayViewData>(encoded)
                 .expect("deserialize checkpoint observations"),
             data
+        );
+
+        let observed_zero = ReplayViewData {
+            observed_live_tick: Some(0),
+            ..data
+        };
+        let frame = render(
+            ShellRoute::Replay,
+            ShellMessage::SetReplayData(ScreenDataState::Data(observed_zero.clone())),
+        );
+        assert!(frame.contains("Observed live tick: 0"));
+        assert!(!row(&frame, "Observed live tick").contains("unavailable"));
+        assert!(frame.contains("No replay comparison recorded; divergence status unavailable"));
+        let encoded =
+            serde_json::to_value(&observed_zero).expect("serialize live tick observation");
+        assert_eq!(encoded["observed_live_tick"], 0);
+        assert!(encoded.get("current_replay_tick").is_none());
+        assert_eq!(
+            serde_json::from_value::<ReplayViewData>(encoded)
+                .expect("deserialize live tick observation"),
+            observed_zero
         );
 
         let divergence = ReplayViewData {
@@ -1477,7 +1535,10 @@ mod tests {
             ShellRoute::Environment,
             ShellMessage::SetEnvironmentData(ScreenDataState::Data(missing.clone())),
         );
-        assert_eq!(row(&frame, "Mean Fertility").matches("unavailable").count(), 3);
+        assert_eq!(
+            row(&frame, "Mean Fertility").matches("unavailable").count(),
+            3
+        );
         assert!(frame.contains("No timed interventions reported in current snapshot"));
         for unsupported in ["Torus", "benign climate", "°C", "m/s"] {
             assert!(!frame.contains(unsupported));
@@ -1518,7 +1579,12 @@ mod tests {
             ShellRoute::Diagnostics,
             ShellMessage::SetDiagnosticsData(ScreenDataState::Data(missing.clone())),
         );
-        assert_eq!(row(&frame, "Simulation Rate").matches("unavailable").count(), 2);
+        assert_eq!(
+            row(&frame, "Simulation Rate")
+                .matches("unavailable")
+                .count(),
+            2
+        );
         assert_eq!(
             row(&frame, "Host Ingress Queue")
                 .matches("unavailable")

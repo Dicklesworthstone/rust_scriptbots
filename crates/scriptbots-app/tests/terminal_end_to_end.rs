@@ -53,7 +53,18 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
         assert_eq!(observation["terminal_attributes_restored"], true);
         assert_eq!(observation["alternate_screen_restored"], true);
         assert_eq!(observation["frankentui_shutdown_observed"], true);
-        assert_eq!(observation["observed_science_routes"].as_array().map(Vec::len), Some(6));
+        assert_eq!(
+            observation["observed_screenshot_routes"]
+                .as_array()
+                .map(Vec::len),
+            Some(6)
+        );
+        assert_eq!(
+            observation["observed_science_routes"]
+                .as_array()
+                .map(Vec::len),
+            Some(6)
+        );
     }
     Ok(())
 }
@@ -61,7 +72,7 @@ fn live_frankentui_pty_routes_and_restores_terminal() -> Result<()> {
 #[cfg(target_os = "linux")]
 const LIVE_TERMINAL_PTY_PROBE: &str = r#"
 import fcntl, hashlib, json, os, pathlib, pty, re, select, signal
-import struct, subprocess, sys, tempfile, termios, time
+import socket, struct, subprocess, sys, tempfile, termios, time, urllib.error, urllib.request
 
 binary, source = sys.argv[1:]
 routes = [
@@ -78,10 +89,14 @@ for profile in ('truecolor', 'no-color'):
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
     initial = termios.tcgetattr(slave)
+    with socket.socket() as reservation:
+        reservation.bind(('127.0.0.1', 0))
+        port = reservation.getsockname()[1]
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith(('SCRIPTBOTS_', 'SB_'))}
     environment.update(SCRIPTBOTS_MODE='terminal', SCRIPTBOTS_TERMINAL_HEADLESS='0',
-                       SCRIPTBOTS_CONTROL_REST_ENABLED='0', SCRIPTBOTS_CONTROL_MCP='disabled',
+                       SCRIPTBOTS_CONTROL_REST_ENABLED='1', SCRIPTBOTS_CONTROL_MCP='disabled',
+                       SCRIPTBOTS_CONTROL_REST_ADDR='127.0.0.1:' + str(port),
                        RUST_LOG='scriptbots::terminal=info', TERM='xterm-256color')
     if profile == 'no-color':
         environment['NO_COLOR'] = '1'
@@ -94,6 +109,7 @@ for profile in ('truecolor', 'no-color'):
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
     raw = bytearray()
     observed = []
+    screenshots = []
     with open(directory / 'stderr.log', 'xb') as log:
         process = subprocess.Popen(
             [binary, '--storage', 'memory', '--bootstrap-ticks', '0', '--threads', '1',
@@ -123,6 +139,23 @@ for profile in ('truecolor', 'no-color'):
                 os.write(master, key.encode())
                 pump_until(lambda: title.encode() in escape.sub(b'', bytes(raw[start:])), title)
                 observed.append(title)
+                def screenshot_matches():
+                    try:
+                        with urllib.request.urlopen(
+                                'http://127.0.0.1:' + str(port) + '/api/screenshot/ascii', timeout=0.2) as response:
+                            body = response.read(200_000)
+                        if title.encode() in body:
+                            with open(directory / ('screen-' + key + '.txt'), 'xb') as screenshot:
+                                screenshot.write(body)
+                            screenshots.append({'route': title, 'sha256': hashlib.sha256(body).hexdigest()})
+                            return True
+                    except urllib.error.HTTPError as error:
+                        if error.code != 409:
+                            raise
+                    except (urllib.error.URLError, TimeoutError):
+                        pass
+                    return False
+                pump_until(screenshot_matches, 'presented screenshot for ' + title)
             os.write(master, b'q')
             deadline = time.monotonic() + 30
             while process.poll() is None and time.monotonic() < deadline:
@@ -156,6 +189,7 @@ for profile in ('truecolor', 'no-color'):
     assert finalized, 'real FrankenTUI shutdown callback was not observed'
     print(json.dumps({'schema': 'scriptbots.live-tui-pty.v1', 'source_commit': source,
                       'capability_profile': profile, 'observed_science_routes': observed,
+                      'observed_screenshot_routes': screenshots,
                       'exit_code': process.returncode, 'raw_mode_observed': raw_mode,
                       'terminal_attributes_restored': restored,
                       'alternate_screen_restored': alternate_restored,

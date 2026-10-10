@@ -228,6 +228,14 @@ impl CommandReceiptEntry {
             }
             ApplicationState::Failed(failure) => ReceiptStatusKind::Failed(format!("{failure:?}")),
         };
+        let (tick, control_revision, scientific_revision) = match status.application() {
+            ApplicationState::Applied(applied) => (
+                applied.tick.0,
+                applied.revisions.control.get(),
+                applied.revisions.scientific.get(),
+            ),
+            _ => (tick, control_revision, scientific_revision),
+        };
         Self {
             command_id: command_id.to_string(),
             action: action.into(),
@@ -768,6 +776,7 @@ impl Model for FrankenTuiModel {
                 let action = receipt.action.clone();
                 let status = receipt.status.clone();
                 let cmd_id = receipt.command_id.clone();
+                let control_revision = receipt.control_revision;
                 self.record_receipt(receipt);
 
                 match &status {
@@ -779,7 +788,7 @@ impl Model for FrankenTuiModel {
                         }
                         self.status_message = Some(format!(
                             "✓ OK: Command {cmd_id} applied (rev {})",
-                            self.control_revision
+                            control_revision
                         ));
                     }
                     ReceiptStatusKind::Rejected(reason) => {
@@ -1805,6 +1814,76 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_receipt_revisions_follow_owner_application_boundary() {
+        use scriptbots_runtime::{
+            AdmissionSequence, AppliedCommand, ControlRevision, HostRevisions, ScientificRevision,
+        };
+
+        let command_id = CommandId::new(57);
+        let admitted = CommandStatus::try_new(
+            command_id,
+            Some(AdmissionSequence::new(1)),
+            ApplicationState::Admitted,
+            JournalState::Pending,
+        )
+        .expect("valid admitted status");
+        let receipt =
+            CommandReceiptEntry::from_runtime_status(&command_id, "Step", &admitted, 40, 5, 40);
+        assert_eq!(receipt.status, ReceiptStatusKind::Admitted);
+        assert_eq!(receipt.timestamp_tick, 40);
+        assert_eq!(receipt.control_revision, 5);
+        assert_eq!(receipt.scientific_revision, 40);
+
+        let mut model = FrankenTuiModel::new();
+        model.update_from_snapshot(40, 0, 0, 0.0, 5, 40);
+        model.update(ShellMessage::CommandReceipt(receipt));
+        for (journal, expected) in [
+            (JournalState::CommittedVolatile, ReceiptStatusKind::Applied),
+            (JournalState::Durable, ReceiptStatusKind::Durable),
+        ] {
+            let applied = CommandStatus::try_new(
+                command_id,
+                Some(AdmissionSequence::new(1)),
+                ApplicationState::Applied(AppliedCommand {
+                    tick: scriptbots_core::Tick(41),
+                    revisions: HostRevisions {
+                        control: ControlRevision::new(8),
+                        scientific: ScientificRevision::new(41),
+                        ..HostRevisions::default()
+                    },
+                }),
+                journal,
+            )
+            .expect("valid applied status");
+            // The snapshot cache still precedes the owner's application boundary.
+            let receipt = CommandReceiptEntry::from_runtime_status(
+                &command_id,
+                "Step",
+                &applied,
+                40,
+                5,
+                40,
+            );
+            assert_eq!(receipt.status, expected);
+            assert_eq!(receipt.timestamp_tick, 41);
+            assert_eq!(receipt.control_revision, 8);
+            assert_eq!(receipt.scientific_revision, 41);
+            model.update(ShellMessage::CommandReceipt(receipt));
+            assert_eq!(model.receipts.len(), 1);
+            assert_eq!(model.receipts[0].timestamp_tick, 41);
+            assert_eq!(model.receipts[0].control_revision, 8);
+            assert_eq!(model.receipts[0].scientific_revision, 41);
+            assert_eq!(
+                model.status_message,
+                Some(format!("✓ OK: Command {command_id} applied (rev 8)"))
+            );
+            assert_eq!(model.tick, 40);
+            assert_eq!(model.control_revision, 5);
+            assert_eq!(model.scientific_revision, 40);
+        }
+    }
+
+    #[test]
     fn test_effect_queue_is_bounded_and_drains_once_without_losing_admitted_intents() {
         let mut model = FrankenTuiModel::new();
         for _ in 0..MAX_PENDING_EFFECTS {
@@ -1852,7 +1931,10 @@ mod tests {
         let watermarks = model.watermark_status.clone();
         model.update_from_snapshot(25, 1, 12, 40.0, 8, 25);
         assert_eq!(model.chart_data.samples, chart.samples);
-        assert_eq!(model.chart_data.last_snapshot_tick, chart.last_snapshot_tick);
+        assert_eq!(
+            model.chart_data.last_snapshot_tick,
+            chart.last_snapshot_tick
+        );
         assert_eq!(model.watermark_status, watermarks);
         assert_eq!(model.tick, 25);
         assert_eq!(model.food_energy, 40.0);
@@ -1935,7 +2017,10 @@ mod tests {
             harness.dispatch(ShellMessage::CommandReceipt(receipt.clone()));
             let frame = harness.capture_frame(100, 24);
             let row = buffer_row_text(frame, 2);
-            assert!(row.contains("[PENDING] journal=unobserved"), "{route:?}: {row}");
+            assert!(
+                row.contains("[PENDING] journal=unobserved"),
+                "{route:?}: {row}"
+            );
             assert!(row.contains("awaiting execution"));
 
             receipt.status = ReceiptStatusKind::Rejected("quota".into());
@@ -1943,7 +2028,10 @@ mod tests {
             harness.dispatch(ShellMessage::CommandReceipt(receipt));
             let frame = harness.capture_frame(100, 24);
             let row = buffer_row_text(frame, 2);
-            assert!(row.contains("[REJECTED] journal=durable"), "{route:?}: {row}");
+            assert!(
+                row.contains("[REJECTED] journal=durable"),
+                "{route:?}: {row}"
+            );
             assert!(row.contains("rejected: quota"));
             assert!(!row.contains("[DURABLE]"));
             assert_eq!(harness.model().receipts.len(), 1);
@@ -1952,7 +2040,9 @@ mod tests {
 
     #[test]
     fn test_receipt_summary_preserves_application_success_and_journal_failure_detail() {
-        use scriptbots_runtime::{AdmissionSequence, AppliedCommand, HostRevisions, JournalFailure};
+        use scriptbots_runtime::{
+            AdmissionSequence, AppliedCommand, HostRevisions, JournalFailure,
+        };
 
         let command_id = CommandId::new(56);
         let status = CommandStatus::try_new(
@@ -2006,7 +2096,10 @@ mod tests {
         print_to_frame(&mut frame, 0, 0, "界X");
         let head = frame.buffer.get(0, 0).unwrap();
         assert_eq!(head.content.width(), 2);
-        assert_eq!(frame.pool.get(head.content.grapheme_id().unwrap()), Some("界"));
+        assert_eq!(
+            frame.pool.get(head.content.grapheme_id().unwrap()),
+            Some("界")
+        );
         assert!(frame.buffer.get(1, 0).unwrap().is_continuation());
         assert_eq!(frame.buffer.get(2, 0).unwrap().content.as_char(), Some('X'));
         print_to_frame(&mut frame, 3, 0, "界");
@@ -2015,7 +2108,10 @@ mod tests {
         print_to_frame(&mut frame, 1, 1, "👍🏽Z");
         let head = frame.buffer.get(1, 1).unwrap();
         assert_eq!(head.content.width(), 2);
-        assert_eq!(frame.pool.get(head.content.grapheme_id().unwrap()), Some("👍🏽"));
+        assert_eq!(
+            frame.pool.get(head.content.grapheme_id().unwrap()),
+            Some("👍🏽")
+        );
         assert!(frame.buffer.get(2, 1).unwrap().is_continuation());
         assert_eq!(frame.buffer.get(3, 1).unwrap().content.as_char(), Some('Z'));
 
@@ -2024,7 +2120,10 @@ mod tests {
         print_to_frame(&mut frame, 2, 2, "e\u{301}!");
         let head = frame.buffer.get(2, 2).unwrap();
         assert_eq!(head.content.width(), 1);
-        assert_eq!(frame.pool.get(head.content.grapheme_id().unwrap()), Some("e\u{301}"));
+        assert_eq!(
+            frame.pool.get(head.content.grapheme_id().unwrap()),
+            Some("e\u{301}")
+        );
         assert_eq!(frame.buffer.get(3, 2).unwrap().content.as_char(), Some('!'));
     }
 
@@ -2127,8 +2226,8 @@ mod tests {
     }
 
     #[test]
-    fn test_golden_frames_for_normal_reduced_rejected_stale_failed() {
-        // Golden 1: Normal State
+    fn test_frame_state_assertions_for_normal_reduced_rejected_stale_failed() {
+        // State 1: Normal State
         let mut h_normal = FrankenTuiSimulatorHarness::new();
         h_normal.init();
         h_normal.dispatch(ShellMessage::UpdateSnapshot {
@@ -2154,7 +2253,7 @@ mod tests {
         assert!(normal_frame.contains("[DURABLE]"));
         assert!(normal_frame.contains("✓ OK: Command cmd-1 applied"));
 
-        // Golden 2: Reduced-Capability State
+        // State 2: Reduced-Capability State
         let mut h_reduced = FrankenTuiSimulatorHarness::new();
         h_reduced.init();
         h_reduced.dispatch(ShellMessage::CapabilityChanged {
@@ -2164,7 +2263,7 @@ mod tests {
         let reduced_frame = h_reduced.capture_frame_str(80, 24);
         assert!(reduced_frame.contains("[REDUCED CAPABILITY]"));
 
-        // Golden 3: Rejected Receipt State
+        // State 3: Rejected Receipt State
         let mut h_rejected = FrankenTuiSimulatorHarness::new();
         h_rejected.init();
         h_rejected.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
@@ -2180,7 +2279,7 @@ mod tests {
         assert!(rejected_frame.contains("[REJECTED]"));
         assert!(rejected_frame.contains("✗ REJECTED: Command cmd-rej rejected: quota exceeded"));
 
-        // Golden 4: Stale-Revision State
+        // State 4: Stale-Revision State
         let mut h_stale = FrankenTuiSimulatorHarness::new();
         h_stale.init();
         h_stale.dispatch(ShellMessage::RecoverStaleRevision {
@@ -2192,7 +2291,7 @@ mod tests {
         assert!(stale_frame.contains("[STALE_REV]"));
         assert!(stale_frame.contains("⚠ Reconciled stale revision for cmd-stale -> rev 10"));
 
-        // Golden 5: Failed Receipt State
+        // State 5: Failed Receipt State
         let mut h_failed = FrankenTuiSimulatorHarness::new();
         h_failed.init();
         h_failed.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
@@ -2370,7 +2469,9 @@ mod tests {
         let effects: Vec<_> = harness.model_mut().drain_effects().collect();
         assert!(matches!(
             effects.as_slice(),
-            [ShellEffect::SubmitCommand(ControlCommand::SpawnAgent { .. })]
+            [ShellEffect::SubmitCommand(
+                ControlCommand::SpawnAgent { .. }
+            )]
         ));
         harness.dispatch(ShellMessage::CommandReceipt(CommandReceiptEntry {
             command_id: cmd2_id.clone(),
@@ -2605,7 +2706,11 @@ mod tests {
             ReceiptStatusKind::Pending
         );
         assert_eq!(
-            harness.model().receipt_for(request_id).unwrap().journal_state,
+            harness
+                .model()
+                .receipt_for(request_id)
+                .unwrap()
+                .journal_state,
             None
         );
         assert!(harness.model().science.replay.is_empty());
@@ -2625,7 +2730,7 @@ mod tests {
                     digest: Some("observed-world-digest".into()),
                     file_size_bytes: 12345,
                 }],
-                current_replay_tick: 250,
+                observed_live_tick: Some(250),
                 first_divergence: None,
                 selected_checkpoint_index: 0,
                 export_receipt: None,
@@ -2769,7 +2874,13 @@ mod tests {
         ));
         assert!(harness.model().science.export_history.is_empty());
         assert_eq!(
-            harness.model().science.replay.data().unwrap().export_receipt,
+            harness
+                .model()
+                .science
+                .replay
+                .data()
+                .unwrap()
+                .export_receipt,
             None
         );
         assert!(
@@ -2944,7 +3055,7 @@ mod tests {
                     file_size_bytes: 49152,
                 },
             ],
-            current_replay_tick: 150,
+            observed_live_tick: Some(150),
             first_divergence: None,
             selected_checkpoint_index: 0,
             export_receipt: Some("export-tick-200-replay.bundle".into()),
@@ -2955,7 +3066,7 @@ mod tests {
         harness.inject_key(KeyCode::Char('7'));
         let replay_frame = harness.capture_frame_str(80, 24);
         assert!(replay_frame.contains("DETERMINISTIC REPLAY & FIRST-DIVERGENCE TRACKER"));
-        assert!(replay_frame.contains("Replay Scrubber: Tick 150"));
+        assert!(replay_frame.contains("Observed live tick: 150"));
         assert!(replay_frame.contains("cp-tick-100"));
         assert!(replay_frame.contains("cp-tick-200"));
         assert!(

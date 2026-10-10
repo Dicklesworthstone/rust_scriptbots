@@ -62,6 +62,30 @@ verify_evidence() {
     done
     [[ $(head -n 1 "$directory/source.txt") == "commit $expected" ]] || refuse "source record mismatch"
     [[ $(sed -n 's/^host: //p' "$directory/rustc.txt") == "$target" ]] || refuse "compiler target mismatch"
+    if [[ "$lane" == terminal ]]; then
+        jq -R -s -e --arg source "$expected" '
+            split("\n") | map(fromjson? | select(.schema == "scriptbots.live-tui-pty.v1"))
+            | length == 2 and ([.[].capability_profile] | sort) == ["no-color", "truecolor"]
+            and all(.[]; .source_commit == $source and .exit_code == 0
+                and .raw_mode_observed == true and .terminal_attributes_restored == true
+                and .alternate_screen_restored == true and .frankentui_shutdown_observed == true
+                and (.observed_science_routes | length) > 0
+                and (.observed_science_routes | length) == (.observed_science_routes | unique | length)
+                and (.observed_science_routes | sort) == ([.observed_screenshot_routes[].route] | sort))
+        ' "$directory/terminal-end-to-end-tests.log" >/dev/null || refuse "missing source-bound live terminal and screenshot observations"
+        while IFS= read -r record; do
+            local artifact_directory transcript_hash screenshot_hash index
+            artifact_directory=$(jq -er '.artifact_directory' <<< "$record") || refuse "missing PTY artifact path"
+            [[ "$artifact_directory" = /* && -d "$artifact_directory" ]] || refuse "missing PTY artifacts"
+            transcript_hash=$(jq -er '.transcript_sha256' <<< "$record") || refuse "missing PTY transcript identity"
+            [[ $(sha256sum "$artifact_directory/terminal.raw" | cut -d ' ' -f 1) == "$transcript_hash" ]] || refuse "changed PTY transcript"
+            index=4
+            while IFS= read -r screenshot_hash; do
+                [[ $(sha256sum "$artifact_directory/screen-$index.txt" | cut -d ' ' -f 1) == "$screenshot_hash" ]] || refuse "changed presented screenshot"
+                index=$((index + 1))
+            done < <(jq -r '.observed_screenshot_routes[].sha256' <<< "$record")
+        done < <(jq -R -c 'fromjson? | select(.schema == "scriptbots.live-tui-pty.v1")' "$directory/terminal-end-to-end-tests.log")
+    fi
     if [[ "$lane" == connectivity ]]; then
         jq -R -s -e --arg source "$expected" --rawfile compiler "$directory/rustc.txt" '
             split("\n") | map(fromjson? | select(.schema == "scriptbots.real-process-e2e.v3"
