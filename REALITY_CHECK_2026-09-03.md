@@ -28,7 +28,8 @@ successor settles the real owner flush before capture and preserves the original
 criteria. R76 still fails that exact case, exposing a production replay-anchor lifecycle bug.
 The isolated successor corrects that lifecycle and adds real enabled/disabled boundary controls.
 R77 runs the exact failed case and new core control first, then retains all ten original gates.
-Execution of the new acceptance tests remains incomplete. The original checkpoint owner
+Both discriminating preludes and all seven initial checks pass at `159fe99d`; the complete
+workspace/feature/persistence/CLI acceptance remains unfinished. The original checkpoint owner
 remains in progress and its public guarantee remains false. Original R61/R67 deadlines were
 not extended. Both expired process groups were retired on October 11; their original runners
 reported timeout with outer exit six. The new workspace run retains all ten original gates.
@@ -181,7 +182,8 @@ partial cadence refuses before its actual flush. All original decoding, actual s
 MLP comparison and registered-but-unused opaque-factory refusal assertions remain. A separate
 core control uses production NullPersistence on empty worlds: both intervals first refuse the
 pending digest, then resolve it across an actual tick and observe the real discarded-gap marker.
-That core control is not file-storage or nonempty-world proof. Native execution remains pending.
+That core control is not file-storage or nonempty-world proof. R77 subsequently executes both
+named controls successfully at this exact source; the remaining original acceptance stays open.
 
 The external resets removed four uncommitted source edits and the prior commit chain from shared
 `main`. Root preserves the complete saved `1e8c34a4` chain in a fresh isolated `main` checkout,
@@ -189,9 +191,12 @@ leaves the reset checkout untouched and asks whether the reset was intentional. 
 files reconstructed there byte-match their pre-reset scan hashes; the two reconstructed test
 files are reviewed and scanned again, rather than claimed byte-identical. Bank `159fe99d`, tree
 `b7df07ebfcfd7e5d101dc4e4d3242913ed84390e`, uses the exact frozen four-file review protocol.
-The isolated Agent Mail reservations are conflict-free. Its installed guard warns that its
-archive identity lookup collides and allows the commit; this is disclosed, not claimed as an
-enforced reservation check. The independent frozen review and actual reservations are retained.
+The isolated Agent Mail reservations are conflict-free. Its initially installed guard warns that
+its archive identity lookup collides and allows the source/docs/tracker commits; this is disclosed,
+not claimed as an enforced reservation check. Reinstalling through the supported API with the
+actual returned project slug resolves that lookup; its direct invocation returns zero without the
+warning. No foreign-reservation rejection is claimed by that empty-index check. The independent
+frozen review and actual reservations are retained.
 
 The first reconstruction scans accidentally run under zsh; Bash cleanup functions fail to export
 and scanner shell temporary directories are deleted. Source and raw logs remain; this is another
@@ -213,6 +218,48 @@ deadline. The independent Hz3 source is `source-checkpoint-r77`. Its fresh profi
 exact named test pass and one executed test before the unchanged ten workspace gates. This is
 diagnostic execution through the installed DSR; full private-tool and Host acceptance remain open.
 
+R77's exact nonempty app comparator passes: one executed test, zero failures/ignores, 5.48 seconds,
+after 6m42s compilation. Its log SHA256 is
+`55a105aab6602f62e330f3ddad75ebb348986f4f4167656b8c0d99349b6e6c85`.
+The new core pending-anchor test passes once, zero failures/ignores, 0.01 seconds; log SHA256
+`7dec0c828bc434b45b6106cbd43bbd4465acea2b3834a795ee5c3ee12ab29dc6`.
+Both logs are copied locally and independently hash-match the retained Hz3 bytes. By 08:02:50 UTC,
+formatting, four original dependency/license guards, all-target workspace compilation and strict
+workspace Clippy all pass at `159fe99d`. Check log SHA256 is
+`afdc773fae9a3bd2729e0eb0ae864c3f92a159b0e5b488cc19d68f440bcbcf7c`;
+Clippy log SHA256 is `3a3e9400c9cae65a4ccb7401dd8818850c49127f46bace16492c1208b4103206`.
+The upstream proc-macro-error2 future-incompatibility notice remains. The original full workspace
+test gate is now running; economy-faults and final analyzer build are not yet reached.
+
+By 08:39:02 UTC, R77's real seeded-world analytics test passes at that same source. Its two
+400-tick runs preserve the original seeds and real MLP reproduction: seed seven observes
+183 births, twelve deaths and 400 admitted/applied/durable batches. All twelve analyzer report
+commands return zero; all five SQL/Parquet table counts agree, including 41,329 agent rows and
+72,039 replay rows. Four original missing/empty/corrupt database and unknown-report controls
+refuse. The completed manifest independently hash-matches the copied bytes at
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/r77-real-world-MANIFEST.json`, SHA256
+`5979e775c037a9eac6c0a9e2cd857e80248ef0325557b6bc814ede0f5d26d11c`.
+Its zero-row narrative-validation report explicitly leaves real planted-scarcity/stationary-null,
+same-run control search and interaction export joins unfinished. The companion fixture pipeline
+and later workspace suites still run; this is not a final workspace or Host continuation verdict.
+
+The original terminal lane now also runs on the idle second worker at the exact clean
+`159fe99d`/`b7df07eb` source, using all fourteen original verifier gates. Preparation finishes
+08:37:46 UTC; launcher PID 3257031 starts 08:38:12 UTC with unique version
+`terminal-diagnostic-20261011-continuation-r78-hz2`, four jobs and the unchanged 7,200-second
+deadline. The profile and launcher hashes are respectively
+`bedae0241da52671b9b2abf693280dc0004d6366435b600b535352d552f19b0a` and
+`88f878855a6d585da6802f6159b17d149674526f885cc58e803ed1ce46070df2`.
+Its incremental bundle hash is `4c4a732e41b1675972daf6902291e09d1a7aee1190e3245d766a3a1100f31776`;
+transport, clean source/tree and the unchanged verifier are checked before launch. Hz2's installed
+DSR has independently advanced to `84d139ea5a6c2d6ac5e1e53c71fba0f26bd919e4`, tree
+`89a48925f032017203d6f09e35483ead2d2824dc`. The relevant native-cache/source changes are read
+before pinning its actual source and executable hashes; root does not modify that installation.
+This remains diagnostic execution, not qualification of the entire DSR tool. By 08:39:34 UTC,
+formatting, four dependency/license guards and exact FrankenTUI consumer metadata pass;
+strict workspace Clippy runs. Actual PTY, runtime, smoke, manifest and final collection results
+remain pending in the original terminal owner.
+
 R72 finishes at the unchanged coordinator deadline: native typed timeout/5, outer failed/6,
 07:45:09 UTC, 7,207 seconds. The baseline completes all 139 original files with 68 passes,
 71 failures and zero skips. The candidate records actual passes and failures, but its full
@@ -222,6 +269,17 @@ collection is inferred. The proof, original profile/launcher and outer raw log a
 SHA256 `d33357799e930f3631956fda8da6a2956be9752eef0a582fe353c0ae39922476`.
 The focused R71 logger proof remains scoped to its actual observed controls; R72 does not qualify
 the private tool or project. Original rosters, source/seed guards and deadlines are unchanged.
+Completed archive transfer independently matches that SHA256 and retains 59,289 members. All
+26 recorded command-channel hashes match. Its inner typed verdict is failed/1, SHA256
+`2701f93c0f3917123127fdbfac092fea9361b62972eae9aa10a962b8a7577ef7`, with thirteen observed
+of fifteen required cases; `candidate-suite` and `final-source` are missing. Raw candidate output
+observes 82 file dispositions: 58 passes, 23 failures, one original git-build-context skip;
+this is an unfinished roster, not a full summary. Trap-retained seed/tool custody exits are zero;
+independent byte comparisons verify installed source/hash lists, seed inode/stat inventory,
+seed receipt and content inventory before/after. This does not establish the missing final
+candidate-source case or successful collection. The earlier statement only refused to infer
+custody; these are now actual readback observations. Empty baseline cache logs do not establish
+their separate root cause.
 
 At 02:52 UTC, a conflict-free strict fast-forward restored saved `0879e176` after external
 resets to `7c9264a1` at 01:37 and 01:38 UTC. Beads import changed zero rows; both authoritative
@@ -967,8 +1025,18 @@ as a working list when its original owners are fully qualified; retained evidenc
   review, scan and bank the reconstructed correction at `159fe99d` without changing shared main.
 - [x] Prepare, transport, verify and launch R77 at the exact isolated source with two discriminating
   preludes and all ten unchanged original workspace gates.
-- [ ] Observe both R77 preludes, finish the original workspace gates and fix actual failures
+- [ ] Finish the original R77 workspace gates and fix actual failures
   without narrowing acceptance or extending the original deadline.
+- [x] Observe both R77 discriminating preludes, formatting, all-target workspace check and
+  strict Clippy passing at `159fe99d`; independently copy/hash both native test logs.
+- [ ] Finish R77's original full workspace tests, economy-faults lane and analyzer build;
+  preserve typed inner/outer results and every actual failure or unexecuted case.
+- [x] Observe the exact-source real seeded analytics test and independently copy/hash its
+  completed manifest; retain its explicit unproved scientific/search/export cases.
+- [x] Prepare, transport, verify and launch the original fourteen-gate terminal lane R78
+  at the same clean source on Hz2, pinned to its actual installed runner and original deadline.
+- [ ] Finish R78's real runtime/PTY/smoke/manifest checks and strict retained-evidence consumer;
+  preserve actual failures, source identity and outer collection disposition before any closure.
 - [ ] Resolve the external-reset intent and integrate only a reviewed, qualified continuation;
   preserve all prior source, failures, original acceptance and independent shared-tree changes.
 - [x] Execute the original logger diagnostic, preserve the R68 observer failure and qualify
