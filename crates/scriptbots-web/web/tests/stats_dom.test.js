@@ -491,7 +491,13 @@ async function runTests() {
       }
       const expectedVersion = `${packageInfo.manifest.name} ${packageInfo.manifest.version}`;
       await page.waitForFunction((version) => document.getElementById("version").textContent === version, expectedVersion);
-      await page.waitForFunction(() => Number(document.getElementById("metric-tick").textContent.replaceAll(",", "")) > 0);
+      await page.waitForFunction(() => Number(document.getElementById("metric-tick").textContent.replaceAll(",", "")) > 0)
+        .catch((error) => {
+          console.error("Real packaged demo did not advance:", JSON.stringify({
+            loadedFiles, pageErrors, consoleLogs,
+          }));
+          throw error;
+        });
       const readMetrics = () => page.evaluate(() => Object.fromEntries(
         ["tick", "population", "tps", "energy", "health", "births", "deaths"].map((field) =>
           [field, document.getElementById(`metric-${field}`).textContent]),
