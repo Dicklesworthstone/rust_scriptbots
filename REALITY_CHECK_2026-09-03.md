@@ -16,7 +16,7 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-The preserved candidate's latest Rust source is `159fe99d5e92c03ad86472b015f13e37189e91c0`.
+The preserved candidate's latest Rust source is `a03bcdbf5ba3a1734db84addef5b3e76c713c1f9`.
 It is isolated at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
 resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. It includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
@@ -30,7 +30,8 @@ The isolated successor corrects that lifecycle and adds real enabled/disabled bo
 R77 runs the exact failed case and new core control first, then retains all ten original gates.
 Both discriminating preludes and all seven initial checks pass at `159fe99d`; the complete
 workspace/feature/persistence/CLI acceptance remains unfinished. The original checkpoint owner
-remains in progress and its public guarantee remains false. Original R61/R67 deadlines were
+remains in progress. The latest source adds an artifact-scoped guarantee writer; its native
+qualification is pending and immutable ordinary launch manifests remain false. Original R61/R67 deadlines were
 not extended. Both expired process groups were retired on October 11; their original runners
 reported timeout with outer exit six. The new workspace run retains all ten original gates.
 
@@ -257,8 +258,154 @@ DSR has independently advanced to `84d139ea5a6c2d6ac5e1e53c71fba0f26bd919e4`, tr
 before pinning its actual source and executable hashes; root does not modify that installation.
 This remains diagnostic execution, not qualification of the entire DSR tool. By 08:39:34 UTC,
 formatting, four dependency/license guards and exact FrankenTUI consumer metadata pass;
-strict workspace Clippy runs. Actual PTY, runtime, smoke, manifest and final collection results
-remain pending in the original terminal owner.
+strict workspace Clippy and all-target workspace compilation subsequently pass. R78 finishes
+08:46:19 UTC with typed failed/1 after eight completed gates, outer failed/6. Runtime observes
+229 passes, four failures and six original ignores. PTY, smoke, manifest and final analyzer gates
+are unreached. Every completed command log is copied and independently hash-checked; runtime
+failure SHA256 is `085b869a7f6200350cca0ddde37d6926f71c8d08dbbbc66214fe938d2c26c4f8`.
+
+The four failures distinguish a real channel defect from three invalid fixtures. The channel
+could skip backward-clock validation while waiting for maintenance. `09a4205a` checks the
+actual native observation before ingress or maintenance mutation, retaining snapshot identity,
+admission/tick cursors, retry deadline and the pending reply on refusal. The schedule test's
+zero archive capacity is correctly refused by the existing nonzero option gate: the corrected
+fixture now separates that typed negative from four valid capacities and their 32
+rehashed mutations. No production gate is weakened. The discarded-history fixture now validates
+its configuration before reaching the intended guard; its previous smaller food maximum was
+invalid against the existing respawn amount. The maximum-sequence restored fixture now settles
+an actual Pause in its production volatile journal before requiring session continuation;
+the fresh unbound journal's refusal remains correct. These fixes preserve every intended
+continuation/refusal observation; they were source-only at that bank.
+
+R79 executes the original failing channel case first at `09a4205a`. It passes the backward-clock
+assertions, then fails the still-empty capture reply at `channel.rs:2050`; zero tests pass,
+one fails, 238 are filtered, outer failed/6 at 09:05:21 UTC. None of the other three preludes or
+fourteen original gates execute. Its copied completed log independently matches SHA256
+`facd019972678e335d544e6395518fe1df92c5bcf24955f6eab1c40dd2605e6a`.
+Source tracing finds the omitted running `Deadline` interest: polling with elapsed time grants
+new science while the checkpoint waits for the previous journal cut. `a4b8b5ec` freezes science
+time for parked captures through that interest and through journal retries, then resumes the
+ordinary cadence after capture. The existing test now observes actual running playback and
+`Deadline` interest before exercising the unchanged capture, decode and resumed-science checks.
+
+R77 at the older exact source `159fe99d` passes all five original replay E2Es, 597.85 seconds.
+The real full-host test observes uninterrupted 18 ticks versus an initial seven-tick handoff
+plus eleven continued ticks in the same physical database/run/session. Independent SQL readback
+checks exact artifact bytes/digests, all three durability watermarks, nonempty MLP population,
+retained source identity and all six chronological stage observations. Real changed-config
+comparison reports the first Sense divergence at tick one; checksum corruption and rehashed
+truncation both refuse without changing observed prefixes/row counts. Ordinary tick-zero/core
+checkpoint replay and bundle create/readback/refusals pass in that same original E2E cohort.
+The retained full-host proof directory is
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/proofs/workspace-diagnostic-20261011-checkpoint-r77-hz3/tmp/host-checkpoint-continuation-0fSxGM`.
+The overall workspace verdict and current-source qualification are still pending.
+
+The new handoff report writer runs only after actual owner retirement, worker close and
+independent exact retained-artifact readback. It uses the same paused-playback, complete factory/
+evaluator coverage and prepared executable-world reconstruction as the bounded continuation CLI;
+its typed `CharacterizationLimitationsV0` claim belongs to that artifact, with an observed refusal
+reason when reconstruction fails. Immutable launch manifests stay false. The existing nonempty
+four-cell control gains actual reconstruction, wrong-registry, opaque-factory and running-playback
+observations; the original real CLI E2E reads both the new typed claim and unchanged launch claim.
+These new observations are not executed yet. Source inspection also corrects the earlier working
+assumption about schedules: `HostThread` already supplies the actual prepared config resolver
+when a restored checkpoint has a schedule. No unsupported-schedule refusal is invented.
+
+All four final changed source files receive direct retained static scans before the frozen
+`a4b8b5ec` bank. Counts are channel 0/507/32, main 4/700/343, library 0/296/151 and replay E2E
+0/340/21 (critical/warning/info). Main's four unchanged heuristic findings are reread: three
+executables come from `std::env::current_exe()` and the fourth compares a public application-state
+string. Nothing is suppressed or called a clean-warning pass. Each scan independently retains
+all twelve created Python paths and seven logged shell-cleanup paths; all four input hashes
+match before/after. Raw logs use prefix
+`/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/continuation-r79-20261011T0912Z-`.
+
+R80 at `a4b8b5ec` stops in its formatter prelude: two whitespace hunks, one in imports and
+one in the immutable-launch readback test, outer failed/6 at 09:14:10 UTC. Zero native tests
+or original verifier gates execute. The copied formatter log independently matches SHA256
+`6ab89973bc9f9961073e6afcb51d05a1c4fa29a6436e5300f5a2d77853f4c0ac`.
+`f781e392` applies exactly those two hunks, no token or assertion changes. Its direct scans
+retain the main 4/700/343 and replay 0/340/21 findings with twelve created Python and seven
+shell paths present per scan; source hashes stay stable. Logs use the `format-r80-20261011T0918Z-`
+prefix in the existing scanner retention root.
+
+The completed older-source full-host E2E proof is copied to
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/r77-host-continuation-0fSxGM/`.
+All 77 files, 82,529,731 bytes, independently match fresh remote lengths and SHA256 hashes.
+Independent readback computes actual equality of complete uninterrupted/continued boundary
+and stage traces, same initial/continued run/session identities, actual 18/7/18 ticks,
+different first-Sense digests at tick one and unchanged corrupt/truncated prefixes. The
+actual observed-handoffs JSON hash is `3c3b30e3eb3870c5d0d991afe49e896217abb1439af88deba5233c922db6bc6b`.
+This is reread evidence from the original R77 test, not a second independent native execution.
+
+Fresh R81 preparation completes 09:20:13 UTC at clean `f781e392`/tree `41ddad4f6631586d8b4c09cab54fbc0b92da92ee`.
+Its transported profile, launcher and incremental bundle hashes are respectively
+`4277f09d04fc784ce9084070a761c12af17d0d9be8019c80480cb79664dae60d`,
+`3b5d842e431cd14f3ccb38be60d769485702e95ff3aa2c322d635c67351568a5` and
+`468cfaec48108961929e046b3822be157fd58ab045667be27cd68623a657e7ea`.
+The profile keeps the actual installed `84d139ea` runner pin, four jobs, 7,200-second limit,
+four exact failing cases, actual prepared-continuation controls and original real SQL E2E,
+followed by all fourteen unchanged terminal gates. R81 finishes failed at 09:21:51 UTC, outer
+exit six. Formatting passes, and the running-journal capture regression executes once and
+passes. The bounded schedule-history case then executes once and refuses capture with
+`Busy { Journal }` at `host_core.rs:6366`; the remaining runtime/app/E2E preludes and all
+fourteen original gates are unreached. The completed failure log is copied locally and its
+fresh remote/local SHA256 matches `fbad8514fff33c7d64b36d228da3fab611acef6c1dd5a54642cbdac3e30d5e16`.
+
+The test-only settlement helper still used four blind owner drives even when the declared
+schedule required multiple journal acknowledgements. `dbc7edc4` keeps four polls per declared
+work item, derives its finite budget from the installed schedule cardinality and observes the
+actual command application, journal commitment and drained owner boundaries. Every poll uses
+the same manual instant, without extra science-time credit. Failure remains an assertion;
+no production validator or original acceptance criterion changes. Its direct static scan
+records one critical heuristic for that test-only `panic!`, 1,644 warnings and 202 informational
+findings, exit one. Root reads its `#[cfg(test)]` scope and retains the assertion and finding.
+All twelve created Python paths and seven logged shell-cleanup paths remain present, and the
+input hash matches before/after; native phases are disabled. Raw log prefix is
+`/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/settlement-r81-20261011T0928Z`.
+
+Fresh R82 preparation completes 09:33:10 UTC at clean `dbc7edc4`/tree
+`dc0a53a4f9a2420f5f3ee706f81c86044d4b35a3`. Transported profile, launcher and bundle hashes are
+`97e890dc6f555e94d774d3bc4f1782b62c3fb473a29da8c8d9ad4c156e1755c8`,
+`2166f054da29696b7fa9c5ffdcd68a4efb733434f27f79f012f4af9ace34c909` and
+`a903eae0f7cbf018b14d55684736a9f0910b213998e9d6f9752e5d1e85b626ab`.
+It is launched through the same pinned diagnostic DSR. All four independent exact runtime
+cases now execute before their aggregate failure check; every named case must still pass
+before the app/E2E preludes and fourteen unchanged original gates can run. Original source
+custody, four-job budget, 7,200-second deadline and strict final proof consumer remain.
+R82 finishes failed at 09:34:45 UTC, outer exit six. All four exact runtime cases execute:
+capture, disabled-recording gap and final lifecycle identity pass; schedule history fails only
+at its final whole-checkpoint byte comparison. The complete failure log is copied and its
+fresh remote/local hash matches `7812ec364148de7247a56840634e4071c5f246076efaeaf18e981ead617510b2`.
+Read-only decoding of both actual 117,740-byte failure values computes precisely two differing
+payload leaves: reused layer capacity 3,072 versus 2,400 bytes, and total capacity 4,164 versus
+3,492 bytes. Every other decoded field is equal. JSON Vec growth retained 128 rather than the
+live capture's 100 terrain slots; neither scientific state nor the schedule cursor diverges.
+
+`a03bcdbf` deep-copies decoded terrain, food and hydrology layer payloads into the exact-sized
+vectors used by live capture before restoring the shared snapshot/cache. Their contents and
+revisions are retained, and later build statistics still measure actual vector capacities.
+The existing regression gains an actual restored-versus-oracle cache-capacity assertion;
+its original full checkpoint byte equality and every mutation/refusal assertion remain.
+No field is masked, no schema/gate is weakened and no performance win is claimed. Direct UBS
+records the same test-only panic heuristic, 1,645 warnings and 205 informational findings,
+exit one; twelve Python paths and seven shell-cleanup paths are independently present, with
+before/after/current source SHA256 `f4a14c8320a18ee9a88a716b08a9080f330d845d51fd12a24b482d175dfddd44`.
+Raw prefix is `layer-capacity-r82-20261011T0939Z` in the existing scanner-retention root.
+
+R83 preparation completes 09:40:27 UTC at clean `a03bcdbf`/tree
+`16f0efd09df286806b8bd038fd8ea72068d5e949`; its profile, launcher and bundle transport hashes
+are `1e921f63b176316994b3a1672630b79f882383f07191e91e275d72c0eb85b6bc`,
+`9b7f392033a16d816b3fea043af632738b59cc2561f3fc2822fe5cfdb00d85d5` and
+`f3539bf92950580a56d6a9afef378810848cd861fd35d8c511c82d23ed4eb367`.
+Preparation emits four pack-index warnings while fast-forwarding; their raw stderr is retained.
+The resulting source/tree/clean-main checks pass; a fresh reachable-object connectivity check
+observes exit zero. The original unchanged diagnostic profile is launched with all four exact
+runtime cases, app/real SQL preludes and fourteen terminal gates. Formatting and all four runtime
+preludes subsequently pass, one executed test each with zero ignores. The schedule case now
+observes all four valid capacities, all 32 rehashed mutation refusals, continuation through the
+last patch/exhausted queue, actual allocation equality and unchanged complete checkpoint bytes.
+The app/E2E/14-gate acceptance and current-source qualification remain pending.
 
 R72 finishes at the unchanged coordinator deadline: native typed timeout/5, outer failed/6,
 07:45:09 UTC, 7,207 seconds. The baseline completes all 139 original files with 68 passes,
@@ -298,10 +445,12 @@ Valid bounded suffixes are the intended newly admitted cases. Missing/stale/adva
 cursors, missing outcomes, nonzero sequence gaps, mismatched remaining sequences and a missing
 schedule are the intended refusals. This admission/refusal split is reviewed source, not an
 observed native result. New regression source compares real nonempty restored and uninterrupted
-owners at five capacities, through the remaining patch and an exhausted schedule, and includes
-eight rehashed mutations per capacity. The existing delayed-journal fault test gains cursor
+owners at five attempted capacities, through the remaining patch and an exhausted schedule,
+with eight rehashed mutations per capacity. R78 subsequently reveals that zero is an invalid
+owner option before those assertions; the current corrected source has one explicit zero refusal
+and four valid capacities with 32 mutations. The existing delayed-journal fault test gains cursor
 assertions for pending, insufficient volatile and qualifying durable receipts; its protocol
-adapter is explicitly not storage evidence. All these new assertions remain unexecuted.
+adapter is explicitly not storage evidence. At that source bank these assertions had not run.
 
 The final one-file static UBS scan for `fbe5618e` exits zero: zero critical, 1,638 warnings,
 203 informational findings; native phases are disabled. Input SHA-256 before and after is
@@ -994,8 +1143,9 @@ as a working list when its original owners are fully qualified; retained evidenc
   without changing rows or attributing restored code to this block.
 - [x] Preserve the owner-derived completed schedule cursor across capture/restore and validate
   bounded outcome history against it; explicitly revise only the full-owner codec to three.
-- [x] Add and review five real-owner capacity cases, forty rehashed corrupt-artifact controls,
-  and pending/volatile/durable cursor assertions in the existing protocol fault test.
+- [x] Add and review bounded-history restore/mutation source and pending/volatile/durable cursor
+  assertions. R78 reveals the attempted zero-capacity valid cell was invalid; corrected source
+  preserves its typed refusal separately from four valid capacities and 32 mutations.
 - [x] Execute the final one-file static UBS scan with native phases disabled and retain all
   twelve logged temporary paths; report the 1,638 warnings without claiming a clean-warning pass.
 - [x] Record the contextual cleanup authorization, verify all owned process identities and retire
@@ -1035,8 +1185,36 @@ as a working list when its original owners are fully qualified; retained evidenc
   completed manifest; retain its explicit unproved scientific/search/export cases.
 - [x] Prepare, transport, verify and launch the original fourteen-gate terminal lane R78
   at the same clean source on Hz2, pinned to its actual installed runner and original deadline.
-- [ ] Finish R78's real runtime/PTY/smoke/manifest checks and strict retained-evidence consumer;
-  preserve actual failures, source identity and outer collection disposition before any closure.
+- [x] Finish R78 and retain its eight passing gates, runtime 229/4/6 and typed failed/1,
+  outer failed/6; copy and independently verify every completed command log.
+- [x] Trace and bank the backward-clock-before-maintenance correction and three fixture admission
+  corrections at `09a4205a`, preserving actual nonzero/config/session production guards.
+- [x] Execute R79's exact channel case first and retain its later capture-reply failure;
+  no original gates are reached and no continuation capability is qualified by that run.
+- [x] Observe the older-source real 18-versus-seven-plus-eleven same-session SQL continuation,
+  corruption/truncation/first-stage-divergence controls and ordinary replay/bundle E2Es passing.
+- [x] Correct running Deadline/journal-maintenance capture starvation and add the retained-artifact
+  guarantee writer with real prepared-world reconstruction; bank source at `a4b8b5ec` after scans.
+- [ ] Execute the four exact runtime cases, new actual preflight controls and original real SQL
+  continuation E2E at the current source; retain typed positive/negative claim observations.
+- [x] Retain R80's actual two-hunk formatting failure with zero executed tests, apply exactly
+  its whitespace changes at `f781e392`, scan/review and prepare fresh pinned R81.
+- [x] Retain R81's actual capture-case pass and schedule-case journal refusal; independently
+  copy/hash its completed failure log and keep every unreached case unqualified.
+- [x] Replace blind test-helper settlement with bounded actual command/journal observations
+  at `dbc7edc4`, review the test-only panic finding and launch source-pinned R82.
+- [x] Observe all four actual runtime dispositions at `a03bcdbf`: one executed positive each,
+  including the full schedule admission/refusal matrix and unchanged checkpoint byte equality.
+- [x] Retain R82's three exact positives and whole-checkpoint byte failure; decode both actual
+  values and compute the two differing allocation fields without suppressing any comparison.
+- [x] Restore the actual cached layer allocation shape at `a03bcdbf`, preserve full byte equality,
+  add direct capacity observation, scan/review and launch source-pinned R83.
+- [x] Independently verify all 77 copied completed R77 full-host proof files and compute actual
+  stage/boundary/session equality, divergent digests and unchanged negative database prefixes.
+- [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
+  qualified successor, including actual PTY, smoke, manifest and outer collection disposition.
+- [ ] Re-run the original ten workspace gates at the final source, including full tests,
+  economy-faults and analyzer build; keep original owner acceptance/dependencies unchanged.
 - [ ] Resolve the external-reset intent and integrate only a reviewed, qualified continuation;
   preserve all prior source, failures, original acceptance and independent shared-tree changes.
 - [x] Execute the original logger diagnostic, preserve the R68 observer failure and qualify
@@ -1188,6 +1366,59 @@ as a working list when its original owners are fully qualified; retained evidenc
 Simulator presentation callbacks remain explicit injected branch observations. They do not
 prove terminal serialization or runtime-selected degradation. Real service and file-backed
 tests establish their named boundaries only after execution; source review is not execution.
+
+### Bounded anti-ceremony inventory — 2026-10-11, 09:00–09:21 UTC
+
+Actual inventory: `git log -3 --stat` observes `09a4205a`, `a4b8b5ec`, `f781e392`;
+all frozen test/production diffs were read. USER candidates=2, ENABLER formatting=1,
+PROCESS commits=0, UNKNOWN=0 in that window. This pending report and two tracker comments
+are PROCESS and earn no capability credit. Original owners remain in progress with unchanged
+criteria/dependencies; the ready graph was inspected, without taking another owner's work.
+Project purpose: a deterministic evolutionary simulation that users can control, inspect,
+continue and compare through the Evolution Lab.
+
+Real-work worksheet: (1) candidate user-visible changes are working-time capture settlement
+and a retained-artifact continuation claim; the existing real CLI 18-versus-seven-plus-eleven
+journey passes at the older source, while these candidates are not yet qualified. (2) Omitting
+the report/tracker work changes no runtime behavior but loses the user's requested TODO and
+observed failure/recovery history. (3) The whitespace correction enables formatting only;
+R81 still owes its actual execution. (4) Full reliable checkpoint continuation and live terminal
+acceptance are old user-facing gaps and remain the current original owners. (5) No delegation
+or swarm closure occurred in this window. (6) No spec change or follow-up issue replaces unmet
+original acceptance. Verdict: DRIFTING risk from repeated launch/report work; keep the next
+block on actual failing code and unchanged native acceptance, with no new process machinery.
+
+Honesty inventory, bounded to those three exact diffs and actual R77–R81 evidence:
+1. No (checked: full original assertions and rosters); the invalid zero-capacity attempt is now
+   an explicit typed refusal plus the original four valid cells, with the 32/40 admission split disclosed.
+2. No (checked: owner/journal/source construction); new observations use production owners,
+   prepared registries and the existing real CLI/SQL E2E, with no new mock.
+3. No (checked: changed paths); no golden, dependency, scenario or performance budget changes.
+4. Yes: the feature shares a new production preflight guard between the existing CLI and report.
+   It checks actual coverage/reconstruction, strengthens refusal, and changes no test/native gate.
+5. No (checked: complete helper data flow); the claim derives from the retained decoded artifact
+   and executable reconstruction, never a scenario name, empty fixture or expected test value.
+6. No (checked: native exact-test counts); R79 is 0/1, R80 runs no tests and neither is green.
+7. Yes: commentary first described one formatting difference; the full log has two hunks.
+   Both are now named, copied and applied exactly, with zero executed tests explicitly retained.
+8. No (checked: source/evidence pins); R77 positive proof is explicitly older-source, and the
+   independent byte/stage reread is not claimed as another native execution.
+9. No (checked: report and original-owner comments); every R78/R79/R80 failure stays visible.
+10. No (checked: scanner, SSH and native commands); cited stderr is retained.
+11. No (checked: complete export semantic diff); no status, closure, issue or dependency changes.
+12. No (checked: original acceptance and source scope); all original criteria remain owed.
+13–17. Not applicable: no subagent dispatch, report acceptance, peer close or agent agreement
+   is used in this window; previous unrelated agent work is not requalified by this inventory.
+18. No (checked: original roster and declared capacity matrix); unsupported zero is reported
+   separately rather than counted as a successful valid case.
+19. Yes: recovery/scans/profile/tracker work consumes substantial effort without qualifying
+   current-source capability. This is disclosed; further report rounds cannot substitute for tests.
+20. Strongest executed evidence is the original R77 real CLI/SQL test at `159fe99d`, with all
+   77 retained proof files hash-matched and actual stage/boundary/session/divergence read back.
+   A skeptic can rerun the original test; current `f781e392` still requires its native verdict.
+No older-session CASS search is claimed in this bounded inventory. Disposition: formatter count
+and schedule-resolver assumptions corrected/disclosed in place; gate self-weakening, proof-class
+inflation and machinery drift remain named countermeasures. No complete-project claim or release.
 
 ### Bounded anti-ceremony inventory — 2026-10-10, through 14:01 UTC
 
