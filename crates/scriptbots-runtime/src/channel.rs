@@ -1455,7 +1455,13 @@ impl ChannelHostDriver {
             // Receipt polling releases the adapter's outstanding capacity before the
             // exact retained allocation is offered again. Ingress cannot accelerate
             // this maintenance cadence, even when a science deadline is overdue.
-            self.host.drive_at(now, NativeDriveTrigger::Maintenance)?;
+            let observed = if self.parked_host_captures.is_empty() {
+                now
+            } else {
+                self.host.last_observed().unwrap_or(now)
+            };
+            self.host
+                .drive_at(observed, NativeDriveTrigger::Maintenance)?;
             if self.journal_retry_needed() {
                 self.host.retry_retained_journal()?;
             }
@@ -1466,7 +1472,9 @@ impl ChannelHostDriver {
         if !self.parked_host_captures.is_empty()
             && matches!(
                 self.host.drive_interest(),
-                HostDriveInterest::ReadyNow | HostDriveInterest::Draining
+                HostDriveInterest::ReadyNow
+                    | HostDriveInterest::Deadline
+                    | HostDriveInterest::Draining
             )
         {
             // Settle work already belonging to this boundary before adding new automatic
@@ -2000,6 +2008,8 @@ mod tests {
             .try_recv()
             .expect("resume reply")
             .expect("resume admitted");
+        assert_eq!(driver.host().drive_interest(), HostDriveInterest::Deadline);
+        assert!(!driver.host().core().latest_snapshot().playback.paused);
         assert!(matches!(
             driver.host().core().capture_host_checkpoint_v1(),
             Err(HostCheckpointError::Busy {

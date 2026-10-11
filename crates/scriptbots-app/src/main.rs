@@ -11,9 +11,9 @@ use scriptbots_app::host_thread::{
 #[cfg(feature = "neuro")]
 use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
-    BootstrapEvidenceV0, BrainPreset, CharacterizationTraceV2, ControlServerConfig,
-    ControlServerReservation, FounderRecipe, RunIdentityV1, RunManifestV3, ScenarioDocumentV1,
-    ScenarioIdentityV0, ScenarioInterventionV1, SharedAnalytics, ThreadPolicyV0,
+    BootstrapEvidenceV0, BrainPreset, CharacterizationLimitationsV0, CharacterizationTraceV2,
+    ControlServerConfig, ControlServerReservation, FounderRecipe, RunIdentityV1, RunManifestV3,
+    ScenarioDocumentV1, ScenarioIdentityV0, ScenarioInterventionV1, SharedAnalytics, ThreadPolicyV0,
     apply_scenario_interventions, create_brain_registry_for_config, install_brains,
     precedence::{
         ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
@@ -943,6 +943,7 @@ fn main() -> Result<()> {
             host,
             storage_pipeline,
             checkpoint_id,
+            cli.brain,
             JsonValue::Object(Default::default()),
         );
     }
@@ -2274,19 +2275,11 @@ fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
     let checkpoint = record.host_checkpoint().with_context(|| {
         format!("host checkpoint {checkpoint_id} in {path} failed artifact validation")
     })?;
-    if !checkpoint.playback().paused {
-        bail!(
-            "bounded continuation requires a paused host checkpoint: {checkpoint_id} at tick {} in {path}",
-            checkpoint.tick().0
-        );
-    }
     let source_tick = checkpoint.tick().0;
     source_tick
         .checked_add(ticks)
         .context("host continuation tick limit overflowed")?;
-    let registry = create_brain_registry_for_config(cli.brain, checkpoint.config())
-        .context("failed to prepare the checkpoint's executable brain registry")?;
-    let world = checkpoint.restore_world(registry)
+    let world = prepare_bounded_host_continuation(&checkpoint, cli.brain)
         .with_context(|| format!("host checkpoint {checkpoint_id} at source tick {source_tick} in {path} refused world reconstruction"))?;
     reader.close()?;
     let mut pipeline = StoragePipeline::recover_existing_run(path, run_id)
@@ -2324,6 +2317,7 @@ fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
         host,
         pipeline,
         &next_id,
+        cli.brain,
         serde_json::json!({
             "continued_from_checkpoint": checkpoint_id, "source_tick": source_tick,
             "requested_steps": ticks,
@@ -2331,10 +2325,29 @@ fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
     )
 }
 
+fn prepare_bounded_host_continuation(
+    checkpoint: &scriptbots_runtime::HostCheckpointV1,
+    brain: BrainPreset,
+) -> Result<WorldState> {
+    if !checkpoint.playback().paused {
+        bail!("bounded continuation requires a paused host checkpoint");
+    }
+    let digest = checkpoint.world_checkpoint().source_digest();
+    if !digest.evaluator_state_covered || !digest.factory_state_covered {
+        bail!("bounded continuation requires complete evaluator and factory state");
+    }
+    let registry = create_brain_registry_for_config(brain, checkpoint.config())
+        .context("failed to prepare the checkpoint's executable brain registry")?;
+    checkpoint
+        .restore_world(registry)
+        .context("prepared executable adapters refused the recorded full host world")
+}
+
 fn finish_checkpoint_handoff(
     host: HostThread,
     mut pipeline: StoragePipeline,
     checkpoint_id: &str,
+    brain: BrainPreset,
     metadata: JsonValue,
 ) -> Result<()> {
     let port = host.port();
@@ -2417,6 +2430,20 @@ fn finish_checkpoint_handoff(
     let manifest = reader.run_manifest()?;
     let row_ticks = reader.summary_ticks()?;
     reader.close()?;
+    // This claim belongs to the independently retained full-owner artifact. The immutable
+    // launch manifest cannot attest a later host/session cut and remains conservative.
+    let retained_checkpoint = retained.host_checkpoint()?;
+    let continuation = prepare_bounded_host_continuation(&retained_checkpoint, brain);
+    let limitations = CharacterizationLimitationsV0 {
+        purpose: "retained_full_host_checkpoint_continuation".to_owned(),
+        evaluator_state_covered: retained_checkpoint
+            .world_checkpoint()
+            .source_digest()
+            .evaluator_state_covered,
+        checkpoint_replay_guarantee: continuation.is_ok(),
+        ..CharacterizationLimitationsV0::default()
+    };
+    let continuation_refusal = continuation.err().map(|error| format!("{error:#}"));
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
@@ -2430,6 +2457,8 @@ fn finish_checkpoint_handoff(
             "source_commit": manifest.source_revision, "boundary_digest": checkpoint.world_checkpoint().source_digest(),
             "step_traces": checkpoint.step_traces(),
             "journal_cut": receipt.journal_cut, "persisted_summary_ticks": row_ticks,
+            "characterization_limitations": limitations,
+            "continuation_refusal": continuation_refusal,
             "watermarks": { "admitted": receipt.watermarks.admitted.map(|id| id.get()),
                 "applied": receipt.watermarks.applied.map(|id| id.get()), "durable": receipt.watermarks.durable.map(|id| id.get()) },
             "metadata": metadata,
@@ -8280,6 +8309,24 @@ mod tests {
             let boundary = checkpoint.world_checkpoint().source_digest();
             assert!(boundary.evaluator_state_covered);
             assert_eq!(boundary.factory_state_covered, !opaque_factory);
+            let continuation = prepare_bounded_host_continuation(&checkpoint, BrainPreset::Mlp);
+            if opaque_factory {
+                let refusal = continuation
+                    .err()
+                    .expect("uncovered factory state cannot attest continuation");
+                assert!(
+                    refusal
+                        .to_string()
+                        .contains("complete evaluator and factory state")
+                );
+            } else {
+                let restored = continuation.expect("prepare actual nonempty MLP continuation");
+                assert_eq!(restored.world_digest_v1().unwrap(), *boundary);
+                assert!(
+                    prepare_bounded_host_continuation(&checkpoint, BrainPreset::Dwraon).is_err(),
+                    "a different executable registry must refuse this actual MLP artifact"
+                );
+            }
             for stage in &checkpoint.step_traces()[0].stages {
                 let capture = stage
                     .capture
@@ -8311,6 +8358,19 @@ mod tests {
             } else {
                 observed.expect("actual fully observed MLP artifact is comparable");
             }
+            let resume_id = CommandId::new(2);
+            core.local_port()
+                .submit(CommandEnvelope::new(resume_id, HostCommand::Resume))
+                .expect("actual running-playback control admission");
+            settle(&mut core, resume_id);
+            let running = core
+                .capture_host_checkpoint_v1()
+                .expect("settled running owner permits a complete capture");
+            assert!(!running.playback().paused);
+            let refusal = prepare_bounded_host_continuation(&running, BrainPreset::Mlp)
+                .err()
+                .expect("bounded continuation must refuse actual running playback");
+            assert!(refusal.to_string().contains("paused host checkpoint"));
         }
     }
 

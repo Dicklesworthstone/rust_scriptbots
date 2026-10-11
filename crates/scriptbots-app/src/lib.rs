@@ -615,7 +615,9 @@ pub struct CharacterizationLimitationsV0 {
     pub rng_state_restorable: bool,
     /// Whether the product can continue this run's full host/session boundary
     /// from a persisted checkpoint. Core science replay and restorable domain
-    /// RNG state alone do not establish that guarantee.
+    /// RNG state alone do not establish that guarantee. Launch manifests retain
+    /// `false`; the full-host handoff report scopes its claim to a read-back artifact
+    /// whose world is reconstructed with the same prepared adapters as the continuation CLI.
     pub checkpoint_replay_guarantee: bool,
     pub comparison_lane: String,
     pub superseded_by: String,
@@ -631,7 +633,7 @@ impl Default for CharacterizationLimitationsV0 {
                     .to_owned(),
             evaluator_state_covered: false,
             rng_state_restorable: true,
-            // Core replay exists; full host/session continuation remains open (bd-2z0.5.13).
+            // Launch provenance does not attest a later full host/session checkpoint.
             checkpoint_replay_guarantee: false,
             comparison_lane: "same pinned toolchain, target, features, and thread lane".to_owned(),
             superseded_by: "WorldDigestV1".to_owned(),

@@ -302,6 +302,17 @@ fn assert_host_handoff_readback(
         .validate_contract()
         .expect("complete science digest contract");
     assert!(digest.evaluator_state_covered && digest.factory_state_covered);
+    let limitations: scriptbots_app::CharacterizationLimitationsV0 =
+        serde_json::from_value(report["characterization_limitations"].clone())
+            .expect("typed artifact-scoped continuation claim");
+    assert_eq!(
+        limitations.purpose,
+        "retained_full_host_checkpoint_continuation"
+    );
+    assert!(limitations.evaluator_state_covered);
+    assert!(limitations.rng_state_restorable);
+    assert!(limitations.checkpoint_replay_guarantee);
+    assert!(report["continuation_refusal"].is_null());
     assert_eq!(
         report["boundary_digest"],
         serde_json::to_value(digest).expect("digest JSON")
@@ -338,6 +349,9 @@ fn assert_host_handoff_readback(
         scriptbots_brain::MlpBrain::KIND.as_str()
     );
     let manifest = reader.run_manifest().expect("actual stored provenance");
+    let launch: scriptbots_app::RunManifestV3 =
+        serde_json::from_str(&manifest.manifest_json).expect("independent immutable launch provenance");
+    assert!(!launch.limitations.checkpoint_replay_guarantee);
     assert_eq!(report["run_id"], manifest.run_id.to_string());
     assert_eq!(manifest.root_seed, SEED);
     assert_eq!(report["brain_roster"], manifest.brain_roster_json);
