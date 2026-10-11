@@ -4413,6 +4413,7 @@ impl EventHub {
             entries: state.entries.iter().cloned().collect(),
             genesis: self.genesis.load_full().as_ref().clone(),
         };
+        drop(state);
         Ok(checkpoint)
     }
 
@@ -4429,6 +4430,7 @@ impl EventHub {
         state.entries = checkpoint.entries.iter().cloned().collect();
         self.hot.store(Arc::new(EventHotView::from(&*state)));
         self.genesis.store(Arc::new(checkpoint.genesis.clone()));
+        drop(state);
         Ok(())
     }
 

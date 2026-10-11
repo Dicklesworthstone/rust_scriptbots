@@ -131,8 +131,10 @@ impl HostCheckpointError {
         matches!(
             self,
             Self::Busy { .. }
-                | Self::World(scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. })
-                | Self::World(scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. })
+                | Self::World(
+                    scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
+                        | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
+                )
         )
     }
 }
@@ -702,7 +704,10 @@ impl HostCheckpointV1 {
     }
 }
 
-fn journal_state_qualifies(state: &JournalState, requirement: ShutdownCommitRequirement) -> bool {
+const fn journal_state_qualifies(
+    state: &JournalState,
+    requirement: ShutdownCommitRequirement,
+) -> bool {
     match requirement {
         ShutdownCommitRequirement::CommittedVolatile => {
             matches!(
@@ -3796,7 +3801,8 @@ impl HostCore {
             .applied_interventions
             .last()
             .map_or(0, |record| record.seq);
-        self.latest_completed_summary = state.latest_completed_summary.clone();
+        self.latest_completed_summary
+            .clone_from(&state.latest_completed_summary);
         self.step_traces = state.step_traces.iter().cloned().collect();
         self.snapshot_layers = SnapshotLayerCache {
             revisions: snapshot.layers.revisions,
@@ -6179,7 +6185,7 @@ mod tests {
         }));
     }
 
-    fn assert_continued_command_retry(restored: &mut HostCore, completed_steps: u64) {
+    fn assert_continued_command_retry(restored: &HostCore, completed_steps: u64) {
         let previous = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
         let cut = restored.next_journal_sequence;
         let mut port = restored.local_port();
@@ -6260,7 +6266,7 @@ mod tests {
                 restored.persistence.last_admitted_tick(),
                 Some(Tick(completed_steps))
             );
-            assert_continued_command_retry(&mut restored, completed_steps);
+            assert_continued_command_retry(&restored, completed_steps);
             let next = CommandEnvelope::new(CommandId::new(99), HostCommand::Step);
             settle_continuation_command(&mut restored, next.clone(), 1_010);
             settle_continuation_command(&mut oracle, next, completed_steps * 10 + 10);
@@ -6386,7 +6392,7 @@ mod tests {
             let after = restored.capture_host_checkpoint_v1().unwrap();
             let uninterrupted = oracle.capture_host_checkpoint_v1().unwrap();
             assert_eq!(after.state.completed_schedule_sequence, Some(4));
-            assert!(after.state.schedule.as_ref().unwrap().is_empty());
+            assert_eq!(after.state.schedule.as_ref().unwrap().as_slice(), []);
             assert_eq!(after.step_traces(), uninterrupted.step_traces());
             assert_eq!(after.encode().unwrap(), uninterrupted.encode().unwrap());
         }
@@ -6874,7 +6880,7 @@ mod tests {
         let mut wrong_counter = checkpoint.clone();
         wrong_counter.state.next_admission = AdmissionSequence::new(1);
         assert!(wrong_counter.encode().is_err());
-        let mut wrong_trace = checkpoint.clone();
+        let mut wrong_trace = checkpoint;
         wrong_trace.state.step_traces[0].stages.swap(0, 1);
         assert!(matches!(
             wrong_trace.encode(),

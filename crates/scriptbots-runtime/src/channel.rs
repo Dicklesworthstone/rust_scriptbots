@@ -854,11 +854,17 @@ pub struct ChannelHostDriver {
     /// Full owner captures retain their original caller budgets and a fixed capacity.
     parked_host_captures: Vec<HostCaptureRequest>,
     host_capture_capacity: usize,
-    handoff_pending: bool,
-    handed_off: bool,
+    handoff: HandoffState,
 }
 
 type CaptureReply = Sender<Result<scriptbots_core::WorldCheckpointV1, HostAccessError>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffState {
+    Open,
+    Capturing,
+    Retired,
+}
 
 struct HostCaptureRequest {
     reply: Sender<Result<HostCheckpointV1, HostCheckpointError>>,
@@ -927,8 +933,7 @@ impl ChannelHostDriver {
             capture_flush: CaptureFlush::Idle,
             parked_host_captures: Vec::with_capacity(options.ingress_capacity),
             host_capture_capacity: options.ingress_capacity,
-            handoff_pending: false,
-            handed_off: false,
+            handoff: HandoffState::Open,
         };
         Ok((driver, port))
     }
@@ -1027,26 +1032,30 @@ impl ChannelHostDriver {
             ChannelHostPort::protocol_violation("channel ingress handoff fence poisoned")
         })?;
         *ingress_open = open;
+        drop(ingress_open);
         Ok(())
     }
 
     fn finish_host_capture(
         &mut self,
-        request: HostCaptureRequest,
+        request: &HostCaptureRequest,
         result: Result<HostCheckpointV1, HostCheckpointError>,
     ) {
         if request.handoff {
             let retiring = result.is_ok();
             // Fence the owner before a successful reply can become visible to the caller.
-            self.handed_off = retiring;
-            self.handoff_pending = false;
+            self.handoff = if retiring {
+                HandoffState::Retired
+            } else {
+                HandoffState::Open
+            };
             if !retiring {
                 let _ = self.set_ingress_open(true);
             }
             if request.reply.send(result).is_err() && retiring {
                 // The caller abandoned its reply before capture completed. No acknowledgement
                 // escaped, so the original owner remains available rather than being stranded.
-                self.handed_off = false;
+                self.handoff = HandoffState::Open;
                 let _ = self.set_ingress_open(true);
             }
         } else {
@@ -1059,10 +1068,10 @@ impl ChannelHostDriver {
             let error = ChannelHostPort::protocol_violation(
                 "host checkpoint caller budget elapsed before capture",
             );
-            self.finish_host_capture(request, Err(error.into()));
+            self.finish_host_capture(&request, Err(error.into()));
             return;
         }
-        if self.handed_off {
+        if self.handoff == HandoffState::Retired {
             let _ = request
                 .reply
                 .send(Err(HostAccessError::Disconnected.into()));
@@ -1077,16 +1086,16 @@ impl ChannelHostDriver {
                     let error = ChannelHostPort::protocol_violation(
                         "host checkpoint caller budget elapsed during capture",
                     );
-                    self.finish_host_capture(request, Err(error.into()));
+                    self.finish_host_capture(&request, Err(error.into()));
                 } else {
-                    self.finish_host_capture(request, result);
+                    self.finish_host_capture(&request, result);
                 }
                 return;
             }
             Err(error) => error,
         };
         if !error.is_retryable_quiescence() {
-            self.finish_host_capture(request, Err(error));
+            self.finish_host_capture(&request, Err(error));
             return;
         }
         let world_tail = matches!(
@@ -1114,12 +1123,12 @@ impl ChannelHostDriver {
                     ..
                 }) => self.capture_flush = CaptureFlush::Submitting,
                 Err(error) => {
-                    self.finish_host_capture(request, Err(error.into()));
+                    self.finish_host_capture(&request, Err(error.into()));
                     return;
                 }
             }
         } else if world_tail && !advancing {
-            self.finish_host_capture(request, Err(error));
+            self.finish_host_capture(&request, Err(error));
             return;
         }
         self.parked_host_captures.push(request);
@@ -1138,7 +1147,7 @@ impl ChannelHostDriver {
                 let _ = request.reply.send(Err(error.into()));
                 return;
             }
-            self.handoff_pending = true;
+            self.handoff = HandoffState::Capturing;
         }
         self.host_capture_or_park(request);
     }
@@ -1230,7 +1239,7 @@ impl ChannelHostDriver {
     }
 
     fn process_ingress(&mut self, message: IngressMessage) {
-        if self.handoff_pending || self.handed_off {
+        if self.handoff != HandoffState::Open {
             Self::refuse_handoff_ingress(message);
             return;
         }
@@ -1504,7 +1513,7 @@ impl ChannelHostDriver {
     ///
     /// Returns [`ChannelDriveError`] when admission or the schedule fails.
     pub fn step(&mut self, now: ManualInstant) -> Result<ChannelStepReport, ChannelDriveError> {
-        if self.handed_off {
+        if self.handoff == HandoffState::Retired {
             self.refuse_retired_requests();
             return Ok(ChannelStepReport {
                 admitted: 0,
@@ -1515,17 +1524,20 @@ impl ChannelHostDriver {
         let admission_before = self.host.core().admission_cursor();
         self.drain_ingress();
         self.update_journal_retry_deadline(now)?;
-        let drove = !self.handed_off && self.drive_due_boundary(now)?;
+        let drove = self.handoff != HandoffState::Retired && self.drive_due_boundary(now)?;
         // A batch acknowledgement can seal the boundary outside a science drive, so
         // parked captures are retried on every step, not only after a tick.
-        if !self.handed_off {
+        if self.handoff != HandoffState::Retired {
             self.service_parked_captures();
             self.service_parked_host_captures();
         }
-        if self.handed_off {
+        if self.handoff == HandoffState::Retired {
             self.refuse_retired_requests();
         }
-        if self.controller_disconnected && !self.shutdown_requested && !self.handed_off {
+        if self.controller_disconnected
+            && !self.shutdown_requested
+            && self.handoff != HandoffState::Retired
+        {
             match self.host.request_shutdown() {
                 Ok(_) => self.shutdown_requested = true,
                 Err(HostAccessError::CommandAuthorityLookup {
@@ -1541,7 +1553,7 @@ impl ChannelHostDriver {
         self.mirror_retained_statuses();
         self.mirror_protocol_events();
         self.update_journal_retry_deadline(now)?;
-        let mut interest = if self.handed_off {
+        let mut interest = if self.handoff == HandoffState::Retired {
             HostDriveInterest::Terminated
         } else if self.journal_retry_at.is_some() {
             HostDriveInterest::Draining
@@ -1599,7 +1611,7 @@ impl ChannelHostDriver {
             match report.interest {
                 HostDriveInterest::Terminated => {
                     return Ok(ChannelRunReceipt {
-                        outcome: if self.handed_off {
+                        outcome: if self.handoff == HandoffState::Retired {
                             ChannelRunOutcome::HandedOff
                         } else if self.controller_disconnected {
                             ChannelRunOutcome::ControllerDisconnected
@@ -2018,7 +2030,7 @@ mod tests {
         assert!(!decoded.playback().paused);
         assert_eq!(decoded.journal_cut(), checkpoint.journal_cut());
         assert_eq!(decoded.world_checkpoint().tick(), pending_tick);
-        assert!(!driver.handed_off);
+        assert_ne!(driver.handoff, HandoffState::Retired);
         let before = driver.host().core().admission_cursor();
         driver
             .step(ManualInstant::from_nanos(1_000_001))
@@ -2110,7 +2122,7 @@ mod tests {
             HostLifecycle::Running
         );
         assert!(driver.host().core().shutdown_command_status().is_none());
-        assert!(!driver.handed_off);
+        assert_ne!(driver.handoff, HandoffState::Retired);
     }
 
     #[test]
@@ -2131,7 +2143,7 @@ mod tests {
             later.try_recv().expect("later queue refusal"),
             Err(HostAccessError::ProtocolViolation { .. })
         ));
-        assert!(driver.handoff_pending);
+        assert_eq!(driver.handoff, HandoffState::Capturing);
         assert!(matches!(
             port.submit(CommandEnvelope::new(CommandId::new(95), HostCommand::Step)),
             Err(HostAccessError::ProtocolViolation { .. })
@@ -2255,7 +2267,7 @@ mod tests {
             ))
         ));
         assert_eq!(driver.parked_host_captures.len(), 1);
-        assert!(!driver.handoff_pending);
+        assert_ne!(driver.handoff, HandoffState::Capturing);
         assert!(*port.ingress_open.lock().expect("ingress remains open"));
         assert!(matches!(
             pending.try_recv(),
@@ -2304,8 +2316,7 @@ mod tests {
         driver
             .step(ManualInstant::from_nanos(0))
             .expect("observe expired intent");
-        assert!(!driver.handed_off);
-        assert!(!driver.handoff_pending);
+        assert_eq!(driver.handoff, HandoffState::Open);
         assert!(
             *port
                 .ingress_open
