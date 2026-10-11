@@ -55,7 +55,7 @@ const LIFECYCLE_COMMAND_NAMESPACE: u64 = u64::MAX;
 /// Full owner checkpoint schema; distinct from the science-only core schema.
 pub const HOST_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.host-checkpoint.v1";
 /// Canonical envelope revision for [`HostCheckpointV1`].
-pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 2;
+pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 3;
 /// Actual envelope, payload and corruption-checksum codecs.
 pub const HOST_CHECKPOINT_V1_CODEC: &str = "postcard-envelope+json+blake3-v1";
 /// Fixed resource ceiling for a complete encoded host artifact.
@@ -183,6 +183,8 @@ struct HostCheckpointStateV1 {
     protocol_events: Vec<HostEvent>,
     events: super::EventHubCheckpointV1,
     schedule: Option<Vec<ScheduledConfigPatch>>,
+    // The owner cursor survives eviction from its bounded publication history.
+    completed_schedule_sequence: Option<u64>,
     scheduled_patches: Vec<ScheduledPatchStatus>,
     last_arrival: Option<MigrationArrival>,
 }
@@ -614,7 +616,27 @@ impl HostCheckpointV1 {
 
     fn validate_schedule(&self) -> Result<(), HostCheckpointError> {
         let state = &self.state;
-        let mut sequence = 0;
+        let completed = match (&state.schedule, state.completed_schedule_sequence) {
+            (Some(_), Some(completed)) => completed,
+            (None, None) => 0,
+            _ => {
+                return Err(checkpoint_error(
+                    "schedule.cursor",
+                    "completed cursor does not match installed schedule",
+                ));
+            }
+        };
+        let retained = u64::try_from(state.scheduled_patches.len())
+            .map_err(|error| checkpoint_error("schedule.capacity", error.to_string()))?;
+        let capacity = u64::try_from(state.options.archived_command_capacity.max(1))
+            .map_err(|error| checkpoint_error("schedule.capacity", error.to_string()))?;
+        if completed > state.cut.last_journal_sequence || retained != completed.min(capacity) {
+            return Err(checkpoint_error(
+                "schedule.cursor",
+                "retained outcome count does not match completed cursor and capacity",
+            ));
+        }
+        let mut sequence = completed - retained;
         let mut due = Tick::zero();
         if state.scheduled_patches.len() > MAX_HOST_CHECKPOINT_ENTRIES
             || state
@@ -633,7 +655,7 @@ impl HostCheckpointV1 {
                 .validate()
                 .map_err(|error| checkpoint_error("schedule.evidence", error))?;
             let patch = &status.evidence.scheduled;
-            if patch.sequence != sequence + 1
+            if sequence.checked_add(1) != Some(patch.sequence)
                 || patch.due_tick < due
                 || patch.due_tick > self.tick()
                 || status.batch_id.session_id() != self.session_id()
@@ -647,7 +669,7 @@ impl HostCheckpointV1 {
             {
                 return Err(checkpoint_error(
                     "schedule.outcome",
-                    "noncontiguous or unsettled schedule prefix",
+                    "noncontiguous or unsettled retained schedule suffix",
                 ));
             }
             sequence = patch.sequence;
@@ -2743,6 +2765,8 @@ pub type PreparedConfigPatchResolver =
 
 struct ScheduledConfigQueue {
     remaining: VecDeque<ScheduledConfigPatch>,
+    // Advance only after the patch reaches the adapter's required commitment.
+    completed_sequence: u64,
     resolve: PreparedConfigPatchResolver,
 }
 
@@ -3086,6 +3110,7 @@ impl HostCore {
         }
         self.schedule = Some(ScheduledConfigQueue {
             remaining: patches.into(),
+            completed_sequence: 0,
             resolve,
         });
         Ok(())
@@ -3123,12 +3148,16 @@ impl HostCore {
             if !self.scheduled_commitment_reached(&status.journal) {
                 return Ok(false);
             }
-            self.scheduled_barrier = None;
-            self.schedule
+            let schedule = self
+                .schedule
                 .as_mut()
-                .ok_or_else(|| protocol_violation("scheduled action lost its queue"))?
+                .ok_or_else(|| protocol_violation("scheduled action lost its queue"))?;
+            let completed = schedule
                 .remaining
-                .pop_front();
+                .pop_front()
+                .ok_or_else(|| protocol_violation("scheduled action lost its queued patch"))?;
+            schedule.completed_sequence = completed.sequence;
+            self.scheduled_barrier = None;
         }
         if !may_start {
             return Ok(true);
@@ -3563,6 +3592,10 @@ impl HostCore {
                 .schedule
                 .as_ref()
                 .map(|schedule| schedule.remaining.iter().cloned().collect()),
+            completed_schedule_sequence: self
+                .schedule
+                .as_ref()
+                .map(|schedule| schedule.completed_sequence),
             scheduled_patches: self.scheduled_patches.as_ref().clone(),
             last_arrival: self.last_arrival,
         };
@@ -3678,6 +3711,9 @@ impl HostCore {
         let schedule = match (&state.schedule, resolver) {
             (Some(remaining), Some(resolve)) => Some(ScheduledConfigQueue {
                 remaining: remaining.iter().cloned().collect(),
+                completed_sequence: state.completed_schedule_sequence.ok_or_else(|| {
+                    checkpoint_error("schedule.cursor", "installed schedule lost completed cursor")
+                })?,
                 resolve,
             }),
             (None, None) => None,
@@ -6241,6 +6277,115 @@ mod tests {
                 after.journal_cut().last_journal_sequence
                     > decoded.journal_cut().last_journal_sequence
             );
+        }
+    }
+
+    fn assert_host_schedule_corruption_refused(bytes: &[u8]) {
+        for mutation in 0..8 {
+            let mut wire: HostCheckpointWireV1 = postcard::from_bytes(bytes).unwrap();
+            let mut payload: serde_json::Value = serde_json::from_slice(&wire.payload).unwrap();
+            match mutation {
+                0 => payload["completed_schedule_sequence"] = serde_json::Value::Null,
+                1 => payload["completed_schedule_sequence"] = serde_json::json!(2),
+                2 => payload["completed_schedule_sequence"] = serde_json::json!(4),
+                3 => payload["completed_schedule_sequence"] = serde_json::json!(u64::MAX),
+                4 => {
+                    let sequence =
+                        &mut payload["scheduled_patches"][0]["evidence"]["scheduled"]["sequence"];
+                    *sequence = serde_json::json!(sequence.as_u64().unwrap() + 1);
+                }
+                5 => {
+                    payload["scheduled_patches"].as_array_mut().unwrap().pop();
+                }
+                6 => payload["schedule"][0]["sequence"] = serde_json::json!(5),
+                _ => payload["schedule"] = serde_json::Value::Null,
+            }
+            wire.payload = serde_json::to_vec(&payload).unwrap();
+            wire.payload_blake3 = *blake3::hash(&wire.payload).as_bytes();
+            assert!(matches!(
+                HostCheckpointV1::decode(&postcard::to_allocvec(&wire).unwrap()),
+                Err(HostCheckpointError::Contract { path, .. })
+                    if path.starts_with("schedule.")
+            ));
+        }
+    }
+
+    #[test]
+    fn full_host_checkpoint_continues_evicted_schedule_history_and_rejects_rehashed_gaps() {
+        for capacity in [0, 1, 2, 3, 4] {
+            let make_owner = || {
+                let mut host_options = options(true);
+                host_options.archived_command_capacity = capacity;
+                let mut owner = HostCore::new(
+                    HostSessionId::new(0xc01c),
+                    continuation_world(),
+                    host_options,
+                )
+                .unwrap();
+                owner
+                    .install_schedule(
+                        vec![
+                            scheduled(1, 0, serde_json::json!({"food_max": 0.61})),
+                            scheduled(2, 0, serde_json::json!({"food_max": 0.72})),
+                            scheduled(3, 0, serde_json::json!({"food_max": 0.83})),
+                            scheduled(4, 2, serde_json::json!({"food_max": 0.94})),
+                        ],
+                        resolve_test_schedule,
+                    )
+                    .unwrap();
+                owner
+            };
+            let mut original = make_owner();
+            let mut oracle = make_owner();
+            let step = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+            settle_continuation_command(&mut original, step.clone(), 10);
+            settle_continuation_command(&mut oracle, step, 10);
+            let checkpoint = original.capture_host_checkpoint_v1().unwrap();
+            assert_eq!(checkpoint.tick(), Tick(1));
+            assert_eq!(checkpoint.world_checkpoint().agent_count(), 3);
+            assert_eq!(checkpoint.state.completed_schedule_sequence, Some(3));
+            assert_eq!(
+                checkpoint.state.scheduled_patches.len(),
+                3.min(capacity.max(1))
+            );
+            assert_eq!(checkpoint.state.schedule.as_ref().unwrap()[0].sequence, 4);
+            let bytes = checkpoint.encode().unwrap();
+            let decoded = HostCheckpointV1::decode(&bytes).unwrap();
+            assert_eq!(decoded.encode().unwrap(), bytes);
+            assert_host_schedule_corruption_refused(&bytes);
+            let restored_world = decoded
+                .restore_world(scriptbots_core::BrainRegistry::new())
+                .unwrap();
+            let persistence = restored_world
+                .bind_persistence(Box::new(NullPersistence))
+                .unwrap();
+            let mut restored = HostCore::restore_host_checkpoint_v1(
+                &decoded,
+                restored_world,
+                persistence,
+                original.journal,
+                Some(resolve_test_schedule),
+                ManualInstant::from_nanos(1_000),
+            )
+            .unwrap();
+            assert_eq!(
+                restored.latest_snapshot().as_ref(),
+                oracle.latest_snapshot().as_ref()
+            );
+            for sequence in 2_u64..=3 {
+                let step =
+                    CommandEnvelope::new(CommandId::new(u128::from(sequence)), HostCommand::Step);
+                settle_continuation_command(&mut restored, step.clone(), 1_000 + sequence * 10);
+                settle_continuation_command(&mut oracle, step, sequence * 10);
+            }
+            assert_continued_owner_outputs(&restored, &oracle);
+            assert_eq!(restored.world().config().food_max, 0.94);
+            let after = restored.capture_host_checkpoint_v1().unwrap();
+            let uninterrupted = oracle.capture_host_checkpoint_v1().unwrap();
+            assert_eq!(after.state.completed_schedule_sequence, Some(4));
+            assert!(after.state.schedule.as_ref().unwrap().is_empty());
+            assert_eq!(after.step_traces(), uninterrupted.step_traces());
+            assert_eq!(after.encode().unwrap(), uninterrupted.encode().unwrap());
         }
     }
 
@@ -10721,6 +10866,7 @@ mod tests {
         submit(&mut port, 1, HostCommand::Step);
         core.drive(ManualInstant::from_nanos(0)).unwrap();
         let retained = core.pending_journal_batch().unwrap();
+        assert_eq!(core.schedule.as_ref().unwrap().completed_sequence, 0);
         let digest = core.scientific_digest_v1().unwrap();
         let config_revision = core.with_world(WorldState::config_revision);
         let shutdown = core.request_shutdown().unwrap();
@@ -10763,6 +10909,7 @@ mod tests {
             Tick(0),
             "durable adapter's volatile receipt cannot release science"
         );
+        assert_eq!(core.schedule.as_ref().unwrap().completed_sequence, 0);
         state.borrow_mut().receipts.push_back(JournalReceipt::new(
             retained.id(),
             JournalReceiptState::Durable,
@@ -10773,6 +10920,7 @@ mod tests {
                 .scientific_steps,
             1
         );
+        assert_eq!(core.schedule.as_ref().unwrap().completed_sequence, 1);
         assert_eq!(core.latest_snapshot().scheduled_patches.len(), 1);
         assert_eq!(
             core.with_world(WorldState::config_revision),
