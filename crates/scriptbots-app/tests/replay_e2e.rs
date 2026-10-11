@@ -68,11 +68,12 @@ fn produce_host_handoff(
     ticks: u64,
     checkpoint_id: &str,
     food_growth_rate: &str,
+    brain: &str,
 ) -> Output {
     let mut command = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
     command
         .env("SCRIPTBOTS_STORAGE_PATH", database)
-        .args(["--storage", "file", "--threads", "1", "--brain", "mlp"])
+        .args(["--storage", "file", "--threads", "1", "--brain", brain])
         .arg("--bootstrap-ticks")
         .arg(ticks.to_string())
         .arg("--checkpoint-handoff")
@@ -89,6 +90,9 @@ fn produce_host_handoff(
         .arg(format!("population_minimum={HOST_MINIMUM_POPULATION}"))
         .arg("--set")
         .arg(format!("food_growth_rate={food_growth_rate}"));
+    if brain == "mixed" {
+        command.args(["--set", "neuroflow.enabled=true"]);
+    }
     retained_host_output(directory, name, &mut command)
 }
 
@@ -98,6 +102,7 @@ fn continue_host_handoff(
     database: &Path,
     checkpoint_id: &str,
     ticks: u64,
+    brain: &str,
 ) -> Output {
     let mut command = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
     command
@@ -108,7 +113,7 @@ fn continue_host_handoff(
         .arg(checkpoint_id)
         .arg("--continue-ticks")
         .arg(ticks.to_string())
-        .args(["--brain", "mlp"]);
+        .args(["--brain", brain]);
     retained_host_output(directory, name, &mut command)
 }
 
@@ -1191,6 +1196,7 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         HOST_CONTINUATION_TICKS,
         "uninterrupted-final",
         "0.0005",
+        "mlp",
     );
     assert!(
         baseline_output.status.success(),
@@ -1208,6 +1214,7 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         HOST_HANDOFF_TICK,
         "first-cut",
         "0.0005",
+        "mlp",
     );
     assert!(
         cut_output.status.success(),
@@ -1230,6 +1237,7 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         &split_db,
         "first-cut",
         HOST_CONTINUATION_TICKS - HOST_HANDOFF_TICK,
+        "mlp",
     );
     assert!(
         continued_output.status.success(),
@@ -1344,6 +1352,7 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         HOST_CONTINUATION_TICKS,
         "perturbed-final",
         "0.4",
+        "mlp",
     );
     assert!(
         perturbed_output.status.success(),
@@ -1437,7 +1446,7 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
             .close()
             .expect("close mutated copy before the real CLI");
         let before = host_database_prefix(&database);
-        let output = continue_host_handoff(&directory, name, &database, "first-cut", 1);
+        let output = continue_host_handoff(&directory, name, &database, "first-cut", 1, "mlp");
         assert!(!output.status.success(), "{name} artifact must fail closed");
         let text = strip_ansi(&format!("{}{}", stdout_text(&output), stderr_text(&output)));
         assert!(
@@ -1473,6 +1482,101 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         source_bytes
     );
     assert_eq!(host_database_prefix(&source_db), source_prefix);
+    #[cfg(feature = "neuro")]
+    {
+        let database = directory.join("uncovered-factory.sqlite");
+        let output = produce_host_handoff(
+            &directory,
+            "uncovered-factory",
+            &database,
+            1,
+            "uncovered-factory-cut",
+            "0.0005",
+            "mixed",
+        );
+        assert!(
+            output.status.success(),
+            "a retained artifact must report its actual continuation limitation: {}",
+            stderr_text(&output)
+        );
+        let report = host_cli_report(&output, "scriptbots.host-checkpoint-handoff.v1");
+        assert_eq!(report["status"], "handed_off");
+        let limitations: scriptbots_app::CharacterizationLimitationsV0 =
+            serde_json::from_value(report["characterization_limitations"].clone())
+                .expect("typed real uncovered-factory claim");
+        assert_eq!(
+            limitations.purpose,
+            "retained_full_host_checkpoint_continuation"
+        );
+        assert!(!limitations.checkpoint_replay_guarantee);
+        assert!(
+            report["continuation_refusal"]
+                .as_str()
+                .expect("actual uncovered-factory refusal")
+                .contains("complete evaluator and factory state")
+        );
+        let reader = StorageReader::open(database.to_str().expect("UTF-8 negative database"))
+            .expect("independently read the real uncovered-factory artifact");
+        let record = reader
+            .load_checkpoints()
+            .expect("real retained uncovered-factory checkpoint")
+            .into_iter()
+            .find(|record| record.checkpoint_id == "uncovered-factory-cut")
+            .expect("exact reported checkpoint exists");
+        let checkpoint = record.host_checkpoint().expect("decode real mixed artifact");
+        assert_eq!(checkpoint.tick().0, 1);
+        assert!(checkpoint.world_checkpoint().agent_count() >= HOST_MINIMUM_POPULATION);
+        let digest = checkpoint.world_checkpoint().source_digest();
+        assert!(digest.evaluator_state_covered);
+        assert!(limitations.evaluator_state_covered);
+        assert!(!digest.factory_state_covered);
+        let uncovered_family = scriptbots_brain_neuro::NeuroflowBrain::KIND.as_str();
+        assert_eq!(
+            digest.uncovered_factory_families,
+            [uncovered_family.to_owned()]
+        );
+        assert_eq!(
+            report["boundary_digest"],
+            serde_json::to_value(digest).expect("actual uncovered-factory digest JSON")
+        );
+        assert_eq!(report["payload_digest"], record.payload_digest);
+        let watermarks = reader
+            .persistence_watermarks()
+            .expect("actual durable prefixes");
+        assert!(watermarks.durable.is_some());
+        assert_eq!(watermarks.admitted, watermarks.applied);
+        assert_eq!(watermarks.applied, watermarks.durable);
+        assert_eq!(report["watermarks"], host_watermarks_json(watermarks));
+        reader
+            .close()
+            .expect("close independent uncovered-factory reader");
+        let before = host_database_prefix(&database);
+        let refused = continue_host_handoff(
+            &directory,
+            "uncovered-factory-continuation",
+            &database,
+            "uncovered-factory-cut",
+            1,
+            "mixed",
+        );
+        assert!(!refused.status.success());
+        let text = strip_ansi(&format!("{}{}", stdout_text(&refused), stderr_text(&refused)));
+        assert!(text.contains("uncovered-factory-cut"));
+        assert!(text.contains("complete evaluator and factory state"));
+        let after = host_database_prefix(&database);
+        assert_eq!(
+            after, before,
+            "uncovered factory refusal cannot advance the real run"
+        );
+        fs::write(
+            directory.join("uncovered-factory.observations.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "handoff": report, "before": before, "after": after,
+            }))
+            .expect("encode real uncovered-factory observations"),
+        )
+        .expect("retain real uncovered-factory observations");
+    }
     fs::write(
         directory.join("observed-handoffs.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
