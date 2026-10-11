@@ -3789,7 +3789,23 @@ impl HostCore {
                 .collect();
         }
         let snapshot = &state.snapshot;
-        self.snapshots = SnapshotHub::new(Arc::new(snapshot.clone()));
+        // JSON's growing Vec decoder can retain spare capacity that live layer capture
+        // never allocated. Copy the decoded payloads into the same exact-sized vectors
+        // as capture before they become the reused layer cache; future build statistics
+        // must measure those real allocations, not the decoder's growth history.
+        let layers = SnapshotLayerCache {
+            revisions: snapshot.layers.revisions,
+            terrain: Arc::new(snapshot.layers.terrain.as_ref().clone()),
+            food: Arc::new(snapshot.layers.food.as_ref().clone()),
+            hydrology: snapshot
+                .layers
+                .hydrology
+                .as_ref()
+                .map(|layer| Arc::new(layer.as_ref().clone())),
+        };
+        let mut restored_snapshot = snapshot.clone();
+        restored_snapshot.layers = layers.snapshot();
+        self.snapshots = SnapshotHub::new(Arc::new(restored_snapshot));
         self.next_snapshot = state.next_snapshot;
         self.last_published_scientific = state.last_published_scientific;
         self.summary_history = Arc::clone(&snapshot.summary_history);
@@ -3804,12 +3820,7 @@ impl HostCore {
         self.latest_completed_summary
             .clone_from(&state.latest_completed_summary);
         self.step_traces = state.step_traces.iter().cloned().collect();
-        self.snapshot_layers = SnapshotLayerCache {
-            revisions: snapshot.layers.revisions,
-            terrain: Arc::clone(&snapshot.layers.terrain),
-            food: Arc::clone(&snapshot.layers.food),
-            hydrology: snapshot.layers.hydrology.as_ref().map(Arc::clone),
-        };
+        self.snapshot_layers = layers;
     }
 
     /// Capture focused inspector data without sharing the world or its evaluator.
@@ -6423,6 +6434,11 @@ mod tests {
             assert_eq!(
                 restored.latest_snapshot().as_ref(),
                 oracle.latest_snapshot().as_ref()
+            );
+            assert_eq!(
+                restored.snapshot_layers.total_capacity_bytes(),
+                oracle.snapshot_layers.total_capacity_bytes(),
+                "restored live layer allocations must match capture, not JSON growth capacity"
             );
             for sequence in 2_u64..=3 {
                 let step =
