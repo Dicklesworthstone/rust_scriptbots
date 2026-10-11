@@ -515,15 +515,41 @@ pins and original build settings. The actual package and all four DOM cases pass
 11:18:44 UTC: the real demo advances from tick 60 to 120 with 256 agents and no page errors;
 the actual init/snapshot/tick/reset contract and exact invalid-geometry cause pass. The
 original synthetic controls remain separately labeled. All four missing-file/export
-rejections and the authoritative CI package smoke also pass. Native/WASM parity, analyzer,
-final-source and outer collection are still running; no complete browser lane pass is claimed.
+rejections and the authoritative CI package smoke also pass. All sixteen inner phases finish
+with typed pass/0. Positive native/WASM parity executes 20 tests, zero failures or ignores;
+the original injected position divergence exits one and names tick one, agent one and the
+unchanged tolerance. The node-only clock suite is explicitly skipped by this browser runner.
+Analyzer and final source/tool identity checks pass. Outer DSR then refuses collection at
+11:25:38 UTC because Cargo recreated the tracked Proptest README link in its private cache:
+native exit four, outer exit six, no collected artifacts. All 928 retained proof files,
+635,905,008 bytes, independently match the copied inventory
+`5e4ac9a181520dbd78883625cbc5bfca52155007b80caf7c47d6fdac6d2b588c`.
+This qualifies the observed package/browser controls, not the containing DSR release or the
+original browser owner's still-open Vite criterion.
 
-Prepared, unlaunched R90 retains all fourteen original terminal gates at `460517d7`. It
-first repeats the exact failed analyzer build with Cargo fingerprint logging, then executes
-the existing storage `host_checkpoint` tests. Its expected roster derives from actual Rust
-test declarations and excludes helpers; the current roster contains eight tests. No cache
-is deleted, no artifact is fabricated, and no gate, dependency, compiler flag or deadline
-changes. Its execution waits for the active browser worker to finish.
+R90 starts at 11:27:57 UTC on the same clean `460517d7` source, retaining all fourteen original
+terminal gates. The exact previously failed analyzer build succeeds in 3m20s; the historical
+missing-directory cause remains unresolved. All eight existing storage `host_checkpoint`
+tests then pass, zero failures or ignores, in 41.38 seconds. The actual file-backed continuation
+preserves session 49181, advances the cut from tick two to four, observes four command rows,
+matches its original stage trace and final digest, and reports admitted/applied/durable 4/4/4.
+Exact retry, changed owner payload, same-tick stale cut, lost reply, later-admission witness,
+foreign pair, shared typed SQL failure and corrupt/truncated/rehashed-owner refusals execute.
+The complete storage log independently hash-matches
+`4cdacf5cc2b9f36b95061058ed2a0bd8a2c5295061bc5d16289e2dae3682f455`.
+Six original checks pass; workspace Clippy then exits 101 with explicit filesystem exhaustion
+and failed output writes. DSR's result receipt is missing/invalid and its outer exit is four;
+the inner verdict file is empty. No typed final verdict or successful source-after check is
+invented. All 23 copied proof files, 8,070,756 bytes, match inventory
+`ca6e40df80830122d817630a69fa8458f38c33057f25921eaac06e00befa0af7`;
+all seven command-log hashes match. No cache, retained database or proof file is deleted.
+
+R93 is prepared to execute the same original fourteen terminal gates and strict consumer on
+Hz4, whose observed filesystem has 123 GB available. Source, verifier, compiler flags, jobs,
+deadline and installed DSR identity remain pinned; the profile changes only worker/path/run
+identities and omits the already executed diagnostic preludes, which are outside those gates.
+The quantitative latency lane remains unexecuted on its required Hz2 class while that
+filesystem is full. No cross-class substitute or performance improvement is claimed.
 
 R72 finishes at the unchanged coordinator deadline: native typed timeout/5, outer failed/6,
 07:45:09 UTC, 7,207 seconds. The baseline completes all 139 original files with 68 passes,
@@ -1349,15 +1375,21 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Execute observer R89 and retain the actual world-initialization console error.
 - [x] Remove the demo's invalid geometry overrides, expose complete error context and add
   a real packaged-API invalid-geometry control at `460517d7`; scan and review the source.
-- [ ] Finish R91's produced-package, four DOM cases, missing-file/export negatives, CI smoke,
-  injected parity refusal, real positive parity, analyzer and final-source/collection checks.
+- [x] Finish R91's sixteen original inner phases and retain the outer cache-link refusal;
+  independently match all 928 proof files. Full containing qualification remains incomplete.
 - [x] Observe R91's actual package, all four DOM cases, invalid geometry and corrupt-WASM
   refusals, four missing-file/export negatives and the authoritative CI package smoke passing.
 - [x] Read back all 94 current full-host artifacts, actual embedded provenance and guarantees;
   preserve the unchanged uncovered-factory negative database prefixes.
-- [ ] Execute all eight existing storage host-checkpoint tests and verify actual named results.
+- [x] Execute all eight existing storage host-checkpoint tests at `460517d7`, verify their
+  actual named 8/0/0 results and independently match the complete retained log.
 - [x] Prepare source-pinned R90 with the exact failed analyzer diagnostic, original storage
-  tests and all fourteen terminal gates; hold execution until the browser worker is free.
+  tests and all fourteen terminal gates; execute after the browser worker is free.
+- [x] Retain R90's successful analyzer/storage preludes and explicit disk-exhaustion failure;
+  preserve its empty verdict, invalid outer receipt and all seven command-log hashes.
+- [x] Prepare the original fourteen terminal gates on Hz4 without deleting existing files.
+- [ ] Execute R93 at the clean pinned successor; retain all original gates, strict consumer
+  and actual outer disposition. Resolve any product failure at its original named guard.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
   or changing compiler flags, original fourteen gates, deadlines or owner acceptance.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
@@ -1375,11 +1407,11 @@ as a working list when its original owners are fully qualified; retained evidenc
   and retain the original proof/profile/launcher/outer log archive; no full qualification.
 - [ ] Complete the original full-tool acceptance and record the actual pass/fail/skip evidence;
   do not upgrade a focused logger pass to full DSR or project qualification.
-- [ ] Execute the new schedule checkpoint regression and unchanged bounded-history/fault tests
-  at `fbe5618e` or its reviewed successor through the original native DSR acceptance.
+- [x] Execute the new schedule checkpoint regression and unchanged bounded-history/fault tests
+  at reviewed successor `66ac7ed1`: R85's complete runtime suite passes 233/0/6.
 - [x] Observe native formatter/check/Clippy results at the reviewed successor `0a8be911`.
-- [ ] Observe the actual valid-suffix/corrupt-gap admission split through the original native
-  tests; keep full continuation qualification false until all original acceptance passes.
+- [x] Observe the actual valid-suffix/corrupt-gap admission split in R85's original runtime
+  suite; full continuation qualification still requires all original acceptance.
 - [x] Write the bounded channel capture/handoff path with its original caller deadline, ingress
   fence, real partial-tail flush, owner retirement and independent thread join. Ordinary
   owner science remains uninstrumented unless diagnostic tracing is requested.
