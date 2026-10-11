@@ -165,7 +165,7 @@ struct InterventionHistoryV1 {
     expired: bool,
 }
 
-pub(super) fn intervention_history_kind(kind: &str) -> Option<&'static str> {
+pub fn intervention_history_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "drought" => Some("drought"),
         "embargo" => Some("embargo"),
@@ -1588,13 +1588,13 @@ impl WorldState {
                 path: "host.communication_rng".to_owned(),
                 detail: error.to_string(),
             })?;
-        world.archive = continuity.archive.clone();
+        world.archive.clone_from(&continuity.archive);
         if let Some(archive) = &mut world.archive {
             archive.logged_eligibility_warning = continuity.archive_logged_eligibility_warning;
         }
         world.agent_stats = continuity.agent_stats.iter().cloned().collect();
         world.archive_evaluations = continuity.archive_evaluations;
-        world.novelty_state = continuity.novelty_state.clone();
+        world.novelty_state.clone_from(&continuity.novelty_state);
         world.consecutive_zero_novelty_samples = continuity.consecutive_zero_novelty_samples;
         world.persistence_discarded_records_at = continuity.persistence_discarded_records_at;
         Ok(world)
@@ -1887,7 +1887,7 @@ impl WorldState {
             // actual derived profiles before the unchanged full science-digest comparison.
             restored.food_profiles.clone_from(&continuity.food_profiles);
             restored.cadence = continuity.cadence.clone();
-            restored.temperature = continuity.temperature.clone();
+            restored.temperature.clone_from(&continuity.temperature);
         }
 
         let actual_digest = restored.world_digest_v1()?;
