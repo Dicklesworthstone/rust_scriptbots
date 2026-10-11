@@ -8167,7 +8167,7 @@ mod tests {
     fn host_checkpoint_comparison_refuses_actual_uncovered_factory_observations() {
         use scriptbots_runtime::{
             ApplicationState, CommandEnvelope, CommandId, HostCheckpointV1, HostCommand, HostCore,
-            JournalState, ManualInstant,
+            JournalState, ManualHostDriver, ManualInstant,
         };
 
         for opaque_factory in [false, true] {
