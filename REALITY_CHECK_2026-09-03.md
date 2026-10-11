@@ -16,9 +16,10 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-Latest source is `cf246e4f68cfacdf7b7971d16626c58ec141a6ac`. It includes the full-owner
+Latest source is `fbe5618e6218f3ffb27ba9a28eb1c6f137569b40`. It includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
-discarded-history/sealed-boundary corrections and pre-admission lifecycle exhaustion handling.
+discarded-history/sealed-boundary corrections, pre-admission lifecycle exhaustion handling,
+and an owner-derived completed schedule cursor that survives bounded outcome-history eviction.
 The combined feature has not compiled or executed to completion. The original checkpoint owner
 remains in progress and its public
 guarantee remains false. R61 and R67 are suspended pending explicit permission for existing
@@ -27,6 +28,36 @@ verdict. Fresh read-only checks at 00:42:17/18 UTC confirm the original boot/sta
 parent and session identities, with all nine R67 and four R61 group members still stopped.
 Their timeout anchors show 9,718 and 14,002 elapsed seconds against the unchanged 7,200-second
 wall-clock limits. No process is resumed or terminated. Detailed failures and remaining tasks follow.
+
+At 02:52 UTC, a conflict-free strict fast-forward restored saved `0879e176` after external
+resets to `7c9264a1` at 01:37 and 01:38 UTC. Beads import changed zero rows; both authoritative
+exports retained SHA-256 `adbc2f7266c3e0a07628dcdd78c715392b3f339ec6057108703f4120a98b039e`.
+That recovered previous work; it is not a new capability increment.
+
+The subsequent source review found a concrete schedule/checkpoint mismatch. Production outcome
+history evicts its oldest entries at `archived_command_capacity.max(1)`, but the checkpoint
+validator requires that retained history to begin with sequence one. The unchanged existing
+`finite_launch_schedule_outlives_bounded_published_history` test constructs the conflicting
+two-entry suffix `2, 3`; it does not test checkpoint capture. `fbe5618e` records the queue's
+completed sequence only after its journal commitment, captures and restores it, and checks the
+exact retained count and contiguous suffix against that independent cursor. The full-owner
+codec advances from two to three; science codecs and existing goldens remain unchanged.
+Valid bounded suffixes are the intended newly admitted cases. Missing/stale/advanced/exhausted
+cursors, missing outcomes, nonzero sequence gaps, mismatched remaining sequences and a missing
+schedule are the intended refusals. This admission/refusal split is reviewed source, not an
+observed native result. New regression source compares real nonempty restored and uninterrupted
+owners at five capacities, through the remaining patch and an exhausted schedule, and includes
+eight rehashed mutations per capacity. The existing delayed-journal fault test gains cursor
+assertions for pending, insufficient volatile and qualifying durable receipts; its protocol
+adapter is explicitly not storage evidence. All these new assertions remain unexecuted.
+
+The final one-file static UBS scan for `fbe5618e` exits zero: zero critical, 1,638 warnings,
+203 informational findings; native phases are disabled. Input SHA-256 before and after is
+`47ffa1dd44271d27c8816255e1ab84302970b467fdfc84787efd9e73bdc3f275`.
+All twelve logged created Python temporary paths remain present. Logs use prefix
+`/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/schedule-cursor-final-20261011T0308Z`;
+actual execution is 03:03:55–03:04:03 UTC. No new compiler, formatter, Clippy or test result
+exists, and no original Bead closes. Cleanup permission remains unanswered.
 
 The October 11 source review found that `request_persistence_flush` submits real work before
 checking lifecycle sequence exhaustion. At `u64::MAX`, it queues the flush and advances admission/
@@ -669,6 +700,18 @@ as a working list when its original owners are fully qualified; retained evidenc
   command ordering/retry identities, scientific/configuration/control revisions, scheduled
   actions, audit/history, domain RNG, QD/novelty state, resource accounting and observer state.
   These are current source changes, not executed continuation evidence.
+- [x] Restore the saved strict descendant after the 01:37/01:38 external resets; import Beads
+  without changing rows or attributing restored code to this block.
+- [x] Preserve the owner-derived completed schedule cursor across capture/restore and validate
+  bounded outcome history against it; explicitly revise only the full-owner codec to three.
+- [x] Add and review five real-owner capacity cases, forty rehashed corrupt-artifact controls,
+  and pending/volatile/durable cursor assertions in the existing protocol fault test.
+- [x] Execute the final one-file static UBS scan with native phases disabled and retain all
+  twelve logged temporary paths; report the 1,638 warnings without claiming a clean-warning pass.
+- [ ] Execute the new schedule checkpoint regression and unchanged bounded-history/fault tests
+  at `fbe5618e` or its reviewed successor through the original native DSR acceptance.
+- [ ] Independently observe the actual valid-suffix/corrupt-gap admission split and native
+  formatter/check/Clippy results; keep full continuation qualification false until then.
 - [x] Write the bounded channel capture/handoff path with its original caller deadline, ingress
   fence, real partial-tail flush, owner retirement and independent thread join. Ordinary
   owner science remains uninstrumented unless diagnostic tracing is requested.
@@ -1129,6 +1172,60 @@ Disposition: incomplete implementation and prior cleanup violations remain discl
 owners stay open. Proof-class inflation, zero-run green, close pumping and machinery drift remain
 the named countermeasures. The prior bounded CASS history check is retained; no new history sweep
 or comprehensive clearance is claimed. Native qualification is the next substantive deliverable.
+
+October 11 bounded audit — 02:51 UTC through this block's source/report/tracker banks:
+`fbe5618e` is one USER candidate (scheduled continuation correctness); this requested report
+and tracker update are two PROCESS items. USER=1, ENABLER=0, PROCESS=2, UNKNOWN=0; qualified
+capability and closure counts remain zero. Recovery is preservation of earlier work.
+Real-work answers: (1) No new native demo; the concrete source fix removes bounded-history
+checkpoint refusal. (2) Omitting process updates changes no runtime behavior, but loses the
+user's requested TODO. (3) No new enabler is claimed exercised. (4) The Evolution Lab and
+original checkpoint journey remain open; this active cohort was chosen over starting another
+unqualified feature. (5) Solo, with no new delegation or agent closes. (6) No requirements are
+changed or transferred to a follow-up. Verdict remains DRIFTING because qualification is flat;
+freeze additional machinery and execute the original native cohort when cleanup is authorized.
+
+Creation gate: this in-place report/TODO is PROCESS. Its consumer and gate are the user's
+explicit request for a complete TODO and reality check; the observed defect is the conflicting
+bounded schedule suffix. The active checklist retires after original acceptance is satisfied;
+historical evidence remains. No integrity exception is needed. Highest ready priority is
+`bd-2z0.7.11`; another hour implementing the active checkpoint journey is more valuable than
+another process artifact. Verdict: minimum requested update only. The retained schedule cursor
+is FEATURE: production checkpoint validation and restored execution consume it.
+
+Honesty inventory for this block (bounded to the complete frozen source diff and actual logs):
+
+1. No (checked: frozen test hunks); no original assertion is weakened, removed or ignored.
+2. No (checked: new positive test); real HostCore/VolatileJournal/NullPersistence, no new double.
+3. No (checked: exact one-file source path); no golden or performance baseline changes.
+4. Yes: production checkpoint validation changes with its owner data. The independent cursor
+   and strict count/sequence guards are reviewed, with the admission/refusal split above and
+   new corruption controls; none is claimed natively verified. No release gate or tolerance changes.
+5. No (checked: queue completion, capture and restore consumers); no demo or benchmark special case.
+6. No (checked: scan log); only static UBS is reported, with native phases explicitly disabled.
+7. No (checked: command receipts); new tests, check, Clippy and formatter remain unrun.
+8. No (checked: front assessment); source review and volatile fixtures are not file durability proof.
+9. No (checked: retained assessment); prior failures, expired held runs and cleanup violations remain.
+10. No (checked: raw scanner redirection); stdout and stderr are retained together.
+11. No (checked: original owner and tracker mutation); no closure or acceptance-splitting follow-up.
+12. No (checked: original criteria and TODO); source progress does not change requirements.
+13. No (checked: this block's tracker/dispatch record); no agent or peer closes an item.
+14. No (checked: dispatch record); no new subagent is dispatched.
+15. No (checked: source author/review); no agent report is accepted as execution evidence.
+16. No (checked: owner status); the positive continuation remains in progress.
+17. No (checked: current claims); no agent agreement is counted as independent proof.
+18. No (checked: declared scan and test inputs); one scanned file, five capacity cases/eight
+    mutations each; expected test denominators are not reported as executed passes.
+19. Yes: this is still uncompiled continuation source after extensive earlier process work.
+    Prior unauthorized cleanup remains disclosed and cannot be undone. This block preserves
+    its temporary paths and leaves deletion-dependent runs held.
+20. Strongest new evidence is the complete reviewed source diff and unchanged input hash across
+    the actual static scan. A skeptic can execute the added regression; execution remains pending.
+
+Disposition: disclose the changed validator and unqualified positive/negative controls in place
+and to the operator; keep the original owner open. Gate self-weakening, proof-class inflation,
+zero-run green and machinery drift remain named countermeasures. The previous bounded CASS
+check is retained; this block claims no new archive search or comprehensive history clearance.
 
 This refresh supersedes the October 8 assessment where current source or later retained evidence
 differs. The October 9 implementation and failure records below remain intact. In particular,

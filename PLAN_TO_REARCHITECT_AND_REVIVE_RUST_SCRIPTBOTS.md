@@ -399,6 +399,10 @@ now includes worker-derived storage cuts, exact same-session journal recovery, d
 owner handoff/join, bounded CLI continuation, and chronological stage-trace comparison.
 Nonempty real-owner/file-worker/subprocess positive and negative tests are being completed;
 all new continuation source remains natively unqualified and the public guarantee stays false.]
+The October 11 source candidate also preserves an owner-derived completed schedule cursor
+across bounded outcome-history eviction. Its five capacity regressions, rehashed gap controls,
+and pending/volatile/durable cursor observations remain unrun; they belong to this same original
+acceptance cohort, with no library-only closure or guarantee promotion.
 
 [Currently In Progress — `bd-g6wf`, LilacElm, 2026-10-10: execute the existing ignored
 control-plane latency acceptance through a clean, source-pinned native DSR profile after the
