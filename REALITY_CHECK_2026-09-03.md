@@ -16,7 +16,7 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-The preserved candidate's latest Rust source is `66ac7ed1780b68305c5662b40cfe2c4921a090f7`.
+The preserved candidate's latest source is `460517d7631bd1c123836182996e0d4dfb43c0ef`.
 It is isolated at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
 resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. It includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
@@ -31,8 +31,9 @@ R77 runs the exact failed case and new core control first, then retains all ten 
 Both discriminating preludes and all seven initial checks pass at `159fe99d`; the complete
 workspace/feature/persistence/CLI acceptance remains unfinished. The original checkpoint owner
 remains in progress. R83 executes the artifact-scoped guarantee writer and real MLP continuation;
-the current source also adds an actual public-report uncovered-factory negative, still awaiting
-execution. Immutable ordinary launch manifests remain false. Original R61/R67 deadlines were
+R87 also executes the actual public-report uncovered-factory negative successfully with the
+full original replay suite. Immutable ordinary launch manifests remain false. Original R61/R67
+deadlines were
 not extended. Both expired process groups were retired on October 11; their original runners
 reported timeout with outer exit six. The new workspace run retains all ten original gates.
 
@@ -434,7 +435,7 @@ Neuroflow factory state. It requires a retained artifact whose public guarantee 
 the uncovered family from its declaration, matches the independently read payload/digest/three
 watermarks, refuses continuation and leaves all science/journal prefixes unchanged. It uses no
 mock or new dependency and preserves every existing replay test. Static UBS finds zero critical
-heuristics, 373 warnings and 23 informational findings; native execution remains pending.
+heuristics, 373 warnings and 23 informational findings; its native execution succeeds in R87.
 
 R77 finishes at its original 7,200-second deadline, outer failed/six at 09:48:59 UTC. Its 34
 completed Rust summaries total 942 passes, zero failures and seven ignores, but the original
@@ -476,7 +477,16 @@ profile restores only the observed missing empty output directory, preserves the
 and supplies the existing compile-time provenance inputs before its preludes. The app
 preflight and core replay-anchor control each pass once. The whole economy-faults suite
 then executes 940 passing tests, zero failures and eight original ignores, including
-`every_injectable_fault_turns_the_gate_red`; the full five-test replay suite is running.
+`every_injectable_fault_turns_the_gate_red`; the full five-test replay suite subsequently passes
+5/0/0 in 691.07 seconds. The current real Mixed/Neuroflow artifact reports false guarantee,
+covered evaluator state, uncovered factory state and exact family `ml.neuroflow`; continuation
+is refused and all before/after science/journal prefixes match. All 94 copied host-continuation
+files, 89,863,878 bytes, match the worker inventory
+`c5d3a4f9f48b31490f3331d516501c60abaf00f9c025fabd2839e30ce75ddfd3`.
+Complete traces, cut prefix, final boundaries and current artifact guarantees are separately
+read back. Three actual manifests report complete embedded provenance, clean `main` and
+source `66ac7ed1`; ordinary launch guarantees remain false. All seven original initial
+workspace checks pass, including check and strict Clippy; full workspace tests are running.
 These are diagnostic source observations, not final workspace or private-DSR qualification.
 
 R88 browser starts at 10:39:17 UTC on the released Hz2 worker, launcher PID 595087, with
@@ -485,10 +495,35 @@ the original sixteen phases, two jobs and original 7,200-second deadline. Its pr
 launcher SHA256 values are `4afa26717b9f7686f53a5c0b8ca56b94f5c78f096979770542c2f7d01f10a770`
 and `625d79429a11107933df682a0a98e76cc33351911251922d7c9db7fe54312e2d`.
 Source/tool checks, both WASM graph controls, exact pinned Chrome/driver qualification and
-the fresh native fixture comparison pass. Actual package production is running; DOM,
-missing-file/export negatives, CI smoke and WASM parity are still unqualified. This
+the fresh native fixture comparison pass. Actual package production passes; the seventh
+phase fails the unchanged real DOM first-tick assertion after 30 seconds. Missing-file/export
+negatives, CI smoke and WASM parity are unreached. This
 independent diagnostic no longer waits for unrelated full private-DSR acceptance; that
 separate unfinished qualification and the original browser owner remain open.
+
+Observer-only `fd643c74` retains the previously hidden page-error and console observations.
+R89 again produces the exact package and fails that same assertion. Its actual console
+reports world initialization refusal; source inspection finds the demo overriding the core's
+valid geometry with 1280×720 while its default food-cell size is 50. Neither dimension is
+divisible by 50. Reviewed `460517d7` removes those overrides and preserves the complete
+Rust error context in JavaScript. The real exported API test now also requires invalid
+geometry to refuse with its exact validation cause. All three original synthetic DOM
+controls, positive assertions, package-byte checks and timeouts remain. Syntax/diff checks
+pass; static UBS has zero critical findings in all three changed files. R91 launches after
+verified source/profile/bundle preparation, retaining all sixteen original browser phases,
+pins and original build settings. The actual package and all four DOM cases pass at
+11:18:44 UTC: the real demo advances from tick 60 to 120 with 256 agents and no page errors;
+the actual init/snapshot/tick/reset contract and exact invalid-geometry cause pass. The
+original synthetic controls remain separately labeled. All four missing-file/export
+rejections and the authoritative CI package smoke also pass. Native/WASM parity, analyzer,
+final-source and outer collection are still running; no complete browser lane pass is claimed.
+
+Prepared, unlaunched R90 retains all fourteen original terminal gates at `460517d7`. It
+first repeats the exact failed analyzer build with Cargo fingerprint logging, then executes
+the existing storage `host_checkpoint` tests. Its expected roster derives from actual Rust
+test declarations and excludes helpers; the current roster contains eight tests. No cache
+is deleted, no artifact is fabricated, and no gate, dependency, compiler flag or deadline
+changes. Its execution waits for the active browser worker to finish.
 
 R72 finishes at the unchanged coordinator deadline: native typed timeout/5, outer failed/6,
 07:45:09 UTC, 7,207 seconds. The baseline completes all 139 original files with 68 passes,
@@ -1282,7 +1317,7 @@ as a working list when its original owners are fully qualified; retained evidenc
   continuation E2E at `a03bcdbf`; retain the actual artifact-scoped positive and unit refusals.
 - [x] Add the real public-report Mixed/Neuroflow uncovered-factory refusal and unchanged-prefix
   control, scan it, preserve the original replay suite and bank its source.
-- [ ] Execute that public negative with the full original replay suite at `66ac7ed1`.
+- [x] Execute that public negative with the full original replay suite at `66ac7ed1`: 5/0/0.
 - [x] Retain R80's actual two-hunk formatting failure with zero executed tests, apply exactly
   its whitespace changes at `f781e392`, scan/review and prepare fresh pinned R81.
 - [x] Retain R81's actual capture-case pass and schedule-case journal refusal; independently
@@ -1310,8 +1345,19 @@ as a working list when its original owners are fully qualified; retained evidenc
   guard: 940 passes, zero failures and eight original ignores. Original workspace gate still owed.
 - [x] Launch independent browser diagnostic R88 at `66ac7ed1` with all sixteen original phases;
   observe the actual tool/graph/Chrome and committed-native-fixture controls passing.
-- [ ] Finish R88's produced-package, four DOM cases, missing-file/export negatives, CI smoke,
+- [x] Finish R88 and preserve actual package success followed by the unchanged DOM timeout.
+- [x] Execute observer R89 and retain the actual world-initialization console error.
+- [x] Remove the demo's invalid geometry overrides, expose complete error context and add
+  a real packaged-API invalid-geometry control at `460517d7`; scan and review the source.
+- [ ] Finish R91's produced-package, four DOM cases, missing-file/export negatives, CI smoke,
   injected parity refusal, real positive parity, analyzer and final-source/collection checks.
+- [x] Observe R91's actual package, all four DOM cases, invalid geometry and corrupt-WASM
+  refusals, four missing-file/export negatives and the authoritative CI package smoke passing.
+- [x] Read back all 94 current full-host artifacts, actual embedded provenance and guarantees;
+  preserve the unchanged uncovered-factory negative database prefixes.
+- [ ] Execute all eight existing storage host-checkpoint tests and verify actual named results.
+- [x] Prepare source-pinned R90 with the exact failed analyzer diagnostic, original storage
+  tests and all fourteen terminal gates; hold execution until the browser worker is free.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
   or changing compiler flags, original fourteen gates, deadlines or owner acceptance.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
