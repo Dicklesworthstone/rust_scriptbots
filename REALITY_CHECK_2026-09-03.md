@@ -721,9 +721,27 @@ after R99 releases the worker. Its original ten workspace gates retain the unfil
 suite, explicit core `economy-faults`, analyzer, four compiler jobs and 7,200-second deadline.
 The same existing bounded seed supplies a fresh private Cargo home. Transport hashes, source/
 tool identities, shell syntax and configuration validate; preflight observes 8,282,374,144
-writable bytes. It is running; no full-workspace pass or resolution of the earlier catalog
-timeout is claimed. The required-class Hz2 quantitative lane and shared-reset conflict remain
-separate open constraints.
+writable bytes. It finishes at 16:17:54 UTC with outer/native failure six and an inner
+`failed`/1 verdict, seven completed steps. All five initial guards, workspace check and strict
+Clippy pass. The unfiltered workspace tests execute 69 passes, then both analytics E2E tests
+fail from actual OS error 28 (`StorageFull`/`No space left on device`). The real seeded-world
+test reaches the second database's tick-400 shutdown, whose Flush error carries the typed
+`RolledBack` state; the following constructed-fixture test cannot create its database.
+The E2E summary is 0/2/0 in 694.61 seconds. This is not a completed workspace suite: later
+application/runtime/core tests, explicit `economy-faults`, analyzer and strict positive
+consumer are unreached. The after-run source/tool guards pass. No successful journal rollback
+readback, report E2E, full-suite result or resolution of the earlier catalog timeout is inferred.
+
+All 57 copied proof files, 204,149,942 bytes, independently match the worker inventory SHA256
+`dafc9c47c02beb91db01eca8c8ddc5a0000476c012fde745b9790e7cc5f4e6b4` under
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/r100-workspace-proof/`.
+The complete failed workspace log matches
+`c3c0c5e9bc86249f8ea1ab08c8c1e974bc9262dd2919142e96145e1b9783419f`.
+Hz3 now has only 180,224 writable bytes; another fresh build there is inadmissible. Root has
+about 8.15 GB free, insufficient for a fresh full target. Hz4 has 143.75 GB free but observed
+I/O PSI `avg10` of 96.11% some/92.85% full and active compiler jobs. No blind retry, cache
+deletion, guard relaxation or substitute quantitative class follows. The original full-suite,
+required-class Hz2 latency and shared-reset constraints remain open.
 
 The strict fast-forward at 12:51:53 UTC restores shared local `main` to `b38e7ffc`, tree
 `f5b0c89ef88f414ddca8309d11f53c383be1c4eb`. Its preflight observes clean tracked/index state,
@@ -1600,7 +1618,10 @@ as a working list when its original owners are fully qualified; retained evidenc
   ignores, the outer Proptest cache-link refusal and all 465 independently matched proof files.
 - [x] Prepare and launch R100 serially at the same source, preserving all ten original workspace
   gates, full test roster, economy-faults, analyzer, build settings and deadline.
-- [ ] Finish R100 and retain its actual full-suite, feature/analyzer and outer results.
+- [x] Finish R100 and independently match all 57 retained proof files: check/Clippy pass,
+  partial workspace tests 69/2/0, actual disk-exhaustion failure; feature/analyzer are unreached.
+- [ ] Obtain a worker with adequate disk/memory and I/O headroom, then finish the original
+  unfiltered workspace, explicit economy-faults and analyzer acceptance without weakened limits.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
   or changing compiler flags, original fourteen gates, deadlines or owner acceptance.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
