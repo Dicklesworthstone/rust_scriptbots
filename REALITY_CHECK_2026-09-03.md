@@ -418,6 +418,17 @@ assertions using `err().expect()` fail linting. Inner verdict is failed/1 with s
 steps; outer exit is six at 09:54:58 UTC. Runtime/terminal whole suites, PTY, smoke and final
 consumer do not execute in this run. Exact `expect_err()` repairs preserve the typed refusals.
 
+R83 artifact readback is complete: all 77 host-continuation files, 82,503,739 bytes, independently
+match the worker inventory SHA256 `13df2c3822e0fd67cf13b70c202a737735de006dee3acf4db57910eb3ba2cd6d`.
+The complete continued 18-tick trace history equals the uninterrupted history; the seven-tick
+cut equals its prefix, and every tick contains all six stage observations. Final boundaries,
+continued run/session identity, three watermarks and unchanged corrupt/truncated database
+prefixes are actually compared. The real config perturbation diverges at Sense, tick one.
+Four retained artifact reports carry true artifact-scoped guarantees; ordinary launch manifests
+remain false. These early prelude binaries have incomplete build provenance and null source
+commit, because the profile had not supplied the existing compile-time inputs before building
+them. The externally pinned source alone does not establish complete embedded provenance.
+
 The new real CLI/SQL negative at `c14e255b` uses the existing Mixed registry with actual enabled
 Neuroflow factory state. It requires a retained artifact whose public guarantee is false, names
 the uncovered family from its declaration, matches the independently read payload/digest/three
@@ -443,6 +454,41 @@ original workspace gates and original timeout. A named executed fault-mutation t
 so an absent feature suite cannot look green. These running profiles are diagnostic execution,
 not full private-DSR qualification or an anticipated acceptance pass. Current source qualification
 and both original owners remain open.
+
+R85 finishes at 10:31:03 UTC with inner failed/1, thirteen completed steps and outer exit six.
+Formatting, strict workspace Clippy, all-target workspace check and the original terminal
+cohorts pass: runtime 233/0/6 existing ignores, terminal units 313/0, executable E2E 5/0,
+smoke 8/0 and manifests 15/0. The final analyzer build fails before producing its binary:
+Cargo cannot write the observed `scriptbots-storage/6d4aa06b0247aabb/fingerprint/invoked.timestamp`
+output. The missing directory's cause is unresolved; SBH's actual failure-window journal
+reports zero candidates and zero deletions. The strict final evidence consumer is unreached.
+All 459 copied proof files, 16,440,117 bytes, independently match the worker inventory,
+SHA256 `58b121d303bc65ff69a992a480227d0a2b0eb4735d57e8406ca253c7072e81b3`;
+all fourteen declared command-log hashes also match. Actual truecolor and NO_COLOR PTYs
+restore terminal attributes, alternate screen, cursor and capture modes; NO_COLOR emits
+zero color SGR. These positive observations do not turn the failed full lane into a pass.
+
+R86 stops before tests at 10:17:48 UTC, outer exit six, because Cargo cannot write the
+observed `cap-std/153132a870b72a2a/run/invoked.timestamp`. The full failed log is retained and
+independently hash-matched as `b868fbe22b64507574a55faea7933e05e4214259414d06997feb7810c46145ea`.
+R87 starts at 10:23:27 UTC with all original gates and deadlines unchanged. Its pinned
+profile restores only the observed missing empty output directory, preserves the cache,
+and supplies the existing compile-time provenance inputs before its preludes. The app
+preflight and core replay-anchor control each pass once. The whole economy-faults suite
+then executes 940 passing tests, zero failures and eight original ignores, including
+`every_injectable_fault_turns_the_gate_red`; the full five-test replay suite is running.
+These are diagnostic source observations, not final workspace or private-DSR qualification.
+
+R88 browser starts at 10:39:17 UTC on the released Hz2 worker, launcher PID 595087, with
+clean source `66ac7ed1`, actual installed DSR `84d139ea`, a fresh isolated output directory,
+the original sixteen phases, two jobs and original 7,200-second deadline. Its profile and
+launcher SHA256 values are `4afa26717b9f7686f53a5c0b8ca56b94f5c78f096979770542c2f7d01f10a770`
+and `625d79429a11107933df682a0a98e76cc33351911251922d7c9db7fe54312e2d`.
+Source/tool checks, both WASM graph controls, exact pinned Chrome/driver qualification and
+the fresh native fixture comparison pass. Actual package production is running; DOM,
+missing-file/export negatives, CI smoke and WASM parity are still unqualified. This
+independent diagnostic no longer waits for unrelated full private-DSR acceptance; that
+separate unfinished qualification and the original browser owner remain open.
 
 R72 finishes at the unchanged coordinator deadline: native typed timeout/5, outer failed/6,
 07:45:09 UTC, 7,207 seconds. The baseline completes all 139 original files with 68 passes,
@@ -1253,7 +1299,21 @@ as a working list when its original owners are fully qualified; retained evidenc
   stage/boundary/session equality, divergent digests and unchanged negative database prefixes.
 - [x] Retain R83's six passing preludes and original Clippy failure; bank its exact typed-error
   repair, apply the three native R84 formatting hunks and launch pinned R85/R86.
-- [ ] Independently verify the copied R83 full-host artifacts and original command-log hashes.
+- [x] Independently verify the copied R83 full-host artifacts and original command-log hashes;
+  compare complete traces, boundaries, identities, watermarks and unchanged negative prefixes.
+  Retain the actual incomplete embedded build provenance rather than inferring it from cwd.
+- [x] Finish R85 and preserve its thirteen passing gates, 574 passing tests and failed final
+  analyzer build; independently match all 459 copied files and fourteen command-log hashes.
+- [x] Preserve R86's missing-output-directory failure before tests; launch R87 with the
+  non-destructive empty-directory repair and actual compile-time provenance inputs.
+- [x] Execute the entire economy-faults suite at `66ac7ed1`, including the named injectable-fault
+  guard: 940 passes, zero failures and eight original ignores. Original workspace gate still owed.
+- [x] Launch independent browser diagnostic R88 at `66ac7ed1` with all sixteen original phases;
+  observe the actual tool/graph/Chrome and committed-native-fixture controls passing.
+- [ ] Finish R88's produced-package, four DOM cases, missing-file/export negatives, CI smoke,
+  injected parity refusal, real positive parity, analyzer and final-source/collection checks.
+- [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
+  or changing compiler flags, original fourteen gates, deadlines or owner acceptance.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
   qualified successor, including actual PTY, smoke, manifest and outer collection disposition.
 - [ ] Re-run the original ten workspace gates at the final source, including full tests,
