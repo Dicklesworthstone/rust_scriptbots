@@ -438,6 +438,16 @@ Preserve all original latency/load/science criteria; quantitative, full-workspac
 containing-DSR acceptance remain open. R106 retains the original three-pair comparison but
 has not launched because adequate worker headroom is unavailable.]
 
+[Currently In Progress — `bd-134`, LilacElm, 2026-10-11: shared local `main` is
+strictly fast-forwarded to retained `31313081` after exact-base, clean tracked/index
+and forty conflict-free reservations; JSONL imports seven records and has zero cycles.
+MCP HTTP still dispatched its synchronous FastMCP handler and session mutex on an
+async worker, despite an inner spawn-and-join helper. Move the whole HTTP dispatch
+to the blocking pool with the caller's Cx captured before transfer. Extend the real
+occupied-pool regression with MCP initialization and owner-applied tool receipts;
+retain caller cancellation through the actual HTTP handler. All original load,
+science, latency and acceptance criteria remain; native qualification is pending.]
+
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
 
 **Persistence decision (2026-07-11):** FrankenSQLite is the only embedded database backend. The former DuckDB architecture is retired in full; no dual-backend abstraction, compatibility shim, or legacy file migration is retained. The migration is complete only when source, manifests, lockfile, tests, CLI/help, CI, and active documentation all use the exact-revision `fsqlite` public facade and a repository-wide search finds no live DuckDB integration.

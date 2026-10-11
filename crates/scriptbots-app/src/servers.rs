@@ -3908,7 +3908,7 @@ impl McpHttpState {
 ///
 /// Requests carrying an `id` receive a JSON-RPC response; notifications (no
 /// `id`) are accepted with HTTP 202 and never produce a response body. The
-/// registered 13-tool control roster is reachable exactly as MCP clients
+/// registered control-tool roster is reachable exactly as MCP clients
 /// expect: `initialize`, `tools/list`, then `tools/call`.
 async fn handle_mcp_http_request(
     State(state): State<McpHttpState>,
@@ -3917,15 +3917,21 @@ async fn handle_mcp_http_request(
     let method = request.method.clone();
     let id = request.id.clone();
     let cx = state.request_cx();
-    match state.server.dispatch_request_concurrent(
-        &cx,
-        &state.session,
-        request,
-        &state.notification_sender,
-        &state.request_sender,
-    ) {
-        Some(message) => Json(message).into_response(),
-        None => {
+    // FastMCP dispatch and its session mutex are synchronous. Capture the
+    // caller's context before moving that work off the HTTP async worker.
+    match tokio::task::spawn_blocking(move || {
+        state.server.dispatch_request_concurrent(
+            &cx,
+            &state.session,
+            request,
+            &state.notification_sender,
+            &state.request_sender,
+        )
+    })
+    .await
+    {
+        Ok(Some(message)) => Json(message).into_response(),
+        Ok(None) => {
             if let Some(request_id) = id {
                 let (code, message) = if method == "initialize" {
                     (
@@ -3949,6 +3955,19 @@ async fn handle_mcp_http_request(
                 Json(err_response).into_response()
             } else {
                 StatusCode::ACCEPTED.into_response()
+            }
+        }
+        Err(error) => {
+            warn!(%error, "MCP HTTP dispatch task failed");
+            if let Some(request_id) = id {
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32603, "message": "MCP dispatch task failed"}
+                }))
+                .into_response()
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
     }
@@ -4491,7 +4510,16 @@ where
     T: Send,
 {
     std::thread::scope(|s| {
-        s.spawn(operation)
+        std::thread::Builder::new()
+            .name("scriptbots-mcp-control".to_owned())
+            .stack_size(CONTROL_RUNTIME_THREAD_STACK_BYTES)
+            .spawn_scoped(s, operation)
+            .map_err(|error| {
+                McpError::new(
+                    McpErrorCode::InternalError,
+                    format!("failed to spawn control operation thread: {error}"),
+                )
+            })?
             .join()
             .map_err(|panic| {
                 McpError::new(
@@ -5151,6 +5179,81 @@ mod tests {
                 .build()
                 .expect("MCP context runtime"),
         )
+    }
+
+    fn mcp_http_test_state(handle: ControlHandle) -> McpHttpState {
+        let server = Arc::new(
+            register_control_tools(ServerBuilder::new("http-dispatch-test", "0"), handle).build(),
+        );
+        let (notifications_tx, _) = tokio::sync::broadcast::channel(128);
+        McpHttpState {
+            session: Arc::new(Mutex::new(Session::new(
+                server.info().clone(),
+                server.capabilities().clone(),
+            ))),
+            server,
+            context_runtime: mcp_context_test_runtime(),
+            notification_sender: Arc::new(|_| {}),
+            request_sender: RequestSender::new(
+                Arc::new(PendingRequests::new()),
+                Arc::new(|_| Err("no outbound HTTP request channel".into())),
+            ),
+            notifications_tx,
+        }
+    }
+
+    #[test]
+    fn mcp_http_dispatch_preserves_caller_cancellation() {
+        use asupersync::cx::cap::None as NoCaps;
+        use asupersync::types::{Budget, CancelKind};
+
+        let (handle, _receiver) = handle();
+        let state = mcp_http_test_state(handle);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("MCP HTTP test runtime");
+        let initialize = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "http-dispatch-test", "version": "0"}}
+        }))
+        .expect("initialize request");
+        let initialized =
+            runtime.block_on(handle_mcp_http_request(State(state.clone()), Json(initialize)));
+        let initialized = runtime
+            .block_on(axum::body::to_bytes(initialized.into_body(), 16_384))
+            .expect("initialize body");
+        let initialized: Value = serde_json::from_slice(&initialized).expect("initialize JSON");
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
+
+        let owner = state.context_runtime.request_cx_with_budget(Budget::INFINITE);
+        let owner_guard = Cx::set_current(Some(owner.clone()));
+        {
+            let _restriction = owner.restrict::<NoCaps>().set_current_restricted();
+            let inherited = Cx::current().expect("restricted caller");
+            inherited.cancel_with(CancelKind::User, Some("cancel HTTP tool request"));
+            let call = serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "list_presets", "arguments": {}}
+            }))
+            .expect("cancelled request");
+            let response = runtime.block_on(handle_mcp_http_request(State(state), Json(call)));
+            let body = runtime
+                .block_on(axum::body::to_bytes(response.into_body(), 16_384))
+                .expect("cancelled response body");
+            let response: Value = serde_json::from_slice(&body).expect("cancelled response JSON");
+            assert_eq!(response["id"], 2);
+            assert!(response.get("error").is_some(), "{response}");
+            assert!(response.get("result").is_none(), "{response}");
+            let restored = Cx::current().expect("caller retained");
+            assert_eq!(restored.task_id(), inherited.task_id());
+            assert_eq!(restored.capabilities(), inherited.capabilities());
+            assert!(restored.checkpoint().is_err());
+        }
+        drop(owner_guard);
+        assert!(Cx::current().is_none(), "entry context restored");
     }
 
     #[test]
@@ -6029,6 +6132,7 @@ mod tests {
         let expected = TickSummaryDto::from(expected);
         let queued_handle = handle.clone();
         let websocket_handle = handle.clone();
+        let mcp_state = mcp_http_test_state(handle.clone());
         let state = ApiState {
             handle,
             scenario: None,
@@ -6080,38 +6184,59 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("blocking operation started");
 
-        let (queued, initial_wait, initial_read, websocket_wait, websocket_command, latest) =
-            runtime.block_on(async {
-                // This real queued operation must time out: otherwise the fixture
-                // never occupied the pool and cannot discriminate the old handlers.
-                let queued = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    run_control(move || queued_handle.latest_summary()),
-                )
-                .await;
-                let mut initial_read = tokio::spawn(get_latest_tick_summary(State(initial_state)));
-                let initial_wait =
-                    tokio::time::timeout(Duration::from_millis(100), &mut initial_read).await;
-                let mut websocket_command = tokio::spawn(apply_ws_control_message(
-                    websocket_handle,
-                    "pause".to_owned(),
-                ));
-                let websocket_wait =
-                    tokio::time::timeout(Duration::from_millis(100), &mut websocket_command).await;
-                let latest = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    get_latest_tick_summary(State(state)),
-                )
-                .await;
-                (
-                    queued,
-                    initial_wait,
-                    initial_read,
-                    websocket_wait,
-                    websocket_command,
-                    latest,
-                )
-            });
+        let (
+            queued,
+            initial_wait,
+            initial_read,
+            websocket_wait,
+            websocket_command,
+            mcp_wait,
+            mcp_request,
+            latest,
+        ) = runtime.block_on(async {
+            // This real queued operation must time out: otherwise the fixture
+            // never occupied the pool and cannot discriminate the old handlers.
+            let queued = tokio::time::timeout(
+                Duration::from_millis(100),
+                run_control(move || queued_handle.latest_summary()),
+            )
+            .await;
+            let mut initial_read = tokio::spawn(get_latest_tick_summary(State(initial_state)));
+            let initial_wait =
+                tokio::time::timeout(Duration::from_millis(100), &mut initial_read).await;
+            let mut websocket_command = tokio::spawn(apply_ws_control_message(
+                websocket_handle,
+                "pause".to_owned(),
+            ));
+            let websocket_wait =
+                tokio::time::timeout(Duration::from_millis(100), &mut websocket_command).await;
+            let initialize = serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "occupied-pool-test", "version": "0"}}
+            }))
+            .expect("MCP initialize request");
+            let mut mcp_request = tokio::spawn(handle_mcp_http_request(
+                State(mcp_state.clone()),
+                Json(initialize),
+            ));
+            let mcp_wait = tokio::time::timeout(Duration::from_millis(100), &mut mcp_request).await;
+            let latest = tokio::time::timeout(
+                Duration::from_secs(1),
+                get_latest_tick_summary(State(state)),
+            )
+            .await;
+            (
+                queued,
+                initial_wait,
+                initial_read,
+                websocket_wait,
+                websocket_command,
+                mcp_wait,
+                mcp_request,
+                latest,
+            )
+        });
 
         // Release before asserting so the old handlers fail without leaving
         // queued work or a blocked thread behind during runtime teardown.
@@ -6122,6 +6247,14 @@ mod tests {
             .expect("initial read task joined")
             .expect("initial summary handler")
             .0;
+        let mcp_response = runtime.block_on(mcp_request).expect("MCP task joined");
+        let mcp_body = runtime
+            .block_on(axum::body::to_bytes(mcp_response.into_body(), 16_384))
+            .expect("MCP response body");
+        let mcp_response: Value = serde_json::from_slice(&mcp_body).expect("MCP response JSON");
+        assert!(mcp_wait.is_err(), "MCP dispatch must use the occupied pool");
+        assert!(mcp_response.get("error").is_none(), "{mcp_response}");
+        assert_eq!(mcp_response["result"]["protocolVersion"], "2024-11-05");
         assert!(queued.is_err(), "the blocking pool was not occupied");
         assert!(
             initial_wait.is_err(),
@@ -6137,6 +6270,25 @@ mod tests {
             websocket_wait.is_err(),
             "WebSocket owner admission must use the occupied pool"
         );
+        let applied = owner.wait_applied(&receipt);
+        assert_eq!(applied.command_id, receipt.command_id);
+        let pause = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "pause", "arguments": {}}
+        }))
+        .expect("MCP pause request");
+        let pause_response = runtime.block_on(handle_mcp_http_request(State(mcp_state), Json(pause)));
+        let pause_body = runtime
+            .block_on(axum::body::to_bytes(pause_response.into_body(), 16_384))
+            .expect("MCP pause body");
+        let pause_response: Value = serde_json::from_slice(&pause_body).expect("MCP pause JSON");
+        assert!(pause_response.get("error").is_none(), "{pause_response}");
+        let receipt: CommandStatusDto = serde_json::from_str(
+            pause_response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP receipt text"),
+        )
+        .expect("MCP owner receipt");
         let applied = owner.wait_applied(&receipt);
         assert_eq!(applied.command_id, receipt.command_id);
         let summary = latest
