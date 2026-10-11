@@ -3346,18 +3346,19 @@ impl HostCore {
     ///
     /// Used by the owner when a checkpoint is requested from a host that will not reach
     /// another persistence boundary by itself. The identity comes from the same reserved
-    /// lifecycle namespace as shutdown, so it cannot collide with a client command.
+    /// lifecycle namespace as shutdown. Exhaustion is checked before submission so an
+    /// exhausted flush cannot consume the final shutdown identity or queue unreported work.
     pub fn request_persistence_flush(&mut self) -> Result<CommandStatus, HostAccessError> {
         loop {
             let sequence = self.next_lifecycle_command_sequence;
+            let advanced = sequence
+                .checked_add(1)
+                .ok_or_else(|| protocol_violation("lifecycle command sequence exhausted"))?;
             let candidate = CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence);
             let result = self.shared.borrow_mut().submit(
                 CommandEnvelope::new(candidate, HostCommand::FlushPersistence),
                 false,
             );
-            let advanced = sequence
-                .checked_add(1)
-                .ok_or_else(|| protocol_violation("lifecycle command sequence exhausted"))?;
             match result {
                 Ok(status) => {
                     self.next_lifecycle_command_sequence = advanced;
@@ -12880,6 +12881,87 @@ mod tests {
                 .expect("maximum lifecycle shutdown remains idempotent"),
             shutdown
         );
+    }
+
+    #[test]
+    fn lifecycle_flush_preserves_final_shutdown_identity_before_and_after_restore() {
+        for sequence in [u64::MAX - 1, u64::MAX] {
+            for restore in [false, true] {
+                let session_id = HostSessionId::new(sequence);
+                let mut core = HostCore::new(session_id, world(0), options(true))
+                    .expect("real owner near lifecycle exhaustion");
+                let mut port = core.local_port();
+                if sequence < u64::MAX {
+                    let flush = core
+                        .request_persistence_flush()
+                        .expect("penultimate lifecycle identity admits a flush");
+                    assert_eq!(
+                        flush.command_id(),
+                        CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, sequence)
+                    );
+                    assert!(matches!(flush.application(), ApplicationState::Admitted));
+                    assert_eq!(port.queue_depth(), 1);
+                    core.drive(ManualInstant::from_nanos(100)).unwrap();
+                    core.drive(ManualInstant::from_nanos(101)).unwrap();
+                    let settled = port.command_status(flush.command_id()).unwrap().unwrap();
+                    assert!(matches!(settled.application(), ApplicationState::Applied(_)));
+                    assert_eq!(settled.journal(), &JournalState::CommittedVolatile);
+                }
+                if restore {
+                    let checkpoint = core.capture_host_checkpoint_v1().unwrap();
+                    assert_eq!(checkpoint.state.next_lifecycle_command_sequence, u64::MAX);
+                    let wire = checkpoint.encode().unwrap();
+                    let decoded = HostCheckpointV1::decode(&wire).unwrap();
+                    assert_eq!(decoded.encode().unwrap(), wire);
+                    let world = decoded
+                        .restore_world(scriptbots_core::BrainRegistry::new())
+                        .unwrap();
+                    let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+                    core = HostCore::restore_host_checkpoint_v1(
+                        &decoded,
+                        world,
+                        persistence,
+                        core.journal,
+                        None,
+                        ManualInstant::from_nanos(101),
+                    )
+                    .expect("actual retained journal and restored advanced lifecycle cursor");
+                    port = core.local_port();
+                }
+                assert_eq!(core.next_lifecycle_command_sequence, u64::MAX);
+                let final_id =
+                    CommandId::from_client_sequence(LIFECYCLE_COMMAND_NAMESPACE, u64::MAX);
+                assert!(port.command_status(final_id).unwrap().is_none());
+                let snapshot = core.latest_snapshot();
+                let before = core.capture_host_checkpoint_v1().unwrap().encode().unwrap();
+                assert_eq!(
+                    core.request_persistence_flush(),
+                    Err(protocol_violation("lifecycle command sequence exhausted"))
+                );
+                assert_eq!(port.queue_depth(), 0);
+                assert!(port.command_status(final_id).unwrap().is_none());
+                assert_eq!(core.shared.borrow().pending_audit_count, 0);
+                assert!(Arc::ptr_eq(&snapshot, &core.latest_snapshot()));
+                assert_eq!(
+                    core.capture_host_checkpoint_v1().unwrap().encode().unwrap(),
+                    before
+                );
+
+                let shutdown = core
+                    .request_shutdown()
+                    .expect("the failed flush preserves the final shutdown identity");
+                assert_eq!(shutdown.command_id(), final_id);
+                assert!(matches!(shutdown.application(), ApplicationState::Admitted));
+                assert_eq!(core.request_shutdown().unwrap(), shutdown);
+                core.drive(ManualInstant::from_nanos(102)).unwrap();
+                core.drive(ManualInstant::from_nanos(103)).unwrap();
+                assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+                let settled = port.command_status(final_id).unwrap().unwrap();
+                assert!(matches!(settled.application(), ApplicationState::Applied(_)));
+                assert_eq!(settled.journal(), &JournalState::CommittedVolatile);
+                assert_eq!(core.world_tick(), Tick::zero());
+            }
+        }
     }
 
     #[test]
