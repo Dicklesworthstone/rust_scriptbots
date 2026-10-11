@@ -646,8 +646,84 @@ DSR/toolchain. The complete existing source bundle is verified and cloned direct
 clean `main` at `460517d7`/tree `64667134`; configuration validates. This different worker is
 not the quantitative-latency or performance comparison class. No cross-class improvement
 or resolution of the intermittent latency cause is claimed. Source, compiler settings,
-original verifier and deadline remain unchanged. Dependency transport is still preparing;
-this functional run has not launched yet.
+original verifier and deadline remain unchanged. R97 launches at 14:59:59 UTC, passes its
+source/tool identity guards, then refuses with exit two because the required DSR `config.yaml`
+is absent. No DSR build or compiler/test runs. Its log remains intact; the required minimal
+configuration and actual local Hz1 host declaration are added before a fresh version.
+
+R98 starts at 15:03:41 UTC and finishes at 15:12:50 UTC with outer exit six. Its original
+verifier records six successful preliminary steps, then Clippy exits 101 after Asupersync's
+compiler receives SIGKILL. The inner verdict is `failed`/1 with six completed steps;
+source/tool identities pass again afterward. Workspace check, runtime/terminal tests,
+analyzer build and the strict positive-evidence consumer are not reached. The worker kernel
+records global OOM kills, including `rustc` PID 2965365 at 15:11:45 UTC. This is a resource
+failure, not a successful compiler or terminal result. The complete bounded kernel log is
+retained with SHA256 `f6999fbc9caf284c556113823a3e0b5a49766847ac08aac5fed71265cfa603ad`.
+All 30 copied R97/R98 proof files, totaling 24,331,527 bytes, independently match the worker
+inventory SHA256 `390d8a99a1919492e042a71fd43ea55403f159c5b0fd091369c5677015d6e60b`.
+
+The installed runner snapshots the full supplied cache: its native call passes no lockfile
+selection argument, and the actual seed receipt has `selection: null`. The prior commentary's
+lockfile-scoped characterization is incorrect. Locked offline metadata still runs, but it
+does not make the copied cache lockfile-scoped. R98's receipt counts 167,608 seed files and
+6,167,098,873 content bytes; the materialized Cargo home occupies 10,074,898,432 disk bytes.
+Only 4,261,150,720 writable bytes remain after the run, so another fresh cache copy on Hz1
+would be inadmissible without authorized capacity recovery. No cache guard is weakened.
+The separately prepared Hz4 transport archive passes `gzip -t` and `tar --compare` against
+its original seed, with SHA256 `13bfe3c3cbf0e12f91e12fd75ebafeb6d8ab04d81b979f015e6c76dff2b9a182`;
+it remains preserved and was not consumed by R98.
+
+R99 starts at 15:19:08 UTC on Hz3 with clean `main` at the same `460517d7` source/tree,
+the same pinned installed DSR, original fourteen terminal gates, strict consumer, four
+compiler jobs and 7,200-second deadline. It reuses the existing bounded `seed-locked-r14`
+as a read-only cache source; DSR still creates a fresh private copy. Preflight observes
+238,074,636 KiB available memory, zero I/O PSI `avg10` and 14,811,746,304 writable
+bytes after source transport. Both transport hashes, source identity, shell syntax and
+configuration validate. Its existing `yq` is bound to its actually observed hash. The lane
+finishes at 15:38:37 UTC. All fourteen original command/log pairs pass, including strict
+workspace Clippy/check and the analyzer build. The runtime suite is 233/0/6, terminal units
+313/0/0, real E2E 5/0/0, smoke 8/0/0 and manifests 15/0/0: 574 executed passes, zero failures
+and the six original runtime ignores. The inner typed verdict is `pass`/0, `completed_steps=14`;
+the original strict evidence consumer and final source/tool identities pass. The analyzer's
+current build passes; this does not reconstruct the earlier missing-output cause.
+
+The actual file-backed palette Shutdown test now reaches all six live science routes, creates
+and reads back a tick-two checkpoint and a real three-tick MLP experiment, and observes external
+REST Step advancing tick one to two without terminal input. Its own Pending Shutdown receipt
+appears at raw-stream byte 49,455 and Durable at 50,858, before the alternate-screen leave prefix
+ends at 51,002. The decoded cells and native SQLite journal readback bind the same command
+`545549b3e6c6f95b0000000000000002` and session 8772911691718916443. Exit zero, restored terminal
+attributes/alternate screen/cursor and no retained capture modes are actually recorded. The
+normal truecolor/NO_COLOR sessions and three fault PTYs pass their unchanged original guards.
+Both normal sessions observe all six actual requested resize dimensions, matching presented
+cells and footer geometry, arrow bytes moving palette rows ten to eleven and back, and SGR
+mouse navigation to Lineages. Presentation changes preserve the paused owner: truecolor
+tick three/population 15/revision seven and NO_COLOR tick zero/population 20/revision three.
+Each profile's 75 accepted/12 rejected parser controls and six rejected stale-cell controls
+are explicitly synthetic controls. They are not live product failures. Truecolor records 193
+truecolor SGR sequences; NO_COLOR records zero. The actual panic, subscription and renderer
+fault PTYs each restore attributes, alternate screen and cursor, with no remaining capture modes.
+This is a fresh positive functional result on Hz3, not a causal repair of R94/R95 startup or
+R96 REST latency, and not a quantitative latency or hardware-rendering claim.
+
+The containing installed DSR refuses artifact collection because the extracted Proptest
+checkout's `README.md` is a linked entry; native and outer results remain `failed`/6 with no
+collected artifacts. No symlink guard, dependency, compiler setting, scenario, deadline or
+golden is weakened to hide that refusal. All 465 copied proof files, 33,061,648 bytes, match
+the independent worker inventory SHA256
+`36869f60352d3713452bc6c24de7963d5bc556fb61092f3736be466d19d31050` under
+`/data/tmp/scriptbots-terminal-hz3-20261010-lilacelm/r99-terminal-proof/`.
+The current-source inner terminal lane is complete; full containing qualification and original
+Bead closure remain open.
+
+R100 starts at 15:41:03 UTC on the same clean source, installed DSR and observed Hz3 class,
+after R99 releases the worker. Its original ten workspace gates retain the unfiltered full
+suite, explicit core `economy-faults`, analyzer, four compiler jobs and 7,200-second deadline.
+The same existing bounded seed supplies a fresh private Cargo home. Transport hashes, source/
+tool identities, shell syntax and configuration validate; preflight observes 8,282,374,144
+writable bytes. It is running; no full-workspace pass or resolution of the earlier catalog
+timeout is claimed. The required-class Hz2 quantitative lane and shared-reset conflict remain
+separate open constraints.
 
 The strict fast-forward at 12:51:53 UTC restores shared local `main` to `b38e7ffc`, tree
 `f5b0c89ef88f414ddca8309d11f53c383be1c4eb`. Its preflight observes clean tracked/index state,
@@ -1515,8 +1591,16 @@ as a working list when its original owners are fully qualified; retained evidenc
   Startup reaches the TUI, then the unchanged REST Step request times out. No causal fix.
 - [ ] Resolve the intermittent native latency's demonstrated cause without weakening limits;
   keep historical startup causes separate from R96's actually observed synchronization waits.
-- [ ] Finish R97 dependency transport and execute all fourteen original functional gates on
-  the independently observed Hz1 worker; preserve actual source, class and outer disposition.
+- [x] Finish Hz4's original seed archive and verify its complete gzip stream and source comparison.
+- [x] Execute R97/R98 on Hz1, preserve the missing-configuration refusal and actual OOM failure;
+  independently match all 30 proof files and correct the full-cache selection claim.
+- [x] Prepare and launch R99 with the existing bounded seed and warm Hz3 target; preserve all
+  fourteen original functional gates, source, compiler settings, limits and strict consumer.
+- [x] Finish R99: all fourteen inner gates/consumer and 574 tests pass; retain six original
+  ignores, the outer Proptest cache-link refusal and all 465 independently matched proof files.
+- [x] Prepare and launch R100 serially at the same source, preserving all ten original workspace
+  gates, full test roster, economy-faults, analyzer, build settings and deadline.
+- [ ] Finish R100 and retain its actual full-suite, feature/analyzer and outer results.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
   or changing compiler flags, original fourteen gates, deadlines or owner acceptance.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
@@ -1683,6 +1767,66 @@ as a working list when its original owners are fully qualified; retained evidenc
 Simulator presentation callbacks remain explicit injected branch observations. They do not
 prove terminal serialization or runtime-selected degradation. Real service and file-backed
 tests establish their named boundaries only after execution; source review is not execution.
+
+### Bounded anti-ceremony inventory — 2026-10-11, through 15:55 UTC
+
+Mechanical six-commit inventory: `b38e7ffc`, `c909e8d8`, `c6ed73b5`, `be8710e4`,
+`dd829e5f`, `eb85a33b` change only this report and tracker exports. USER=0, ENABLER=0,
+PROCESS=6, UNKNOWN=0. No new runtime code, gate, golden, issue or closure in this window.
+Project purpose remains the README's evolutionary agent simulation and usable Evolution Lab.
+
+Creation worksheet: this report and tracker cohort are PROCESS; running product code does
+not branch on them. The user explicitly requests a granular complete TODO and Beads updates.
+The concrete reader is that user reviewing the original terminal/checkpoint owners; the
+observed failures are lost shared-checkout changes and refused native artifact collection.
+The working checklist retires when its original owners are qualified; raw proof stays retained.
+For the proof copies, the actual loss mode is the repeated shared reset plus failed collection:
+preserving source and original artifacts is necessary at this scale, independent complete-file
+hash readback is the smallest reliable copy check, and a partial log is no cheaper equivalent.
+Highest-value current work is original live frontend/full-host acceptance, with R100 executing
+its full workspace consumer. Another hour of report machinery would add no runtime value.
+Verdict: retain only the requested TODO and minimal evidence, with no new audit framework.
+
+Real-work worksheet: (1) no new user feature ships in the six commits; the saved candidate now
+demonstrates real terminal checkpoint/MLP experiment/own Durable Shutdown in R99. (2) Omitting
+PROCESS changes no behavior, but loses requested TODO and failure provenance. (3) No speculative
+enabler is credited: the original fourteen-step verifier and strict evidence consumer actually
+execute successfully, while outer collection fails. (4) The oldest Evolution Lab/checkpoint
+goals remain unfinished; original acceptance, not new leaves, gets the next work block.
+(5) This window is solo, with no agent closes. (6) No original acceptance or dependency changes,
+follow-up laundering or spec edits stand in for implementation. Verdict: CAPTURED for the
+commit window. Correction to root: freeze new machinery and microcommit rounds; bank this
+cohort once, then finish R100 and work only on demonstrated product failures.
+
+Honesty inventory, bounded to those six commit path inventories, the current complete
+report/tracker diff, original profile diffs and actual R97–R100 records:
+1. No (checked: source/profile/verifier diffs); no tests, assertions or original gates removed.
+2. No (checked: live PTY/owner/SQL evidence); no new mock or substitute fixture.
+3. No (checked: complete changed paths); no golden regeneration.
+4. No (checked: original verifier hash and complete profile diffs); no source, compiler flags,
+   four-job budget, 7,200-second deadline, tolerance, suppression or cache guard relaxation.
+5. No (checked: all original fourteen/ten commands); no demo hardcoding or narrowed full suite.
+6. No (checked: all five completed terminal test summaries); 574 actual passes, six named ignores.
+7. Yes: earlier commentary called R98's cache lockfile-scoped. The installed native call passes
+   no lockfile argument and its receipt has `selection: null`; operator commentary, this report
+   and original-owner comment 2730 explicitly correct the claim. Locked metadata is separate.
+8. No (checked: raw cells, actual journal and explicitly synthetic parser controls); copied
+   artifacts are readback, not another live run; inner pass is not outer qualification.
+9. No (checked: complete current failure section); R97 refusal, R98 OOM and R99 outer failure stay.
+10. No (checked: retained launch/native/command logs); cited commands retain stderr and failures.
+11. No (checked: all 718 export records); original owners remain in progress, with no new issues.
+12. No (checked: complete export semantic diff); criteria, dependencies and prior comments remain.
+13–17. Not applicable: no dispatch, peer acceptance, agent close or agreement in this window.
+18. No (checked: original rosters and actual summaries); denominator fixed before outcomes.
+19. Yes: six PROCESS commits and repeated cache/build work produce no new feature or full
+   containing qualification. The operator is told; stop new machinery and finish original R100.
+20. Strongest evidence is source-pinned R99's real own Durable receipt before restoration,
+   actual journal readback, fourteen passing checks/strict consumer and 465 matched files.
+   Its original pinned profile is re-executable; the containing cache-link refusal remains red.
+No older-session CASS search is claimed. Disposition: the unsupported cache characterization
+is corrected and disclosed, with RH-2/PL-2 requiring observed producer and consumer evidence.
+The process drift is disclosed and countered by RH-4/SM-1: one cohort, no commit-count credit,
+and original user acceptance next. Neither correction grants capability or release credit.
 
 ### Bounded anti-ceremony inventory — 2026-10-11, 09:00–09:21 UTC
 
