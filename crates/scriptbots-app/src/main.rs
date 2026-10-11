@@ -8312,8 +8312,7 @@ mod tests {
             let continuation = prepare_bounded_host_continuation(&checkpoint, BrainPreset::Mlp);
             if opaque_factory {
                 let refusal = continuation
-                    .err()
-                    .expect("uncovered factory state cannot attest continuation");
+                    .expect_err("uncovered factory state cannot attest continuation");
                 assert!(
                     refusal
                         .to_string()
@@ -8368,8 +8367,7 @@ mod tests {
                 .expect("settled running owner permits a complete capture");
             assert!(!running.playback().paused);
             let refusal = prepare_bounded_host_continuation(&running, BrainPreset::Mlp)
-                .err()
-                .expect("bounded continuation must refuse actual running playback");
+                .expect_err("bounded continuation must refuse actual running playback");
             assert!(refusal.to_string().contains("paused host checkpoint"));
         }
     }
