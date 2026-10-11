@@ -8170,10 +8170,11 @@ mod tests {
             JournalState, ManualHostDriver, ManualInstant,
         };
 
-        for opaque_factory in [false, true] {
+        let recording_cases = [(0, false), (0, true), (2, false), (2, true)];
+        for (persistence_interval, opaque_factory) in recording_cases {
             let mut world = WorldState::new(ScriptBotsConfig {
                 rng_seed: Some(0x513c),
-                persistence_interval: 0,
+                persistence_interval,
                 population_minimum: scriptbots_app::SPREAD_FOUNDER_COUNT,
                 ..ScriptBotsConfig::default()
             })
@@ -8235,14 +8236,23 @@ mod tests {
                 );
             };
             settle(&mut core, command_id);
-            assert!(matches!(
-                core.capture_host_checkpoint_v1(),
-                Err(scriptbots_runtime::HostCheckpointError::World(
-                    scriptbots_core::WorldCheckpointError::DeferredHostOutput {
-                        field: "host.persistence_tail"
-                    }
-                ))
-            ));
+            let disabled_checkpoint = if persistence_interval == 0 {
+                Some(
+                    core.capture_host_checkpoint_v1()
+                        .expect("disabled recording discards its completed tick output")
+                        .world_checkpoint()
+                        .encode()
+                        .expect("disabled-recording science checkpoint encoding"),
+                )
+            } else {
+                assert!(matches!(
+                    core.capture_host_checkpoint_v1(),
+                    Err(scriptbots_runtime::HostCheckpointError::World(
+                        scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
+                    ))
+                ));
+                None
+            };
             let flush_id = core
                 .request_persistence_flush()
                 .expect("actual production flush admission")
@@ -8251,6 +8261,16 @@ mod tests {
             let checkpoint = core
                 .capture_host_checkpoint_v1()
                 .expect("actual complete host capture permits qualified coverage gaps");
+            if let Some(disabled_checkpoint) = disabled_checkpoint {
+                assert_eq!(
+                    checkpoint
+                        .world_checkpoint()
+                        .encode()
+                        .expect("post-flush science checkpoint encoding"),
+                    disabled_checkpoint,
+                    "disabled flush must not invent pending replay output or change science"
+                );
+            }
             let checkpoint =
                 HostCheckpointV1::decode(&checkpoint.encode().expect("actual artifact encoding"))
                     .expect("independent validated host decoding");

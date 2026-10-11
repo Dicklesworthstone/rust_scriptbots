@@ -28610,6 +28610,7 @@ impl WorldState {
             self.pending_lifecycle_birth_metrics.clear();
             self.pending_lifecycle_death_metrics.clear();
             self.replay_events.clear();
+            self.replay_world_digest_pending = false;
             self.narrative.drain_pending_persistence();
             self.pending_communication_metrics.clear();
             self.pending_birth_events = 0;

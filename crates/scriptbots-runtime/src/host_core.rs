@@ -5351,7 +5351,9 @@ impl HostCore {
         // The flushed boundary is the state a checkpoint captures, and a paused run may be
         // shut down at this very tick, leaving shutdown nothing to project. Anchor the
         // canonical digest here so replay verification still has a final state to compare.
-        self.world.request_replay_world_digest();
+        if self.world.config().persistence_interval != 0 {
+            self.world.request_replay_world_digest();
+        }
         let persistence = match self.persistence.stage_final_batch(&mut self.world) {
             Ok(persistence) => persistence,
             Err(error) => {

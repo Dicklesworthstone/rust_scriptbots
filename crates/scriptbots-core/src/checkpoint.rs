@@ -3479,6 +3479,50 @@ mod tests {
         registry
     }
 
+    #[test]
+    fn requested_replay_anchor_blocks_host_capture_until_recording_boundary_resolves() {
+        for persistence_interval in [0, 1] {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                persistence_interval,
+                ..checkpoint_config()
+            })
+            .expect("actual empty boundary-control world");
+            assert!(world.config.replay_event_tick_cap > 0);
+            world.request_replay_world_digest();
+            assert!(world.replay_world_digest_pending);
+            let science = world
+                .capture_checkpoint_quiescent()
+                .expect("pending anchor is outside the science-only checkpoint");
+            assert!(matches!(
+                world.capture_host_continuity_v1(&science),
+                Err(WorldCheckpointError::DeferredHostOutput {
+                    field: "host.persistence_tail"
+                })
+            ));
+            let mut session = world
+                .bind_persistence(Box::new(crate::NullPersistence))
+                .expect("production null persistence boundary");
+            session
+                .step(&mut world)
+                .expect("actual completed recording boundary");
+            assert!(!world.replay_world_digest_pending);
+            assert_eq!(
+                world.persistence_discarded_records_at,
+                (persistence_interval == 0).then_some(Tick(1))
+            );
+            let science = world
+                .capture_checkpoint_quiescent()
+                .expect("completed science boundary");
+            let continuity = world
+                .capture_host_continuity_v1(&science)
+                .expect("completed boundary resolves the requested anchor");
+            assert_eq!(
+                continuity.persistence_discarded_records_at(),
+                world.persistence_discarded_records_at
+            );
+        }
+    }
+
     fn assert_host_auxiliary_state_equal(original: &WorldState, restored: &WorldState) {
         assert_eq!(restored.archive, original.archive);
         assert_eq!(restored.novelty_state, original.novelty_state);
