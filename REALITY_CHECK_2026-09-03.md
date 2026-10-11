@@ -16,7 +16,7 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-The preserved candidate's latest Rust source is `a03bcdbf5ba3a1734db84addef5b3e76c713c1f9`.
+The preserved candidate's latest Rust source is `66ac7ed1780b68305c5662b40cfe2c4921a090f7`.
 It is isolated at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
 resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. It includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
@@ -30,8 +30,9 @@ The isolated successor corrects that lifecycle and adds real enabled/disabled bo
 R77 runs the exact failed case and new core control first, then retains all ten original gates.
 Both discriminating preludes and all seven initial checks pass at `159fe99d`; the complete
 workspace/feature/persistence/CLI acceptance remains unfinished. The original checkpoint owner
-remains in progress. The latest source adds an artifact-scoped guarantee writer; its native
-qualification is pending and immutable ordinary launch manifests remain false. Original R61/R67 deadlines were
+remains in progress. R83 executes the artifact-scoped guarantee writer and real MLP continuation;
+the current source also adds an actual public-report uncovered-factory negative, still awaiting
+execution. Immutable ordinary launch manifests remain false. Original R61/R67 deadlines were
 not extended. Both expired process groups were retired on October 11; their original runners
 reported timeout with outer exit six. The new workspace run retains all ten original gates.
 
@@ -405,7 +406,43 @@ runtime cases, app/real SQL preludes and fourteen terminal gates. Formatting and
 preludes subsequently pass, one executed test each with zero ignores. The schedule case now
 observes all four valid capacities, all 32 rehashed mutation refusals, continuation through the
 last patch/exhausted queue, actual allocation equality and unchanged complete checkpoint bytes.
-The app/E2E/14-gate acceptance and current-source qualification remain pending.
+R83's nonempty four-cell app preflight also passes, one executed test, zero ignores, 5.43 seconds.
+The real full-host SQL continuation passes once with zero ignores in 163.07 seconds: its public
+retained-artifact guarantee is true, while the immutable ordinary launch manifest remains false.
+The original corrupt/truncated-prefix refusals and first-stage divergence assertions remain.
+Root independently matches the completed app and E2E log hashes locally and remotely:
+`d4f21aa0d76be8bdc549c174be0436c7cfeafe27669a5d4177b67ddc544f19da` and
+`d62010fb3c846c4ddf1124f02db5109eff30696aba97d962825dc448001cc3c4`.
+The original terminal roster then stops at strict Clippy: six preceding checks pass, two test
+assertions using `err().expect()` fail linting. Inner verdict is failed/1 with six completed
+steps; outer exit is six at 09:54:58 UTC. Runtime/terminal whole suites, PTY, smoke and final
+consumer do not execute in this run. Exact `expect_err()` repairs preserve the typed refusals.
+
+The new real CLI/SQL negative at `c14e255b` uses the existing Mixed registry with actual enabled
+Neuroflow factory state. It requires a retained artifact whose public guarantee is false, names
+the uncovered family from its declaration, matches the independently read payload/digest/three
+watermarks, refuses continuation and leaves all science/journal prefixes unchanged. It uses no
+mock or new dependency and preserves every existing replay test. Static UBS finds zero critical
+heuristics, 373 warnings and 23 informational findings; native execution remains pending.
+
+R77 finishes at its original 7,200-second deadline, outer failed/six at 09:48:59 UTC. Its 34
+completed Rust summaries total 942 passes, zero failures and seven ignores, but the original
+scenario-catalog cohort never completes. No inner verdict is emitted and the feature lane and
+analyzer remain unreached. The installed DSR source also changes externally from `bf0543ec` to
+`84d139ea` while R77 runs, so its final pinned-runner custody is unqualified. The complete
+catalog denominator is six scenarios, thirteen seeds and twenty-six runs; the four observed
+meadow launches cannot substitute for that denominator. No catalog source or deadline changes.
+
+R84 at `0512350f` stops on exactly three formatting hunks before any tests; outer exit six at
+10:08:28 UTC. The manual layout corrections are banked at `66ac7ed1`/tree
+`e780d87cfe3eb56733382c7a3dd46f3a9258df4c`. Fresh source-pinned R86 workspace starts at
+10:12:16 UTC on Hz3; R85 terminal starts at 10:12:42 UTC on Hz2. Both bind the actual clean
+installed DSR `84d139ea` and its executable hashes. R85 retains all fourteen original gates;
+R86 frontloads the whole economy-faults and five-test replay suites, then retains all ten
+original workspace gates and original timeout. A named executed fault-mutation test is required,
+so an absent feature suite cannot look green. These running profiles are diagnostic execution,
+not full private-DSR qualification or an anticipated acceptance pass. Current source qualification
+and both original owners remain open.
 
 R72 finishes at the unchanged coordinator deadline: native typed timeout/5, outer failed/6,
 07:45:09 UTC, 7,207 seconds. The baseline completes all 139 original files with 68 passes,
@@ -1175,12 +1212,12 @@ as a working list when its original owners are fully qualified; retained evidenc
   review, scan and bank the reconstructed correction at `159fe99d` without changing shared main.
 - [x] Prepare, transport, verify and launch R77 at the exact isolated source with two discriminating
   preludes and all ten unchanged original workspace gates.
-- [ ] Finish the original R77 workspace gates and fix actual failures
-  without narrowing acceptance or extending the original deadline.
+- [x] Retain R77's original deadline timeout and the external runner-source change; distinguish
+  its 942 actual passes from its uncompleted catalog, feature and analyzer gates.
 - [x] Observe both R77 discriminating preludes, formatting, all-target workspace check and
   strict Clippy passing at `159fe99d`; independently copy/hash both native test logs.
-- [ ] Finish R77's original full workspace tests, economy-faults lane and analyzer build;
-  preserve typed inner/outer results and every actual failure or unexecuted case.
+- [ ] Complete the original workspace tests, economy-faults lane and analyzer at the successor;
+  diagnose the actual catalog delay without narrowing acceptance or extending its deadline.
 - [x] Observe the exact-source real seeded analytics test and independently copy/hash its
   completed manifest; retain its explicit unproved scientific/search/export cases.
 - [x] Prepare, transport, verify and launch the original fourteen-gate terminal lane R78
@@ -1195,8 +1232,11 @@ as a working list when its original owners are fully qualified; retained evidenc
   corruption/truncation/first-stage-divergence controls and ordinary replay/bundle E2Es passing.
 - [x] Correct running Deadline/journal-maintenance capture starvation and add the retained-artifact
   guarantee writer with real prepared-world reconstruction; bank source at `a4b8b5ec` after scans.
-- [ ] Execute the four exact runtime cases, new actual preflight controls and original real SQL
-  continuation E2E at the current source; retain typed positive/negative claim observations.
+- [x] Execute the four exact runtime cases, nonempty preflight controls and original real SQL
+  continuation E2E at `a03bcdbf`; retain the actual artifact-scoped positive and unit refusals.
+- [x] Add the real public-report Mixed/Neuroflow uncovered-factory refusal and unchanged-prefix
+  control, scan it, preserve the original replay suite and bank its source.
+- [ ] Execute that public negative with the full original replay suite at `66ac7ed1`.
 - [x] Retain R80's actual two-hunk formatting failure with zero executed tests, apply exactly
   its whitespace changes at `f781e392`, scan/review and prepare fresh pinned R81.
 - [x] Retain R81's actual capture-case pass and schedule-case journal refusal; independently
@@ -1211,6 +1251,9 @@ as a working list when its original owners are fully qualified; retained evidenc
   add direct capacity observation, scan/review and launch source-pinned R83.
 - [x] Independently verify all 77 copied completed R77 full-host proof files and compute actual
   stage/boundary/session equality, divergent digests and unchanged negative database prefixes.
+- [x] Retain R83's six passing preludes and original Clippy failure; bank its exact typed-error
+  repair, apply the three native R84 formatting hunks and launch pinned R85/R86.
+- [ ] Independently verify the copied R83 full-host artifacts and original command-log hashes.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
   qualified successor, including actual PTY, smoke, manifest and outer collection disposition.
 - [ ] Re-run the original ten workspace gates at the final source, including full tests,
