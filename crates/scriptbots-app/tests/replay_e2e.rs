@@ -1523,7 +1523,9 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
             .into_iter()
             .find(|record| record.checkpoint_id == "uncovered-factory-cut")
             .expect("exact reported checkpoint exists");
-        let checkpoint = record.host_checkpoint().expect("decode real mixed artifact");
+        let checkpoint = record
+            .host_checkpoint()
+            .expect("decode real mixed artifact");
         assert_eq!(checkpoint.tick().0, 1);
         assert!(checkpoint.world_checkpoint().agent_count() >= HOST_MINIMUM_POPULATION);
         let digest = checkpoint.world_checkpoint().source_digest();
@@ -1560,7 +1562,11 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
             "mixed",
         );
         assert!(!refused.status.success());
-        let text = strip_ansi(&format!("{}{}", stdout_text(&refused), stderr_text(&refused)));
+        let text = strip_ansi(&format!(
+            "{}{}",
+            stdout_text(&refused),
+            stderr_text(&refused)
+        ));
         assert!(text.contains("uncovered-factory-cut"));
         assert!(text.contains("complete evaluator and factory state"));
         let after = host_database_prefix(&database);

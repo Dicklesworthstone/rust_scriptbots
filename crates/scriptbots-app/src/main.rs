@@ -8311,8 +8311,8 @@ mod tests {
             assert_eq!(boundary.factory_state_covered, !opaque_factory);
             let continuation = prepare_bounded_host_continuation(&checkpoint, BrainPreset::Mlp);
             if opaque_factory {
-                let refusal = continuation
-                    .expect_err("uncovered factory state cannot attest continuation");
+                let refusal =
+                    continuation.expect_err("uncovered factory state cannot attest continuation");
                 assert!(
                     refusal
                         .to_string()
