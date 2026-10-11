@@ -493,8 +493,6 @@ async function resetSimulation(populationOverride) {
     ...defaults,
     seed,
     population: populationOverride,
-    world_width: defaults.world_width ?? 1280,
-    world_height: defaults.world_height ?? 720,
   };
 
   simHandle = init_sim(options);

@@ -534,12 +534,25 @@ async function runTests() {
               || reset.tick !== initial.tick || reset.summary.agentCount !== options.population) {
             throw new Error("Packaged init/snapshot/tick/reset did not preserve their public contracts");
           }
+          let invalidGeometryError = null;
+          try {
+            const invalid = wasm.init_sim({ ...options, world_width: initial.world.width + 1 });
+            invalid.free();
+            throw new Error("Packaged initialization admitted invalid food-grid geometry");
+          } catch (error) {
+            invalidGeometryError = error.message;
+            if (!invalidGeometryError.includes("failed to initialize ScriptBots world state")
+                || !invalidGeometryError.includes("world_width must be divisible by food_cell_size")) {
+              throw error;
+            }
+          }
           return {
             package: { name: manifest.name, version: manifest.version, exports: manifest.exports },
             options, steps,
             initial: { tick: initial.tick, summary: initial.summary, agentCount: initial.agents.length },
             advanced: { tick: advanced.tick, summary: advanced.summary, agentCount: advanced.agents.length },
             reset: { tick: reset.tick, summary: reset.summary, agentCount: reset.agents.length },
+            invalidGeometryError,
           };
         } finally {
           handle.free();

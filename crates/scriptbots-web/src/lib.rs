@@ -592,7 +592,7 @@ fn normalize_seed(seed: Option<f64>) -> Result<Option<u64>> {
 fn js_error(err: impl std::fmt::Display) -> JsValue {
     #[cfg(target_arch = "wasm32")]
     {
-        JsError::new(&err.to_string()).into()
+        JsError::new(&format!("{err:#}")).into()
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
