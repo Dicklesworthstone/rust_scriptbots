@@ -16,18 +16,47 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-Latest source is `fbe5618e6218f3ffb27ba9a28eb1c6f137569b40`. It includes the full-owner
+Latest Rust source is `d4e243c9bfaa1bcc953c6bada5a530f5d4ed333f`. It includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
 discarded-history/sealed-boundary corrections, pre-admission lifecycle exhaustion handling,
 and an owner-derived completed schedule cursor that survives bounded outcome-history eviction.
 The combined feature has not compiled or executed to completion. The original checkpoint owner
-remains in progress and its public
-guarantee remains false. R61 and R67 are suspended pending explicit permission for existing
-test-fixture cleanup. Their original wall-clock deadlines have elapsed; neither has a final
-verdict. Fresh read-only checks at 00:42:17/18 UTC confirm the original boot/start-time, UID,
-parent and session identities, with all nine R67 and four R61 group members still stopped.
-Their timeout anchors show 9,718 and 14,002 elapsed seconds against the unchanged 7,200-second
-wall-clock limits. No process is resumed or terminated. Detailed failures and remaining tasks follow.
+remains in progress and its public guarantee remains false. Original R61/R67 deadlines were
+not extended. Both expired process groups were retired on October 11; their original runners
+reported timeout with outer exit six. The new workspace run retains all ten original gates.
+
+The user's reply following the explicit cleanup-scope permission request said: "OK, so please
+do everything you think is advisable based on all of that" and "OK, please do ALL of that now."
+Root treated that contextual affirmative as authorization for the original runners' disposable
+test fixtures and staging files in isolated build directories. This does not authorize repository
+file, retained database or proof-log deletion, or retroactively authorize earlier deviations.
+Immediately before signaling, root verified the original boot IDs, start ticks, UID 1000,
+parents, sessions and every stopped group member. Exact commands on Hz3 at 05:29:02 UTC were
+`kill -TERM -- -1794371` and `kill -CONT -- -1794371`; on Hz2 at 05:29:03 UTC they were
+`kill -TERM -- -1898814` and `kill -CONT -- -1898814`. Subsequent process listings contain no
+members of either group. The original launchers exit six at 05:29:03 and 05:29:11 respectively;
+all prior raw evidence remains. No manual file deletion or unrelated process signal was issued.
+Retirement logs remain in each existing worker root as `retirement-r67-20261011T0530Z.log`
+and `retirement-r61-20261011T0530Z.log`.
+
+R69 ran the original workspace lane at clean `4c5dbda1` through the installed DSR. It fails
+formatting: typed failed/1, zero completed steps, outer DSR failed/6, zero compiled/executed
+tests. The complete proof is copied to the existing Hz3 root under
+`proofs/workspace-diagnostic-20261011-checkpoint-r69-hz3/`; formatting log SHA256 is
+`44c0f8fad2a6ef8d7d18afcaba59615cf731f8a8d8d0c9a0a778872b18a02c51`.
+`d4e243c9` applies exactly its ten formatter hunks in the existing owner file. Root reads the
+entire frozen diff; whitespace and the formatter's removed trailing comma are the only token
+changes. Static UBS exits zero with 0 critical, 1,638 warnings and 203 informational findings;
+all twelve logged Python temporary paths remain present. Native phases are disabled. Source
+SHA256 is `2d98436815f6339e9b1fabb4440035d279822822ef165b1f64483410f292dc98`;
+logs use prefix `/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/format-r69-20261011T0537Z`.
+
+Fresh R70 is source-bound to `d4e243c9`/tree `4907fe768cc4a2c487bf9cd3c515eacabcc1b0dd`.
+Its clean independent clone, bundle, profile and launcher pass transport hashes and configuration
+validation before launch. The unchanged workspace verifier, ten-gate roster, four-job limit and
+7,200-second timeout remain. Formatting, FrankenSQLite pin and license checks are observed zero
+by 05:39:56 UTC; remaining native checks are pending. Installed DSR remains a diagnostic runner:
+these results do not qualify the private tool candidate or complete Host continuation.
 
 At 02:52 UTC, a conflict-free strict fast-forward restored saved `0879e176` after external
 resets to `7c9264a1` at 01:37 and 01:38 UTC. Beads import changed zero rows; both authoritative
@@ -57,7 +86,8 @@ The final one-file static UBS scan for `fbe5618e` exits zero: zero critical, 1,6
 All twelve logged created Python temporary paths remain present. Logs use prefix
 `/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/schedule-cursor-final-20261011T0308Z`;
 actual execution is 03:03:55–03:04:03 UTC. No new compiler, formatter, Clippy or test result
-exists, and no original Bead closes. Cleanup permission remains unanswered.
+exists at that earlier bank, and no original Bead closes. The later authorization and native
+results are recorded above.
 
 The October 11 source review found that `request_persistence_flush` submits real work before
 checking lifecycle sequence exhaustion. At `u64::MAX`, it queues the flush and advances admission/
@@ -472,7 +502,8 @@ use no override. R67's five command/log hashes match and the partial compiler lo
 R61's ten completed case rows match both channel hashes. Neither copy contains a final verdict.
 Original wall-clock timeouts continue to elapse during suspension; no deadline is extended.
 
-The focused R68 logger diagnostic is fully reviewed but not transported or launched. Its
+At the October 10 preparation boundary, the focused R68 logger diagnostic was reviewed but
+not transported or launched. Its
 204-line profile and 56-line launcher parse statically and bind the live old/new source pins,
 all original sixteen logger tests, six added child/PTY controls, warning-level ShellCheck and
 an identical exported-child command with baseline-failure/candidate-success assertions.
@@ -480,6 +511,34 @@ It explicitly leaves packaging unexecuted and complete tool acceptance open. Log
 still replaces its generated latest symlink, so fixture authorization also gates this run.
 Profile SHA256 is `c8b886bdaa399139488452603d5e996ed61f1a470f0928db04f10ac76e6f05d6`;
 launcher SHA256 is `0df59eeae5d163f0a7596c822e53da84ca6b5943e550e386f8d4d7fef9b46998`.
+
+On October 11, R68's launcher refuses the installed runner's shallow-history guard before DSR
+execution. A fetch of the pinned complete clone supplies history without changing installed
+HEAD, tree or source files. The subsequent fresh-log launch runs the original sixteen logger
+tests successfully, then fails its prepared observer: the exact old exported-child command
+returns 127 with `info: unbound variable`, empty stdout and no JSON log, where the observer
+expected one. Both refusals and raw outputs remain. R71 corrects that expected failure code
+and pins the observed Bash executable SHA256
+`3efccc187bafa75ff1e37d246270ab3e7aa559f242c7a52bf3ec2a1b5450bdbd`.
+Before, this observer admits code one and rejects 127; after, it admits 127 only with the exact
+cause/empty-output/absent-log checks and rejects one. Candidate success still requires zero,
+exact stderr, a single complete structured record and all original tests. This changes a
+diagnostic observation of a failing incumbent, not an original release or performance gate.
+
+R71 observes baseline 16/16 and candidate 22/22, including the six actual exported-child/PTY
+controls. Its identical old/new child command returns the above baseline failure and candidate
+zero with the exact structured record. Typed `logger_diagnostic_pass` and outer collection exit
+zero are observed at 05:40:48 UTC. This is focused source qualification, not packaged/full DSR
+or Host qualification; the collected entry point is unchanged. The archive
+`/data/tmp/scriptbots-logger-hz1-20261010-lilacelm/logger-native-r68-r71-20261011T0545Z.tar`
+retains both actual diagnostic runs and symlinks: SHA256
+`d35821b1d5c4465d4a1c196391cdc1b9b32a9ca4c86caed6e70883542bdb241a`.
+Local readback verifies all 77/108 declared artifact entries and all 35/40 command-channel
+hashes. R71 verdict SHA256 is `fb91d95e3024601342d638bb933ea770e59792af69888771909af14f5b33cb4e`.
+The first recursive SCP returns one on dangling fixture links; its partial copy is preserved,
+and the hash-verified tar retains the links without following them. R72 now executes the
+original fifteen-case roster and both full tool suites at `f5a62141`. Baseline failures remain
+failures; no roster, predicate, timeout or suite is removed to obtain a pass.
 
 Three recent UBS runs actually removed their temporary shadow directories automatically:
 `tmp.v68Cs6oybA`, `tmp.a8nEeMgMF1`, and the agent SARIF run's `tmp.zC1ebuHD9C`. This violates the
@@ -708,6 +767,20 @@ as a working list when its original owners are fully qualified; retained evidenc
   and pending/volatile/durable cursor assertions in the existing protocol fault test.
 - [x] Execute the final one-file static UBS scan with native phases disabled and retain all
   twelve logged temporary paths; report the 1,638 warnings without claiming a clean-warning pass.
+- [x] Record the contextual cleanup authorization, verify all owned process identities and retire
+  expired R61/R67 groups; retain their original timeout results and raw evidence.
+- [x] Run fresh R69 at the saved clean source and preserve its actual formatter failure.
+- [x] Apply only the ten native formatter hunks, review and bank `d4e243c9`, and retain the actual
+  static scan with its twelve observed temporary paths.
+- [x] Prepare, transport, verify and launch fresh R70 with the unchanged original workspace gates.
+- [ ] Finish R70, read every actual failure, and fix source before another uniquely pinned run.
+- [x] Execute the original logger diagnostic, preserve the R68 observer failure and qualify
+  only the actual 16/22-case logger scope through R71 with pinned Bash and exact child controls.
+- [x] Preserve and read back all 77/108 logger artifact entries and 35/40 raw command hashes.
+- [x] Launch R72 at the saved logger/cache successor with all fifteen original cases and both
+  full original tool suites; preserve incumbent failures and every suite disposition.
+- [ ] Complete the original full-tool acceptance and record the actual pass/fail/skip evidence;
+  do not upgrade a focused logger pass to full DSR or project qualification.
 - [ ] Execute the new schedule checkpoint regression and unchanged bounded-history/fault tests
   at `fbe5618e` or its reviewed successor through the original native DSR acceptance.
 - [ ] Independently observe the actual valid-suffix/corrupt-gap admission split and native
