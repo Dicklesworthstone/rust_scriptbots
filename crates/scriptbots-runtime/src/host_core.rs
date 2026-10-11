@@ -6323,7 +6323,19 @@ mod tests {
 
     #[test]
     fn full_host_checkpoint_continues_evicted_schedule_history_and_rejects_rehashed_gaps() {
-        for capacity in [0, 1, 2, 3, 4] {
+        let mut invalid_options = options(true);
+        invalid_options.archived_command_capacity = 0;
+        let invalid_owner = HostCore::new(
+            HostSessionId::new(0xc01c),
+            continuation_world(),
+            invalid_options,
+        );
+        assert!(matches!(
+            invalid_owner,
+            Err(HostCoreBuildError::InvalidOptions { message })
+                if message == "archived_command_capacity must be nonzero"
+        ));
+        for capacity in [1, 2, 3, 4] {
             let make_owner = || {
                 let mut host_options = options(true);
                 host_options.archived_command_capacity = capacity;
@@ -6448,7 +6460,10 @@ mod tests {
         let config = oracle.world.config().clone();
         let mut enabled = config.clone();
         enabled.persistence_interval = 1;
-        enabled.food_max *= 0.9;
+        enabled.food_max *= 1.1;
+        enabled
+            .validate()
+            .expect("valid config must reach the discarded-history application guard");
         let enable = CommandEnvelope::new(
             CommandId::new(2),
             HostCommand::UpdateConfig(Box::new(enabled)),
@@ -13066,6 +13081,12 @@ mod tests {
                 let session_id = HostSessionId::new(sequence);
                 let mut core = HostCore::new(session_id, world(0), options(true))
                     .expect("real owner near lifecycle exhaustion");
+                assert!(core.journal.continuation_cut().is_none());
+                settle_continuation_command(
+                    &mut core,
+                    CommandEnvelope::new(CommandId::new(1), HostCommand::Pause),
+                    1,
+                );
                 let mut port = core.local_port();
                 if sequence < u64::MAX {
                     let flush = core
@@ -13096,6 +13117,7 @@ mod tests {
                         .restore_world(scriptbots_core::BrainRegistry::new())
                         .unwrap();
                     let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+                    assert_eq!(core.journal.continuation_cut(), Some(decoded.journal_cut()));
                     core = HostCore::restore_host_checkpoint_v1(
                         &decoded,
                         world,

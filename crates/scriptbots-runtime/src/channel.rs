@@ -1473,13 +1473,6 @@ impl ChannelHostDriver {
             // science credit. A full-speed host would otherwise create another journal batch
             // on every receipt poll and never expose its actual settled checkpoint cut.
             let observed = self.host.last_observed().unwrap_or(now);
-            if now < observed {
-                return Err(NativeScheduleError::ClockMovedBackwards {
-                    previous: observed.as_nanos(),
-                    observed: now.as_nanos(),
-                }
-                .into());
-            }
             self.host
                 .drive_at(observed, NativeDriveTrigger::Maintenance)?;
             return Ok(true);
@@ -1520,6 +1513,17 @@ impl ChannelHostDriver {
                 drove: false,
                 interest: HostDriveInterest::Terminated,
             });
+        }
+        // Reject a regressing observation before ingress or a maintenance deadline can
+        // change owner state or skip the native driver's clock validation.
+        if let Some(previous) = self.host.last_observed()
+            && now < previous
+        {
+            return Err(NativeScheduleError::ClockMovedBackwards {
+                previous: previous.as_nanos(),
+                observed: now.as_nanos(),
+            }
+            .into());
         }
         let admission_before = self.host.core().admission_cursor();
         self.drain_ingress();
@@ -2007,6 +2011,9 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         let pending_tick = driver.host().core().world_tick();
+        let pending_admission = driver.host().core().admission_cursor();
+        let pending_snapshot = driver.host().core().latest_snapshot();
+        let pending_retry = driver.journal_retry_at;
         assert!(matches!(
             driver.step(ManualInstant::from_nanos(9)),
             Err(ChannelDriveError::Schedule(
@@ -2014,6 +2021,26 @@ mod tests {
             ))
         ));
         assert_eq!(driver.host().core().world_tick(), pending_tick);
+        assert_eq!(driver.host().core().admission_cursor(), pending_admission);
+        assert!(Arc::ptr_eq(
+            &pending_snapshot,
+            &driver.host().core().latest_snapshot()
+        ));
+        assert!(matches!(
+            driver.host().core().capture_host_checkpoint_v1(),
+            Err(HostCheckpointError::Busy {
+                reason: crate::HostCheckpointBusy::Journal,
+            })
+        ));
+        assert_eq!(driver.journal_retry_at, pending_retry);
+        assert_eq!(
+            driver.host().last_observed(),
+            Some(ManualInstant::from_nanos(10))
+        );
+        assert!(matches!(
+            capture.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
         let settled = driver
             .step(ManualInstant::from_nanos(1_000_000))
             .expect("poll the real receipt without new automatic credit");
