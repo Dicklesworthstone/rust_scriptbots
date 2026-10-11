@@ -5219,8 +5219,10 @@ mod tests {
                 "clientInfo": {"name": "http-dispatch-test", "version": "0"}}
         }))
         .expect("initialize request");
-        let initialized =
-            runtime.block_on(handle_mcp_http_request(State(state.clone()), Json(initialize)));
+        let initialized = runtime.block_on(handle_mcp_http_request(
+            State(state.clone()),
+            Json(initialize),
+        ));
         let initialized = runtime
             .block_on(axum::body::to_bytes(initialized.into_body(), 16_384))
             .expect("initialize body");
@@ -5228,7 +5230,9 @@ mod tests {
         assert!(initialized.get("error").is_none(), "{initialized}");
         assert_eq!(initialized["result"]["protocolVersion"], "2024-11-05");
 
-        let owner = state.context_runtime.request_cx_with_budget(Budget::INFINITE);
+        let owner = state
+            .context_runtime
+            .request_cx_with_budget(Budget::INFINITE);
         let owner_guard = Cx::set_current(Some(owner.clone()));
         {
             let _restriction = owner.restrict::<NoCaps>().set_current_restricted();
@@ -6277,7 +6281,8 @@ mod tests {
             "params": {"name": "pause", "arguments": {}}
         }))
         .expect("MCP pause request");
-        let pause_response = runtime.block_on(handle_mcp_http_request(State(mcp_state), Json(pause)));
+        let pause_response =
+            runtime.block_on(handle_mcp_http_request(State(mcp_state), Json(pause)));
         let pause_body = runtime
             .block_on(axum::body::to_bytes(pause_response.into_body(), 16_384))
             .expect("MCP pause body");
