@@ -1654,15 +1654,11 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Run a world-lock-taking control operation on the blocking thread pool.
+/// Run a waiting or CPU-heavy control operation on the blocking thread pool.
 ///
-/// Every `ControlHandle` read or mutation may contend on the world mutex with
-/// the simulation driver, which holds it for a full scientific tick at a time.
-/// Calling such an operation directly from a handler parks a tokio async
-/// worker on a blocking lock; with one slow tick and `num_cpus` concurrent
-/// clients the entire control plane (REST, Swagger, and MCP) freezes (bd-134).
-/// A parked blocking-pool thread is cheap and bounded; a parked async worker
-/// is the event loop.
+/// Command admission, database reads and rasterization must not park an async
+/// worker. Bounded reads of immutable host publications run directly so they
+/// remain available when unrelated blocking operations occupy the pool.
 async fn run_control<T, F>(operation: F) -> Result<T, AppError>
 where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
@@ -1709,7 +1705,7 @@ async fn get_config(State(state): State<ApiState>) -> Result<Json<ConfigSnapshot
 async fn get_latest_tick_summary(
     State(state): State<ApiState>,
 ) -> Result<Json<TickSummaryDto>, AppError> {
-    let summary = run_control(move || state.handle.latest_summary()).await?;
+    let summary = state.handle.latest_summary().map_err(AppError::from)?;
     Ok(Json(summary.into()))
 }
 
@@ -1993,9 +1989,7 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let handle_clone = handle.clone();
-                let summary_res = tokio::task::spawn_blocking(move || handle_clone.latest_summary()).await;
-                if let Ok(Ok(summary)) = summary_res {
+                if let Ok(summary) = handle.latest_summary() {
                     let dto = TickSummaryDto::from(summary);
                     if let Ok(bytes) = postcard::to_stdvec(&dto)
                         && socket.send(WsMessage::Binary(bytes.into())).await.is_err()
@@ -2120,8 +2114,7 @@ async fn screenshot_ascii(State(state): State<ApiState>) -> Result<Response, App
     )
 )]
 async fn screenshot_png(State(state): State<ApiState>) -> Result<Response, AppError> {
-    // Rasterization is CPU-heavy on top of the lock acquisition, so the whole
-    // operation belongs on the blocking pool (bd-134).
+    // Rasterization is CPU-heavy even though capture reads an immutable publication.
     let bytes = run_control(move || state.handle.snapshot_png(1024, 576)).await?;
     Ok((StatusCode::OK, axum::body::Bytes::from(bytes)).into_response())
 }
@@ -5987,6 +5980,77 @@ mod tests {
         .await
         .expect("get_interventions with after_seq");
         assert!(!poll_seq.gap_detected);
+    }
+
+    #[test]
+    fn published_latest_tick_does_not_wait_for_the_blocking_pool() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("published read world");
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("nonempty published population");
+        world.step().expect("completed scientific tick");
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let handle = owner.handle();
+        let expected = handle.latest_summary().expect("published summary");
+        assert_eq!(expected.tick.0, 1);
+        assert_eq!(expected.agent_count, 1);
+        let expected = TickSummaryDto::from(expected);
+        let queued_handle = handle.clone();
+        let state = ApiState {
+            handle,
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("one-slot blocking pool");
+        let (entered, started) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::channel();
+        let occupied = runtime.spawn_blocking(move || {
+            entered.send(()).expect("occupied blocking slot");
+            wait.recv().expect("release blocking slot");
+        });
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking operation started");
+
+        let (queued, latest) = runtime.block_on(async {
+            // This real queued operation must time out: otherwise the fixture
+            // never occupied the pool and cannot discriminate the old handlers.
+            let queued = tokio::time::timeout(
+                Duration::from_millis(100),
+                run_control(move || queued_handle.latest_summary()),
+            )
+            .await;
+            let latest = tokio::time::timeout(
+                Duration::from_secs(1),
+                get_latest_tick_summary(State(state)),
+            )
+            .await;
+            (queued, latest)
+        });
+
+        // Release before asserting so the old handlers fail without leaving
+        // queued work or a blocked thread behind during runtime teardown.
+        release.send(()).expect("release unrelated blocking work");
+        runtime.block_on(occupied).expect("blocking work joined");
+        assert!(queued.is_err(), "the blocking pool was not occupied");
+        let summary = latest
+            .expect("published summary must bypass the occupied pool")
+            .expect("latest summary handler")
+            .0;
+        assert_eq!(summary, expected);
     }
 
     #[test]

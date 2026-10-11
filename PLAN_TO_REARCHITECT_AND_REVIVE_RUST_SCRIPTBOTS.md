@@ -414,6 +414,16 @@ pending; neither an initial population nor requested ×8 establishes sustained m
 Retain same-invocation baseline/loaded TPS, raw histograms and actual machine/source identities;
 no latency result has been observed yet.]
 
+[Currently In Progress — `bd-g6wf` / reopened `bd-134`, LilacElm, 2026-10-11: R92 at clean
+`460517d7` executes on its original Hz2 machine class: 200 successful requests, p95 1.547823 ms,
+32 attached SSE clients, but throughput degradation 16.629247% fails the unchanged 10% bound.
+Complete workspace acceptance remains open. The isolated successor removes the blocking-pool
+hop from latest-summary and WebSocket single-tick publication reads. SSE/NDJSON history
+serialization stays on the blocking pool. A real occupied-pool regression checks that the
+old queued latest-summary read waits while the actual REST handler returns the full published
+summary from a nonempty tick-one world. Preserve all original latency/load/science criteria; source changes remain
+natively unqualified until their pinned DSR compiler, lint, formatting and test gates run.]
+
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
 
 **Persistence decision (2026-07-11):** FrankenSQLite is the only embedded database backend. The former DuckDB architecture is retired in full; no dual-backend abstraction, compatibility shim, or legacy file migration is retained. The migration is complete only when source, manifests, lockfile, tests, CLI/help, CI, and active documentation all use the exact-revision `fsqlite` public facade and a repository-wide search finds no live DuckDB integration.
