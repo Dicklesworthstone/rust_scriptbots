@@ -349,8 +349,8 @@ fn assert_host_handoff_readback(
         scriptbots_brain::MlpBrain::KIND.as_str()
     );
     let manifest = reader.run_manifest().expect("actual stored provenance");
-    let launch: scriptbots_app::RunManifestV3 =
-        serde_json::from_str(&manifest.manifest_json).expect("independent immutable launch provenance");
+    let launch: scriptbots_app::RunManifestV3 = serde_json::from_str(&manifest.manifest_json)
+        .expect("independent immutable launch provenance");
     assert!(!launch.limitations.checkpoint_replay_guarantee);
     assert_eq!(report["run_id"], manifest.run_id.to_string());
     assert_eq!(manifest.root_seed, SEED);
