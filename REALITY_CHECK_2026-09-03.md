@@ -1,6 +1,6 @@
-# Reality Check — rust_scriptbots — reassessed 2026-10-10
+# Reality Check — rust_scriptbots — reassessed 2026-10-11
 
-## Current assessment — 2026-10-10
+## Current assessment — 2026-10-11
 
 **This is a substantial deterministic simulator with real control, persistence, replay and
 research machinery. It is still an unfinished Evolution Lab. The remaining gap is the complete
@@ -8,7 +8,7 @@ user journey: a useful live frontend, a responsive durable run, a trustworthy co
 qualified scientific results and an independently verifiable release. The cinematic hardware-GPU
 meadow and durable browser laboratory also remain unfinished.**
 
-### Current implementation and granular TODO — 2026-10-10
+### Current implementation and granular TODO — 2026-10-11
 
 The source changes through saved commit `c37ea6ebf3bfacd5ba0fb780584318940ce3e786`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
@@ -16,12 +16,37 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-Latest source is `58b7a7c25e97d9ec64f02ce9138b10c71f1da929`. It includes the full-owner
+Latest source is `cf246e4f68cfacdf7b7971d16626c58ec141a6ac`. It includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
-and discarded-history/sealed-boundary corrections. The combined feature has not compiled or
-executed to completion. The original checkpoint owner remains in progress and its public
+discarded-history/sealed-boundary corrections and pre-admission lifecycle exhaustion handling.
+The combined feature has not compiled or executed to completion. The original checkpoint owner
+remains in progress and its public
 guarantee remains false. R61 and R67 are suspended pending explicit permission for existing
-test-fixture cleanup; the detailed failures, process identities and remaining tasks follow.
+test-fixture cleanup. Their original wall-clock deadlines have elapsed; neither has a final
+verdict. Fresh read-only checks at 00:42:17/18 UTC confirm the original boot/start-time, UID,
+parent and session identities, with all nine R67 and four R61 group members still stopped.
+Their timeout anchors show 9,718 and 14,002 elapsed seconds against the unchanged 7,200-second
+wall-clock limits. No process is resumed or terminated. Detailed failures and remaining tasks follow.
+
+The October 11 source review found that `request_persistence_flush` submits real work before
+checking lifecycle sequence exhaustion. At `u64::MAX`, it queues the flush and advances admission/
+audit state, then returns an error. `cf246e4f` moves that check before submission, preserving the
+unused final identity for orderly shutdown. The existing maximum-sequence shutdown test stays
+unchanged. One new four-case test source uses actual fresh/restored owners and the production
+volatile journal: a penultimate flush must apply with CommittedVolatile evidence, an exhausted
+flush must leave the entire encoded checkpoint unchanged, and the final shutdown must complete.
+The restored penultimate case captures an actually advanced allocator, so a constructor-default
+restore would fail. This source has not compiled or run; it makes no file-durability claim.
+
+The final one-file static UBS scan exits zero with zero critical, 1,591 warning and 200
+informational findings. The exact input hash before and after is
+`e2b7cf7e8a80a7eb7598c3edd4868b9b3bd87435f748b7a81fbb2e5f967d1c0d`.
+All twelve logged created Python temporary paths are observed present after exit. This scan
+uses no Cargo phase and is neither a clean-warning nor native qualification result. Its first
+command was blocked before execution for dynamic truncating redirection; literal append-only
+logging implements the safety hook's stated alternative without an override. Raw scanner logs
+remain under `/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/`, with prefix
+`lifecycle-flush-final-20261011T0040Z`; the observed execution is 00:38:58–00:39:06 UTC.
 
 R24 is bound to `c4011d523af99a4c380619af43faa3a321102a2d`, before the latest file-backed
 receipt and pending-presentation changes. Formatting, four integration guards, exact ftui
@@ -559,8 +584,9 @@ as a working list when its original owners are fully qualified; retained evidenc
   successor; leave the active R60 source and descriptor immutable.
 - [x] Scan, independently review and bank the minimal successor as private `7161c7fc`;
   review the complete R61 descriptor without changing test timeouts or warning gates.
-- [ ] Execute fresh source-pinned R61 validation; require all fifteen case exits, both
-  unfiltered original 139-file suites, exact typed pass and actually collected artifacts.
+- [ ] Complete the original R61 acceptance in a fresh source-pinned successor; require all
+  fifteen case exits, both unfiltered original 139-file suites, exact typed pass and actually
+  collected artifacts.
   ShellCheck still examines every runtime-derived original input at warning severity, now
   one file per invocation with each actual command, source hash and exit retained.
 - [ ] Read back all emitted successor proof bytes, authentic fixture identity and actual suite
@@ -607,8 +633,9 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Fix the actual missing checkpoint serialization derives in the existing core enum;
   bank the reviewed one-line source fix separately at `6de19f8b` after its required static scan.
 - [x] Verify the incremental source bundle and complete R67 readiness before a fresh launch.
-- [ ] Read R67's actual compiler/test outcomes through the unchanged ten workspace gates;
-  repair further concrete failures and keep final capability qualification separate.
+- [ ] Retain R67's incomplete compiler observation and expired original wall-clock deadline.
+  After fixture authorization, retire the exact owned group and use a fresh final-source
+  invocation of the unchanged ten workspace gates; do not extend or qualify the suspended run.
 - [x] Identify the actual discarded-history marker loss and boundary/admission-cursor mismatch
   against production setters, restore and later recording/arrival consumers.
 - [x] Finish and review the minimal full-owner marker/coherence fix; preserve the valid sealed,
@@ -625,6 +652,15 @@ as a working list when its original owners are fully qualified; retained evidenc
   existing packaging/full-suite acceptance. Leave its profile unlaunched pending authorization.
 - [ ] Resolve fixture-cleanup authorization before resuming or launching those dependent tests;
   keep current suspended work, prior cleanup deviations, original deadlines and failures visible.
+- [x] Trace lifecycle allocation through the actual submit/admission/audit consumer and correct
+  the exhausted flush's admitted-before-error behavior in place at `cf246e4f`.
+- [x] Add fresh/restored final-sequence refusal, actual penultimate flush and final Shutdown
+  regression source; restore the advanced allocator rather than just the constructor value.
+- [x] Read every frozen source hunk, run the required static scan and observe its exact input
+  identity and twelve retained created Python paths. Bank source without report/tracker changes.
+- [ ] Compile and execute the lifecycle regression at the final source pin, retaining actual
+  application/journal outcomes. Finish workspace check, strict Clippy, formatting, core
+  fault-feature tests and the original CLI-to-FrankenSQLite continuation acceptance.
 - [x] Acquire the persistence binding before mutating recording settings or the gap marker.
 - [ ] Implement and qualify full Host/session continuation: command/event counters, deadlines,
   configuration revisions, deduplication, journal prefixes, audit and persistence watermarks.
@@ -1027,6 +1063,72 @@ Their phrases alone do not establish misconduct: the viewed older closure names 
 profile-authoring acceptance and leaves full qualification open. This is a bounded history check,
 not a comprehensive clearance of older sessions. No archive index or model is installed.
 This inventory lives in the explicitly requested report and adds no recurring process system.
+
+October 11 bounded work-block audit — 00:30 UTC through the separate source/report/tracker banks.
+The README's purpose is an evolutionary simulator and usable Evolution Lab. The actual new
+source bank is `cf246e4f` (USER candidate: lifecycle admission correctness); the requested report
+and tracker banks are PROCESS. Tally: USER=1, ENABLER=0, PROCESS=2, UNKNOWN=0. These are work
+classifications, not newly qualified capability. No new agent is dispatched and no Bead closes.
+
+Real-work questions: (1) Nothing new is demonstrated natively; the source candidate prevents an
+exhausted flush from consuming the real shutdown identity. (2) Omitting this report/tracker work
+would change no runtime behavior; it would lose the explicitly requested TODO and truthful
+handoff. (3) No enabler is added or claimed exercised. (4) The longstanding Evolution Lab goal
+`bd-2z0` and its full checkpoint journey remain unfinished; this block corrects an observed
+continuation-owner defect while cleanup-dependent acceptance is held. (5) Solo block; no agent
+close count or farming claim applies. (6) No plan/spec change replaces implementation and no
+follow-up transfers original acceptance. Verdict: DRIFTING across the larger continuation,
+because qualified deliverables remain flat. Correction: freeze new process machinery; finish
+the original exact-source native acceptance after the pending fixture decision, and fix only
+observed product defects rather than manufacture another readiness system.
+
+Process creation gate for this update: code does not branch on the report. The concrete consumer
+is the user who requested a detailed complete TODO and reality check; that request gates this
+handoff and records the observed admitted-before-error defect plus incomplete qualification.
+The active checklist retires when its original owners satisfy their unchanged acceptance; the
+historical evidence can remain. This in-place update adds no separate certificate or service.
+The highest-priority ready capability is fallible GPU rendering (`bd-2z0.7.11`); the selected
+active continuation cohort remains the nearer unfinished end-to-end boundary. An hour on
+either implementation beats another process artifact. The integrity-control exception is not
+needed: the user's explicit request passes the creation gate. Verdict: minimum requested update only.
+
+October 11 honesty inventory, bounded to this block and its new frozen source diff:
+
+1. No (checked: the complete source diff); all original tests remain, with one added real-owner test.
+2. No (checked: new test construction); production HostCore, VolatileJournal and NullPersistence
+   are used, with no new substitute and no claim of file-backed durability.
+3. No (checked: the frozen path list); no golden or baseline changes.
+4. No (checked: the entire code diff and unchanged verifier); no gate, suppression, budget,
+   tolerance, timeout or test roster changes. Static-only scanning is explicitly labelled.
+5. No (checked: the allocator and actual submit consumers); no benchmark special case or fabricated
+   success path. The guard precedes the real side effect.
+6. No (checked: scanner output and held native state); no zero-run suite receives green credit.
+7. No (checked: command exits and logs); new tests, Cargo check, Clippy and formatting are unrun.
+8. No (checked: the current assessment); reviewed source and static evidence are not runtime proof.
+9. No (checked: the revised front section); previous real failures, absent verdicts and the
+   elapsed suspended-run deadlines remain explicit. The full owner is not called finished.
+10. No (checked: scanner stderr and the rejected command); diagnostics remain in raw logs and
+    the safety-hook rejection is disclosed before the permitted append-only alternative.
+11. No (checked: owner status and unchanged original acceptance); no closure or new follow-up.
+12. No (checked: TODO diff and original owner criteria); requirements remain unchanged.
+13. No (checked: current dispatch and tracker changes); no agent or peer closure occurs.
+14. No (checked: this block's dispatch record); there is no new delegation.
+15. No (checked: source author and frozen review); no new agent report is accepted. Root's
+    own review is not independent execution evidence.
+16. No (checked: open owner status); a refusal fix does not close the positive continuation goal.
+17. No (checked: claims in this update); no agent agreement is counted as proof.
+18. No (checked: the scan's one-file input and unchanged native rosters); no denominator changes.
+19. Yes: the larger continuation still has unqualified source and prior unauthorized temporary
+    cleanup. Both stay disclosed above. The new scan retains its twelve observed created Python
+    paths; native cleanup-dependent work remains held and old deadlines are not reset. No cleanup
+    violation is undone or retroactively authorized. This block creates no further tool framework.
+20. Strongest new evidence is the exact reviewed patch and unchanged input hash across the real
+    static scan. A skeptic can re-execute the added four-case test, but that execution is pending.
+
+Disposition: incomplete implementation and prior cleanup violations remain disclosed; the original
+owners stay open. Proof-class inflation, zero-run green, close pumping and machinery drift remain
+the named countermeasures. The prior bounded CASS history check is retained; no new history sweep
+or comprehensive clearance is claimed. Native qualification is the next substantive deliverable.
 
 This refresh supersedes the October 8 assessment where current source or later retained evidence
 differs. The October 9 implementation and failure records below remain intact. In particular,
