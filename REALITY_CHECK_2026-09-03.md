@@ -16,9 +16,11 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-The preserved candidate's latest source is `460517d7631bd1c123836182996e0d4dfb43c0ef`.
-It is isolated at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
-resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. It includes the full-owner
+The preserved candidate's latest product source is `460517d7631bd1c123836182996e0d4dfb43c0ef`.
+It remains backed up at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
+resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. At 12:51:53 UTC a
+conflict-free strict fast-forward restores reviewed `b38e7ffc` to shared local `main`; no push
+occurs. That restores the implementation, not an overall qualification claim. It includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
 discarded-history/sealed-boundary corrections, pre-admission lifecycle exhaustion handling,
 and an owner-derived completed schedule cursor that survives bounded outcome-history eviction.
@@ -486,7 +488,18 @@ files, 89,863,878 bytes, match the worker inventory
 Complete traces, cut prefix, final boundaries and current artifact guarantees are separately
 read back. Three actual manifests report complete embedded provenance, clean `main` and
 source `66ac7ed1`; ordinary launch guarantees remain false. All seven original initial
-workspace checks pass, including check and strict Clippy; full workspace tests are running.
+workspace checks pass, including check and strict Clippy. R87 reaches the unchanged two-hour
+deadline and finishes at 12:23:40 UTC with native timeout/5 and outer failed/6. The retained
+workspace test log independently hash-matches
+`29825ca19df1d4c608fc0a95f813a5e613fae04af52a04b3c1a9a2efcbfdac65`.
+Its 34 completed suite summaries record 942 passes, zero failures and seven existing ignores;
+that count excludes the separate economy prelude and does not describe an entire workspace pass.
+Both completed meadow/seed-42 catalog runs reach tick 360 and digest `c74a8e5b4214409f`, with
+40 births, four deaths and six admitted/applied memory batches each. Only two of the original
+26 catalog runs complete. Their increasing payload/row counts cannot establish a fixed-volume
+storage scaling defect. Three ordinary control-plane fixture tests pass, including the actual
+minimum-zero versus minimum-1,000 death/refill control, split SSE records and published status
+while the owner is parked. The quantitative latency test remains explicitly ignored.
 These are diagnostic source observations, not final workspace or private-DSR qualification.
 
 R88 browser starts at 10:39:17 UTC on the released Hz2 worker, launcher PID 595087, with
@@ -544,12 +557,34 @@ invented. All 23 copied proof files, 8,070,756 bytes, match inventory
 `ca6e40df80830122d817630a69fa8458f38c33057f25921eaac06e00befa0af7`;
 all seven command-log hashes match. No cache, retained database or proof file is deleted.
 
-R93 is prepared to execute the same original fourteen terminal gates and strict consumer on
-Hz4, whose observed filesystem has 123 GB available. Source, verifier, compiler flags, jobs,
-deadline and installed DSR identity remain pinned; the profile changes only worker/path/run
-identities and omits the already executed diagnostic preludes, which are outside those gates.
+R93 starts at 12:29:28 UTC on Hz4 and stops before compilation at 12:30:23 UTC: SBH cannot
+protect the task-owned target directory because it does not yet exist. Native build exit two
+and outer failed/six are retained; no project test result is inferred. The completed launcher
+is preserved, the absent directory is created, and R94 uses a fresh run version with that
+prerequisite checked before launch. The original profile is unchanged, SHA256
+`c19b34475164c5f40f657b4e48a0e921e1b65f36911d5485806d45f99a8cf4f8`;
+the updated launcher is `2c0dc17982d0ba385bb69f39421a90313cb5984520017970b9e25a717b627602`.
+Source, verifier, compiler flags, four jobs, 7,200-second deadline and installed DSR identity
+remain pinned. R94 retains all fourteen original terminal gates and their strict consumer;
+its first six checks pass and workspace Clippy is compiling at 12:59 UTC. No final verdict is
+anticipated.
+
+The strict fast-forward at 12:51:53 UTC restores shared local `main` to `b38e7ffc`, tree
+`f5b0c89ef88f414ddca8309d11f53c383be1c4eb`. Its preflight observes clean tracked/index state,
+the exact expected base, no removed paths and no foreign reservation conflicts. All four
+existing untracked directories remain. Beads import creates zero issues, updates three,
+skips 715 and removes zero orphans; both authoritative exports remain byte-identical at
+SHA256 `2d400e7af51ce3feb85ccd90e40bf2d892e7ebd3a87ceb318e1f8edec8b7b564`.
+The graph has zero cycles and reports healthy synchronization. The original owners remain
+in progress; native final qualification and the coordinated publication hold remain open.
+
 The quantitative latency lane remains unexecuted on its required Hz2 class while that
-filesystem is full. No cross-class substitute or performance improvement is claimed.
+filesystem is full. Its two completed R90/R91 private cache copies are preserved in
+`/data/tmp/scriptbots-terminal-hz2-20261010-lilacelm/completed-cache-r90-r91-20261011T1240Z.tar.gz`,
+3,567,011,030 bytes, SHA256 `6a0c0aa57276c90333658b8f24f2d76eee072fffe34578866ba324522a3c2caf`.
+The independent archive copy matches and worker `tar --compare` against both originals exits
+zero at 12:46:52 UTC. The exact cache-deletion permission question is pending; no deletion
+is performed. No cross-class substitute or performance improvement is claimed.
 
 R72 finishes at the unchanged coordinator deadline: native typed timeout/5, outer failed/6,
 07:45:09 UTC, 7,207 seconds. The baseline completes all 139 original files with 68 passes,
@@ -1388,16 +1423,19 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Retain R90's successful analyzer/storage preludes and explicit disk-exhaustion failure;
   preserve its empty verdict, invalid outer receipt and all seven command-log hashes.
 - [x] Prepare the original fourteen terminal gates on Hz4 without deleting existing files.
-- [ ] Execute R93 at the clean pinned successor; retain all original gates, strict consumer
-  and actual outer disposition. Resolve any product failure at its original named guard.
+- [x] Execute R93 at the clean pinned successor and retain its pre-compilation missing-target
+  refusal; preserve the completed launcher and create the task-owned prerequisite directory.
+- [ ] Finish R94 with all fourteen original gates, strict consumer and actual outer disposition.
+  Resolve any product failure at its original named guard.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
   or changing compiler flags, original fourteen gates, deadlines or owner acceptance.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
   qualified successor, including actual PTY, smoke, manifest and outer collection disposition.
 - [ ] Re-run the original ten workspace gates at the final source, including full tests,
   economy-faults and analyzer build; keep original owner acceptance/dependencies unchanged.
-- [ ] Resolve the external-reset intent and integrate only a reviewed, qualified continuation;
-  preserve all prior source, failures, original acceptance and independent shared-tree changes.
+- [x] Restore the reviewed implementation to shared local `main` by strict fast-forward after
+  exact-base, clean tracked/index and foreign-reservation checks; retain isolated recovery.
+  External-reset intent is unanswered, qualification remains incomplete and no push occurs.
 - [x] Execute the original logger diagnostic, preserve the R68 observer failure and qualify
   only the actual 16/22-case logger scope through R71 with pinned Bash and exact child controls.
 - [x] Preserve and read back all 77/108 logger artifact entries and 35/40 raw command hashes.
@@ -1506,14 +1544,19 @@ as a working list when its original owners are fully qualified; retained evidenc
   phase populations. The original 1-ns period and bounded catch-up remain; requested ×8 does
   not establish eightfold observed throughput. Static scan exits zero with zero critical,
   61 warning and 36 informational findings, triaged before the frozen source commit.
-- [ ] Execute the two-case production death/refill control: 1,000 actual deaths with minimum
+- [x] Execute the two-case production death/refill control: 1,000 actual deaths with minimum
   zero must leave zero agents; minimum 1,000 must leave 1,000. A numerical latency pass after
-  population collapse does not qualify the original active-load premise.
+  population collapse does not qualify the original active-load premise. R87 observes the
+  named control passing at `66ac7ed1`; quantitative boundary observations remain owed.
 - [ ] Retain all raw latency samples, declared versus actual timing denominators, and observed
   phase-boundary populations, host health and playback; require the actual minimum at every
   measured boundary and qualify replenishment through the real death/refill control.
 - [x] Review the minimal external source-pinned latency DSR profile, original-bound reader,
   typed manifest/verdict assertion and actual installed native machine/toolchain identity.
+- [x] Preserve both completed private cache copies in a byte-verified independent archive
+  before proposing exact cleanup to reclaim the latency host's exhausted filesystem.
+- [ ] Obtain the required explicit cache-deletion authorization and confirm its exact scope;
+  retain source, databases, proof logs, seed and build outputs. Do not infer consent from time.
 - [ ] Retarget the held latency profile to the exact terminal/workspace-qualified source.
 - [ ] Execute the exact ignored 1,000-agent test after terminal/workspace qualification releases
   the worker; retain the original 2× available-parallelism SSE load and unchanged bounds.
