@@ -8206,32 +8206,48 @@ mod tests {
             let command_id = CommandId::new(1);
             port.submit(CommandEnvelope::new(command_id, HostCommand::Step))
                 .expect("actual Step admission");
-            let mut settled = false;
-            for _ in 0..64 {
-                core.drive(ManualInstant::from_nanos(0))
-                    .expect("bounded deterministic owner progress");
-                let status = port
-                    .command_status(command_id)
-                    .expect("actual journal observation")
-                    .expect("admitted Step retains its exact identity");
-                assert!(
-                    !matches!(
-                        status.application(),
-                        ApplicationState::Rejected(_) | ApplicationState::Failed(_)
-                    ),
-                    "actual Step failed: {status:?}"
-                );
-                if matches!(status.application(), ApplicationState::Applied(_))
-                    && matches!(status.journal(), JournalState::CommittedVolatile)
-                {
-                    settled = true;
-                    break;
+            let mut settle = |core: &mut HostCore, command_id: CommandId| {
+                let mut settled = false;
+                for _ in 0..64 {
+                    core.drive(ManualInstant::from_nanos(0))
+                        .expect("bounded deterministic owner progress");
+                    let status = port
+                        .command_status(command_id)
+                        .expect("actual journal observation")
+                        .expect("admitted command retains its exact identity");
+                    assert!(
+                        !matches!(
+                            status.application(),
+                            ApplicationState::Rejected(_) | ApplicationState::Failed(_)
+                        ),
+                        "actual command failed: {status:?}"
+                    );
+                    if matches!(status.application(), ApplicationState::Applied(_))
+                        && matches!(status.journal(), JournalState::CommittedVolatile)
+                    {
+                        settled = true;
+                        break;
+                    }
                 }
-            }
-            assert!(
-                settled,
-                "the real owner must settle before artifact capture"
-            );
+                assert!(
+                    settled,
+                    "the real owner must settle before artifact capture"
+                );
+            };
+            settle(&mut core, command_id);
+            assert!(matches!(
+                core.capture_host_checkpoint_v1(),
+                Err(scriptbots_runtime::HostCheckpointError::World(
+                    scriptbots_core::WorldCheckpointError::DeferredHostOutput {
+                        field: "host.persistence_tail"
+                    }
+                ))
+            ));
+            let flush_id = core
+                .request_persistence_flush()
+                .expect("actual production flush admission")
+                .command_id();
+            settle(&mut core, flush_id);
             let checkpoint = core
                 .capture_host_checkpoint_v1()
                 .expect("actual complete host capture permits qualified coverage gaps");
