@@ -16,11 +16,15 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-Latest Rust source is `d4e243c9bfaa1bcc953c6bada5a530f5d4ed333f`. It includes the full-owner
+Latest Rust source is `1a0f283ea46e22acf1e9640766a3b2e7fbf0c74f`. It includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
 discarded-history/sealed-boundary corrections, pre-admission lifecycle exhaustion handling,
 and an owner-derived completed schedule cursor that survives bounded outcome-history eviction.
-The combined feature has not compiled or executed to completion. The original checkpoint owner
+R75 observes formatting, all-target workspace compilation and strict workspace Clippy passing
+at `0a8be911`, then fails one new comparison-fixture test after 833 actual passes. The reviewed
+successor settles the real owner flush before capture and preserves the original comparison
+criteria. R76 runs that exact case first and retains all ten original workspace gates.
+Execution of the new acceptance tests remains incomplete. The original checkpoint owner
 remains in progress and its public guarantee remains false. Original R61/R67 deadlines were
 not extended. Both expired process groups were retired on October 11; their original runners
 reported timeout with outer exit six. The new workspace run retains all ten original gates.
@@ -51,12 +55,105 @@ all twelve logged Python temporary paths remain present. Native phases are disab
 SHA256 is `2d98436815f6339e9b1fabb4440035d279822822ef165b1f64483410f292dc98`;
 logs use prefix `/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/format-r69-20261011T0537Z`.
 
-Fresh R70 is source-bound to `d4e243c9`/tree `4907fe768cc4a2c487bf9cd3c515eacabcc1b0dd`.
+R70 is source-bound to `d4e243c9`/tree `4907fe768cc4a2c487bf9cd3c515eacabcc1b0dd`.
 Its clean independent clone, bundle, profile and launcher pass transport hashes and configuration
 validation before launch. The unchanged workspace verifier, ten-gate roster, four-job limit and
-7,200-second timeout remain. Formatting, FrankenSQLite pin and license checks are observed zero
-by 05:39:56 UTC; remaining native checks are pending. Installed DSR remains a diagnostic runner:
-these results do not qualify the private tool candidate or complete Host continuation.
+7,200-second timeout remain. Its first five checks pass, then the all-target workspace check
+returns 101: E0599 at `main.rs:8211`, where an existing real-owner comparison test calls the
+production trait method `HostCore::drive` without importing `ManualHostDriver`. Typed failed/1
+has five completed steps; outer DSR exits six at 05:46:48 UTC. Clippy and tests are not reached.
+The complete proof is copied under the same existing root's
+`proofs/workspace-diagnostic-20261011-checkpoint-r70-hz3/`; compiler log SHA256 is
+`f1862b793d557cc94542f3f9d8d126edafa296c1bbb027dcd085eee6b1a5c6b9`.
+
+`fa521238` adds that single missing trait to the existing test's local import group. No assertion
+or implementation changes. Root reads the full frozen hunk. Static UBS remains exit one:
+four critical heuristic matches, 683 warnings and 343 informational findings. The critical
+data flows are reread: three executable values are the process's `std::env::current_exe()`;
+the fourth comparison is the test's public application-state string. These unchanged sites
+were already disclosed in the earlier source scan. No finding is suppressed or called a clean
+pass. All twelve logged Python temporary paths remain present, with native phases disabled.
+Source SHA256 is `765623097e8767c348539b9fa72bc2ca945179b8052b3d64f59f0a5c664de981`;
+logs use prefix `/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/host-driver-import-20261011T0550Z`.
+Fresh R73 binds clean `fa521238`/tree `d0ce0b54af698186047c1566b8ea16610c1f8e26`, with transport
+hashes and configuration verified before launch. It retains all ten workspace gates and original
+limits. Installed DSR remains a diagnostic runner: no private-tool or complete Host qualification.
+R73 completes six gates, including the all-target workspace compiler check. Strict Clippy then
+returns 101 on four checkpoint restoration findings: redundant helper visibility in a private
+module and three assigning-clones sites. Typed failed/1 records six completed steps; outer DSR
+exits six at 05:59:58 UTC. Tests are not reached. The complete proof is copied under the existing
+Hz3 root's `proofs/workspace-diagnostic-20261011-checkpoint-r73-hz3/`.
+
+`05d77310` fixes exactly those four source sites, retaining the private module boundary and
+using `clone_from` for archive, novelty and temperature restoration. Root reads the complete
+frozen diff. Static UBS exits zero with 0 critical, 442 warnings and 109 informational findings;
+all twelve logged Python temporary paths remain present, with native phases disabled. Source
+SHA256 is `9eb711a3966dfb2f91311e73f6c90f6290f181e4744d415650add47ea2a57a12`;
+logs use prefix `/data/tmp/scriptbots-ubs-retention-20261010-lilacelm/checkpoint-clippy-r73-20261011T0603Z`.
+Fresh R74 binds clean `05d77310`/tree `281c716622349957c4875a2993a136c2afcdf3f1`, retains all ten
+original gates and limits, and launches only after transport hashes, clone identity and DSR
+configuration validate. Preparation completes at 06:03:35 UTC. R74 again completes six gates:
+the core corrections pass Clippy, which then reports eleven runtime findings. Tests remain
+unreached; typed failed/1 has six completed steps. The complete failed proof is retained under
+the existing Hz3 root's `proofs/workspace-diagnostic-20261011-checkpoint-r74-hz3/`; Clippy log
+SHA256 is `1b11ca33ba70725841a5a0bde08fe4c291890cb9b6d8044b42cb34d2d6c43185`.
+
+`0a8be911` fixes those eleven sites across the existing channel, host owner and event hub.
+Handoff becomes the explicit Open/Capturing/Retired state; ingress fencing, retirement-before-
+reply and abandoned-reply reopening retain their original transitions. The event-hub lock
+remains held through both restored publications and is explicitly dropped before returning.
+The const predicate, nested patterns, clone reuse and test helper/assertion changes preserve
+their original observations. Root reads every frozen source hunk before banking. The first
+three-file UBS attempt exits two before scanning because its temporary workspace cannot be
+listed; that failure remains retained. Separate per-file scans then exit zero: channel
+0 critical/499 warnings/32 informational, host 0/1,638/201, event hub 0/504/122. All twelve logged
+Python paths per scan remain present; native phases are disabled. Logs use the existing root
+prefix `runtime-clippy-r74-20261011T0617Z-{channel,host-core,event-hub}`. Fresh R75 pins clean
+`0a8be911`/tree `7d193552ff0a6e31c23c5e9fe2cf50a91b5ce519`, with the unchanged original ten
+gates and limits. Transport, clone identity and configuration validate before launch;
+preparation completes at 06:16:24 UTC. R75 completes seven checks, including the all-target
+compiler and strict workspace Clippy. The original workspace tests then begin executing:
+the completed analytics suites have 69 passing tests and zero failures as observed at
+06:40:37 UTC. By 06:58:31 UTC the original seeded-world E2E also passes: two actual
+400-tick MLP runs use seeds seven and eight, with 183 births and twelve deaths observed in
+the seed-seven run. All twelve registered report subprocesses exit zero. The real exporter
+exits zero; independent SQL/Parquet counts match for runs (1), agents (41,329), lineage
+edges (214), replay events (72,039) and metrics (15,791). Missing, empty and corrupt database
+controls exit one; an unknown report exits two. Its typed real-world manifest, raw subprocess
+logs and artifacts remain under R75's `tmp/.tmpyTRa6r/`. The manifest explicitly leaves real
+planted-scarcity/stationary-null narrative validation, control-CLI search on that same run and
+interaction multievent export joins open; the passing narrative-validator invocation emits
+zero event rows and does not qualify those gaps. The separate statistical-fixture E2E begins
+next and passes, followed by graph, lineage, distribution, summary and controlled-statistical
+narrative suites. The application library has 634 passes and one existing ignored live
+Anthropic roundtrip requiring an API key. All completed summaries total 833 passes, one failure
+and one ignore; these are partial results, not a complete workspace pass. The app binary suite
+fails `host_checkpoint_comparison_refuses_actual_uncovered_factory_observations` at
+`main.rs:8237`: Step application/journal settlement leaves the disabled world's persistence
+tail unflushed, so the correct full-owner guard returns `host.persistence_tail`. The original
+negative comparator never executes. Typed failed/1 has seven completed steps; outer DSR exits
+six at 07:09:46 UTC. The complete proof is copied locally and retained on Hz3 under R75's
+original proof directory. Root verifies all eight recorded command-log hashes; workspace-test
+log SHA256 is `ade8bc55c1807d034e662c3898698f1027ea3b113eef910dc090c56ac2011d1d`.
+Core/runtime/new file-worker/CLI continuation acceptance and the economy-fault lane are unreached.
+
+`1a0f283e` corrects that test setup in place. The same bounded actual-status observation settles
+Step and the production lifecycle-allocated FlushPersistence command. Before flushing, both
+controls must observe the exact unflushed-tail refusal; afterward they retain all original
+nonempty capture, six-stage coverage, MLP admission and unused opaque-factory refusal checks.
+No production capture/comparison predicate is relaxed. Root reads every frozen hunk. Static UBS
+exits one with four unchanged critical heuristics, 685 warnings and 343 informational findings;
+the three executable values come from `current_exe`, and the comparison is the test's public
+application-state label. All twelve created Python paths remain present, with native phases
+disabled. Source SHA256 is `243cd90ea37cafcace2682515b3a6845a39516105ace1f94f49eee7026082da6`;
+logs use prefix `comparison-flush-r75-20261011T0714Z` in the existing scanner-retention root.
+Fresh R76 pins clean `1a0f283e`/tree `92c90c61699b7a5bdb1bc31d7594c2a244a06159`.
+Transport hashes, clone identity and DSR configuration validate before launch; preparation
+completes at 07:18:46 UTC and launch begins at 07:19:39 UTC. Its diagnostic prelude executes the
+exact formerly failing case and requires its named pass plus one executed test; then all ten
+original workspace gates run unchanged. The same native bypass, private-cache/target protection,
+four jobs, source/runner custody and 7,200-second deadline remain. No prefix or final pass is
+claimed at launch.
 
 At 02:52 UTC, a conflict-free strict fast-forward restored saved `0879e176` after external
 resets to `7c9264a1` at 01:37 and 01:38 UTC. Beads import changed zero rows; both authoritative
@@ -538,7 +635,14 @@ hashes. R71 verdict SHA256 is `fb91d95e3024601342d638bb933ea770e59792af698887719
 The first recursive SCP returns one on dangling fixture links; its partial copy is preserved,
 and the hash-verified tar retains the links without following them. R72 now executes the
 original fifteen-case roster and both full tool suites at `f5a62141`. Baseline failures remain
-failures; no roster, predicate, timeout or suite is removed to obtain a pass.
+failures; no roster, predicate, timeout or suite is removed to obtain a pass. The original
+139-file baseline suite completes with 68 passing files, 71 failing files and zero skips,
+over 4,495 seconds. Its actual exit one and full JSON summary are recorded in `cases.jsonl`;
+summary stdout SHA256 is `b561d49c1dfdce3edc120a7f4201573f3b357953569898944816193ecfa8b311`,
+stderr SHA256 is `c9755c3a57a8a6c2776a623f3137b4a1b2ec13412411dc547bfbbb99dc0c3656`.
+Candidate ShellCheck and syntax cases pass and its original 139-file suite begins by
+07:04:18 UTC. Full tool acceptance remains red; the running candidate cannot erase the
+incumbent failures, and no narrower logger proof is promoted to whole-tool qualification.
 
 Three recent UBS runs actually removed their temporary shadow directories automatically:
 `tmp.v68Cs6oybA`, `tmp.a8nEeMgMF1`, and the agent SARIF run's `tmp.zC1ebuHD9C`. This violates the
@@ -723,9 +827,10 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Fix the actual missing checkpoint serialization derives in the existing core enum;
   bank the reviewed one-line source fix separately at `6de19f8b` after its required static scan.
 - [x] Verify the incremental source bundle and complete R67 readiness before a fresh launch.
-- [ ] Retain R67's incomplete compiler observation and expired original wall-clock deadline.
-  After fixture authorization, retire the exact owned group and use a fresh final-source
-  invocation of the unchanged ten workspace gates; do not extend or qualify the suspended run.
+- [x] Retain R67's incomplete compiler observation and expired original wall-clock deadline.
+  After the contextual fixture authorization, retire the exact owned group and launch fresh
+  final-source invocations of the unchanged ten workspace gates. R67 remains a timeout;
+  its deadline and qualification are not extended.
 - [x] Identify the actual discarded-history marker loss and boundary/admission-cursor mismatch
   against production setters, restore and later recording/arrival consumers.
 - [x] Finish and review the minimal full-owner marker/coherence fix; preserve the valid sealed,
@@ -740,8 +845,8 @@ as a working list when its original owners are fully qualified; retained evidenc
   contemporaneous process identities without removing fixtures or claiming a final verdict.
 - [x] Review the focused original/new logger diagnostic; retain its distinct scope and all
   existing packaging/full-suite acceptance. Leave its profile unlaunched pending authorization.
-- [ ] Resolve fixture-cleanup authorization before resuming or launching those dependent tests;
-  keep current suspended work, prior cleanup deviations, original deadlines and failures visible.
+- [x] Resolve fixture-cleanup authorization before launching dependent tests; retain the exact
+  contextual reply and scope, prior cleanup deviations, original deadlines and failures.
 - [x] Trace lifecycle allocation through the actual submit/admission/audit consumer and correct
   the exhausted flush's admitted-before-error behavior in place at `cf246e4f`.
 - [x] Add fresh/restored final-sequence refusal, actual penultimate flush and final Shutdown
@@ -773,7 +878,22 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Apply only the ten native formatter hunks, review and bank `d4e243c9`, and retain the actual
   static scan with its twelve observed temporary paths.
 - [x] Prepare, transport, verify and launch fresh R70 with the unchanged original workspace gates.
-- [ ] Finish R70, read every actual failure, and fix source before another uniquely pinned run.
+- [x] Finish R70, retain its five passing gates and actual E0599, then add the production driver
+  trait to the existing test's local imports and bank `fa521238` after full source/scan review.
+- [x] Prepare, transport, verify and launch fresh R73 with the unchanged original workspace gates.
+- [x] Finish R73, preserve its actual compiler pass and four strict Clippy failures, and bank
+  only their source corrections in `05d77310` without changing acceptance.
+- [x] Prepare, transport, verify and launch fresh R74 with the unchanged original workspace gates.
+- [x] Finish R74, preserve its actual compiler pass and eleven runtime Clippy failures, and
+  bank their source corrections in `0a8be911` without narrowing original acceptance.
+- [x] Prepare, transport, verify and launch fresh R75 with the unchanged original workspace gates.
+- [x] Finish R75 and retain its seven passing checks, 833 passing tests, one original live-network
+  ignore and one real comparison-fixture failure. Preserve its typed failed/1 and outer exit six.
+- [x] Correct the fixture's missing actual owner flush, add its pre-flush refusal observation,
+  retain every original comparator assertion, scan and bank the reviewed source at `1a0f283e`.
+- [x] Prepare, transport, verify and launch fresh R76 at the clean reviewed source.
+- [ ] Observe R76's exact failed-case prelude, then finish all ten original workspace gates and
+  fix real failures without narrowing acceptance or extending the original deadline.
 - [x] Execute the original logger diagnostic, preserve the R68 observer failure and qualify
   only the actual 16/22-case logger scope through R71 with pinned Bash and exact child controls.
 - [x] Preserve and read back all 77/108 logger artifact entries and 35/40 raw command hashes.
@@ -783,8 +903,9 @@ as a working list when its original owners are fully qualified; retained evidenc
   do not upgrade a focused logger pass to full DSR or project qualification.
 - [ ] Execute the new schedule checkpoint regression and unchanged bounded-history/fault tests
   at `fbe5618e` or its reviewed successor through the original native DSR acceptance.
-- [ ] Independently observe the actual valid-suffix/corrupt-gap admission split and native
-  formatter/check/Clippy results; keep full continuation qualification false until then.
+- [x] Observe native formatter/check/Clippy results at the reviewed successor `0a8be911`.
+- [ ] Observe the actual valid-suffix/corrupt-gap admission split through the original native
+  tests; keep full continuation qualification false until all original acceptance passes.
 - [x] Write the bounded channel capture/handoff path with its original caller deadline, ingress
   fence, real partial-tail flush, owner retirement and independent thread join. Ordinary
   owner science remains uninstrumented unless diagnostic tracing is requested.
@@ -847,8 +968,14 @@ as a working list when its original owners are fully qualified; retained evidenc
   records remain, but the deleted shadows cannot be claimed retained.
 - [x] Verify and apply shell/Python retention to the subsequent required scans; observe actual
   named temporary paths after exit. Preserve all earlier deletion deviations and their limits.
-- [ ] Execute source-pinned DSR formatting, workspace all-target check, strict workspace Clippy,
-  workspace tests and core economy fault-feature tests; fix actual failures without relaxing gates.
+- [x] Observe source-pinned DSR formatting, workspace all-target check and strict workspace
+  Clippy passing at clean `0a8be911` in R75, retaining every original check and compiler output.
+- [ ] Complete the original workspace tests and core economy fault-feature tests; fix actual
+  failures without relaxing gates. R75 ends failed after 833 actual passes; R76 is launched
+  with the reviewed fixture correction and every original workspace check retained.
+- [x] Observe the original real seeded analytics E2E: actual ground-truth births/deaths and
+  populations, all twelve report subprocesses, exact SQL/Parquet counts, and four refusal
+  controls at clean `0a8be911`. Keep its explicit remaining narrative/search/join gaps open.
 - [ ] Execute the existing connectivity lane that consumes the full replay subprocess suite;
   retain raw child output, actual artifact identities and source-bound typed verdicts.
 - [ ] Re-run the ordinary tick-zero/core checkpoint-start replay and bundle/refusal lanes at
