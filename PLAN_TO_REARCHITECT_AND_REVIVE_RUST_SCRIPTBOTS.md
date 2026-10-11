@@ -427,6 +427,9 @@ R103 retains all three matched pairs: both versions pass two and fail one origin
 bound, so there is no qualified performance win. The successor keeps the pre-first-tick
 population scan on the blocking pool through the same helper used by REST and WebSocket,
 and extends the occupied-pool regression to compare whole initial and completed summaries.
+WebSocket pause/resume/step/speed admission still ran synchronously on an async worker;
+the current follow-up routes it through the existing blocking dispatcher, retains owner
+receipts and errors, and adds actual owner-application and occupied-pool controls.
 Preserve all original latency/load/science criteria; this successor remains natively unqualified
 until its pinned DSR compiler, lint, formatting and test gates run.]
 

@@ -2001,6 +2001,34 @@ async fn stream_ticks_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) ->
     ws.on_upgrade(move |socket| handle_ws_stream(socket, state))
 }
 
+async fn apply_ws_control_message(
+    handle: ControlHandle,
+    text: String,
+) -> Result<Option<CommandStatusDto>, AppError> {
+    run_control(move || {
+        let text = text.trim();
+        let outcome = if text.eq_ignore_ascii_case("pause") {
+            Some(handle.pause(None))
+        } else if text.eq_ignore_ascii_case("resume") {
+            Some(handle.resume(None))
+        } else if text.eq_ignore_ascii_case("step") {
+            Some(handle.step())
+        } else if let Ok(json) = serde_json::from_str::<Value>(text) {
+            match json.get("command").and_then(|command| command.as_str()) {
+                Some("speed") => json
+                    .get("speed")
+                    .and_then(Value::as_f64)
+                    .map(|speed| handle.set_speed(speed as f32, None)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        outcome.transpose()
+    })
+    .await
+}
+
 async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     let handle = state.handle.clone();
     let mut interval = tokio::time::interval(Duration::from_millis(50));
@@ -2019,42 +2047,19 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
-                        let text_str = text.trim();
-                        // Every branch REPORTS its receipt. These four used to
-                        // discard it with `let _ =`, so a websocket client sent
-                        // "pause" and received nothing at all - no receipt, no
-                        // error, no acknowledgement of any kind. It is the same
-                        // class the other transports were cleared of, on a
-                        // surface that is not even listed in the migration
-                        // acceptance criteria alongside CLI/REST/MCP/SSE/NDJSON
-                        // (bd-k7nq).
-                        let outcome = if text_str.eq_ignore_ascii_case("pause") {
-                            Some(handle.pause(None))
-                        } else if text_str.eq_ignore_ascii_case("resume") {
-                            Some(handle.resume(None))
-                        } else if text_str.eq_ignore_ascii_case("step") {
-                            Some(handle.step())
-                        } else if let Ok(json) = serde_json::from_str::<Value>(text_str) {
-                            match json.get("command").and_then(|c| c.as_str()) {
-                                Some("speed") => json
-                                    .get("speed")
-                                    .and_then(|s| s.as_f64())
-                                    .map(|speed| handle.set_speed(speed as f32, None)),
-                                _ => None,
-                            }
-                        } else {
-                            None
+                        // Owner admission can wait. Use the blocking pool and
+                        // return its receipt or error for every recognized command.
+                        let outcome = apply_ws_control_message(handle.clone(), text.to_string()).await;
+                        let payload = match outcome {
+                            Ok(Some(status)) => Some(serde_json::json!({"receipt": status})),
+                            Ok(None) => None,
+                            Err(error) => Some(serde_json::json!({"error": error.message})),
                         };
-                        if let Some(result) = outcome {
-                            let payload = match result {
-                                Ok(status) => serde_json::json!({"receipt": status}),
-                                Err(error) => serde_json::json!({"error": error.to_string()}),
-                            };
-                            if let Ok(text) = serde_json::to_string(&payload)
-                                && socket.send(WsMessage::Text(text.into())).await.is_err()
-                            {
-                                break;
-                            }
+                        if let Some(payload) = payload
+                            && let Ok(text) = serde_json::to_string(&payload)
+                            && socket.send(WsMessage::Text(text.into())).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break,
@@ -6023,6 +6028,7 @@ mod tests {
         assert_eq!(expected.agent_count, 1);
         let expected = TickSummaryDto::from(expected);
         let queued_handle = handle.clone();
+        let websocket_handle = handle.clone();
         let state = ApiState {
             handle,
             scenario: None,
@@ -6074,24 +6080,38 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("blocking operation started");
 
-        let (queued, initial_wait, initial_read, latest) = runtime.block_on(async {
-            // This real queued operation must time out: otherwise the fixture
-            // never occupied the pool and cannot discriminate the old handlers.
-            let queued = tokio::time::timeout(
-                Duration::from_millis(100),
-                run_control(move || queued_handle.latest_summary()),
-            )
-            .await;
-            let mut initial_read = tokio::spawn(get_latest_tick_summary(State(initial_state)));
-            let initial_wait =
-                tokio::time::timeout(Duration::from_millis(100), &mut initial_read).await;
-            let latest = tokio::time::timeout(
-                Duration::from_secs(1),
-                get_latest_tick_summary(State(state)),
-            )
-            .await;
-            (queued, initial_wait, initial_read, latest)
-        });
+        let (queued, initial_wait, initial_read, websocket_wait, websocket_command, latest) =
+            runtime.block_on(async {
+                // This real queued operation must time out: otherwise the fixture
+                // never occupied the pool and cannot discriminate the old handlers.
+                let queued = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    run_control(move || queued_handle.latest_summary()),
+                )
+                .await;
+                let mut initial_read = tokio::spawn(get_latest_tick_summary(State(initial_state)));
+                let initial_wait =
+                    tokio::time::timeout(Duration::from_millis(100), &mut initial_read).await;
+                let mut websocket_command = tokio::spawn(apply_ws_control_message(
+                    websocket_handle,
+                    "pause".to_owned(),
+                ));
+                let websocket_wait =
+                    tokio::time::timeout(Duration::from_millis(100), &mut websocket_command).await;
+                let latest = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    get_latest_tick_summary(State(state)),
+                )
+                .await;
+                (
+                    queued,
+                    initial_wait,
+                    initial_read,
+                    websocket_wait,
+                    websocket_command,
+                    latest,
+                )
+            });
 
         // Release before asserting so the old handlers fail without leaving
         // queued work or a blocked thread behind during runtime teardown.
@@ -6108,11 +6128,88 @@ mod tests {
             "the population-dependent initial read must use the occupied pool"
         );
         assert_eq!(initial_summary, initial_expected);
+        let receipt = runtime
+            .block_on(websocket_command)
+            .expect("WebSocket command task joined")
+            .expect("WebSocket command dispatch")
+            .expect("recognized pause command");
+        assert!(
+            websocket_wait.is_err(),
+            "WebSocket owner admission must use the occupied pool"
+        );
+        let applied = owner.wait_applied(&receipt);
+        assert_eq!(applied.command_id, receipt.command_id);
         let summary = latest
             .expect("published summary must bypass the occupied pool")
             .expect("latest summary handler")
             .0;
         assert_eq!(summary, expected);
+    }
+
+    #[test]
+    fn websocket_control_messages_return_owner_receipts() {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("WebSocket command world");
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let handle = owner.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("WebSocket command runtime");
+
+        for message in [
+            "pause",
+            "{\"command\":\"speed\",\"speed\":2}",
+            "step",
+            "resume",
+            "pause",
+        ] {
+            let receipt = runtime
+                .block_on(apply_ws_control_message(handle.clone(), message.to_owned()))
+                .expect("WebSocket command dispatch")
+                .expect("recognized command");
+            let applied = owner.wait_applied(&receipt);
+            assert_eq!(applied.command_id, receipt.command_id);
+            let snapshot = handle.read_snapshot().expect("applied publication");
+            match message {
+                "pause" => assert!(snapshot.playback.paused),
+                "resume" => assert!(!snapshot.playback.paused),
+                "step" => assert_eq!(snapshot.world.tick, 1),
+                _ => assert_eq!(snapshot.playback.speed_multiplier, 2.0),
+            }
+        }
+        for message in ["unknown", "{", "{\"command\":\"speed\"}"] {
+            assert!(
+                runtime
+                    .block_on(apply_ws_control_message(handle.clone(), message.to_owned()))
+                    .expect("unrecognized message is ignored")
+                    .is_none()
+            );
+        }
+        let error = runtime
+            .block_on(apply_ws_control_message(
+                handle.clone(),
+                "{\"command\":\"speed\",\"speed\":-1}".to_owned(),
+            ))
+            .expect_err("invalid speed is rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "invalid speed multiplier");
+        assert_eq!(
+            handle
+                .read_snapshot()
+                .expect("unchanged playback")
+                .playback
+                .speed_multiplier,
+            2.0
+        );
     }
 
     #[test]
