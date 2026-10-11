@@ -1672,6 +1672,24 @@ where
         .map_err(AppError::from)
 }
 
+async fn read_latest_tick_summary(
+    handle: ControlHandle,
+) -> Result<scriptbots_core::TickSummary, AppError> {
+    let summary = {
+        let snapshot = handle.read_snapshot().map_err(AppError::from)?;
+        snapshot
+            .completed_summary
+            .clone()
+            .or_else(|| snapshot.summary_history.last().cloned())
+    };
+    if let Some(summary) = summary {
+        return Ok(summary);
+    }
+    // Before the first completed tick, the fallback computes max_age by
+    // scanning the published population. Keep that work off async workers.
+    run_control(move || handle.latest_summary()).await
+}
+
 #[utoipa::path(
     get,
     path = "/api/knobs",
@@ -1705,7 +1723,7 @@ async fn get_config(State(state): State<ApiState>) -> Result<Json<ConfigSnapshot
 async fn get_latest_tick_summary(
     State(state): State<ApiState>,
 ) -> Result<Json<TickSummaryDto>, AppError> {
-    let summary = state.handle.latest_summary().map_err(AppError::from)?;
+    let summary = read_latest_tick_summary(state.handle).await?;
     Ok(Json(summary.into()))
 }
 
@@ -1989,7 +2007,7 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Ok(summary) = handle.latest_summary() {
+                if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
                     let dto = TickSummaryDto::from(summary);
                     if let Ok(bytes) = postcard::to_stdvec(&dto)
                         && socket.send(WsMessage::Binary(bytes.into())).await.is_err()
@@ -6010,6 +6028,37 @@ mod tests {
             scenario: None,
             presented_frame: empty_presented_frame(),
         };
+        let mut initial_world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("initial read world");
+        initial_world
+            .try_spawn_agent(scriptbots_core::AgentData {
+                age: 17,
+                ..scriptbots_core::AgentData::default()
+            })
+            .expect("nonempty initial population");
+        let initial_owner = crate::control::tests::TestHost::spawn(initial_world);
+        let initial_handle = initial_owner.handle();
+        let initial_snapshot = initial_handle.read_snapshot().expect("initial publication");
+        assert!(initial_snapshot.completed_summary.is_none());
+        assert!(initial_snapshot.summary_history.is_empty());
+        let initial_expected = initial_handle.latest_summary().expect("initial summary");
+        assert_eq!(initial_expected.tick.0, 0);
+        assert_eq!(initial_expected.agent_count, 1);
+        assert_eq!(initial_expected.max_age, 17);
+        let initial_expected = TickSummaryDto::from(initial_expected);
+        let initial_state = ApiState {
+            handle: initial_handle,
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -6025,7 +6074,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("blocking operation started");
 
-        let (queued, latest) = runtime.block_on(async {
+        let (queued, initial_wait, initial_read, latest) = runtime.block_on(async {
             // This real queued operation must time out: otherwise the fixture
             // never occupied the pool and cannot discriminate the old handlers.
             let queued = tokio::time::timeout(
@@ -6033,19 +6082,32 @@ mod tests {
                 run_control(move || queued_handle.latest_summary()),
             )
             .await;
+            let mut initial_read = tokio::spawn(get_latest_tick_summary(State(initial_state)));
+            let initial_wait =
+                tokio::time::timeout(Duration::from_millis(100), &mut initial_read).await;
             let latest = tokio::time::timeout(
                 Duration::from_secs(1),
                 get_latest_tick_summary(State(state)),
             )
             .await;
-            (queued, latest)
+            (queued, initial_wait, initial_read, latest)
         });
 
         // Release before asserting so the old handlers fail without leaving
         // queued work or a blocked thread behind during runtime teardown.
         release.send(()).expect("release unrelated blocking work");
         runtime.block_on(occupied).expect("blocking work joined");
+        let initial_summary = runtime
+            .block_on(initial_read)
+            .expect("initial read task joined")
+            .expect("initial summary handler")
+            .0;
         assert!(queued.is_err(), "the blocking pool was not occupied");
+        assert!(
+            initial_wait.is_err(),
+            "the population-dependent initial read must use the occupied pool"
+        );
+        assert_eq!(initial_summary, initial_expected);
         let summary = latest
             .expect("published summary must bypass the occupied pool")
             .expect("latest summary handler")

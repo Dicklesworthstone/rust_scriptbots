@@ -421,8 +421,14 @@ Complete workspace acceptance remains open. The isolated successor removes the b
 hop from latest-summary and WebSocket single-tick publication reads. SSE/NDJSON history
 serialization stays on the blocking pool. A real occupied-pool regression checks that the
 old queued latest-summary read waits while the actual REST handler returns the full published
-summary from a nonempty tick-one world. Preserve all original latency/load/science criteria; source changes remain
-natively unqualified until their pinned DSR compiler, lint, formatting and test gates run.]
+summary from a nonempty tick-one world. R101 passes formatting, workspace compiler/strict
+Clippy checks and all 37 scoped tests; its containing DSR refuses final Cargo-cache collection.
+R103 retains all three matched pairs: both versions pass two and fail one original throughput
+bound, so there is no qualified performance win. The successor keeps the pre-first-tick
+population scan on the blocking pool through the same helper used by REST and WebSocket,
+and extends the occupied-pool regression to compare whole initial and completed summaries.
+Preserve all original latency/load/science criteria; this successor remains natively unqualified
+until its pinned DSR compiler, lint, formatting and test gates run.]
 
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
 
