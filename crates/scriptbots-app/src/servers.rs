@@ -4604,7 +4604,7 @@ mod tests {
         sync::atomic::{AtomicBool, Ordering},
     };
 
-    /// No transport may discard a control command's receipt.
+    /// Reject statement-style receipt discards in production transport code.
     ///
     /// This is a GUARD over a shape, not a fix for one site. The same defect
     /// had appeared independently on three surfaces and each one looked like a
@@ -4615,40 +4615,65 @@ mod tests {
     /// shipped a command-status lookup for ids that no command ever returned
     /// (bd-2z0.4.9).
     ///
-    /// A ninth instance is easy to add and hard to notice, so the shape is
-    /// checked instead of the instances. A control call whose line both starts
+    /// This line-oriented guard covers calls beginning with either dispatcher;
+    /// it does not parse arbitrary Rust expressions or establish application.
+    /// A control call whose line both starts
     /// the statement and ends it with `;` bound nothing — the receipt went
     /// nowhere. Bound calls continue onto an expression, so they do not match.
     #[test]
     fn no_control_command_discards_its_receipt() {
-        let source = include_str!("servers.rs");
+        let (source, _) = include_str!("servers.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("production source must end before this test module");
         // Assembled at runtime: a source-scanning test that spells out its own
         // needle matches itself and passes forever.
         let openers = [
             format!("run_control(move || {}.", "state.handle"),
             format!("run_control_mcp_sync(move || {}.", "handle"),
         ];
-
-        let discarded: Vec<&str> = source
-            .lines()
-            .map(str::trim)
-            .filter(|line| {
-                openers.iter().any(|opener| line.starts_with(opener)) && line.ends_with(';')
-            })
+        let bound_openers: Vec<String> = openers
+            .iter()
+            .map(|opener| format!("let status = {opener}"))
             .collect();
+        let receipt_forms = |candidate: &str| {
+            let bound = candidate
+                .lines()
+                .map(str::trim)
+                .any(|line| bound_openers.iter().any(|opener| line.starts_with(opener)));
+            let discarded = candidate.lines().map(str::trim).any(|line| {
+                openers.iter().any(|opener| line.starts_with(opener)) && line.ends_with(';')
+            });
+            (bound, discarded)
+        };
 
-        assert!(
-            discarded.is_empty(),
-            "these control calls throw away the receipt they were handed, leaving the \
-             caller with no command id to poll: {discarded:#?}"
+        assert_eq!(
+            receipt_forms(source),
+            (true, false),
+            "production must contain bound receipts and no statement-style discard"
         );
 
-        // Positive control: the bound form must actually be present, or this
-        // test would pass just as happily against a file where every control
-        // call had been deleted.
-        assert!(
-            source.contains("let status = run_control(move || state.handle.pause())"),
-            "the receipt-bearing form is missing; this guard is checking nothing"
+        // Deleting every observed binding must invalidate the positive control.
+        // The test module is excluded, so its own assertions cannot keep it green.
+        let deleted = source
+            .lines()
+            .filter(|line| {
+                !bound_openers
+                    .iter()
+                    .any(|opener| line.trim().starts_with(opener))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(receipt_forms(&deleted), (false, false));
+
+        // A genuine discard must fail even when valid production bindings remain.
+        for opener in &openers {
+            let discarded = format!("{source}\n{opener}pause(None));");
+            assert_eq!(receipt_forms(&discarded), (true, true));
+        }
+        assert_eq!(
+            receipt_forms(""),
+            (false, false),
+            "empty production cannot satisfy the guard"
         );
     }
 

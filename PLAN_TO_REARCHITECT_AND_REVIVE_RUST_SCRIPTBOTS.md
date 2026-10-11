@@ -448,6 +448,13 @@ occupied-pool regression with MCP initialization and owner-applied tool receipts
 retain caller cancellation through the actual HTTP handler. All original load,
 science, latency and acceptance criteria remain; native qualification is pending.]
 
+[Currently In Progress — `bd-0oro`, LilacElm, 2026-10-11: repair the receipt
+guard's observed self-matching positive. Restrict its line-oriented scan to production,
+derive actual bound forms from the dispatcher openers, and require both deleted-binding
+and inserted-discard controls. This does not establish application or arbitrary Rust
+expression coverage, and does not close the broader defect-class bead. Native execution
+is pending; the original control-plane acceptance remains unchanged.]
+
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
 
 **Persistence decision (2026-07-11):** FrankenSQLite is the only embedded database backend. The former DuckDB architecture is retired in full; no dual-backend abstraction, compatibility shim, or legacy file migration is retained. The migration is complete only when source, manifests, lockfile, tests, CLI/help, CI, and active documentation all use the exact-revision `fsqlite` public facade and a repository-wide search finds no live DuckDB integration.
