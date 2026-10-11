@@ -3712,7 +3712,10 @@ impl HostCore {
             (Some(remaining), Some(resolve)) => Some(ScheduledConfigQueue {
                 remaining: remaining.iter().cloned().collect(),
                 completed_sequence: state.completed_schedule_sequence.ok_or_else(|| {
-                    checkpoint_error("schedule.cursor", "installed schedule lost completed cursor")
+                    checkpoint_error(
+                        "schedule.cursor",
+                        "installed schedule lost completed cursor",
+                    )
                 })?,
                 resolve,
             }),
@@ -6409,7 +6412,10 @@ mod tests {
         assert_eq!(checkpoint.tick(), Tick(1));
         assert_eq!(checkpoint.world_checkpoint().agent_count(), 3);
         assert_eq!(
-            checkpoint.state.continuity.persistence_discarded_records_at(),
+            checkpoint
+                .state
+                .continuity
+                .persistence_discarded_records_at(),
             Some(Tick(1))
         );
         assert_eq!(checkpoint.persistence_last_admitted_tick(), None);
@@ -6450,7 +6456,10 @@ mod tests {
             .to_string(),
         });
         for owner in [&mut oracle, &mut restored] {
-            let status = owner.local_port().command_status(CommandId::new(2)).unwrap();
+            let status = owner
+                .local_port()
+                .command_status(CommandId::new(2))
+                .unwrap();
             let status = status.expect("actual enable command retains its identity");
             assert_eq!(status.application(), &expected);
             assert_eq!(status.journal(), &JournalState::CommittedVolatile);
@@ -6491,7 +6500,10 @@ mod tests {
         settle_continuation_command(&mut original, disable.clone(), 20);
         settle_continuation_command(&mut oracle, disable, 20);
         for owner in [&original, &oracle] {
-            let status = owner.local_port().command_status(CommandId::new(2)).unwrap();
+            let status = owner
+                .local_port()
+                .command_status(CommandId::new(2))
+                .unwrap();
             assert!(matches!(
                 status.unwrap().application(),
                 ApplicationState::Applied(_)
@@ -6501,7 +6513,10 @@ mod tests {
         }
         let checkpoint = original.capture_host_checkpoint_v1().unwrap();
         assert_eq!(
-            checkpoint.state.continuity.persistence_discarded_records_at(),
+            checkpoint
+                .state
+                .continuity
+                .persistence_discarded_records_at(),
             None
         );
         assert_eq!(checkpoint.config().persistence_interval, 0);
@@ -6538,7 +6553,10 @@ mod tests {
         settle_continuation_command(&mut oracle, enable.clone(), 30);
         settle_continuation_command(&mut restored, enable, 1_010);
         for owner in [&oracle, &restored] {
-            let status = owner.local_port().command_status(CommandId::new(3)).unwrap();
+            let status = owner
+                .local_port()
+                .command_status(CommandId::new(3))
+                .unwrap();
             assert!(matches!(
                 status.unwrap().application(),
                 ApplicationState::Applied(_)
@@ -6585,12 +6603,11 @@ mod tests {
             let mut wire: HostCheckpointWireV1 = postcard::from_bytes(&bytes).unwrap();
             let mut payload: serde_json::Value = serde_json::from_slice(&wire.payload).unwrap();
             if change_boundary {
-                payload["continuity"]["persistence_boundary"] = serde_json::to_value(
-                    scriptbots_core::PersistenceBoundaryStatus::Open {
+                payload["continuity"]["persistence_boundary"] =
+                    serde_json::to_value(scriptbots_core::PersistenceBoundaryStatus::Open {
                         tick: checkpoint.tick(),
-                    },
-                )
-                .unwrap();
+                    })
+                    .unwrap();
             } else {
                 payload["persistence_last_admitted_tick"] = serde_json::Value::Null;
             }
@@ -6627,7 +6644,10 @@ mod tests {
         let discarded = disabled.capture_host_checkpoint_v1().unwrap();
         let encoded = discarded.encode().unwrap();
         assert_eq!(
-            HostCheckpointV1::decode(&encoded).unwrap().encode().unwrap(),
+            HostCheckpointV1::decode(&encoded)
+                .unwrap()
+                .encode()
+                .unwrap(),
             encoded
         );
         for marker in [None, Some(Tick::zero()), Some(Tick(2))] {
@@ -13052,7 +13072,10 @@ mod tests {
                     core.drive(ManualInstant::from_nanos(100)).unwrap();
                     core.drive(ManualInstant::from_nanos(101)).unwrap();
                     let settled = port.command_status(flush.command_id()).unwrap().unwrap();
-                    assert!(matches!(settled.application(), ApplicationState::Applied(_)));
+                    assert!(matches!(
+                        settled.application(),
+                        ApplicationState::Applied(_)
+                    ));
                     assert_eq!(settled.journal(), &JournalState::CommittedVolatile);
                 }
                 if restore {
@@ -13105,7 +13128,10 @@ mod tests {
                 core.drive(ManualInstant::from_nanos(103)).unwrap();
                 assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
                 let settled = port.command_status(final_id).unwrap().unwrap();
-                assert!(matches!(settled.application(), ApplicationState::Applied(_)));
+                assert!(matches!(
+                    settled.application(),
+                    ApplicationState::Applied(_)
+                ));
                 assert_eq!(settled.journal(), &JournalState::CommittedVolatile);
                 assert_eq!(core.world_tick(), Tick::zero());
             }
