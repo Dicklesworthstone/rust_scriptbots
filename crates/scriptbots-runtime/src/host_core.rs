@@ -6136,13 +6136,42 @@ mod tests {
     }
 
     fn settle_continuation_command(owner: &mut HostCore, envelope: CommandEnvelope, now: u64) {
+        let command_id = envelope.command_id;
+        // Each declared scheduled action may need its own journal boundary before the
+        // command. Keep the original four polls per item, but observe settlement itself.
+        let scheduled = owner
+            .schedule
+            .as_ref()
+            .map_or(0, |queue| queue.remaining.len());
+        let poll_budget = 4 * (scheduled + 1);
         let mut port = owner.local_port();
         port.submit(envelope).expect("actual admitted command");
-        for offset in 0..4 {
+        for _ in 0..poll_budget {
             owner
-                .drive(ManualInstant::from_nanos(now + offset))
+                .drive(ManualInstant::from_nanos(now))
                 .expect("actual manual owner drive");
+            let status = port
+                .command_status(command_id)
+                .expect("actual command status read")
+                .expect("admitted command retains its identity");
+            if !matches!(status.application(), ApplicationState::Admitted)
+                && matches!(
+                    status.journal(),
+                    JournalState::CommittedVolatile | JournalState::Durable
+                )
+                && owner.inflight_journal.is_empty()
+                && owner.retained_journal.is_none()
+                && owner.scheduled_barrier.is_none()
+                && owner.active_command.is_none()
+                && owner.shared.borrow().pending_audit_count == 0
+                && owner.shared.borrow().queue.is_empty()
+            {
+                return;
+            }
         }
+        panic!(
+            "actual command {command_id:?} did not settle its application/journal boundary within {poll_budget} polls"
+        );
     }
 
     fn assert_continued_owner_outputs(restored: &HostCore, oracle: &HostCore) {
