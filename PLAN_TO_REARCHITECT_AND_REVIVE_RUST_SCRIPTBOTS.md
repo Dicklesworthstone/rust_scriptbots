@@ -430,8 +430,13 @@ and extends the occupied-pool regression to compare whole initial and completed 
 WebSocket pause/resume/step/speed admission still ran synchronously on an async worker;
 the current follow-up routes it through the existing blocking dispatcher, retains owner
 receipts and errors, and adds actual owner-application and occupied-pool controls.
-Preserve all original latency/load/science criteria; this successor remains natively unqualified
-until its pinned DSR compiler, lint, formatting and test gates run.]
+R104 at `dac2cdc4` and R105 at `839a21b9` pass their six pinned inner quality gates:
+workspace formatting/check/strict Clippy, complete server units, three latency fixtures and
+analyzer build. R105 has 38 scoped test passes and one original quantitative ignore; both
+real regressions pass. Both containing DSR runs exit 6 at final Cargo-cache verification.
+Preserve all original latency/load/science criteria; quantitative, full-workspace and
+containing-DSR acceptance remain open. R106 retains the original three-pair comparison but
+has not launched because adequate worker headroom is unavailable.]
 
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
 

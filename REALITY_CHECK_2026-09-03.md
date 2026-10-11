@@ -16,8 +16,9 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-The preserved candidate's latest product source is `460517d7631bd1c123836182996e0d4dfb43c0ef`.
-It remains backed up at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
+The preserved candidate's latest product source is `839a21b9a48c8c4580a644aa7c1a82dc63d8c020`,
+retained in the complete `source-839a21b9-main.bundle` in the durable publication bank and on Hz2.
+The earlier source remains backed up at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
 resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. Conflict-free strict
 fast-forwards restore reviewed `b38e7ffc` at 12:51:53 UTC and documentation/tracker successor
 `c6ed73b5` at 13:25:29 UTC, without a push. External resets to `origin/main` at 13:37:57 and
@@ -42,6 +43,140 @@ full original replay suite. Immutable ordinary launch manifests remain false. Or
 deadlines were
 not extended. Both expired process groups were retired on October 11; their original runners
 reported timeout with outer exit six. The new workspace run retains all ten original gates.
+
+At 16:40:41 UTC, the previously prepared original latency profile R92 starts on Hz2 at clean
+`460517d7`, after a fresh observation of 19,099,234,304 available disk bytes, 14,382,980 KiB
+available memory and zero I/O PSI averages. No cache deletion is performed and no reclaim actor
+is inferred. Profile SHA256 is `254ee8c78787fc2e58566d33fd0a9bc5b53d458687a6a863d949bc8783703bd5`;
+launcher SHA256 is `b2f775eb343c7295e16a8eadc7f3bcfb91d06c6f8519938cd686048bfa6b7f54`.
+The original source/class/toolchain/load/bounds and same-invocation baseline remain unchanged.
+This resumes the missing observation while capacity exists; it does not discharge the still
+incomplete full-workspace or containing-DSR acceptance. No latency pass is observed at launch.
+
+R92 finishes at 16:48:17 UTC with the exact ignored test executed: 0 passed, 1 failed, 0 ignored.
+All 200 requests return HTTP 200; independently derived p50/p95/p99 are 942,461 / 1,547,823 /
+2,319,126 ns. All 32 SSE clients attach and stay connected, with 800 complete data events before
+load and 256 during it. All four phase populations are 1,000 with healthy, unpaused requested
+×8 playback. The original baseline observes 152 ticks / 3 seconds = 50.666667 TPS; load observes
+8 ticks / 189,388,642 ns = 42.241181 TPS. Degradation is 16.629247%, failing the unchanged 10%
+bound. Typed failed/1 has zero completed steps, outer DSR fails/6, and analyzer/final collection
+are unreached. Original `bd-134` is reopened and claimed under `bd-g6wf`'s failed-bound rule.
+The raw test log SHA256 is `5da24a2cc8cdc3cba7cc75e5b6de68abce6a9a62058fd0b04ffb30d8cbc36692`;
+its existing proof path is `proofs/control-latency-20261011-460517d7-r92-hz2/` under the Hz2 root.
+
+The isolated successor `40c7c5c1ce3d7f3b095b26ac0dfb7800c7512b71` removes the blocking-pool
+hop from REST latest-summary and WebSocket single-tick publication reads. SSE/NDJSON history
+serialization remains on the pool because configured history size is not capped by this code.
+The new actual occupied-pool test uses a nonempty completed tick, requires the old queued
+summary read to time out, and compares the actual REST result's complete summary. It is
+unqualified at banking; the subsequently executed R101 scope is recorded below. No causal
+attribution or performance improvement is claimed. Static UBS
+exits one with nine critical, 295 warning and 332 informational observations. The critical
+texts are unchanged: six expected test panic branches, two test Origin insertions and a CORS
+response after the real policy check. All categories are read; no finding or severity is
+suppressed. Native compiler/lint/formatting and complete server/latency-fixture scopes are next.
+
+The complete R92 proof, launcher and native-run directory are independently byte-matched
+between worker and root: 35 files, 174,388,230 bytes, canonical relative-path/size/SHA256
+inventory `44ed4da3f6dbd9dd5935c27586874d7efa88058c56a5066efc7d7917c7b1b73e`.
+That inventory includes the incumbent executable retained after R92 and before candidate
+builds; its SHA256 is `609ec4790727da75193b501f24892e8b66afe7eff66140710d266ee16086fd45`.
+The earlier profile's own artifact manifest predates this added executable and is not edited.
+This custody observation supports a future matched invocation, not a performance win.
+
+R101 launches at 17:02:50 UTC at clean `40c7c5c1` with the six declared source-qualification
+steps. Formatting, workspace all-target check and strict workspace Clippy pass. All 34 server
+tests, including the real occupied-pool negative and exact-summary positive, pass; all three
+existing latency fixtures pass, with the original quantitative test still explicitly ignored
+in that fixture scope. The analyzer and final source/tool guards also pass. The inner typed
+verdict is `scriptbots.publication-summary.quality.v1` pass/0 with all six command/log channels
+zero. Outer DSR finishes failed/6 at 17:18:35 UTC: its final cache verifier refuses the tracked
+Proptest `README.md` link, and artifact paths are empty. No full-workspace-test, quantitative
+or containing-DSR pass follows from these 37 tests. All 53 proof/native/launcher files,
+305,784 bytes, independently match inventory
+`cf0120ad25673c765aa221f952c1bd61e4e9a3ac05c911b3f5fad7c76e3b688b`.
+Profile SHA256 is `16b085849a480ca8cb68585c9181034e42e8582ac13657993512e37daa342cb2`.
+
+The root filesystem reaches zero writable bytes at 17:11 UTC while Hz2 retains about 12 GB.
+No deletion or disk-reclaim actor is inferred. The complete own isolated checkout is copied
+without deleting or overwriting its source to
+`/dev/shm/scriptbots-publication-20261011-lilacelm/review-main/`, still on `main` at `40c7c5c1`.
+Narrow conflict-free leases cover its report and exact tracker exports. This RAM-backed bank
+must also be preserved on the worker before it can count as retained session work; it does
+not change the unresolved shared-reset or publication hold. A separate original-bound R102
+profile declares three incumbent/candidate pairs, alternates order and uses the byte-bound R92
+reader. Profile SHA256 is `bd8e2daae358582ce10621cb8d64517814f9d8ffc83a3a00fcb816f2819af5a3`;
+the extracted original reader is `86e3e75b352a2926aa81db1c5347b5119b6432002ac906f3cc1022309fd39797`.
+The first launcher invocation at 17:20:45 UTC incorrectly uses root; Git refuses the
+Ubuntu-owned checkout before DSR starts. No native test or performance measurement runs in
+that preflight. Its original log/launcher remain. The R103 retry uses the checkout owner and
+an unchanged profile, a new log/version and launcher SHA256
+`a44abc74e7005d7e0f3280b1ced638da27641cbaa1783e7cce52ed647351cd8a`.
+R103 finishes at 17:35:00 UTC with all six original-bound runs retained. Both versions pass
+two pairs and fail one: candidate degradation in pair 1 is 13.875421%, incumbent 32.997272%,
+against the unchanged 10% ceiling. Candidate p95 is 1.491148 / 1.587443 / 0.974811 ms;
+incumbent p95 is 1.571420 / 1.630699 / 1.671750 ms. All six runs retain 200 successful requests,
+32 live SSE clients, healthy unpaused requested ×8 playback and phase populations at least
+1,000. The 77 proof/native/launcher files independently match inventory
+`1975ea10418635878f6235c809a0ffc0719135d72e1216015903aa1ad7d364da`.
+No qualified performance win follows. Loaded progress is one or two eight-tick publication
+batches over 123–233 ms; distinguishing publication cadence from actual science progress is
+an investigation requirement, not authority to weaken the original bound.
+
+Source `dac2cdc453d8` corrects the remaining pre-first-tick dispatch: REST and WebSocket share
+a helper that returns an existing completed summary directly and sends the population-dependent
+initial max-age scan to the blocking pool. The real regression now compares whole initial and
+completed summaries from nonempty worlds while the sole blocking slot is occupied. R104 at this
+exact source passes workspace formatting/check/strict Clippy, all 34 server units, all three
+latency fixtures and the analyzer build. Its typed inner verdict is pass/0; containing DSR
+exits 6 at 21:14:07 UTC because the final cache verifier refuses the tracked Proptest README
+link. All 54 proof/native/launcher files, 306,028 bytes, independently match inventory
+`7549726ef023fb4354afd1e7ebb7399f7e1e6caaf5eb505c8b3171103eb9efe8` between worker and bank.
+The original quantitative case is still ignored in the fixture scope; full workspace and
+performance acceptance remain open. Beads comments 2740/2741 retain R103 on both owners.
+
+Source `839a21b9a48c` also moves WebSocket pause/resume/step/speed owner admission off async
+workers through the existing blocking dispatcher, preserving owner receipts and errors.
+The occupied-pool regression now requires WebSocket admission to wait while completed REST
+reads remain available. A real HostCore test checks owner-applied command receipts, tick and
+playback effects, ignored malformed/unknown messages and rejected negative speed without a
+configuration change. Static UBS exits 1 with 9 critical, 333 warning and 338 informational
+observations; unchanged critical texts and all categories are read, with no suppression or
+native-check claim. R105 completes at 21:34:06 UTC: all six inner quality commands pass,
+including workspace formatting/check/strict Clippy, 35 server units, three latency fixtures
+and the analyzer build. Both real regression names pass; the quantitative case is still
+ignored in this fixture scope. Its typed inner verdict is pass/0, but containing DSR exits 6
+at the same tracked Proptest README link and collects no artifacts. All 61 retained files,
+307,966 bytes, independently match worker/bank inventory
+`2e7aa777d2120f8bbd6f2f980d5f0c04eb2bda7cfe7c663777bdadbb0828af80`.
+Neither original owner is closed. The existing EventHub publishes a scientific boundary after
+each completed world step and before journal admission; it offers a possible diagnostic for
+eight-step snapshot publication, but no per-tick probe or gate change has been executed.
+
+R106 is prepared but unlaunched. Its original compiler/analyzer commands, all three alternating
+incumbent/candidate pairs, byte-bound reader, class checks and quantitative bounds remain
+unchanged. Executable reuse was investigated and parked: diagnostic mode requires a strict
+release contract absent from these profiles. The original build path was restored and compared
+byte-for-byte after source-identity normalization. Hz2 has approximately 3.3 GB available;
+Hz3/Hz4 have severe I/O stalls with foreign builds. No cleanup, foreign process signals,
+new measurements or performance improvement claims follow.
+
+A read-only counterprobe also finds that `no_control_command_discards_its_receipt` has one
+occurrence of its positive pause string, inside its own assertion. Removing production code
+leaves that positive check satisfied. Comment 2745 records the observed guard defect on
+existing open `bd-0oro`; its owner and acceptance are unchanged. This guard has not been
+repaired. The new real owner tests separately observe applied receipts and playback/tick effects.
+
+At 20:51 UTC, the authorized `am service restart` exits one because the old manually launched
+daemon still owns port 8765. After a fresh byte-matched database/WAL/SHM backup, only that
+verified daemon receives SIGTERM; it exits gracefully and the managed service becomes active
+at 20:52:01 UTC. Fresh leases 8826–8831 and the authoritative conflict check succeed. Agent Mail
+still reports a failed full integrity check: no live database repair, reconstruction, guard
+bypass or integrity-health claim is made. Source and metadata work resume through fresh normal
+reservations. The incident backups remain outside the project.
+
+At the next earlier capacity check, root again has
+39,035,842,560 writable bytes; no reclaim actor is inferred and root performed no deletion.
 
 The user's reply following the explicit cleanup-scope permission request said: "OK, so please
 do everything you think is advisable based on all of that" and "OK, please do ALL of that now."
@@ -1620,6 +1755,55 @@ as a working list when its original owners are fully qualified; retained evidenc
   gates, full test roster, economy-faults, analyzer, build settings and deadline.
 - [x] Finish R100 and independently match all 57 retained proof files: check/Clippy pass,
   partial workspace tests 69/2/0, actual disk-exhaustion failure; feature/analyzer are unreached.
+- [x] Recheck Hz2 capacity, source, profile and launcher identities; launch the original R92
+  latency profile once, without cache cleanup or altered load, thresholds or machine class.
+- [x] Complete R92 and retain its real failed throughput bound, complete request/SSE/population
+  observations and original acceptance; reopen and claim `bd-134` for source remediation.
+- [x] Independently byte-match all 35 R92 proof/native/launcher files, including the preserved
+  incumbent executable; recompute all quantiles and original throughput operands from raw data.
+- [x] Review and bank the narrow immutable-summary consumer repair and occupied-pool regression
+  at `40c7c5c1`; keep bulk-history serialization off async workers.
+- [x] Qualify the repair's declared inner source scope through pinned workspace formatting/check/
+  strict Clippy, complete server units and latency fixtures; R101 passes all six steps. Its
+  actual outer cache-link refusal and incomplete full-workspace debt remain explicit.
+- [x] Observe all six R101 inner steps passing, including analyzer and final source/verdict;
+  retain its final cache refusal instead of claiming containing-DSR collection.
+- [x] Preserve the full own checkout in a separately writable filesystem when root fills;
+  reserve its exact report/tracker files without deleting source, proof or foreign data.
+- [ ] Review and bank the exact metadata, synchronize exports and preserve its commit bundle
+  on the worker; the RAM-backed copy alone does not establish durable session retention.
+- [x] Prepare R102 with three declared matched pairs and the unchanged byte-bound original
+  reader, original test source, source/toolchain/class checks and full raw result retention.
+- [x] Finish R101 with inner typed pass and outer cache-link failure; preserve all 53 matched
+  proof files. Retain the R102 wrong-user preflight without counting any native execution.
+- [x] Launch the unchanged matched profile as its checkout owner with the unique R103 version;
+  observe all three declared pairs and retain every original-bound result.
+- [x] Preserve all six R103 results, independently recompute their samples and retain the
+  original failed acceptance on both owner Beads without a performance-win claim.
+- [x] Replace the old Agent Mail daemon gracefully, obtain fresh source/metadata leases and
+  pass the authoritative conflict check; its full integrity warning remains unresolved.
+- [x] Bank the shared initial/completed summary dispatch and extend the real occupied-pool
+  regression at `dac2cdc453d8`, preserving science values and all quantitative criteria.
+- [x] Execute pinned formatting/compiler/strict Clippy and complete server/fixture scopes at
+  `dac2cdc453d8`; retain R104 inner pass, actual outer cache refusal and all 54 matched files.
+- [x] Route WebSocket owner admission through the blocking dispatcher and bank real
+  owner-application, error and occupied-pool regressions at `839a21b9a48c`.
+- [x] Finish R105's same six quality gates at exact `839a21b9a48c`; retain both discriminating
+  tests, 38 scoped passes, one quantitative ignore, outer cache refusal and all 61 matched files.
+- [x] Prepare R106 with the original build/analyzer and three original-bound matched pairs;
+  park unsupported executable reuse and retain the unlaunched profile without new numbers.
+- [ ] Run the original R106 comparison when adequate worker headroom is observed; retain all
+  declared repetitions, incumbent and candidate, exact class and original quantitative criteria.
+- [x] Record the receipt guard's self-matching positive check on existing `bd-0oro` without
+  changing its owner, acceptance or closure state.
+- [ ] Correct that guard with a production-only observation and a deletion counterexample;
+  retain a negative case that distinguishes an actually discarded receipt.
+- [ ] Discriminate completed scientific boundaries from eight-step snapshot publication using
+  the existing runtime observer; preserve original load, bounds, science and every repetition.
+- [ ] Resolve the full Agent Mail integrity warning without losing unarchived messages or
+  reconstructing from an incomplete archive.
+- [ ] Measure the original quantitative bounds at the qualified candidate; retain the incumbent
+  in the same invocation before any improvement claim and investigate any failing bound.
 - [ ] Obtain a worker with adequate disk/memory and I/O headroom, then finish the original
   unfiltered workspace, explicit economy-faults and analyzer acceptance without weakened limits.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
@@ -1746,9 +1930,10 @@ as a working list when its original owners are fully qualified; retained evidenc
   zero must leave zero agents; minimum 1,000 must leave 1,000. A numerical latency pass after
   population collapse does not qualify the original active-load premise. R87 observes the
   named control passing at `66ac7ed1`; quantitative boundary observations remain owed.
-- [ ] Retain all raw latency samples, declared versus actual timing denominators, and observed
+- [x] Retain all raw latency samples, declared versus actual timing denominators, and observed
   phase-boundary populations, host health and playback; require the actual minimum at every
-  measured boundary and qualify replenishment through the real death/refill control.
+  measured boundary and qualify replenishment through the real death/refill control. R92
+  observes the complete matrix but fails the original throughput bound; this is not acceptance.
 - [x] Review the minimal external source-pinned latency DSR profile, original-bound reader,
   typed manifest/verdict assertion and actual installed native machine/toolchain identity.
 - [x] Preserve both completed private cache copies in a byte-verified independent archive
@@ -1758,8 +1943,9 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [ ] Retarget the held latency profile to the exact terminal/workspace-qualified source.
 - [ ] Execute the exact ignored 1,000-agent test after terminal/workspace qualification releases
   the worker; retain the original 2× available-parallelism SSE load and unchanged bounds.
-- [ ] Read back actual p50/p95/p99, zero request failures, SSE liveness and same-invocation
+- [x] Read back actual p50/p95/p99, zero request failures, SSE liveness and same-invocation
   baseline/loaded TPS; record typed results and source-bound raw evidence on `bd-g6wf`/`bd-134`.
+  R92's 16.629247% loss keeps remediation and final quantitative acceptance open.
 - [ ] Remediate any failed original latency/throughput bound in source before claiming acceptance.
 - [x] Claim original BR-ready `bd-azi3` after reading its full package/demo acceptance and comments.
 - [x] Implement one browser package producer with Cargo-derived name/version/types and exports;
