@@ -18,9 +18,13 @@ Full original acceptance remains open; no overall product or performance pass is
 
 The preserved candidate's latest product source is `460517d7631bd1c123836182996e0d4dfb43c0ef`.
 It remains backed up at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
-resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. At 12:51:53 UTC a
-conflict-free strict fast-forward restores reviewed `b38e7ffc` to shared local `main`; no push
-occurs. That restores the implementation, not an overall qualification claim. It includes the full-owner
+resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. Conflict-free strict
+fast-forwards restore reviewed `b38e7ffc` at 12:51:53 UTC and documentation/tracker successor
+`c6ed73b5` at 13:25:29 UTC, without a push. External resets to `origin/main` at 13:37:57 and
+13:39:08 UTC undo that restoration again; shared local `main` is back at `7c9264a1` when
+observed at 13:49 UTC. The complete candidate remains preserved on isolated `main`, and the
+independent DSR runs still bind their clean private source. Reset intent remains unanswered;
+no further shared-checkout mutation is made while that conflict is unresolved. The candidate includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
 discarded-history/sealed-boundary corrections, pre-admission lifecycle exhaustion handling,
 and an owner-derived completed schedule cursor that survives bounded outcome-history eviction.
@@ -591,7 +595,59 @@ launcher SHA256 is `1dc05c964ea1656b1128b0ee31ab79e61646735171fd628fde6f6ddacab5
 Transport hashes and DSR configuration pass before launch at 13:39:56 UTC. The worker's later
 I/O pressure observation reports 82.13% some/75.27% full over ten seconds while foreign
 compiler jobs run; that later sample cannot be retroactively assigned as the startup failure's
-cause. R95 is still ongoing; no positive rerun or final acceptance is claimed.
+cause. R95 reproduces the same startup guard: zero passes, one failure and zero ignores in
+42.78 seconds after a 32-minute-43-second dependency build. Its cleanup waits also expire.
+The prelude's Cargo exit is 101 and log exit zero; its wrapper returns one, the native result
+receipt records failed/six and the outer launcher exits six at 14:17:28 UTC. None of the fourteen
+original verifier steps executes. The actual 63-byte transcript contains only a run seed;
+there is no run manifest or terminal log, and its WAL is 8,272 bytes. This failure stops earlier
+than R94's observed post-bootstrap callback and does not establish the same blocked operation.
+The later direct inspection finds the child already gone and retains those missing-proc errors;
+no live stack or causal fix is claimed. All 21 copied files, 197,837 bytes, match the worker's
+individual hashes; canonical copied inventory SHA256 is
+`64421db7b1267ab964b43bb62f951f4832ecf4a6bff9441e8c24adff5d231efa`.
+The complete failed-case log matches
+`41ddba443aa3c1914aa78f75a685384f54db9599ba47b5d813fc3c4863d10dcb`.
+
+R96 starts at 14:25:00 UTC using the same clean source, pinned DSR and original fourteen-step
+verifier. Its diagnostic prelude invokes the exact R95-produced test and application, binds
+both executable hashes before and after, and matches the Cargo-provided 32 MiB stack and
+single-test-thread settings. An explicit read-only collector records only this diagnostic's
+descendants, start identities, kernel stacks, syscalls and file descriptors. It neither attaches
+nor signals them. Discovery read errors can be missed by this minimal collector; absent samples
+are not reconstructed. The diagnostic case retains its original assertions and limits and is
+not final qualification. All fourteen original gates and their consumer remain byte-identical;
+they execute without the collector only after the exact case passes. Profile SHA256 is
+`dc5764a8c0cf2bf8237c7c43ac0f7c2e3fe667e23753ef4f19a11bc59bab585a`;
+launcher SHA256 is `f0565b8a9507beda15ac769f0c530b2f20c8e7850f4fdd54e0b191e537859202`.
+Both transport hashes, shell syntax and DSR configuration pass before launch. R96 completes
+failed at 14:27:16 UTC: zero passes, one failure and zero ignores in 36.63 seconds. This time
+startup reaches the terminal; the unchanged real REST Step request then times out at its
+two-second HTTP wait before any palette Shutdown input. The preceding Applied Pause receipt
+still reports journal Pending. Diagnostic exit is 101, collector exit zero, wrapper exit one,
+and outer DSR exit six. Both executable hash bindings pass again after the case; none of the
+original fourteen verifier gates executes.
+
+The raw collector actually observes process 3091431/start 186319549 and storage TID 3091489,
+with TracerPid zero. At 14:26:32 UTC, syscall 74/descriptor 14 maps to the run's WAL through
+`ext4_sync_file` and file writeback. Separate samples at 14:26:32 and 14:26:33 bind descriptor
+eight to its WAL certificate through ext4/jbd2. These are separated observations, not a
+continuous wait or proof of the HTTP timeout's cause. The final record loses threads during
+exit and retains the errors. Neither R94's nor R95's unobserved startup stack is reconstructed.
+The complete copied collector matches SHA256
+`3ff46a8149cc62a653f7e3187672d1969697b7394ca2380ba3f9572933765926`;
+the exact failed-case log matches
+`7ef9bd4599133b50085711b90758a7f3790fa0fbd108833d3117f25d98299362`.
+No source, durability, compiler flag, acceptance criterion, deadline or golden changes.
+
+R97 prepares the unchanged original fourteen-step functional lane on a fresh Hz1 checkout.
+Two host reads observe zero I/O pressure, about 16 GB writable space and the same pinned
+DSR/toolchain. The complete existing source bundle is verified and cloned directly onto
+clean `main` at `460517d7`/tree `64667134`; configuration validates. This different worker is
+not the quantitative-latency or performance comparison class. No cross-class improvement
+or resolution of the intermittent latency cause is claimed. Source, compiler settings,
+original verifier and deadline remain unchanged. Dependency transport is still preparing;
+this functional run has not launched yet.
 
 The strict fast-forward at 12:51:53 UTC restores shared local `main` to `b38e7ffc`, tree
 `f5b0c89ef88f414ddca8309d11f53c383be1c4eb`. Its preflight observes clean tracked/index state,
@@ -1451,9 +1507,16 @@ as a working list when its original owners are fully qualified; retained evidenc
   refusal; preserve the completed launcher and create the task-owned prerequisite directory.
 - [x] Finish R94, preserve its original failed startup guard, all ten successful steps,
   failed/1 verdict and outer exit six; independently match all 277 proof files and eleven logs.
-- [ ] Re-execute R94's exact failed file-storage PTY startup in R95, observe its live owner
-  and storage state if it stalls, and resolve the demonstrated cause without weakening limits.
-  The unchanged original fourteen gates proceed only after the exact case actually passes.
+- [x] Re-execute R94's exact failed file-storage PTY startup in R95: 0/1/0, unchanged startup
+  and cleanup timeouts, outer failure six, and no original verifier steps reached. Copy and
+  independently hash all 21 retained files; preserve the missed live inspection honestly.
+- [x] Capture actual native file-synchronization waits in source-bound R96 using the exact
+  compiled diagnostic; preserve the WAL/certificate descriptor bindings and lost-thread errors.
+  Startup reaches the TUI, then the unchanged REST Step request times out. No causal fix.
+- [ ] Resolve the intermittent native latency's demonstrated cause without weakening limits;
+  keep historical startup causes separate from R96's actually observed synchronization waits.
+- [ ] Finish R97 dependency transport and execute all fourteen original functional gates on
+  the independently observed Hz1 worker; preserve actual source, class and outer disposition.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
   or changing compiler flags, original fourteen gates, deadlines or owner acceptance.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
@@ -1462,7 +1525,10 @@ as a working list when its original owners are fully qualified; retained evidenc
   economy-faults and analyzer build; keep original owner acceptance/dependencies unchanged.
 - [x] Restore the reviewed implementation to shared local `main` by strict fast-forward after
   exact-base, clean tracked/index and foreign-reservation checks; retain isolated recovery.
-  External-reset intent is unanswered, qualification remains incomplete and no push occurs.
+  This executes at 12:51:53 and 13:25:29 UTC, then external resets undo it at 13:37:57 and
+  13:39:08 UTC. Historical successful restoration does not describe the current shared checkout.
+- [ ] Resolve the repeated shared-reset intent before reintegration; preserve the complete
+  isolated candidate and source-pinned proofs. Qualification remains incomplete; no push occurs.
 - [x] Execute the original logger diagnostic, preserve the R68 observer failure and qualify
   only the actual 16/22-case logger scope through R71 with pinned Bash and exact child controls.
 - [x] Preserve and read back all 77/108 logger artifact entries and 35/40 raw command hashes.
