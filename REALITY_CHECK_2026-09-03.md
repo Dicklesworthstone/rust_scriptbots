@@ -565,9 +565,33 @@ prerequisite checked before launch. The original profile is unchanged, SHA256
 `c19b34475164c5f40f657b4e48a0e921e1b65f36911d5485806d45f99a8cf4f8`;
 the updated launcher is `2c0dc17982d0ba385bb69f39421a90313cb5984520017970b9e25a717b627602`.
 Source, verifier, compiler flags, four jobs, 7,200-second deadline and installed DSR identity
-remain pinned. R94 retains all fourteen original terminal gates and their strict consumer;
-its first six checks pass and workspace Clippy is compiling at 12:59 UTC. No final verdict is
-anticipated.
+remain pinned. R94 retains all fourteen original terminal gates and their strict consumer.
+Formatting, strict all-target workspace Clippy and the all-target compiler check pass at
+`460517d7`. The current-source runtime suite passes 233 tests with six existing ignores;
+terminal units pass 313 with zero failures or ignores. The end-to-end suite then fails one
+of five tests: `live_palette_shutdown_serializes_its_durable_receipt_before_restoration`
+times out at alternate-screen startup, before its palette command executes. The actual child
+prints its new file-database path, produces 314 raw terminal bytes and leaves a launch manifest
+and SQLite/WAL files; the failed probe has no lifecycle-finalized log. Its unchanged cleanup
+waits also time out. No live process remains at the subsequent observation. This does not
+establish a Shutdown-command defect or its cause. The later three headless tests pass.
+The original typed verdict is failed/1 with ten completed steps; outer DSR exits six at
+13:28:49 UTC. Smoke, manifest, analyzer and strict final evidence checks are not reached.
+The entire 277-file, 11,311,432-byte proof is copied to the existing root's
+`r94-terminal-proof/`; local and worker inventories match SHA256
+`69f7305cb88d96eb9b4a3c43f6673f3a635143ef6c46af5213510c460e9d8137`,
+and all eleven command-log hashes match. This is failed terminal qualification, with real
+bounded positive results retained.
+
+R95 re-executes that exact failed test first, requiring one actual pass, before retaining
+all fourteen original terminal gates and their consumer. It changes no source, assertion,
+timeout, build flag or acceptance criterion. Completed R94 profile/launcher preimages remain.
+The new profile SHA256 is `077c460c4651a7f79e11aa22d307fb6bbfd1b40812264f5b94557ee6f1a29f46`;
+launcher SHA256 is `1dc05c964ea1656b1128b0ee31ab79e61646735171fd628fde6f6ddacab59466`.
+Transport hashes and DSR configuration pass before launch at 13:39:56 UTC. The worker's later
+I/O pressure observation reports 82.13% some/75.27% full over ten seconds while foreign
+compiler jobs run; that later sample cannot be retroactively assigned as the startup failure's
+cause. R95 is still ongoing; no positive rerun or final acceptance is claimed.
 
 The strict fast-forward at 12:51:53 UTC restores shared local `main` to `b38e7ffc`, tree
 `f5b0c89ef88f414ddca8309d11f53c383be1c4eb`. Its preflight observes clean tracked/index state,
@@ -1425,8 +1449,11 @@ as a working list when its original owners are fully qualified; retained evidenc
 - [x] Prepare the original fourteen terminal gates on Hz4 without deleting existing files.
 - [x] Execute R93 at the clean pinned successor and retain its pre-compilation missing-target
   refusal; preserve the completed launcher and create the task-owned prerequisite directory.
-- [ ] Finish R94 with all fourteen original gates, strict consumer and actual outer disposition.
-  Resolve any product failure at its original named guard.
+- [x] Finish R94, preserve its original failed startup guard, all ten successful steps,
+  failed/1 verdict and outer exit six; independently match all 277 proof files and eleven logs.
+- [ ] Re-execute R94's exact failed file-storage PTY startup in R95, observe its live owner
+  and storage state if it stalls, and resolve the demonstrated cause without weakening limits.
+  The unchanged original fourteen gates proceed only after the exact case actually passes.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
   or changing compiler flags, original fourteen gates, deadlines or owner acceptance.
 - [ ] Finish all fourteen unchanged terminal gates and strict retained-evidence consumer at the
