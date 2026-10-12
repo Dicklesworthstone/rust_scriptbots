@@ -5280,7 +5280,10 @@ mod tests {
 
         let response = runtime.block_on(handle_mcp_http_notification(
             State(state.clone()),
-            Json(JsonRpcRequest::notification("notifications/initialized", None)),
+            Json(JsonRpcRequest::notification(
+                "notifications/initialized",
+                None,
+            )),
         ));
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = runtime
@@ -5303,7 +5306,10 @@ mod tests {
             ));
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(completions.load(Ordering::SeqCst), 1);
-            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
         }
     }
 
@@ -6263,8 +6269,10 @@ mod tests {
         let expected = TickSummaryDto::from(expected);
         let queued_handle = handle.clone();
         let websocket_handle = handle.clone();
-        let mcp_state =
-            mcp_http_test_state(handle.clone(), ServerBuilder::new("http-dispatch-test", "0"));
+        let mcp_state = mcp_http_test_state(
+            handle.clone(),
+            ServerBuilder::new("http-dispatch-test", "0"),
+        );
         let state = ApiState {
             handle,
             scenario: None,
