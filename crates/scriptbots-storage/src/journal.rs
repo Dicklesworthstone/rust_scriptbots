@@ -45,7 +45,8 @@ const DEFAULT_JOURNAL_IDENTITY_CAPACITY: usize = 512;
 const DEFAULT_EVENT_PAGE_BYTES: usize = 256 << 20;
 const MAX_JOURNAL_BYTES: usize = 1 << 30;
 // Version 4: `scientific` and `persistence` are deflated sections (`bd-nvqh`).
-pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 4;
+// V5 binds the explicit placement policy in ApplyMap command evidence.
+pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 5;
 
 /// Bounded admission and catch-up limits for one HostCore journal adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,7 +711,8 @@ enum HostCommandPostcardV1 {
     UpdateConfig(#[serde(with = "config_command_wire")] Box<ScriptBotsConfig>),
     Shutdown,
     // The durable discriminant order is append-only. New command kinds belong
-    // after the original six variants so existing V1 archives remain decodable.
+    // after the original six variants. The archive payload version identifies
+    // layout changes within a command, including V5's explicit map placement.
     UpdateSelection(SelectionUpdate),
     AdjustAgentMutationRates {
         agent_uid: u64,
@@ -739,7 +741,10 @@ enum HostCommandPostcardV1 {
         speed_bits: Option<u32>,
         step_once: bool,
     },
-    ApplyMap(Box<MapArtifact>),
+    ApplyMap {
+        artifact: Box<MapArtifact>,
+        reposition_agents: bool,
+    },
     /// An intervention as its canonical postcard parameter bytes. `Intervention` and `Region`
     /// are internally tagged serde enums, which postcard can encode but can never decode
     /// (`deserialize_any`), so embedding the command made every journaled intervention
@@ -794,7 +799,13 @@ impl HostCommandPostcardV1 {
                 origin_island: origin_island.0,
                 origin_uid: origin_uid.get(),
             },
-            HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.clone()),
+            HostCommand::ApplyMap {
+                artifact,
+                reposition_agents,
+            } => Self::ApplyMap {
+                artifact: artifact.clone(),
+                reposition_agents: *reposition_agents,
+            },
             HostCommand::Intervention(cmd) => Self::Intervention {
                 params: scriptbots_core::interventions::canonical_param_bytes(&cmd.intervention),
                 surface: cmd.surface,
@@ -850,7 +861,13 @@ impl HostCommandPostcardV1 {
                 origin_island: IslandId(origin_island),
                 origin_uid: AgentUid(origin_uid),
             },
-            Self::ApplyMap(artifact) => HostCommand::ApplyMap(artifact),
+            Self::ApplyMap {
+                artifact,
+                reposition_agents,
+            } => HostCommand::ApplyMap {
+                artifact,
+                reposition_agents,
+            },
             Self::Intervention {
                 params,
                 surface,
@@ -908,7 +925,10 @@ enum HostCommandPostcardRefV1<'a> {
         speed_bits: Option<u32>,
         step_once: bool,
     },
-    ApplyMap(&'a MapArtifact),
+    ApplyMap {
+        artifact: &'a MapArtifact,
+        reposition_agents: bool,
+    },
     // Canonical parameter bytes, as in the owned enum; `&str` encodes as `String` does.
     Intervention {
         params: Vec<u8>,
@@ -959,7 +979,13 @@ impl<'a> HostCommandPostcardRefV1<'a> {
                 origin_island: origin_island.0,
                 origin_uid: origin_uid.get(),
             },
-            HostCommand::ApplyMap(artifact) => Self::ApplyMap(artifact.as_ref()),
+            HostCommand::ApplyMap {
+                artifact,
+                reposition_agents,
+            } => Self::ApplyMap {
+                artifact: artifact.as_ref(),
+                reposition_agents: *reposition_agents,
+            },
             HostCommand::Intervention(cmd) => Self::Intervention {
                 params: scriptbots_core::interventions::canonical_param_bytes(&cmd.intervention),
                 surface: cmd.surface,
@@ -3981,7 +4007,7 @@ mod tests {
             "owner patch cannot carry a persistence tail"
         );
 
-        for version in [2, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
+        for version in [2, 4, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
             let mut stale = scheduled_archive(evidence.clone());
             stale.version = version;
             assert!(
@@ -6370,26 +6396,38 @@ mod tests {
             metadata,
         )
         .expect("valid test artifact");
-        let command = HostCommand::ApplyMap(Box::new(artifact.clone()));
-        let owned = HostCommandPostcardV1::from_runtime(&command);
-        let borrowed = HostCommandPostcardRefV1::from_runtime(&command);
-        let bytes = postcard::to_allocvec(&owned).expect("owned command bytes");
-        assert_eq!(
-            bytes,
-            postcard::to_allocvec(&borrowed).expect("borrowed command bytes")
-        );
-        let decoded: HostCommandPostcardV1 =
-            postcard::from_bytes(&bytes).expect("durable command readback");
-        let HostCommand::ApplyMap(decoded_artifact) =
-            decoded.into_runtime("test").expect("decodes")
-        else {
-            panic!("apply map command discriminant changed");
-        };
-        assert_eq!(decoded_artifact.as_ref(), &artifact);
-        assert_eq!(
-            decoded_artifact.scientific_content_hash(),
-            artifact.scientific_content_hash()
-        );
+        let mut policy_bytes = Vec::new();
+        for reposition_agents in [false, true] {
+            let command = HostCommand::ApplyMap {
+                artifact: Box::new(artifact.clone()),
+                reposition_agents,
+            };
+            let owned = HostCommandPostcardV1::from_runtime(&command);
+            let borrowed = HostCommandPostcardRefV1::from_runtime(&command);
+            let bytes = postcard::to_allocvec(&owned).expect("owned command bytes");
+            assert_eq!(
+                bytes,
+                postcard::to_allocvec(&borrowed).expect("borrowed command bytes")
+            );
+            let decoded: HostCommandPostcardV1 =
+                postcard::from_bytes(&bytes).expect("durable command readback");
+            let decoded = decoded.into_runtime("test").expect("decodes");
+            assert_eq!(decoded, command);
+            let HostCommand::ApplyMap {
+                artifact: decoded_artifact,
+                ..
+            } = decoded
+            else {
+                panic!("apply map command discriminant changed");
+            };
+            assert_eq!(decoded_artifact.as_ref(), &artifact);
+            assert_eq!(
+                decoded_artifact.scientific_content_hash(),
+                artifact.scientific_content_hash()
+            );
+            policy_bytes.push(bytes);
+        }
+        assert_ne!(policy_bytes[0], policy_bytes[1]);
     }
 
     #[test]

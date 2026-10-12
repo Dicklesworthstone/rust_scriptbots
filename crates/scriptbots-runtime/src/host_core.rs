@@ -4861,10 +4861,16 @@ impl HostCore {
                 next_control,
                 true,
             ),
-            HostCommand::ApplyMap(artifact) => self.apply_world_control_command(
+            HostCommand::ApplyMap {
+                artifact,
+                reposition_agents,
+            } => self.apply_world_control_command(
                 admission,
                 &retry_envelope,
-                ControlCommand::ApplyMap(artifact),
+                ControlCommand::ApplyMap {
+                    artifact,
+                    reposition_agents,
+                },
                 next_control,
                 true,
             ),
@@ -4983,7 +4989,7 @@ impl HostCore {
                     | HostCommand::SpawnCrossover { .. }
                     | HostCommand::Emigrate { .. }
                     | HostCommand::Immigrate { .. }
-                    | HostCommand::ApplyMap(_)
+                    | HostCommand::ApplyMap { .. }
                     | HostCommand::Intervention(_)
             )
         {
@@ -5050,7 +5056,7 @@ impl HostCore {
                     .ok_or_else(|| protocol_violation("scientific revision exhausted"))
             })
             .transpose()?;
-        let is_apply_map = matches!(command, ControlCommand::ApplyMap(_));
+        let is_apply_map = matches!(command, ControlCommand::ApplyMap { .. });
         match apply_control_command(&mut self.world, command) {
             Ok(ControlDisposition::WorldApplied) => {
                 if is_apply_map {
@@ -13279,7 +13285,14 @@ mod tests {
 
         let initial_terrain_rev = initial_snapshot.layers.revisions.terrain;
 
-        let status = submit(&mut port, 1, HostCommand::ApplyMap(Box::new(changed_map)));
+        let status = submit(
+            &mut port,
+            1,
+            HostCommand::ApplyMap {
+                artifact: Box::new(changed_map),
+                reposition_agents: false,
+            },
+        );
         assert_eq!(status.application(), &ApplicationState::Admitted);
 
         core.drive(ManualInstant::from_nanos(0))

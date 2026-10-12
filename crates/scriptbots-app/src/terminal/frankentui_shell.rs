@@ -809,7 +809,7 @@ impl Model for FrankenTuiModel {
                     ControlCommand::AdjustAgentMutationRates { .. } => "AdjustMutation",
                     ControlCommand::UpdateSimulation(_) => "UpdateSim",
                     ControlCommand::Shutdown => "Shutdown",
-                    ControlCommand::ApplyMap(_) => "ApplyMap",
+                    ControlCommand::ApplyMap { .. } => "ApplyMap",
                     ControlCommand::Intervention(_) => "Intervention",
                 };
                 if self.enqueue_effect(ShellEffect::SubmitCommand(cmd)) {

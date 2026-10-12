@@ -624,7 +624,8 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 
 ### Procedural maps (WFC sandbox; in progress)
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
-- Production CLI/REST/MCP generation and application remain unconnected (`bd-2z0.10.6`); the later interactive rule/sample sandbox and its real-process/native acceptance are tracked by `bd-2z0.10.7` and `bd-2z0.10.8`. Core generation and application APIs do not yet provide that user workflow. The hydrology system builds atop terrain for dynamic water flows (see below).
+- CLI `map-generate`/`map-apply`, REST `/api/v1/map/generate` and `/api/v1/map/apply`, and MCP `map_generate`/`map_apply` use the shared map service and acknowledged owner commands. Map application retains agents by default. CLI `map-apply --file map.json --reposition-agents`, or REST/MCP `reposition_agents: true`, moves agents on deep water to the nearest non-deep-water tile using wrapped distance and row-major tie breaking. If no such tile exists for a present agent, application fails without changing the world; inspect the command's application and journal statuses separately.
+- Placement is included in the durable command and replayed explicitly. Host archive v5 refuses older archives rather than guessing the policy. The interactive rule/sample sandbox and its real-process/native acceptance remain open under `bd-2z0.10.7` and `bd-2z0.10.8`; the hydrology system builds atop terrain for dynamic water flows (see below).
 
 ### Hydrology snapshot (experimental)
 - Runtime hydrology state models per-cell flow direction, accumulation, basins, and a water depth field. Use `GET /api/hydrology` for a snapshot with:

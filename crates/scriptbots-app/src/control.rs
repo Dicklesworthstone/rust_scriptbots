@@ -300,6 +300,9 @@ pub struct MapApplyRequestBody {
     /// Map artifact payload: either a JSON representation of MapArtifact or a base64/hex postcard string, or file path.
     #[schema(value_type = Object)]
     pub artifact: Value,
+    /// Move agents on deep water to the nearest non-deep-water tile; defaults to retaining positions.
+    #[serde(default)]
+    pub reposition_agents: bool,
     /// Optional idempotency key to prevent double application on retry.
     pub idempotency_key: Option<String>,
 }
@@ -2753,10 +2756,14 @@ impl ControlHandle {
     pub fn apply_map(
         &self,
         artifact: MapArtifact,
+        reposition_agents: bool,
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
         self.submit_control_command_with_key(
-            ControlCommand::ApplyMap(Box::new(artifact)),
+            ControlCommand::ApplyMap {
+                artifact: Box::new(artifact),
+                reposition_agents,
+            },
             idempotency_key,
         )
     }
@@ -3391,7 +3398,7 @@ pub(crate) mod tests {
             observed
         }
 
-        fn wait_finished(&self, command_id: &str) -> CommandStatusDto {
+        pub(crate) fn wait_finished(&self, command_id: &str) -> CommandStatusDto {
             let handle = self.handle();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
@@ -5175,7 +5182,7 @@ pub(crate) mod tests {
             .expect("generate valid map");
 
         let status = handle
-            .apply_map(artifact, None)
+            .apply_map(artifact, false, None)
             .expect("apply valid map command");
         assert_eq!(status.application_state, APPLICATION_STATE_ADMITTED);
 
@@ -5192,7 +5199,7 @@ pub(crate) mod tests {
             .generate_map(width + 10, height + 10, Some(cell_size), 42, None)
             .expect("generate mismatched map");
         let status_bad = handle
-            .apply_map(bad_artifact, None)
+            .apply_map(bad_artifact, false, None)
             .expect("submit mismatched map");
         let observed_bad = host.wait_finished(&status_bad.command_id);
         assert_eq!(observed_bad.application_state, "failed");

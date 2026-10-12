@@ -1527,7 +1527,12 @@ pub enum ControlCommand {
     /// Request simulation shutdown.
     Shutdown,
     /// Replace the world environment with a validated procedural map artifact.
-    ApplyMap(Box<map_sandbox::MapArtifact>),
+    ApplyMap {
+        /// Validated replacement environment.
+        artifact: Box<map_sandbox::MapArtifact>,
+        /// Move agents on deep water to the nearest non-deep-water tile.
+        reposition_agents: bool,
+    },
     /// Operator intervention applied at a simulation tick boundary (bd-16g.10.2).
     Intervention(Box<interventions::InterventionCommand>),
 }
@@ -1624,7 +1629,7 @@ impl ControlCommand {
                     Ok(())
                 }
             }
-            Self::ApplyMap(artifact) => artifact
+            Self::ApplyMap { artifact, .. } => artifact
                 .validate()
                 .map_err(|_| WorldStateError::InvalidConfig("invalid map artifact")),
             Self::Intervention(cmd) => cmd.intervention.validate(),
@@ -1700,8 +1705,16 @@ pub fn apply_control_command(
             step_once: false,
         })),
         ControlCommand::Shutdown => Ok(ControlDisposition::WorldApplied),
-        ControlCommand::ApplyMap(artifact) => {
-            world.apply_map_artifact(&artifact)?;
+        ControlCommand::ApplyMap {
+            artifact,
+            reposition_agents,
+        } => {
+            let policy = if reposition_agents {
+                map_sandbox::ExistingAgentPolicy::RepositionToSafeTile
+            } else {
+                map_sandbox::ExistingAgentPolicy::Retain
+            };
+            world.apply_map_artifact_with_policy(&artifact, policy)?;
             Ok(ControlDisposition::WorldApplied)
         }
         ControlCommand::Intervention(cmd) => {
@@ -20348,6 +20361,123 @@ mod map_sandbox {
                 "agent on deep water must be culled under CullIncompatible"
             );
         }
+
+        fn placement_fixture(safe_cells: &[usize]) -> (crate::WorldState, MapArtifact) {
+            let world = crate::WorldState::new(crate::ScriptBotsConfig {
+                world_width: 48,
+                world_height: 48,
+                food_cell_size: 16,
+                rng_seed: Some(123),
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                ..crate::ScriptBotsConfig::default()
+            })
+            .expect("placement world");
+            let generated = RuleBasedMapGenerator::new(default_tileset_spec())
+                .expect("tileset")
+                .generate(3, 3, 16, 123)
+                .expect("map");
+            let mut tiles = vec![grass_tile(); 9];
+            for tile in &mut tiles {
+                tile.kind = TerrainKind::DeepWater;
+            }
+            for &index in safe_cells {
+                tiles[index].kind = TerrainKind::Grass;
+            }
+            let artifact = MapArtifact::new(
+                TerrainLayer::new(3, 3, 16, tiles).expect("terrain"),
+                None,
+                None,
+                None,
+                None,
+                generated.metadata().clone(),
+            )
+            .expect("placement artifact");
+            (world, artifact)
+        }
+
+        #[test]
+        fn map_reposition_uses_both_toroidal_seams_and_stable_ties() {
+            use crate::{AgentData, ControlCommand, Position, Tick, apply_control_command};
+
+            for (position, safe, expected) in [
+                (Position::new(1.0, 24.0), [4, 5], Position::new(40.0, 24.0)),
+                (Position::new(24.0, 1.0), [4, 7], Position::new(24.0, 40.0)),
+                (Position::new(24.0, 24.0), [3, 5], Position::new(8.0, 24.0)),
+            ] {
+                let (mut world, artifact) = placement_fixture(&safe);
+                let id = world
+                    .try_spawn_agent(AgentData {
+                        position,
+                        ..AgentData::default()
+                    })
+                    .expect("agent");
+                for reposition_agents in [false, true] {
+                    apply_control_command(
+                        &mut world,
+                        ControlCommand::ApplyMap {
+                            artifact: Box::new(artifact.clone()),
+                            reposition_agents,
+                        },
+                    )
+                    .expect("map command");
+                    assert_eq!(
+                        world.agents().snapshot(id).expect("survivor").position,
+                        if reposition_agents {
+                            expected
+                        } else {
+                            position
+                        }
+                    );
+                    assert_eq!(world.tick(), Tick(0));
+                    assert_eq!(world.agents().len(), 1);
+                }
+            }
+        }
+
+        #[test]
+        fn map_reposition_rejects_all_water_atomically_but_allows_empty_world() {
+            use crate::{
+                AgentData, ControlCommand, Position, WorldStateError, apply_control_command,
+            };
+
+            let (mut world, artifact) = placement_fixture(&[]);
+            world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(56.0, 8.0),
+                    ..AgentData::default()
+                })
+                .expect("finite out-of-bounds agent");
+            let before = world.world_digest_v1().expect("initial digest");
+            let result = apply_control_command(
+                &mut world,
+                ControlCommand::ApplyMap {
+                    artifact: Box::new(artifact.clone()),
+                    reposition_agents: true,
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(WorldStateError::InvalidConfig(
+                    "map has no safe tile for repositioning existing agents"
+                ))
+            ));
+            assert_eq!(world.world_digest_v1().expect("after refusal"), before);
+            assert!(world.map_metadata().is_none());
+
+            let (mut empty, _) = placement_fixture(&[]);
+            apply_control_command(
+                &mut empty,
+                ControlCommand::ApplyMap {
+                    artifact: Box::new(artifact),
+                    reposition_agents: true,
+                },
+            )
+            .expect("an empty world needs no safe agent placement");
+            assert!(empty.map_metadata().is_some());
+            assert!(empty.agents().is_empty());
+        }
     }
 }
 
@@ -31565,8 +31695,10 @@ impl WorldState {
                 }
             }
             ExistingAgentPolicy::RepositionToSafeTile => {
-                let columns = self.agents.columns_mut();
-                for pos in columns.positions_mut() {
+                // Resolve every position before mutating the world: an impossible placement
+                // must not normalize or relocate earlier agents in a rejected command.
+                let mut positions = self.agents.columns().positions().to_vec();
+                for pos in &mut positions {
                     pos.x = pos.x.rem_euclid(world_w);
                     pos.y = pos.y.rem_euclid(world_h);
                     let cell_x = cell_of(pos.x, candidate_terrain.width());
@@ -31583,8 +31715,10 @@ impl WorldState {
                                 {
                                     let center_x = (tx as f32 + 0.5) * cell_sz;
                                     let center_y = (ty as f32 + 0.5) * cell_sz;
-                                    let dx = center_x - pos.x;
-                                    let dy = center_y - pos.y;
+                                    let dx = (center_x - pos.x).abs();
+                                    let dy = (center_y - pos.y).abs();
+                                    let dx = dx.min(world_w - dx);
+                                    let dy = dy.min(world_h - dy);
                                     // Keep the separate multiply-add: mul_add would change
                                     // the scientific result of which tile is nearest.
                                     #[allow(clippy::suboptimal_flops)]
@@ -31596,11 +31730,18 @@ impl WorldState {
                                 }
                             }
                         }
-                        if best_dist_sq < f32::MAX {
-                            *pos = best_target;
+                        if best_dist_sq == f32::MAX {
+                            return Err(WorldStateError::InvalidConfig(
+                                "map has no safe tile for repositioning existing agents",
+                            ));
                         }
+                        *pos = best_target;
                     }
                 }
+                self.agents
+                    .columns_mut()
+                    .positions_mut()
+                    .copy_from_slice(&positions);
             }
             ExistingAgentPolicy::CullIncompatible => {
                 let handles: Vec<_> = self.agents.iter_handles().collect();

@@ -10,6 +10,30 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-12
 
+Current map-placement work (`bd-2z0.10.7`):
+
+- [x] Inspect the production policy and consumers: live map commands always retain agents;
+  repositioning ignores toroidal distance and silently leaves agents on an all-water map.
+- [ ] Stage candidate positions and commit only after every placement succeeds.
+- [ ] Test horizontal/vertical seams, deterministic ties, retain default, failed-map digest
+  preservation and successful all-water application to an empty world.
+- [ ] Carry `reposition_agents` through CLI, REST, MCP, control handle and sole-owner commands.
+- [ ] Preserve the explicit policy through owned/borrowed journal codecs and offline replay;
+  version the changed archive and prove both policy values survive readback.
+- [ ] Exercise real REST/MCP owner results, malformed policy rejection and failed placement.
+- [ ] Run pinned DSR formatting, all-target workspace check, strict Clippy and affected tests.
+- [ ] Review source, export Beads, publish exact reviewed commits and retain evidence.
+- [ ] Complete the original editor/sample/native-input/expected-revision acceptance. This
+  broader bead stays open; culling still bypasses death accounting and requires a separate
+  boundary-aware repair within its existing scope.
+
+Creation worksheet (2026-10-12): this TODO is process; its consumer is the user who explicitly
+requested a granular complete TODO, its gate is that requested handoff, and its observed
+defect is the missing map-policy consumer above. Active checkboxes retire when the original
+task is qualified; historical evidence remains. The integrity exception is unnecessary
+(no additional recovery artifact is being proposed). An hour on the existing map command
+delivers more value than another report; verdict: minimum requested TODO, then source work.
+
 The source changes through saved commit `c37ea6ebf3bfacd5ba0fb780584318940ce3e786`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-

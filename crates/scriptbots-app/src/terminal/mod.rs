@@ -2272,7 +2272,7 @@ impl<'a> TerminalApp<'a> {
             ControlCommand::Step => "Step",
             ControlCommand::SetSpeed(_) => "SetSpeed",
             ControlCommand::Shutdown => "Shutdown",
-            ControlCommand::ApplyMap(_) => "ApplyMap",
+            ControlCommand::ApplyMap { .. } => "ApplyMap",
             ControlCommand::Intervention(_) => "Intervention",
         }
         .to_owned();

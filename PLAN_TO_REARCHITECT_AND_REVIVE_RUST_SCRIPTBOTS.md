@@ -2328,6 +2328,11 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] `bd-2z0.10.7`, 2026-10-12:** connect the existing safe-placement
+policy to acknowledged CLI/REST/MCP map application and durable replay. Correct wrapped
+nearest-tile selection and reject all-water placement without partial world edits. The
+interactive editor, sample mode, native input acceptance and culling accounting remain open.
+
 Priorities are `P0` correctness/blocking, `P1` usable product, `P2` scientific expansion, and `P3` optional reach.
 
 ### Phase 0 — Establish Truth and Reproducibility (`P0`)

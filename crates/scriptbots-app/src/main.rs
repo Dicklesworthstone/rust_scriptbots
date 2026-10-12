@@ -5910,7 +5910,13 @@ fn recorded_operator_commands(
                     HostCommand::SpawnCrossover { parent_a, parent_b } => {
                         ControlCommand::SpawnCrossover { parent_a, parent_b }
                     }
-                    HostCommand::ApplyMap(artifact) => ControlCommand::ApplyMap(artifact),
+                    HostCommand::ApplyMap {
+                        artifact,
+                        reposition_agents,
+                    } => ControlCommand::ApplyMap {
+                        artifact,
+                        reposition_agents,
+                    },
                     HostCommand::Emigrate { .. } | HostCommand::Immigrate { .. } => bail!(
                         "the recording migrated agents between islands at tick {}; replaying an \
                          archipelago run is not supported by --replay-db",

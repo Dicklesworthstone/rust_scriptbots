@@ -1863,7 +1863,12 @@ pub enum HostCommand {
     /// Apply pause, speed, and an optional single step as one ordered command.
     UpdateSimulation(SimulationCommand),
     /// Replace the active world map with a pre-generated map artifact.
-    ApplyMap(Box<scriptbots_core::MapArtifact>),
+    ApplyMap {
+        /// Validated replacement environment.
+        artifact: Box<scriptbots_core::MapArtifact>,
+        /// Move agents on deep water to the nearest non-deep-water tile.
+        reposition_agents: bool,
+    },
     /// Apply an intervention command with canonical metadata and parameters.
     Intervention(Box<scriptbots_core::interventions::InterventionCommand>),
     /// Persist the partial cadence tail now, without advancing a tick (bd-2mpi).
@@ -1925,7 +1930,7 @@ impl HostCommand {
                     message: "crossover parents must be distinct".to_owned(),
                 })
             }
-            Self::ApplyMap(artifact) => {
+            Self::ApplyMap { artifact, .. } => {
                 artifact
                     .validate()
                     .map_err(|error| CommandValidationError::InvalidWorldCommand {
@@ -1960,7 +1965,7 @@ impl HostCommand {
             | Self::Emigrate { .. }
             | Self::Immigrate { .. }
             | Self::UpdateSimulation(_)
-            | Self::ApplyMap(_)
+            | Self::ApplyMap { .. }
             | Self::Intervention(_)
             | Self::FlushPersistence
             | Self::Shutdown => true,
@@ -2030,7 +2035,13 @@ impl TryFrom<ControlCommand> for HostCommand {
                 Ok(Self::SetSpeed(speed.clamp(0.0, 32.0)))
             }
             ControlCommand::Shutdown => Ok(Self::Shutdown),
-            ControlCommand::ApplyMap(artifact) => Ok(Self::ApplyMap(artifact)),
+            ControlCommand::ApplyMap {
+                artifact,
+                reposition_agents,
+            } => Ok(Self::ApplyMap {
+                artifact,
+                reposition_agents,
+            }),
             ControlCommand::Intervention(cmd) => Ok(Self::Intervention(cmd)),
         }
     }
@@ -7750,7 +7761,7 @@ mod tests {
                     | HostCommand::SpawnCrossover { .. }
                     | HostCommand::Emigrate { .. }
                     | HostCommand::Immigrate { .. }
-                    | HostCommand::ApplyMap(_)
+                    | HostCommand::ApplyMap { .. }
                     | HostCommand::Intervention(_) => {
                         self.revisions.scientific =
                             self.revisions.scientific.checked_next().ok_or_else(|| {

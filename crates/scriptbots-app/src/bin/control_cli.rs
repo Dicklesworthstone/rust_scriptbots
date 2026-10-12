@@ -176,6 +176,9 @@ enum Command {
         /// Path to map artifact file (postcard binary or JSON).
         #[arg(long, short)]
         file: PathBuf,
+        /// Move agents on deep water to the nearest non-deep-water tile.
+        #[arg(long)]
+        reposition_agents: bool,
     },
     /// Apply an environmental or population intervention via REST.
     Intervene {
@@ -394,8 +397,11 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 }
-                Command::MapApply { file } => {
-                    map_apply_command(&client, &cli.base_url, file, key).await?
+                Command::MapApply {
+                    file,
+                    reposition_agents,
+                } => {
+                    map_apply_command(&client, &cli.base_url, file, reposition_agents, key).await?
                 }
                 Command::Intervene { sub } => {
                     intervene_command(&client, &cli.base_url, sub, key).await?
@@ -1422,6 +1428,7 @@ async fn map_apply_command(
     client: &Client,
     base_url: &str,
     file: PathBuf,
+    reposition_agents: bool,
     idempotency_key: Option<&str>,
 ) -> Result<()> {
     let bytes =
@@ -1442,6 +1449,7 @@ async fn map_apply_command(
 
     let body = serde_json::json!({
         "artifact": artifact_val,
+        "reposition_agents": reposition_agents,
         "idempotency_key": idempotency_key,
     });
 
@@ -1914,6 +1922,32 @@ fn json_pointer(path: &str) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn map_apply_placement_is_explicit_and_defaults_to_retain() {
+        for (arguments, expected) in [
+            (vec!["control", "map-apply", "--file", "map.json"], false),
+            (
+                vec![
+                    "control",
+                    "map-apply",
+                    "--file",
+                    "map.json",
+                    "--reposition-agents",
+                ],
+                true,
+            ),
+        ] {
+            let parsed = Cli::try_parse_from(arguments).expect("map CLI");
+            let Command::MapApply {
+                reposition_agents, ..
+            } = parsed.command
+            else {
+                panic!("map command expected");
+            };
+            assert_eq!(reposition_agents, expected);
+        }
+    }
 
     /// The CLI must recover the pollable id from a real receipt body.
     ///

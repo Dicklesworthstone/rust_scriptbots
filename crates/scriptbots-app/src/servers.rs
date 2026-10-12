@@ -2767,7 +2767,12 @@ async fn post_map_apply(
     let key = idempotency_key(&headers).or(payload.idempotency_key);
     let artifact = parse_map_artifact(&payload.artifact)?;
 
-    let status = run_control(move || state.handle.apply_map(artifact, key.as_deref())).await?;
+    let status = run_control(move || {
+        state
+            .handle
+            .apply_map(artifact, payload.reposition_agents, key.as_deref())
+    })
+    .await?;
 
     Ok(Json(status))
 }
@@ -3557,13 +3562,14 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "map_apply",
-        "Apply a procedural map artifact to the running simulation",
+        "Apply a procedural map artifact; optionally move deep-water agents to the nearest non-deep-water tile",
         json!({
             "type": "object",
             "properties": {
                 "artifact": {
                     "description": "Map artifact as a JSON object, file path, raw JSON string, or hex-encoded postcard"
                 },
+                "reposition_agents": {"type": "boolean", "default": false},
                 "idempotency_key": {"type": "string"}
             },
             "required": ["artifact"],
@@ -4279,7 +4285,18 @@ impl ToolHandler for ControlTool {
                 let key = mcp_idempotency_key(&arguments);
                 let id_key = key.as_deref();
                 let handle = self.handle.clone();
-                let status = run_control_mcp_sync(move || handle.apply_map(artifact, id_key))?;
+                let reposition_agents = match arguments.get("reposition_agents") {
+                    None => false,
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            "'reposition_agents' must be a boolean",
+                        )
+                    })?,
+                };
+                let status = run_control_mcp_sync(move || {
+                    handle.apply_map(artifact, reposition_agents, id_key)
+                })?;
                 make_tool_result(status)
             }
             ControlToolKind::Intervene => {
@@ -5914,6 +5931,143 @@ mod tests {
                 .last_applied_command
                 .is_none()
         );
+    }
+
+    async fn map_policy_mcp_request(state: &McpHttpState, request: Value) -> Value {
+        let response = handle_mcp_http_request(
+            State(state.clone()),
+            Json(serde_json::from_value(request).expect("MCP request")),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .expect("MCP response body");
+        serde_json::from_slice(&bytes).expect("MCP response JSON")
+    }
+
+    #[tokio::test]
+    async fn map_apply_rest_and_mcp_dispatch_preserve_placement_and_owner_results() {
+        use scriptbots_core::{AgentData, MapArtifact, Position, TerrainKind, TerrainLayer};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 48,
+            world_height: 48,
+            food_cell_size: 16,
+            rng_seed: Some(123),
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        world
+            .try_spawn_agent(AgentData {
+                position: Position::new(1.0, 24.0),
+                ..AgentData::default()
+            })
+            .expect("agent");
+        let host = crate::control::tests::TestHost::spawn(world);
+        let handle = host.handle();
+        let generated = handle.generate_map(3, 3, Some(16), 123, None).expect("map");
+        let artifact = |safe: &[usize]| {
+            let mut tiles = generated.terrain().tiles().to_vec();
+            for tile in &mut tiles {
+                tile.kind = TerrainKind::DeepWater;
+            }
+            for &index in safe {
+                tiles[index].kind = TerrainKind::Grass;
+            }
+            MapArtifact::new(
+                TerrainLayer::new(3, 3, 16, tiles).expect("terrain"),
+                None,
+                None,
+                None,
+                None,
+                generated.metadata().clone(),
+            )
+            .expect("artifact")
+        };
+        let safe = artifact(&[4, 5]);
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let request = serde_json::from_value(json!({"artifact": safe})).expect("default policy");
+        let Json(retained) = post_map_apply(State(state.clone()), HeaderMap::new(), Json(request))
+            .await
+            .expect("REST map admission");
+        host.wait_applied(&retained);
+        let before = handle.read_snapshot().expect("retained snapshot");
+        assert_eq!(before.world.agents[0].position, [1.0, 24.0]);
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("map-policy", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "map-policy", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let invalid = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "map_apply", "arguments": {"artifact": safe,
+                    "reposition_agents": "yes"}}
+            }),
+        )
+        .await;
+        assert_eq!(
+            invalid["error"]["code"],
+            i32::from(McpErrorCode::InvalidParams)
+        );
+        let result = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "map_apply", "arguments": {"artifact": safe,
+                    "reposition_agents": true}}
+            }),
+        )
+        .await;
+        assert!(result.get("error").is_none(), "{result}");
+        let moved: CommandStatusDto = serde_json::from_str(
+            result["result"]["content"][0]["text"]
+                .as_str()
+                .expect("receipt text"),
+        )
+        .expect("owner receipt");
+        assert_eq!(
+            moved.admission_sequence,
+            retained.admission_sequence.map(|seq| seq + 1)
+        );
+        host.wait_applied(&moved);
+        let placed = handle.read_snapshot().expect("placed snapshot");
+        assert_eq!(placed.world.agents[0].position, [40.0, 24.0]);
+        assert_eq!(placed.world.tick, before.world.tick);
+        assert!(placed.revisions.scientific > before.revisions.scientific);
+        let Json(failed) = post_map_apply(
+            State(state),
+            HeaderMap::new(),
+            Json(MapApplyRequestBody {
+                artifact: serde_json::to_value(artifact(&[])).expect("all-water map"),
+                reposition_agents: true,
+                idempotency_key: None,
+            }),
+        )
+        .await
+        .expect("admit impossible placement");
+        assert_eq!(
+            host.wait_finished(&failed.command_id).application_state,
+            "failed"
+        );
+        let after = handle.read_snapshot().expect("refused snapshot");
+        assert_eq!(after.world.agents, placed.world.agents);
+        assert_eq!(after.layers.terrain, placed.layers.terrain);
+        assert_eq!(after.revisions.scientific, placed.revisions.scientific);
     }
 
     #[tokio::test]
