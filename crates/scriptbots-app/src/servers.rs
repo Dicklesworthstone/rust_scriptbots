@@ -6022,12 +6022,16 @@ mod tests {
         .expect("changed exemplar generation");
         let changed: MapArtifact = serde_json::from_value(changed).expect("changed artifact");
         assert!(
-            changed.terrain()
+            changed
+                .terrain()
                 .tiles()
                 .iter()
                 .all(|tile| tile.kind == TerrainKind::Grass)
         );
-        assert_ne!(changed.metadata().tileset_hash, rest.metadata().tileset_hash);
+        assert_ne!(
+            changed.metadata().tileset_hash,
+            rest.metadata().tileset_hash
+        );
 
         let invalid = [
             json!({"width": 4_294_967_296_u64}),
