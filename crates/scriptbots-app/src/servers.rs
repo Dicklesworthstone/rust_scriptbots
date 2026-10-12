@@ -5235,7 +5235,9 @@ mod tests {
     fn mcp_notify_dispatches_notifications_and_rejects_requests() {
         use fastmcp_rust::McpContext;
         use fastmcp_server::Middleware;
+        use scriptbots_runtime::{HostEventKind, HostPort, ProtocolEventSequence};
         use std::sync::atomic::AtomicUsize;
+        use std::time::Instant;
 
         struct CompletedNotification(Arc<AtomicUsize>);
 
@@ -5253,7 +5255,16 @@ mod tests {
             }
         }
 
-        let (handle, receiver) = handle();
+        let first_admission_sequence = {
+            let probe = test_host();
+            let receipt = probe.handle().pause(None).expect("observer positive control");
+            probe
+                .wait_applied(&receipt)
+                .admission_sequence
+                .expect("actual first admission")
+        };
+        let (handle, host) = handle();
+        let mut port = host.port.clone();
         let completions = Arc::new(AtomicUsize::new(0));
         let state = mcp_http_test_state(
             handle,
@@ -5306,10 +5317,50 @@ mod tests {
             ));
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(completions.load(Ordering::SeqCst), 1);
-            assert!(matches!(
-                receiver.try_recv(),
-                Err(mpsc::TryRecvError::Empty)
-            ));
+            let events = port
+                .events_after(ProtocolEventSequence::new(0), usize::MAX)
+                .expect("actual owner protocol events");
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(&event.kind, HostEventKind::CommandStatusChanged(_)))
+            );
+        }
+
+        // Prove that this observer actually sees a dispatched control command.
+        let pause = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "pause", "arguments": {}}
+        }))
+        .expect("valid pause request");
+        let response = runtime.block_on(handle_mcp_http_request(State(state), Json(pause)));
+        let body = runtime
+            .block_on(axum::body::to_bytes(response.into_body(), 16_384))
+            .expect("pause response body");
+        let response: Value = serde_json::from_slice(&body).expect("pause response JSON");
+        assert_eq!(response["id"], 3);
+        assert!(response.get("error").is_none(), "{response}");
+        let receipt: CommandStatusDto = serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("pause receipt text"),
+        )
+        .expect("pause receipt");
+        assert_eq!(receipt.admission_sequence, Some(first_admission_sequence));
+        host.wait_applied(&receipt);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let events = port
+                .events_after(ProtocolEventSequence::new(0), usize::MAX)
+                .expect("actual owner protocol events");
+            if events
+                .iter()
+                .any(|event| matches!(&event.kind, HostEventKind::CommandStatusChanged(_)))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "owner command was not observed");
+            std::thread::yield_now();
         }
     }
 
