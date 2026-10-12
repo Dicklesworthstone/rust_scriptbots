@@ -6425,6 +6425,46 @@ mod tests {
                 decoded_artifact.scientific_content_hash(),
                 artifact.scientific_content_hash()
             );
+            let lifecycle = applied_lifecycle(
+                CommandEnvelope::new(CommandId::new(1), command.clone()),
+                applied(),
+            );
+            let mut archive = HostJournalArchive {
+                version: HOST_JOURNAL_ARCHIVE_VERSION,
+                run_id: RunId::new(1),
+                host_session_id: encode_journal_u64(1),
+                journal_sequence: encode_journal_u64(1),
+                scientific_event_sequence: None,
+                command_lifecycle: Some(
+                    EncodedCommandLifecycle::encode(&lifecycle).expect("encoded map lifecycle"),
+                ),
+                scheduled_patch: None,
+                applied: applied(),
+                scientific: None,
+                persistence: None,
+            };
+            let record = decode_test_archive(&archive)
+                .expect("validated map archive readback")
+                .into_public_record(HostJournalRecordState::Admitted)
+                .expect("map archive public readback");
+            assert_eq!(
+                record
+                    .command_lifecycle
+                    .expect("archived lifecycle")
+                    .envelope()
+                    .command,
+                command
+            );
+            for version in [4, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
+                archive.version = version;
+                assert!(matches!(
+                    decode_test_archive(&archive),
+                    Err(StorageError::InvalidData {
+                        context: "host_journal_archive.payload_version",
+                        ..
+                    })
+                ));
+            }
             policy_bytes.push(bytes);
         }
         assert_ne!(policy_bytes[0], policy_bytes[1]);

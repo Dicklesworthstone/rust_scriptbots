@@ -5978,7 +5978,7 @@ mod tests {
                 tiles[index].kind = TerrainKind::Grass;
             }
             MapArtifact::new(
-                TerrainLayer::new(3, 3, 16, tiles).expect("terrain"),
+                TerrainLayer::from_tiles(3, 3, 16, tiles).expect("terrain"),
                 None,
                 None,
                 None,
