@@ -18960,7 +18960,8 @@ mod map_sandbox {
         undo_stack: Vec<DraftState>,
         #[serde(skip)]
         redo_stack: Vec<DraftState>,
-        /// Maximum number of undo steps retained.
+        /// Maximum number of history steps retained in each stack. Zero disables history;
+        /// retained history is discarded on the next edit, undo or redo.
         pub max_history: usize,
     }
 
@@ -18993,11 +18994,21 @@ mod map_sandbox {
             }
         }
 
-        fn push_checkpoint(&mut self) {
-            if self.undo_stack.len() >= self.max_history {
-                self.undo_stack.remove(0);
+        fn trim_history(&mut self) {
+            for stack in [&mut self.undo_stack, &mut self.redo_stack] {
+                let excess = stack.len().saturating_sub(self.max_history);
+                drop(stack.drain(..excess));
             }
-            self.undo_stack.push(self.state.clone());
+        }
+
+        fn push_checkpoint(&mut self) {
+            self.trim_history();
+            if self.max_history > 0 {
+                if self.undo_stack.len() >= self.max_history {
+                    self.undo_stack.remove(0);
+                }
+                self.undo_stack.push(self.state.clone());
+            }
             self.redo_stack.clear();
             self.revision = self.revision.wrapping_add(1);
         }
@@ -19070,6 +19081,7 @@ mod map_sandbox {
 
         /// Undo the last draft edit, restoring the previous state. Returns true if an action was undone.
         pub fn undo(&mut self) -> Result<bool, MapGenerationError> {
+            self.trim_history();
             if let Some(prev) = self.undo_stack.pop() {
                 if self.redo_stack.len() >= self.max_history {
                     self.redo_stack.remove(0);
@@ -19085,6 +19097,7 @@ mod map_sandbox {
 
         /// Redo a previously undone draft edit. Returns true if an action was redone.
         pub fn redo(&mut self) -> Result<bool, MapGenerationError> {
+            self.trim_history();
             if let Some(next) = self.redo_stack.pop() {
                 if self.undo_stack.len() >= self.max_history {
                     self.undo_stack.remove(0);
@@ -19101,13 +19114,13 @@ mod map_sandbox {
         /// Whether an undo operation is currently available.
         #[must_use]
         pub const fn can_undo(&self) -> bool {
-            !self.undo_stack.is_empty()
+            self.max_history > 0 && !self.undo_stack.is_empty()
         }
 
         /// Whether a redo operation is currently available.
         #[must_use]
         pub const fn can_redo(&self) -> bool {
-            !self.redo_stack.is_empty()
+            self.max_history > 0 && !self.redo_stack.is_empty()
         }
 
         /// Generate the full validated [`MapArtifact`] from this draft, applying constraints on top.
@@ -20342,6 +20355,48 @@ mod map_sandbox {
                 artifact.terrain().tile(2, 2).unwrap().kind,
                 TerrainKind::Rock
             );
+        }
+
+        #[test]
+        fn map_editor_draft_zero_and_reduced_history_remain_bounded() {
+            let mut draft = MapEditorDraft::new(
+                "history_limits",
+                8,
+                8,
+                16,
+                1,
+                DraftGeneratorConfig::RuleBased {
+                    tileset: default_tileset_spec(),
+                },
+            );
+            draft.max_history = 0;
+            draft.set_seed(2);
+            assert_eq!(draft.state.seed, 2);
+            assert_eq!(draft.revision, 1);
+            assert!(!draft.can_undo());
+            assert!(!draft.undo().expect("disabled undo"));
+            assert!(!draft.redo().expect("disabled redo"));
+
+            draft.max_history = 3;
+            draft.set_seed(3);
+            draft.set_seed(4);
+            draft.set_seed(5);
+            draft.max_history = 1;
+            assert!(draft.undo().expect("latest edit retained"));
+            assert_eq!(draft.state.seed, 4);
+            assert!(!draft.undo().expect("older edits discarded"));
+            assert!(draft.can_redo());
+            draft.max_history = 0;
+            assert!(!draft.can_redo());
+            assert!(!draft.redo().expect("retained redo discarded"));
+            assert_eq!(draft.state.seed, 4);
+
+            draft.max_history = 1;
+            assert!(!draft.can_undo());
+            assert!(!draft.can_redo());
+            draft.set_seed(6);
+            assert!(draft.undo().expect("new history enabled"));
+            assert_eq!(draft.state.seed, 4);
         }
 
         #[test]

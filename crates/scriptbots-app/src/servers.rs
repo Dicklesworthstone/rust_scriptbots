@@ -6072,6 +6072,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn map_generate_omitted_dimensions_use_live_terrain_without_fixed_schema_defaults() {
+        use scriptbots_core::MapArtifact;
+
+        let host = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 48,
+                world_height: 32,
+                food_cell_size: 16,
+                rng_seed: Some(42),
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("custom world"),
+        );
+        let handle = host.handle();
+        let before = handle.read_snapshot().expect("live terrain");
+        let dimensions = (
+            before.layers.terrain.width,
+            before.layers.terrain.height,
+            before.layers.terrain.cell_size,
+        );
+        assert_ne!(dimensions, (100, 100, 50));
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let Json(value) = post_map_generate(State(state), HeaderMap::new(), axum::body::Bytes::new())
+            .await
+            .expect("default map generation");
+        let artifact: MapArtifact = serde_json::from_value(value).expect("default artifact");
+        assert_eq!(
+            (
+                artifact.terrain().width(),
+                artifact.terrain().height(),
+                artifact.terrain().cell_size(),
+            ),
+            dimensions
+        );
+
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI document");
+        let properties = spec["components"]["schemas"]["MapGenerateRequestBody"]["properties"]
+            .as_object()
+            .expect("published generator properties");
+        for name in ["width", "height", "cell_size"] {
+            let property = properties.get(name).expect("dimension property");
+            assert!(property.get("default").is_none(), "{name}: {property}");
+            assert!(
+                property["description"]
+                    .as_str()
+                    .expect("default policy description")
+                    .contains("live terrain"),
+                "{name}: {property}"
+            );
+        }
+        let after = handle.read_snapshot().expect("after default generation");
+        assert_eq!(after.world.tick, before.world.tick);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+    }
+
+    #[tokio::test]
     async fn map_apply_rest_and_mcp_dispatch_preserve_placement_and_owner_results() {
         use scriptbots_core::{AgentData, MapArtifact, Position, TerrainKind, TerrainLayer};
 

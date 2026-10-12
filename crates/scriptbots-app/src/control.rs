@@ -280,18 +280,15 @@ pub struct SpeedRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MapGenerateRequestBody {
-    /// Width of the map grid in cells. Defaults to 100.
-    #[schema(default = 100)]
+    /// Width in cells. If omitted, uses the live terrain width (100 if unavailable).
     pub width: Option<u32>,
-    /// Height of the map grid in cells. Defaults to 100.
-    #[schema(default = 100)]
+    /// Height in cells. If omitted, uses the live terrain height (100 if unavailable).
     pub height: Option<u32>,
-    /// Cell size in world units. Defaults to 50.
-    #[schema(default = 50)]
+    /// Cell size in world units. If omitted, uses the live terrain cell size (50 if unavailable).
     pub cell_size: Option<u32>,
     /// Random seed for deterministic generation. Defaults to a constant seed if omitted.
     pub seed: Option<u64>,
-    /// Optional declarative tileset specification (as JSON object). If omitted, default biome tileset is used.
+    /// Optional declarative tileset. If both tileset and sample are omitted, uses the default biome tileset.
     #[schema(value_type = Option<Object>)]
     pub tileset: Option<Value>,
     /// Exemplar for overlapping sample generation. Mutually exclusive with tileset.
