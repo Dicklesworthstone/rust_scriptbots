@@ -16640,6 +16640,14 @@ mod map_sandbox {
 
     const DEFAULT_RETRY_BUDGET: usize = 32;
 
+    /// Maximum exemplar cells admitted before overlapping-pattern extraction.
+    pub const MAX_SAMPLE_CELLS: usize = 64;
+    /// Maximum output cells admitted by the sample generator.
+    pub const MAX_SAMPLE_OUTPUT_CELLS: usize = 65_536;
+    /// Maximum output-cell/exemplar-cell pairs before building the WFC model.
+    /// This bounds input work, not wall-clock execution or exact allocation bytes.
+    pub const MAX_SAMPLE_CELL_PAIRS: usize = 1_048_576;
+
     /// Every way rule-based or sample-based map generation can fail before producing an artifact.
     #[derive(Debug, thiserror::Error)]
     pub enum MapGenerationError {
@@ -18401,6 +18409,18 @@ mod map_sandbox {
                     actual: self.sample_tiles.len(),
                 });
             }
+            if expected > MAX_SAMPLE_CELLS {
+                return Err(MapGenerationError::DraftError(format!(
+                    "sample has {expected} cells; limit is {MAX_SAMPLE_CELLS}"
+                )));
+            }
+            // OverlappingPatterns extracts with wrapped exemplar boundaries. Do not
+            // advertise the unused non-periodic flag as a supported generation mode.
+            if !self.periodic {
+                return Err(MapGenerationError::DraftError(
+                    "non-periodic sample extraction is not supported".into(),
+                ));
+            }
             if self.pattern_size == 0
                 || self.pattern_size > self.sample_width
                 || self.pattern_size > self.sample_height
@@ -18492,6 +18512,20 @@ mod map_sandbox {
             }
             let tile_capacity =
                 validated_cell_count_for::<TerrainTile>("map.tiles", width, height)?;
+
+            if tile_capacity > MAX_SAMPLE_OUTPUT_CELLS {
+                return Err(MapGenerationError::DraftError(format!(
+                    "sample map has {tile_capacity} output cells; limit is {MAX_SAMPLE_OUTPUT_CELLS}"
+                )));
+            }
+            let cell_pairs = tile_capacity
+                .checked_mul(self.spec.sample_tiles.len())
+                .ok_or(MapGenerationError::InvalidDimensions)?;
+            if cell_pairs > MAX_SAMPLE_CELL_PAIRS {
+                return Err(MapGenerationError::DraftError(format!(
+                    "sample map requires {cell_pairs} output/exemplar cell pairs; limit is {MAX_SAMPLE_CELL_PAIRS}"
+                )));
+            }
 
             let sample_w = self.spec.sample_width;
             let grid = Grid::new_fn(
@@ -20069,6 +20103,67 @@ mod map_sandbox {
         }
 
         #[test]
+        fn sample_generation_bounds_extraction_and_output_before_wfc_work() {
+            let sample = SamplePatternSpec {
+                sample_id: "bounded_sand_v1".into(),
+                sample_width: 8,
+                sample_height: 8,
+                pattern_size: 2,
+                sample_tiles: vec![TerrainKind::Sand; MAX_SAMPLE_CELLS],
+                all_orientations: true,
+                periodic: true,
+            };
+            let mut oversized = sample.clone();
+            oversized.sample_width = 65;
+            oversized.sample_height = 1;
+            oversized.pattern_size = 1;
+            oversized.sample_tiles = vec![TerrainKind::Sand; 65];
+            assert!(
+                SampleBasedMapGenerator::new(oversized)
+                    .err()
+                    .expect("oversized exemplar refused")
+                    .to_string()
+                    .contains("sample has 65 cells")
+            );
+            let mut unsupported = sample.clone();
+            unsupported.periodic = false;
+            assert!(
+                SampleBasedMapGenerator::new(unsupported)
+                    .err()
+                    .expect("unused boundary flag refused")
+                    .to_string()
+                    .contains("non-periodic")
+            );
+
+            let generator = SampleBasedMapGenerator::new(sample).expect("maximum exemplar");
+            let map = generator.generate(128, 128, 16, 42).expect("pair limit");
+            assert_eq!(
+                map.terrain().tiles().len() * MAX_SAMPLE_CELLS,
+                MAX_SAMPLE_CELL_PAIRS
+            );
+            assert!(
+                map.terrain()
+                    .tiles()
+                    .iter()
+                    .all(|tile| tile.kind == TerrainKind::Sand)
+            );
+            assert!(
+                generator
+                    .generate(129, 128, 16, 42)
+                    .expect_err("excess pair work refused")
+                    .to_string()
+                    .contains("output/exemplar cell pairs")
+            );
+            assert!(
+                generator
+                    .generate(257, 256, 16, 42)
+                    .expect_err("excess output refused")
+                    .to_string()
+                    .contains("output cells")
+            );
+        }
+
+        #[test]
         fn constraint_layer_painting_and_application() {
             let sample = SamplePatternSpec {
                 sample_id: "sample_spec_paint".into(),
@@ -20483,7 +20578,8 @@ mod map_sandbox {
 
 pub use map_sandbox::{
     AdjacencySpec, ConstraintLayer, DraftGeneratorConfig, DraftState, ExistingAgentPolicy,
-    HydrologyField, HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer, MapArtifact,
+    HydrologyField, HydrologyFlowDirection, HydrologyTile, HydrologyTileLayer,
+    MAX_SAMPLE_CELL_PAIRS, MAX_SAMPLE_CELLS, MAX_SAMPLE_OUTPUT_CELLS, MapArtifact,
     MapArtifactMetadata, MapEditorDraft, MapGenerationError, MapGeneratorKind, PaintedConstraint,
     RuleBasedMapGenerator, SampleBasedMapGenerator, SamplePatternSpec, ScalarField, TileSpec,
     TilesetSpec, ToroidalSeamReport, check_toroidal_seams, compute_sample_hash,

@@ -2329,9 +2329,12 @@ Skill inventory/census/verification scripts may produce evidence outside project
 ## 12. Phased Execution Roadmap
 
 **[Currently In Progress] `bd-2z0.10.7`, 2026-10-12:** connect the existing safe-placement
-policy to acknowledged CLI/REST/MCP map application and durable replay. Correct wrapped
-nearest-tile selection and reject all-water placement without partial world edits. The
-interactive editor, sample mode, native input acceptance and culling accounting remain open.
+policy to acknowledged CLI/REST/MCP map application and durable replay. Wrapped nearest-tile
+selection and atomic all-water refusal are implemented in `0425c43a`; its inner source checks
+pass but outer DSR collection refuses the dependency cache. The current slice connects the
+existing sample generator through those same control surfaces, bounds exemplar/output work
+before WFC allocation, and refuses malformed/conflicting requests. Its pinned qualification
+is pending. Interactive drafts, native input acceptance and culling accounting remain open.
 
 Priorities are `P0` correctness/blocking, `P1` usable product, `P2` scientific expansion, and `P3` optional reach.
 

@@ -624,6 +624,13 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 
 ### Procedural maps (WFC sandbox; in progress)
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
+- Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Native qualification of this new control wiring is pending.
+- A sample specifies `sample_id`, `sample_width`, `sample_height`, `pattern_size`, and row-major `sample_tiles` terrain kinds. `all_orientations` and `periodic` default to true; `periodic: false` is refused because non-periodic extraction is not implemented. Core bounds (`MAX_SAMPLE_CELLS`, `MAX_SAMPLE_OUTPUT_CELLS`, `MAX_SAMPLE_CELL_PAIRS`) admit at most 64 exemplar cells, 65,536 output cells, and 1,048,576 output/exemplar cell pairs before model construction. These are input-work bounds, not wall-clock or exact-byte guarantees. For example, a 2×2 all-sand sample is:
+
+  ```json
+  {"sample_id":"sand_v1","sample_width":2,"sample_height":2,"pattern_size":2,"sample_tiles":["Sand","Sand","Sand","Sand"]}
+  ```
+
 - CLI `map-generate`/`map-apply`, REST `/api/v1/map/generate` and `/api/v1/map/apply`, and MCP `map_generate`/`map_apply` use the shared map service and acknowledged owner commands. Map application retains agents by default. CLI `map-apply --file map.json --reposition-agents`, or REST/MCP `reposition_agents: true`, moves agents on deep water to the nearest non-deep-water tile using wrapped distance and row-major tie breaking. If no such tile exists for a present agent, application fails without changing the world; inspect the command's application and journal statuses separately.
 - Placement is included in the durable command and replayed explicitly. Host archive v5 refuses older archives rather than guessing the policy. The interactive rule/sample sandbox and its real-process/native acceptance remain open under `bd-2z0.10.7` and `bd-2z0.10.8`; the hydrology system builds atop terrain for dynamic water flows (see below).
 

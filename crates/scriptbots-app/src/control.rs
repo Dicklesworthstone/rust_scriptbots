@@ -10,9 +10,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use scriptbots_core::{
-    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, HydrologyFlowDirection,
-    MapArtifact, RuleBasedMapGenerator, ScriptBotsConfig, SelectionMode, SelectionState,
-    SelectionUpdate, TerrainKind, Tick, TilesetSpec, WorldState, default_tileset_spec,
+    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, DraftGeneratorConfig,
+    HydrologyFlowDirection, MapArtifact, RuleBasedMapGenerator, SampleBasedMapGenerator,
+    ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind, Tick,
+    WorldState, default_tileset_spec,
 };
 
 use scriptbots_core::ConfigAuditEntry;
@@ -276,7 +277,8 @@ pub struct SpeedRequest {
 }
 
 /// Request payload for generating a procedural map sandbox artifact.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MapGenerateRequestBody {
     /// Width of the map grid in cells. Defaults to 100.
     #[schema(default = 100)]
@@ -292,6 +294,31 @@ pub struct MapGenerateRequestBody {
     /// Optional declarative tileset specification (as JSON object). If omitted, default biome tileset is used.
     #[schema(value_type = Option<Object>)]
     pub tileset: Option<Value>,
+    /// Exemplar for overlapping sample generation. Mutually exclusive with tileset.
+    #[schema(value_type = Option<Object>)]
+    pub sample: Option<Value>,
+}
+
+impl MapGenerateRequestBody {
+    /// Resolve the requested backend without silently substituting invalid inputs.
+    pub fn generator_config(&self) -> Result<Option<DraftGeneratorConfig>, ControlError> {
+        match (&self.tileset, &self.sample) {
+            (Some(_), Some(_)) => Err(ControlError::InvalidPatch(
+                "tileset and sample are mutually exclusive".into(),
+            )),
+            (Some(value), None) => serde_json::from_value(value.clone())
+                .map(|tileset| Some(DraftGeneratorConfig::RuleBased { tileset }))
+                .map_err(|error| {
+                    ControlError::InvalidPatch(format!("invalid tileset specification: {error}"))
+                }),
+            (None, Some(value)) => serde_json::from_value(value.clone())
+                .map(|sample| Some(DraftGeneratorConfig::SampleBased { sample }))
+                .map_err(|error| {
+                    ControlError::InvalidPatch(format!("invalid sample specification: {error}"))
+                }),
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 /// Request payload for applying a map artifact to the simulation.
@@ -2780,14 +2807,14 @@ impl ControlHandle {
         )
     }
 
-    /// Generate a procedural map artifact deterministically using a rule-based generator.
+    /// Generate a procedural map artifact using the requested rule or sample backend.
     pub fn generate_map(
         &self,
         width: u32,
         height: u32,
         cell_size: Option<u32>,
         seed: u64,
-        tileset: Option<TilesetSpec>,
+        generator_config: Option<DraftGeneratorConfig>,
     ) -> Result<MapArtifact, ControlError> {
         let cells = u64::from(width) * u64::from(height);
         if cells > MAX_GENERATED_MAP_CELLS {
@@ -2795,13 +2822,16 @@ impl ControlHandle {
                 "map of {width}x{height} cells exceeds the limit of {MAX_GENERATED_MAP_CELLS} cells"
             )));
         }
-        let spec = tileset.unwrap_or_else(default_tileset_spec);
-        let generator = RuleBasedMapGenerator::new(spec)
-            .map_err(|e| ControlError::InvalidPatch(format!("tileset compile error: {e}")))?;
         let cell_size = cell_size.unwrap_or(50);
-        generator
-            .generate(width, height, cell_size, seed)
-            .map_err(|e| ControlError::InvalidPatch(format!("map generation error: {e}")))
+        let result = match generator_config.unwrap_or_else(|| DraftGeneratorConfig::RuleBased {
+            tileset: default_tileset_spec(),
+        }) {
+            DraftGeneratorConfig::RuleBased { tileset } => RuleBasedMapGenerator::new(tileset)
+                .and_then(|generator| generator.generate(width, height, cell_size, seed)),
+            DraftGeneratorConfig::SampleBased { sample } => SampleBasedMapGenerator::new(sample)
+                .and_then(|generator| generator.generate(width, height, cell_size, seed)),
+        };
+        result.map_err(|error| ControlError::InvalidPatch(format!("map generation error: {error}")))
     }
 
     /// Submit a command, honouring an idempotency key when one is supplied.
@@ -5164,6 +5194,83 @@ pub(crate) mod tests {
         assert_ne!(
             map1.scientific_content_hash(),
             map_diff_seed.scientific_content_hash()
+        );
+    }
+
+    #[test]
+    fn test_map_generate_sample_preserves_backend_and_rejects_conflicts() {
+        let (handle, _receiver) = handle();
+        let sample = scriptbots_core::SamplePatternSpec {
+            sample_id: "sand_control_v1".into(),
+            sample_width: 2,
+            sample_height: 2,
+            pattern_size: 2,
+            sample_tiles: vec![TerrainKind::Sand; 4],
+            all_orientations: true,
+            periodic: true,
+        };
+        let request: MapGenerateRequestBody = serde_json::from_value(serde_json::json!({
+            "sample": sample,
+        }))
+        .expect("sample request");
+        let map = handle
+            .generate_map(
+                8,
+                8,
+                Some(16),
+                42,
+                request.generator_config().expect("backend"),
+            )
+            .expect("sample generation");
+        assert_eq!(
+            map.metadata().generator,
+            scriptbots_core::MapGeneratorKind::SampleBased
+        );
+        assert_eq!(map.metadata().tileset_id, sample.sample_id);
+        assert_eq!(
+            map.metadata().tileset_hash,
+            scriptbots_core::compute_sample_hash(&sample)
+        );
+        assert!(
+            map.terrain()
+                .tiles()
+                .iter()
+                .all(|tile| tile.kind == TerrainKind::Sand)
+        );
+        let default = handle
+            .generate_map(8, 8, Some(16), 42, None)
+            .expect("default rule map");
+        assert_eq!(
+            default.metadata().generator,
+            scriptbots_core::MapGeneratorKind::RuleBased
+        );
+        assert_ne!(
+            map.scientific_content_hash(),
+            default.scientific_content_hash()
+        );
+
+        let conflict = MapGenerateRequestBody {
+            tileset: Some(serde_json::json!({})),
+            sample: request.sample,
+            ..MapGenerateRequestBody::default()
+        };
+        assert!(
+            conflict
+                .generator_config()
+                .expect_err("conflicting backend")
+                .to_string()
+                .contains("mutually exclusive")
+        );
+        let malformed = MapGenerateRequestBody {
+            tileset: Some(serde_json::json!({"unknown": true})),
+            ..MapGenerateRequestBody::default()
+        };
+        assert!(
+            malformed
+                .generator_config()
+                .expect_err("invalid tileset")
+                .to_string()
+                .contains("invalid tileset specification")
         );
     }
 

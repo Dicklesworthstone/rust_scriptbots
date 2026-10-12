@@ -2704,27 +2704,14 @@ async fn post_map_generate(
 ) -> Result<Json<Value>, AppError> {
     require_json_content_type(&headers, &bytes)?;
     let req: MapGenerateRequestBody = if bytes.iter().all(u8::is_ascii_whitespace) {
-        MapGenerateRequestBody {
-            width: None,
-            height: None,
-            cell_size: None,
-            seed: None,
-            tileset: None,
-        }
+        MapGenerateRequestBody::default()
     } else {
         serde_json::from_slice(&bytes).map_err(|error| {
             AppError::bad_request(format!("invalid map generate request payload: {error}"))
         })?
     };
 
-    let tileset: Option<scriptbots_core::TilesetSpec> =
-        if let Some(v) = req.tileset {
-            Some(serde_json::from_value(v).map_err(|e| {
-                AppError::bad_request(format!("invalid tileset specification: {e}"))
-            })?)
-        } else {
-            None
-        };
+    let generator_config = req.generator_config()?;
 
     let artifact = run_control(move || {
         let (def_w, def_h, def_cell) = state
@@ -2744,7 +2731,7 @@ async fn post_map_generate(
         let seed = req.seed.unwrap_or(0x5a4f_4d41);
         state
             .handle
-            .generate_map(width, height, cell_size, seed, tileset)
+            .generate_map(width, height, cell_size, seed, generator_config)
     })
     .await?;
 
@@ -3543,7 +3530,7 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "map_generate",
-        "Generate a procedural map artifact deterministically",
+        "Generate a procedural map artifact using rule tiles or a bounded periodic exemplar",
         json!({
             "type": "object",
             "properties": {
@@ -3551,7 +3538,8 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                 "height": {"type": "integer", "minimum": 1},
                 "cell_size": {"type": "integer", "minimum": 1},
                 "seed": {"type": "integer"},
-                "tileset": {"type": "object"}
+                "tileset": {"type": "object"},
+                "sample": {"type": "object", "description": format!("SamplePatternSpec; mutually exclusive with tileset; at most {} exemplar cells", scriptbots_core::MAX_SAMPLE_CELLS)}
             },
             "additionalProperties": false
         }),
@@ -4234,26 +4222,16 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::MapGenerate => {
-                let width = arguments
-                    .get("width")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32);
-                let height = arguments
-                    .get("height")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32);
-                let cell_size = arguments
-                    .get("cell_size")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32);
-                let seed = arguments
-                    .get("seed")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0x5a4f_4d41);
-                let tileset = arguments
-                    .get("tileset")
-                    .cloned()
-                    .and_then(|v| serde_json::from_value(v).ok());
+                let req: MapGenerateRequestBody =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid map generate request payload: {error}"),
+                        )
+                    })?;
+                let generator_config = req.generator_config().map_err(|error| {
+                    McpError::new(McpErrorCode::InvalidParams, error.to_string())
+                })?;
                 let handle = self.handle.clone();
                 let artifact = run_control_mcp_sync(move || {
                     let (def_w, def_h, def_cell) = handle
@@ -4266,9 +4244,16 @@ impl ToolHandler for ControlTool {
                             )
                         })
                         .unwrap_or((100, 100, 50));
-                    let width = width.unwrap_or(def_w);
-                    let height = height.unwrap_or(def_h);
-                    handle.generate_map(width, height, cell_size.or(Some(def_cell)), seed, tileset)
+                    let width = req.width.unwrap_or(def_w);
+                    let height = req.height.unwrap_or(def_h);
+                    let seed = req.seed.unwrap_or(0x5a4f_4d41);
+                    handle.generate_map(
+                        width,
+                        height,
+                        req.cell_size.or(Some(def_cell)),
+                        seed,
+                        generator_config,
+                    )
                 })?;
                 make_tool_result(artifact)
             }
@@ -5943,6 +5928,116 @@ mod tests {
             .await
             .expect("MCP response body");
         serde_json::from_slice(&bytes).expect("MCP response JSON")
+    }
+
+    #[tokio::test]
+    async fn map_generate_rest_and_mcp_use_sample_and_refuse_invalid_inputs() {
+        use scriptbots_core::{MapArtifact, MapGeneratorKind, SamplePatternSpec, TerrainKind};
+
+        let (handle, _host) = handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let sample = SamplePatternSpec {
+            sample_id: "sand_transport_v1".into(),
+            sample_width: 2,
+            sample_height: 2,
+            pattern_size: 2,
+            sample_tiles: vec![TerrainKind::Sand; 4],
+            all_orientations: true,
+            periodic: true,
+        };
+        let request = json!({"width": 8, "height": 8, "cell_size": 16, "seed": 42, "sample": sample});
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let before = handle.read_snapshot().expect("before generation");
+        let Json(rest) = post_map_generate(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from(serde_json::to_vec(&request).expect("request bytes")),
+        )
+        .await
+        .expect("REST sample generation");
+        let rest: MapArtifact = serde_json::from_value(rest).expect("REST map artifact");
+        assert_eq!(rest.metadata().generator, MapGeneratorKind::SampleBased);
+        assert_eq!(rest.metadata().tileset_id, sample.sample_id);
+        assert_eq!(
+            rest.metadata().tileset_hash,
+            scriptbots_core::compute_sample_hash(&sample)
+        );
+        assert!(
+            rest.terrain()
+                .tiles()
+                .iter()
+                .all(|tile| tile.kind == TerrainKind::Sand)
+        );
+
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("sample-map", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "sample-map", "version": "0"}}}),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let generated = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "map_generate", "arguments": request}}),
+        )
+        .await;
+        assert!(generated.get("error").is_none(), "{generated}");
+        let artifact: MapArtifact = serde_json::from_str(
+            generated["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP artifact text"),
+        )
+        .expect("MCP map artifact");
+        assert_eq!(
+            artifact.scientific_content_hash(),
+            rest.scientific_content_hash()
+        );
+
+        let invalid = [
+            json!({"width": 4_294_967_296_u64}),
+            json!({"width": "8"}),
+            json!({"tileset": {"unknown": true}}),
+            json!({"sample": {"sample_width": 2}}),
+            json!({"sample": sample, "tileset": {}}),
+            json!({"sample": SamplePatternSpec { periodic: false, ..sample.clone() }}),
+            json!({"width": 65_537, "height": 1, "sample": sample}),
+            json!({"unknown": true}),
+        ];
+        for arguments in invalid {
+            let error = post_map_generate(
+                State(state.clone()),
+                headers.clone(),
+                axum::body::Bytes::from(serde_json::to_vec(&arguments).expect("invalid request bytes")),
+            )
+            .await
+            .expect_err("REST must refuse invalid generator inputs");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{}", error.message);
+            let result = map_policy_mcp_request(
+                &mcp,
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "map_generate", "arguments": arguments}}),
+            )
+            .await;
+            assert_eq!(
+                result["error"]["code"],
+                i32::from(McpErrorCode::InvalidParams),
+                "{result}"
+            );
+        }
+        let after = handle.read_snapshot().expect("after generation");
+        assert_eq!(before.world.tick, after.world.tick);
+        assert_eq!(before.last_applied_command, after.last_applied_command);
     }
 
     #[tokio::test]

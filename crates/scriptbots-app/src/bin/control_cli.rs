@@ -165,8 +165,11 @@ enum Command {
         #[arg(long)]
         seed: Option<u64>,
         /// Optional tileset specification JSON file.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sample")]
         tileset: Option<PathBuf>,
+        /// Periodic exemplar sample specification JSON file (bounded in core).
+        #[arg(long, conflicts_with = "tileset")]
+        sample: Option<PathBuf>,
         /// Output file path to save the generated map artifact (Postcard or JSON depending on extension).
         #[arg(long, short)]
         out: Option<PathBuf>,
@@ -383,6 +386,7 @@ async fn main() -> Result<()> {
                     cell_size,
                     seed,
                     tileset,
+                    sample,
                     out,
                 } => {
                     map_generate_command(
@@ -393,6 +397,7 @@ async fn main() -> Result<()> {
                         cell_size,
                         seed,
                         tileset,
+                        sample,
                         out,
                     )
                     .await?
@@ -1337,12 +1342,20 @@ async fn map_generate_command(
     cell_size: Option<u32>,
     seed: Option<u64>,
     tileset_path: Option<PathBuf>,
+    sample_path: Option<PathBuf>,
     out: Option<PathBuf>,
 ) -> Result<()> {
     let tileset: Option<Value> = if let Some(path) = tileset_path {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read tileset file {}", path.display()))?;
         Some(serde_json::from_str(&content).context("failed to parse tileset JSON")?)
+    } else {
+        None
+    };
+    let sample: Option<Value> = if let Some(path) = sample_path {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read sample file {}", path.display()))?;
+        Some(serde_json::from_str(&content).context("failed to parse sample JSON")?)
     } else {
         None
     };
@@ -1353,6 +1366,7 @@ async fn map_generate_command(
         "cell_size": cell_size,
         "seed": seed,
         "tileset": tileset,
+        "sample": sample,
     });
 
     let url = join_url(base_url, "/api/v1/map/generate");
@@ -1922,6 +1936,41 @@ fn json_pointer(path: &str) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn map_generate_accepts_sample_and_refuses_conflicting_backends() {
+        let parsed = Cli::try_parse_from([
+            "control",
+            "map-generate",
+            "--sample",
+            "sample.json",
+            "--seed",
+            "42",
+        ])
+        .expect("sample map CLI");
+        let Command::MapGenerate {
+            sample,
+            tileset,
+            seed,
+            ..
+        } = parsed.command
+        else {
+            panic!("map generator command expected");
+        };
+        assert_eq!(sample, Some(PathBuf::from("sample.json")));
+        assert!(tileset.is_none());
+        assert_eq!(seed, Some(42));
+        let error = Cli::try_parse_from([
+            "control",
+            "map-generate",
+            "--sample",
+            "sample.json",
+            "--tileset",
+            "tileset.json",
+        ])
+        .expect_err("conflicting map generators must fail");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn map_apply_placement_is_explicit_and_defaults_to_retain() {
