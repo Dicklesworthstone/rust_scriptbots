@@ -448,6 +448,13 @@ occupied-pool regression with MCP initialization and owner-applied tool receipts
 retain caller cancellation through the actual HTTP handler. All original load,
 science, latency and acceptance criteria remain; native qualification is pending.]
 
+[Currently In Progress — `bd-134`, LilacElm, 2026-10-12: strengthen the HTTP
+cancellation regression with a successful uncancelled call under the same restricted
+caller context, then require the locked FastMCP API's RequestCancelled code after
+cancellation. Apply the same typed assertion to the existing dispatcher regression.
+A generic dispatch error is not cancellation evidence; exact-source native execution
+remains pending, and R114 retains its original frozen revision and raw results.]
+
 [Currently In Progress — `bd-0oro`, LilacElm, 2026-10-11: repair the receipt
 guard's observed self-matching positive. Restrict its line-oriented scan to production,
 derive actual bound forms from the dispatcher openers, and require both deleted-binding

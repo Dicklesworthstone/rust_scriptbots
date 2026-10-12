@@ -5262,9 +5262,23 @@ mod tests {
         {
             let _restriction = owner.restrict::<NoCaps>().set_current_restricted();
             let inherited = Cx::current().expect("restricted caller");
-            inherited.cancel_with(CancelKind::User, Some("cancel HTTP tool request"));
             let call = serde_json::from_value(json!({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "list_presets", "arguments": {}}
+            }))
+            .expect("uncancelled request");
+            let response =
+                runtime.block_on(handle_mcp_http_request(State(state.clone()), Json(call)));
+            let body = runtime
+                .block_on(axum::body::to_bytes(response.into_body(), 16_384))
+                .expect("uncancelled response body");
+            let response: Value = serde_json::from_slice(&body).expect("uncancelled response JSON");
+            assert_eq!(response["id"], 2);
+            assert!(response.get("error").is_none(), "{response}");
+            assert!(response["result"]["content"][0]["text"].as_str().is_some());
+            inherited.cancel_with(CancelKind::User, Some("cancel HTTP tool request"));
+            let call = serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "list_presets", "arguments": {}}
             }))
             .expect("cancelled request");
@@ -5273,8 +5287,12 @@ mod tests {
                 .block_on(axum::body::to_bytes(response.into_body(), 16_384))
                 .expect("cancelled response body");
             let response: Value = serde_json::from_slice(&body).expect("cancelled response JSON");
-            assert_eq!(response["id"], 2);
-            assert!(response.get("error").is_some(), "{response}");
+            assert_eq!(response["id"], 3);
+            assert_eq!(
+                response["error"]["code"],
+                i32::from(McpErrorCode::RequestCancelled),
+                "{response}"
+            );
             assert!(response.get("result").is_none(), "{response}");
             let restored = Cx::current().expect("caller retained");
             assert_eq!(restored.task_id(), inherited.task_id());
@@ -5366,7 +5384,11 @@ mod tests {
             assert!(request.checkpoint().is_err());
             let response =
                 serde_json::to_value(dispatch(&request, call)).expect("cancelled response JSON");
-            assert!(response.get("error").is_some(), "{response}");
+            assert_eq!(
+                response["error"]["code"],
+                i32::from(McpErrorCode::RequestCancelled),
+                "{response}"
+            );
             assert!(response.get("result").is_none(), "{response}");
             assert_eq!(
                 Cx::current().expect("caller restored").capabilities(),
