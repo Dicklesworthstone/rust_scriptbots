@@ -5954,7 +5954,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
+            axum::http::HeaderValue::from_static("application/json"),
         );
         let before = handle.read_snapshot().expect("before generation");
         let Json(rest) = post_map_generate(
