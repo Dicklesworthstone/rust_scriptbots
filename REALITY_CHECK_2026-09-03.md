@@ -1,6 +1,6 @@
-# Reality Check — rust_scriptbots — reassessed 2026-10-11
+# Reality Check — rust_scriptbots — reassessed 2026-10-12
 
-## Current assessment — 2026-10-11
+## Current assessment — 2026-10-12
 
 **This is a substantial deterministic simulator with real control, persistence, replay and
 research machinery. It is still an unfinished Evolution Lab. The remaining gap is the complete
@@ -8,7 +8,7 @@ user journey: a useful live frontend, a responsive durable run, a trustworthy co
 qualified scientific results and an independently verifiable release. The cinematic hardware-GPU
 meadow and durable browser laboratory also remain unfinished.**
 
-### Current implementation and granular TODO — 2026-10-11
+### Current implementation and granular TODO — 2026-10-12
 
 The source changes through saved commit `c37ea6ebf3bfacd5ba0fb780584318940ce3e786`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
@@ -16,16 +16,126 @@ legacy widgets, acknowledged control receipts and terminal capture. The older mi
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-The preserved candidate's latest product source is `839a21b9a48c8c4580a644aa7c1a82dc63d8c020`,
-retained in the complete `source-839a21b9-main.bundle` in the durable publication bank and on Hz2.
+Shared local `main` is restored to retained `31313081` at 22:14:08 UTC after exact-base,
+clean tracked/index and forty authoritative conflict-free leases. The latest retained product source
+is `5d8eaeea376e04aced145b3d4ac733f0aef9a9f3`, including the actual MCP HTTP dispatcher
+offload, explicit scoped-thread stack budget, typed cancellation regression and dedicated
+notification-route dispatch. The earlier complete `43cd2171` bundle is
+independently byte-matched on Hz2 (`308680cb3fcf6c7de586f1a76acd9b3250ab6d1c4bcf65ef5d9443ce356c8174`).
+Hz4 verifies R114's frozen incremental bundle and clean `main` at exact `bc6f0aaf`/tree
+`26f7ca70d35177b3e83b2e8582669afab73dfe23` before R114 starts at 23:32:15 UTC.
+The latest scoped MCP source qualification passes; earlier attempts remain recorded:
+R109 exposes three formatting hunks, applied manually;
+R110 and R112 pass formatting then fail their actual workspace checks on observed disk-full
+errors before the app regressions. R112's inner verdict is empty and its outer worker receipt
+invalid; no typed pass is manufactured. R113 refuses before Cargo because its required `yq`
+parser is absent. R114 retains all ten source gates, moves app tests before the broad
+workspace checks on Hz4, and pins the existing parser binary in the task directory.
+Hz2 independently matches the `d1cefe1f` incremental source bundle, profile, launcher
+and parser bytes, then verifies clean `main`/tree `dc3c9a96` before the R116 launch.
+Its HTTP regression now first succeeds under the same restricted caller context, then
+requires the locked FastMCP RequestCancelled code; an unrelated error cannot satisfy it.
+The latest source also repairs the receipt guard's observed self-matching positive:
+it scans production and includes deleted-binding/empty/discard controls. R118 executes these
+controls at frozen `d1cefe1f`: all ten source commands/logs exit zero, with 36 server tests,
+three fixture passes and one original quantitative ignore, plus three exact direct repetitions
+without `RUST_MIN_STACK`. Formatting, analyzer build, workspace all-target compilation and
+strict workspace Clippy also pass. The final tool-identity guard fails after the installed DSR
+checkout changes from `84d139ea` to clean `086b010d` during execution: inner failed/one, outer
+six, final launcher identity one. Passing commands do not turn that failed verdict into a pass.
+The later `/mcp/notify` source fixes an active endpoint that previously discarded every body;
+its new regression observes real FastMCP completion and rejects IDs/non-notification methods
+without admitting controls. R119 fails formatting before tests; its three requested
+layout hunks are applied manually and committed as `5c818df4`. R120 then catches a test-type
+mistake: the fixture returns a real `TestHost`, not a channel receiver, so `try_recv` does not
+compile. Command 101/log zero, inner failed/one, outer six and final tool identity zero;
+no tests run. Corrected `4048bcb4` reads actual owner protocol events, proves that the observer
+sees an applied valid MCP pause, and compares the later admission sequence with the first
+sequence observed on another real fresh host. Accidental admission cannot hide behind delayed
+protocol publication. R122 keeps all ten original checks and adds a direct notification
+repetition with `RUST_MIN_STACK` unset, but fails formatting before compilation or tests:
+command one/log zero, typed failed/one, outer six, final identity zero. Its exact one-hunk
+layout correction is committed manually as `5d8eaeea`; normalized UBS observations remain
+identical (exit one, nine critical heuristics, 426 warnings, 359 informational observations).
+R124 completes the same eleven steps at that exact source. Its complete server scope
+observes 37 passed/zero failed/zero ignored, including the notification, typed cancellation,
+receipt guard and real occupied-pool controls. The three original fixture tests pass with
+the quantitative case still explicitly ignored. Analyzer build and all four exact direct
+repetitions also pass, each direct test 1/0/0 with `RUST_MIN_STACK` unset; these are repeats,
+not extra distinct tests or finished-database-reader qualification. Workspace all-target
+compilation and strict Clippy pass, as do the final source/tool/profile guards. The typed
+source verdict is pass/zero; every raw artifact hash checks successfully. The unchanged
+installed-DSR snapshot remains byte-bound before and after execution. The containing DSR
+build still fails: final cache verification refuses the tracked Proptest README link, outer
+exit six, final identity zero, finished 02:08:19 UTC. No DSR code or guard is patched.
+The original current-source R125 comparison has a failed root-account preflight: Git refuses
+the Ubuntu-owned repository before DSR/tests execute. That log is preserved separately;
+the same unused profile/version is retried under its owning account, retaining the original
+incumbent, six runs, reader and bounds. The actual owning-account DSR launch starts
+02:15:59 UTC. All three candidate exact tests and original readers pass, retaining every
+incumbent outcome: two passes and one original throughput failure of 17.466036 percent.
+The candidate has zero failures among 200 HTTP requests and all 32 attached/live SSE clients
+in each run, with healthy populations of at least 1,000 and unpaused requested speed eight
+at every measured phase boundary. The candidate p95 values are 1.854185, 1.362473 and
+0.669740 ms. Original snapshot-derived degradation is -20.859470, -19.860172 and
+-47.565071 percent; negative degradation is the harness's measured loaded increase.
+R125 retains all fourteen command results, final source/tool/profile guards and typed
+candidate pass/zero. Containing DSR still fails cache collection, outer six/identity zero,
+finished 02:32:16 UTC. Its complete 70-file, 175,913,919-byte proof independently matches both
+hosts at inventory SHA256 `c0f889e471e344951c446cb5c4c5854412c782bc10e232ac1f34a6d3c4e3cdef`.
+The raw proof is `/data/tmp/scriptbots-publication-bank-20261011-lilacelm/r125-latency-proof/`.
+**No performance win:** descriptive matched median p95 worsens 6.633477 percent and loaded
+snapshot-derived TPS worsens 25.813671 percent. The candidate loaded windows cover only
+eight published ticks over 112.945–146.013 ms; this does not qualify stable scientific
+throughput or causal attribution. The original execution/retention task `bd-g6wf` is completed
+with these exact measurements and limitations. `bd-134` stays in progress for its original
+PNG stress, determinism and broader acceptance. The tracker now has 718 issues: 579 closed,
+111 open and 28 in progress, leaving 139 unfinished; no original acceptance or dependency changes.
+The separate R126 full workspace run retains all ten original gates. Its first seven gates,
+including workspace compilation and strict Clippy, pass. The original native deadline ends
+in timeout at 03:57:46 UTC: native exit five, containing DSR exit six. The raw partial test log
+observes 62 analytics unit tests, four real-file comparison tests and three export tests
+passing with zero failures. The real seeded-world pipeline remains unfinished while producing
+the treatment database. Economy-faults, analyzer, final source/tool guards and strict acceptance
+are unreached; neither a typed verdict nor final artifact manifest is produced. No full-suite
+or release pass is claimed. The complete partial proof and containing failure independently
+match worker/root: 42 files/214,666,501 bytes at inventory SHA256
+`e9cba2a7e4221c410e28895317cd73bcc1f64832670347830afbdd5be95c9b54`,
+and five files/209,024 bytes at `6f92c0937b1001f3ee0f42246341828720f8deec90ab8f10521a0a86821ab38e`.
+The retained partial log SHA256 is
+`730bbb36ec1d737ce63348554e4dd8c8a72250d81ec519c58be23775734f64d8`;
+the original owned test process is absent afterward. Read-only database growth and an observed
+kernel journal wait demonstrate progress during the run, without establishing a deadlock or
+root cause. Logs and partial databases remain in
+`/data/tmp/scriptbots-publication-bank-20261011-lilacelm/r126-workspace-proof/`.
+Source publication and final custody outcomes are recorded in the existing external receipt.
+The shared checkout is externally reset again to `origin/main` (`7c9264a1`) at 01:38:16 UTC.
+This agent does not reset the shared checkout to `origin/main`. R124's isolated source remains clean and unaffected;
+a complete main bundle independently matches both hosts at SHA256
+`43e82a02c7d0a6fce0ac902b2129e16441d819b03311a79ba7e88c1ac0b7eaea`.
+Own metadata is recovered on private `main` from the exact saved 01:15 patch and the last
+actual comment row, preserving all sixteen comments 2748–2763 including their identities,
+authors and timestamps. Normal BR import observes 718 issues and zero graph cycles.
+The reset-intent question is unanswered. Existing authorized work proceeds through a fresh
+guarded strict fast-forward at 03:43:43 UTC from clean shared `7c9264a1` to `589e98be`,
+the required separately reviewed tracker snapshot. All forty paths have fresh exclusive
+conflict-free leases. Every one of the shared database's 2,614 comments matches a retained
+comment in identity, issue, author, exact text and timestamp before import. Normal BR import
+processes 718 issues, updates two and skips 716; dependency cycles remain zero. No foreign
+tracked/index change is present, and foreign untracked directories remain in place.
+The tracker-only successor changes no Rust, dependency, configuration or test source;
+native qualification remains explicitly bound to product source `5d8eaeea`.
+The earlier qualified **scoped** source `839a21b9` and all failed/raw evidence remain retained;
+its inner source pass and containing-DSR refusal do not qualify the current MCP successor.
 The earlier source remains backed up at `/data/tmp/scriptbots-checkpoint-recovery-20261011-lilacelm/` after external
 resets of the shared checkout to `7c9264a1` at 07:37:54 and 07:39:05 UTC. Conflict-free strict
 fast-forwards restore reviewed `b38e7ffc` at 12:51:53 UTC and documentation/tracker successor
 `c6ed73b5` at 13:25:29 UTC, without a push. External resets to `origin/main` at 13:37:57 and
 13:39:08 UTC undo that restoration again; shared local `main` is back at `7c9264a1` when
 observed at 13:49 UTC. The complete candidate remains preserved on isolated `main`, and the
-independent DSR runs still bind their clean private source. Reset intent remains unanswered;
-no further shared-checkout mutation is made while that conflict is unresolved. The candidate includes the full-owner
+independent DSR runs still bind their clean private source. Reset intent remains unanswered.
+That historical hold ends with the fresh guarded restoration at 22:14:08 UTC; reset intent
+remains unknown and no foreign edits are discarded. The candidate includes the full-owner
 continuation candidate, exact native-requested formatting, the observed serialization fix,
 discarded-history/sealed-boundary corrections, pre-admission lifecycle exhaustion handling,
 and an owner-derived completed schedule cursor that survives bounded outcome-history eviction.
@@ -1770,8 +1880,8 @@ as a working list when its original owners are fully qualified; retained evidenc
   retain its final cache refusal instead of claiming containing-DSR collection.
 - [x] Preserve the full own checkout in a separately writable filesystem when root fills;
   reserve its exact report/tracker files without deleting source, proof or foreign data.
-- [ ] Review and bank the exact metadata, synchronize exports and preserve its commit bundle
-  on the worker; the RAM-backed copy alone does not establish durable session retention.
+- [x] Review and bank the exact metadata at `31313081`, synchronize exports and independently
+  match the complete main bundle on Hz2; retain a clean durable checkout as well as the RAM copy.
 - [x] Prepare R102 with three declared matched pairs and the unchanged byte-bound original
   reader, original test source, source/toolchain/class checks and full raw result retention.
 - [x] Finish R101 with inner typed pass and outer cache-link failure; preserve all 53 matched
@@ -1790,20 +1900,198 @@ as a working list when its original owners are fully qualified; retained evidenc
   owner-application, error and occupied-pool regressions at `839a21b9a48c`.
 - [x] Finish R105's same six quality gates at exact `839a21b9a48c`; retain both discriminating
   tests, 38 scoped passes, one quantitative ignore, outer cache refusal and all 61 matched files.
+- [x] Restore all forty reviewed paths to shared `main` at `31313081` by a guarded strict
+  fast-forward at 22:14:08 UTC; import seven JSONL updates with zero graph cycles.
+- [x] Trace the remaining synchronous MCP HTTP dispatcher/session lock to its actual async
+  consumer; the inner scoped spawn joins synchronously and does not release that async worker.
+- [x] Commit whole-request blocking dispatch at `8f648ccd`, capturing the inherited Cx before
+  transfer, preserving the JSON-RPC/notification contract and handling dispatch join failure.
+- [x] Extend the occupied-pool regression with actual MCP initialization and owner-applied
+  pause receipts; add an actual HTTP cancellation/restricted-context regression.
+- [x] Give the existing scoped MCP control thread the existing 32 MiB stack budget; make no
+  finished-database reader or global Cargo stack-lane claim without its named probe.
+- [x] Prepare source/tool-pinned R107 with the six unchanged source-quality gates and three
+  direct regression repetitions without `RUST_MIN_STACK`; preserve the original acceptance.
+- [x] Transfer and independently match R107's clean source bundle, bounded seed, profile and
+  launcher on Hz4; R107 remains unlaunched, with preparation refusals retained and no RAM guard bypass.
+- [x] Retain R108's missing-proof-parent startup failure (outer six, no Cargo run) and R109's
+  actual formatter failure (typed failed/one, outer six); apply its exact three layout hunks
+  manually and commit `43cd2171` without changing code behavior or gate requirements.
+- [x] Start R110's original six source-quality gates at clean `43cd2171` after root headroom
+  returns; use installed clean DSR `8cdcec2`, two jobs and the unchanged 7,200-second deadline.
+- [x] Retain R110's real workspace-check OS28 failure: formatting passes, command check exits
+  101/log zero, typed failed/one and outer six; Clippy and every test/analyzer gate are unreached.
+- [x] Prepare and transfer R112's unchanged ten-step source scope to Hz2's existing warm target,
+  with exact source/tree and existing installed DSR `84d139ea` pins; no installed tool changes.
+- [x] Retain R112's actual Bevy dependency OS28 failures, compiler command 101/log zero,
+  empty inner verdict and invalid worker receipt/outer four; later source gates are unreached.
+- [x] Prepare R113 with the same ten steps, test arguments, named positives and nonzero result
+  checks; run app/default tests and direct repetitions first, keeping all-target workspace check
+  and strict Clippy mandatory before typed pass. No acceptance criterion is removed.
+- [x] Transfer/read back and execute R113 at exact `43cd2171` on Hz4; retain the actual
+  missing-parser refusal before Cargo, outer four, final tool-identity zero and zero tests.
+- [x] Repair only SBH's observed configuration permission prerequisite with its protection
+  command via sudo; preserve marker checks, prepared profile bytes and all native gates.
+- [x] Reproduce the old receipt guard's self-match directly: zero production occurrences,
+  one occurrence in the assertion, and a passing positive after all production is removed.
+- [x] Commit the production-only, derived-bound guard and deletion/empty/two-dispatcher
+  discard controls at `bc6f0aaf`; document its line-oriented scope and retain original criteria.
+- [x] Read all 597 static UBS lines: exit one, nine existing critical observations,
+  382 warnings and 348 informational observations. This is not compiler/test qualification.
+- [x] Prepare R114 at exact `bc6f0aaf`, retaining the same ten steps and adding the repaired
+  guard to required named server results; pin the already-used `yq` binary, not a DSR patch.
+- [x] Complete R114's exact source/profile/parser readback and start native execution at
+  23:32:15 UTC; verify the complete current main bundle byte-for-byte on Hz4 as well.
+- [x] Observe latest-source R114 formatting pass, command/log zero; dependency compilation
+  starts after the actual SQLite submodule fetch. No compiler or test pass follows yet.
+- [x] Finish R114's original deadline: native timeout, outer six/final launcher identity zero
+  at 01:35:08 UTC. Only formatting is recorded; no tests execute. Its interrupted inner trap
+  emits status `failed` with exit zero, which is not typed pass. Preserve that discrepancy.
+- [x] Identify the HTTP cancellation test's generic-error false positive; confirm the locked
+  FastMCP 0.10.0 public RequestCancelled conversion in its actual registry source.
+- [x] Strengthen the HTTP test with an uncancelled positive under the same restricted caller
+  context and a typed cancellation negative; strengthen the existing direct dispatcher
+  assertion too. R114 stays frozen at its original source, without a changed running profile.
+- [x] Read all 606 UBS lines for the strengthened tests: exit one, nine unchanged critical
+  observations, 390 warnings and 350 informational observations; new findings are test
+  expectations/assertions and the state clone. No suppression or native qualification.
+- [x] Review every frozen source/plan hunk and commit the strengthened regression as
+  `d1cefe1f`; source tree `dc3c9a96` retains the MCP implementation and receipt guard.
+- [x] Execute every original source command at the exact strengthened revision in R118;
+  observe typed cancellation and repaired guard tests passing. Retain its failed final tool
+  guard and make no typed qualification or active-client preemption claim.
+- [x] Prepare R115 with the same ten checks at frozen `bc6f0aaf` after a fresh Hz2
+  observation of 47.6 GB available and near-zero I/O stalls. It is a retry, not new capability.
+- [x] Retain R115's failed uploads and `mkdir` OS28 before any source clone or native launch;
+  fresh `df` then observes zero available bytes. Keep partial files; do not execute the
+  truncated parser or infer that initially observed headroom remains available.
+- [x] Retain R115 as an unlaunched historical preparation; its partial uploads cannot qualify
+  the later source. No partial parser is executed or prior preparation relabeled as a run.
+- [x] Prepare R116 at exact `d1cefe1f` after fresh 59.6 GB capacity observation; match
+  source/profile/launcher/parser hashes on Hz2, verify the source bundle, normal clean
+  clone and strict fast-forward, then launch the same original ten gates on the warm target.
+- [x] Retain R116's native entry-guard failure, empty native log, absent inner proof and
+  containing exit six/final identity zero. No Cargo command or test executes.
+- [x] Observe the worker shell selecting its global parser rather than the required task
+  parser; prepare R117 with the same exact source and ten gates, selecting the pinned
+  task parser inside the build command. Keep every path/hash/source guard.
+- [x] Retain R117's exact source/tool/parser guard passes followed by SBH permission denial
+  at the root-owned target marker; no Cargo command, typed verdict or test result follows.
+- [x] Observe both persistent target/proof markers are root-owned, successfully protect
+  those two paths with sudo and retain marker assertions. R118 keeps the same source,
+  parser pin and original ten native steps; prepared profile bytes are preserved.
+- [x] Finish R118: all ten command/log results zero, 36 server plus three fixture passes,
+  one original quantitative ignore, and three direct repetitions. Final tool identity changes;
+  retain inner failed/one, outer six, launcher identity one and zero performance credit.
+- [x] Observe R118's actual complete server scope: 36 passed, zero failed/ignored at
+  frozen `d1cefe1f`; these results do not qualify the later notification route change.
+- [x] Confirm `/mcp/notify` is an active router endpoint that discards every JSON body,
+  while the canonical `/mcp` uses the real dispatcher; inspect the locked FastMCP API.
+- [x] Wire typed notifications to the existing dispatcher and reject request IDs/non-notification
+  methods. Add a real middleware completion observation and invalid-input controls; replace
+  the erroneous receiver probe below. Keep the running source profile frozen. No client
+  preemption claim.
+- [x] Read all 610 notification UBS lines: exit one, nine unchanged critical heuristic
+  observations, 406 warnings and 357 informational observations. Review every source/plan
+  hunk and commit notification dispatch as `6ac9a141`; no native qualification follows yet.
+- [x] Prepare/read back its exact source bundle, clean main/tree, R119 profile and launcher;
+  preserve the unlaunched old tool pins after R118 exposes the external installed-tool change.
+- [x] Snapshot the actual installed clean DSR `086b010d` unchanged, verify tree and executable
+  hashes, pin it in R119 before launch, and retain every original check and final guard.
+- [x] Retain R119's actual formatter failure: command one/log zero, inner failed/one,
+  containing exit six and final tool identity zero. No tests execute. Apply its three exact
+  layout hunks manually, compare the scanner's unchanged findings and commit `5c818df4`.
+- [x] Match the incremental source bundle and R120 profile/launcher on Hz2, verify clean
+  main/tree, then launch its exact ten original checks against the unchanged tool snapshot.
+- [x] Retain R120's actual E0599 test compile failure after formatting passes: the fixture
+  returns `TestHost`, so the new `try_recv` probe is invalid. Compiler 101/log zero,
+  inner failed/one, outer six, final identity zero and no tests. This is my test mistake.
+- [x] Replace that probe with real protocol events, a valid applied MCP pause and a first
+  admission sequence observed on another fresh real host. Commit corrected `4048bcb4`.
+- [x] Retain scanner exit one/nine critical heuristics/426 warnings/359 informational items;
+  full normalized deltas are reviewed, with new observations in the actual test controls.
+- [x] Retain R122's actual formatter failure before compiler/tests; manually apply its one
+  requested layout hunk, verify identical normalized UBS observations and commit `5d8eaeea`.
+- [x] Transfer/read back R124's exact profile, launcher and bundle on Hz2; verify complete
+  ancestry and clean main/tree before launching all ten original gates plus direct notification.
+- [x] Finish R124 at that exact source; inspect all eleven successful commands, forty distinct
+  scoped passes and four direct repeats, final source/tool/profile guards and typed pass/zero.
+  All raw hashes check; containing DSR still fails cache collection, outer six/identity zero.
+- [x] Observe R124's actual complete server scope: 37/0/0, and fixture scope 3/0/1;
+  independently match both copied raw log hashes. These forty distinct scoped passes do not
+  qualify the original quantitative or unfiltered workspace acceptance.
+- [x] Observe R124 analyzer/test-binary builds and all four direct regression repetitions
+  passing, each 1/0/0 without the Cargo stack override. No extra distinct test or finished-
+  database reader coverage is claimed. Workspace compiler/Clippy and final guards later pass.
+- [x] Execute the three source-bound direct regressions without `RUST_MIN_STACK` at frozen
+  `d1cefe1f`: each 1/0/0. These are repetitions, not additional distinct tests or finished-
+  database reader qualification; rerun them for the notification successor in R124.
+- [x] Inspect R114's actual final tool guard and timeout disposition; do not extend its
+  deadline, infer a compiler error from timeout, or convert failed/zero into accepted evidence.
+- [x] Preserve complete `5d8eaeea` source on both hosts after the external shared reset;
+  recover the exact own tracker comments and saved metadata on isolated main without deleting
+  files, bypassing shared hooks or overwriting another agent's edits.
+- [x] Record actual R124/R125 proof on the original Beads, export the graph, compare every
+  frozen changed field and preserve every historical comment; commit the required separate
+  tracker snapshot as `589e98be` through the unchanged full hook chain.
+- [x] Preserve and independently match the complete R124/R125 raw proofs on a second host;
+  retain the separate containing-build failures and source-bound qualified product bundle.
+  Final report/plan review, commit, source-bundle readback and publication outcomes are recorded
+  when observed in the existing `/data/tmp/scriptbots-publication-bank-20261011-lilacelm/run-receipt.json`.
 - [x] Prepare R106 with the original build/analyzer and three original-bound matched pairs;
   park unsupported executable reuse and retain the unlaunched profile without new numbers.
-- [ ] Run the original R106 comparison when adequate worker headroom is observed; retain all
-  declared repetitions, incumbent and candidate, exact class and original quantitative criteria.
+- [x] Retain R106 as historical unlaunched preparation; its original three-pair acceptance
+  carries forward to the latest-source R111 successor below, without execution credit.
+- [x] Observe 31.3 GB available on Hz2 and R92 physical-class fields matching; prepare the
+  unchanged three-pair recipe as R111 at the current MCP source `43cd2171`, with the stronger
+  ten-step R110 source-proof prerequisite. R106 remains unlaunched at its historical source.
+- [x] Match R111's complete source bundle, profile and launcher on Hz2; retain clean `main`
+  at the exact source/tree and do not launch while source qualification is pending.
+- [x] Retarget the existing original R111 recipe to exact `5c818df4` as unique R121, with the
+  actual R120 ten-step typed pass and all raw artifact hashes required before launch. Preserve
+  its historical prepared bytes, original three-pair order, class, test and quantitative limits.
+- [x] Retain R121/5c and R123/4048 as unlaunched preparations after their source prerequisites
+  fail. Prepare/read back R125 at `5d8eaeea`, requiring actual R124 eleven-step typed pass and
+  complete raw artifact hashes; every original comparison/class/load/bound remains unchanged.
+- [x] Launch R125 only after its actual eleven-step source proof and every raw hash check.
+  A wrong-account preflight fails before DSR/tests; preserve that exact log and retry under
+  the verified Ubuntu repository owner at 02:15:59 UTC without an exception or guard change.
+- [x] Finish R125's three alternating pairs and preserve all six original-bound outcomes:
+  candidate three passes, incumbent two passes/one failure, typed candidate pass/zero,
+  outer cache refusal six/identity zero and independently matching complete raw proof.
+- [x] Record the measured losses: paired descriptive median p95 worsens 6.633477 percent,
+  loaded snapshot-derived TPS worsens 25.813671 percent. Claim no performance win or causality.
+- [x] Complete only original `bd-g6wf` execution/retention debt on its actual named probe;
+  keep `bd-134` open for original PNG stress/determinism and stable science-throughput evidence.
+- [x] Pass the existing staged JSONL closure check against a separate private index:
+  `bd-g6wf ok`, zero findings. A targeted human-output check
+  misclassifies external proof-directory prefixes as crate locations; preserve its failure,
+  retain full artifact paths in evidence comments, and cite the actual test source in the
+  close reason. Normal BR metadata reopen/reclose earns no new capability or additional unique
+  closure. No guard or bypass flag changes; the final frozen commit must run the full hook chain.
+- [x] Prepare/read back R126 on Hz3 with the original ten workspace gates, unfiltered tests,
+  economy-faults and analyzer; preserve exact verifier bytes and source/tool/tree/hash guards.
+  The unchanged installed-tool snapshot and complete source bundle are independently matched.
+- [x] Finish R126's original run at `5d8eaeea` and retain its actual native timeout/outer six
+  at 03:57:46 UTC. Check all seven completed command hashes and the 69 completed partial tests;
+  retain the unfinished seeded-world test, absent verdict/manifest and unreached feature,
+  analyzer and final guards. Independently match the full partial proof and containing failure
+  on both hosts; preserve the original deadline, inputs and all partial databases.
+- [ ] Meet the original complete workspace acceptance: unfiltered tests, explicit economy-
+  faults, analyzer, final source/tool guards and strict typed consumer. A completed timeout
+  run does not complete this acceptance; retain the existing original owners and criteria.
 - [x] Record the receipt guard's self-matching positive check on existing `bd-0oro` without
   changing its owner, acceptance or closure state.
-- [ ] Correct that guard with a production-only observation and a deletion counterexample;
-  retain a negative case that distinguishes an actually discarded receipt.
+- [x] Correct that guard with a production-only observation and a deletion counterexample;
+  retain both dispatcher discard controls. R118 executes the named guard successfully at
+  frozen `d1cefe1f`; R124 also observes the same guard passing at the qualified `5d8eaeea`.
 - [ ] Discriminate completed scientific boundaries from eight-step snapshot publication using
   the existing runtime observer; preserve original load, bounds, science and every repetition.
 - [ ] Resolve the full Agent Mail integrity warning without losing unarchived messages or
   reconstructing from an incomplete archive.
-- [ ] Measure the original quantitative bounds at the qualified candidate; retain the incumbent
-  in the same invocation before any improvement claim and investigate any failing bound.
+- [x] Measure the original quantitative bounds at the qualified candidate in R125; retain the
+  incumbent in the same invocation and every outcome. All three candidate probes pass; retain
+  the incumbent failure and worse descriptive medians without an improvement or causal claim.
 - [ ] Obtain a worker with adequate disk/memory and I/O headroom, then finish the original
   unfiltered workspace, explicit economy-faults and analyzer acceptance without weakened limits.
 - [ ] Diagnose and repair the terminal analyzer's actual missing output without deleting cache
@@ -1816,8 +2104,12 @@ as a working list when its original owners are fully qualified; retained evidenc
   exact-base, clean tracked/index and foreign-reservation checks; retain isolated recovery.
   This executes at 12:51:53 and 13:25:29 UTC, then external resets undo it at 13:37:57 and
   13:39:08 UTC. Historical successful restoration does not describe the current shared checkout.
-- [ ] Resolve the repeated shared-reset intent before reintegration; preserve the complete
-  isolated candidate and source-pinned proofs. Qualification remains incomplete; no push occurs.
+- [ ] Identify the actor/intent if shared resets recur; preserve the complete isolated candidate
+  and source-pinned proofs. The latest guarded restoration is 22:14:08 UTC at `31313081`,
+  followed by source commits through `5d8eaeea`, then the external 01:38:16 reset to `7c9264a1`.
+  A fresh guarded strict fast-forward restores `589e98be` at 03:43:43 UTC after all 2,614
+  existing database comments match the retained graph. Reset actor/intent remains unknown;
+  do not discard foreign work or bypass reservation/commit/publication guards.
 - [x] Execute the original logger diagnostic, preserve the R68 observer failure and qualify
   only the actual 16/22-case logger scope through R71 with pinned Bash and exact child controls.
 - [x] Preserve and read back all 77/108 logger artifact entries and 35/40 raw command hashes.
@@ -2559,15 +2851,15 @@ percentage from tracker counts.
 | 4 | ML inference and lifetime learning | **Partial; some paths are stubs.** Candle performs real CPU tensor forward inference but has no observed production app registration/preset. Tract/tch/no-backend paths still copy sensors and do not implement evolution. Optional FtBrain has real flat-f32 validation/kernel inference; packed batching, hybrid learning and final survival/checkpoint/tournament qualification remain unfinished. | `bd-2z0.3.12.3`–`.6` |
 | 5 | One authoritative native simulation clock | **Implemented architecture, incomplete qualification.** `HostThread::spawn_with_bootstrap` transfers the world/session to `HostCore`; native consumers use snapshots and command receipts. TUI refresh/present does not directly tick the world. Lifecycle, contention and soak acceptance remain open. | `bd-2z0.4.11`, `bd-2z0.8.9.16` |
 | 6 | Reliable durable scientific runs | **Implemented protocol, unresolved liveness/performance.** FrankenSQLite worker ownership, identity/writer leases, durable outbox, idempotent admission, distinct admitted/applied/durable watermarks, recovery and immutable read models are real. Pin qualification, growing-database cost, original long-server failures and command/journal latency remain open. | `bd-l103`, `bd-kgob`, `bd-50bg`, `bd-w1oi`, `bd-j8o2`, `bd-vrb3` |
-| 7 | Responsive real REST/MCP control | **Implemented with incomplete joined proof.** Routers, receipts, config, inspection, intervention and worker execution exist. Listener-derived authority and configured Origin validation now have actual middleware consumers; full real-process qualification remains open. | `bd-g6wf`, `bd-w1oi`, `bd-j8o2`, `bd-2z0.15`, `bd-2z0.19` |
+| 7 | Responsive real REST/MCP control | **Implemented with incomplete joined proof.** Whole MCP HTTP dispatch now leaves the async worker, and the dedicated notification route dispatches valid messages. R124 qualifies the focused controls; R125 completes the original three candidate load probes. Matched descriptive medians worsen; no performance win is claimed. PNG stress, determinism and the composed control journey remain open. | Completed probe `bd-g6wf`; open broader `bd-134`, `bd-j8o2`, `bd-2z0.15`, `bd-2z0.19` |
 | 8 | Matched-seed experiments | **Implemented substrate.** REST/MCP create real worker-run matched-seed experiments with status/cancel/resume/artifacts. The complete user journey and scientific result qualification remain **unproven**. | Delivered `bd-2z0.12.2`; join `bd-2z0.13.11` |
 | 9 | Bounded checkpoint capture | **Implemented with open acceptance.** API/periodic world checkpoint capture is real. Current retention accounting bounds payloads, metadata, files/leases and periodic producers; it is no longer merely per-page limiting. | `bd-2z0.16`, `bd-2z0.19` |
-| 10 | Trustworthy continuation | **Partial.** Checkpoint-start CLI replay restores `WorldState`, prepares its brain registry and applies recorded commands/interventions. It does not restore the complete live `HostCore`/persistence session, command deduplication/revisions and audit history. New-run versus continued-session identity policy must be explicit. | Reconciled original `bd-2z0.5.13` |
+| 10 | Trustworthy continuation | **Implemented candidate, incomplete original qualification.** The retained full-owner checkpoint and bounded file-continuation CLI restore the declared host/session identity, deduplication/revisions, evaluator state, observed journal cut and schedule cursor; capture refuses an uncovered or stale cut. Original file-backed CLI, corruption and composed-journey acceptance remains open. Checkpoint-start world replay is a separate existing path. | Reconciled original `bd-2z0.5.13`; current `host_core.rs` and `main.rs` |
 | 11 | Replay/timeline inspection | **Partial.** Events, digests, checkpoints, typed V8/V9 journal consumers and replay verification exist. Scrubbable narrated timeline and live experiment/replay panes remain unfinished. The server final-cadence repair has a real scoped proof and is credited separately below. | `bd-ji3a`, `bd-16g.2.9`, `bd-2z0.7.6.1`; closed fix `bd-46iu` |
 | 12 | Independently verifiable portable bundles | **Implemented production repair, incomplete composed qualification.** Finished export holds a source identity/OS lease through materialization and independent SQL readback, and refuses live/pending/colliding sources. The October 8 naive main-file-copy finding is superseded. Full process acceptance remains open. | `bd-2z0.17`, `bd-2z0.19`, `bd-2z0.13.11` |
 | 13 | Scientific analytics | **Implemented machinery; partial original acceptance.** Offline statistics/lineage/report/Parquet/CLI code and actual seeded-world pipeline executions exist. Real planted scarcity, stationary null, complete two-parent lineage, control-CLI FTS and repeated source-bound success remain outstanding. | `bd-2z0.11.9`, `bd-16g.2.9` |
 | 14 | Publishable comparative tournaments | **Partial.** Actual matched-world CLI execution, ratings and reproducible small smoke outputs exist; misleading protocol/provenance labels have been repaired. The full 32-seed × three-order × 20k-tick, 96-match publication remains uncompleted. | `bd-16g.12.3`, conjunctive parent `bd-16g.12` |
-| 15 | Useful live FrankenTUI laboratory | **Implemented integration, native acceptance open.** Through `b49008cc`, the actual interactive consumer is ftui Program/Model with retained Ratatui widgets, all six real science providers, Pending/final presentation barriers and bounded receipt retention. R28 passes 309 terminal units and three fault PTYs but fails executable observer startup; R32/R34 fail before tests. Current repairs require fresh complete native proof. | Original `bd-2z0.6.8`; actual PTY `bd-dkd9`; broad storm/matrix `bd-2z0.14.3.5.2` |
+| 15 | Useful live FrankenTUI laboratory | **Implemented integration, broad acceptance open.** The retained interactive path consumes ftui Program/Model with Ratatui widgets, six actual science providers, Pending/final presentation barriers, bounded receipt retention and capture. R99's fourteen named inner checks, real PTYs and native-consumer observations pass at its frozen source; containing DSR cache collection fails. Later MCP qualification is scoped separately. The original broad storm/matrix and composed laboratory acceptance remain open. | Original `bd-2z0.6.8`; actual PTY `bd-dkd9`; broad storm/matrix `bd-2z0.14.3.5.2` |
 | 16 | Useful native GPU laboratory | **Partial.** GPUI/wgpu/Bevy code consumes host snapshots. Per-window acknowledged interaction, renderer/device failure behavior and complete laboratory workflows still have open acceptance. | `bd-2z0.7.11`, `bd-2z0.7.14`, `bd-2z0.7.6`, `bd-2z0.7.8` |
 | 17 | Game-grade cinematic meadow | **Partial/unproven.** The live Bevy path still spawns per-agent roots/body/stripe/wheel/spike entities and materials. GPU-resident instancing, LOD, terrain/vegetation/water/material/lighting/particles/camera/animation integration and the playable hardware showcase are not complete. | `bd-2z0.7.3`; granular `bd-2z0.14.1.*`, especially `.20` and `.21` |
 | 18 | Honest graphics/performance evidence | **Unproven at the required scope.** The inspected 1600×900 dark-field reference has six agents and llvmpipe/Vulkan metadata, with no HUD. It supports that software-rendered fixture's visual direction, not actual hardware meadow, native UI or FPS. The GPUI/Bevy decision's precise reported measurements lack a retained raw receipt. | Reopened `bd-2z0.7.7`; `bd-2z0.14.3.10`, `.11`, `.5.3`, `.5.4`, `bd-2z0.14.1.12` |
@@ -2622,7 +2914,7 @@ and scope, not presented as fresh executions of the current SHA.
    host/control architecture, persistence identity protocol, world checkpoints, checkpoint-start
    scientific replay, experiment worker, analyzer/tournament machinery, Ratatui interface and
    native render infrastructure are real. Scoped actual-process/SQL/replay evidence exists.
-2. **What is missing or unqualified?** Complete host/session continuation, the live ftui frontend,
+2. **What is missing or unqualified?** Complete acceptance of host/session continuation and the live ftui frontend,
    the polished hardware meadow, durable browser execution, full scientific qualification,
    long-run persistence/control guarantees, composed release evidence and attached binaries.
    Some source is implemented but awaits its original acceptance; some user behavior is still
@@ -2648,9 +2940,9 @@ and scope, not presented as fresh executions of the current SHA.
 | Priority/dependency | Concrete next work and falsifiable exit |
 |---|---|
 | 1. Establish a reliable source-bound run | Finish `bd-w1oi`, `bd-j8o2`, `bd-bfkd`, engine/persistence owners and `bd-build-farm-reliability-lb19.2`. Re-run the unchanged original long probes with their original stimulus; retain the latency distribution, actual science/controls, normal shutdown and durable readback. Attribute a root cause only after a discriminating intervention. Both typed inner acceptance and successful outer DSR collection must bind the source and raw hashes. |
-| 2. Complete continuation and scientific identity | `bd-2z0.5.13` must restore the declared full host/session boundary with explicit identity policy, dedup/revision state, brain evaluator state, audit/history and monotonic persistence. Corrupt/unsupported checkpoints must refuse; checkpoint-start and tick-zero replay must keep working. |
+| 2. Qualify continuation and scientific identity | `bd-2z0.5.13` must qualify the implemented full host/session restoration through its original file-backed CLI and corruption probes, with identity, dedup/revisions, evaluator state, audit/history and monotonic persistence observed. Corrupt/unsupported checkpoints must refuse; checkpoint-start and tick-zero replay must keep working. |
 | 3. Finish scientific publication | Fulfil `bd-2z0.11.9`, `bd-16g.12.3`, narrative parity and captured legacy-trace acceptance. Use actual interventions and stationary controls, complete lineage/search/export joins, the original tournament matrix and explicit source/scenario/founder provenance. A smoke or retained readback cannot become full-matrix publication. |
-| 4. Complete live frontend providers | `bd-2z0.6.8` must connect the actual ftui Program/view to snapshots and all six real science providers, preserve existing panels/bindings/capture/accessibility/lifecycle and pass the real PTY matrix. Native GPU owners must finish per-window acknowledged controls and complete experiment/replay/inspection workflow. No second science clock may be introduced. |
+| 4. Qualify live frontend providers | `bd-2z0.6.8` must qualify the connected ftui Program/view, snapshots and six real science providers through the original broad matrix, including existing panels/bindings/capture/accessibility/lifecycle. Native GPU owners must finish per-window acknowledged controls and complete experiment/replay/inspection workflow. No second science clock may be introduced. |
 | 5. Complete cinematic rendering and measure it | Finish the existing granular `.14.1.*` implementation, GPU-resident instancing/LOD and real hardware meadow. Recover the raw `.7.7` decision receipt or run the bounded source-bound probe. Capture actual presented frames with adapter/driver/source identity, feature ablations and science neutrality; observe the original frame/memory budgets at the named population/tier. Keep software and hardware lanes separate. |
 | 6. Complete browser and optional research reach | Existing browser owners must remove RAF authority over science, wire the actual renderer, prove packaging/bundle size and durable IndexedDB recovery in real supported browsers. Existing distributed-island/communication/audio/learning owners retain their original long-study and integration criteria. These can proceed independently where their graph permits; they cannot certify a missing native joined journey. |
 | 7. Join and publish the actual product | `bd-2z0.13.9`/`.11` must run scenario → living world → stable-UID inspection → acknowledged intervention → durable run → verified continuation → matched-seed analysis → independent bundle readback. Explicitly identify executed frontends/platforms and optional/unexecuted cells. Finish onboarding/tutorials, ship actual assets and credit only the source/platform/evidence that was observed. |

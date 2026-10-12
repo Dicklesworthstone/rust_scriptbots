@@ -446,28 +446,37 @@ async worker, despite an inner spawn-and-join helper. Move the whole HTTP dispat
 to the blocking pool with the caller's Cx captured before transfer. Extend the real
 occupied-pool regression with MCP initialization and owner-applied tool receipts;
 retain caller cancellation through the actual HTTP handler. All original load,
-science, latency and acceptance criteria remain; native qualification is pending.]
+science, latency and acceptance criteria remain. Exact source `5d8eaeea` passes R124's
+eleven native source checks, forty distinct scoped tests and four direct repetitions.
+R125 executes all three original candidate load probes successfully; matched descriptive
+medians worsen, so no performance win is claimed. Only `bd-g6wf` execution/retention debt
+closes. Containing DSR still refuses cache collection; `bd-134` PNG stress/determinism
+and full-workspace acceptance remain open.]
 
 [Currently In Progress — `bd-134`, LilacElm, 2026-10-12: strengthen the HTTP
 cancellation regression with a successful uncancelled call under the same restricted
 caller context, then require the locked FastMCP API's RequestCancelled code after
 cancellation. Apply the same typed assertion to the existing dispatcher regression.
-A generic dispatch error is not cancellation evidence; exact-source native execution
-remains pending, and R114 retains its original frozen revision and raw results.]
+A generic dispatch error is not cancellation evidence. Both typed regressions execute
+successfully at `5d8eaeea` in R124, also directly without `RUST_MIN_STACK`.
+R114 retains its original frozen revision and actual timeout before tests.]
 
 [Currently In Progress — `bd-134`, LilacElm, 2026-10-12: `/mcp/notify`
 returns success while discarding its body. Route typed notifications through the
 existing real HTTP dispatcher; reject request IDs and non-notification methods.
 Observe successful notifications in real FastMCP middleware and require that invalid
 messages do not dispatch or enqueue controls. No wire cancellation/preemption claim.
-R118 remains frozen at `d1cefe1f`; the successor requires fresh native qualification.]
+R118 remains frozen at `d1cefe1f`. The successor `5d8eaeea` passes the real middleware,
+invalid-input and owner-admission controls in R124, also directly without `RUST_MIN_STACK`.
+These handler tests do not establish dedicated-route socket E2E or wire preemption.]
 
 [Currently In Progress — `bd-0oro`, LilacElm, 2026-10-11: repair the receipt
 guard's observed self-matching positive. Restrict its line-oriented scan to production,
 derive actual bound forms from the dispatcher openers, and require both deleted-binding
 and inserted-discard controls. This does not establish application or arbitrary Rust
-expression coverage, and does not close the broader defect-class bead. Native execution
-is pending; the original control-plane acceptance remains unchanged.]
+expression coverage, and does not close the broader defect-class bead. R124 observes the
+positive/deletion/discard controls passing at `5d8eaeea`; original control-plane acceptance
+remains unchanged and open.]
 
 **Relationship to older plans:** this document supersedes the execution order and completion claims in the older port, rendering, Bevy, and WASM plans. Those documents remain valuable historical context. A checked box in an older plan is not evidence that a feature works. Current source, executable tests, and the acceptance gates below are authoritative.
 
