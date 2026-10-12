@@ -455,6 +455,13 @@ cancellation. Apply the same typed assertion to the existing dispatcher regressi
 A generic dispatch error is not cancellation evidence; exact-source native execution
 remains pending, and R114 retains its original frozen revision and raw results.]
 
+[Currently In Progress — `bd-134`, LilacElm, 2026-10-12: `/mcp/notify`
+returns success while discarding its body. Route typed notifications through the
+existing real HTTP dispatcher; reject request IDs and non-notification methods.
+Observe successful notifications in real FastMCP middleware and require that invalid
+messages do not dispatch or enqueue controls. No wire cancellation/preemption claim.
+R118 remains frozen at `d1cefe1f`; the successor requires fresh native qualification.]
+
 [Currently In Progress — `bd-0oro`, LilacElm, 2026-10-11: repair the receipt
 guard's observed self-matching positive. Restrict its line-oriented scan to production,
 derive actual bound forms from the dispatcher openers, and require both deleted-binding

@@ -3973,8 +3973,14 @@ async fn handle_mcp_http_request(
     }
 }
 
-async fn handle_mcp_http_notification(Json(_notification): Json<Value>) -> StatusCode {
-    StatusCode::OK
+async fn handle_mcp_http_notification(
+    State(state): State<McpHttpState>,
+    Json(notification): Json<JsonRpcRequest>,
+) -> Response {
+    if notification.id.is_some() || !notification.method.starts_with("notifications/") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    handle_mcp_http_request(State(state), Json(notification)).await
 }
 
 async fn handle_mcp_http_events(
@@ -5206,10 +5212,8 @@ mod tests {
         )
     }
 
-    fn mcp_http_test_state(handle: ControlHandle) -> McpHttpState {
-        let server = Arc::new(
-            register_control_tools(ServerBuilder::new("http-dispatch-test", "0"), handle).build(),
-        );
+    fn mcp_http_test_state(handle: ControlHandle, builder: ServerBuilder) -> McpHttpState {
+        let server = Arc::new(register_control_tools(builder, handle).build());
         let (notifications_tx, _) = tokio::sync::broadcast::channel(128);
         McpHttpState {
             session: Arc::new(Mutex::new(Session::new(
@@ -5228,12 +5232,88 @@ mod tests {
     }
 
     #[test]
+    fn mcp_notify_dispatches_notifications_and_rejects_requests() {
+        use fastmcp_rust::McpContext;
+        use fastmcp_server::Middleware;
+        use std::sync::atomic::AtomicUsize;
+
+        struct CompletedNotification(Arc<AtomicUsize>);
+
+        impl Middleware for CompletedNotification {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                request: &JsonRpcRequest,
+                response: Value,
+            ) -> McpResult<Value> {
+                if request.method == "notifications/initialized" && response.is_null() {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(response)
+            }
+        }
+
+        let (handle, receiver) = handle();
+        let completions = Arc::new(AtomicUsize::new(0));
+        let state = mcp_http_test_state(
+            handle,
+            ServerBuilder::new("notify-test", "0")
+                .middleware(CompletedNotification(Arc::clone(&completions))),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("notification test runtime");
+        let initialize = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "notify-test", "version": "0"}}
+        }))
+        .expect("initialize request");
+        let initialized = runtime.block_on(handle_mcp_http_request(
+            State(state.clone()),
+            Json(initialize),
+        ));
+        assert_eq!(initialized.status(), StatusCode::OK);
+        assert!(state.session.lock().expect("session").is_initialized());
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+
+        let response = runtime.block_on(handle_mcp_http_notification(
+            State(state.clone()),
+            Json(JsonRpcRequest::notification("notifications/initialized", None)),
+        ));
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = runtime
+            .block_on(axum::body::to_bytes(response.into_body(), 1))
+            .expect("notification response body");
+        assert!(body.is_empty());
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+
+        for invalid in [
+            serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "notifications/initialized"
+            }))
+            .expect("request with id"),
+            JsonRpcRequest::notification("tools/call", Some(json!({"name": "pause"}))),
+            JsonRpcRequest::notification("", None),
+        ] {
+            let response = runtime.block_on(handle_mcp_http_notification(
+                State(state.clone()),
+                Json(invalid),
+            ));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(completions.load(Ordering::SeqCst), 1);
+            assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+    }
+
+    #[test]
     fn mcp_http_dispatch_preserves_caller_cancellation() {
         use asupersync::cx::cap::None as NoCaps;
         use asupersync::types::{Budget, CancelKind};
 
         let (handle, _receiver) = handle();
-        let state = mcp_http_test_state(handle);
+        let state = mcp_http_test_state(handle, ServerBuilder::new("http-dispatch-test", "0"));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6183,7 +6263,8 @@ mod tests {
         let expected = TickSummaryDto::from(expected);
         let queued_handle = handle.clone();
         let websocket_handle = handle.clone();
-        let mcp_state = mcp_http_test_state(handle.clone());
+        let mcp_state =
+            mcp_http_test_state(handle.clone(), ServerBuilder::new("http-dispatch-test", "0"));
         let state = ApiState {
             handle,
             scenario: None,
