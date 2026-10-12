@@ -4222,8 +4222,8 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::MapGenerate => {
-                let req: MapGenerateRequestBody =
-                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                let req: MapGenerateRequestBody = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
                         McpError::new(
                             McpErrorCode::InvalidParams,
                             format!("invalid map generate request payload: {error}"),
@@ -5949,7 +5949,8 @@ mod tests {
             all_orientations: true,
             periodic: true,
         };
-        let request = json!({"width": 8, "height": 8, "cell_size": 16, "seed": 42, "sample": sample});
+        let request =
+            json!({"width": 8, "height": 8, "cell_size": 16, "seed": 42, "sample": sample});
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::CONTENT_TYPE,
@@ -6004,6 +6005,30 @@ mod tests {
             rest.scientific_content_hash()
         );
 
+        let grass = SamplePatternSpec {
+            sample_tiles: vec![TerrainKind::Grass; sample.sample_tiles.len()],
+            ..sample.clone()
+        };
+        let mut grass_request = request.clone();
+        grass_request["sample"] = serde_json::to_value(grass).expect("changed exemplar");
+        let Json(changed) = post_map_generate(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from(
+                serde_json::to_vec(&grass_request).expect("changed sample bytes"),
+            ),
+        )
+        .await
+        .expect("changed exemplar generation");
+        let changed: MapArtifact = serde_json::from_value(changed).expect("changed artifact");
+        assert!(
+            changed.terrain()
+                .tiles()
+                .iter()
+                .all(|tile| tile.kind == TerrainKind::Grass)
+        );
+        assert_ne!(changed.metadata().tileset_hash, rest.metadata().tileset_hash);
+
         let invalid = [
             json!({"width": 4_294_967_296_u64}),
             json!({"width": "8"}),
@@ -6018,7 +6043,9 @@ mod tests {
             let error = post_map_generate(
                 State(state.clone()),
                 headers.clone(),
-                axum::body::Bytes::from(serde_json::to_vec(&arguments).expect("invalid request bytes")),
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&arguments).expect("invalid request bytes"),
+                ),
             )
             .await
             .expect_err("REST must refuse invalid generator inputs");
