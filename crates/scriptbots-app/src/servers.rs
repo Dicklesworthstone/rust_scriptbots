@@ -5257,7 +5257,10 @@ mod tests {
 
         let first_admission_sequence = {
             let probe = test_host();
-            let receipt = probe.handle().pause(None).expect("observer positive control");
+            let receipt = probe
+                .handle()
+                .pause(None)
+                .expect("observer positive control");
             probe
                 .wait_applied(&receipt)
                 .admission_sequence
