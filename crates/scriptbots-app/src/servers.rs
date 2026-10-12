@@ -6101,7 +6101,8 @@ mod tests {
             scenario: None,
             presented_frame: empty_presented_frame(),
         };
-        let Json(value) = post_map_generate(State(state), HeaderMap::new(), axum::body::Bytes::new())
+        let bytes = axum::body::Bytes::new();
+        let Json(value) = post_map_generate(State(state), HeaderMap::new(), bytes)
             .await
             .expect("default map generation");
         let artifact: MapArtifact = serde_json::from_value(value).expect("default artifact");
@@ -6112,6 +6113,33 @@ mod tests {
                 artifact.terrain().cell_size(),
             ),
             dimensions
+        );
+
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("default-map", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "default-map", "version": "0"}}}),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let generated = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "map_generate", "arguments": {}}}),
+        )
+        .await;
+        assert!(generated.get("error").is_none(), "{generated}");
+        let mcp_artifact: MapArtifact = serde_json::from_str(
+            generated["result"]["content"][0]["text"]
+                .as_str()
+                .expect("default MCP artifact text"),
+        )
+        .expect("default MCP artifact");
+        assert_eq!(
+            mcp_artifact.scientific_content_hash(),
+            artifact.scientific_content_hash()
         );
 
         let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI document");
