@@ -10075,10 +10075,8 @@ activation = "Sigmoid"
         );
     }
 
-    #[test]
-    fn replay_map_culling_applies_before_recorded_flush_and_final_cut() {
-        use scriptbots_core::{ControlCommand, ExistingAgentPolicy, TerrainKind, TerrainLayer};
-
+    fn replay_culling_fixture() -> (ScriptBotsConfig, MapArtifact) {
+        use scriptbots_core::{TerrainKind, TerrainLayer};
         let config = ScriptBotsConfig {
             rng_seed: Some(42),
             persistence_interval: 3,
@@ -10107,6 +10105,14 @@ activation = "Sigmoid"
             generated.metadata().clone(),
         )
         .unwrap();
+        (config, artifact)
+    }
+
+    #[test]
+    fn replay_map_culling_applies_before_recorded_flush_and_final_cut() {
+        use scriptbots_core::{ControlCommand, ExistingAgentPolicy};
+
+        let (config, artifact) = replay_culling_fixture();
         for horizon in [1, 2] {
             let mut mirror = ReplayMirror {
                 flush_ticks: BTreeSet::from([1]),
@@ -10162,6 +10168,69 @@ activation = "Sigmoid"
             .expect("retain control");
             assert!(retained.summaries.last().unwrap().agent_count > 0);
             assert_ne!(retained.final_digest, culled.final_digest);
+        }
+    }
+
+    #[test]
+    fn run_headless_simulation_from_checkpoint_replays_cull_before_sealing() {
+        use scriptbots_core::{ControlCommand, ExistingAgentPolicy, Tick};
+
+        let (config, artifact) = replay_culling_fixture();
+        let (mut oracle, mut recording) =
+            WorldState::with_persistence(config.clone(), Box::new(NullPersistence)).unwrap();
+        let brains = install_brains(&mut oracle, BrainPreset::Mlp)
+            .unwrap()
+            .population;
+        seed_agents(&mut oracle, &brains, FounderRecipe::CornerGrid).unwrap();
+        recording.step(&mut oracle).unwrap();
+        let checkpoint = oracle.checkpoint_v1().expect("recorded checkpoint tick one");
+        assert_eq!(checkpoint.tick(), Tick(1));
+        recording.step(&mut oracle).unwrap();
+        assert!(!oracle.agents().is_empty());
+        let command = ControlCommand::ApplyMap {
+            artifact: Box::new(artifact),
+            existing_agent_policy: ExistingAgentPolicy::CullIncompatible,
+        };
+        scriptbots_core::apply_control_command(&mut oracle, command.clone()).unwrap();
+        recording.finalize(&mut oracle).unwrap();
+        let mirror = ReplayMirror {
+            flush_ticks: BTreeSet::from([2]),
+            operator_commands: BTreeMap::from([(2, vec![command])]),
+            ..ReplayMirror::default()
+        };
+        for horizon in [2, 3] {
+            if horizon == 3 {
+                recording.step(&mut oracle).unwrap();
+            }
+            let resumed = run_headless_simulation_from_checkpoint(
+                &checkpoint,
+                &config,
+                horizon,
+                BrainPreset::Mlp,
+                &[],
+                &mirror,
+            )
+            .expect("restored replay culls at a later open cut");
+            assert_eq!(resumed.final_digest, oracle.world_digest_v1().unwrap());
+            assert_eq!(resumed.summaries.last().unwrap().agent_count, 0);
+            let binding_cut = ReplayMirror {
+                flush_ticks: mirror.flush_ticks.clone(),
+                operator_commands: BTreeMap::from([(1, mirror.operator_commands[&2].clone())]),
+                ..ReplayMirror::default()
+            };
+            let refused = run_headless_simulation_from_checkpoint(
+                &checkpoint,
+                &config,
+                horizon,
+                BrainPreset::Mlp,
+                &[],
+                &binding_cut,
+            )
+            .expect_err("restored binding cut cannot retire prior lives");
+            assert!(
+                format!("{refused:#}").contains("recorded tick after persistence binding"),
+                "wrong restored refusal: {refused:#}"
+            );
         }
     }
 
