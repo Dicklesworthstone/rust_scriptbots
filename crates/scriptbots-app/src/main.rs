@@ -10172,6 +10172,58 @@ activation = "Sigmoid"
     }
 
     #[test]
+    fn replay_map_after_flush_preserves_the_pre_map_digest() {
+        use scriptbots_core::ControlCommand;
+
+        let (config, artifact) = replay_culling_fixture();
+        let (mut oracle, mut recording) =
+            WorldState::with_persistence(config.clone(), Box::new(NullPersistence)).unwrap();
+        let brains = install_brains(&mut oracle, BrainPreset::Mlp)
+            .unwrap()
+            .population;
+        seed_agents(&mut oracle, &brains, FounderRecipe::CornerGrid).unwrap();
+        oracle.request_replay_world_digest();
+        recording.step(&mut oracle).unwrap();
+        let before_map = oracle.world_digest_v1().unwrap();
+        recording.finalize(&mut oracle).unwrap();
+        let command = ControlCommand::ApplyMap {
+            artifact: Box::new(artifact),
+            existing_agent_policy: scriptbots_core::ExistingAgentPolicy::Retain,
+        };
+        scriptbots_core::apply_control_command(&mut oracle, command.clone()).unwrap();
+        assert_ne!(oracle.world_digest_v1().unwrap(), before_map);
+        recording.step(&mut oracle).unwrap();
+        let mirror = ReplayMirror {
+            digest_ticks: Some(BTreeSet::from([1])),
+            flush_ticks: BTreeSet::from([1]),
+            operator_commands: BTreeMap::from([(1, vec![command])]),
+        };
+        let replay = run_headless_simulation(
+            &config,
+            2,
+            BrainPreset::Mlp,
+            FounderRecipe::CornerGrid,
+            &[],
+            &mirror,
+        )
+        .expect("replay post-flush retain command");
+        assert_eq!(replay.final_digest, oracle.world_digest_v1().unwrap());
+        let digests: Vec<_> = replay
+            .events
+            .iter()
+            .filter_map(|entry| match &entry.event.kind {
+                ReplayEventKind::WorldDigest { overall } if entry.tick == 1 => Some(overall),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            digests,
+            vec![&before_map.overall],
+            "the recorded digest must precede the post-flush map change"
+        );
+    }
+
+    #[test]
     fn run_headless_simulation_from_checkpoint_replays_cull_before_sealing() {
         use scriptbots_core::{ControlCommand, ExistingAgentPolicy, Tick};
 
