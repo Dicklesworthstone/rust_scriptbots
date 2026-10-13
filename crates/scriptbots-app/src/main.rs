@@ -10289,13 +10289,31 @@ activation = "Sigmoid"
         );
     }
 
+    fn submit_durable_replay_command(
+        port: &mut impl HostPort,
+        id: scriptbots_runtime::CommandId,
+        command: scriptbots_runtime::HostCommand,
+    ) -> Result<()> {
+        use scriptbots_runtime::{ApplicationState, CommandEnvelope, JournalState};
+        use std::time::Duration;
+
+        port.submit(CommandEnvelope::new(id, command))?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = port.command_status(id)?.expect("submitted command");
+            if status.journal() == &JournalState::Durable {
+                assert!(matches!(status.application(), ApplicationState::Applied(_)));
+                return Ok(());
+            }
+            assert!(Instant::now() < deadline, "command did not settle: {status:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn replay_map_journal_preserves_flush_between_same_tick_maps() -> Result<()> {
         use scriptbots_core::{ControlCommand, ExistingAgentPolicy};
-        use scriptbots_runtime::{
-            ApplicationState, CommandEnvelope, CommandId, HostCommand, HostLifecycle, JournalState,
-        };
-        use std::time::Duration;
+        use scriptbots_runtime::{CommandId, HostCommand, HostLifecycle};
 
         let directory = tempdir()?;
         let database = directory.path().join("ordered-map-journal.sqlite");
@@ -10342,17 +10360,7 @@ activation = "Sigmoid"
         ];
         for (index, command) in commands.into_iter().enumerate() {
             let id = CommandId::new(u128::try_from(index + 1)?);
-            port.submit(CommandEnvelope::new(id, command))?;
-            let deadline = Instant::now() + Duration::from_secs(20);
-            loop {
-                let status = port.command_status(id)?.expect("submitted command");
-                if status.journal() == &JournalState::Durable {
-                    assert!(matches!(status.application(), ApplicationState::Applied(_)));
-                    break;
-                }
-                assert!(Instant::now() < deadline, "command did not settle: {status:?}");
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            submit_durable_replay_command(&mut port, id, command)?;
         }
         drop(port);
         let observed = host.join()?;
@@ -10371,6 +10379,12 @@ activation = "Sigmoid"
         );
         let mut recorded = reader.load_replay_events()?;
         let batch_ticks = reader.summary_ticks()?;
+        assert_eq!(batch_ticks, [1, 2]);
+        let deaths = reader.load_ancestry_deaths()?;
+        assert!(!deaths.is_empty());
+        assert!(deaths.iter().all(|death| {
+            death.tick.0 == 1 && death.cause == scriptbots_core::DeathCause::MapIncompatible
+        }));
         reader.close()?;
         canonicalize_replay_event_order(&mut recorded)?;
         let mirror = ReplayMirror {
@@ -10388,6 +10402,7 @@ activation = "Sigmoid"
         )?;
         assert_eq!(replay.final_digest, final_digest);
         assert_eq!(replay.events, recorded);
+        assert_eq!(replay.summaries.len(), batch_ticks.len());
         assert!(replay.summaries.iter().all(|summary| summary.agent_count == 0));
         Ok(())
     }
