@@ -717,8 +717,9 @@ mod capture_smoke_test {
             );
         }
         let rgb_sum = |pixels: &[u8]| -> u64 {
-            pixels
-                .chunks_exact(4)
+            let (rgba_pixels, _) = pixels.as_chunks::<4>();
+            rgba_pixels
+                .iter()
                 .flat_map(|pixel| &pixel[..3])
                 .map(|channel| u64::from(*channel))
                 .sum()

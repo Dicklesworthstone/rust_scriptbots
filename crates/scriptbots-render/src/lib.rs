@@ -18739,8 +18739,9 @@ mod command_characterization_tests {
         let high = factors[2].expect("explicit bright exposure survives Potato");
         assert!(low > 0.0 && high > low);
         let rgb_sum = |pixels: &[u8]| -> u64 {
-            pixels
-                .chunks_exact(4)
+            let (rgba_pixels, _) = pixels.as_chunks::<4>();
+            rgba_pixels
+                .iter()
                 .flat_map(|pixel| &pixel[..3])
                 .map(|channel| u64::from(*channel))
                 .sum()
