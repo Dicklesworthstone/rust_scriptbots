@@ -5377,6 +5377,7 @@ pub(crate) mod tests {
             .expect("command identity");
         let status = host
             .port
+            .clone()
             .command_status(command_id)
             .expect("owner status")
             .expect("known");
