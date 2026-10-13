@@ -6040,10 +6040,12 @@ mod tests {
             if protocol_error {
                 response.get("result").is_none()
                     && response["error"]["code"] == i32::from(McpErrorCode::InvalidParams)
-                    && response["error"]["message"].as_str().is_some_and(|message| {
-                        message.starts_with("Input validation failed:")
-                            && message.contains(diagnostic)
-                    })
+                    && response["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| {
+                            message.starts_with("Input validation failed:")
+                                && message.contains(diagnostic)
+                        })
             } else {
                 response.get("error").is_none()
                     && response["result"]["isError"] == true
@@ -6131,7 +6133,11 @@ mod tests {
                 missing_error["result"]["isError"] = json!(false);
                 wrong_cause["result"]["content"][0]["text"] = json!("unrelated failure");
             }
-            assert!(!matches_rejection(&missing_error, protocol_error, diagnostic));
+            assert!(!matches_rejection(
+                &missing_error,
+                protocol_error,
+                diagnostic
+            ));
             assert!(!matches_rejection(&wrong_cause, protocol_error, diagnostic));
         }
         let after = handle.read_snapshot().expect("after generation");
