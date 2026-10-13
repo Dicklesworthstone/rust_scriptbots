@@ -10183,7 +10183,10 @@ activation = "Sigmoid"
             .population;
         seed_agents(&mut oracle, &brains, FounderRecipe::CornerGrid).unwrap();
         recording.step(&mut oracle).unwrap();
-        let checkpoint = oracle.checkpoint_v1().expect("recorded checkpoint tick one");
+        recording.finalize(&mut oracle).unwrap();
+        let checkpoint = oracle
+            .capture_checkpoint_quiescent()
+            .expect("recorded checkpoint tick one");
         assert_eq!(checkpoint.tick(), Tick(1));
         recording.step(&mut oracle).unwrap();
         assert!(!oracle.agents().is_empty());
