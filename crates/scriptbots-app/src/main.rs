@@ -5912,10 +5912,10 @@ fn recorded_operator_commands(
                     }
                     HostCommand::ApplyMap {
                         artifact,
-                        reposition_agents,
+                        existing_agent_policy,
                     } => ControlCommand::ApplyMap {
                         artifact,
-                        reposition_agents,
+                        existing_agent_policy,
                     },
                     HostCommand::Emigrate { .. } | HostCommand::Immigrate { .. } => bail!(
                         "the recording migrated agents between islands at tick {}; replaying an \

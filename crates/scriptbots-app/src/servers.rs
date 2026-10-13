@@ -42,7 +42,7 @@ use crate::control::{
     ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
     ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentRunRecordDto,
     ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
-    InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyRequestBody, MapGenerateRequestBody,
+    InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody,
     PaginatedArtifactsResponse, PaginatedCheckpointsResponse, PaginatedExperimentsResponse,
     Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
     SpeedRequest, parse_intervention_command, parse_map_artifact,
@@ -1494,6 +1494,7 @@ pub struct SpeedRequestBody {
             SimulationStatusDto,
             MapGenerateRequestBody,
             MapApplyRequestBody,
+            MapApplyAgentPolicy,
             InterveneRequestBody,
             ApiVersionDto,
             ApiSchemaDto,
@@ -2757,7 +2758,7 @@ async fn post_map_apply(
     let status = run_control(move || {
         state.handle.apply_map(
             artifact,
-            payload.reposition_agents,
+            payload.existing_agent_policy.into(),
             payload.expected_scientific_revision,
             key.as_deref(),
         )
@@ -3553,14 +3554,16 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "map_apply",
-        "Apply a procedural map artifact; optionally guard the observed scientific revision and move deep-water agents to the nearest non-deep-water tile",
+        "Apply a procedural map artifact with retain, reposition or recorded culling policy and an optional scientific revision guard",
         json!({
             "type": "object",
             "properties": {
                 "artifact": {
                     "description": "Map artifact as a JSON object, file path, raw JSON string, or hex-encoded postcard"
                 },
-                "reposition_agents": {"type": "boolean", "default": false},
+                "existing_agent_policy": {"type": "string",
+                    "enum": <MapApplyAgentPolicy as clap::ValueEnum>::value_variants(),
+                    "default": MapApplyAgentPolicy::default()},
                 "expected_scientific_revision": {"type": "integer", "minimum": 0,
                     "description": "Owner scientific revision from get_status; omission is unguarded"},
                 "idempotency_key": {"type": "string"}
@@ -4282,7 +4285,7 @@ impl ToolHandler for ControlTool {
                 let status = run_control_mcp_sync(move || {
                     handle.apply_map(
                         artifact,
-                        req.reposition_agents,
+                        req.existing_agent_policy.into(),
                         req.expected_scientific_revision,
                         id_key,
                     )
@@ -6242,6 +6245,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn map_apply_rest_culling_retires_agents_only_after_recorded_tick() {
+        let (host, artifact) = map_culling_transport_fixture();
+        let handle = host.handle();
+        let state = ApiState { handle: handle.clone(), scenario: None,
+            presented_frame: empty_presented_frame() };
+        let request: MapApplyRequestBody = serde_json::from_value(json!({
+            "artifact": artifact, "existing_agent_policy": "cull_incompatible",
+        })).expect("typed culling request");
+        let before = handle.read_snapshot().unwrap();
+        let Json(genesis) = post_map_apply(State(state.clone()), HeaderMap::new(),
+            Json(request.clone())).await.expect("admit genesis request");
+        assert_eq!(host.wait_finished(&genesis.command_id).application_state, "failed");
+        let refused = handle.read_snapshot().unwrap();
+        assert_eq!(refused.world.agents, before.world.agents);
+        assert_eq!(refused.layers.terrain, before.layers.terrain);
+        assert_eq!(refused.world.tick, before.world.tick);
+        assert_eq!(refused.revisions, before.revisions);
+        assert_eq!(refused.last_applied_command, before.last_applied_command);
+        let step = handle.step().expect("recorded step");
+        host.wait_applied(&step);
+        let open = handle.read_snapshot().unwrap();
+        assert_eq!(open.world.agents.len(), 1);
+        let Json(culled) = post_map_apply(State(state), HeaderMap::new(),
+            Json(request)).await.expect("admit open-cut request");
+        assert!(host.wait_applied(&culled).rejection_reason.is_none());
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world.agents.len(), 0);
+        assert_eq!(after.world.tick, open.world.tick);
+        assert_eq!(after.revisions.scientific.get(), open.revisions.scientific.get() + 1);
+        assert!(after.layers.terrain.tiles.iter().all(|tile|
+            tile.kind == scriptbots_core::TerrainKind::DeepWater));
+    }
+
+    fn map_culling_transport_fixture() -> (crate::control::tests::TestHost, scriptbots_core::MapArtifact) {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 48, world_height: 48, food_cell_size: 16,
+            rng_seed: Some(123), closed: true, population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX, persistence_interval: 3,
+            ..ScriptBotsConfig::default()
+        }).expect("recorded culling world");
+        world.try_spawn_agent(scriptbots_core::AgentData::default()).expect("founder");
+        let host = crate::control::tests::TestHost::spawn(world);
+        let generated = host.handle().generate_map(3, 3, Some(16), 42, None).expect("map");
+        let mut tiles = generated.terrain().tiles().to_vec();
+        for tile in &mut tiles {
+            tile.kind = scriptbots_core::TerrainKind::DeepWater;
+        }
+        let artifact = scriptbots_core::MapArtifact::new(
+            scriptbots_core::TerrainLayer::from_tiles(3, 3, 16, tiles).unwrap(),
+            None, None, None, None, generated.metadata().clone(),
+        ).expect("all-water artifact");
+        (host, artifact)
+    }
+
+    #[tokio::test]
+    async fn map_apply_mcp_culling_and_schema_use_the_typed_policy() {
+        let (host, artifact) = map_culling_transport_fixture();
+        let handle = host.handle();
+        host.wait_applied(&handle.step().expect("recorded step"));
+        let before = handle.read_snapshot().unwrap();
+        assert_eq!(before.world.agents.len(), 1);
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("map-culling", "0"));
+        let initialized = map_policy_mcp_request(&mcp, json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "map-culling", "version": "0"}},
+        })).await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let roster = map_policy_mcp_request(&mcp, json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+        })).await;
+        let schema = &roster["result"]["tools"].as_array().expect("actual roster")
+            .iter().find(|tool| tool["name"] == "map_apply").expect("map tool")["inputSchema"];
+        let policies = json!(<MapApplyAgentPolicy as clap::ValueEnum>::value_variants());
+        assert_eq!(schema["properties"]["existing_agent_policy"]["enum"], policies);
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(openapi["components"]["schemas"]["MapApplyAgentPolicy"]["enum"], policies);
+        for (index, invalid) in [json!(true), json!("unknown"), json!(null), json!({}), json!([])]
+            .into_iter().enumerate() {
+            let request = json!({"artifact": artifact, "existing_agent_policy": invalid});
+            assert!(serde_json::from_value::<MapApplyRequestBody>(request.clone()).is_err());
+            let response = map_policy_mcp_request(&mcp, json!({
+                "jsonrpc": "2.0", "id": index + 3, "method": "tools/call",
+                "params": {"name": "map_apply", "arguments": request},
+            })).await;
+            assert_eq!(response["error"]["code"], i32::from(McpErrorCode::InvalidParams), "{response}");
+        }
+        let unchanged = handle.read_snapshot().unwrap();
+        assert_eq!(unchanged.world.agents, before.world.agents);
+        assert_eq!(unchanged.layers.terrain, before.layers.terrain);
+        assert_eq!(unchanged.revisions, before.revisions);
+        assert_eq!(unchanged.last_applied_command, before.last_applied_command);
+        let response = map_policy_mcp_request(&mcp, json!({
+            "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+            "params": {"name": "map_apply", "arguments": {"artifact": artifact,
+                "existing_agent_policy": "cull_incompatible"}},
+        })).await;
+        assert!(response.get("error").is_none(), "{response}");
+        let receipt: CommandStatusDto = serde_json::from_str(
+            response["result"]["content"][0]["text"].as_str().expect("receipt text"),
+        ).expect("actual owner receipt");
+        host.wait_applied(&receipt);
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world.agents.len(), 0);
+        assert_eq!(after.world.tick, before.world.tick);
+        assert_eq!(after.revisions.scientific.get(), before.revisions.scientific.get() + 1);
+    }
+
+    #[tokio::test]
     async fn map_apply_rest_and_mcp_dispatch_preserve_placement_and_owner_results() {
         use scriptbots_core::{AgentData, MapArtifact, Position, TerrainKind, TerrainLayer};
 
@@ -6312,7 +6424,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
                 "params": {"name": "map_apply", "arguments": {"artifact": safe,
-                    "reposition_agents": "yes"}}
+                    "existing_agent_policy": true}}
             }),
         )
         .await;
@@ -6325,7 +6437,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "map_apply", "arguments": {"artifact": safe,
-                    "reposition_agents": true}}
+                    "existing_agent_policy": "reposition_to_safe_tile"}}
             }),
         )
         .await;
@@ -6350,7 +6462,7 @@ mod tests {
             HeaderMap::new(),
             Json(MapApplyRequestBody {
                 artifact: serde_json::to_value(artifact(&[])).expect("all-water map"),
-                reposition_agents: true,
+                existing_agent_policy: MapApplyAgentPolicy::RepositionToSafeTile,
                 expected_scientific_revision: None,
                 idempotency_key: None,
             }),

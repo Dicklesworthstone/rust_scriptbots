@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use scriptbots_core::{
-    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, DraftGeneratorConfig,
+    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, DraftGeneratorConfig, ExistingAgentPolicy,
     HydrologyFlowDirection, MapArtifact, RuleBasedMapGenerator, SampleBasedMapGenerator,
     ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind, Tick,
     WorldState, default_tileset_spec,
@@ -324,6 +324,29 @@ impl MapGenerateRequestBody {
     }
 }
 
+/// Existing-agent policy shared by CLI parsing and REST/MCP request schemas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum MapApplyAgentPolicy {
+    /// Keep existing agents at their current positions.
+    #[default]
+    Retain,
+    /// Move deep-water agents to the nearest non-deep-water tile.
+    RepositionToSafeTile,
+    /// Record deaths for deep-water agents at an open recorded lifecycle boundary.
+    CullIncompatible,
+}
+
+impl From<MapApplyAgentPolicy> for ExistingAgentPolicy {
+    fn from(policy: MapApplyAgentPolicy) -> Self {
+        match policy {
+            MapApplyAgentPolicy::Retain => Self::Retain,
+            MapApplyAgentPolicy::RepositionToSafeTile => Self::RepositionToSafeTile,
+            MapApplyAgentPolicy::CullIncompatible => Self::CullIncompatible,
+        }
+    }
+}
+
 /// Request payload for applying a map artifact to the simulation.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -331,9 +354,9 @@ pub struct MapApplyRequestBody {
     /// Map artifact payload: either a JSON representation of MapArtifact or a base64/hex postcard string, or file path.
     #[schema(value_type = Object)]
     pub artifact: Value,
-    /// Move agents on deep water to the nearest non-deep-water tile; defaults to retaining positions.
+    /// Existing-agent policy; defaults to retaining positions.
     #[serde(default)]
-    pub reposition_agents: bool,
+    pub existing_agent_policy: MapApplyAgentPolicy,
     /// Reject at ordered application if the owner's scientific revision differs.
     /// Obtain this value from simulation status before preparing a preview; omission is unguarded.
     pub expected_scientific_revision: Option<u64>,
@@ -2791,14 +2814,14 @@ impl ControlHandle {
     pub fn apply_map(
         &self,
         artifact: MapArtifact,
-        reposition_agents: bool,
+        existing_agent_policy: ExistingAgentPolicy,
         expected_scientific_revision: Option<u64>,
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
         let mut envelope = self.prepare_control_command(
             ControlCommand::ApplyMap {
                 artifact: Box::new(artifact),
-                reposition_agents,
+                existing_agent_policy,
             },
             idempotency_key,
         )?;
@@ -5308,7 +5331,7 @@ pub(crate) mod tests {
             .expect("generate valid map");
 
         let status = handle
-            .apply_map(artifact, false, None, None)
+            .apply_map(artifact, ExistingAgentPolicy::Retain, None, None)
             .expect("apply valid map command");
         assert_eq!(status.application_state, APPLICATION_STATE_ADMITTED);
 
@@ -5325,7 +5348,7 @@ pub(crate) mod tests {
             .generate_map(width + 10, height + 10, Some(cell_size), 42, None)
             .expect("generate mismatched map");
         let status_bad = handle
-            .apply_map(bad_artifact, false, None, None)
+            .apply_map(bad_artifact, ExistingAgentPolicy::Retain, None, None)
             .expect("submit mismatched map");
         let observed_bad = host.wait_finished(&status_bad.command_id);
         assert_eq!(observed_bad.application_state, "failed");
@@ -5357,7 +5380,7 @@ pub(crate) mod tests {
         let first = handle
             .apply_map(
                 artifact.clone(),
-                false,
+                ExistingAgentPolicy::Retain,
                 Some(observed.scientific_revision),
                 None,
             )
@@ -5376,7 +5399,7 @@ pub(crate) mod tests {
         let stale = handle
             .apply_map(
                 artifact.clone(),
-                false,
+                ExistingAgentPolicy::Retain,
                 Some(observed.scientific_revision),
                 Some("stale-map"),
             )
@@ -5408,7 +5431,7 @@ pub(crate) mod tests {
         let retry = handle
             .apply_map(
                 artifact.clone(),
-                false,
+                ExistingAgentPolicy::Retain,
                 Some(observed.scientific_revision),
                 Some("stale-map"),
             )
@@ -5419,7 +5442,7 @@ pub(crate) mod tests {
         assert_eq!(retry.rejection_reason, rejected.rejection_reason);
         let changed = handle.apply_map(
             artifact,
-            false,
+            ExistingAgentPolicy::Retain,
             Some(before.revisions.scientific.get()),
             Some("stale-map"),
         );

@@ -1530,8 +1530,8 @@ pub enum ControlCommand {
     ApplyMap {
         /// Validated replacement environment.
         artifact: Box<map_sandbox::MapArtifact>,
-        /// Move agents on deep water to the nearest non-deep-water tile.
-        reposition_agents: bool,
+        /// Retain, reposition or retire agents incompatible with the replacement map.
+        existing_agent_policy: map_sandbox::ExistingAgentPolicy,
     },
     /// Operator intervention applied at a simulation tick boundary (bd-16g.10.2).
     Intervention(Box<interventions::InterventionCommand>),
@@ -1707,14 +1707,9 @@ pub fn apply_control_command(
         ControlCommand::Shutdown => Ok(ControlDisposition::WorldApplied),
         ControlCommand::ApplyMap {
             artifact,
-            reposition_agents,
+            existing_agent_policy,
         } => {
-            let policy = if reposition_agents {
-                map_sandbox::ExistingAgentPolicy::RepositionToSafeTile
-            } else {
-                map_sandbox::ExistingAgentPolicy::Retain
-            };
-            world.apply_map_artifact_with_policy(&artifact, policy)?;
+            world.apply_map_artifact_with_policy(&artifact, existing_agent_policy)?;
             Ok(ControlDisposition::WorldApplied)
         }
         ControlCommand::Intervention(cmd) => {
@@ -18942,9 +18937,9 @@ mod map_sandbox {
         /// Keep agents at their exact positions, clamped to world bounds.
         #[default]
         Retain,
-        /// Reposition agents on impassable/lethal tiles to the nearest safe walkable tile.
+        /// Reposition deep-water agents to the nearest non-deep-water tile.
         RepositionToSafeTile,
-        /// Cull agents that end up on impassable/lethal tiles.
+        /// Record deaths for deep-water agents at a valid recorded lifecycle boundary.
         CullIncompatible,
     }
 
@@ -20568,7 +20563,7 @@ mod map_sandbox {
             reason = "one real transition checks survivor identity, companion cleanup, ancestry and the subsequent persistence boundary"
         )]
         fn map_culling_records_ordered_deaths_and_cleans_companions() {
-            use crate::{AgentData, DeathCause, NullPersistence, Position, Tick};
+            use crate::{AgentData, ControlCommand, DeathCause, NullPersistence, Position, Tick, apply_control_command};
 
             let (mut world, artifact) = placement_fixture(&[4]);
             let mut config = world.config().clone();
@@ -20612,9 +20607,10 @@ mod map_sandbox {
             let survivor_counters = world.agent_rng_counters(ids[1]);
             world.set_activation_probe(Some(ids[0]));
             world.pending_deaths.push(ids[0]);
-            world
-                .apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible)
-                .expect("cull at open boundary");
+            apply_control_command(&mut world, ControlCommand::ApplyMap {
+                artifact: Box::new(artifact),
+                existing_agent_policy: ExistingAgentPolicy::CullIncompatible,
+            }).expect("cull command at open boundary");
             assert_eq!(world.tick(), Tick(1));
             assert_eq!(world.agents.len(), 1);
             assert_eq!(world.runtime.len(), 1);
@@ -20857,18 +20853,21 @@ mod map_sandbox {
                         ..AgentData::default()
                     })
                     .expect("agent");
-                for reposition_agents in [false, true] {
+                for existing_agent_policy in [
+                    ExistingAgentPolicy::Retain,
+                    ExistingAgentPolicy::RepositionToSafeTile,
+                ] {
                     apply_control_command(
                         &mut world,
                         ControlCommand::ApplyMap {
                             artifact: Box::new(artifact.clone()),
-                            reposition_agents,
+                            existing_agent_policy,
                         },
                     )
                     .expect("map command");
                     assert_eq!(
                         world.agents().snapshot(id).expect("survivor").position,
-                        if reposition_agents {
+                        if existing_agent_policy == ExistingAgentPolicy::RepositionToSafeTile {
                             expected
                         } else {
                             position
@@ -20898,7 +20897,7 @@ mod map_sandbox {
                 &mut world,
                 ControlCommand::ApplyMap {
                     artifact: Box::new(artifact.clone()),
-                    reposition_agents: true,
+                    existing_agent_policy: ExistingAgentPolicy::RepositionToSafeTile,
                 },
             );
             assert!(matches!(
@@ -20915,7 +20914,7 @@ mod map_sandbox {
                 &mut empty,
                 ControlCommand::ApplyMap {
                     artifact: Box::new(artifact),
-                    reposition_agents: true,
+                    existing_agent_policy: ExistingAgentPolicy::RepositionToSafeTile,
                 },
             )
             .expect("an empty world needs no safe agent placement");

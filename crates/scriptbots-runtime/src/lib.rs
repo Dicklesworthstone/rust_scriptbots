@@ -1866,8 +1866,8 @@ pub enum HostCommand {
     ApplyMap {
         /// Validated replacement environment.
         artifact: Box<scriptbots_core::MapArtifact>,
-        /// Move agents on deep water to the nearest non-deep-water tile.
-        reposition_agents: bool,
+        /// Existing-agent lifecycle policy for the replacement environment.
+        existing_agent_policy: scriptbots_core::ExistingAgentPolicy,
     },
     /// Apply an intervention command with canonical metadata and parameters.
     Intervention(Box<scriptbots_core::interventions::InterventionCommand>),
@@ -2037,10 +2037,10 @@ impl TryFrom<ControlCommand> for HostCommand {
             ControlCommand::Shutdown => Ok(Self::Shutdown),
             ControlCommand::ApplyMap {
                 artifact,
-                reposition_agents,
+                existing_agent_policy,
             } => Ok(Self::ApplyMap {
                 artifact,
-                reposition_agents,
+                existing_agent_policy,
             }),
             ControlCommand::Intervention(cmd) => Ok(Self::Intervention(cmd)),
         }

@@ -9,7 +9,7 @@ use super::{
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use scriptbots_core::{
-    AgentUid, BirthRecord, DeathRecord, MapArtifact, ScriptBotsConfig, SelectionUpdate, Tick,
+    AgentUid, BirthRecord, DeathRecord, ExistingAgentPolicy, MapArtifact, ScriptBotsConfig, SelectionUpdate, Tick,
     TickCombatSummary,
 };
 use scriptbots_runtime::{
@@ -46,7 +46,8 @@ const DEFAULT_EVENT_PAGE_BYTES: usize = 256 << 20;
 const MAX_JOURNAL_BYTES: usize = 1 << 30;
 // Version 4: `scientific` and `persistence` are deflated sections (`bd-nvqh`).
 // V5 binds the explicit placement policy in ApplyMap command evidence.
-pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 5;
+// V6 binds all three typed existing-agent policies, including lifecycle culling.
+pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 6;
 
 /// Bounded admission and catch-up limits for one HostCore journal adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -743,7 +744,7 @@ enum HostCommandPostcardV1 {
     },
     ApplyMap {
         artifact: Box<MapArtifact>,
-        reposition_agents: bool,
+        existing_agent_policy: ExistingAgentPolicy,
     },
     /// An intervention as its canonical postcard parameter bytes. `Intervention` and `Region`
     /// are internally tagged serde enums, which postcard can encode but can never decode
@@ -801,10 +802,10 @@ impl HostCommandPostcardV1 {
             },
             HostCommand::ApplyMap {
                 artifact,
-                reposition_agents,
+                existing_agent_policy,
             } => Self::ApplyMap {
                 artifact: artifact.clone(),
-                reposition_agents: *reposition_agents,
+                existing_agent_policy: *existing_agent_policy,
             },
             HostCommand::Intervention(cmd) => Self::Intervention {
                 params: scriptbots_core::interventions::canonical_param_bytes(&cmd.intervention),
@@ -863,10 +864,10 @@ impl HostCommandPostcardV1 {
             },
             Self::ApplyMap {
                 artifact,
-                reposition_agents,
+                existing_agent_policy,
             } => HostCommand::ApplyMap {
                 artifact,
-                reposition_agents,
+                existing_agent_policy,
             },
             Self::Intervention {
                 params,
@@ -927,7 +928,7 @@ enum HostCommandPostcardRefV1<'a> {
     },
     ApplyMap {
         artifact: &'a MapArtifact,
-        reposition_agents: bool,
+        existing_agent_policy: ExistingAgentPolicy,
     },
     // Canonical parameter bytes, as in the owned enum; `&str` encodes as `String` does.
     Intervention {
@@ -981,10 +982,10 @@ impl<'a> HostCommandPostcardRefV1<'a> {
             },
             HostCommand::ApplyMap {
                 artifact,
-                reposition_agents,
+                existing_agent_policy,
             } => Self::ApplyMap {
                 artifact: artifact.as_ref(),
-                reposition_agents: *reposition_agents,
+                existing_agent_policy: *existing_agent_policy,
             },
             HostCommand::Intervention(cmd) => Self::Intervention {
                 params: scriptbots_core::interventions::canonical_param_bytes(&cmd.intervention),
@@ -4007,7 +4008,7 @@ mod tests {
             "owner patch cannot carry a persistence tail"
         );
 
-        for version in [2, 4, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
+        for version in [2, 4, 5, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
             let mut stale = scheduled_archive(evidence.clone());
             stale.version = version;
             assert!(
@@ -6397,10 +6398,14 @@ mod tests {
         )
         .expect("valid test artifact");
         let mut policy_bytes = Vec::new();
-        for reposition_agents in [false, true] {
+        for existing_agent_policy in [
+            ExistingAgentPolicy::Retain,
+            ExistingAgentPolicy::RepositionToSafeTile,
+            ExistingAgentPolicy::CullIncompatible,
+        ] {
             let command = HostCommand::ApplyMap {
                 artifact: Box::new(artifact.clone()),
-                reposition_agents,
+                existing_agent_policy,
             };
             let owned = HostCommandPostcardV1::from_runtime(&command);
             let borrowed = HostCommandPostcardRefV1::from_runtime(&command);
@@ -6455,7 +6460,7 @@ mod tests {
                     .command,
                 command
             );
-            for version in [4, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
+            for version in [4, 5, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
                 archive.version = version;
                 assert!(matches!(
                     decode_test_archive(&archive),
@@ -6467,7 +6472,11 @@ mod tests {
             }
             policy_bytes.push(bytes);
         }
-        assert_ne!(policy_bytes[0], policy_bytes[1]);
+        for (index, bytes) in policy_bytes.iter().enumerate() {
+            for other in &policy_bytes[index + 1..] {
+                assert_ne!(bytes, other, "distinct policies must have distinct command evidence");
+            }
+        }
     }
 
     #[test]
