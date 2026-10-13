@@ -10403,7 +10403,12 @@ activation = "Sigmoid"
         assert_eq!(replay.final_digest, final_digest);
         assert_eq!(replay.events, recorded);
         assert_eq!(replay.summaries.len(), batch_ticks.len());
-        assert!(replay.summaries.iter().all(|summary| summary.agent_count == 0));
+        assert!(
+            replay
+                .summaries
+                .iter()
+                .all(|summary| summary.agent_count == 0)
+        );
         Ok(())
     }
 
