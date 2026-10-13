@@ -2346,6 +2346,16 @@ named probes pass (1,270 tests, 14 existing ignores), including workspace check 
 Clippy. The typed source receipt passes; outer DSR still fails at the unchanged tracked-Proptest-
 README cache guard. No native editor, full-workspace test suite or overall DSR pass is claimed.
 
+**[Currently In Progress] Culling continuation, 2026-10-13 (`bd-2z0.10.7`):** direct map
+culling now preflights recorded open boundaries, records ordered map-incompatibility deaths,
+cleans live companions and preserves exact food/ancestry/mortality accounting. R149 at clean
+`31557cdc` passes fourteen source commands, ten named probes and 1,183 scoped tests, including
+the production file worker, durable shutdown and reopened finished ancestry reader. Workspace
+check, strict Clippy and formatting pass. Outer DSR still fails/6 at the unchanged cache guard;
+native acceptance and the original blocker remain open. Next carry all three policies through
+the typed owner protocol, CLI/REST/MCP requests and replay, qualifying successful culling at a
+recorded open cut and atomic refusals. This does not close the original native editor task.
+
 Priorities are `P0` correctness/blocking, `P1` usable product, `P2` scientific expansion, and `P3` optional reach.
 
 ### Phase 0 — Establish Truth and Reproducibility (`P0`)

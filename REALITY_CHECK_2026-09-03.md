@@ -12,6 +12,22 @@ meadow and durable browser laboratory also remain unfinished.**
 
 Current map-placement work (`bd-2z0.10.7`):
 
+- [x] Repair arena-only culling: preflight open persistence boundaries and companions, record
+  UID-ordered map-incompatibility deaths, remove live companions and clear the active probe.
+- [x] Refuse genesis, same-tick arrivals, pending/sealed cuts, disabled recording and the
+  checkpoint-restoration binding cut before mutation; require a subsequent recorded cut.
+- [x] Verify survivor state, exact food accounting, ancestry and subsequent death/mortality
+  totals through real core transitions.
+- [x] Persist, shut down and reopen a real file through the production worker and finished
+  reader; verify the explicit cause, matching watermarks and rebuilt ancestry.
+- [x] Read back R149's fourteen passing command/log pairs, ten named probes and complete
+  source receipt at clean `31557cdc`; retain the separate outer DSR collection failure.
+- [x] Copy and hash-check all 56 final manifest files plus four DSR state/log/result files and
+  the outer log in protected local storage; preserve every failed attempt.
+- [ ] Publish the qualified lifecycle source and its ordinary Beads/evidence export separately.
+- [ ] Carry all three policies through typed live commands, shared requests, CLI and replay;
+  qualify successful culling at an open recorded boundary and atomic boundary refusals.
+- [ ] Keep native editor input, painting, cancellation and accessible authoring acceptance open.
 - [x] Inspect the production policy and consumers: live map commands always retain agents;
   repositioning ignores toroidal distance and silently leaves agents on an all-water map.
 - [x] Stage candidate positions and commit only after every placement succeeds.
@@ -23,7 +39,7 @@ Current map-placement work (`bd-2z0.10.7`):
 - [x] Exercise real REST/MCP owner results, malformed policy rejection and failed placement.
 - [x] Observe all fourteen pinned R128 source commands passing at clean `0425c43a`.
 - [x] Review and publish both map-placement source commits; retain successful and failed logs.
-- [ ] Obtain successful outer DSR artifact collection; R142's unchanged cache guard refuses
+- [ ] Obtain successful outer DSR artifact collection; R142/R149's unchanged cache guard refuses
   the tracked Proptest README link, after all source commands and the typed source receipt pass.
 - [x] Verify the new Agent Mail mailbox after the operator reset: full integrity, registration,
   granted exclusive reservations and authoritative readback. Preserve external old snapshots.
@@ -60,8 +76,104 @@ Current map-placement work (`bd-2z0.10.7`):
   guards and retain separate admission, application and durability displays.
 - [ ] Qualify keyboard/focus/accessibility and the original native input journey, including
   contradictory, stale and cancelled negatives.
-- [ ] Repair culling's companion-state/death/ancestry/persistence accounting at a valid science
-  boundary before exposing it. Original acceptance and the blocker of `bd-2z0.10.8` stay intact.
+- [x] Repair culling's companion-state/death/ancestry/persistence accounting at a valid science
+  boundary (R149, direct API). Live policy wiring and original native acceptance remain open;
+  the blocker of `bd-2z0.10.8` stays intact.
+
+**Culling continuation, 2026-10-13:** the direct `CullIncompatible` implementation previously
+removed arena entries without recording deaths or removing their runtime, identity, RNG and
+statistics companions. Clean source `31557cdc89b9ba47192a7c2cd2352236451bd6bf`, tree
+`455dadcf6c99b8ffc801035eeb9ddba3086eb9e3`, repairs that lifecycle. It stages candidate terrain,
+preflights the recording boundary and companions, records UID-ordered `MapIncompatible`
+deaths with exact lifetime food totals, cleans live companions/probes and updates mortality.
+Genesis, pending/sealed cuts, same-tick arrivals, disabled recording and the actual restored
+session binding cut refuse before mutation. A later recorded open cut permits the operation.
+The new epoch belongs to the session token; pure world/checkpoint goldens are unchanged.
+
+Five source commits implement and qualify this slice: `b09774e7` (lifecycle), `e8b0da77`
+(formatting), `83123385` (restored-session chronology and test compile correction), `0a099832`
+(formatting), `31557cdc` (three exact assertions under strict Clippy). These are two user
+behavior changes and three enablers, not five capabilities. No dependency, golden, CI gate,
+unsafe site, existing ignore or acceptance criterion changes. The new long lifecycle test has
+a narrowly explained style allowance; its assertions remain intact. Float food equality uses
+exact bit equality, with no tolerance added. Static UBS is non-clean: the final core scan
+reports 5,311 warnings/1,020 informational findings, and the storage scan reports 18 critical
+heuristics/1,866 warnings/702 informational findings. This is not exhaustive clearance.
+
+Qualification retains every unsuccessful attempt. R143 stops at eight formatter differences;
+R144 stops at a test compile error (a persistence batch has no `Serialize` implementation);
+R145 stops at two formatter differences. R146 runs 1,183 passing scoped tests and workspace
+check, but strict Clippy fails on three new assertions: its typed result is failed/1. A progress
+message prematurely called Clippy green from an incomplete tail; the final receipt corrected
+that claim immediately. R147 encounters HZ2 disk exhaustion before compilation (typed
+failed/1, outer 4); its two empty result/manifest files remain empty. R148 fails HZ3 protection
+setup before any source command (outer 6). R149 uses the same frozen runner/tools on HZ3,
+with the required privileged protection setup, and finishes at 07:54:16 UTC.
+
+R149 version `map-cull-20261013-31557cdc-r149-hz3`, run
+`e5c6caf1-1dd3-4b8b-9b47-739de5ae2d4e`, passes all fourteen command/log pairs and the typed
+`scriptbots.map-culling.quality.v1` source receipt (pass/0). Raw summaries establish core
+economy-faults 947 passed/0 failed/8 existing ignored, runtime 233/0/6, and three storage
+filters with one pass each: **1,183 passes, zero failures, fourteen existing ignores**.
+Workspace all-target check, strict Clippy, formatting, four boundary guards and the analyzer
+build pass. The additional core Clippy preflight was declared before execution; no original
+command or named probe was removed. All ten required named probes complete successfully.
+The storage probe uses a real unique file, the production worker, durable shutdown, matching
+watermarks and a reopened finished reader; it verifies the exact death cause and ancestry.
+This is one in-process round trip, not crash recovery or a fresh-process/native journey.
+
+Outer DSR still fails/6 at the unchanged private-cache Proptest README link/special-entry
+guard, collecting zero artifacts. Final runner identity is zero; raw publishable metadata does
+not imply publication. All 56 original manifest files, four DSR state/log/result files and the
+outer log are copied and SHA256-verified under
+`/data/tmp/scriptbots-cull-20261013-lilacelm/`. Profile SHA256:
+`f6ef265a58119c70d72ff9f30e6647dede683c02742b94346d98f810cc4bd934`;
+outer log SHA256: `ee4aa705ec9778270010d2d14f75942a7f1bc295e4a6dcc33c05d6ff6e0837da`.
+The readback separately binds fourteen receipts/log hashes, ten named completions and actual
+test totals. Existing Cargo future-Rust notices remain. No overall DSR, full-workspace test,
+performance, release or native-editor pass is claimed. The collection gap remains with the
+existing build-farm work, including `bd-build-farm-reliability-lb19.2`, without a duplicate bead.
+
+The local checkout subsequently returned externally to published `7aff0c75`; surviving Git
+objects and protected evidence allowed an ordinary clean fast-forward to the reviewed source.
+The agent did not run a reset. Saved comment identity 2782 survives in BR's database; ordinary
+export restores it without editing JSONL by hand. Existing unrelated WAL directories remain.
+
+Bounded anti-ceremony review of this slice:
+
+- Creation worksheet (twelve answers): (1) the requested TODO is process and DSR is required
+  qualification; (2) consumers are the operator and existing runner; (3) gates are the explicit
+  granular handoff and compiler/testing rules; (4) defects are arena-only culling and observed
+  formatter refusal; (5) active entries retire on qualification while historical evidence stays;
+  (6) raw retention prevents loss of failed evidence; (7) mailbox reset, disk exhaustion and the
+  checkout reset are observed failures; (8) the existing protected root is sufficient;
+  (9) no new recovery ledger is needed; (10) lifecycle and live policy wiring improve the
+  product; (11) source work beats another census; (12) minimum requested tracking and required
+  proof, with zero capability credit for this report. The first worksheet followed initial profile
+  preparation; that timing is not rewritten. Successor profiles reused this disposition first.
+- Real-work audit (six answers): (1) direct culling changes real lifecycle/persistence behavior;
+  (2) the report improves operator visibility only; (3) formatting/compile/lint fixes enable the
+  same source qualification; (4) the larger Evolution Lab remains unfinished; (5) work is solo;
+  (6) no criteria/dependency/status edits, closures or follow-up splitting claim completion.
+  Source classification: USER_BEHAVIOR 2, ENABLER 3, PROCESS 0, UNKNOWN 0. This evidence and
+  tracker checkpoint are PROCESS and earn no product capability credit.
+- Honesty audit (twenty answers): (1) no existing assertion/ignore removal; valid-cut positive
+  replaces the invalid genesis setup and explicit genesis negatives remain; (2) admission-only
+  null persistence is qualified separately from the actual file worker; (3) no golden changes;
+  (4) one explained long-test style allowance, no tolerance or new Clippy suppression;
+  (5) no bench hardcoding or denominator substitution; (6) R143–145 have no passing suite,
+  R146 is failed despite passing tests, R147/148 have no tests, R149 counts are derived;
+  (7) the premature Clippy claim is explicitly corrected above; (8) no fixtures presented as
+  native/TCP/independent evidence; (9) all setup/compile/disk/outer failures retained;
+  (10) raw stderr retained; (11) no closure; (12) original criteria unchanged; (13–16) no swarm,
+  delegation, independent reviewer or parallel reviewer claims apply; (17) same-source evidence
+  is counted once; (18) scope/names declared before runs, old ignores and zero collected outer
+  artifacts are countermetrics; (19) avoidable compile/format/profile-copy/sampler mistakes
+  remain disclosed, a wrong fixture edit was corrected before commit, the agent's stalled
+  read-only scan was stopped without cleanup, and checkout recovery used fast-forward;
+  (20) strongest observation is the exact real-file durable death/ancestry round trip.
+  Disposition: keep failed receipts failed, retain exact assertions, qualify the narrow source
+  scope, and carry all three policies through live consumers next. Self-review is not independent.
 
 Creation worksheet (2026-10-12): this TODO is process; its consumer is the user who explicitly
 requested a granular complete TODO, its gate is that requested handoff, and its observed
