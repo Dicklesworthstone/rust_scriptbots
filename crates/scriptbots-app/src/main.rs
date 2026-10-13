@@ -5985,10 +5985,9 @@ fn apply_recorded_operator_commands(
     for command in commands {
         match command {
             ReplayOperatorCommand::World(command) => {
-                scriptbots_core::apply_control_command(world, command.clone())
-                    .with_context(|| {
-                        format!("failed to re-apply a recorded operator command at tick {tick}")
-                    })?;
+                scriptbots_core::apply_control_command(world, command.clone()).with_context(
+                    || format!("failed to re-apply a recorded operator command at tick {tick}"),
+                )?;
             }
             ReplayOperatorCommand::FlushPersistence => {
                 persistence.finalize(world).with_context(|| {
@@ -10305,7 +10304,10 @@ activation = "Sigmoid"
                 assert!(matches!(status.application(), ApplicationState::Applied(_)));
                 return Ok(());
             }
-            assert!(Instant::now() < deadline, "command did not settle: {status:?}");
+            assert!(
+                Instant::now() < deadline,
+                "command did not settle: {status:?}"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
