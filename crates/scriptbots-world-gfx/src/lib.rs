@@ -43,6 +43,9 @@ pub struct WorldSnapshot<'a> {
     /// the renderer's environment-driven default; `Some` makes the chosen curve drive
     /// the shader every frame rather than sitting unconsumed (bd-2z0.7.11).
     pub tonemap_mode: Option<RenderTonemapMode>,
+    /// Resolved linear exposure multiplier from the frontend's snapshot-derived post stack.
+    /// Must be finite and non-negative. `None` retains the environment default.
+    pub exposure_factor: Option<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -372,7 +375,8 @@ impl WorldRenderer {
         // Freeze presentation controls once for this frame. Reading the
         // environment independently in `ensure_post` and `PostFx::run` made
         // one frozen snapshot depend on wall-clock cache refreshes.
-        let post_controls = PostControls::from_env()?;
+        let mut post_controls = PostControls::from_env()?;
+        post_controls.exposure = snapshot.exposure_factor.unwrap_or(post_controls.exposure);
         let selected_tonemap = snapshot.tonemap_mode.map(|mode| match mode {
             RenderTonemapMode::Aces | RenderTonemapMode::Tony => 1_u32,
             RenderTonemapMode::Agx => 3_u32,
@@ -500,6 +504,13 @@ fn validate_frame_token(
 }
 
 fn validate_snapshot(snapshot: &WorldSnapshot<'_>) -> Result<(), ReadbackError> {
+    if let Some(exposure) = snapshot.exposure_factor
+        && (!exposure.is_finite() || exposure < 0.0)
+    {
+        return Err(ReadbackError::Configuration(format!(
+            "snapshot exposure must be finite and non-negative, got {exposure}"
+        )));
+    }
     let (width, height) = snapshot.terrain.dims;
     let expected = (width as usize)
         .checked_mul(height as usize)
@@ -626,6 +637,7 @@ mod capture_smoke_test {
             agents: &[],
             anim_seconds: 0.0,
             tonemap_mode: None,
+            exposure_factor: None,
         };
         let frame = renderer.render(&snapshot).expect("valid render snapshot");
         renderer
@@ -662,6 +674,78 @@ mod capture_smoke_test {
         assert_eq!(
             first, second,
             "same snapshot, controls, adapter, and tick-derived animation time must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn snapshot_exposure_changes_pixels_and_rejects_invalid_frames() {
+        let _gpu_lock = crate::GPU_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let adapter = live_adapter("snapshot exposure")
+            .expect("snapshot exposure proof requires an actual wgpu adapter");
+        eprintln!("snapshot exposure adapter: {:?}", adapter.get_info());
+        let tiles = [3];
+        let colors = [[0.4, 0.4, 0.4, 1.0]];
+        let mut snapshot = WorldSnapshot {
+            world_size: (64.0, 64.0),
+            terrain: TerrainView {
+                dims: (1, 1),
+                cell_size: 64,
+                tiles: &tiles,
+                colors: &colors,
+                elevation: None,
+            },
+            agents: &[],
+            anim_seconds: 0.0,
+            tonemap_mode: None,
+            exposure_factor: Some(0.5),
+        };
+        let mut renderer = pollster::block_on(WorldRenderer::new(&adapter, (64, 64)))
+            .expect("exposure renderer");
+        let mut captures = Vec::new();
+        for exposure in [0.5, 2.0, 0.5] {
+            snapshot.exposure_factor = Some(exposure);
+            let frame = renderer.render(&snapshot).expect("exposure frame");
+            renderer.copy_to_readback(&frame).expect("exposure copy");
+            captures.push(
+                renderer
+                    .mapped_rgba()
+                    .expect("exposure readback")
+                    .bytes()
+                    .to_vec(),
+            );
+        }
+        let rgb_sum = |pixels: &[u8]| -> u64 {
+            pixels
+                .chunks_exact(4)
+                .flat_map(|pixel| &pixel[..3])
+                .map(|channel| u64::from(*channel))
+                .sum()
+        };
+        let low = rgb_sum(&captures[0]);
+        let high = rgb_sum(&captures[1]);
+        assert!(low > 0, "opaque black pixels cannot prove exposure");
+        assert!(
+            high > low,
+            "exposure must brighten actual RGB: {low} -> {high}"
+        );
+        assert_eq!(captures[0], captures[2]);
+        let generation = renderer.frame_generation;
+        for exposure in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5] {
+            snapshot.exposure_factor = Some(exposure);
+            assert!(matches!(
+                renderer.render(&snapshot),
+                Err(ReadbackError::Configuration(_))
+            ));
+            assert_eq!(renderer.frame_generation, generation);
+        }
+        snapshot.exposure_factor = Some(0.5);
+        let frame = renderer.render(&snapshot).expect("recover after bad exposure");
+        renderer.copy_to_readback(&frame).expect("recovered copy");
+        assert_eq!(
+            renderer.mapped_rgba().expect("recovered pixels").bytes(),
+            captures[0]
         );
     }
 
@@ -710,6 +794,7 @@ mod capture_smoke_test {
             agents: &[],
             anim_seconds: 0.0,
             tonemap_mode: None,
+            exposure_factor: None,
         };
 
         // Each closure owns its renderer for its whole lifetime, so the second
@@ -1012,6 +1097,7 @@ mod capture_smoke_test {
             agents: &agents,
             anim_seconds: 1.2,
             tonemap_mode: None,
+            exposure_factor: None,
         };
 
         let t_start = std::time::Instant::now();
@@ -2556,6 +2642,7 @@ mod tests {
             agents: &[],
             anim_seconds: 0.0,
             tonemap_mode: None,
+            exposure_factor: None,
         };
         assert!(matches!(
             validate_snapshot(&snapshot),

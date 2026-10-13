@@ -933,6 +933,7 @@ pub mod world_compositor {
             agents: &agents_gpu,
             anim_seconds: frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
             tonemap_mode: frame.tonemap_mode,
+            exposure_factor: frame.gpu_exposure_factor(),
         };
 
         // Fit camera into the requested viewport
@@ -1082,6 +1083,7 @@ pub mod world_compositor {
                 agents: &[] as &[AgentInstance],
                 anim_seconds: 0.0,
                 tonemap_mode: None,
+                exposure_factor: None,
             }
         }
 
@@ -1395,6 +1397,7 @@ mod wgpu_capture_test {
             agents: &[] as &[AgentInstance],
             anim_seconds: 0.0,
             tonemap_mode: None,
+            exposure_factor: None,
         };
         comp.set_camera_params(1.0, (0.0, 0.0));
         comp.render_snapshot(&snapshot, viewport)
@@ -1537,6 +1540,7 @@ mod wgpu_capture_test {
             agents: &agents,
             anim_seconds: 0.0,
             tonemap_mode: None,
+            exposure_factor: None,
         };
 
         comp.render_snapshot(&snapshot, viewport)
@@ -1593,6 +1597,7 @@ mod wgpu_capture_test {
             agents: &[] as &[AgentInstance],
             anim_seconds: 0.0,
             tonemap_mode: None,
+            exposure_factor: None,
         };
         comp.render_snapshot(&empty, viewport)
             .expect("comparison capture must either render or return a typed GPU failure");
@@ -1861,6 +1866,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         agents: &agents_gpu,
         anim_seconds: state.frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
         tonemap_mode: state.frame.tonemap_mode,
+        exposure_factor: state.frame.gpu_exposure_factor(),
     };
 
     emit_wgpu_camera_mapping_diagnostic(width_px, height_px, world_dims, layout, cam_offset);
@@ -14409,6 +14415,13 @@ struct CanvasState {
 }
 
 impl RenderFrame {
+    fn gpu_exposure_factor(&self) -> Option<f32> {
+        self.post_stack.passes.iter().find_map(|pass| match pass {
+            PostProcessPass::Exposure { factor } => Some(*factor),
+            _ => None,
+        })
+    }
+
     fn from_snapshot(snapshot: &RenderSnapshot, palette: ColorPaletteMode) -> Option<Self> {
         Self::from_snapshot_with_vfx(snapshot, palette, None)
     }
@@ -18664,6 +18677,39 @@ mod command_characterization_tests {
         let mut missing_visuals = snapshot.as_ref().clone();
         missing_visuals.agent_visuals = Arc::new(Vec::new());
         assert!(RenderFrame::from_snapshot(&missing_visuals, ColorPaletteMode::Natural).is_none());
+    }
+
+    #[test]
+    fn published_snapshot_exposure_reaches_the_gpu_frame() {
+        use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId};
+
+        let mut factors = Vec::new();
+        for bias in [None, Some(-1.0), Some(1.0)] {
+            let mut config = ScriptBotsConfig {
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            };
+            config.render.quality = Some(RenderQuality::Potato);
+            config.render.tonemap_exposure_bias = bias;
+            let world = WorldState::new(config).expect("exposure world");
+            let expected = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+                .expect("owner exposure frame")
+                .gpu_exposure_factor();
+            let host =
+                HostCore::new(HostSessionId::new(78), world, HostCoreOptions::default())
+                    .expect("exposure host");
+            let snapshot = host.snapshot_hub().latest();
+            let actual = RenderFrame::from_snapshot(&snapshot, ColorPaletteMode::Natural)
+                .expect("published exposure frame")
+                .gpu_exposure_factor();
+            assert_eq!(actual, expected);
+            factors.push(actual);
+        }
+        assert_eq!(factors[0], None);
+        let low = factors[1].expect("explicit dim exposure survives Potato");
+        let high = factors[2].expect("explicit bright exposure survives Potato");
+        assert!(low > 0.0 && high > low);
     }
 
     #[test]
