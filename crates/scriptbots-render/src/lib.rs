@@ -18682,8 +18682,10 @@ mod command_characterization_tests {
     #[test]
     fn published_snapshot_exposure_reaches_the_gpu_frame() {
         use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId};
+        use std::io::Write as _;
 
         let mut factors = Vec::new();
+        let mut pixels = Vec::new();
         for bias in [None, Some(-1.0), Some(1.0)] {
             let mut config = ScriptBotsConfig {
                 rng_seed: Some(42),
@@ -18705,11 +18707,45 @@ mod command_characterization_tests {
                 .gpu_exposure_factor();
             assert_eq!(actual, expected);
             factors.push(actual);
+            let png = world_compositor::render_wgpu_png_offscreen(&snapshot, 128, 64)
+                .expect("production offscreen exposure capture requires an allowed adapter");
+            let image = image::load_from_memory(&png)
+                .expect("actual exposure PNG")
+                .to_rgba8();
+            assert_eq!(image.dimensions(), (128, 64));
+            pixels.push(image.into_raw());
+            if let Some(directory) = std::env::var_os("SCRIPTBOTS_EXPOSURE_EVIDENCE_ROOT") {
+                let directory = std::path::PathBuf::from(directory);
+                assert!(directory.is_absolute() && directory.is_dir());
+                let name = match bias {
+                    None => "exposure-default.png",
+                    Some(value) if value < 0.0 => "exposure-dim.png",
+                    Some(_) => "exposure-bright.png",
+                };
+                std::fs::File::create_new(directory.join(name))
+                    .expect("unique exposure proof artifact")
+                    .write_all(&png)
+                    .expect("retain actual exposure PNG");
+            }
         }
         assert_eq!(factors[0], None);
         let low = factors[1].expect("explicit dim exposure survives Potato");
         let high = factors[2].expect("explicit bright exposure survives Potato");
         assert!(low > 0.0 && high > low);
+        let rgb_sum = |pixels: &[u8]| -> u64 {
+            pixels
+                .chunks_exact(4)
+                .flat_map(|pixel| &pixel[..3])
+                .map(|channel| u64::from(*channel))
+                .sum()
+        };
+        let default_rgb = rgb_sum(&pixels[0]);
+        let dim_rgb = rgb_sum(&pixels[1]);
+        let bright_rgb = rgb_sum(&pixels[2]);
+        eprintln!(
+            "production offscreen exposure RGB sums: dim={dim_rgb} default={default_rgb} bright={bright_rgb}"
+        );
+        assert!(dim_rgb > 0 && default_rgb > dim_rgb && bright_rgb > default_rgb);
     }
 
     #[test]
