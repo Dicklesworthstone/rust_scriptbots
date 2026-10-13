@@ -4263,8 +4263,9 @@ impl ToolHandler for ControlTool {
                 make_tool_result(artifact)
             }
             ControlToolKind::MapApply => {
+                let key = mcp_idempotency_key(&arguments);
                 let req: MapApplyRequestBody =
-                    serde_json::from_value(arguments.clone()).map_err(|error| {
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
                         McpError::new(
                             McpErrorCode::InvalidParams,
                             format!("invalid map apply request: {error}"),
@@ -4276,7 +4277,6 @@ impl ToolHandler for ControlTool {
                         format!("invalid map artifact: {e}"),
                     )
                 })?;
-                let key = mcp_idempotency_key(&arguments);
                 let id_key = key.as_deref();
                 let handle = self.handle.clone();
                 let status = run_control_mcp_sync(move || {
