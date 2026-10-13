@@ -13258,10 +13258,15 @@ mod tests {
     }
 
     fn map_culling_owner(interval: u32) -> (HostCore, MapArtifact) {
-        let mut world = continuation_world();
-        let mut config = world.config().clone();
+        let mut config = continuation_world().config().clone();
         config.persistence_interval = interval;
-        world.apply_config_update(config).expect("open cadence");
+        let mut world = WorldState::new(config).expect("initial recording cadence");
+        for _ in 0..3 {
+            world
+                .try_spawn_agent(AgentData::default())
+                .expect("real founder");
+        }
+        world.set_resource_ledger_enabled(true);
         let (_, map, _) = snapshot_map_artifacts(&world);
         let mut tiles = map.terrain().tiles().to_vec();
         for tile in &mut tiles {
