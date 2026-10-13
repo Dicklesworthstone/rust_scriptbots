@@ -326,7 +326,16 @@ impl MapGenerateRequestBody {
 
 /// Existing-agent policy shared by CLI parsing and REST/MCP request schemas.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, clap::ValueEnum,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum MapApplyAgentPolicy {

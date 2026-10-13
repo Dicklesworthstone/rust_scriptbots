@@ -2019,7 +2019,8 @@ mod tests {
         ] {
             let parsed = Cli::try_parse_from(arguments).expect("map CLI");
             let Command::MapApply {
-                existing_agent_policy, ..
+                existing_agent_policy,
+                ..
             } = parsed.command
             else {
                 panic!("map command expected");
