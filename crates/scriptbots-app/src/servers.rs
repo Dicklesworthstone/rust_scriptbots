@@ -6033,17 +6033,64 @@ mod tests {
             rest.metadata().tileset_hash
         );
 
+        // FastMCP rejects schema violations before dispatch with InvalidParams;
+        // handler refusals become CallToolResult { isError: true }. Check the
+        // expected phase and cause, rather than treating any error as sufficient.
+        let matches_rejection = |response: &Value, protocol_error: bool, diagnostic: &str| {
+            if protocol_error {
+                response.get("result").is_none()
+                    && response["error"]["code"] == i32::from(McpErrorCode::InvalidParams)
+                    && response["error"]["message"].as_str().is_some_and(|message| {
+                        message.starts_with("Input validation failed:")
+                            && message.contains(diagnostic)
+                    })
+            } else {
+                response.get("error").is_none()
+                    && response["result"]["isError"] == true
+                    && response["result"]["content"][0]["text"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(diagnostic))
+            }
+        };
         let invalid = [
-            json!({"width": 4_294_967_296_u64}),
-            json!({"width": "8"}),
-            json!({"tileset": {"unknown": true}}),
-            json!({"sample": {"sample_width": 2}}),
-            json!({"sample": sample, "tileset": {}}),
-            json!({"sample": SamplePatternSpec { periodic: false, ..sample.clone() }}),
-            json!({"width": 65_537, "height": 1, "sample": sample}),
-            json!({"unknown": true}),
+            (
+                json!({"width": 4_294_967_296_u64}),
+                false,
+                "invalid map generate request payload",
+            ),
+            (json!({"width": "8"}), true, "width"),
+            (
+                json!({"tileset": {"unknown": true}}),
+                false,
+                "invalid tileset specification",
+            ),
+            (
+                json!({"sample": {"sample_width": 2}}),
+                false,
+                "invalid sample specification",
+            ),
+            (
+                json!({"sample": sample, "tileset": {}}),
+                false,
+                "mutually exclusive",
+            ),
+            (
+                json!({"sample": SamplePatternSpec { periodic: false, ..sample.clone() }}),
+                false,
+                "non-periodic",
+            ),
+            (
+                json!({"width": 65_537, "height": 1, "sample": sample}),
+                false,
+                "output cells",
+            ),
+            (json!({"unknown": true}), true, "unknown"),
         ];
-        for arguments in invalid {
+        for (arguments, protocol_error, diagnostic) in invalid {
+            assert!(
+                !matches_rejection(&generated, protocol_error, diagnostic),
+                "a real successful map must fail the rejection guard"
+            );
             let error = post_map_generate(
                 State(state.clone()),
                 headers.clone(),
@@ -6060,11 +6107,32 @@ mod tests {
                     "params": {"name": "map_generate", "arguments": arguments}}),
             )
             .await;
-            assert_eq!(
-                result["error"]["code"],
-                i32::from(McpErrorCode::InvalidParams),
-                "{result}"
+            let rejection_matches = matches_rejection(&result, protocol_error, diagnostic);
+            assert!(rejection_matches, "{result}");
+
+            println!(
+                "{}",
+                json!({
+                    "schema": "scriptbots.map-generate.rejection-oracle.v1",
+                    "arguments": arguments,
+                    "observed_protocol_error": result.get("error").is_some(),
+                    "old_code_assertion_passes": result["error"]["code"]
+                        == i32::from(McpErrorCode::InvalidParams),
+                    "rejection_matches": rejection_matches,
+                })
             );
+
+            let mut missing_error = result.clone();
+            let mut wrong_cause = result.clone();
+            if protocol_error {
+                missing_error["error"]["code"] = Value::Null;
+                wrong_cause["error"]["message"] = json!("unrelated failure");
+            } else {
+                missing_error["result"]["isError"] = json!(false);
+                wrong_cause["result"]["content"][0]["text"] = json!("unrelated failure");
+            }
+            assert!(!matches_rejection(&missing_error, protocol_error, diagnostic));
+            assert!(!matches_rejection(&wrong_cause, protocol_error, diagnostic));
         }
         let after = handle.read_snapshot().expect("after generation");
         assert_eq!(before.world.tick, after.world.tick);
