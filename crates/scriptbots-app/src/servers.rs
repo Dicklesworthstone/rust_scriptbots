@@ -2755,14 +2755,12 @@ async fn post_map_apply(
     let artifact = parse_map_artifact(&payload.artifact)?;
 
     let status = run_control(move || {
-        state
-            .handle
-            .apply_map(
-                artifact,
-                payload.reposition_agents,
-                payload.expected_scientific_revision,
-                key.as_deref(),
-            )
+        state.handle.apply_map(
+            artifact,
+            payload.reposition_agents,
+            payload.expected_scientific_revision,
+            key.as_deref(),
+        )
     })
     .await?;
 
@@ -4265,8 +4263,8 @@ impl ToolHandler for ControlTool {
                 make_tool_result(artifact)
             }
             ControlToolKind::MapApply => {
-                let req: MapApplyRequestBody = serde_json::from_value(arguments.clone())
-                    .map_err(|error| {
+                let req: MapApplyRequestBody =
+                    serde_json::from_value(arguments.clone()).map_err(|error| {
                         McpError::new(
                             McpErrorCode::InvalidParams,
                             format!("invalid map apply request: {error}"),
@@ -6413,9 +6411,7 @@ mod tests {
             scenario: None,
             presented_frame: empty_presented_frame(),
         };
-        let Json(observed) = get_status(State(state.clone()))
-            .await
-            .expect("REST status");
+        let Json(observed) = get_status(State(state.clone())).await.expect("REST status");
         let request = serde_json::from_value(json!({"artifact": sand,
             "expected_scientific_revision": observed.scientific_revision}))
         .expect("REST request");
@@ -6425,7 +6421,10 @@ mod tests {
         host.wait_applied(&first);
         let before = handle.read_snapshot().expect("applied REST map");
         assert_eq!(before.world.agents.len(), 1);
-        assert_eq!(before.layers.terrain.tiles.len(), sand.terrain().tiles().len());
+        assert_eq!(
+            before.layers.terrain.tiles.len(),
+            sand.terrain().tiles().len()
+        );
         assert!(
             before
                 .layers
@@ -6496,7 +6495,10 @@ mod tests {
                 .expect("MCP status"),
         )
         .expect("status body");
-        assert_eq!(status.scientific_revision, before.revisions.scientific.get());
+        assert_eq!(
+            status.scientific_revision,
+            before.revisions.scientific.get()
+        );
         let current = map_policy_mcp_request(
             &mcp,
             json!({
@@ -6528,9 +6530,15 @@ mod tests {
                 .all(|tile| tile.kind == scriptbots_core::TerrainKind::Grass)
         );
         assert_ne!(applied.layers.terrain, before.layers.terrain);
-        for (index, invalid) in [json!(-1), json!("latest"), json!(1.5), json!(true), json!(1e20)]
-            .into_iter()
-            .enumerate()
+        for (index, invalid) in [
+            json!(-1),
+            json!("latest"),
+            json!(1.5),
+            json!(true),
+            json!(1e20),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let request = json!({"artifact": sand, "expected_scientific_revision": invalid});
             assert!(serde_json::from_value::<MapApplyRequestBody>(request.clone()).is_err());

@@ -5342,9 +5342,7 @@ pub(crate) mod tests {
             .expect("agent");
         let host = TestHost::spawn(world);
         let handle = host.handle();
-        let artifact = handle
-            .generate_map(3, 3, Some(16), 42, None)
-            .expect("map");
+        let artifact = handle.generate_map(3, 3, Some(16), 42, None).expect("map");
         let observed = handle.status().expect("observed revision");
         let first = handle
             .apply_map(
@@ -5359,7 +5357,10 @@ pub(crate) mod tests {
         assert_eq!(before.world.agents.len(), 1);
         assert!(before.revisions.scientific.get() > observed.scientific_revision);
         assert_eq!(
-            handle.status().expect("status revision").scientific_revision,
+            handle
+                .status()
+                .expect("status revision")
+                .scientific_revision,
             before.revisions.scientific.get()
         );
         let stale = handle
@@ -5404,7 +5405,9 @@ pub(crate) mod tests {
         );
         assert!(matches!(
             changed,
-            Err(ControlError::Host(scriptbots_runtime::HostAccessError::CommandIdCollision { .. }))
+            Err(ControlError::Host(
+                scriptbots_runtime::HostAccessError::CommandIdCollision { .. }
+            ))
         ));
         let after = handle.read_snapshot().expect("rejected map snapshot");
         assert_eq!(after.layers.terrain, before.layers.terrain);
