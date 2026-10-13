@@ -129,7 +129,7 @@ use std::fmt;
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -8797,6 +8797,9 @@ pub enum PersistenceBoundaryStatus {
 #[derive(Debug, Default)]
 struct PersistenceSessionToken {
     claimed: AtomicBool,
+    // External admission authority observed this initial boundary. Culling needs a later
+    // recorded cut to establish origin chronology; this is session state, not a tick input.
+    lifecycle_start_tick: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -20416,6 +20419,8 @@ mod map_sandbox {
 
         #[test]
         fn existing_agent_policy_application() {
+            use crate::NullPersistence;
+
             let spec = default_tileset_spec();
             let generator = RuleBasedMapGenerator::new(spec).expect("compile tileset");
             let mut artifact = generator
@@ -20453,7 +20458,7 @@ mod map_sandbox {
                 rng_seed: Some(123),
                 population_minimum: 0,
                 population_spawn_interval: 0,
-                persistence_interval: 0,
+                persistence_interval: 3,
                 ..super::super::ScriptBotsConfig::default()
             })
             .expect("world");
@@ -20499,7 +20504,12 @@ mod map_sandbox {
             );
 
             // Test 3: Culling must follow the founder's origin, never kill it at tick zero.
-            world.step().expect("advance beyond founder origin");
+            let mut session = world
+                .bind_persistence(Box::new(NullPersistence))
+                .expect("session");
+            session
+                .step(&mut world)
+                .expect("advance beyond founder origin");
             // First move agent back to deep water (24.0, 24.0).
             let index = world
                 .agents
@@ -20683,6 +20693,14 @@ mod map_sandbox {
             };
 
             let (mut world, artifact) = placement_fixture(&[]);
+            let mut config = world.config().clone();
+            config.persistence_interval = 3;
+            world
+                .apply_config_update(config)
+                .expect("deferred persistence");
+            let mut session = world
+                .bind_persistence(Box::new(NullPersistence))
+                .expect("session");
             world
                 .try_spawn_agent(AgentData::default())
                 .expect("founder");
@@ -20693,18 +20711,10 @@ mod map_sandbox {
                     ExistingAgentPolicy::CullIncompatible
                 ),
                 Err(WorldStateError::InvalidConfig(
-                    "map culling requires agents to arrive before the current tick"
+                    "map culling requires a recorded tick after persistence binding"
                 ))
             ));
             assert_eq!(world.world_digest_v1().expect("refused genesis"), before);
-            let mut config = world.config().clone();
-            config.persistence_interval = 3;
-            world
-                .apply_config_update(config)
-                .expect("deferred persistence");
-            let mut session = world
-                .bind_persistence(Box::new(NullPersistence))
-                .expect("session");
             session.step(&mut world).expect("open tick one");
             world
                 .try_inject_agent(AgentData {
@@ -20737,10 +20747,11 @@ mod map_sandbox {
                     ScientificStateError::PersistenceBoundaryUnresolved { .. }
                 ))
             ));
-            assert_eq!(
-                serde_json::to_value(session.pending_batch()).expect("pending payload"),
-                serde_json::to_value(retained.as_ref()).expect("retained payload")
-            );
+            let still_retained = session
+                .stage_final_batch(&mut world)
+                .expect("same pending boundary")
+                .expect("retained exact payload");
+            assert!(std::sync::Arc::ptr_eq(&retained, &still_retained));
             assert!(session.finalize(&mut world).expect("seal boundary"));
             let before = world.world_digest_v1().expect("sealed digest");
             assert!(matches!(
@@ -20755,6 +20766,76 @@ mod map_sandbox {
             assert_eq!(world.world_digest_v1().expect("refused sealed"), before);
             assert_eq!(world.runtime.len(), 2);
             assert_eq!(world.identities.len(), 2);
+        }
+
+        #[test]
+        fn map_culling_refuses_discarded_and_restored_origin_boundaries() {
+            use crate::{
+                AgentData, BrainRegistry, NullPersistence, Tick, WorldState, WorldStateError,
+            };
+
+            let (mut world, artifact) = placement_fixture(&[]);
+            world.step().expect("disabled recording cut");
+            let id = world
+                .try_inject_agent(AgentData {
+                    age: 100,
+                    ..AgentData::default()
+                })
+                .expect("old-looking same-tick arrival");
+            let uid = world.agent_uid(id).expect("arrival identity");
+            let before = world.world_digest_v1().expect("disabled digest");
+            assert!(matches!(
+                world.apply_map_artifact_with_policy(
+                    &artifact,
+                    ExistingAgentPolicy::CullIncompatible
+                ),
+                Err(WorldStateError::InvalidConfig(
+                    "map culling requires uninterrupted lifecycle persistence"
+                ))
+            ));
+            assert_eq!(world.world_digest_v1().expect("refused disabled"), before);
+            let checkpoint = world.checkpoint_v1().expect("between-step checkpoint");
+            let mut restored = WorldState::restore_checkpoint_v1(&checkpoint, BrainRegistry::new())
+                .expect("restore arrival");
+            let mut session = restored
+                .bind_continuation_persistence(Box::new(NullPersistence), 3, 0)
+                .expect("continuation session");
+            assert!(restored.persistence_discarded_records_at.is_none());
+            let before = restored.world_digest_v1().expect("restored digest");
+            assert!(matches!(
+                restored.apply_map_artifact_with_policy(
+                    &artifact,
+                    ExistingAgentPolicy::CullIncompatible
+                ),
+                Err(WorldStateError::InvalidConfig(
+                    "map culling requires a recorded tick after persistence binding"
+                ))
+            ));
+            assert_eq!(restored.world_digest_v1().expect("refused restored"), before);
+            session
+                .step(&mut restored)
+                .expect("recorded continuation cut");
+            restored
+                .apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible)
+                .expect("cull after recorded origin");
+            assert!(restored.agents().is_empty());
+            let batch = session
+                .stage_final_batch(&mut restored)
+                .expect("stage continuation")
+                .expect("actual lifecycle batch");
+            assert_eq!(batch.births.len(), 1);
+            assert_eq!(batch.births[0].agent_uid, uid);
+            assert_eq!(batch.births[0].tick, Tick(1));
+            assert_eq!(batch.deaths.len(), 1);
+            assert_eq!(batch.deaths[0].agent_uid, uid);
+            assert_eq!(batch.deaths[0].tick, Tick(2));
+            let mut graph = crate::ancestry::AncestryGraph::new();
+            graph.apply_birth(&batch.births[0]).expect("actual origin");
+            graph.apply_death(&batch.deaths[0]).expect("later death");
+            assert_eq!(
+                graph.node(uid).expect("finished arrival").death_tick,
+                Some(Tick(2))
+            );
         }
 
         #[test]
@@ -22270,6 +22351,9 @@ impl WorldState {
             .claimed
             .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
             .map_err(|_| PersistenceSessionError::AlreadyBound)?;
+        self.persistence_binding
+            .lifecycle_start_tick
+            .store(self.tick.0, AtomicOrdering::Release);
         Ok(PersistenceAdmissionSession {
             sink,
             pending: None,
@@ -32017,9 +32101,10 @@ impl WorldState {
 
     /// Replace the current terrain and food fields using a pre-generated map artifact with an explicit existing-agent policy.
     ///
-    /// Culling records an external lifecycle change at the current open boundary. It refuses
-    /// sealed boundaries and agents that arrived at this same tick; their death could not be
-    /// appended to the immutable persistence timeline or follow their origin, respectively.
+    /// Culling records an external lifecycle change at the current open boundary. It requires
+    /// uninterrupted lifecycle recording and a tick after persistence binding, including after
+    /// checkpoint restoration. Sealed boundaries and same-tick arrivals are refused because
+    /// their deaths cannot be appended to the immutable timeline or follow their origins.
     // bd-tqpj: exact f32 != cell-size guard is an intentional identity check.
     #[allow(clippy::float_cmp, clippy::too_many_lines, clippy::cast_precision_loss)]
     pub fn apply_map_artifact_with_policy(
@@ -32162,6 +32247,24 @@ impl WorldState {
         dead_ids: &HashSet<AgentId>,
     ) -> Result<(), WorldStateError> {
         self.validate_external_lifecycle_boundary("map.cull")?;
+        if self.config.persistence_interval == 0
+            || self.persistence_discarded_records_at.is_some()
+            || !self.persistence_binding.claimed.load(AtomicOrdering::Acquire)
+        {
+            return Err(WorldStateError::InvalidConfig(
+                "map culling requires uninterrupted lifecycle persistence",
+            ));
+        }
+        if self.tick.0
+            <= self
+                .persistence_binding
+                .lifecycle_start_tick
+                .load(AtomicOrdering::Acquire)
+        {
+            return Err(WorldStateError::InvalidConfig(
+                "map culling requires a recorded tick after persistence binding",
+            ));
+        }
         self.validate_live_agent_companions()?;
         let mut records = Vec::with_capacity(dead_ids.len());
         for &id in dead_ids {
