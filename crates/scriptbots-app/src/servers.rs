@@ -6465,6 +6465,33 @@ mod tests {
             host.wait_finished(&stale.command_id).application_state,
             "rejected"
         );
+        let expected_reason = Some(json!({
+            "kind": "scientific_revision_conflict",
+            "expected": observed.scientific_revision,
+            "actual": before.revisions.scientific.get(),
+        }));
+        assert_eq!(
+            host.wait_finished(&stale.command_id).rejection_reason,
+            expected_reason
+        );
+        let polled = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                "params": {"name": "get_command_status", "arguments": {
+                    "command_id": stale.command_id}}
+            }),
+        )
+        .await;
+        assert!(polled.get("error").is_none(), "{polled}");
+        let polled: CommandStatusDto = serde_json::from_str(
+            polled["result"]["content"][0]["text"]
+                .as_str()
+                .expect("polled rejection receipt"),
+        )
+        .expect("public rejection receipt");
+        assert_eq!(polled.application_state, "rejected");
+        assert_eq!(polled.rejection_reason, expected_reason);
         let stale_request = serde_json::from_value(json!({"artifact": grass,
             "expected_scientific_revision": observed.scientific_revision}))
         .expect("stale REST request");
@@ -6474,6 +6501,10 @@ mod tests {
         assert_eq!(
             host.wait_finished(&stale_rest.command_id).application_state,
             "rejected"
+        );
+        assert_eq!(
+            host.wait_finished(&stale_rest.command_id).rejection_reason,
+            expected_reason
         );
         let after = handle.read_snapshot().expect("stale rejection");
         assert_eq!(after.layers.terrain, before.layers.terrain);
@@ -6515,7 +6546,7 @@ mod tests {
                 .expect("current receipt"),
         )
         .expect("owner receipt");
-        host.wait_applied(&current);
+        assert!(host.wait_applied(&current).rejection_reason.is_none());
         let applied = handle.read_snapshot().expect("applied MCP map");
         assert_eq!(
             applied.layers.terrain.tiles.len(),

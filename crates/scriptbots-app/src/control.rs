@@ -267,6 +267,10 @@ pub struct CommandStatusDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission_sequence: Option<u64>,
     pub application_state: String,
+    /// Exact owner rejection, including requested and actual revisions for a stale guard.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub rejection_reason: Option<Value>,
     pub journal_state: String,
     pub control_revision: u64,
     pub scientific_revision: u64,
@@ -2923,6 +2927,12 @@ impl ControlHandle {
                 ApplicationState::Failed(_) => "failed",
             }
             .to_owned(),
+            rejection_reason: match status.application() {
+                ApplicationState::Rejected(reason) => {
+                    Some(serde_json::to_value(reason).map_err(ControlError::serialization)?)
+                }
+                _ => None,
+            },
             journal_state: match status.journal() {
                 JournalState::NotRequired => "not_required",
                 JournalState::Pending => "pending",
@@ -5373,6 +5383,14 @@ pub(crate) mod tests {
             .expect("stale request reaches owner");
         let rejected = host.wait_finished(&stale.command_id);
         assert_eq!(rejected.application_state, "rejected");
+        assert_eq!(
+            rejected.rejection_reason,
+            Some(serde_json::json!({
+                "kind": "scientific_revision_conflict",
+                "expected": observed.scientific_revision,
+                "actual": before.revisions.scientific.get(),
+            }))
+        );
         let command_id: CommandId = serde_json::from_value(Value::String(stale.command_id.clone()))
             .expect("command identity");
         let status = host
@@ -5398,6 +5416,7 @@ pub(crate) mod tests {
         assert_eq!(retry.command_id, rejected.command_id);
         assert_eq!(retry.admission_sequence, rejected.admission_sequence);
         assert_eq!(retry.application_state, "rejected");
+        assert_eq!(retry.rejection_reason, rejected.rejection_reason);
         let changed = handle.apply_map(
             artifact,
             false,
