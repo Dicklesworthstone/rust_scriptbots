@@ -20811,7 +20811,10 @@ mod map_sandbox {
                     "map culling requires a recorded tick after persistence binding"
                 ))
             ));
-            assert_eq!(restored.world_digest_v1().expect("refused restored"), before);
+            assert_eq!(
+                restored.world_digest_v1().expect("refused restored"),
+                before
+            );
             session
                 .step(&mut restored)
                 .expect("recorded continuation cut");
@@ -32249,7 +32252,10 @@ impl WorldState {
         self.validate_external_lifecycle_boundary("map.cull")?;
         if self.config.persistence_interval == 0
             || self.persistence_discarded_records_at.is_some()
-            || !self.persistence_binding.claimed.load(AtomicOrdering::Acquire)
+            || !self
+                .persistence_binding
+                .claimed
+                .load(AtomicOrdering::Acquire)
         {
             return Err(WorldStateError::InvalidConfig(
                 "map culling requires uninterrupted lifecycle persistence",
