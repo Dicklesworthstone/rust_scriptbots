@@ -20568,7 +20568,11 @@ mod map_sandbox {
                 .apply_config_update(config)
                 .expect("deferred persistence");
             let ids: Vec<_> = (0..3)
-                .map(|_| world.try_spawn_agent(AgentData::default()).expect("founder"))
+                .map(|_| {
+                    world
+                        .try_spawn_agent(AgentData::default())
+                        .expect("founder")
+                })
                 .collect();
             let uids: Vec<_> = ids
                 .iter()
@@ -20674,7 +20678,9 @@ mod map_sandbox {
 
         #[test]
         fn map_culling_refuses_sealed_boundaries_and_same_tick_arrivals_atomically() {
-            use crate::{AgentData, NullPersistence, Position, ScientificStateError, WorldStateError};
+            use crate::{
+                AgentData, NullPersistence, Position, ScientificStateError, WorldStateError,
+            };
 
             let (mut world, artifact) = placement_fixture(&[]);
             world
@@ -20682,7 +20688,10 @@ mod map_sandbox {
                 .expect("founder");
             let before = world.world_digest_v1().expect("genesis digest");
             assert!(matches!(
-                world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible),
+                world.apply_map_artifact_with_policy(
+                    &artifact,
+                    ExistingAgentPolicy::CullIncompatible
+                ),
                 Err(WorldStateError::InvalidConfig(
                     "map culling requires agents to arrive before the current tick"
                 ))
@@ -20705,7 +20714,10 @@ mod map_sandbox {
                 .expect("same-tick arrival");
             let before = world.world_digest_v1().expect("arrival digest");
             assert!(matches!(
-                world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible),
+                world.apply_map_artifact_with_policy(
+                    &artifact,
+                    ExistingAgentPolicy::CullIncompatible
+                ),
                 Err(WorldStateError::InvalidConfig(
                     "map culling requires agents to arrive before the current tick"
                 ))
@@ -20717,7 +20729,10 @@ mod map_sandbox {
                 .expect("stage boundary")
                 .expect("retained exact payload");
             assert!(matches!(
-                world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible),
+                world.apply_map_artifact_with_policy(
+                    &artifact,
+                    ExistingAgentPolicy::CullIncompatible
+                ),
                 Err(WorldStateError::InvalidState(
                     ScientificStateError::PersistenceBoundaryUnresolved { .. }
                 ))
@@ -20729,7 +20744,10 @@ mod map_sandbox {
             assert!(session.finalize(&mut world).expect("seal boundary"));
             let before = world.world_digest_v1().expect("sealed digest");
             assert!(matches!(
-                world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible),
+                world.apply_map_artifact_with_policy(
+                    &artifact,
+                    ExistingAgentPolicy::CullIncompatible
+                ),
                 Err(WorldStateError::InvalidState(
                     ScientificStateError::PersistenceBoundarySealed { .. }
                 ))
@@ -32195,7 +32213,9 @@ impl WorldState {
                 None,
                 position,
                 direction,
-                visual::WorldVisualEvent::Death { cause: record.cause },
+                visual::WorldVisualEvent::Death {
+                    cause: record.cause,
+                },
             );
             self.runtime.remove(id);
             self.identities.remove(id);

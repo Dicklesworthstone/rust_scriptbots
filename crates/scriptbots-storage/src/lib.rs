@@ -40883,7 +40883,8 @@ mod tests {
         let mut pipeline = StoragePipeline::create_unattributed_file(&path_text)?;
         let mut session = world.bind_persistence(Box::new(pipeline.sink()))?;
         session.step(&mut world)?;
-        let generated = RuleBasedMapGenerator::new(default_tileset_spec())?.generate(4, 4, 16, 123)?;
+        let generated =
+            RuleBasedMapGenerator::new(default_tileset_spec())?.generate(4, 4, 16, 123)?;
         let mut tiles = generated.terrain().tiles().to_vec();
         for tile in &mut tiles {
             tile.kind = TerrainKind::DeepWater;
