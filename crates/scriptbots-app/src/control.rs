@@ -22,7 +22,7 @@ use scriptbots_core::check_knob_ranges;
 use scriptbots_render::{OffscreenScene, render_offscreen_scene};
 use scriptbots_runtime::{
     ApplicationState, CommandEnvelope, CommandId, HostCommand, HostPort, JournalState,
-    RenderSnapshot, channel::ChannelHostPort,
+    RenderSnapshot, ScientificRevision, channel::ChannelHostPort,
 };
 use smallvec::SmallVec;
 
@@ -50,6 +50,8 @@ pub struct SimulationStatusDto {
     pub agent_count: usize,
     pub is_closed: bool,
     pub config_revision: u64,
+    /// Owner scientific revision for guarding operations against stale world observations.
+    pub scientific_revision: u64,
     /// Automatic ticking state observed at this publication, not a queued request.
     pub paused: bool,
     /// Owner lifecycle; stopping does not establish completed shutdown.
@@ -320,6 +322,7 @@ impl MapGenerateRequestBody {
 
 /// Request payload for applying a map artifact to the simulation.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MapApplyRequestBody {
     /// Map artifact payload: either a JSON representation of MapArtifact or a base64/hex postcard string, or file path.
     #[schema(value_type = Object)]
@@ -327,6 +330,9 @@ pub struct MapApplyRequestBody {
     /// Move agents on deep water to the nearest non-deep-water tile; defaults to retaining positions.
     #[serde(default)]
     pub reposition_agents: bool,
+    /// Reject at ordered application if the owner's scientific revision differs.
+    /// Obtain this value from simulation status before preparing a preview; omission is unguarded.
+    pub expected_scientific_revision: Option<u64>,
     /// Optional idempotency key to prevent double application on retry.
     pub idempotency_key: Option<String>,
 }
@@ -2339,6 +2345,7 @@ impl ControlHandle {
             agent_count: snapshot.world.agents.len(),
             is_closed: snapshot.config.closed,
             config_revision: snapshot.revisions.config.get(),
+            scientific_revision: snapshot.revisions.scientific.get(),
             paused: snapshot.playback.paused,
             lifecycle: snapshot.lifecycle,
             health: snapshot.health.clone(),
@@ -2776,20 +2783,25 @@ impl ControlHandle {
             .transpose()
     }
 
-    /// Submit an ApplyMap command.
+    /// Submit a map command with an optional owner-side scientific revision guard.
     pub fn apply_map(
         &self,
         artifact: MapArtifact,
         reposition_agents: bool,
+        expected_scientific_revision: Option<u64>,
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
-        self.submit_control_command_with_key(
+        let mut envelope = self.prepare_control_command(
             ControlCommand::ApplyMap {
                 artifact: Box::new(artifact),
                 reposition_agents,
             },
             idempotency_key,
-        )
+        )?;
+        envelope.expected_scientific_revision =
+            expected_scientific_revision.map(ScientificRevision::new);
+        let status = self.host.clone().submit(envelope)?;
+        self.status_dto(status)
     }
 
     /// Submit an Intervention command.
@@ -5286,7 +5298,7 @@ pub(crate) mod tests {
             .expect("generate valid map");
 
         let status = handle
-            .apply_map(artifact, false, None)
+            .apply_map(artifact, false, None, None)
             .expect("apply valid map command");
         assert_eq!(status.application_state, APPLICATION_STATE_ADMITTED);
 
@@ -5303,10 +5315,103 @@ pub(crate) mod tests {
             .generate_map(width + 10, height + 10, Some(cell_size), 42, None)
             .expect("generate mismatched map");
         let status_bad = handle
-            .apply_map(bad_artifact, false, None)
+            .apply_map(bad_artifact, false, None, None)
             .expect("submit mismatched map");
         let observed_bad = host.wait_finished(&status_bad.command_id);
         assert_eq!(observed_bad.application_state, "failed");
+    }
+
+    #[test]
+    fn test_map_apply_revision_guard_preserves_owner_and_keyed_identity() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 48,
+            world_height: 48,
+            food_cell_size: 16,
+            rng_seed: Some(123),
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        world
+            .try_spawn_agent(scriptbots_core::AgentData {
+                position: scriptbots_core::Position::new(8.0, 24.0),
+                ..scriptbots_core::AgentData::default()
+            })
+            .expect("agent");
+        let host = TestHost::spawn(world);
+        let handle = host.handle();
+        let artifact = handle
+            .generate_map(3, 3, Some(16), 42, None)
+            .expect("map");
+        let observed = handle.status().expect("observed revision");
+        let first = handle
+            .apply_map(
+                artifact.clone(),
+                false,
+                Some(observed.scientific_revision),
+                None,
+            )
+            .expect("matching revision admitted");
+        host.wait_applied(&first);
+        let before = handle.read_snapshot().expect("applied map");
+        assert_eq!(before.world.agents.len(), 1);
+        assert!(before.revisions.scientific.get() > observed.scientific_revision);
+        assert_eq!(
+            handle.status().expect("status revision").scientific_revision,
+            before.revisions.scientific.get()
+        );
+        let stale = handle
+            .apply_map(
+                artifact.clone(),
+                false,
+                Some(observed.scientific_revision),
+                Some("stale-map"),
+            )
+            .expect("stale request reaches owner");
+        let rejected = host.wait_finished(&stale.command_id);
+        assert_eq!(rejected.application_state, "rejected");
+        let command_id: CommandId = serde_json::from_value(Value::String(stale.command_id.clone()))
+            .expect("command identity");
+        let status = host
+            .port
+            .command_status(command_id)
+            .expect("owner status")
+            .expect("known");
+        assert!(matches!(
+            status.application(),
+            ApplicationState::Rejected(scriptbots_runtime::RejectionReason::ScientificRevisionConflict {
+                expected, actual
+            }) if expected.get() == observed.scientific_revision && *actual == before.revisions.scientific
+        ));
+        let retry = handle
+            .apply_map(
+                artifact.clone(),
+                false,
+                Some(observed.scientific_revision),
+                Some("stale-map"),
+            )
+            .expect("identical guarded retry");
+        assert_eq!(retry.command_id, rejected.command_id);
+        assert_eq!(retry.admission_sequence, rejected.admission_sequence);
+        assert_eq!(retry.application_state, "rejected");
+        let changed = handle.apply_map(
+            artifact,
+            false,
+            Some(before.revisions.scientific.get()),
+            Some("stale-map"),
+        );
+        assert!(matches!(
+            changed,
+            Err(ControlError::Host(scriptbots_runtime::HostAccessError::CommandIdCollision { .. }))
+        ));
+        let after = handle.read_snapshot().expect("rejected map snapshot");
+        assert_eq!(after.layers.terrain, before.layers.terrain);
+        assert_eq!(after.world.agents, before.world.agents);
+        assert_eq!(after.world.tick, before.world.tick);
+        assert_eq!(after.revisions.scientific, before.revisions.scientific);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
     }
 
     #[test]

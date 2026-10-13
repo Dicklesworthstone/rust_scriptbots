@@ -2757,7 +2757,12 @@ async fn post_map_apply(
     let status = run_control(move || {
         state
             .handle
-            .apply_map(artifact, payload.reposition_agents, key.as_deref())
+            .apply_map(
+                artifact,
+                payload.reposition_agents,
+                payload.expected_scientific_revision,
+                key.as_deref(),
+            )
     })
     .await?;
 
@@ -3550,7 +3555,7 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "map_apply",
-        "Apply a procedural map artifact; optionally move deep-water agents to the nearest non-deep-water tile",
+        "Apply a procedural map artifact; optionally guard the observed scientific revision and move deep-water agents to the nearest non-deep-water tile",
         json!({
             "type": "object",
             "properties": {
@@ -3558,6 +3563,8 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                     "description": "Map artifact as a JSON object, file path, raw JSON string, or hex-encoded postcard"
                 },
                 "reposition_agents": {"type": "boolean", "default": false},
+                "expected_scientific_revision": {"type": "integer", "minimum": 0,
+                    "description": "Owner scientific revision from get_status; omission is unguarded"},
                 "idempotency_key": {"type": "string"}
             },
             "required": ["artifact"],
@@ -4258,10 +4265,14 @@ impl ToolHandler for ControlTool {
                 make_tool_result(artifact)
             }
             ControlToolKind::MapApply => {
-                let artifact_val = arguments.get("artifact").ok_or_else(|| {
-                    McpError::new(McpErrorCode::InvalidParams, "missing 'artifact' parameter")
-                })?;
-                let artifact = parse_map_artifact(artifact_val).map_err(|e| {
+                let req: MapApplyRequestBody = serde_json::from_value(arguments.clone())
+                    .map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid map apply request: {error}"),
+                        )
+                    })?;
+                let artifact = parse_map_artifact(&req.artifact).map_err(|e| {
                     McpError::new(
                         McpErrorCode::InvalidParams,
                         format!("invalid map artifact: {e}"),
@@ -4270,17 +4281,13 @@ impl ToolHandler for ControlTool {
                 let key = mcp_idempotency_key(&arguments);
                 let id_key = key.as_deref();
                 let handle = self.handle.clone();
-                let reposition_agents = match arguments.get("reposition_agents") {
-                    None => false,
-                    Some(value) => value.as_bool().ok_or_else(|| {
-                        McpError::new(
-                            McpErrorCode::InvalidParams,
-                            "'reposition_agents' must be a boolean",
-                        )
-                    })?,
-                };
                 let status = run_control_mcp_sync(move || {
-                    handle.apply_map(artifact, reposition_agents, id_key)
+                    handle.apply_map(
+                        artifact,
+                        req.reposition_agents,
+                        req.expected_scientific_revision,
+                        id_key,
+                    )
                 })?;
                 make_tool_result(status)
             }
@@ -6346,6 +6353,7 @@ mod tests {
             Json(MapApplyRequestBody {
                 artifact: serde_json::to_value(artifact(&[])).expect("all-water map"),
                 reposition_agents: true,
+                expected_scientific_revision: None,
                 idempotency_key: None,
             }),
         )
@@ -6359,6 +6367,191 @@ mod tests {
         assert_eq!(after.world.agents, placed.world.agents);
         assert_eq!(after.layers.terrain, placed.layers.terrain);
         assert_eq!(after.revisions.scientific, placed.revisions.scientific);
+    }
+
+    #[tokio::test]
+    async fn map_apply_rest_and_mcp_guard_the_observed_scientific_revision() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 48,
+            world_height: 48,
+            food_cell_size: 16,
+            rng_seed: Some(123),
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("world");
+        world
+            .try_spawn_agent(scriptbots_core::AgentData {
+                position: scriptbots_core::Position::new(8.0, 24.0),
+                ..scriptbots_core::AgentData::default()
+            })
+            .expect("agent");
+        let host = crate::control::tests::TestHost::spawn(world);
+        let handle = host.handle();
+        let generated = handle.generate_map(3, 3, Some(16), 42, None).expect("map");
+        let artifact = |kind| {
+            let mut tiles = generated.terrain().tiles().to_vec();
+            for tile in &mut tiles {
+                tile.kind = kind;
+            }
+            scriptbots_core::MapArtifact::new(
+                scriptbots_core::TerrainLayer::from_tiles(3, 3, 16, tiles).expect("terrain"),
+                None,
+                None,
+                None,
+                None,
+                generated.metadata().clone(),
+            )
+            .expect("artifact")
+        };
+        let sand = artifact(scriptbots_core::TerrainKind::Sand);
+        let grass = artifact(scriptbots_core::TerrainKind::Grass);
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let Json(observed) = get_status(State(state.clone()))
+            .await
+            .expect("REST status");
+        let request = serde_json::from_value(json!({"artifact": sand,
+            "expected_scientific_revision": observed.scientific_revision}))
+        .expect("REST request");
+        let Json(first) = post_map_apply(State(state.clone()), HeaderMap::new(), Json(request))
+            .await
+            .expect("guarded REST admission");
+        host.wait_applied(&first);
+        let before = handle.read_snapshot().expect("applied REST map");
+        assert_eq!(before.world.agents.len(), 1);
+        assert_eq!(before.layers.terrain.tiles.len(), sand.terrain().tiles().len());
+        assert!(
+            before
+                .layers
+                .terrain
+                .tiles
+                .iter()
+                .all(|tile| tile.kind == scriptbots_core::TerrainKind::Sand)
+        );
+        assert!(before.revisions.scientific.get() > observed.scientific_revision);
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("map-revision", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "map-revision", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let stale = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "map_apply", "arguments": {"artifact": grass,
+                    "expected_scientific_revision": observed.scientific_revision}}
+            }),
+        )
+        .await;
+        assert!(stale.get("error").is_none(), "{stale}");
+        let stale: CommandStatusDto = serde_json::from_str(
+            stale["result"]["content"][0]["text"]
+                .as_str()
+                .expect("stale receipt"),
+        )
+        .expect("owner receipt");
+        assert_eq!(
+            host.wait_finished(&stale.command_id).application_state,
+            "rejected"
+        );
+        let stale_request = serde_json::from_value(json!({"artifact": grass,
+            "expected_scientific_revision": observed.scientific_revision}))
+        .expect("stale REST request");
+        let Json(stale_rest) = post_map_apply(State(state), HeaderMap::new(), Json(stale_request))
+            .await
+            .expect("stale REST admission");
+        assert_eq!(
+            host.wait_finished(&stale_rest.command_id).application_state,
+            "rejected"
+        );
+        let after = handle.read_snapshot().expect("stale rejection");
+        assert_eq!(after.layers.terrain, before.layers.terrain);
+        assert_eq!(after.world.agents, before.world.agents);
+        assert_eq!(after.world.tick, before.world.tick);
+        assert_eq!(after.revisions.scientific, before.revisions.scientific);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        let status = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "get_status", "arguments": {}}
+            }),
+        )
+        .await;
+        let status: SimulationStatusDto = serde_json::from_str(
+            status["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP status"),
+        )
+        .expect("status body");
+        assert_eq!(status.scientific_revision, before.revisions.scientific.get());
+        let current = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {"name": "map_apply", "arguments": {"artifact": grass,
+                    "expected_scientific_revision": status.scientific_revision}}
+            }),
+        )
+        .await;
+        assert!(current.get("error").is_none(), "{current}");
+        let current: CommandStatusDto = serde_json::from_str(
+            current["result"]["content"][0]["text"]
+                .as_str()
+                .expect("current receipt"),
+        )
+        .expect("owner receipt");
+        host.wait_applied(&current);
+        let applied = handle.read_snapshot().expect("applied MCP map");
+        assert_eq!(
+            applied.layers.terrain.tiles.len(),
+            grass.terrain().tiles().len()
+        );
+        assert!(
+            applied
+                .layers
+                .terrain
+                .tiles
+                .iter()
+                .all(|tile| tile.kind == scriptbots_core::TerrainKind::Grass)
+        );
+        assert_ne!(applied.layers.terrain, before.layers.terrain);
+        for (index, invalid) in [json!(-1), json!("latest"), json!(1.5), json!(true), json!(1e20)]
+            .into_iter()
+            .enumerate()
+        {
+            let request = json!({"artifact": sand, "expected_scientific_revision": invalid});
+            assert!(serde_json::from_value::<MapApplyRequestBody>(request.clone()).is_err());
+            let response = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc": "2.0", "id": index + 5, "method": "tools/call",
+                    "params": {"name": "map_apply", "arguments": request}
+                }),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"],
+                i32::from(McpErrorCode::InvalidParams),
+                "{response}"
+            );
+        }
+        let end = handle.read_snapshot().expect("invalid guard observation");
+        assert_eq!(end.layers.terrain, applied.layers.terrain);
+        assert_eq!(end.revisions.scientific, applied.revisions.scientific);
+        assert_eq!(end.last_applied_command, applied.last_applied_command);
     }
 
     #[tokio::test]

@@ -182,6 +182,9 @@ enum Command {
         /// Move agents on deep water to the nearest non-deep-water tile.
         #[arg(long)]
         reposition_agents: bool,
+        /// Reject if the owner's scientific revision has changed since this observation.
+        #[arg(long)]
+        expected_scientific_revision: Option<u64>,
     },
     /// Apply an environmental or population intervention via REST.
     Intervene {
@@ -405,8 +408,17 @@ async fn main() -> Result<()> {
                 Command::MapApply {
                     file,
                     reposition_agents,
+                    expected_scientific_revision,
                 } => {
-                    map_apply_command(&client, &cli.base_url, file, reposition_agents, key).await?
+                    map_apply_command(
+                        &client,
+                        &cli.base_url,
+                        file,
+                        reposition_agents,
+                        expected_scientific_revision,
+                        key,
+                    )
+                    .await?
                 }
                 Command::Intervene { sub } => {
                     intervene_command(&client, &cli.base_url, sub, key).await?
@@ -1443,6 +1455,7 @@ async fn map_apply_command(
     base_url: &str,
     file: PathBuf,
     reposition_agents: bool,
+    expected_scientific_revision: Option<u64>,
     idempotency_key: Option<&str>,
 ) -> Result<()> {
     let bytes =
@@ -1464,6 +1477,7 @@ async fn map_apply_command(
     let body = serde_json::json!({
         "artifact": artifact_val,
         "reposition_agents": reposition_agents,
+        "expected_scientific_revision": expected_scientific_revision,
         "idempotency_key": idempotency_key,
     });
 
@@ -1995,6 +2009,43 @@ mod tests {
                 panic!("map command expected");
             };
             assert_eq!(reposition_agents, expected);
+        }
+    }
+
+    #[test]
+    fn map_apply_accepts_scientific_revision_and_refuses_invalid_guards() {
+        for expected in [0, u64::MAX] {
+            let parsed = Cli::try_parse_from([
+                "control",
+                "map-apply",
+                "--file",
+                "map.json",
+                "--expected-scientific-revision",
+                &expected.to_string(),
+            ])
+            .expect("guarded map CLI");
+            let Command::MapApply {
+                expected_scientific_revision,
+                ..
+            } = parsed.command
+            else {
+                panic!("map command expected");
+            };
+            assert_eq!(expected_scientific_revision, Some(expected));
+        }
+        for invalid in ["-1", "18446744073709551616", "1.5", "latest"] {
+            assert!(
+                Cli::try_parse_from([
+                    "control",
+                    "map-apply",
+                    "--file",
+                    "map.json",
+                    "--expected-scientific-revision",
+                    invalid,
+                ])
+                .is_err(),
+                "invalid guard {invalid}"
+            );
         }
     }
 
