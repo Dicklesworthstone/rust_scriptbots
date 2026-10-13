@@ -4264,8 +4264,8 @@ impl ToolHandler for ControlTool {
             }
             ControlToolKind::MapApply => {
                 let key = mcp_idempotency_key(&arguments);
-                let req: MapApplyRequestBody =
-                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                let req: MapApplyRequestBody = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
                         McpError::new(
                             McpErrorCode::InvalidParams,
                             format!("invalid map apply request: {error}"),
