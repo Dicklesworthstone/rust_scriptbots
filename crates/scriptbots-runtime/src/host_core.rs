@@ -13306,7 +13306,10 @@ mod tests {
         settle_continuation_command(&mut core, command.clone(), 0);
         let mut port = core.local_port();
         let applied = port.command_status(CommandId::new(2)).unwrap().unwrap();
-        assert!(matches!(applied.application(), ApplicationState::Applied(_)));
+        assert!(matches!(
+            applied.application(),
+            ApplicationState::Applied(_)
+        ));
         assert_eq!(port.submit(command).expect("identical retry"), applied);
         assert!(matches!(
             port.submit(CommandEnvelope::new(
@@ -13371,7 +13374,8 @@ mod tests {
                     CommandId::new(2),
                     HostCommand::ApplyMap {
                         artifact: Box::new(artifact),
-                        existing_agent_policy: scriptbots_core::ExistingAgentPolicy::CullIncompatible,
+                        existing_agent_policy:
+                            scriptbots_core::ExistingAgentPolicy::CullIncompatible,
                     },
                 ),
                 0,
