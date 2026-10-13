@@ -20437,15 +20437,15 @@ mod map_sandbox {
             for invalid in [
                 PaintedConstraint {
                     elevation: Some(f32::NAN),
-                    ..paint.clone()
+                    ..paint
                 },
                 PaintedConstraint {
                     moisture: Some(f32::INFINITY),
-                    ..paint.clone()
+                    ..paint
                 },
                 PaintedConstraint {
                     swim_cost: Some(f32::NEG_INFINITY),
-                    ..paint.clone()
+                    ..paint
                 },
             ] {
                 assert!(matches!(
@@ -20456,7 +20456,7 @@ mod map_sandbox {
             }
             let out_of_bounds = PaintedConstraint {
                 x: draft.state.width,
-                ..paint.clone()
+                ..paint
             };
             assert!(matches!(
                 draft.paint_constraint(out_of_bounds),
