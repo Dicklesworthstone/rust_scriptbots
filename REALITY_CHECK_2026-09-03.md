@@ -24,9 +24,53 @@ Current map-placement work (`bd-2z0.10.7`):
   source receipt at clean `31557cdc`; retain the separate outer DSR collection failure.
 - [x] Copy and hash-check all 56 final manifest files plus four DSR state/log/result files and
   the outer log in protected local storage; preserve every failed attempt.
-- [ ] Publish the qualified lifecycle source and its ordinary Beads/evidence export separately.
-- [ ] Carry all three policies through typed live commands, shared requests, CLI and replay;
+- [x] Publish the qualified lifecycle source and its ordinary Beads/evidence export separately;
+  both required remote references read back `1f6cd2c9`.
+- [x] Carry all three policies through typed live commands, shared requests, CLI and replay;
   qualify successful culling at an open recorded boundary and atomic boundary refusals.
+- [x] Replace boolean placement with a typed three-policy owner command, forwarding through
+  core, HostCore, live CLI, REST, MCP and both replay drivers.
+- [x] Share CLI/JSON/OpenAPI policy choices and derive the MCP schema from the actual enum;
+  reject malformed values instead of substituting retain.
+- [x] Encode all three policies through owned/borrowed journal codecs; archive v6 preserves
+  older/future refusal probes and pairwise-distinct command bytes.
+- [x] Execute owner death/ancestry, retry identity and atomic recording-cut refusal probes
+  in R158 at `5c1950c5`; this historical prefix does not qualify the current whole source.
+- [x] Qualify REST and actual MCP dispatch, schema parity, malformed values and CLI parsing/
+  payloads at `7d03f30f` in R168. This is in-process dispatch, not TCP or live CLI transport.
+- [x] Preserve explicit journal flushes among same-tick maps and final-tick commands before
+  the final digest in both replay drivers, with fallback cuts for older journal-free recordings.
+- [x] Retain R154's red pre-map digest observation with its original assertion. R167 exposes
+  an oracle sampled before founder-record projection; that red result alone does not prove
+  a flush-order defect. The corrected cut requires an explicit wrong-order control.
+- [x] Qualify repaired headless/checkpoint replay, retain control, restored later-cut culling
+  and binding-cut refusal at `7d03f30f` in R168; the proper recorded pre-map digest is unchanged
+  and actual-driver wrong-order control changes the recorded digest despite the same final digest.
+- [x] Qualify the real file/channel-host cull–flush–retain timeline at `7d03f30f` in R168 through
+  the finished journal reader, exact events/digest, all founders alive before culling, exact
+  nonempty map deaths, and batch ticks one/two. This remains one-session evidence.
+- [x] Execute current-source workspace all-targets check and strict Clippy in R168.
+- [x] Finish all twenty declared checks, thirty-five original required named completions and
+  the added combat control at one
+  clean source pin; retain actual failures, existing ignores and outer collection separately.
+- [x] Copy and hash-verify all 197 final manifest files, six state/raw/outer files, twenty
+  command-log hashes and thirty-six named completions.
+- [x] Retain and verify R162's 38 manifest files, six state/raw/outer files and ten completed
+  command-log hashes after the repeated file-worker startup failure.
+- [x] Trace the unchanged storage startup wait: R163 observes a 57.887714-second database
+  fsync and a later fsync still unfinished after at least 57.120471 seconds.
+- [x] Repeat the diagnostic on hz2 with Cargo's declared 32 MiB test-thread stack: R165
+  executes the unchanged real-file test, one pass, zero failures, in 2.63 seconds.
+- [x] Finish and retain R167: seventeen checks pass; replay has seven passes and two failures;
+  checkpoint tests and analyzer build do not run. Verify all 193 manifest files, six state/raw/
+  outer files and eighteen command-log hashes.
+- [x] Correct the test cut and isolate map deaths, preserving the digest/death assertions,
+  and commit the additional wrong-order/combat controls at `7d03f30f`.
+- [x] Qualify the corrected positive/negative controls, real file journal replay and checkpoint
+  continuation, then all twenty checks at clean `7d03f30f` in R168. No deadline is changed.
+- [x] Publish qualified live-policy/replay and draft-paint source;
+  release own leases and verify both required remote references.
+- [x] Prepare guidance and ordinary Beads export for separate immutable review and publication.
 - [ ] Keep native editor input, painting, cancellation and accessible authoring acceptance open.
 - [x] Inspect the production policy and consumers: live map commands always retain agents;
   repositioning ignores toroidal distance and silently leaves agents on an all-water map.
@@ -72,13 +116,425 @@ Current map-placement work (`bd-2z0.10.7`):
 - [ ] Add original native controls for rules, samples, seeds, dimensions and constraints.
 - [ ] Connect bounded preview, progress, cancellation and disclosed generate-again seeds.
 - [ ] Connect draft painting, undo/redo, import/export and persisted artifact inspection.
+- [x] Validate finite paint values before changing draft revision or undo/redo history;
+  `3ade6ce2` implements the guard and `54e89fc9` corrects redundant fixture clones.
+- [x] Execute the invalid-paint regression for NaN/infinities and bounds, exact whole-draft
+  preservation, retained redo and valid painted artifact generation with undo. Its named test
+  passes in R160 and R161 at `54e89fc9` (948 core passes, zero failures, eight existing ignores).
+- [x] Finish combined current-source qualification and publish the draft correction;
+  the native painting consumer remains unconnected.
 - [ ] Expose the expected world revision at apply time; reject stale previews through owner
   guards and retain separate admission, application and durability displays.
 - [ ] Qualify keyboard/focus/accessibility and the original native input journey, including
   contradictory, stale and cancelled negatives.
 - [x] Repair culling's companion-state/death/ancestry/persistence accounting at a valid science
-  boundary (R149, direct API). Live policy wiring and original native acceptance remain open;
+  boundary (R149, direct API). Live policy wiring is qualified below; original native acceptance remains open;
   the blocker of `bd-2z0.10.8` stays intact.
+
+**Live-policy continuation, 2026-10-13, qualified source published:** twelve reviewed commits carry
+Retain/RepositionToSafeTile/CullIncompatible through core, actual HostCore dispatch, shared
+CLI/JSON/OpenAPI/MCP requests and owned/borrowed journal codecs. Archive v6 refuses older and
+future versions; policy encodings are pairwise distinct. `faa68c8b` wires the policies.
+`f007e7a6` initially moves commands before off-cadence sealing and includes final-tick commands
+in both replay drivers, but discards explicit flush order. `cdd0db5e` adds the red pre-map
+digest observation, whose oracle is corrected below; `ddabd931` preserves the journal's actual cull–flush–retain ordering.
+`7abd978b` strengthens the real-file/channel-host test with nonempty exact map deaths and
+batch ticks one/two. Other commits correct formatter diagnostics and fixture contracts;
+the final policy/replay layout is `5c1950c5`.
+
+Two further commits address a separate core API bug for the unconnected native editor:
+`3ade6ce2` validates finite paint values before changing draft revision/history, and
+`54e89fc9` removes redundant fixture clones. The new regression requires whole-draft equality
+after NaN/infinity/bounds failures, then retained redo, actual Sand artifact generation and
+undo. The R160–R167 combined source is `54e89fc946837b240a955de720c606e76363157a`, tree
+`0be4d5375fb00a7d07f5d4a716dee40d90c85f4c`. Exact-file UBS for the clone correction exits zero
+with 0 critical, 5,329 warnings and 1,021 informational findings; this is not a clean scan.
+The policy-file scan exits one with four existing heuristic critical findings and 768 warnings;
+no suppression, ignore, golden, dependency or CI gate is changed.
+
+Every attempt uses a clean expected source, the frozen runner and a unique protected proof
+directory. Retained failures under `/data/tmp/scriptbots-cull-20261013-lilacelm/`:
+
+- R150/R151/R152 stop at formatting before compilation; ten manifest files plus each outer
+  log are hash-verified. R153 at `4e1b9576` passes ten initial command/log pairs, including
+  core strict Clippy, 947 core tests and three storage filters. Runtime has 234 passes, one
+  fixture failure and six existing ignores: changing cadence after pending births correctly
+  refuses. Total 1,184 passes, one failure and fourteen existing ignores; later scopes do not
+  run. `ffd369fe` constructs initial cadence instead, preserving all production refusals.
+  All fifty manifest files and five state/outer files are copied and hash-verified.
+- R154 is intentionally red at `ffd369fe`, not qualification. It ends at 14:04:02 UTC after
+  the actual `replay_map_after_flush_preserves_the_pre_map_digest` assertion fails: recorded
+  `db6e9215c71a5573` differs from the computed pre-map `08d31352641420a0`. Zero passes, one
+  failure, no ignores; typed `counterexample_confirmed`/101. All twelve manifest and six
+  state/raw/outer files are verified. R155 is prepared but never executed.
+- R156 (`7abd978b`) and R157 (`e674a3f9`) fail formatting before tests; each retains ten
+  manifest and six state/raw/outer files. Two diagnostics were missed in R156's log;
+  `5c1950c5` applies the remaining layout without changing assertions or deadlines.
+- R158 at `5c1950c5` runs 14:41:36–16:42:03 UTC. Twelve command/log pairs pass: core strict
+  Clippy, 947 core tests, three storage tests including real-file culling/ancestry, 235 runtime
+  tests and 29 journal tests. All three owner map probes pass, including the invalid-cut
+  matrix, as does the actual three-policy archive roundtrip. Total 1,214 passes, zero failures,
+  fourteen existing ignores. It times out during application compilation; no application
+  test runs and eight checks remain unexecuted. Typed source status is `failed`, despite its
+  signal-trap exit-code field zero. All 117 manifest and six state/raw/outer files are verified.
+  Verdict SHA256 `590e8bd8943acc5c3a83dd935eb1ab7717da5ea6fc6dbb1127bd39aecf711a36`.
+- R159 at `3ade6ce2` runs 16:43:45–17:01:40 UTC, preserving twenty commands and adding the
+  draft regression to thirty-five required names. Five checks pass; strict core Clippy fails
+  on redundant fixture clones before tests. All twenty manifest and six state/raw/outer
+  files are verified. Verdict SHA256
+  `a95cd73d7ce94852f05bfc90fd6841988d3f1ffa849994bda9755ea493d6ef04`.
+- R160 at `54e89fc9` runs 17:08:41–18:00:06 UTC. Seven checks pass, including strict core
+  Clippy and 948 core tests, zero failures, eight existing ignores; the new paint test is `ok`.
+  Storage compilation fails/101 on `No space left on device` while writing Asupersync metadata.
+  No storage test runs and checks nine through twenty remain unexecuted. All twenty-six
+  manifest files, six state/raw/outer files and eight command-log hashes are verified.
+  Verdict SHA256 `a879b020069a6822a0f4e0d5a3042c027bd95c2f3c62cb87a22537e00f1ebabb`.
+- R161 at the identical source/tree runs 18:14:05–18:37:50 UTC. Only generated Cargo artifacts
+  move to tmpfs; source/cache isolation, proof TMPDIR and real-file tests stay on disk.
+  Seven checks and the same 948 core tests pass. Storage compilation completes, then the
+  file worker returns `Worker(Timeout { operation: Startup, phase: Acknowledgement,
+  waited: 120s, commit_state: Indeterminate })`. The culling/durability/ancestry assertions
+  are never reached; zero storage passes, one failure, 264 filtered. All thirty-four manifest
+  files, six state/raw/outer files and eight command-log hashes are verified, including the
+  partial database. Verdict SHA256
+  `ac2ddef1a92b725eba0cd48e7584661b954fb90bca9bb4d068bfcaa2da9ac612`.
+
+The failed source attempts retain typed failed/1 unless otherwise stated; outer DSR exits 6
+and frozen-runner identity checks exit zero. R158's native result is timeout/5. No outer
+artifact collection succeeds, and no partial prefix qualifies the whole source. Incorrect
+state-hash captures that included a directory or diagnostic headers remain retained alongside
+the corrected file-only hash manifests. Full historical notes are protected byte-for-byte
+in `pending-policy-notes-20261013-1825/`, with the corresponding Beads comments retained.
+
+**R162 failed:** version `map-cull-20261013-54e89fc9-r162-hz4`, run
+`af8be8e5-cf88-4a88-8aae-a7c1bc1c7ddb`, launcher PID 2868171, starts once at 19:23:01 UTC.
+All twenty commands and thirty-five names, four compilation jobs, one test thread, the
+7,200-second build limit, 120-second storage startup limit and twenty-second durable-command
+polling remain unchanged. Workspace check and strict Clippy move before tests; an exact
+command-multiset and other-profile-byte comparison verifies only those two line moves.
+The original profile is retained before replacement. Final profile SHA256
+`1fd88917bae2f7b13f99b38064ea85cc3ab7b465f8dd1e59f94bd5d7a93edfda`;
+launcher SHA256 `cb53a847b6773bc207ca1ffa3d6936436c38c50f64eef2fcca444c1bef32ff29`.
+All five runner hashes, clean runner/source HEAD and tree, profile and launcher identities
+are reverified before launch. Source/cache remain on disk and generated Cargo target alone
+uses `/dev/shm/scriptbots-map-cull-r162-54e89fc9-target`. Nine opening command/log pairs
+pass, including workspace all-targets check, strict Clippy and eighteen core summaries with
+948 passes, zero failures and eight existing ignores. The draft and culling probes are `ok`.
+Workspace check log SHA256
+`bf54870ce55d55a2dcbe9ceca35e4080de6599d3fb527ac7f46f6203fe691414`;
+strict workspace Clippy log SHA256
+`5284da87709618beb37a5d9fd5b9508949f3bdafca179ae0b8c38b2b823e3037`.
+The existing proc-macro-error2 future-Rust notice remains. Storage compilation finishes in
+6m29s, then the unchanged file test again returns Startup/Acknowledgement timeout after 120s
+with Indeterminate commit state, before culling/durability/ancestry assertions. Zero storage
+passes, one failure, 264 filtered; command exit 101, log exit zero. Checks eleven through twenty
+do not run. Source failed/1, outer failed/6, final runner identity zero, no collected artifacts;
+launcher finishes at 20:04:53 UTC. All 38 manifest files, six state/raw/outer files and ten
+command-log hashes are copied and independently recomputed, including the partial database/WAL.
+Verdict SHA256 `cb23ded5849a592bc69d3fe4f484002f808704f0cfc9c1a68f5ef381ff7c8704`;
+outer SHA256 `dc5d78dad42c4972c25ab14e2115bd1f187fe70ebe3a894b4e81d62f381aff0c`.
+This repeat is not assumed to be a source or filesystem cause. R163 is prepared as a separate
+syscall diagnostic of the exact retained R162 test binary, SHA256
+`534d224eb3008f09f9fd009c121a71496176111f98cf7e718277ff52ab95a5ef`, with the same test and
+120-second deadline, fresh disk proof TMPDIR and expected clean source/tree. It traces the
+child process directly with existing strace; no debugger installation or global ptrace setting
+change. Diagnostic timings cannot qualify the full source. Profile SHA256
+`6c265d5941c89839e219da3438c7c889caf4f6e96648622bc50bc53b6292bb7b`;
+launcher SHA256 `0e41d01dbd12e4d505249fa19650d893e648dc7715afc1ac97568fc8910411ca`.
+The diagnostic runs 20:12:59–20:29:32 UTC, PID 489387, with unchanged runner identity.
+Its typed result is `observed_startup_timeout`, actual test exit 101, diagnostic exit zero,
+outer DSR exit 6 and no collected artifacts. All 34 manifest files and six state/raw/outer
+files are copied and independently hash-verified. Worker trace `trace.930546` records a
+57.887714-second database fsync; 24 completed fsyncs total 62.465888 seconds. A final
+certificate fsync remains unfinished for at least 57.120471 seconds until test process exit.
+This directly observes synchronization stalls in this probe, without attributing every prior
+failure or claiming performance qualification. The diagnostic's direct binary invocation
+does not record or set Cargo's source-declared `RUST_MIN_STACK`, so host comparisons need a
+corrected environment. Verdict SHA256
+`f5ae54e658c47c75d87443a3cc6a2e14084759fc80aa3fc34be4004134f641a5`.
+
+R164 runs the same retained binary on hz2 at 20:29:50–20:30:12 UTC. It aborts with stack
+overflow: test exit 134, typed diagnostic failed/1, outer 6, unchanged runner identity and
+zero collected artifacts. Its traces include storage-worker activity; the abort's stage is
+not established. All 34 manifest files and six state/raw/outer files are copied and hash-
+verified. Neither R164 nor R163 can qualify a host comparison with this omitted setting.
+R165 derives `RUST_MIN_STACK` from the pinned source's `.cargo/config.toml` using TOML parsing,
+retains that config and selected value, and repeats the exact test with unchanged binary,
+120-second deadline and diagnostic result guards. No source, stack limit, test assertion,
+runner, dependency seed or acceptance criterion changes.
+
+R165 runs 20:41:56–20:42:21 UTC, launcher PID 1104004, run
+`ba9ce7cb-87d9-457b-8420-30dc0a30b745`. It retains the source config and derived stack value
+33554432. The exact file-backed test completes `ok`: one pass, zero failures, no ignores,
+264 filtered, 2.63 seconds. Typed `observed_test_pass`, test/log/diagnostic exits zero;
+outer DSR remains failed/6 because the diagnostic does not build the declared `sb-analyze`
+artifact (native collection exit seven), runner identity zero and no
+collected artifacts. All 36 manifest files and six state/raw/outer files are hash-verified;
+verdict SHA256 `1d8f41938ec2fc3a79c48eed372608b992fb49c1660c6e137f61da7a2e27394a`.
+Local disk exhaustion and `/tmp` quota failures leave incomplete copies retained; verified
+copies first use `/run/user/1000`, then permanent `r165-custody/` after space returns.
+This is one traced test completion, not whole-source qualification or a speedup claim.
+
+R166 stops before source checks because the new Cargo target directory was not created
+before `sbh protect`; no test executes and no source verdict is emitted. Its six state/raw/
+outer files are retained and hash-verified in `r166-custody/`. R167 creates the fresh target
+before launch and preserves the same twenty commands, thirty-five names, four jobs, one
+test thread and all original limits. It uses clean `54e89fc9`, the identical frozen runner
+and dependency-seed inventory on hz2, a unique disk Cargo target and disk proof TMPDIR.
+Profile SHA256 `8d8b85ed544995d976a8a5403c3339c75401763d6565f9704b42c324a638155a`;
+launcher SHA256 `8e599089c8ff01375728ea23e9b86796e9baff58b4a6a5cb7aeb201adc9e2050`.
+R167 finishes at 21:24:20 UTC, run `1a93d5c5-6f4c-4769-b0eb-cb4b7789db28`:
+seventeen opening command/log pairs pass, including strict core/workspace Clippy, workspace
+all-targets check, 948 core, three storage, 235 runtime, 29 journal, 43 server, four map-control
+and nineteen CLI tests. Replay then has seven passes and two failures. Total completed tests:
+1,288 passes, two failures, fourteen existing ignores. Checkpoint tests and analyzer build are
+unexecuted. Source verdict is failed/1, outer DSR exit 6, runner identity exit zero, no collected
+artifacts. All 193 manifest files, six state/raw/outer files and eighteen command-log hashes
+are copied and recomputed. Verdict SHA256
+`67440a576cd1c65c450c16f38c23beb453abb066650f4bfbc23618d19624cbb6`.
+
+**Test correction under explicit scrutiny:** the pre-map digest oracle is captured before
+`finalize`, while the production projection drains pending founder records before emitting
+the requested digest. The `origins` lane deliberately includes those open records. R167's
+expected `08d31352641420a0` therefore describes a different cut from recorded
+`83b92b88cf1bc066`. `7d03f30f` samples the oracle after projection, explicitly requires the
+origins change and equality of every other lane, retains exact recorded-digest equality,
+and runs the actual replay driver with map-before-flush ordering as a negative control.
+Its final digest must still match, while its tick-one digest must differ. This correction
+admits the proper projection cut; it must continue rejecting a reordered cut.
+
+The real-file test's nonempty death check passes in R167, but its all-map-cause check fails.
+The small wrapping world overlaps armed founders; combat is a hypothesis until the new
+control executes. The corrected fixture disables spike damage only for these culling tests;
+a separate control restores the default damage and requires actual combat deaths. The file
+test additionally requires all founders alive after the first host tick and exactly that
+many persisted map deaths. The original all-map-cause, nonempty-death, ordered-command,
+batch-tick, whole-event and final-digest assertions remain. No death filtering, assertion
+deletion, deadline change, gate suppression, golden replacement or dependency change occurs.
+UBS scans this exact source path: exit 1, four critical heuristics, 791 warnings and 360 info;
+the critical sites are unchanged `current_exe()` child launches and the nonsecret
+`application_state` comparison. This is triaged static output, not a clean scan.
+
+R168 uses clean source `7d03f30fa69537c1c762b966b2566c8f1a3e15c0`, tree
+`5a7a0ce86d47ee75ade373ed37961c4953c9cdbe`, the same frozen runner, seed and host. The
+twenty original commands are preserved; replay/checkpoint commands move before compiler
+preflight to expose these controls early, and the new fixture-control name is also required.
+The existing target cache is reused without changing source binding or feature/build settings.
+Profile SHA256 `557f013086e6df3d8bc0e3f36c5d1f553147e40b127b7df97a0bed74e2c88a32`;
+launcher SHA256 `e4050418421b33e9fce8a8b81023be41b557b9e6cd2643554b6ad7c0397d0314`.
+At launch, full qualification and publication are pending; the final result follows below. The automatic launch guard refused a
+dynamic log redirection before execution; the accepted retry uses a literal unique path with
+overwrite protection. No rejected command or destructive action ran.
+
+R168's first eight command/log pairs pass: formatting, the four dependency guards, replay,
+checkpoint and strict core Clippy. Replay executes ten tests, zero failures/ignores, in 9.22
+seconds; both checkpoint tests pass in 0.59 seconds. The new default-damage control observes
+nonempty combat deaths; disabling that damage preserves every founder through the first tick.
+The corrected digest test passes its proper-cut equality and actual-driver wrong-order
+negative; the real-file probe reaches exact events and final-digest equality with its added
+founder/death count checks. Combat attribution is now observed by this bounded control.
+Replay log SHA256 `9c751b4ef2bf47783ded551e6443e741ed29b9e7d96c2a89e930c1b5a068bf39`;
+checkpoint log SHA256 `aeb505ea631ba725d0358e116b2521d42c69ba46eb02db2f9744f27f6e5f8d9b`.
+The passing prefix is superseded by the complete result below.
+
+**R168 final result:** all twenty command/log pairs pass at clean `7d03f30f`, including the
+analyzer build, workspace all-targets check, strict Clippy and formatting. All thirty-six named
+completions are extracted in a separate pass over the retained logs; this is a fresh self-review,
+not independent verification. Completed tests total 1,293 passes, zero failures and fourteen
+existing ignores: core 948/0/8, runtime 235/0/6, three storage tests, journal 29, server 43,
+map-control four, CLI nineteen, replay ten and checkpoint two. All 197 manifest files, six
+state/raw/outer files and twenty command-log hashes are copied and recomputed in protected
+local storage. Verdict SHA256
+`8d2a9a90764a7fd1ab3dd0caaee0dd2218d2e5f593bfb27591a88e9ae9e1c1e2`.
+The outer launcher finishes at 22:03:50 UTC with exit 6, frozen-runner identity exit zero,
+and no collected artifacts. Its actual failure is the unchanged private-cache verification
+guard rejecting `git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md` as a linked/special
+entry. The successful source verdict does not override that refusal. Outer log SHA256
+`54d3c8ff721557d2b7eff28dfcd454b8f0ddb220476e2abdcea40d90a71879ef`.
+
+All fifteen reviewed source commits publish through normal pushes after all fourteen owned
+leases are released. Both required remote references read back
+`7d03f30fa69537c1c762b966b2566c8f1a3e15c0` at 22:08:59 UTC. This delivers one combined typed
+live-policy/replay increment and the draft-paint API correction; it is not fifteen capabilities.
+The updated guidance and ordinary tracker export are prepared for their separate exact reviews.
+Exact-path UBS on the three documentation files returns exit 3 with no supported scanner;
+it provides no bug-scan pass. `git diff --check` passes.
+The original native sandbox acceptance, in-progress owner, open successor and blocking edge
+remain unchanged. The existing offline CLI artifact-validation roundtrip does not prove live
+`control_cli` application; actual TCP/client acceptance remains with the existing owners.
+
+**Bounded anti-ceremony review, 21:29–22:09 UTC:** the one new source commit `7d03f30f` is
+ENABLER, correcting two test premises with actual positive/negative controls. USER 0, ENABLER
+1, PROCESS 0, UNKNOWN 0 among new commits; the prior fourteen source commits are now published.
+Six worksheet answers: (1) the visible increment is explicit retain/reposition/cull behavior
+through existing live control surfaces, not a demonstrated native editor; (2) notes alone
+change no runtime behavior, while protected copies prevent the twice-observed reset loss;
+(3) the actual file/channel-host replay consumes this correction and passes exact events/digest;
+(4) native authoring remains missing, and this block completes the already-staged control
+foundation; (5) no swarm work is dispatched or credited; (6) no acceptance change, new follow-up
+or closure substitutes for implementation. Disposition remains DRIFTING because correction/
+qualification overhead dominates this block; stop adding process machinery and move to actual
+frontend/product behavior after this publication.
+
+Twenty-question honesty answers for this window:
+
+1. Tests change explicitly: proper digest cut and isolated combat fixture, with original
+   digest/death assertions retained and stronger founder/count/wrong-order controls. The
+   original red evidence remains; the corrected proper cut passes and reordered cut fails.
+2. No (checked: `7d03f30f` exercises real core transitions, replay drivers and the file worker;
+   its NullPersistence oracle is disclosed).
+3. No (checked: the sole source diff is main.rs inline tests, with no golden changes).
+4. No unreviewed relaxation (checked: complete frozen test diff, unchanged CI/dependencies/
+   ignores/deadlines; external profile retains twenty commands and adds one required name).
+5. No (checked: no production fast path, environment branch or narrowed original matrix).
+6. No (checked: all thirty-six names complete once, all scoped test commands execute nonempty
+   suites; zero-test subtargets within the eighteen core summaries earn no test credit).
+7. The earlier R154 ordering claim needed correction: its oracle preceded projection. The
+   correction is explicit in this report, plan, commentary and comment 2797; the new control
+   now observes the ordering distinction at the proper cut.
+8. No (checked: in-process dispatch, one-session file proof, source pass and outer refusal
+   remain separate; no native/TCP/fresh-process/performance claim).
+9. No (checked: R167's two failures, unexecuted tail, retained evidence and R168 outer refusal).
+10. No (checked: command/log channel exits, raw logs and outer stderr are retained).
+11. No (checked: owner remains in progress, successor open and original blocker unchanged).
+12. No (checked: original acceptance remains unchanged; plan edits report actual results).
+13–17. Not applicable to new delegation (checked: no agents dispatched, reports accepted,
+   closes performed or agreement credited in this window).
+18. No (checked: the twenty-command/thirty-six-name denominator predates R168 results;
+   totals include every completed summary and all existing ignores).
+19. Explain the test-premise corrections and blocked dynamic redirection before calling the
+   work verified. Both are disclosed above; the accepted launch preserves overwrite protection.
+20. Strongest evidence: the exact file-backed cull–flush–retain event/final-digest roundtrip,
+   proper-cut equality, actual-driver wrong-order negative and default-combat control at one
+   retained clean source, with all twenty checks and raw hashes available for re-execution.
+
+CASS's new quoted exact test-name query returns zero hits; its unquoted expansion yields
+unrelated September contexts, two of which are read through `cass view`. Together with the
+previous six bounded searches, this is limited historical coverage, not clearance of older
+sessions. RH-2 gate self-weakening and proof-class inflation are countered by the retained
+red result, separately reviewed test-only correction, explicit admission split and unchanged
+original acceptance. No new enforcement framework is created.
+
+Correction: comment 2795 calls R165's outer failure an unchanged collection refusal without
+naming the missing artifact. Raw log readback establishes `Local cp failed for sb-analyze`;
+it does not establish the historical Proptest cache-guard failure. R163 also stops at that
+missing artifact. The diagnostics deliberately avoid compilation and leave it absent. Their
+observed test results retain their stated scope; the full qualification profile builds the
+analyzer and must be assessed from its own actual result.
+
+The real-file probe covers one host session. Cross-session same-tick chronology remains
+unqualified: numeric session-ID order does not establish continuation order. In-process
+REST/MCP oracles use actual HostCore with NullPersistence; they are not TCP or file durability
+proof. This slice claims neither native input nor fresh-process recovery, full-workspace tests,
+performance, an independent verifier or Bead completion. The native-editor acceptance and
+`bd-2z0.10.8` blocker remain intact.
+
+The shared checkout is externally reset to published `1f6cd2c9` at 13:39:28 and again at
+19:39:21 UTC while immutable remote builds continue. Reflog records `reset: moving to
+origin/main`; this agent does not run reset. Clean normal fast-forwards restore reviewed
+source descendants; protected backups and literal patches recover notes. The first ordinary
+Beads merge restores comments with all 718 IDs intact, no deletions/conflicts and zero active
+dependency cycles. The second reset leaves all comments 2784–2792 in the database but rolls
+back JSONL/base; both stores are preserved before ordinary merge. The merge succeeds at
+19:48:19 UTC with 718 issues, zero deletions/conflicts/collisions and healthy sync. Semantic
+readback finds only the original issue's comments and update timestamp changed, its status
+still `in_progress`, the successor still `open` behind its unchanged blocker, and zero active
+dependency cycles. Read-only external-backup
+reconciliation plans are not applied: the older backup lacks two newer comments and is correctly
+refused as relation drift. No force flag, cleanup, history rewrite or destructive recovery is used.
+
+Local disk exhaustion at 20:42 UTC leaves comment 2794 committed in Beads but prevents its
+JSONL export. A read-only SQLite backup attempt also fails with I/O error; subsequent BR
+reads require WAL-index recovery. The complete directory is copied before repair. The
+recovery command's source and actual retention eligibility are checked: all owned recovery
+runs and quarantines are younger than its declared seven-day threshold; the older migration
+lacks a recovery-prepared receipt and is ineligible. Normal `br doctor migrate-schema recover`
+completes at 20:53:26 UTC, retaining the complete pre-state and identical raw database, WAL
+and certificate bytes; integrity is `ok`. Comment 2794 survives. Strict ordinary export then
+clears the one dirty issue with all 718 IDs, 1,348 dependencies, 1,738 labels and 2,645 comments
+intact. Comment 2795 records the actual R165 pass and recovery. Semantic comparison against
+published `1f6cd2c9` still changes only `bd-2z0.10.7` comments/update time; its status remains
+in progress and the successor is unchanged. Space returns externally; no files are deleted
+by this agent. Failed and incomplete transfer/backup attempts remain retained, without
+integrity credit. The verified notes and unsynced comment also have protected remote copies.
+The subsequent read-only full doctor exits one with healthy reliability audit: warnings
+include the stale merge anchor, existing ignore-pattern omissions and retained recovery
+artifacts. This is not a clean doctor pass. No ignore or recovery-retention policy is changed
+to silence those findings; ordinary graph merge/export remains the publication path.
+
+Bounded anti-ceremony accounting: fourteen source commits are USER 3 (`faa68c8b`, the incomplete
+`f007e7a6`, and its correction `ddabd931`), ENABLER 11 including draft validation and lint
+correction, PROCESS 0, UNKNOWN 0. Twelve form one combined policy/replay slice; the draft fix
+is a separate enabler. Verdict **DRIFTING**: excessive formatter/fixture corrections, cold
+builds and recovery overhead earn no capability credit. Finish the declared qualification
+before expanding scope. The user requests the existing granular TODO; the existing DSR runner
+consumes the profiles. Backups address observed external resets; reports do not change behavior.
+There is no closure, new follow-up, criteria/dependency edit, golden regeneration, tolerance or
+deadline widening, suppression or CI change. Compilation jobs increase from two to four only
+after an actual timeout and observed worker headroom; tmpfs targets address actual disk exhaustion.
+No benchmark/speedup claim follows. Retained positives, counterexamples, failures, ignores and
+unexecuted scopes remain distinct; source/oracle/runner agreement is not independent proof.
+Six bounded CASS searches end in September and provide no clearance for today's work; initial
+physical-offset misses are corrected with indexed-content reads. Completion-reader positive
+and negative controls remain fixed. Solo review cannot certify independent acceptance.
+
+Real-work worksheet, qualification/recovery continuation 20:35–21:08 UTC (zero new source
+commits): the README's purpose is a faithful evolutionary simulator and usable laboratory.
+USER 0; the one ongoing source-qualification block is ENABLER; requested notes/tracker updates
+are PROCESS, with zero capability credit; UNKNOWN 0. Six answers: (1) no new capability ships
+in this block; (2) omitting notes would not change runtime behavior, but would lose the requested
+TODO/failure record; (3) R165 exercises the real file worker and finished ancestry reader,
+while R167 gates the pending live-policy/replay source; (4) the original usable native lab
+remains open, with this source slice still awaiting publication; (5) no delegation or peer
+report is used in this block; (6) no original acceptance is replaced by a plan or follow-up.
+Verdict **DRIFTING**: avoidable diagnostic environment/setup mistakes and incorrect cause
+attribution add recovery cost. Correction: freeze additional profiles and machinery, finish
+R167, and publish only the qualified behavioral increment.
+
+Honesty inventory for the same continuation and the retained fourteen-commit source slice:
+
+1. Test fixtures changed earlier, explicitly: cadence moves to construction and checkpoint
+   expectations use the actual finalized boundary; the original pre-map digest assertion
+   stays intact, R154 remains red, and real-file death/batch assertions are strengthened.
+   No new source/test edit in this continuation (checked: commit/path inventory and working diff).
+2. No new behavior double (checked: the real-file diagnostic and unchanged source); existing
+   in-process REST/MCP NullPersistence/VolatileJournal tests remain labelled scoped proof.
+3. No golden regeneration (checked: all eight source paths and current five-path notes diff).
+4. Diagnostic profiles change host/path/version and restore Cargo's declared stack environment;
+   no acceptance/test limit changes (checked: inverse profile comparison, pinned config,
+   twenty commands and thirty-five names). All failed attempts remain failed.
+5. No release-path special case or benchmark claim (checked: fixed source tree/runner/seed,
+   unchanged original test and no perf invocation). Diagnostic latency is not a speedup.
+6. No zero-run green (checked: R165's named one-test completion and 948 core passes);
+   R166 executes no checks and stays a setup failure; remaining R167 scopes are pending.
+7. Yes: an early stack-overflow stage attribution and the R165 collection-cause shorthand
+   exceeded the observation. Both are corrected explicitly in commentary/report; comment
+   2796 records the missing-analyzer cause. The actual abort stage remains unestablished.
+8. No promotion to full-source/native/TCP/fresh-process proof (checked: diagnostic and
+   source receipt scope plus this report's outstanding TODO).
+9. Avoidable environment/target setup failures, incomplete transfers and local disk/export
+   failures are disclosed and retained; none count as successful qualification.
+10. No cited stderr discarded (checked: command/log channels, raw runner logs and explicit
+    nonzero doctor result). Failed local copies and hash captures earn no integrity credit.
+11. No closure or follow-up laundering (checked: identical 718 IDs, original task in progress,
+    successor unchanged, and only comments/update timestamp differ from published JSONL).
+12. No spec relaxation claimed as delivery (checked: original native criteria/blocker and
+    twenty-check qualification retained; pending notes describe observations only).
+13–17. Not applicable to this solo continuation: no dispatch, peer closure/report acceptance,
+    refusal-farming pane or shared-agent agreement is used as evidence.
+18. No result-selected denominator (checked: fixed twenty-command/thirty-five-name roster
+    before R167; core totals derive from all eighteen completed summaries).
+19. The operator should see the failed attempts and cost before any publication claim;
+    fourteen commits are one policy/replay increment plus an unconnected-editor API fix,
+    not fourteen features. Repeated compile/recovery work ships no additional capability.
+20. Strongest current new evidence is R165's source/binary-bound real-file ancestry test
+    completion; the full R167 result is still required for the pending combined source.
+
+Disposition: cause claims corrected and disclosed; the named signal-discipline rule and
+RH-2 proof-class distinction bind the next readback. Preserve raw failure causes, read the
+actual outer result before attribution, and derive direct-test environment from the pinned
+Cargo config. No new enforcement framework is created. The earlier bounded CASS readback
+is retained with its September coverage limit; it provides no independent current clearance.
 
 **Culling continuation, 2026-10-13:** the direct `CullIncompatible` implementation previously
 removed arena entries without recording deaths or removing their runtime, identity, RNG and

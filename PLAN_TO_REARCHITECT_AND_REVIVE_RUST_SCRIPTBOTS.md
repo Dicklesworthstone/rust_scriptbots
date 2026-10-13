@@ -2354,7 +2354,46 @@ the production file worker, durable shutdown and reopened finished ancestry read
 check, strict Clippy and formatting pass. Outer DSR still fails/6 at the unchanged cache guard;
 native acceptance and the original blocker remain open. Next carry all three policies through
 the typed owner protocol, CLI/REST/MCP requests and replay, qualifying successful culling at a
-recorded open cut and atomic refusals. This does not close the original native editor task.
+recorded open cut and atomic refusals. Typed live wiring is implemented at `faa68c8b`.
+`ddabd931` preserves explicit replay flushes in their actual journal order around same-tick maps;
+R154 retains a red digest observation whose oracle-cut defect is diagnosed in R167; its red
+result alone does not establish ordering. R158 passes twelve checks and 1,214 tests at `5c1950c5`,
+then times out during application compilation. `3ade6ce2` validates draft paint before changing
+history; `54e89fc9` fixes its fixture lint without changing assertions. R160 passes strict core
+Clippy and 948 core tests, then storage compilation fails on disk exhaustion. R161 uses the
+identical source and a tmpfs Cargo target but the real-file storage worker times out during
+startup after 120 seconds, before the test assertions. All raw failure evidence is retained.
+R162 runs the same twenty commands and thirty-five required names at clean `54e89fc9` on hz4,
+using the same frozen runner, four compilation jobs, one test thread and 7,200-second limit.
+Workspace check and strict Clippy run before the test suites and pass, followed by 948 core
+tests. R162 finishes failed at 20:04:53 UTC: the same 120-second storage startup timeout occurs
+before culling assertions. R163's retained-binary trace observes a 57.887714-second database
+fsync and another fsync unfinished for at least 57.120471 seconds. R164 on hz2 aborts with
+stack overflow after the direct diagnostic omitted Cargo's declared 32 MiB test-thread stack;
+its traces include storage-worker activity, so the abort's stage is not established. R165
+derives and retains that exact source setting; the unchanged real-file test passes in 2.63
+seconds. This traced diagnostic does not qualify the full source. R166 stops before checks
+on a missing target directory; R167 creates it before launching the unchanged twenty-check,
+thirty-five-name qualification on hz2. R167 finishes with seventeen passing checks and
+1,288 passing tests, two replay failures and fourteen existing ignores; checkpoint/analyzer
+commands do not execute. `7d03f30f` corrects the digest oracle to the actual post-projection cut
+and isolates map deaths from spike combat, retaining the original assertions and adding
+wrong-order/combat controls plus exact surviving-founder/death counts. Combat attribution
+remains a hypothesis until that control runs. R168 launches the same twenty commands at this
+new clean pin, with replay/checkpoint first and the fixture-control name additionally required.
+R168's ten replay and two checkpoint tests pass, including both corrected oracles and the
+wrong-order/default-combat controls; the file probe reaches exact events and final digest.
+Formatting, four dependency guards and strict core Clippy also pass. All deadlines, runner
+and seed remain unchanged. R168 finishes all twenty checks with 1,293 passes, zero failures,
+fourteen existing ignores and all thirty-six required completions. All 197 manifest files,
+six state/raw/outer files and twenty log hashes are copied and recomputed. Source verdict is
+pass/0; outer DSR still refuses collection/6 at the unchanged linked-Proptest-README cache
+guard, with runner identity zero. All fifteen source commits publish normally; both required
+remote references read back `7d03f30f` at 22:08:59 UTC. Native acceptance and its blocker remain
+open; no TCP, fresh-process or complete release claim follows from this component proof. Source/cache
+staging and real-file tests remain on disk; R161/R162 generated Cargo
+artifacts use tmpfs. The detailed retained evidence and granular work list are in
+`REALITY_CHECK_2026-09-03.md`. This does not close the original native editor task.
 
 Priorities are `P0` correctness/blocking, `P1` usable product, `P2` scientific expansion, and `P3` optional reach.
 
