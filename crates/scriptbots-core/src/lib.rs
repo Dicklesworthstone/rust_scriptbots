@@ -20632,7 +20632,7 @@ mod map_sandbox {
                 survivor_runtime
             );
             assert_eq!(world.agent_rng_counters(ids[1]), survivor_counters);
-            assert!(world.pending_deaths.is_empty());
+            assert_eq!(world.pending_deaths.len(), 0);
             assert_eq!(world.last_probed_agent_death(), Some((uids[0], Tick(1))));
             assert!(world.active_activation_probe().is_none());
             assert_eq!(world.pending_death_events, 2);
@@ -20648,7 +20648,7 @@ mod map_sandbox {
             assert!(world.pending_death_records.iter().all(|r| {
                 r.tick == Tick(1)
                     && r.cause == DeathCause::MapIncompatible
-                    && r.food_balance_total == 7.0
+                    && r.food_balance_total.to_bits() == 7.0_f32.to_bits()
             }));
             let mut ancestry = crate::ancestry::AncestryGraph::new();
             for record in &world.pending_birth_records {
@@ -20733,7 +20733,7 @@ mod map_sandbox {
                 ))
             ));
             assert_eq!(world.world_digest_v1().expect("refused arrival"), before);
-            assert!(world.pending_death_records.is_empty());
+            assert_eq!(world.pending_death_records.len(), 0);
             let retained = session
                 .stage_final_batch(&mut world)
                 .expect("stage boundary")
