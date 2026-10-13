@@ -23,8 +23,8 @@ Current map-placement work (`bd-2z0.10.7`):
 - [x] Exercise real REST/MCP owner results, malformed policy rejection and failed placement.
 - [x] Observe all fourteen pinned R128 source commands passing at clean `0425c43a`.
 - [x] Review and publish both map-placement source commits; retain successful and failed logs.
-- [ ] Obtain successful outer DSR artifact collection; R128's cache guard refuses it and
-  R136's named-test reader fails before collection.
+- [ ] Obtain successful outer DSR artifact collection; R142's unchanged cache guard refuses
+  the tracked Proptest README link, after all source commands and the typed source receipt pass.
 - [x] Verify the new Agent Mail mailbox after the operator reset: full integrity, registration,
   granted exclusive reservations and authoritative readback. Preserve external old snapshots.
 - [x] Recover saved Beads comments 2774–2776 through ordinary BR export, preserving identities.
@@ -40,8 +40,19 @@ Current map-placement work (`bd-2z0.10.7`):
   refuse the unused non-periodic flag rather than advertising it as functional.
 - [x] Qualify actual sample terrain/provenance, deterministic REST/MCP parity, unchanged owner
   tick/last-applied command and independent bound/type/conflict negatives through pinned DSR.
-- [ ] Obtain a passing source receipt that recognizes named-test completion with diagnostic
-  output. Preserve the failed R136 reader and all original named probes/refusal controls.
+- [x] Obtain a passing source receipt that recognizes named-test completion with diagnostic
+  output. R142 passes all 17 named probes; the failed R136 reader and refusal controls remain.
+- [x] Publish the owner's scientific revision through the existing status DTO.
+- [x] Carry an explicit expected scientific revision through CLI/REST/MCP map application.
+- [x] Preserve the exact owner rejection cause in the public command receipt, including
+  requested/actual revisions; successful receipts must carry no rejection reason.
+- [x] Observe current-revision application and stale rejection after a real intervening map.
+- [x] Verify stale rejection preserves terrain, agents, tick, scientific revision and last
+  applied command; an identical retry keeps its receipt and a changed guard conflicts.
+- [x] Refuse malformed guard types/ranges without dropping the guard; qualify the shared
+  request DTO, actual MCP dispatcher and CLI parser through pinned DSR.
+- [x] Run workspace check, strict Clippy, formatting and existing scoped suites at the new
+  clean source pin and retain all failures. Publication must preserve their stated scope.
 - [ ] Add original native controls for rules, samples, seeds, dimensions and constraints.
 - [ ] Connect bounded preview, progress, cancellation and disclosed generate-again seeds.
 - [ ] Connect draft painting, undo/redo, import/export and persisted artifact inspection.
@@ -58,6 +69,143 @@ defect is the missing map-policy consumer above. Active checkboxes retire when t
 task is qualified; historical evidence remains. The integrity exception is unnecessary
 (no additional recovery artifact is being proposed). An hour on the existing map command
 delivers more value than another report; verdict: minimum requested TODO, then source work.
+
+**Active continuation, 2026-10-13:** authoritative triage still finds 139 unfinished items
+and 33 BR-ready claims. Continue the existing map task rather than rewriting its acceptance.
+The owner already checks `CommandEnvelope.expected_scientific_revision` at ordered application;
+map callers previously never supplied it, and the public receipt dropped the owner's rejection
+cause. The current candidate publishes the scientific revision through status, carries an
+optional guard through CLI/REST/MCP, and preserves the exact rejection cause for polling.
+Omission remains explicitly unguarded; no native editor, automatic preview binding, configuration-
+revision guard or persistence qualification is implied.
+
+Source commits since the previous published checkpoint: `ab785f57` wires the guard/status/shared
+typed request and adds three named tests; `87826106` applies ten native formatter hunks;
+`b82c3806` fixes the new fixture's mutable-port lookup; `cf83fd9a` preserves the rejection cause
+and exercises real MCP polling; `080cdde3` consumes the actual MCP argument object rather than
+passing its map directly to `serde_json::from_value`; `e2b74f58` applies the final one-hunk
+native formatting correction. These are implementation and validation corrections, not six
+delivered capabilities. The source candidate is
+`e2b74f584bb52b22fd3d9c6bac10525f639c2250`, tree `b4f92996a31de914030598a535d250fc39b6cc10`.
+
+R137 at `ab785f57` stops at formatting: command 1/log 0, typed failed/1, outer DSR 6,
+final runner identity 0, no compiler/test runs. Its ten manifest files are copied and hash-verified.
+R138 at `87826106` passes the five initial commands but is deliberately interrupted while
+compiling the superseded fixture. Only the agent's owned Cargo process is signalled after
+checking its exact working directory and process identity: SIGINT at 03:33:19 UTC does not
+stop it, then SIGTERM at 03:35:20 yields command 143/log 0, typed failed/1, outer 6 and final
+identity 0 at 03:35:22. No tests ran; this is an interrupted attempt, not observed compiler
+rejection or a suite result. Its twenty manifest files and outer log are retained. R139 and
+R140 profiles were prepared/transferred but never executed. R141 at `080cdde3` stops at the
+one-hunk formatting correction: command 1/log 0, typed failed/1, outer 6 and final identity 0;
+its ten manifest files are copied and hash-verified. R142 completes at 04:22:11 UTC with all
+fourteen command/log pairs at zero and typed source `pass`/0. Raw summaries establish core
+economy-faults 944 passed/0 failed/8 existing ignored, runtime 233/0/6, journal 29/0/0,
+servers 41/0/0, map-control 4/0/0 and CLI 19/0/0: 1,270 passes and 14 existing ignores.
+Workspace all-target check, strict Clippy, formatting, analyzer build and all four boundary
+guards pass. Both the profile and a separate readback recognize all 17 named probes, including
+all three new guard tests. Cargo's existing `proc-macro-error2` future-Rust warning remains
+and is also present in the preceding R136 proof; no dependency or lint setting changes here.
+
+Overall DSR still fails with exit 6: private-cache verification rejects the tracked Proptest
+README link and collects zero artifacts. Run `97502648-2da7-4c74-89f3-f1fe1ee99c4a` retains
+raw `publishable: true` metadata, which does not turn this failed run into publication proof.
+The final frozen-runner identity check is zero. Readback of the retained staged checkout
+confirms the exact source commit/tree and empty status. All 158 manifest files are copied and
+SHA256-verified under
+`/data/tmp/scriptbots-map-placement-20261012-lilacelm/map-guard-20261013-e2b74f58-r142-hz2/`.
+The outer log plus five DSR state/result/raw-log files are separately copied and hash-matched
+to the worker. Outer log SHA256 is
+`d4c4aff0ecc6638ea95c1bda7af2087ae9a1746ecbe7174d68c38ad5b0560976`;
+native raw log is `3d213a6cc78fa7d074027716c04f07847d97e39971fdda5a59c582fcd3480bf4`.
+The custody reader initially searches for the outer cache error inside the native command
+stream and fails; the corrected readback binds it to the actual outer and attempt streams,
+retains the exact native hash, and passes. No original receipt is relabelled or rewritten.
+The six guard entries and source-receipt/workspace entries above are now qualified. This
+is neither a full-workspace test suite nor TCP, file-backed replay or native editor acceptance.
+
+The successor profile retains all fourteen original commands and all original named probes,
+adding the three guard tests. Its named-completion reader fixes the observed R136 stdout layout
+without changing tests: two synthetic successes pass; five failure/missing/neighbor/duplicate
+controls refuse. On actual preserved logs the old reader refuses R136's successful diagnostic
+test while the corrected reader recognizes its completion; both refuse R134's failed test.
+That one newly admitted success is the observed price of the fix. Original receipts remain
+unchanged; the frozen DSR runtime, Cargo cache guards, tolerances, dependencies and goldens are
+not edited. Final DSR collection remains a separate required observation.
+
+R142 profile SHA256 `bc8dbb96ae7cb2bde141b59fd0e4a7b03993854dc0e2f62c50484046e8014b23`;
+launcher `49b5bcd5fd40e8da7bfa31a1755f310ec5ff54fd4f02aa384293fa1b53c41b7c`;
+source bundle `562bad5036cc082a7ba9eaab0d9620f0196e6af200587618de3997444d1ff19e`.
+Static-only UBS remains non-clean (final server-file scan: 9 critical heuristics, 627 warnings,
+393 informational). Reviewed reported critical samples include existing test panic paths and
+the existing validated-origin header path; this is not exhaustive clearance or a clean scan.
+
+Bounded anti-ceremony review of this continuation (source commits `7bfaf2ea..e2b74f58`;
+R142 source qualification passes, outer collection fails):
+
+- Creation worksheet: running code does not branch on this requested TODO/report. Consumer:
+  the operator explicitly requesting a granular TODO and skill audit. Gate: the requested
+  checkpoint must distinguish implemented guard wiring from qualified/native completion.
+  Observed defect: no map consumer supplies the existing guard, receipts discard its cause,
+  and R136 misreads diagnostic test completion. Retirement: completed active entries retire
+  after their cited qualification; historical failed evidence is preserved, with no deletion.
+  Integrity exception is not needed for this requested report. For the minimal raw proof copy,
+  the failure mode is losing worker-only logs after reset/reaping; it is required for these
+  long pinned runs, the existing manifest/copy is the smallest retained evidence, and a link
+  alone cannot preserve it. Highest BR-ready priority is the GPU correctness task; continuing
+  the already-owned map task gives a bounded user control improvement without assuming absent
+  hardware evidence. An hour on source is more useful than extending this report. Verdict:
+  minimum requested gate record, then product/qualification work.
+- Real-work inventory: the six actual source commits classify as USER `ab785f57`, `cf83fd9a`;
+  ENABLER `87826106`, `b82c3806`, `080cdde3`, `e2b74f58`; PROCESS 0, UNKNOWN 0. The requested
+  report and tracker comments are process and earn zero capability credit. Q1: the intended
+  two-minute demonstration is a guarded map changing terrain, then an outdated preview rejected
+  with requested/actual revisions; both occur in the passing owner and dispatcher probes.
+  Q2: omitting process leaves the code
+  the same but loses the user's requested failure/TODO accounting. Q3: the decoder and formatter
+  corrections serve this concrete map path; scoped execution and required compiler checks
+  pass, outer collection remains failed. Q4:
+  oldest open user goal is `bd-2z0` (July 11), the Evolution Lab; this existing map-authoring
+  requirement is a bounded part of it and does not finish the GPU frontend. Q5: solo; no pane
+  or close-count comparison applies. Q6: no acceptance rewrite, replacement bead or closure
+  was made (checked actual source paths, BR counts and original `bd-2z0.10.7` criteria).
+  Verdict: product work is concrete, but four corrective commits and the interrupted dependency
+  rebuild are real overhead. The original source checks now pass; native acceptance stays open.
+- Honesty inventory, answers 1–6: (1) No, checked every immutable source review and unchanged
+  original tests/ignores; (2) No, the existing real owner and MCP dispatcher run the new path,
+  not a new production stub; (3) No, changed source paths contain no golden; (4) Yes, the external
+  named-test reader is corrected separately with the observed R136/R134 split and seven controls
+  above; original commands/probes and frozen runner/cache guards remain. No suppression or
+  tolerance change. (5) No, checked normal argument/owner consumers and exact pin/profile;
+  (6) No: R137/R141 ran no tests and R138 was interrupted before tests. R142 is claimed green
+  only after all fixed source checks and sealed readback pass; outer DSR remains failed.
+- Answers 7–12: (7) No, completed guards, failed formatting and signal exits are the observations
+  actually read; (8) No, unit-owner/dispatcher scope is explicitly distinct from TCP/native/file
+  persistence; (9) No, all failed/interrupted attempts are retained and disclosed; (10) No,
+  evidence-bearing stdout/stderr are captured together, with both pipeline exits retained;
+  (11) No, original item remains in progress and its dependent remains blocked; (12) No,
+  checked the plan edit adds progress and original criteria remain unchanged.
+- Answers 13–18: (13)–(17) No, checked this turn's calls: no subagent dispatch, agent-message
+  send, delegated close, accepted peer report, refusal-farming pane or consensus-as-proof.
+  (18) No, no performance metric is claimed; the fixed fourteen commands and original scopes
+  precede execution, and pass counts must be derived from raw summaries, not selected afterward.
+- Older-session check: the previous five doctrine sweeps remain bounded historical evidence,
+  not an exhaustive audit. This continuation adds `cass search expected_scientific_revision`
+  (306 matches, first three inspected through canonical message-index readback, conversations
+  526/629/620). Those hits are protocol source excerpts, not independent runtime qualification.
+- Answers 19–20: (19) Yes: the new code needed formatter and type/borrow corrections, and the
+  superseded build spent time recompiling dependencies before interruption. Those avoidable
+  costs are disclosed and fixed forward, never counted as new features. (20) The strongest
+  evidence is the exact-source current/stale map test plus public polling, observed in R142's
+  passing server and owner logs. Sealed readback verifies all 17 named probes, 14 command/log
+  pairs, 158 manifest files and the separate outer/raw-log hashes. Overall collection fails.
+  Disposition: reader change and repair costs are corrected and disclosed here and in Beads;
+  original failed receipts remain immutable. The countermeasure is the fixed named acceptance,
+  planted stale/changed-key negatives, observed reader win/lose split and frozen machinery.
+  Pattern references: RH-1 (gate self-weakening), SM-1 (commit-count gaming), SM-11
+  (first-attempt amnesia), PL-2 (positive observation) and PL-3 (proof binding).
+  No independent verifier, complete native editor, broad project completion or overall DSR
+  success is asserted by this source-qualified review.
 
 Final placement outcome: R127 at `7bc9c10b` failed fixture compilation (`TerrainLayer::new`
 does not exist); five preceding guards passed, no tests ran, Cargo 101, typed failed/1, outer
