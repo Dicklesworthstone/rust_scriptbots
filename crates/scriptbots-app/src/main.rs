@@ -10136,6 +10136,8 @@ activation = "Sigmoid"
             world_height: 200,
             food_cell_size: 20,
             closed: true,
+            // The wrapped founder grid overlaps; isolate map deaths from spike combat.
+            spike_damage: 0.0,
             population_spawn_interval: 0,
             reproduction_energy_threshold: f32::MAX,
             ..ScriptBotsConfig::default()
@@ -10158,6 +10160,42 @@ activation = "Sigmoid"
         )
         .unwrap();
         (config, artifact)
+    }
+
+    #[test]
+    fn replay_culling_fixture_excludes_tick_combat_deaths() {
+        use scriptbots_core::DeathCause;
+
+        let (config, _) = replay_culling_fixture();
+        for combat_enabled in [false, true] {
+            let mut config = config.clone();
+            if combat_enabled {
+                config.spike_damage = ScriptBotsConfig::default().spike_damage;
+            }
+            let (mut world, mut recording) =
+                WorldState::with_persistence(config, Box::new(NullPersistence)).unwrap();
+            let brains = install_brains(&mut world, BrainPreset::Mlp)
+                .unwrap()
+                .population;
+            seed_agents(&mut world, &brains, FounderRecipe::CornerGrid).unwrap();
+            let founders = world.agents().len();
+            assert!(founders > 0);
+            let completion = recording.step_outcome(&mut world).unwrap();
+            assert!(completion.fault.is_none());
+            if combat_enabled {
+                assert!(!completion.outcome.deaths.is_empty());
+                assert!(completion.outcome.deaths.iter().all(|death| {
+                    matches!(
+                        death.cause,
+                        DeathCause::CombatCarnivore | DeathCause::CombatHerbivore
+                    )
+                }));
+                assert!(world.agents().len() < founders);
+            } else {
+                assert!(completion.outcome.deaths.is_empty());
+                assert_eq!(world.agents().len(), founders);
+            }
+        }
     }
 
     #[test]
@@ -10243,8 +10281,14 @@ activation = "Sigmoid"
         seed_agents(&mut oracle, &brains, FounderRecipe::CornerGrid).unwrap();
         oracle.request_replay_world_digest();
         recording.step(&mut oracle).unwrap();
-        let before_map = oracle.world_digest_v1().unwrap();
+        let before_flush = oracle.world_digest_v1().unwrap();
         recording.finalize(&mut oracle).unwrap();
+        let before_map = oracle.world_digest_v1().unwrap();
+        assert_ne!(before_flush.origins, before_map.origins);
+        let mut projected = before_flush;
+        projected.origins.clone_from(&before_map.origins);
+        projected.overall.clone_from(&before_map.overall);
+        assert_eq!(projected, before_map);
         let command = ControlCommand::ApplyMap {
             artifact: Box::new(artifact),
             existing_agent_policy: scriptbots_core::ExistingAgentPolicy::Retain,
@@ -10259,7 +10303,7 @@ activation = "Sigmoid"
                 1,
                 vec![
                     ReplayOperatorCommand::FlushPersistence,
-                    ReplayOperatorCommand::World(command),
+                    ReplayOperatorCommand::World(command.clone()),
                 ],
             )]),
         };
@@ -10286,6 +10330,37 @@ activation = "Sigmoid"
             vec![&before_map.overall],
             "the recorded digest must precede the post-flush map change"
         );
+        let wrong_order = ReplayMirror {
+            digest_ticks: Some(BTreeSet::from([1])),
+            flush_ticks: BTreeSet::from([1]),
+            operator_commands: BTreeMap::from([(
+                1,
+                vec![
+                    ReplayOperatorCommand::World(command),
+                    ReplayOperatorCommand::FlushPersistence,
+                ],
+            )]),
+        };
+        let reordered = run_headless_simulation(
+            &config,
+            2,
+            BrainPreset::Mlp,
+            FounderRecipe::CornerGrid,
+            &[],
+            &wrong_order,
+        )
+        .expect("map-before-flush negative control");
+        let reordered_digests: Vec<_> = reordered
+            .events
+            .iter()
+            .filter_map(|entry| match &entry.event.kind {
+                ReplayEventKind::WorldDigest { overall } if entry.tick == 1 => Some(overall),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reordered_digests.len(), 1);
+        assert_ne!(reordered_digests, digests);
+        assert_eq!(reordered.final_digest, replay.final_digest);
     }
 
     fn submit_durable_replay_command(
@@ -10327,6 +10402,8 @@ activation = "Sigmoid"
             WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
         let brains = install_brains(&mut world, BrainPreset::Mlp)?.population;
         seed_agents(&mut world, &brains, FounderRecipe::CornerGrid)?;
+        let founders = world.agents().len();
+        assert!(founders > 0);
         let session = HostSessionId::new(0x6d61_7066);
         let journal = pipeline.journal_port(session, Default::default())?;
         let host = HostThread::spawn(
@@ -10363,6 +10440,10 @@ activation = "Sigmoid"
         for (index, command) in commands.into_iter().enumerate() {
             let id = CommandId::new(u128::try_from(index + 1)?);
             submit_durable_replay_command(&mut port, id, command)?;
+            if index == 0 {
+                let snapshot = port.snapshot_after(None)?.expect("completed first tick");
+                assert_eq!(snapshot.world.agents.len(), founders);
+            }
         }
         drop(port);
         let observed = host.join()?;
@@ -10384,6 +10465,7 @@ activation = "Sigmoid"
         assert_eq!(batch_ticks, [1, 2]);
         let deaths = reader.load_ancestry_deaths()?;
         assert!(!deaths.is_empty());
+        assert_eq!(deaths.len(), founders);
         assert!(deaths.iter().all(|death| {
             death.tick.0 == 1 && death.cause == scriptbots_core::DeathCause::MapIncompatible
         }));
