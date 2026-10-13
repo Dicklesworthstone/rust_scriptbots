@@ -42,10 +42,11 @@ use crate::control::{
     ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
     ExperimentBatchStatusDto, ExperimentCreateRequest, ExperimentRunRecordDto,
     ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
-    InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody,
-    PaginatedArtifactsResponse, PaginatedCheckpointsResponse, PaginatedExperimentsResponse,
-    Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
-    SpeedRequest, parse_intervention_command, parse_map_artifact,
+    InterventionsPollDto, KnobEntry, KnobUpdate, MapApplyAgentPolicy, MapApplyRequestBody,
+    MapGenerateRequestBody, PaginatedArtifactsResponse, PaginatedCheckpointsResponse,
+    PaginatedExperimentsResponse, Scoreboard, SelectionModeDto, SelectionSnapshotDto,
+    SelectionStateDto, SimulationStatusDto, SpeedRequest, parse_intervention_command,
+    parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use scriptbots_core::{
@@ -6248,15 +6249,27 @@ mod tests {
     async fn map_apply_rest_culling_retires_agents_only_after_recorded_tick() {
         let (host, artifact) = map_culling_transport_fixture();
         let handle = host.handle();
-        let state = ApiState { handle: handle.clone(), scenario: None,
-            presented_frame: empty_presented_frame() };
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
         let request: MapApplyRequestBody = serde_json::from_value(json!({
             "artifact": artifact, "existing_agent_policy": "cull_incompatible",
-        })).expect("typed culling request");
+        }))
+        .expect("typed culling request");
         let before = handle.read_snapshot().unwrap();
-        let Json(genesis) = post_map_apply(State(state.clone()), HeaderMap::new(),
-            Json(request.clone())).await.expect("admit genesis request");
-        assert_eq!(host.wait_finished(&genesis.command_id).application_state, "failed");
+        let Json(genesis) = post_map_apply(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .expect("admit genesis request");
+        assert_eq!(
+            host.wait_finished(&genesis.command_id).application_state,
+            "failed"
+        );
         let refused = handle.read_snapshot().unwrap();
         assert_eq!(refused.world.agents, before.world.agents);
         assert_eq!(refused.layers.terrain, before.layers.terrain);
@@ -6267,35 +6280,64 @@ mod tests {
         host.wait_applied(&step);
         let open = handle.read_snapshot().unwrap();
         assert_eq!(open.world.agents.len(), 1);
-        let Json(culled) = post_map_apply(State(state), HeaderMap::new(),
-            Json(request)).await.expect("admit open-cut request");
+        let Json(culled) = post_map_apply(State(state), HeaderMap::new(), Json(request))
+            .await
+            .expect("admit open-cut request");
         assert!(host.wait_applied(&culled).rejection_reason.is_none());
         let after = handle.read_snapshot().unwrap();
         assert_eq!(after.world.agents.len(), 0);
         assert_eq!(after.world.tick, open.world.tick);
-        assert_eq!(after.revisions.scientific.get(), open.revisions.scientific.get() + 1);
-        assert!(after.layers.terrain.tiles.iter().all(|tile|
-            tile.kind == scriptbots_core::TerrainKind::DeepWater));
+        assert_eq!(
+            after.revisions.scientific.get(),
+            open.revisions.scientific.get() + 1
+        );
+        assert!(
+            after
+                .layers
+                .terrain
+                .tiles
+                .iter()
+                .all(|tile| tile.kind == scriptbots_core::TerrainKind::DeepWater)
+        );
     }
 
-    fn map_culling_transport_fixture() -> (crate::control::tests::TestHost, scriptbots_core::MapArtifact) {
+    fn map_culling_transport_fixture() -> (
+        crate::control::tests::TestHost,
+        scriptbots_core::MapArtifact,
+    ) {
         let mut world = WorldState::new(ScriptBotsConfig {
-            world_width: 48, world_height: 48, food_cell_size: 16,
-            rng_seed: Some(123), closed: true, population_spawn_interval: 0,
-            reproduction_energy_threshold: f32::MAX, persistence_interval: 3,
+            world_width: 48,
+            world_height: 48,
+            food_cell_size: 16,
+            rng_seed: Some(123),
+            closed: true,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            persistence_interval: 3,
             ..ScriptBotsConfig::default()
-        }).expect("recorded culling world");
-        world.try_spawn_agent(scriptbots_core::AgentData::default()).expect("founder");
+        })
+        .expect("recorded culling world");
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .expect("founder");
         let host = crate::control::tests::TestHost::spawn(world);
-        let generated = host.handle().generate_map(3, 3, Some(16), 42, None).expect("map");
+        let generated = host
+            .handle()
+            .generate_map(3, 3, Some(16), 42, None)
+            .expect("map");
         let mut tiles = generated.terrain().tiles().to_vec();
         for tile in &mut tiles {
             tile.kind = scriptbots_core::TerrainKind::DeepWater;
         }
         let artifact = scriptbots_core::MapArtifact::new(
             scriptbots_core::TerrainLayer::from_tiles(3, 3, 16, tiles).unwrap(),
-            None, None, None, None, generated.metadata().clone(),
-        ).expect("all-water artifact");
+            None,
+            None,
+            None,
+            None,
+            generated.metadata().clone(),
+        )
+        .expect("all-water artifact");
         (host, artifact)
     }
 
@@ -6307,50 +6349,92 @@ mod tests {
         let before = handle.read_snapshot().unwrap();
         assert_eq!(before.world.agents.len(), 1);
         let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("map-culling", "0"));
-        let initialized = map_policy_mcp_request(&mcp, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                "clientInfo": {"name": "map-culling", "version": "0"}},
-        })).await;
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "map-culling", "version": "0"}},
+            }),
+        )
+        .await;
         assert!(initialized.get("error").is_none(), "{initialized}");
-        let roster = map_policy_mcp_request(&mcp, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
-        })).await;
-        let schema = &roster["result"]["tools"].as_array().expect("actual roster")
-            .iter().find(|tool| tool["name"] == "map_apply").expect("map tool")["inputSchema"];
+        let roster = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .await;
+        let schema = &roster["result"]["tools"]
+            .as_array()
+            .expect("actual roster")
+            .iter()
+            .find(|tool| tool["name"] == "map_apply")
+            .expect("map tool")["inputSchema"];
         let policies = json!(<MapApplyAgentPolicy as clap::ValueEnum>::value_variants());
-        assert_eq!(schema["properties"]["existing_agent_policy"]["enum"], policies);
+        assert_eq!(
+            schema["properties"]["existing_agent_policy"]["enum"],
+            policies
+        );
         let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        assert_eq!(openapi["components"]["schemas"]["MapApplyAgentPolicy"]["enum"], policies);
-        for (index, invalid) in [json!(true), json!("unknown"), json!(null), json!({}), json!([])]
-            .into_iter().enumerate() {
+        assert_eq!(
+            openapi["components"]["schemas"]["MapApplyAgentPolicy"]["enum"],
+            policies
+        );
+        for (index, invalid) in [
+            json!(true),
+            json!("unknown"),
+            json!(null),
+            json!({}),
+            json!([]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let request = json!({"artifact": artifact, "existing_agent_policy": invalid});
             assert!(serde_json::from_value::<MapApplyRequestBody>(request.clone()).is_err());
-            let response = map_policy_mcp_request(&mcp, json!({
-                "jsonrpc": "2.0", "id": index + 3, "method": "tools/call",
-                "params": {"name": "map_apply", "arguments": request},
-            })).await;
-            assert_eq!(response["error"]["code"], i32::from(McpErrorCode::InvalidParams), "{response}");
+            let response = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc": "2.0", "id": index + 3, "method": "tools/call",
+                    "params": {"name": "map_apply", "arguments": request},
+                }),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"],
+                i32::from(McpErrorCode::InvalidParams),
+                "{response}"
+            );
         }
         let unchanged = handle.read_snapshot().unwrap();
         assert_eq!(unchanged.world.agents, before.world.agents);
         assert_eq!(unchanged.layers.terrain, before.layers.terrain);
         assert_eq!(unchanged.revisions, before.revisions);
         assert_eq!(unchanged.last_applied_command, before.last_applied_command);
-        let response = map_policy_mcp_request(&mcp, json!({
-            "jsonrpc": "2.0", "id": 99, "method": "tools/call",
-            "params": {"name": "map_apply", "arguments": {"artifact": artifact,
-                "existing_agent_policy": "cull_incompatible"}},
-        })).await;
+        let response = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+                "params": {"name": "map_apply", "arguments": {"artifact": artifact,
+                    "existing_agent_policy": "cull_incompatible"}},
+            }),
+        )
+        .await;
         assert!(response.get("error").is_none(), "{response}");
         let receipt: CommandStatusDto = serde_json::from_str(
-            response["result"]["content"][0]["text"].as_str().expect("receipt text"),
-        ).expect("actual owner receipt");
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("receipt text"),
+        )
+        .expect("actual owner receipt");
         host.wait_applied(&receipt);
         let after = handle.read_snapshot().unwrap();
         assert_eq!(after.world.agents.len(), 0);
         assert_eq!(after.world.tick, before.world.tick);
-        assert_eq!(after.revisions.scientific.get(), before.revisions.scientific.get() + 1);
+        assert_eq!(
+            after.revisions.scientific.get(),
+            before.revisions.scientific.get() + 1
+        );
     }
 
     #[tokio::test]

@@ -5775,13 +5775,16 @@ fn run_headless_simulation(
             let tick = world.tick().0;
             apply_scenario_interventions(&mut world, &mut current_config, interventions, tick)?;
             apply_recorded_operator_commands(&mut world, &mut current_config, mirror, tick)?;
+            // Commands at this completed cut must precede the off-cadence flush that seals it.
+            mirror_recorded_flush(&mut world, &mut persistence, &mirror.flush_ticks)?;
             // Digest-carrying batches mirror the recorded stream (final tick by default).
             if digest_due(mirror.digest_ticks.as_ref(), tick + 1, tick_limit) {
                 world.request_replay_world_digest();
             }
             persistence.step(&mut world)?;
-            mirror_recorded_flush(&mut world, &mut persistence, &mirror.flush_ticks)?;
         }
+        let final_tick = world.tick().0;
+        apply_recorded_operator_commands(&mut world, &mut current_config, mirror, final_tick)?;
         let final_digest = world
             .world_digest_v1()
             .context("failed to capture the final headless WorldDigestV1")?;
@@ -6056,13 +6059,15 @@ fn run_headless_simulation_from_checkpoint(
             let tick = world.tick().0;
             apply_scenario_interventions(&mut world, &mut current_config, interventions, tick)?;
             apply_recorded_operator_commands(&mut world, &mut current_config, mirror, tick)?;
+            mirror_recorded_flush(&mut world, &mut persistence, &mirror.flush_ticks)?;
             // Digest-carrying batches mirror the recorded stream (final tick by default).
             if digest_due(mirror.digest_ticks.as_ref(), tick + 1, tick_limit) {
                 world.request_replay_world_digest();
             }
             persistence.step(&mut world)?;
-            mirror_recorded_flush(&mut world, &mut persistence, &mirror.flush_ticks)?;
         }
+        let final_tick = world.tick().0;
+        apply_recorded_operator_commands(&mut world, &mut current_config, mirror, final_tick)?;
         let final_digest = world
             .world_digest_v1()
             .context("failed to capture final WorldDigestV1 in resumed simulation")?;
@@ -10068,6 +10073,96 @@ activation = "Sigmoid"
             outputs_one, outputs_two,
             "NeuroFlow outputs should be deterministic for same seed"
         );
+    }
+
+    #[test]
+    fn replay_map_culling_applies_before_recorded_flush_and_final_cut() {
+        use scriptbots_core::{ControlCommand, ExistingAgentPolicy, TerrainKind, TerrainLayer};
+
+        let config = ScriptBotsConfig {
+            rng_seed: Some(42),
+            persistence_interval: 3,
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            closed: true,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            ..ScriptBotsConfig::default()
+        };
+        let generated = RuleBasedMapGenerator::new(scriptbots_core::default_tileset_spec())
+            .unwrap()
+            .generate(10, 10, 20, 42)
+            .unwrap();
+        let mut tiles = generated.terrain().tiles().to_vec();
+        for tile in &mut tiles {
+            tile.kind = TerrainKind::DeepWater;
+        }
+        let artifact = MapArtifact::new(
+            TerrainLayer::from_tiles(10, 10, 20, tiles).unwrap(),
+            None,
+            None,
+            None,
+            None,
+            generated.metadata().clone(),
+        )
+        .unwrap();
+        for horizon in [1, 2] {
+            let mut mirror = ReplayMirror {
+                flush_ticks: BTreeSet::from([1]),
+                operator_commands: BTreeMap::from([(
+                    1,
+                    vec![ControlCommand::ApplyMap {
+                        artifact: Box::new(artifact.clone()),
+                        existing_agent_policy: ExistingAgentPolicy::CullIncompatible,
+                    }],
+                )]),
+                ..ReplayMirror::default()
+            };
+            let culled = run_headless_simulation(
+                &config,
+                horizon,
+                BrainPreset::Mlp,
+                FounderRecipe::CornerGrid,
+                &[],
+                &mirror,
+            )
+            .expect("replay recorded cull before sealing");
+            let (mut oracle, mut recording) =
+                WorldState::with_persistence(config.clone(), Box::new(NullPersistence)).unwrap();
+            let brains = install_brains(&mut oracle, BrainPreset::Mlp)
+                .unwrap()
+                .population;
+            seed_agents(&mut oracle, &brains, FounderRecipe::CornerGrid).unwrap();
+            recording.step(&mut oracle).unwrap();
+            assert!(!oracle.agents().is_empty());
+            scriptbots_core::apply_control_command(
+                &mut oracle,
+                mirror.operator_commands[&1][0].clone(),
+            )
+            .unwrap();
+            recording.finalize(&mut oracle).unwrap();
+            if horizon == 2 {
+                recording.step(&mut oracle).unwrap();
+            }
+            assert_eq!(culled.final_digest, oracle.world_digest_v1().unwrap());
+            assert_eq!(culled.summaries.last().unwrap().agent_count, 0);
+            mirror.operator_commands.get_mut(&1).unwrap()[0] = ControlCommand::ApplyMap {
+                artifact: Box::new(artifact.clone()),
+                existing_agent_policy: ExistingAgentPolicy::Retain,
+            };
+            let retained = run_headless_simulation(
+                &config,
+                horizon,
+                BrainPreset::Mlp,
+                FounderRecipe::CornerGrid,
+                &[],
+                &mirror,
+            )
+            .expect("retain control");
+            assert!(retained.summaries.last().unwrap().agent_count > 0);
+            assert_ne!(retained.final_digest, culled.final_digest);
+        }
     }
 
     #[test]

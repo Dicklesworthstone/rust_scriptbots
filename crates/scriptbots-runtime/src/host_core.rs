@@ -13257,11 +13257,10 @@ mod tests {
         assert!(core.scientific_digest_v1().is_ok());
     }
 
-    #[test]
-    fn host_command_map_culling_records_exact_lifecycle_and_retry_identity() {
+    fn map_culling_owner(interval: u32) -> (HostCore, MapArtifact) {
         let mut world = continuation_world();
         let mut config = world.config().clone();
-        config.persistence_interval = 3;
+        config.persistence_interval = interval;
         world.apply_config_update(config).expect("open cadence");
         let (_, map, _) = snapshot_map_artifacts(&world);
         let mut tiles = map.terrain().tiles().to_vec();
@@ -13269,35 +13268,69 @@ mod tests {
             tile.kind = scriptbots_core::TerrainKind::DeepWater;
         }
         let artifact = MapArtifact::new(
-            TerrainLayer::from_tiles(map.terrain().width(), map.terrain().height(),
-                map.terrain().cell_size(), tiles).expect("all-water terrain"),
-            None, None, None, None, map.metadata().clone(),
-        ).expect("culling artifact");
-        let mut core = HostCore::new(HostSessionId::new(91), world, options(true)).expect("owner");
-        settle_continuation_command(&mut core,
-            CommandEnvelope::new(CommandId::new(1), HostCommand::Step), 0);
+            TerrainLayer::from_tiles(
+                map.terrain().width(),
+                map.terrain().height(),
+                map.terrain().cell_size(),
+                tiles,
+            )
+            .expect("all-water terrain"),
+            None,
+            None,
+            None,
+            None,
+            map.metadata().clone(),
+        )
+        .expect("culling artifact");
+        let core = HostCore::new(HostSessionId::new(91), world, options(true)).expect("owner");
+        (core, artifact)
+    }
+
+    #[test]
+    fn host_command_map_culling_records_exact_lifecycle_and_retry_identity() {
+        let (mut core, artifact) = map_culling_owner(3);
+        settle_continuation_command(
+            &mut core,
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            0,
+        );
         let before = core.latest_snapshot();
         assert_eq!(before.world.agents.len(), 3);
-        let command = CommandEnvelope::new(CommandId::new(2), HostCommand::ApplyMap {
-            artifact: Box::new(artifact.clone()),
-            existing_agent_policy: scriptbots_core::ExistingAgentPolicy::CullIncompatible,
-        });
+        let command = CommandEnvelope::new(
+            CommandId::new(2),
+            HostCommand::ApplyMap {
+                artifact: Box::new(artifact.clone()),
+                existing_agent_policy: scriptbots_core::ExistingAgentPolicy::CullIncompatible,
+            },
+        );
         settle_continuation_command(&mut core, command.clone(), 0);
         let mut port = core.local_port();
         let applied = port.command_status(CommandId::new(2)).unwrap().unwrap();
         assert!(matches!(applied.application(), ApplicationState::Applied(_)));
         assert_eq!(port.submit(command).expect("identical retry"), applied);
-        assert!(matches!(port.submit(CommandEnvelope::new(CommandId::new(2), HostCommand::ApplyMap {
-            artifact: Box::new(artifact),
-            existing_agent_policy: scriptbots_core::ExistingAgentPolicy::Retain,
-        })), Err(HostAccessError::CommandIdCollision { .. })));
+        assert!(matches!(
+            port.submit(CommandEnvelope::new(
+                CommandId::new(2),
+                HostCommand::ApplyMap {
+                    artifact: Box::new(artifact),
+                    existing_agent_policy: scriptbots_core::ExistingAgentPolicy::Retain,
+                },
+            )),
+            Err(HostAccessError::CommandIdCollision { .. })
+        ));
         let after = core.latest_snapshot();
         assert_eq!(after.world.tick, before.world.tick);
         assert_eq!(after.world.agents.len(), 0);
-        assert_eq!(after.revisions.scientific.get(), before.revisions.scientific.get() + 1);
+        assert_eq!(
+            after.revisions.scientific.get(),
+            before.revisions.scientific.get() + 1
+        );
         assert_eq!(core.world().runtime().len(), 0);
-        let batch = core.persistence.stage_final_batch(&mut core.world)
-            .expect("actual final cadence tail").expect("retired lifecycle");
+        let batch = core
+            .persistence
+            .stage_final_batch(&mut core.world)
+            .expect("actual final cadence tail")
+            .expect("retired lifecycle");
         assert_eq!(batch.births.len(), before.world.agents.len());
         assert_eq!(batch.deaths.len(), before.world.agents.len());
         let mut ancestry = scriptbots_core::ancestry::AncestryGraph::new();
@@ -13308,40 +13341,51 @@ mod tests {
             assert_eq!(death.cause, scriptbots_core::DeathCause::MapIncompatible);
             assert_eq!(death.tick, Tick(before.world.tick));
             ancestry.apply_death(death).expect("actual later death");
-            assert_eq!(ancestry.node(death.agent_uid).unwrap().death_tick, Some(death.tick));
+            assert_eq!(
+                ancestry.node(death.agent_uid).unwrap().death_tick,
+                Some(death.tick)
+            );
         }
     }
 
     #[test]
     fn host_command_map_culling_refuses_invalid_recording_cuts_atomically() {
-        for (interval, advance) in [(3, false), (0, true), (1, true)] {
-            let mut world = continuation_world();
-            let mut config = world.config().clone();
-            config.persistence_interval = interval;
-            world.apply_config_update(config).expect("recording lane");
-            let (_, map, _) = snapshot_map_artifacts(&world);
-            let mut tiles = map.terrain().tiles().to_vec();
-            for tile in &mut tiles {
-                tile.kind = scriptbots_core::TerrainKind::DeepWater;
-            }
-            let artifact = MapArtifact::new(
-                TerrainLayer::from_tiles(map.terrain().width(), map.terrain().height(),
-                    map.terrain().cell_size(), tiles).unwrap(),
-                None, None, None, None, map.metadata().clone(),
-            ).unwrap();
-            let mut core = HostCore::new(HostSessionId::new(92), world, options(true)).unwrap();
+        for (interval, advance, cause) in [
+            (3, false, "recorded tick after persistence binding"),
+            (0, true, "uninterrupted lifecycle persistence"),
+            (1, true, "already sealed at `map.cull`"),
+        ] {
+            let (mut core, artifact) = map_culling_owner(interval);
             if advance {
-                settle_continuation_command(&mut core,
-                    CommandEnvelope::new(CommandId::new(1), HostCommand::Step), 0);
+                settle_continuation_command(
+                    &mut core,
+                    CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+                    0,
+                );
             }
             let before = core.latest_snapshot();
             let digest = core.world().world_digest_v1().unwrap();
-            settle_continuation_command(&mut core, CommandEnvelope::new(CommandId::new(2),
-                HostCommand::ApplyMap { artifact: Box::new(artifact),
-                    existing_agent_policy: scriptbots_core::ExistingAgentPolicy::CullIncompatible }), 0);
-            let receipt = core.local_port().command_status(CommandId::new(2)).unwrap().unwrap();
-            assert!(matches!(receipt.application(), ApplicationState::Failed(failure)
-                if failure.code == "world_control_application"));
+            settle_continuation_command(
+                &mut core,
+                CommandEnvelope::new(
+                    CommandId::new(2),
+                    HostCommand::ApplyMap {
+                        artifact: Box::new(artifact),
+                        existing_agent_policy: scriptbots_core::ExistingAgentPolicy::CullIncompatible,
+                    },
+                ),
+                0,
+            );
+            let receipt = core
+                .local_port()
+                .command_status(CommandId::new(2))
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(receipt.application(), ApplicationState::Failed(failure)
+                    if failure.code == "world_control_application" && failure.message.contains(cause)),
+                "wrong boundary refusal: {receipt:?}"
+            );
             let after = core.latest_snapshot();
             assert_eq!(core.world().world_digest_v1().unwrap(), digest);
             assert_eq!(after.world.agents, before.world.agents);

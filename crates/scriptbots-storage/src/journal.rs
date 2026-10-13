@@ -9,8 +9,8 @@ use super::{
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use scriptbots_core::{
-    AgentUid, BirthRecord, DeathRecord, ExistingAgentPolicy, MapArtifact, ScriptBotsConfig, SelectionUpdate, Tick,
-    TickCombatSummary,
+    AgentUid, BirthRecord, DeathRecord, ExistingAgentPolicy, MapArtifact, ScriptBotsConfig,
+    SelectionUpdate, Tick, TickCombatSummary,
 };
 use scriptbots_runtime::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand,
@@ -6474,7 +6474,10 @@ mod tests {
         }
         for (index, bytes) in policy_bytes.iter().enumerate() {
             for other in &policy_bytes[index + 1..] {
-                assert_ne!(bytes, other, "distinct policies must have distinct command evidence");
+                assert_ne!(
+                    bytes, other,
+                    "distinct policies must have distinct command evidence"
+                );
             }
         }
     }

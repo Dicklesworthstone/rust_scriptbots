@@ -10,10 +10,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use scriptbots_core::{
-    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, DraftGeneratorConfig, ExistingAgentPolicy,
-    HydrologyFlowDirection, MapArtifact, RuleBasedMapGenerator, SampleBasedMapGenerator,
-    ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate, TerrainKind, Tick,
-    WorldState, default_tileset_spec,
+    AgentDebugInfo, AgentDebugQuery, ControlCommand, DietClass, DraftGeneratorConfig,
+    ExistingAgentPolicy, HydrologyFlowDirection, MapArtifact, RuleBasedMapGenerator,
+    SampleBasedMapGenerator, ScriptBotsConfig, SelectionMode, SelectionState, SelectionUpdate,
+    TerrainKind, Tick, WorldState, default_tileset_spec,
 };
 
 use scriptbots_core::ConfigAuditEntry;
@@ -325,7 +325,9 @@ impl MapGenerateRequestBody {
 }
 
 /// Existing-agent policy shared by CLI parsing and REST/MCP request schemas.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MapApplyAgentPolicy {
     /// Keep existing agents at their current positions.

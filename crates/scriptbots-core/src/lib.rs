@@ -20563,7 +20563,10 @@ mod map_sandbox {
             reason = "one real transition checks survivor identity, companion cleanup, ancestry and the subsequent persistence boundary"
         )]
         fn map_culling_records_ordered_deaths_and_cleans_companions() {
-            use crate::{AgentData, ControlCommand, DeathCause, NullPersistence, Position, Tick, apply_control_command};
+            use crate::{
+                AgentData, ControlCommand, DeathCause, NullPersistence, Position, Tick,
+                apply_control_command,
+            };
 
             let (mut world, artifact) = placement_fixture(&[4]);
             let mut config = world.config().clone();
@@ -20607,10 +20610,14 @@ mod map_sandbox {
             let survivor_counters = world.agent_rng_counters(ids[1]);
             world.set_activation_probe(Some(ids[0]));
             world.pending_deaths.push(ids[0]);
-            apply_control_command(&mut world, ControlCommand::ApplyMap {
-                artifact: Box::new(artifact),
-                existing_agent_policy: ExistingAgentPolicy::CullIncompatible,
-            }).expect("cull command at open boundary");
+            apply_control_command(
+                &mut world,
+                ControlCommand::ApplyMap {
+                    artifact: Box::new(artifact),
+                    existing_agent_policy: ExistingAgentPolicy::CullIncompatible,
+                },
+            )
+            .expect("cull command at open boundary");
             assert_eq!(world.tick(), Tick(1));
             assert_eq!(world.agents.len(), 1);
             assert_eq!(world.runtime.len(), 1);

@@ -23,6 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row, Table},
 };
 use reqwest::{Client, StatusCode};
+use scriptbots_app::control::MapApplyAgentPolicy;
 use scriptbots_app::{
     ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest, KnobEntry, KnobKind,
     KnobUpdate, STORAGE_SIDECAR_SUFFIXES, default_control_rest_base_url,
@@ -31,7 +32,6 @@ use scriptbots_app::{
         execute_narrative_around, execute_narrative_search, format_hits_table,
     },
 };
-use scriptbots_app::control::MapApplyAgentPolicy;
 use scriptbots_storage::{DomainEventPayload, StorageReader};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -1990,7 +1990,10 @@ mod tests {
     #[test]
     fn map_apply_placement_is_explicit_and_defaults_to_retain() {
         for (arguments, expected) in [
-            (vec!["control", "map-apply", "--file", "map.json"], MapApplyAgentPolicy::Retain),
+            (
+                vec!["control", "map-apply", "--file", "map.json"],
+                MapApplyAgentPolicy::Retain,
+            ),
             (
                 vec![
                     "control",
@@ -2003,7 +2006,14 @@ mod tests {
                 MapApplyAgentPolicy::RepositionToSafeTile,
             ),
             (
-                vec!["control", "map-apply", "--file", "map.json", "--existing-agent-policy", "cull-incompatible"],
+                vec![
+                    "control",
+                    "map-apply",
+                    "--file",
+                    "map.json",
+                    "--existing-agent-policy",
+                    "cull-incompatible",
+                ],
                 MapApplyAgentPolicy::CullIncompatible,
             ),
         ] {
@@ -2017,9 +2027,18 @@ mod tests {
             assert_eq!(existing_agent_policy, expected);
         }
         for invalid in ["true", "yes", "unknown", "cull_incompatible"] {
-            assert!(Cli::try_parse_from([
-                "control", "map-apply", "--file", "map.json", "--existing-agent-policy", invalid,
-            ]).is_err(), "invalid policy {invalid}");
+            assert!(
+                Cli::try_parse_from([
+                    "control",
+                    "map-apply",
+                    "--file",
+                    "map.json",
+                    "--existing-agent-policy",
+                    invalid,
+                ])
+                .is_err(),
+                "invalid policy {invalid}"
+            );
         }
     }
 
