@@ -701,8 +701,8 @@ mod capture_smoke_test {
             tonemap_mode: None,
             exposure_factor: Some(0.5),
         };
-        let mut renderer = pollster::block_on(WorldRenderer::new(&adapter, (64, 64)))
-            .expect("exposure renderer");
+        let mut renderer =
+            pollster::block_on(WorldRenderer::new(&adapter, (64, 64))).expect("exposure renderer");
         let mut captures = Vec::new();
         for exposure in [0.5, 2.0, 0.5] {
             snapshot.exposure_factor = Some(exposure);
@@ -741,7 +741,9 @@ mod capture_smoke_test {
             assert_eq!(renderer.frame_generation, generation);
         }
         snapshot.exposure_factor = Some(0.5);
-        let frame = renderer.render(&snapshot).expect("recover after bad exposure");
+        let frame = renderer
+            .render(&snapshot)
+            .expect("recover after bad exposure");
         renderer.copy_to_readback(&frame).expect("recovered copy");
         assert_eq!(
             renderer.mapped_rgba().expect("recovered pixels").bytes(),

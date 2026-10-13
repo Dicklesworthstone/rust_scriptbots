@@ -18686,6 +18686,7 @@ mod command_characterization_tests {
 
         let mut factors = Vec::new();
         let mut pixels = Vec::new();
+        let mut world_digest = None;
         for bias in [None, Some(-1.0), Some(1.0)] {
             let mut config = ScriptBotsConfig {
                 rng_seed: Some(42),
@@ -18695,12 +18696,17 @@ mod command_characterization_tests {
             config.render.quality = Some(RenderQuality::Potato);
             config.render.tonemap_exposure_bias = bias;
             let world = WorldState::new(config).expect("exposure world");
+            let digest = world.world_digest_v1().expect("exposure science digest");
+            if let Some(expected) = &world_digest {
+                assert_eq!(&digest, expected);
+            } else {
+                world_digest = Some(digest);
+            }
             let expected = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
                 .expect("owner exposure frame")
                 .gpu_exposure_factor();
-            let host =
-                HostCore::new(HostSessionId::new(78), world, HostCoreOptions::default())
-                    .expect("exposure host");
+            let host = HostCore::new(HostSessionId::new(78), world, HostCoreOptions::default())
+                .expect("exposure host");
             let snapshot = host.snapshot_hub().latest();
             let actual = RenderFrame::from_snapshot(&snapshot, ColorPaletteMode::Natural)
                 .expect("published exposure frame")
