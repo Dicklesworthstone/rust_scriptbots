@@ -19027,6 +19027,7 @@ mod map_sandbox {
                     height: self.state.height,
                 });
             }
+            constraint.validate()?;
             self.push_checkpoint();
             self.state.constraints.paint(constraint)?;
             Ok(())
@@ -20398,6 +20399,88 @@ mod map_sandbox {
             draft.set_seed(6);
             assert!(draft.undo().expect("new history enabled"));
             assert_eq!(draft.state.seed, 4);
+        }
+
+        #[test]
+        fn map_editor_draft_invalid_paint_preserves_revision_and_history() {
+            let mut draft = MapEditorDraft::new(
+                "paint_validation",
+                8,
+                8,
+                16,
+                1,
+                DraftGeneratorConfig::RuleBased {
+                    tileset: default_tileset_spec(),
+                },
+            );
+            draft.set_seed(2);
+            draft.set_seed(3);
+            assert!(draft.undo().expect("retain both history directions"));
+            assert!(draft.can_undo());
+            assert!(draft.can_redo());
+            let before = draft.clone();
+            let paint = PaintedConstraint {
+                x: 1,
+                y: 1,
+                terrain_kind: Some(TerrainKind::Sand),
+                elevation: None,
+                moisture: None,
+                fertility_bias: None,
+                temperature_bias: None,
+                permeability: None,
+                runoff_bias: None,
+                basin_rank: None,
+                channel_priority: None,
+                swim_cost: None,
+                hazard: None,
+            };
+            for invalid in [
+                PaintedConstraint {
+                    elevation: Some(f32::NAN),
+                    ..paint.clone()
+                },
+                PaintedConstraint {
+                    moisture: Some(f32::INFINITY),
+                    ..paint.clone()
+                },
+                PaintedConstraint {
+                    swim_cost: Some(f32::NEG_INFINITY),
+                    ..paint.clone()
+                },
+            ] {
+                assert!(matches!(
+                    draft.paint_constraint(invalid),
+                    Err(MapGenerationError::DraftError(_))
+                ));
+                assert_eq!(draft, before);
+            }
+            let out_of_bounds = PaintedConstraint {
+                x: draft.state.width,
+                ..paint.clone()
+            };
+            assert!(matches!(
+                draft.paint_constraint(out_of_bounds),
+                Err(MapGenerationError::ConstraintOutOfBounds { .. })
+            ));
+            assert_eq!(draft, before);
+            assert!(draft.redo().expect("redo survives rejected painting"));
+            assert_eq!(draft.state.seed, 3);
+            assert!(draft.undo().expect("undo redo before valid painting"));
+            let before_paint_revision = draft.revision;
+            draft.paint_constraint(paint).expect("valid painting");
+            assert_eq!(draft.revision, before_paint_revision + 1);
+            assert_eq!(
+                draft.state.constraints.get(1, 1).unwrap().terrain_kind,
+                Some(TerrainKind::Sand)
+            );
+            let artifact = draft.generate_artifact().expect("generate painted draft");
+            assert_eq!(
+                artifact.terrain().tile(1, 1).unwrap().kind,
+                TerrainKind::Sand
+            );
+            assert!(!draft.can_redo());
+            assert!(draft.undo().expect("valid painting remains undoable"));
+            assert_eq!(draft.state, before.state);
         }
 
         #[test]
