@@ -1,6 +1,6 @@
-# Reality Check — rust_scriptbots — reassessed 2026-10-12
+# Reality Check — rust_scriptbots — reassessed 2026-10-13
 
-## Current assessment — 2026-10-12
+## Current assessment — 2026-10-13
 
 **This is a substantial deterministic simulator with real control, persistence, replay and
 research machinery. It is still an unfinished Evolution Lab. The remaining gap is the complete
@@ -8,24 +8,49 @@ user journey: a useful live frontend, a responsive durable run, a trustworthy co
 qualified scientific results and an independently verifiable release. The cinematic hardware-GPU
 meadow and durable browser laboratory also remain unfinished.**
 
-### Current implementation and granular TODO — 2026-10-12
+### Current implementation and granular TODO — 2026-10-13
 
 Current map-placement work (`bd-2z0.10.7`):
 
 - [x] Inspect the production policy and consumers: live map commands always retain agents;
   repositioning ignores toroidal distance and silently leaves agents on an all-water map.
-- [ ] Stage candidate positions and commit only after every placement succeeds.
-- [ ] Test horizontal/vertical seams, deterministic ties, retain default, failed-map digest
+- [x] Stage candidate positions and commit only after every placement succeeds.
+- [x] Test horizontal/vertical seams, deterministic ties, retain default, failed-map digest
   preservation and successful all-water application to an empty world.
-- [ ] Carry `reposition_agents` through CLI, REST, MCP, control handle and sole-owner commands.
-- [ ] Preserve the explicit policy through owned/borrowed journal codecs and offline replay;
-  version the changed archive and prove both policy values survive readback.
-- [ ] Exercise real REST/MCP owner results, malformed policy rejection and failed placement.
-- [ ] Run pinned DSR formatting, all-target workspace check, strict Clippy and affected tests.
-- [ ] Review source, export Beads, publish exact reviewed commits and retain evidence.
-- [ ] Complete the original editor/sample/native-input/expected-revision acceptance. This
-  broader bead stays open; culling still bypasses death accounting and requires a separate
-  boundary-aware repair within its existing scope.
+- [x] Carry `reposition_agents` through CLI, REST, MCP, control handle and sole-owner commands.
+- [x] Preserve the explicit policy through owned/borrowed journal codecs and offline replay;
+  archive v5 reads both policy values and refuses v4 and unknown future versions.
+- [x] Exercise real REST/MCP owner results, malformed policy rejection and failed placement.
+- [x] Observe all fourteen pinned R128 source commands passing at clean `0425c43a`.
+- [x] Review and publish both map-placement source commits; retain successful and failed logs.
+- [ ] Obtain successful outer DSR artifact collection; R128's cache guard refuses it and
+  R136's named-test reader fails before collection.
+- [x] Verify the new Agent Mail mailbox after the operator reset: full integrity, registration,
+  granted exclusive reservations and authoritative readback. Preserve external old snapshots.
+- [x] Recover saved Beads comments 2774–2776 through ordinary BR export, preserving identities.
+- [x] Prepare the evidence/TODO and ordinary Beads export for separate immutable review
+  and normal publication.
+- [x] Bound sample extraction and output work before allocating the overlapping WFC model.
+- [x] Connect the existing sample generator to the shared service, CLI, REST and MCP.
+- [x] Make the request schema describe defaults derived from live terrain, rather than
+  advertising fixed dimensions for customized worlds.
+- [x] Qualify the zero/reduced draft-history fix, including disabling retained redo and
+  re-enabling new history without recovering discarded edits.
+- [x] Reject malformed, overflowing and conflicting requests without default substitution;
+  refuse the unused non-periodic flag rather than advertising it as functional.
+- [x] Qualify actual sample terrain/provenance, deterministic REST/MCP parity, unchanged owner
+  tick/last-applied command and independent bound/type/conflict negatives through pinned DSR.
+- [ ] Obtain a passing source receipt that recognizes named-test completion with diagnostic
+  output. Preserve the failed R136 reader and all original named probes/refusal controls.
+- [ ] Add original native controls for rules, samples, seeds, dimensions and constraints.
+- [ ] Connect bounded preview, progress, cancellation and disclosed generate-again seeds.
+- [ ] Connect draft painting, undo/redo, import/export and persisted artifact inspection.
+- [ ] Expose the expected world revision at apply time; reject stale previews through owner
+  guards and retain separate admission, application and durability displays.
+- [ ] Qualify keyboard/focus/accessibility and the original native input journey, including
+  contradictory, stale and cancelled negatives.
+- [ ] Repair culling's companion-state/death/ancestry/persistence accounting at a valid science
+  boundary before exposing it. Original acceptance and the blocker of `bd-2z0.10.8` stay intact.
 
 Creation worksheet (2026-10-12): this TODO is process; its consumer is the user who explicitly
 requested a granular complete TODO, its gate is that requested handoff, and its observed
@@ -34,15 +59,219 @@ task is qualified; historical evidence remains. The integrity exception is unnec
 (no additional recovery artifact is being proposed). An hour on the existing map command
 delivers more value than another report; verdict: minimum requested TODO, then source work.
 
+Final placement outcome: R127 at `7bc9c10b` failed fixture compilation (`TerrainLayer::new`
+does not exist); five preceding guards passed, no tests ran, Cargo 101, typed failed/1, outer
+DSR 6. Corrected `0425c43a`/tree `b1fe126dda430ec2205b6a3bc8a87994e9783031` completes
+all fourteen unchanged R128 source commands with command/log exit zero and typed pass/0:
+core economy-faults 942 passed/0 failed/8 original ignored; runtime library 233/0/6; journal
+29/0/0 (235 filtered); servers 38/0/0 (602 filtered); map-control 2/0/0 (638 filtered);
+CLI 17/0/0. Workspace all-target check, strict Clippy, formatting, analyzer build and pin,
+license, Asupersync/WASM guards also pass. These are 1,261 passes and 14 original ignores,
+not a full-workspace test suite or native editor journey. Outer DSR fails with exit 6 because
+final private-cache verification refuses the tracked Proptest README link. Final runner
+identity checks pass; no guard/cache/dependency is changed to admit collection.
+
+The complete 145-file R128 raw proof is retained and hash-verified at
+`/data/tmp/scriptbots-map-placement-20261012-lilacelm/map-placement-20261012-0425c43a-r128-hz2/`,
+with failed R127 and separate outer receipts beside it. Profile SHA256:
+`689718729d9f73b99650c71fea6d5b5f3601f0b89d41e8ca926ee1ee8c4e1274`.
+Static-only UBS remains exit 1 (33 critical heuristics, 12,310 warnings, 2,962 informational);
+sampled findings are reviewed, not exhaustively cleared. No overall DSR, file-backed map replay,
+native acceptance, performance win or bead closure is claimed. The full earlier map audit and
+saved report/tracker diff remain in `report-beads-checkpoint.patch` beside the raw proof.
+
+At 23:02 UTC the operator reports executing `am clear-and-reset-everything`, declining an
+archive and confirming its destructive reset. This agent executes neither that reset nor the
+previously proposed live VACUUM. The replacement server subsequently reports a passing full
+integrity check; fresh project/LilacElm registrations, exclusive reservations and authoritative
+readback succeed. The external recovery snapshot and compacted copy retain their original
+hashes in `/data/tmp/scriptbots-agent-mail-recovery-20261012T1056Z-lilacelm/copy-validation.json`.
+They have not been restored into the new mailbox, and the active VACUUM checklist is retired.
+At restart the tracked metadata had lost its pending checkpoint while source was `0425c43a`;
+ordinary BR export recovers the exact saved comment rows without manual JSONL edits.
+
+Current product work is the existing sample-generator consumer above. Read-only source review
+also finds `periodic` entering the sample hash without changing extraction, and `max_history=0`
+making draft checkpoints remove from an empty stack. Neither observation is native acceptance.
+The requested TODO is maintained here; no new work graph, replacement scope or closure is created.
+
+Sample candidate `c53fab56` connects the existing generator through the shared control service,
+`--sample`, REST and MCP. It introduces explicit exemplar/output/pair limits before WFC model
+construction and replaces MCP's truncating/silent-fallback parser with the shared typed request.
+R129 stops at formatting (command 1/log 0, typed failed/1, outer 6, final identity 0); no tests
+run. `818b8682` applies those three requested hunks and adds an exemplar-changing positive to
+the transport regression; R130 catches two formatting hunks in that case, with the same failure
+class and no tests. Exact corrections are committed as `eec7ee95`/tree
+`f1efc6cd435c9695a4d32e2d088f1e0bcbf42711`. R131 retains all fourteen commands and requires
+the four new test names plus the original placement/codec tests. Its five initial commands
+(formatting and four dependency guards), core suite (943/0/8), runtime library (233/0/6)
+and journal scope (29/0/0) pass. App fixture compilation then fails: an unqualified
+`HeaderValue` is not imported in the new sample test. Nine commands are recorded, server
+Cargo exits 101/log 0, typed failed/1, outer 6 and final runner identity 0; no app tests run.
+The complete 91-file failed proof and outer launcher log are copied and hash-verified.
+All three failed native proofs are
+copied into the same external custody directory and every artifact-manifest hash is verified.
+Static-only UBS scope is explicit: the four-file source scan exits 1 with 16 critical heuristics,
+6,325 warnings and 1,686 informational; the final one-file formatter scan exits 1 with 9/499/377.
+These have different denominators and are not an improvement comparison or clean-scan claim.
+
+Adjacent source fixes are committed in `ade774c51d07c9010d8ab7aa521e63a1a24254e1`/tree
+`90ca6d98f58f0da55c3253d1ba71bd3c7a9ad899`: OpenAPI stops advertising fixed generator
+dimensions, and draft operations trim both history stacks to a reduced limit and safely
+disable history at zero. New regressions require customized-world output matching its live
+terrain plus actual published schema inspection, and zero/reduced/disabled-redo/new-history
+behavior. `cd0b101c3b9f0394d1ae6cfce4a02664f032fccb`/tree
+`e9fb3873a7005f028093b4a1af4073e4afd7a336` extends that customized-world regression to
+actual MCP dispatch and shortens a 101-column call before qualification. Prepared R132/R133
+are superseded without execution. `7d0ce250bb0c4b73eec489a695dc4aab5a86bcb9`/tree
+`24dc954dd843fb9a1e96f04ec523418eb483d595` qualifies the missing header type. R134 pins
+that source, retains the exact fourteen-command roster and both additional required test
+names, and moves app checks before the unchanged core/runtime/journal suites. Read-only
+comparison verifies command equality independently of ordering. Its profile SHA256 is
+`0ba396afc40b3af98cc6ed1058f87a456eb735c27e1516946a6f5afd8ba5deaf`. R134 completes
+five initial checks, then its server scope reports 39 passed/1 failed/0 ignored: the new
+sample test expects a JSON-RPC error for an overflow correctly refused as a handler tool
+result (`isError: true`). The customized-world REST/MCP/schema regression passes. Six
+commands are recorded, Cargo 101/log 0, typed failed/1, outer 6, final identity 0. Its full
+62-file failed proof and launcher log are locally retained and hash-verified.
+
+The test oracle is corrected in `abfba4efc80845f2a835cac1b15807b35e995c6d`/tree
+`10626d9e7db89f169d3160a6a8d9480ee831497a`, with no production behavior or gate roster
+change. Evidence: locked FastMCP 0.10.0 `router.rs` checks schemas before dispatch and
+converts nonterminal handler errors into tool results; its `srv_01_b_positive` regression
+requires this distinction, consistent with the [MCP error contract](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2026-07-28/server/tools.mdx#error-handling).
+The new oracle requires the declared phase and diagnostic for every existing negative,
+and independently refuses the actual successful map, a removed error marker/code and an
+unrelated diagnostic. It emits each real rejection's old-code/new-guard classification so
+the admission split can be observed, rather than inferred from the fixture labels. That
+split was not reached in R135: formatting catches two hunks before any tests (command 1/log
+0, typed failed/1, outer 6, final identity 0). The complete ten-file proof and launcher log
+are locally retained and hash-verified. R135 profile SHA256:
+`5df3632495ec73f1154dd57c3fd923ca0c48f6c711545b01c122803842dc7747`.
+Static-only UBS on the one-file final oracle scope remains exit 1 (9 critical heuristics,
+553 warnings, 383 informational); no clean-scan result is claimed.
+`a5bcdf85d08be57054635137e6a0c999e87b0154`/tree
+`7c124a3ba11e24c45630377442b35aede86a48d5` applies precisely those formatting hunks.
+R136 pins this source, preserves all fourteen commands and required test names, and uses
+profile SHA256 `3c040d04fbcc14e6e5971ba93609873087323fc3ef4ff008dbb897cfcd4886ee`.
+Static UBS is repeated on that one file with the same non-clean 9/553/383 result.
+R136 subsequently passes all 40 server tests, three map-control tests and 18 CLI tests.
+The actual eight rejection rows distinguish two schema errors from six handler errors;
+the old scalar code assertion accepts two and wrongly refuses six, while the new
+phase/cause oracle accepts all eight actual refusals. Its successful-response,
+missing-marker and wrong-cause falsifiers execute within that passing test.
+Diagnostic output puts the named sample test's terminal `ok` on a separate line. The
+profile's one-line named-test reader therefore cannot recognize that successful case.
+Independent read-only parsing observes its exact-name completion, checks seven synthetic
+completion/missing/failed/duplicate/neighbor cases, and still refuses the actual failed
+R134 test. The live R136 profile and its eventual typed receipt are not modified or
+relabelled. All six scoped suites subsequently pass: core economy-faults 944/0/8, runtime
+library 233/0/6, journal 29/0/0, servers 40/0/0, map-control 3/0/0 and CLI 18/0/0. These
+are 1,267 passes and 14 original ignores. Workspace all-target check, strict Clippy and
+analyzer build also pass. All fourteen command/log pairs exit zero. The original final
+typed receipt is failed/1 at the reader assertion; outer DSR is failed/6, collects no
+artifacts, and finishes at 2026-10-13T01:07:24Z with final runner identity zero. Its
+`publishable: true` field describes purpose metadata, not a successful release.
+The complete 148-file proof is copied and every manifest hash verified at
+`/data/tmp/scriptbots-map-placement-20261012-lilacelm/map-sample-20261013-a5bcdf85-r136-hz2/`.
+Readback derives the required names from the frozen profile and recognizes all fourteen
+actual named completions. Both complete outer/native logs independently match worker bytes:
+`0a02b9e31c3b26b2142050e3817f30ea1a739fc6e0cd55ab7bae0721dc308b68` and
+`c0350162ff0f4173ceac03fe898107c1f399bbb2dc9439f0b8760950a10979ed`.
+No source receipt is relabelled, cache guard weakened or original acceptance closed.
+Beads comment 2778 records these exact observations and original remaining requirements.
+The three-file static UBS scan remains exit 1 (12 critical heuristics, 6,274 warnings, 1,575
+informational); sampled critical reports concern existing test panics and validated headers.
+This is a separate scan scope, not a clean result or comparative improvement.
+The final one-file parity scan is also nonzero (9 critical heuristics, 528 warnings, 380
+informational), with the same scope limitation.
+
+Bounded real-work audit, `0425c43a..a5bcdf85` (eight commits, no Beads closures): README
+purpose is a faithful deterministic evolution simulator with a GPU UI, pluggable brains and
+analytics. Classification: USER 2 (`c53fab56`, `ade774c5`); ENABLER 6 (fixture, oracle and
+formatting corrections); PROCESS 0; UNKNOWN 0. Report/tracker publication is additional
+requested process, with no capability credit. Answers to the six worksheet questions:
+
+1. The visible improvement is selecting an exemplar with `map-generate --sample`, then
+   inspecting actual generated terrain/provenance through the shared transports. This is
+   implemented source; publication and broader qualification are separate observations.
+2. Without the report/tracker checkpoint, generation behaves identically; the requested
+   detailed TODO and reproducible failure record would be missing.
+3. The enablers are exercised by actual server/control/CLI tests, including eight refusals
+   and successful sample output. Expensive compilation and waiting earn no feature credit.
+4. The oldest open goal is `bd-2z0`, created 2026-07-11. Its usable GPU/terminal lab remains
+   open. This bounded consumer repair advances reusable scenario controls, not that whole
+   journey; it does not justify replacing the original native acceptance.
+5. Not applicable: this work block is solo; no subagent dispatch or close occurred.
+6. No replacement scope/criteria or follow-up closure was introduced (checked: the source
+   range, original bead criteria/dependencies and unchanged status).
+
+Verdict: user-facing source progress, but six corrective commits and six failed DSR attempts
+are validation cost, not six further capabilities. Correction to self: finish the unchanged
+source commands, retain every failure, publish the bounded change and stop expanding evidence
+machinery. The known log-reader false negative cannot be repaired by fabricating a pass.
+
+Honesty inventory for that same source range and this checkpoint:
+
+1. Oracle assertions changed: R134 assumed all refusals were JSON-RPC errors. The separately
+   reviewed correction retains every negative, requires its phase/cause and adds real-success,
+   missing-marker and wrong-cause falsifiers; observed admission split is two unchanged schema
+   refusals plus six correctly rejected handler errors. No test/ignore is deleted.
+2. No specialized behavior double (checked: the new tests use the existing real TestHost,
+   map generators, REST handlers and FastMCP dispatcher). They remain scoped tests.
+3. No golden regeneration (checked: complete changed-path range; no fixture/golden changes).
+4. Test/oracle changes are explicit above; no dependency, lint/CI gate, tolerance, timeout,
+   suppression or bypass flag changes (checked: their empty source-range diffs). The active
+   external DSR profile remains frozen despite its reader defect.
+5. No release-path hardcoding or performance denominator change (checked: production
+   request parsing/generation changes and all fourteen retained source commands).
+6. No zero-run result presented as success (checked: nonzero actual scoped test totals,
+   all required named completions and fourteen command/log pairs; final receipt stays failed).
+7. No unexecuted run presented as executed (checked: R132/R133 labelled superseded/unrun;
+   R129/R130/R131/R134/R135 failures retained; R136 reported only as observed).
+8. No scoped test promoted to real native input, TCP CLI E2E, file-backed map replay,
+   complete workspace tests or release proof (checked: report/README qualifiers).
+9. Avoidable fixture/import/oracle/formatting mistakes and the reader failure are disclosed;
+   their correction does not rewrite the failed runs. Native editor/culling remain unfinished.
+10. No discarded stderr used as cited evidence (checked: DSR command/log channels and retained
+    complete launcher logs; UBS nonzero output is retained rather than called clean).
+11. No closure or follow-up laundering (checked: original `bd-2z0.10.7` still in progress,
+    original `bd-2z0.10.8` blocker and acceptance unchanged).
+12. No plan relaxation presented as implementation (checked: current marker describes this
+    limited slice and still names original unresolved native/editor/culling requirements).
+13–17. Not applicable to this solo block: no dispatch, subagent report, peer closure, refusal
+    farming or shared-agent agreement is used as evidence.
+18. No denominator chosen after the result (checked: eight negative requests predate R136;
+    the same fourteen-command roster and scoped suites are retained).
+19. The operator should see the repeated failed qualification attempts before any result
+    claim. Their exact causes and receipts are retained above; commit count earns no credit.
+20. Strongest current evidence is the source-bound raw execution of real successful maps,
+    differing exemplars and all eight transport refusals. Re-execution is possible through
+    the retained profile; complete source/release qualification is reported separately.
+
+Older-session check uses six bounded lexical CASS queries and canonical archived-message
+readback, not raw physical-line hints. The usable local index covers known sessions through
+2026-09-16, so this is not an exhaustive current-history audit. In conversation 614, message
+102, an older agent calls a 60-tick event-count/thread comparison "provably real"; this is
+broader than that observation supports. That claim is not adopted. Conversations 627/622
+also retain limited qualification and opt-in golden-regeneration discussions; reading those
+records is not proof that their entire runs/closures were valid.
+
+Disposition: correct fixture/oracle mistakes in place, disclose each failed attempt and
+retain its raw receipts; enforce phase/cause falsifiers against RH-1, preserve first failures
+against SM-11, and keep scoped observations separate from native/release claims against PL-2.
+No independent verifier or whole-project completion is claimed.
+
 The source changes through saved commit `c37ea6ebf3bfacd5ba0fb780584318940ce3e786`
 connect the live FrankenTUI Program/Model runtime, six actual science providers, preserved
 legacy widgets, acknowledged control receipts and terminal capture. The older missing-live-
 consumer finding below describes the initial audited source, not this newer candidate.
 Full original acceptance remains open; no overall product or performance pass is claimed.
 
-Shared local `main` is restored to retained `31313081` at 22:14:08 UTC after exact-base,
-clean tracked/index and forty authoritative conflict-free leases. The latest retained product source
-is `5d8eaeea376e04aced145b3d4ac733f0aef9a9f3`, including the actual MCP HTTP dispatcher
+In the earlier terminal/MCP checkpoint, shared local `main` was restored to retained
+`31313081` at 22:14:08 UTC after exact-base, clean tracked/index and forty authoritative
+conflict-free leases. The retained product source at that checkpoint was
+`5d8eaeea376e04aced145b3d4ac733f0aef9a9f3`, including the actual MCP HTTP dispatcher
 offload, explicit scoped-thread stack budget, typed cancellation regression and dedicated
 notification-route dispatch. The earlier complete `43cd2171` bundle is
 independently byte-matched on Hz2 (`308680cb3fcf6c7de586f1a76acd9b3250ab6d1c4bcf65ef5d9443ce356c8174`).
