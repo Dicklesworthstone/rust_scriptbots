@@ -8204,6 +8204,8 @@ pub enum DeathCause {
     Unknown,
     /// A valid brain program produced an invalid execution state and was removed.
     BrainExecutionFault(BrainExecutionFault),
+    /// Explicitly removed because an applied map made the agent's tile incompatible.
+    MapIncompatible,
 }
 
 impl DeathCause {
@@ -8220,6 +8222,7 @@ impl DeathCause {
             Self::Aging => 0x04,
             Self::Unknown => 0x05,
             Self::BrainExecutionFault(_) => 0x06,
+            Self::MapIncompatible => 0x07,
         }
     }
 }
@@ -11743,9 +11746,9 @@ pub enum ScientificStateError {
         /// Tick whose persistence boundary is unresolved.
         tick: u64,
     },
-    /// An external arrival was attempted after the current persistence boundary was admitted.
+    /// An external lifecycle change was attempted after the current boundary was admitted.
     #[error(
-        "persistence boundary for tick {tick} is already sealed at `{path}`; advance to a new tick before adding an external arrival"
+        "persistence boundary for tick {tick} is already sealed at `{path}`; advance to a new tick before changing the external lifecycle"
     )]
     PersistenceBoundarySealed {
         /// Exact field or collection path rejected.
@@ -20450,6 +20453,7 @@ mod map_sandbox {
                 rng_seed: Some(123),
                 population_minimum: 0,
                 population_spawn_interval: 0,
+                persistence_interval: 0,
                 ..super::super::ScriptBotsConfig::default()
             })
             .expect("world");
@@ -20494,8 +20498,9 @@ mod map_sandbox {
                 agent.position.y
             );
 
-            // Test 3: CullIncompatible culls agent if they are on deep water
-            // First move agent back to deep water (24.0, 24.0)
+            // Test 3: Culling must follow the founder's origin, never kill it at tick zero.
+            world.step().expect("advance beyond founder origin");
+            // First move agent back to deep water (24.0, 24.0).
             let index = world
                 .agents
                 .index_of(agent_id)
@@ -20545,6 +20550,193 @@ mod map_sandbox {
             )
             .expect("placement artifact");
             (world, artifact)
+        }
+
+        #[test]
+        #[allow(
+            clippy::too_many_lines,
+            reason = "one real transition checks survivor identity, companion cleanup, ancestry and the subsequent persistence boundary"
+        )]
+        fn map_culling_records_ordered_deaths_and_cleans_companions() {
+            use crate::{AgentData, DeathCause, NullPersistence, Position, Tick};
+
+            let (mut world, artifact) = placement_fixture(&[4]);
+            let mut config = world.config().clone();
+            config.persistence_interval = 3;
+            config.analytics_stride.lifecycle_events = 1;
+            world
+                .apply_config_update(config)
+                .expect("deferred persistence");
+            let ids: Vec<_> = (0..3)
+                .map(|_| world.try_spawn_agent(AgentData::default()).expect("founder"))
+                .collect();
+            let uids: Vec<_> = ids
+                .iter()
+                .map(|&id| world.agent_uid(id).expect("uid"))
+                .collect();
+            let mut session = world
+                .bind_persistence(Box::new(NullPersistence))
+                .expect("session");
+            session.step(&mut world).expect("open tick one");
+            for (id, position) in ids.iter().copied().zip([
+                Position::new(8.0, 8.0),
+                Position::new(24.0, 24.0),
+                Position::new(40.0, 40.0),
+            ]) {
+                world
+                    .try_update_agent(id, |data, runtime| {
+                        data.position = position;
+                        runtime.food_balance_total = 7.0;
+                        runtime.food_delta = 1.25;
+                    })
+                    .expect("place agent");
+            }
+            let survivor = world.agents.snapshot(ids[1]).expect("survivor before");
+            let survivor_runtime =
+                serde_json::to_value(world.runtime.get(ids[1]).expect("runtime before"))
+                    .expect("runtime serialization");
+            let survivor_counters = world.agent_rng_counters(ids[1]);
+            world.set_activation_probe(Some(ids[0]));
+            world.pending_deaths.push(ids[0]);
+            world
+                .apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible)
+                .expect("cull at open boundary");
+            assert_eq!(world.tick(), Tick(1));
+            assert_eq!(world.agents.len(), 1);
+            assert_eq!(world.runtime.len(), 1);
+            assert_eq!(world.identities.len(), 1);
+            assert_eq!(world.agent_rng_counters.len(), 1);
+            for &id in &[ids[0], ids[2]] {
+                assert!(world.runtime.get(id).is_none());
+                assert!(world.identities.get(id).is_none());
+                assert!(world.agent_rng_counters(id).is_none());
+            }
+            assert_eq!(world.agents.snapshot(ids[1]), Some(survivor));
+            assert_eq!(
+                serde_json::to_value(world.runtime.get(ids[1]).expect("runtime after"))
+                    .expect("runtime serialization"),
+                survivor_runtime
+            );
+            assert_eq!(world.agent_rng_counters(ids[1]), survivor_counters);
+            assert!(world.pending_deaths.is_empty());
+            assert_eq!(world.last_probed_agent_death(), Some((uids[0], Tick(1))));
+            assert!(world.active_activation_probe().is_none());
+            assert_eq!(world.pending_death_events, 2);
+            assert_eq!(world.pending_death_records.len(), 2);
+            assert_eq!(
+                world
+                    .pending_death_records
+                    .iter()
+                    .map(|r| r.agent_uid)
+                    .collect::<Vec<_>>(),
+                vec![uids[0], uids[2]]
+            );
+            assert!(world.pending_death_records.iter().all(|r| {
+                r.tick == Tick(1)
+                    && r.cause == DeathCause::MapIncompatible
+                    && r.food_balance_total == 7.0
+            }));
+            let mut ancestry = crate::ancestry::AncestryGraph::new();
+            for record in &world.pending_birth_records {
+                ancestry.apply_birth(record).expect("origin");
+            }
+            for record in &world.pending_death_records {
+                ancestry.apply_death(record).expect("death follows origin");
+            }
+            assert_eq!(
+                ancestry.node(uids[0]).and_then(|node| node.death_cause),
+                Some(DeathCause::MapIncompatible)
+            );
+            let completion = session.step_outcome(&mut world).expect("next real tick");
+            assert_eq!(completion.outcome.deaths.len(), 2);
+            let batch = session
+                .stage_final_batch(&mut world)
+                .expect("partial batch")
+                .expect("batch");
+            assert_eq!(batch.summary.deaths, 2);
+            assert_eq!(batch.deaths.len(), 2);
+            for (name, expected) in [
+                ("mortality.total.count", 2.0),
+                ("mortality.map_incompatible.count", 2.0),
+                ("mortality.map_incompatible.ratio", 1.0),
+            ] {
+                assert_eq!(
+                    batch
+                        .metrics
+                        .iter()
+                        .find(|metric| metric.name == name)
+                        .expect("mortality metric")
+                        .value,
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn map_culling_refuses_sealed_boundaries_and_same_tick_arrivals_atomically() {
+            use crate::{AgentData, NullPersistence, Position, ScientificStateError, WorldStateError};
+
+            let (mut world, artifact) = placement_fixture(&[]);
+            world
+                .try_spawn_agent(AgentData::default())
+                .expect("founder");
+            let before = world.world_digest_v1().expect("genesis digest");
+            assert!(matches!(
+                world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible),
+                Err(WorldStateError::InvalidConfig(
+                    "map culling requires agents to arrive before the current tick"
+                ))
+            ));
+            assert_eq!(world.world_digest_v1().expect("refused genesis"), before);
+            let mut config = world.config().clone();
+            config.persistence_interval = 3;
+            world
+                .apply_config_update(config)
+                .expect("deferred persistence");
+            let mut session = world
+                .bind_persistence(Box::new(NullPersistence))
+                .expect("session");
+            session.step(&mut world).expect("open tick one");
+            world
+                .try_inject_agent(AgentData {
+                    position: Position::new(8.0, 8.0),
+                    ..AgentData::default()
+                })
+                .expect("same-tick arrival");
+            let before = world.world_digest_v1().expect("arrival digest");
+            assert!(matches!(
+                world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible),
+                Err(WorldStateError::InvalidConfig(
+                    "map culling requires agents to arrive before the current tick"
+                ))
+            ));
+            assert_eq!(world.world_digest_v1().expect("refused arrival"), before);
+            assert!(world.pending_death_records.is_empty());
+            let retained = session
+                .stage_final_batch(&mut world)
+                .expect("stage boundary")
+                .expect("retained exact payload");
+            assert!(matches!(
+                world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible),
+                Err(WorldStateError::InvalidState(
+                    ScientificStateError::PersistenceBoundaryUnresolved { .. }
+                ))
+            ));
+            assert_eq!(
+                serde_json::to_value(session.pending_batch()).expect("pending payload"),
+                serde_json::to_value(retained.as_ref()).expect("retained payload")
+            );
+            assert!(session.finalize(&mut world).expect("seal boundary"));
+            let before = world.world_digest_v1().expect("sealed digest");
+            assert!(matches!(
+                world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible),
+                Err(WorldStateError::InvalidState(
+                    ScientificStateError::PersistenceBoundarySealed { .. }
+                ))
+            ));
+            assert_eq!(world.world_digest_v1().expect("refused sealed"), before);
+            assert_eq!(world.runtime.len(), 2);
+            assert_eq!(world.identities.len(), 2);
         }
 
         #[test]
@@ -21216,6 +21408,7 @@ struct MortalityCounts {
     aging: usize,
     unknown: usize,
     brain_execution_fault: usize,
+    map_incompatible: usize,
 }
 
 /// Birth composition tallied at the boundary, so the projection never sees a `BirthRecord`
@@ -21333,8 +21526,13 @@ fn project_mortality_metrics(counts: Option<&MortalityCounts>, metrics: &mut Vec
     let aging = counts.aging;
     let unknown = counts.unknown;
     let brain_execution_fault = counts.brain_execution_fault;
-    let total =
-        combat_carnivore + combat_herbivore + starvation + aging + unknown + brain_execution_fault;
+    let total = combat_carnivore
+        + combat_herbivore
+        + starvation
+        + aging
+        + unknown
+        + brain_execution_fault
+        + counts.map_incompatible;
     if total == 0 {
         return;
     }
@@ -21390,6 +21588,16 @@ fn project_mortality_metrics(counts: Option<&MortalityCounts>, metrics: &mut Vec
         "mortality.brain_execution_fault.ratio",
         telemetry_count_f64(brain_execution_fault) / telemetry_count_f64(total),
     ));
+    if counts.map_incompatible != 0 {
+        metrics.push(MetricSample::new(
+            "mortality.map_incompatible.count",
+            telemetry_count_f64(counts.map_incompatible),
+        ));
+        metrics.push(MetricSample::new(
+            "mortality.map_incompatible.ratio",
+            telemetry_count_f64(counts.map_incompatible) / telemetry_count_f64(total),
+        ));
+    }
 }
 
 /// Append birth-composition metrics for the ticks that recorded births (bd-mv2j).
@@ -29179,6 +29387,7 @@ impl WorldState {
                         DeathCause::Aging => counts.aging += 1,
                         DeathCause::Unknown => counts.unknown += 1,
                         DeathCause::BrainExecutionFault(_) => counts.brain_execution_fault += 1,
+                        DeathCause::MapIncompatible => counts.map_incompatible += 1,
                     }
                 }
                 counts
@@ -31666,9 +31875,13 @@ impl WorldState {
     /// current tick was successfully admitted. The caller must advance the world
     /// to a new tick before adding an external arrival.
     pub fn validate_external_arrival_boundary(&self) -> Result<(), ScientificStateError> {
+        self.validate_external_lifecycle_boundary("agent")
+    }
+
+    fn validate_external_lifecycle_boundary(&self, path: &str) -> Result<(), ScientificStateError> {
         if let PersistenceBoundaryStatus::Pending { tick } = self.persistence_boundary {
             return Err(ScientificStateError::PersistenceBoundaryUnresolved {
-                path: "agent".to_owned(),
+                path: path.to_owned(),
                 tick: tick.0,
             });
         }
@@ -31680,7 +31893,7 @@ impl WorldState {
             self.persistence_boundary == (PersistenceBoundaryStatus::Sealed { tick: self.tick });
         if admitted_current_tick {
             return Err(ScientificStateError::PersistenceBoundarySealed {
-                path: "agent".to_owned(),
+                path: path.to_owned(),
                 tick: self.tick.0,
             });
         }
@@ -31785,6 +31998,10 @@ impl WorldState {
     }
 
     /// Replace the current terrain and food fields using a pre-generated map artifact with an explicit existing-agent policy.
+    ///
+    /// Culling records an external lifecycle change at the current open boundary. It refuses
+    /// sealed boundaries and agents that arrived at this same tick; their death could not be
+    /// appended to the immutable persistence timeline or follow their origin, respectively.
     // bd-tqpj: exact f32 != cell-size guard is an intentional identity check.
     #[allow(clippy::float_cmp, clippy::too_many_lines, clippy::cast_precision_loss)]
     pub fn apply_map_artifact_with_policy(
@@ -31908,7 +32125,7 @@ impl WorldState {
                     }
                 }
                 if !dead_ids.is_empty() {
-                    self.agents.remove_many(&dead_ids);
+                    self.cull_map_incompatible_agents(&dead_ids)?;
                 }
             }
         }
@@ -31919,6 +32136,86 @@ impl WorldState {
         self.hydrology = candidate_hydrology;
         self.temperature = artifact.temperature().cloned();
         self.map_metadata = Some(artifact.metadata().clone());
+        Ok(())
+    }
+
+    fn cull_map_incompatible_agents(
+        &mut self,
+        dead_ids: &HashSet<AgentId>,
+    ) -> Result<(), WorldStateError> {
+        self.validate_external_lifecycle_boundary("map.cull")?;
+        self.validate_live_agent_companions()?;
+        let mut records = Vec::with_capacity(dead_ids.len());
+        for &id in dead_ids {
+            let uid = self.require_agent_uid(id, || "map.cull.identity".to_owned())?;
+            if self.agent_rng_counters.get(id).is_none() {
+                return Err(ScientificStateError::MissingAgentRngCounters {
+                    path: "map.cull.rng_counters".to_owned(),
+                }
+                .into());
+            }
+            if self.tick == Tick::zero()
+                || self
+                    .pending_birth_records
+                    .iter()
+                    .any(|record| record.agent_uid == uid && record.tick >= self.tick)
+            {
+                return Err(WorldStateError::InvalidConfig(
+                    "map culling requires agents to arrive before the current tick",
+                ));
+            }
+            let data = self.agents.snapshot(id).expect("cull candidate is live");
+            let runtime = self.runtime.get(id).expect("cull companion preflight");
+            records.push((
+                id,
+                data.position,
+                [data.heading.cos(), data.heading.sin()],
+                DeathRecord {
+                    tick: self.tick,
+                    agent_uid: uid,
+                    age: data.age,
+                    generation: data.generation,
+                    herbivore_tendency: clamp01(runtime.herbivore_tendency),
+                    brain_kind: runtime.brain.kind().map(str::to_owned),
+                    brain_key: runtime.brain.registry_key(),
+                    energy: runtime.energy,
+                    food_balance_total: runtime.food_balance_total,
+                    cause: DeathCause::MapIncompatible,
+                    was_hybrid: runtime.hybrid,
+                    combat_flags: runtime.combat,
+                },
+            ));
+        }
+        // Stable identities, rather than HashSet iteration or physical slots, order the log.
+        records.sort_unstable_by_key(|(_, _, _, record)| record.agent_uid);
+        for (id, position, direction, record) in records {
+            self.push_visual_event(
+                self.tick,
+                Some(record.agent_uid),
+                None,
+                position,
+                direction,
+                visual::WorldVisualEvent::Death { cause: record.cause },
+            );
+            self.runtime.remove(id);
+            self.identities.remove(id);
+            self.agent_rng_counters.remove(id);
+            self.agent_stats.remove(&record.agent_uid);
+            self.pending_persistence_runtime_tail.remove(id);
+            self.pending_lifecycle_death_metrics.push(record.clone());
+            self.pending_death_records.push(record);
+        }
+        self.pending_deaths.retain(|id| !dead_ids.contains(id));
+        if let Some((id, uid)) = self.active_activation_probe
+            && dead_ids.contains(&id)
+        {
+            self.last_probed_agent_death = Some((uid, self.tick));
+            self.active_activation_probe = None;
+        }
+        let removed = self.agents.remove_many(dead_ids);
+        // The next tick's natural-death count is separate; this external removal is already
+        // pending for persistence and must neither disappear nor be counted twice at a step.
+        self.pending_death_events = self.pending_death_events.saturating_add(removed);
         Ok(())
     }
 

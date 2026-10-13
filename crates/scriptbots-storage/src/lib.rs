@@ -27638,6 +27638,7 @@ fn death_cause_to_string(cause: DeathCause) -> Result<String, StorageError> {
         DeathCause::Starvation => "starvation".to_owned(),
         DeathCause::Aging => "aging".to_owned(),
         DeathCause::Unknown => "unknown".to_owned(),
+        DeathCause::MapIncompatible => "map_incompatible".to_owned(),
         DeathCause::BrainExecutionFault(fault) => {
             if !fault.is_valid() {
                 return Err(StorageError::InvalidData {
@@ -27689,6 +27690,7 @@ fn decode_death_cause(value: &str) -> Result<DeathCause, StorageError> {
         "starvation" => Ok(DeathCause::Starvation),
         "aging" => Ok(DeathCause::Aging),
         "unknown" => Ok(DeathCause::Unknown),
+        "map_incompatible" => Ok(DeathCause::MapIncompatible),
         other => decode_brain_execution_fault_cause(other)
             .map(DeathCause::BrainExecutionFault)
             .ok_or_else(|| StorageError::InvalidData {
@@ -40801,6 +40803,7 @@ mod tests {
             ("starvation", DeathCause::Starvation),
             ("aging", DeathCause::Aging),
             ("unknown", DeathCause::Unknown),
+            ("map_incompatible", DeathCause::MapIncompatible),
         ] {
             assert!(matches!(decode_death_cause(encoded), Ok(actual) if actual == expected));
             assert_eq!(
@@ -40849,6 +40852,76 @@ mod tests {
             starvation.canonical_digest(),
             "substituting Starvation for the persisted cause must change the ancestry oracle"
         );
+    }
+
+    #[test]
+    fn map_culling_persists_exact_death_and_rebuilds_finished_ancestry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_core::{
+            ExistingAgentPolicy, MapArtifact, RuleBasedMapGenerator, TerrainKind, TerrainLayer,
+            default_tileset_spec,
+        };
+
+        let path = temp_db_path("map-cull-lifecycle");
+        let path_text = path.to_string_lossy().into_owned();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(123),
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 3,
+            analytics_stride: scriptbots_core::AnalyticsStride {
+                lifecycle_events: 1,
+                ..Default::default()
+            },
+            ..ScriptBotsConfig::default()
+        })?;
+        let agent = world.try_spawn_agent(AgentData::default())?;
+        let uid = world.agent_uid(agent).expect("founder identity");
+        let mut pipeline = StoragePipeline::create_unattributed_file(&path_text)?;
+        let mut session = world.bind_persistence(Box::new(pipeline.sink()))?;
+        session.step(&mut world)?;
+        let generated = RuleBasedMapGenerator::new(default_tileset_spec())?.generate(4, 4, 16, 123)?;
+        let mut tiles = generated.terrain().tiles().to_vec();
+        for tile in &mut tiles {
+            tile.kind = TerrainKind::DeepWater;
+        }
+        let artifact = MapArtifact::new(
+            TerrainLayer::from_tiles(4, 4, 16, tiles)?,
+            None,
+            None,
+            None,
+            None,
+            generated.metadata().clone(),
+        )?;
+        world.apply_map_artifact_with_policy(&artifact, ExistingAgentPolicy::CullIncompatible)?;
+        assert!(world.agents().is_empty());
+        assert!(session.finalize(&mut world)?);
+        let receipt = pipeline.shutdown()?;
+        assert_eq!(receipt.committed_tick, Some(1));
+        assert_eq!(receipt.guarantee, PersistenceGuarantee::Durable);
+        assert!(receipt.watermarks.durable.is_some());
+        let reader = StorageReader::open_finished(&path_text)?;
+        assert_eq!(reader.persistence_watermarks()?, receipt.watermarks);
+        let births = reader.load_ancestry_births()?;
+        let deaths = reader.load_ancestry_deaths()?;
+        assert_eq!(births.len(), 1);
+        assert_eq!(deaths.len(), 1);
+        assert_eq!(deaths[0].agent_uid, uid);
+        assert_eq!(deaths[0].tick, Tick(1));
+        assert_eq!(deaths[0].cause, DeathCause::MapIncompatible);
+        let graph = rebuild_ancestry(&births, &deaths)?;
+        assert_eq!(
+            graph.node(uid).and_then(|node| node.death_cause),
+            Some(DeathCause::MapIncompatible)
+        );
+        let ticks = reader.recent_ticks(8)?;
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].deaths, 1);
+        reader.close()?;
+        Ok(())
     }
 
     #[test]
