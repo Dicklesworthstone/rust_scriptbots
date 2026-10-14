@@ -2559,6 +2559,7 @@ fn refuse_ambiguous_island_attribution_migration(
         after_run = decode(row, 0, "storage_outbox.run_id")?;
         after_batch = decode(row, 1, "storage_outbox.batch_id")?;
         let payload: String = decode(row, 2, "storage_outbox.payload")?;
+        let payload = outbox_encoding::decode(&payload)?;
         let decoded: OutboxPayload =
             serde_json::from_str(&payload).map_err(|error| StorageError::InvalidData {
                 context: "storage.migration.island_attribution",
@@ -8004,6 +8005,80 @@ struct OutboxPayloadRef<'a> {
     storage: &'a StorageBuffer,
 }
 
+/// Physical outbox encoding only. The batch identity remains the BLAKE3 of the exact
+/// uncompressed JSON, so compression never changes retries or host-journal links.
+mod outbox_encoding {
+    use std::borrow::Cow;
+
+    use base64::Engine as _;
+
+    use super::{MAX_HOST_JOURNAL_ARCHIVE_BYTES, StorageError};
+
+    const PREFIX: &str = "deflate-json-v1:";
+
+    fn invalid(reason: impl ToString) -> StorageError {
+        StorageError::InvalidData {
+            context: "storage_outbox.payload.encoding",
+            reason: reason.to_string(),
+        }
+    }
+
+    pub(super) fn encode(payload: &str) -> String {
+        // Preserve the admission budget's authority, including explicitly enlarged budgets.
+        // Only compressed representations use the archive decoder's fixed expansion bound.
+        if payload.len() > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
+            return payload.to_owned();
+        }
+        let compressed = miniz_oxide::deflate::compress_to_vec(payload.as_bytes(), 1);
+        let stored = format!(
+            "{PREFIX}{}:{}",
+            payload.len(),
+            base64::engine::general_purpose::STANDARD.encode(compressed)
+        );
+        if stored.len() < payload.len() {
+            stored
+        } else {
+            payload.to_owned()
+        }
+    }
+
+    pub(super) fn decode(payload: &str) -> Result<Cow<'_, str>, StorageError> {
+        let Some(encoded) = payload.strip_prefix(PREFIX) else {
+            // Existing admitted JSON is still the same logical payload format, not a
+            // deprecated API: recovery may encounter both representations in one file.
+            return Ok(Cow::Borrowed(payload));
+        };
+        let (length, encoded) = encoded
+            .split_once(':')
+            .ok_or_else(|| invalid("compressed payload lacks its length separator"))?;
+        let length: usize = length.parse().map_err(invalid)?;
+        if length == 0 || length > MAX_HOST_JOURNAL_ARCHIVE_BYTES {
+            return Err(invalid(format!(
+                "decoded length {length} is outside 1..={MAX_HOST_JOURNAL_ARCHIVE_BYTES}"
+            )));
+        }
+        if payload.len() >= length {
+            return Err(invalid("compressed representation does not save bytes"));
+        }
+        let compressed = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(invalid)?;
+        let decoded = miniz_oxide::inflate::decompress_to_vec_with_limit(&compressed, length)
+            .map_err(|error| invalid(format!("deflate: {error}")))?;
+        if decoded.len() != length {
+            return Err(invalid(format!(
+                "declared {length} bytes, decoded {}",
+                decoded.len()
+            )));
+        }
+        let decoded = String::from_utf8(decoded).map_err(invalid)?;
+        if encode(&decoded) != payload {
+            return Err(invalid("compressed payload is not canonically encoded"));
+        }
+        Ok(Cow::Owned(decoded))
+    }
+}
+
 #[derive(Debug)]
 struct RecoveredOutboxBatch {
     run_id: RunId,
@@ -8765,6 +8840,8 @@ impl StorageBuffer {
         expected_tick: u64,
         expected_digest: &str,
     ) -> Result<Self, StorageError> {
+        let decoded_payload = outbox_encoding::decode(payload)?;
+        let payload = decoded_payload.as_ref();
         let actual_digest = format!("blake3:{}", blake3::hash(payload.as_bytes()).to_hex());
         if actual_digest != expected_digest {
             return Err(StorageError::InvalidData {
@@ -20470,6 +20547,7 @@ impl Storage {
             });
         }
 
+        let payload = outbox_encoding::encode(&payload);
         execute_transaction_with_retry(self.connection()?, |transaction| {
             let ledger_rows = transaction.execute_with_params(
                 "INSERT INTO storage_batch_ledger (
@@ -34393,6 +34471,334 @@ mod tests {
     }
 
     #[test]
+    fn outbox_compression_preserves_logical_identity_and_bounds_expansion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use base64::Engine as _;
+
+        for plain in ["", "{}", "{\"tiny\":1}"] {
+            assert_eq!(outbox_encoding::encode(plain), plain);
+            assert!(matches!(
+                outbox_encoding::decode(plain)?,
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
+        let prepared = PreparedPersistenceBatch::from_batch(&outbox_compression_batch(1))?;
+        let run = RunId::new(1);
+        let (plain, digest) = prepared.storage.encode_outbox(run, prepared.tick)?;
+        let stored = outbox_encoding::encode(&plain);
+        assert!(stored.starts_with("deflate-json-v1:"));
+        assert!(stored.len() < plain.len() / 2);
+        assert_eq!(outbox_encoding::decode(&stored)?, plain);
+        for representation in [&plain, &stored] {
+            let decoded = StorageBuffer::decode_outbox(representation, run, 1, &digest)?;
+            assert_eq!(decoded.encode_outbox(run, 1)?, (plain.clone(), digest.clone()));
+            assert_invalid_data_context(
+                StorageBuffer::decode_outbox(representation, RunId::new(2), 1, &digest),
+                "storage_outbox.payload.run_id",
+            );
+            assert_invalid_data_context(
+                StorageBuffer::decode_outbox(representation, run, 2, &digest),
+                "storage_outbox.payload.tick",
+            );
+            assert_invalid_data_context(
+                StorageBuffer::decode_outbox(representation, run, 1, "blake3:changed"),
+                "storage_outbox.payload_digest",
+            );
+        }
+        let (_, encoded) = stored
+            .strip_prefix("deflate-json-v1:")
+            .ok_or("missing prefix")?
+            .split_once(':')
+            .ok_or("missing length")?;
+        let mut invalid = vec![
+            "deflate-json-v1:missing-separator".to_owned(),
+            "deflate-json-v1:0:AAAA".to_owned(),
+            "deflate-json-v1:-1:AAAA".to_owned(),
+            format!("deflate-json-v1:{}:AAAA", MAX_HOST_JOURNAL_ARCHIVE_BYTES + 1),
+            "deflate-json-v1:4096:not_base64!".to_owned(),
+            "deflate-json-v1:4096:bm90IGRlZmxhdGU=".to_owned(),
+            format!("deflate-json-v1:{}:{encoded}", plain.len() - 1),
+            format!("deflate-json-v1:{}:{encoded}", plain.len() + 1),
+            format!("deflate-json-v1:0{}:{encoded}", plain.len()),
+            format!("deflate-json-v1:1:{encoded}"),
+        ];
+        let compressed = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        invalid.push(format!(
+            "deflate-json-v1:{}:{}",
+            plain.len(),
+            base64::engine::general_purpose::STANDARD.encode(&compressed[..compressed.len() / 2])
+        ));
+        let mut trailing = compressed;
+        trailing.push(0);
+        invalid.push(format!(
+            "deflate-json-v1:{}:{}",
+            plain.len(),
+            base64::engine::general_purpose::STANDARD.encode(trailing)
+        ));
+        invalid.push(format!(
+            "deflate-json-v1:4096:{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(miniz_oxide::deflate::compress_to_vec(&vec![0xff; 4096], 1))
+        ));
+        for corrupt in invalid {
+            assert_invalid_data_context(
+                outbox_encoding::decode(&corrupt),
+                "storage_outbox.payload.encoding",
+            );
+        }
+        let mut changed = prepared.storage;
+        changed.agents[0].energy += 1.0;
+        let (changed, _) = changed.encode_outbox(run, 1)?;
+        assert_invalid_data_context(
+            StorageBuffer::decode_outbox(&outbox_encoding::encode(&changed), run, 1, &digest),
+            "storage_outbox.payload_digest",
+        );
+        eprintln!(
+            "outbox representation bytes: plain={} stored={}; identity unchanged; no timing claim",
+            plain.len(),
+            stored.len()
+        );
+        Ok(())
+    }
+
+    fn outbox_compression_batch(tick: u64) -> PersistenceBatch {
+        let mut batch = sample_batch(tick, 1.0);
+        batch.agents = (1..=256)
+            .map(|uid| {
+                let mut agent = sample_agent(1.0);
+                agent.identity.uid = AgentUid(uid);
+                agent.identity.spawn_ordinal = uid - 1;
+                agent
+            })
+            .collect();
+        batch.summary.agent_count = batch.agents.len();
+        batch.summary.total_energy = batch.agents.len() as f32;
+        batch.replay_events = (0..64)
+            .map(|ordinal| ReplayEvent {
+                agent_uid: Some(AgentUid(1)),
+                position: Some(Position::new(12.0, 34.0)),
+                counterpart: Some(AgentUid(2)),
+                counterpart_position: Some(Position::new(13.0, 35.0)),
+                kind: ReplayEventKind::Interaction {
+                    tick: Tick(tick),
+                    ordinal,
+                    kind: scriptbots_core::ReplayInteractionKind::FoodShare,
+                    magnitude: 0.001,
+                },
+            })
+            .collect();
+        batch
+    }
+
+    #[test]
+    fn compressed_outbox_file_recovery_preserves_rows_retries_and_watermarks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-compressed-outbox-recovery");
+        let path_string = path.to_string_lossy().into_owned();
+        let mut interrupted = create_file_storage(&path_string)?;
+        let mut oracle = Storage::unattributed_memory()?;
+        let mut admissions = Vec::new();
+        for tick in 1..=2 {
+            let batch = outbox_compression_batch(tick);
+            let prepared = PreparedPersistenceBatch::from_batch(&batch)?;
+            let (plain, digest) = prepared.storage.encode_outbox(interrupted.run_id, tick)?;
+            let (admission, newly_admitted) = interrupted.stage_outbox(tick, &prepared.storage)?;
+            assert!(newly_admitted);
+            let stored: String = interrupted
+                .connection()?
+                .query_row_with_params(
+                    "SELECT payload FROM storage_outbox WHERE batch_id = ?1",
+                    &[admission.batch_id.as_i64().into()],
+                )?
+                .get_typed(0)?;
+            assert!(stored.starts_with("deflate-json-v1:"));
+            assert!(stored.len() < plain.len() / 2);
+            assert_eq!(outbox_encoding::decode(&stored)?, plain);
+            let ledger_digest: String = interrupted
+                .connection()?
+                .query_row_with_params(
+                    "SELECT payload_digest FROM storage_batch_ledger WHERE batch_id = ?1",
+                    &[admission.batch_id.as_i64().into()],
+                )?
+                .get_typed(0)?;
+            assert_eq!(ledger_digest, digest);
+            if tick == 1 {
+                // A pre-compression admitted batch can coexist with a new compressed batch.
+                assert_eq!(
+                    interrupted.connection()?.execute_with_params(
+                        "UPDATE storage_outbox SET payload = ?1 WHERE batch_id = ?2",
+                        &[plain.as_str().into(), admission.batch_id.as_i64().into()],
+                    )?,
+                    1
+                );
+            }
+            let (retry, retry_is_new) = interrupted.stage_outbox(tick, &prepared.storage)?;
+            assert!(!retry_is_new);
+            assert_eq!(retry.batch_id, admission.batch_id);
+            let before = interrupted.persistence_watermarks()?;
+            let mut changed = PreparedPersistenceBatch::from_batch(&batch)?.storage;
+            changed.agents[0].energy += 1.0;
+            assert_invalid_data_context(
+                interrupted.stage_outbox(tick, &changed),
+                "storage_batch_ledger.payload_digest",
+            );
+            assert_eq!(interrupted.persistence_watermarks()?, before);
+            assert!(!interrupted.enqueue_staged(admission.batch_id, prepared.storage)?);
+            oracle.persist(&batch)?;
+            admissions.push(admission.batch_id);
+            eprintln!(
+                "file outbox tick={tick} plain_bytes={} compressed_bytes={}",
+                plain.len(),
+                stored.len()
+            );
+        }
+        let last = admissions.last().copied();
+        assert_eq!(
+            interrupted.persistence_watermarks()?,
+            PersistenceWatermarks {
+                admitted: last,
+                applied: None,
+                durable: None,
+            }
+        );
+        interrupted.abandon_after_error();
+        oracle.flush_with_watermarks()?;
+
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        let shutdown = recovered.shutdown()?;
+        assert_eq!(
+            shutdown.watermarks,
+            PersistenceWatermarks {
+                admitted: last,
+                applied: last,
+                durable: last,
+            }
+        );
+        let reader = StorageReader::open(&path_string)?;
+        for table in [
+            "tick_summaries",
+            "metrics",
+            "events",
+            "agents",
+            "replay_events",
+            "interactions",
+        ] {
+            let sql = format!("SELECT * FROM {table} ORDER BY rowid");
+            let expected = oracle
+                .connection()?
+                .query(&sql)?
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>();
+            let observed = reader
+                .connection()?
+                .query(&sql)?
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>();
+            assert!(!expected.is_empty(), "empty oracle for {table}");
+            assert_eq!(observed, expected, "recovery changed {table}");
+        }
+        assert_eq!(
+            reader
+                .connection()?
+                .query_row("SELECT COUNT(*) FROM agents")?
+                .get_typed::<i64>(0)?,
+            512
+        );
+        assert_eq!(
+            reader
+                .connection()?
+                .query_row("SELECT COUNT(*) FROM interactions")?
+                .get_typed::<i64>(0)?,
+            128
+        );
+        assert_eq!(
+            reader
+                .connection()?
+                .query_row("SELECT COUNT(*) FROM storage_outbox")?
+                .get_typed::<i64>(0)?,
+            0
+        );
+        for batch_id in admissions {
+            assert_eq!(
+                reader.batch_status(batch_id)?.map(|status| status.state),
+                Some(BatchPersistenceState::Durable)
+            );
+        }
+        reader.close()?;
+        oracle.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_outbox_corruption_refuses_before_partial_file_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-compressed-outbox-corruption");
+        let path_string = path.to_string_lossy().into_owned();
+        let mut interrupted = create_file_storage(&path_string)?;
+        for tick in 1..=2 {
+            let prepared = PreparedPersistenceBatch::from_batch(&sample_batch(tick, 1.0))?;
+            let (admission, newly_admitted) = interrupted.stage_outbox(tick, &prepared.storage)?;
+            assert!(newly_admitted);
+            assert!(!interrupted.enqueue_staged(admission.batch_id, prepared.storage)?);
+        }
+        interrupted.abandon_after_error();
+        let corruptor = Connection::open(&path_string)?;
+        let original: String = corruptor
+            .query_row("SELECT payload FROM storage_outbox WHERE batch_id = 2")?
+            .get_typed(0)?;
+        assert!(original.starts_with("deflate-json-v1:"));
+        let corrupted = format!("{original}AAAA");
+        assert_eq!(
+            corruptor.execute_with_params(
+                "UPDATE storage_outbox SET payload = ?1 WHERE batch_id = 2",
+                &[corrupted.as_str().into()],
+            )?,
+            1
+        );
+        corruptor.close()?;
+        let error = recover_file_storage(&path_string)
+            .err()
+            .ok_or("corrupt outbox recovered")?;
+        assert!(
+            matches!(
+                error,
+                StorageError::InvalidData {
+                    context: "storage_outbox.payload.encoding",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let inspector = Connection::open(&path_string)?;
+        assert_eq!(
+            inspector
+                .query_row("SELECT COUNT(*) FROM tick_summaries")?
+                .get_typed::<i64>(0)?,
+            0
+        );
+        let progress = inspector
+            .query_row("SELECT applied_batch_id, durable_batch_id FROM storage_progress")?;
+        assert_eq!(progress.get_typed::<i64>(0)?, 0);
+        assert_eq!(progress.get_typed::<i64>(1)?, 0);
+        assert_eq!(
+            inspector
+                .query_row("SELECT COUNT(*) FROM storage_outbox")?
+                .get_typed::<i64>(0)?,
+            2
+        );
+        assert_eq!(
+            inspector
+                .query_row("SELECT payload FROM storage_outbox WHERE batch_id = 2")?
+                .get_typed::<String>(0)?,
+            corrupted
+        );
+        inspector.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn durable_outbox_recovers_all_birth_origins_after_the_worker_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("storage-outbox-admission-recovery");
@@ -34543,6 +34949,7 @@ mod tests {
                 &[child_admission.batch_id.as_i64().into()],
             )?
             .get_typed(0)?;
+        let original_payload = outbox_encoding::decode(&original_payload)?;
         let mut corrupted: Value = serde_json::from_str(&original_payload)?;
         corrupted["storage"]["births"][0]["parent_a"] = json!(999_i64);
         let corrupted_payload = serde_json::to_string(&corrupted)?;
@@ -34639,6 +35046,7 @@ mod tests {
                 &[born_admission.batch_id.as_i64().into()],
             )?
             .get_typed(0)?;
+        let original_payload = outbox_encoding::decode(&original_payload)?;
         let mut corrupted: Value = serde_json::from_str(&original_payload)?;
         corrupted["storage"]["births"] = json!([]);
         let corrupted_payload = serde_json::to_string(&corrupted)?;
@@ -34762,6 +35170,7 @@ mod tests {
                     &[second_admission.batch_id.as_i64().into()],
                 )?
                 .get_typed(0)?;
+            let original_payload = outbox_encoding::decode(&original_payload)?;
             let mut corrupted: Value = serde_json::from_str(&original_payload)?;
             corrupted["storage"][collection][0][field] = json!(overflow);
             let corrupted_payload = serde_json::to_string(&corrupted)?;
@@ -38117,6 +38526,7 @@ mod tests {
                 ],
             )?
             .get_typed(0)?;
+        let original_payload = outbox_encoding::decode(&original_payload)?;
         let mut corrupted: Value = serde_json::from_str(&original_payload)?;
         let replay_events = corrupted["storage"]["replay_events"]
             .as_array_mut()
