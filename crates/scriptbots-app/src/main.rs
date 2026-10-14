@@ -5223,14 +5223,16 @@ fn run_replay_cli(
     storage.close()?;
     // A host-driven run journaled its operator commands; the journal is read through a
     // finished-run reader, which takes the file's exclusive lease once the plain one is closed.
-    // An unclean shutdown is refused while the journal pages are read, a v0.2.0 recording
-    // (journal archive v3) when the finished reader opens, so the hint covers both steps.
+    // An unclean shutdown is refused while the journal pages are read, an earlier release's
+    // recording (journal archive v3 to v5) when the finished reader opens, so the hint covers
+    // both steps. The cause names the release that wrote a refused archive (#6).
     let operator_commands = if journaled {
         finished_run_operator_commands(&db_display).with_context(|| {
             format!(
                 "failed to read the command journal of {db_display} as a finished run \
                  (a run that did not shut down cleanly needs `--recover-storage {db_display}` \
-                 first; a run recorded by scriptbots v0.2.0 replays with v0.2.0)"
+                 first; a run recorded by an earlier release replays with that release, which \
+                 the cause below names)"
             )
         })?
     } else {
