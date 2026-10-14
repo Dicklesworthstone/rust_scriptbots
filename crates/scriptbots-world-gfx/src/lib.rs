@@ -46,6 +46,18 @@ pub struct WorldSnapshot<'a> {
     /// Resolved linear exposure multiplier from the frontend's snapshot-derived post stack.
     /// Must be finite and non-negative. `None` retains the environment default.
     pub exposure_factor: Option<f32>,
+    /// Resolved fog from the frontend. `None` retains environment controls;
+    /// `Some` with zero strength explicitly disables fog.
+    pub fog: Option<FogControls>,
+}
+
+/// Snapshot-selected bottom-height fog, blended in linear RGB.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FogControls {
+    /// Maximum opacity at the bottom, finite and in `0..=1`.
+    pub strength: f32,
+    /// Linear RGB components, each finite and in `0..=1`.
+    pub color_linear: [f32; 3],
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +389,11 @@ impl WorldRenderer {
         // one frozen snapshot depend on wall-clock cache refreshes.
         let mut post_controls = PostControls::from_env()?;
         post_controls.exposure = snapshot.exposure_factor.unwrap_or(post_controls.exposure);
+        if let Some(fog) = snapshot.fog {
+            post_controls.fog_strength = Some(fog.strength);
+            post_controls.fog_enabled = fog.strength > 0.0;
+            post_controls.fog_color = fog.color_linear;
+        }
         let selected_tonemap = snapshot.tonemap_mode.map(|mode| match mode {
             RenderTonemapMode::Aces | RenderTonemapMode::Tony => 1_u32,
             RenderTonemapMode::Agx => 3_u32,
@@ -504,6 +521,18 @@ fn validate_frame_token(
 }
 
 fn validate_snapshot(snapshot: &WorldSnapshot<'_>) -> Result<(), ReadbackError> {
+    if let Some(fog) = snapshot.fog
+        && (!fog.strength.is_finite()
+            || !(0.0..=1.0).contains(&fog.strength)
+            || fog
+                .color_linear
+                .iter()
+                .any(|component| !component.is_finite() || !(0.0..=1.0).contains(component)))
+    {
+        return Err(ReadbackError::Configuration(format!(
+            "snapshot fog strength and linear RGB must be finite and in 0..=1, got {fog:?}"
+        )));
+    }
     if let Some(exposure) = snapshot.exposure_factor
         && (!exposure.is_finite() || exposure < 0.0)
     {
@@ -638,6 +667,7 @@ mod capture_smoke_test {
             anim_seconds: 0.0,
             tonemap_mode: None,
             exposure_factor: None,
+            fog: None,
         };
         let frame = renderer.render(&snapshot).expect("valid render snapshot");
         renderer
@@ -700,6 +730,7 @@ mod capture_smoke_test {
             anim_seconds: 0.0,
             tonemap_mode: None,
             exposure_factor: Some(0.5),
+            fog: None,
         };
         let mut renderer =
             pollster::block_on(WorldRenderer::new(&adapter, (64, 64))).expect("exposure renderer");
@@ -752,6 +783,138 @@ mod capture_smoke_test {
         );
     }
 
+    #[test]
+    fn snapshot_fog_changes_pixels_and_rejects_invalid_frames() {
+        let _gpu_lock = crate::GPU_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let adapter = live_adapter("snapshot fog")
+            .expect("snapshot fog proof requires an actual wgpu adapter");
+        eprintln!("snapshot fog adapter: {:?}", adapter.get_info());
+        let tiles = [3];
+        let colors = [[0.01, 0.01, 0.01, 1.0]];
+        let mut snapshot = WorldSnapshot {
+            world_size: (64.0, 64.0),
+            terrain: TerrainView {
+                dims: (1, 1),
+                cell_size: 64,
+                tiles: &tiles,
+                colors: &colors,
+                elevation: None,
+            },
+            agents: &[],
+            anim_seconds: 0.0,
+            tonemap_mode: None,
+            exposure_factor: Some(1.0),
+            fog: Some(FogControls {
+                strength: 0.0,
+                color_linear: [0.25, 0.0, 0.0],
+            }),
+        };
+        let mut renderer =
+            pollster::block_on(WorldRenderer::new(&adapter, (64, 64))).expect("fog renderer");
+        let mut captures = Vec::new();
+        for (strength, color_linear) in [
+            (0.0, [0.25, 0.0, 0.0]),
+            (0.25, [0.25, 0.0, 0.0]),
+            (0.75, [0.25, 0.0, 0.0]),
+            (1.0, [0.25, 0.0, 0.0]),
+            (1.0, [0.0, 0.25, 0.0]),
+            (0.0, [0.25, 0.0, 0.0]),
+            (1.0, [0.25, 0.0, 0.0]),
+        ] {
+            snapshot.fog = Some(FogControls {
+                strength,
+                color_linear,
+            });
+            let frame = renderer.render(&snapshot).expect("fog frame");
+            renderer.copy_to_readback(&frame).expect("fog copy");
+            let view = renderer.mapped_rgba().expect("fog pixels");
+            assert_eq!(view.bytes_per_row, 64 * 4);
+            captures.push(view.bytes().to_vec());
+        }
+        let channel_sum = |pixels: &[u8], channel: usize| -> u64 {
+            let (rgba_pixels, _) = pixels.as_chunks::<4>();
+            rgba_pixels
+                .iter()
+                .map(|pixel| u64::from(pixel[channel]))
+                .sum()
+        };
+        let red_sums: Vec<_> = captures
+            .iter()
+            .map(|pixels| channel_sum(pixels, 0))
+            .collect();
+        assert!(red_sums[0] > 0, "actual RGB must contain terrain");
+        assert!(red_sums[0] < red_sums[1] && red_sums[1] < red_sums[2]);
+        assert!(red_sums[2] < red_sums[3]);
+        assert!(channel_sum(&captures[3], 0) > channel_sum(&captures[3], 1));
+        assert!(channel_sum(&captures[4], 1) > channel_sum(&captures[4], 0));
+        let top = channel_sum(&captures[3][..32 * 64 * 4], 0);
+        let bottom = channel_sum(&captures[3][32 * 64 * 4..], 0);
+        assert!(
+            bottom > top,
+            "bottom-height fog must brighten the lower half: {top} -> {bottom}"
+        );
+        // At the final pixel center, opacity is 63.5/64. Linear red 0.25
+        // therefore encodes near sRGB byte 136. An extra decode or a missing
+        // output encode instead produces approximately byte 64.
+        let bottom_red = captures[3][(63 * 64 + 32) * 4];
+        assert!(
+            (134..=139).contains(&bottom_red),
+            "linear fog encoded once: {bottom_red}"
+        );
+        assert_eq!(captures[0], captures[5]);
+        assert_eq!(captures[3], captures[6]);
+        eprintln!(
+            "snapshot fog red sums: {red_sums:?}; top={top} bottom={bottom} bottom_red={bottom_red}"
+        );
+
+        // This branch is exercised in a separate DSR invocation with environment
+        // fog enabled. Explicit zero must win; None must retain the raw fallback.
+        if PostControls::from_env()
+            .expect("valid fog environment")
+            .fog_enabled
+        {
+            snapshot.fog = None;
+            let frame = renderer.render(&snapshot).expect("environment fog frame");
+            renderer.copy_to_readback(&frame).expect("environment fog copy");
+            assert_ne!(
+                renderer.mapped_rgba().expect("environment fog pixels").bytes(),
+                captures[0]
+            );
+        }
+        let generation = renderer.frame_generation;
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+            for channel in 0..4 {
+                let mut fog = FogControls {
+                    strength: 0.5,
+                    color_linear: [0.25; 3],
+                };
+                if channel == 3 {
+                    fog.strength = value;
+                } else {
+                    fog.color_linear[channel] = value;
+                }
+                snapshot.fog = Some(fog);
+                assert!(matches!(
+                    renderer.render(&snapshot),
+                    Err(ReadbackError::Configuration(_))
+                ));
+                assert_eq!(renderer.frame_generation, generation);
+            }
+        }
+        snapshot.fog = Some(FogControls {
+            strength: 0.0,
+            color_linear: [0.25, 0.0, 0.0],
+        });
+        let frame = renderer.render(&snapshot).expect("recover after bad fog");
+        renderer.copy_to_readback(&frame).expect("recovered fog copy");
+        assert_eq!(
+            renderer.mapped_rgba().expect("recovered fog pixels").bytes(),
+            captures[0]
+        );
+    }
+
     /// Deterministic ACROSS RENDERER INSTANCES, not merely across two draws.
     ///
     /// The test above renders twice through the SAME `WorldRenderer`, so it
@@ -798,6 +961,7 @@ mod capture_smoke_test {
             anim_seconds: 0.0,
             tonemap_mode: None,
             exposure_factor: None,
+            fog: None,
         };
 
         // Each closure owns its renderer for its whole lifetime, so the second
@@ -1101,6 +1265,7 @@ mod capture_smoke_test {
             anim_seconds: 1.2,
             tonemap_mode: None,
             exposure_factor: None,
+            fog: None,
         };
 
         let t_start = std::time::Instant::now();
@@ -2646,6 +2811,7 @@ mod tests {
             anim_seconds: 0.0,
             tonemap_mode: None,
             exposure_factor: None,
+            fog: None,
         };
         assert!(matches!(
             validate_snapshot(&snapshot),
@@ -3871,6 +4037,7 @@ struct PostControls {
     bloom_intensity: f32,
     fog_enabled: bool,
     fog_density: f32,
+    fog_strength: Option<f32>,
     fog_color: [f32; 3],
 }
 
@@ -3886,6 +4053,7 @@ impl Default for PostControls {
             bloom_intensity: 0.65,
             fog_enabled: false,
             fog_density: 0.6,
+            fog_strength: None,
             fog_color: [0.6, 0.7, 0.8],
         }
     }
@@ -4505,8 +4673,9 @@ impl PostFx {
                 controls.bloom_enabled,
                 controls.bloom_intensity,
             ),
-            fog_density: controls.fog_density,
-            fog_enabled: u32::from(controls.fog_enabled),
+            fog_density: controls.fog_strength.unwrap_or(controls.fog_density),
+            fog_enabled: u32::from(controls.fog_enabled)
+                * if controls.fog_strength.is_some() { 2 } else { 1 },
             fog_color: controls.fog_color,
             _pad0: 0.0,
         };
@@ -4695,8 +4864,11 @@ fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   rgb *= vign;
   // Height-fog (screen-space Y proxy)
   if (params.fog_enabled != 0u) {
-    let h = 1.0 - uv01.y; // bottom-heavy fog (denser near bottom)
-    let fog_f = clamp(1.0 - exp(-params.fog_density * h), 0.0, 1.0);
+    let h = uv01.y; // framebuffer Y increases toward the bottom
+    var fog_f = clamp(1.0 - exp(-params.fog_density * h), 0.0, 1.0);
+    if (params.fog_enabled == 2u) {
+      fog_f = clamp(params.fog_density * h, 0.0, 1.0);
+    }
     rgb = mix(rgb, params.fog_color, fog_f);
   }
   // Bloom composite (additive)

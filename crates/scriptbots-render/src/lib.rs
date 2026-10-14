@@ -934,6 +934,7 @@ pub mod world_compositor {
             anim_seconds: frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
             tonemap_mode: frame.tonemap_mode,
             exposure_factor: frame.gpu_exposure_factor(),
+            fog: Some(frame.gpu_fog_controls()),
         };
 
         // Fit camera into the requested viewport
@@ -1084,6 +1085,7 @@ pub mod world_compositor {
                 anim_seconds: 0.0,
                 tonemap_mode: None,
                 exposure_factor: None,
+                fog: None,
             }
         }
 
@@ -1398,6 +1400,7 @@ mod wgpu_capture_test {
             anim_seconds: 0.0,
             tonemap_mode: None,
             exposure_factor: None,
+            fog: None,
         };
         comp.set_camera_params(1.0, (0.0, 0.0));
         comp.render_snapshot(&snapshot, viewport)
@@ -1541,6 +1544,7 @@ mod wgpu_capture_test {
             anim_seconds: 0.0,
             tonemap_mode: None,
             exposure_factor: None,
+            fog: None,
         };
 
         comp.render_snapshot(&snapshot, viewport)
@@ -1598,6 +1602,7 @@ mod wgpu_capture_test {
             anim_seconds: 0.0,
             tonemap_mode: None,
             exposure_factor: None,
+            fog: None,
         };
         comp.render_snapshot(&empty, viewport)
             .expect("comparison capture must either render or return a typed GPU failure");
@@ -1867,6 +1872,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         anim_seconds: state.frame.tick as f32 * scriptbots_world_gfx::ANIM_SECONDS_PER_TICK,
         tonemap_mode: state.frame.tonemap_mode,
         exposure_factor: state.frame.gpu_exposure_factor(),
+        fog: Some(state.frame.gpu_fog_controls()),
     };
 
     emit_wgpu_camera_mapping_diagnostic(width_px, height_px, world_dims, layout, cam_offset);
@@ -10886,12 +10892,16 @@ fn aces_fitted(x: f32) -> f32 {
 }
 
 fn linear_to_srgb_byte(x: f32) -> u8 {
+    (linear_to_srgb(x) * 255.0).round() as u8
+}
+
+fn linear_to_srgb(x: f32) -> f32 {
     let srgb = if x <= 0.003_130_8 {
         12.92 * x
     } else {
         1.055 * x.powf(1.0 / 2.4) - 0.055
     };
-    (srgb.clamp(0.0, 1.0) * 255.0).round() as u8
+    srgb.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -14197,6 +14207,7 @@ enum PostProcessPass {
     },
     Fog {
         strength: f32,
+        /// Linear RGB; canvas consumers encode it, GPU consumers blend it directly.
         color: [f32; 3],
     },
     Scanlines {
@@ -14305,7 +14316,11 @@ fn post_process_stack(
     };
     let fog_color = fog
         .and_then(|settings| settings.color)
-        .unwrap_or(atmosphere.fog_srgb);
+        .unwrap_or_else(|| {
+            atmosphere
+                .fog_srgb
+                .map(scriptbots_world_gfx::srgb_component_to_linear)
+        });
 
     let temperature = match palette {
         ColorPaletteMode::Natural => 0.07 - night * 0.13 - life_delta * 0.05,
@@ -14415,6 +14430,23 @@ struct CanvasState {
 }
 
 impl RenderFrame {
+    fn gpu_fog_controls(&self) -> scriptbots_world_gfx::FogControls {
+        self.post_stack
+            .passes
+            .iter()
+            .find_map(|pass| match pass {
+                PostProcessPass::Fog { strength, color } => Some(scriptbots_world_gfx::FogControls {
+                    strength: *strength,
+                    color_linear: *color,
+                }),
+                _ => None,
+            })
+            .unwrap_or(scriptbots_world_gfx::FogControls {
+                strength: 0.0,
+                color_linear: [0.0; 3],
+            })
+    }
+
     fn gpu_exposure_factor(&self) -> Option<f32> {
         self.post_stack.passes.iter().find_map(|pass| match pass {
             PostProcessPass::Exposure { factor } => Some(*factor),
@@ -17386,7 +17418,7 @@ fn apply_post_processing(
                         size(px(width_px), px(height_px * 0.66)),
                     );
                     let fog_color = apply_palette(
-                        rgba_from_triplet_with_alpha(color, strength * 0.42),
+                        rgba_from_triplet_with_alpha(color.map(linear_to_srgb), strength * 0.42),
                         palette,
                     );
                     let transparent = Rgba {
@@ -18753,6 +18785,128 @@ mod command_characterization_tests {
             "production offscreen exposure RGB sums: dim={dim_rgb} default={default_rgb} bright={bright_rgb}"
         );
         assert!(dim_rgb > 0 && default_rgb > dim_rgb && bright_rgb > default_rgb);
+    }
+
+    #[test]
+    fn published_snapshot_fog_reaches_the_gpu_frame() {
+        use scriptbots_core::{RenderFogSettings, RenderPostSettings};
+        use std::io::Write as _;
+
+        let mut controls = Vec::new();
+        let mut pixels = Vec::new();
+        let mut world_digest = None;
+        for (mode, color, name) in [
+            (RenderFogMode::Off, [0.25, 0.0, 0.0], "fog-off.png"),
+            (RenderFogMode::Low, [0.25, 0.0, 0.0], "fog-low-red.png"),
+            (RenderFogMode::High, [0.25, 0.0, 0.0], "fog-high-red.png"),
+            (RenderFogMode::High, [0.0, 0.25, 0.0], "fog-high-green.png"),
+            (RenderFogMode::Off, [0.25, 0.0, 0.0], "fog-restored.png"),
+        ] {
+            let mut config = ScriptBotsConfig {
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            };
+            config.render.quality = Some(RenderQuality::Potato);
+            config.render.post = Some(RenderPostSettings {
+                fog: Some(RenderFogSettings {
+                    mode: Some(mode),
+                    color: Some(color),
+                }),
+                ..RenderPostSettings::default()
+            });
+            let world = WorldState::new(config).expect("fog world");
+            let digest = world.world_digest_v1().expect("initial fog science digest");
+            if let Some(expected) = &world_digest {
+                assert_eq!(&digest, expected);
+            } else {
+                world_digest = Some(digest);
+            }
+            let expected = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+                .expect("owner fog frame")
+                .gpu_fog_controls();
+            let host = HostCore::new(HostSessionId::new(79), world, HostCoreOptions::default())
+                .expect("fog host");
+            let snapshot = host.snapshot_hub().latest();
+            let actual = RenderFrame::from_snapshot(&snapshot, ColorPaletteMode::Natural)
+                .expect("published fog frame")
+                .gpu_fog_controls();
+            assert_eq!(actual, expected);
+            if mode != RenderFogMode::Off {
+                assert_eq!(actual.color_linear, color);
+            }
+            controls.push(actual);
+            let png = world_compositor::render_wgpu_png_offscreen(&snapshot, 128, 64)
+                .expect("production offscreen fog capture requires an allowed adapter");
+            let image = image::load_from_memory(&png)
+                .expect("actual fog PNG")
+                .to_rgba8();
+            assert_eq!(image.dimensions(), (128, 64));
+            pixels.push(image.into_raw());
+            if let Some(directory) = std::env::var_os("SCRIPTBOTS_FOG_EVIDENCE_ROOT") {
+                let directory = std::path::PathBuf::from(directory);
+                assert!(directory.is_absolute() && directory.is_dir());
+                std::fs::File::create_new(directory.join(name))
+                    .expect("unique fog proof artifact")
+                    .write_all(&png)
+                    .expect("retain actual fog PNG");
+            }
+        }
+        assert_eq!(controls[0].strength, 0.0);
+        assert!(controls[1].strength > 0.0 && controls[2].strength > controls[1].strength);
+        assert_eq!(controls[2].strength, controls[3].strength);
+        let channel_sum = |pixels: &[u8], channel: usize| -> i64 {
+            let (rgba_pixels, _) = pixels.as_chunks::<4>();
+            rgba_pixels
+                .iter()
+                .map(|pixel| i64::from(pixel[channel]))
+                .sum()
+        };
+        let red: Vec<_> = pixels.iter().map(|image| channel_sum(image, 0)).collect();
+        let green: Vec<_> = pixels.iter().map(|image| channel_sum(image, 1)).collect();
+        assert!(
+            red[0] > 0 && green[0] > 0,
+            "actual terrain RGB must be populated"
+        );
+        assert!(red[1] > red[0] && red[2] > red[1]);
+        assert!(red[2] > red[3] && green[3] > green[2]);
+        let half = 32 * 128 * 4;
+        let top_delta = channel_sum(&pixels[2][..half], 0) - channel_sum(&pixels[0][..half], 0);
+        let bottom_delta = channel_sum(&pixels[2][half..], 0) - channel_sum(&pixels[0][half..], 0);
+        assert!(
+            bottom_delta > top_delta && top_delta > 0,
+            "resolved fog must increase toward the bottom: {top_delta} -> {bottom_delta}"
+        );
+        assert_eq!(
+            pixels[0], pixels[4],
+            "explicit off must restore actual production pixels"
+        );
+        eprintln!(
+            "production offscreen fog red sums: {red:?}; green sums: {green:?}; top_delta={top_delta} bottom_delta={bottom_delta}"
+        );
+    }
+
+    #[test]
+    fn palette_fog_is_decoded_once_and_canvas_encode_restores_the_palette() {
+        let mut config = ScriptBotsConfig::default();
+        config.render.quality = Some(RenderQuality::Ultra);
+        let stack = post_process_stack(0, &config, false, 1, None, ColorPaletteMode::Natural);
+        let color = stack
+            .passes
+            .iter()
+            .find_map(|pass| match pass {
+                PostProcessPass::Fog { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("Ultra includes palette fog");
+        let palette = visual::visual_style().atmosphere.fog_srgb;
+        assert_ne!(
+            color, palette,
+            "encoded palette values must not pass as linear RGB"
+        );
+        for (linear, encoded) in color.into_iter().zip(palette) {
+            assert!((linear_to_srgb(linear) - encoded).abs() < 0.000_001);
+        }
     }
 
     #[test]
