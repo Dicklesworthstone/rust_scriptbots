@@ -30350,6 +30350,13 @@ mod tests {
         Ok(())
     }
 
+    // A writer-lease child is a re-exec of this debug test binary that opens the storage engine.
+    // Under a loaded suite its startup can take longer than 10 s (#7: in a 3320 s v0.3.0 gate
+    // run at worker load ~13 the child missed the old 10 s readiness bound and was SIGKILLed;
+    // the same test passed alone in 19.7 s). A child that never becomes ready or never exits
+    // still fails the test, after this bound.
+    const WRITER_LEASE_CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
     struct WriterLeaseChild {
         child: Child,
     }
@@ -30359,7 +30366,7 @@ mod tests {
             &mut self,
             context: &str,
         ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + WRITER_LEASE_CHILD_DEADLINE;
             loop {
                 if let Some(status) = self.child.try_wait()? {
                     return Ok(status);
@@ -30426,7 +30433,7 @@ mod tests {
         child: &mut WriterLeaseChild,
         ready_path: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WRITER_LEASE_CHILD_DEADLINE;
         loop {
             if ready_path.try_exists()? {
                 return Ok(());
