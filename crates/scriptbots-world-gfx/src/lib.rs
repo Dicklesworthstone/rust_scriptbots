@@ -49,6 +49,10 @@ pub struct WorldSnapshot<'a> {
     /// Resolved fog from the frontend. `None` retains environment controls;
     /// `Some` with zero strength explicitly disables fog.
     pub fog: Option<FogControls>,
+    /// Resolved bloom. Zero intensity explicitly disables it; `None` uses the environment.
+    pub bloom: Option<BloomControls>,
+    /// Resolved vignette. Zero strength explicitly disables it; `None` uses the environment.
+    pub vignette: Option<VignetteControls>,
 }
 
 /// Snapshot-selected bottom-height fog, blended in linear RGB.
@@ -58,6 +62,24 @@ pub struct FogControls {
     pub strength: f32,
     /// Linear RGB components, each finite and in `0..=1`.
     pub color_linear: [f32; 3],
+}
+
+/// Snapshot-selected controls for the existing bloom extraction and blend passes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BloomControls {
+    /// Peak linear RGB extraction threshold, finite and in `0..=16`.
+    pub threshold: f32,
+    /// Additive blend intensity, finite and in `0..=1`.
+    pub intensity: f32,
+}
+
+/// Snapshot-selected vignette strength and edge falloff.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VignetteControls {
+    /// Edge darkening strength, finite and in `0..=1`.
+    pub strength: f32,
+    /// Edge width control, finite and in `0..=1`.
+    pub smoothness: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -394,6 +416,15 @@ impl WorldRenderer {
             post_controls.fog_enabled = fog.strength > 0.0;
             post_controls.fog_color = fog.color_linear;
         }
+        if let Some(bloom) = snapshot.bloom {
+            post_controls.bloom_enabled = bloom.intensity > 0.0;
+            post_controls.bloom_thresh = bloom.threshold;
+            post_controls.bloom_intensity = bloom.intensity;
+        }
+        if let Some(vignette) = snapshot.vignette {
+            post_controls.vignette = vignette.strength;
+            post_controls.vignette_smoothness = Some(vignette.smoothness);
+        }
         let selected_tonemap = snapshot.tonemap_mode.map(|mode| match mode {
             RenderTonemapMode::Aces | RenderTonemapMode::Tony => 1_u32,
             RenderTonemapMode::Agx => 3_u32,
@@ -521,6 +552,25 @@ fn validate_frame_token(
 }
 
 fn validate_snapshot(snapshot: &WorldSnapshot<'_>) -> Result<(), ReadbackError> {
+    if let Some(bloom) = snapshot.bloom
+        && (!bloom.threshold.is_finite()
+            || !(0.0..=16.0).contains(&bloom.threshold)
+            || !bloom.intensity.is_finite()
+            || !(0.0..=1.0).contains(&bloom.intensity))
+    {
+        return Err(ReadbackError::Configuration(format!(
+            "snapshot bloom threshold must be finite in 0..=16 and intensity in 0..=1, got {bloom:?}"
+        )));
+    }
+    if let Some(vignette) = snapshot.vignette
+        && [vignette.strength, vignette.smoothness]
+            .iter()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(ReadbackError::Configuration(format!(
+            "snapshot vignette strength and smoothness must be finite in 0..=1, got {vignette:?}"
+        )));
+    }
     if let Some(fog) = snapshot.fog
         && (!fog.strength.is_finite()
             || !(0.0..=1.0).contains(&fog.strength)
@@ -668,6 +718,8 @@ mod capture_smoke_test {
             tonemap_mode: None,
             exposure_factor: None,
             fog: None,
+            bloom: None,
+            vignette: None,
         };
         let frame = renderer.render(&snapshot).expect("valid render snapshot");
         renderer
@@ -731,6 +783,8 @@ mod capture_smoke_test {
             tonemap_mode: None,
             exposure_factor: Some(0.5),
             fog: None,
+            bloom: None,
+            vignette: None,
         };
         let mut renderer =
             pollster::block_on(WorldRenderer::new(&adapter, (64, 64))).expect("exposure renderer");
@@ -810,6 +864,8 @@ mod capture_smoke_test {
                 strength: 0.0,
                 color_linear: [0.25, 0.0, 0.0],
             }),
+            bloom: None,
+            vignette: None,
         };
         let mut renderer =
             pollster::block_on(WorldRenderer::new(&adapter, (64, 64))).expect("fog renderer");
@@ -925,6 +981,183 @@ mod capture_smoke_test {
         );
     }
 
+    #[test]
+    fn snapshot_bloom_and_vignette_change_pixels_and_reject_invalid_frames() {
+        let _gpu_lock = crate::GPU_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let adapter = live_adapter("snapshot bloom/vignette")
+            .expect("post-control proof requires an actual wgpu adapter");
+        eprintln!("snapshot post adapter: {:?}", adapter.get_info());
+        const EXTENT: u32 = 64;
+        let tiles = [3];
+        let colors = [[0.4, 0.4, 0.4, 1.0]];
+        let bloom_off = BloomControls {
+            threshold: 0.0,
+            intensity: 0.0,
+        };
+        let vignette_off = VignetteControls {
+            strength: 0.0,
+            smoothness: 0.0,
+        };
+        let mut snapshot = WorldSnapshot {
+            world_size: (EXTENT as f32, EXTENT as f32),
+            terrain: TerrainView {
+                dims: (1, 1),
+                cell_size: EXTENT,
+                tiles: &tiles,
+                colors: &colors,
+                elevation: None,
+            },
+            agents: &[],
+            anim_seconds: 0.0,
+            tonemap_mode: None,
+            exposure_factor: Some(1.0),
+            fog: Some(FogControls {
+                strength: 0.0,
+                color_linear: [0.0; 3],
+            }),
+            bloom: Some(bloom_off),
+            vignette: Some(vignette_off),
+        };
+        let mut renderer = pollster::block_on(WorldRenderer::new(&adapter, (EXTENT, EXTENT)))
+            .expect("post renderer");
+        let mut captures = Vec::new();
+        for (threshold, intensity, strength, smoothness) in [
+            (0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.25, 0.0, 0.0),
+            (0.0, 0.75, 0.0, 0.0),
+            (16.0, 0.75, 0.0, 0.0),
+            (0.0, 0.0, 0.25, 0.0),
+            (0.0, 0.0, 0.75, 0.0),
+            (0.0, 0.0, 0.75, 1.0),
+            (0.0, 0.0, 0.0, 0.0),
+        ] {
+            snapshot.bloom = Some(BloomControls {
+                threshold,
+                intensity,
+            });
+            snapshot.vignette = Some(VignetteControls {
+                strength,
+                smoothness,
+            });
+            let frame = renderer.render(&snapshot).expect("post frame");
+            renderer.copy_to_readback(&frame).expect("post copy");
+            let view = renderer.mapped_rgba().expect("post pixels");
+            assert_eq!(view.bytes_per_row, EXTENT * 4);
+            assert_eq!(view.bytes().len(), (EXTENT * EXTENT * 4) as usize);
+            captures.push(view.bytes().to_vec());
+        }
+        let rgb_sum = |pixels: &[u8]| -> u64 {
+            let (rgba, _) = pixels.as_chunks::<4>();
+            rgba.iter()
+                .flat_map(|pixel| &pixel[..3])
+                .map(|value| u64::from(*value))
+                .sum()
+        };
+        let sums: Vec<_> = captures.iter().map(|pixels| rgb_sum(pixels)).collect();
+        assert!(sums[0] > 0 && sums[1] > sums[0] && sums[2] > sums[1]);
+        assert_eq!(
+            captures[0], captures[3],
+            "threshold 16 excludes this gray terrain"
+        );
+        assert!(sums[4] < sums[0] && sums[5] < sums[4] && sums[6] < sums[5]);
+        let pixel = |x: u32, y: u32| ((y * EXTENT + x) * 4) as usize;
+        let center = pixel(EXTENT / 2, EXTENT / 2);
+        for image in &captures[4..7] {
+            assert_eq!(&image[center..center + 4], &captures[0][center..center + 4]);
+        }
+        let edge = pixel(5, EXTENT / 2);
+        assert_eq!(
+            captures[5][edge], captures[0][edge],
+            "narrow falloff leaves this pixel alone"
+        );
+        assert!(
+            captures[6][edge] < captures[5][edge],
+            "smoothness widens actual darkening"
+        );
+        assert_eq!(captures[0], captures[7]);
+        eprintln!(
+            "snapshot post RGB sums: {sums:?}; narrow_edge={} wide_edge={}",
+            captures[5][edge], captures[6][edge]
+        );
+
+        let controls = PostControls::from_env().expect("valid post environment");
+        if controls.bloom_enabled
+            && controls.bloom_intensity >= 0.25
+            && controls.bloom_thresh <= 0.0
+        {
+            snapshot.bloom = None;
+            snapshot.vignette = Some(vignette_off);
+            let frame = renderer.render(&snapshot).expect("raw bloom frame");
+            renderer.copy_to_readback(&frame).expect("raw bloom copy");
+            let view = renderer.mapped_rgba().expect("raw bloom pixels");
+            assert!(rgb_sum(view.bytes()) > sums[0]);
+            eprintln!("raw bloom fallback exercised independently");
+        }
+        if controls.vignette >= 0.08 {
+            snapshot.bloom = Some(bloom_off);
+            snapshot.vignette = None;
+            let frame = renderer.render(&snapshot).expect("raw vignette frame");
+            renderer.copy_to_readback(&frame).expect("raw vignette copy");
+            let view = renderer.mapped_rgba().expect("raw vignette pixels");
+            assert!(rgb_sum(view.bytes()) < sums[0]);
+            eprintln!("raw vignette fallback exercised independently");
+        }
+        let generation = renderer.frame_generation;
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+            for (bloom, vignette) in [
+                (
+                    BloomControls {
+                        threshold: value * 16.0,
+                        ..bloom_off
+                    },
+                    vignette_off,
+                ),
+                (
+                    BloomControls {
+                        intensity: value,
+                        ..bloom_off
+                    },
+                    vignette_off,
+                ),
+                (
+                    bloom_off,
+                    VignetteControls {
+                        strength: value,
+                        ..vignette_off
+                    },
+                ),
+                (
+                    bloom_off,
+                    VignetteControls {
+                        smoothness: value,
+                        ..vignette_off
+                    },
+                ),
+            ] {
+                snapshot.bloom = Some(bloom);
+                snapshot.vignette = Some(vignette);
+                assert!(matches!(
+                    renderer.render(&snapshot),
+                    Err(ReadbackError::Configuration(_))
+                ));
+                assert_eq!(renderer.frame_generation, generation);
+            }
+        }
+        snapshot.bloom = Some(bloom_off);
+        snapshot.vignette = Some(vignette_off);
+        let frame = renderer.render(&snapshot).expect("post recovery frame");
+        renderer.copy_to_readback(&frame).expect("post recovery copy");
+        assert_eq!(
+            renderer
+                .mapped_rgba()
+                .expect("post recovery pixels")
+                .bytes(),
+            captures[0]
+        );
+    }
+
     /// Deterministic ACROSS RENDERER INSTANCES, not merely across two draws.
     ///
     /// The test above renders twice through the SAME `WorldRenderer`, so it
@@ -972,6 +1205,8 @@ mod capture_smoke_test {
             tonemap_mode: None,
             exposure_factor: None,
             fog: None,
+            bloom: None,
+            vignette: None,
         };
 
         // Each closure owns its renderer for its whole lifetime, so the second
@@ -1276,6 +1511,8 @@ mod capture_smoke_test {
             tonemap_mode: None,
             exposure_factor: None,
             fog: None,
+            bloom: None,
+            vignette: None,
         };
 
         let t_start = std::time::Instant::now();
@@ -2822,6 +3059,8 @@ mod tests {
             tonemap_mode: None,
             exposure_factor: None,
             fog: None,
+            bloom: None,
+            vignette: None,
         };
         assert!(matches!(
             validate_snapshot(&snapshot),
@@ -4033,13 +4272,14 @@ struct PostParams {
     fog_density: f32,
     fog_enabled: u32,
     fog_color: [f32; 3],
-    _pad0: f32,
+    vignette_smoothness: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PostControls {
     exposure: f32,
     vignette: f32,
+    vignette_smoothness: Option<f32>,
     tonemap: u32,
     fxaa: u32,
     bloom_enabled: bool,
@@ -4056,6 +4296,7 @@ impl Default for PostControls {
         Self {
             exposure: 1.0,
             vignette: 0.08,
+            vignette_smoothness: None,
             tonemap: 1,
             fxaa: 0,
             bloom_enabled: true,
@@ -4691,7 +4932,7 @@ impl PostFx {
                     1
                 },
             fog_color: controls.fog_color,
-            _pad0: 0.0,
+            vignette_smoothness: controls.vignette_smoothness.unwrap_or(-1.0),
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         // Recreate params bind group (demonstrates use of params_layout; allows for dynamic layout changes in future)
@@ -4835,7 +5076,7 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32
 struct Params {
   exposure: f32, vignette: f32, tonemap: u32, fxaa: u32,
   bloom_thresh: f32, bloom_intensity: f32, fog_density: f32, fog_enabled: u32,
-  fog_color: vec3<f32>, _pad0: f32,
+  fog_color: vec3<f32>, vignette_smoothness: f32,
 };
 @group(1) @binding(0) var<uniform> params: Params;
 
@@ -4874,7 +5115,13 @@ fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
   }
   let p = uv01 * 2.0 - 1.0;
-  let vign = clamp(1.0 - dot(p, p) * params.vignette, 0.85, 1.0);
+  var vign = clamp(1.0 - dot(p, p) * params.vignette, 0.85, 1.0);
+  if (params.vignette_smoothness >= 0.0) {
+    let edge_width = 0.08 + params.vignette_smoothness * 0.15;
+    let edge = max(abs(p.x), abs(p.y));
+    let mask = smoothstep(1.0 - 2.0 * edge_width, 1.0, edge);
+    vign = 1.0 - params.vignette * mask;
+  }
   rgb *= vign;
   // Height-fog (screen-space Y proxy)
   if (params.fog_enabled != 0u) {
@@ -4905,7 +5152,7 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_smp: sampler;
-struct Params { exposure: f32, vignette: f32, tonemap: u32, fxaa: u32, bloom_thresh: f32, bloom_intensity: f32, fog_density: f32, fog_enabled: u32, fog_color: vec3<f32>, _pad0: f32 };
+struct Params { exposure: f32, vignette: f32, tonemap: u32, fxaa: u32, bloom_thresh: f32, bloom_intensity: f32, fog_density: f32, fog_enabled: u32, fog_color: vec3<f32>, vignette_smoothness: f32 };
 @group(1) @binding(0) var<uniform> params: Params;
 
 @fragment

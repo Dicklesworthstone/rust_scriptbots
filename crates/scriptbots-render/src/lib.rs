@@ -935,6 +935,8 @@ pub mod world_compositor {
             tonemap_mode: frame.tonemap_mode,
             exposure_factor: frame.gpu_exposure_factor(),
             fog: Some(frame.gpu_fog_controls()),
+            bloom: Some(frame.gpu_bloom_controls()),
+            vignette: Some(frame.gpu_vignette_controls()),
         };
 
         // Fit camera into the requested viewport
@@ -1086,6 +1088,8 @@ pub mod world_compositor {
                 tonemap_mode: None,
                 exposure_factor: None,
                 fog: None,
+                bloom: None,
+                vignette: None,
             }
         }
 
@@ -1401,6 +1405,8 @@ mod wgpu_capture_test {
             tonemap_mode: None,
             exposure_factor: None,
             fog: None,
+            bloom: None,
+            vignette: None,
         };
         comp.set_camera_params(1.0, (0.0, 0.0));
         comp.render_snapshot(&snapshot, viewport)
@@ -1545,6 +1551,8 @@ mod wgpu_capture_test {
             tonemap_mode: None,
             exposure_factor: None,
             fog: None,
+            bloom: None,
+            vignette: None,
         };
 
         comp.render_snapshot(&snapshot, viewport)
@@ -1603,6 +1611,8 @@ mod wgpu_capture_test {
             tonemap_mode: None,
             exposure_factor: None,
             fog: None,
+            bloom: None,
+            vignette: None,
         };
         comp.render_snapshot(&empty, viewport)
             .expect("comparison capture must either render or return a typed GPU failure");
@@ -1873,6 +1883,8 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         tonemap_mode: state.frame.tonemap_mode,
         exposure_factor: state.frame.gpu_exposure_factor(),
         fog: Some(state.frame.gpu_fog_controls()),
+        bloom: Some(state.frame.gpu_bloom_controls()),
+        vignette: Some(state.frame.gpu_vignette_controls()),
     };
 
     emit_wgpu_camera_mapping_diagnostic(width_px, height_px, world_dims, layout, cam_offset);
@@ -14204,6 +14216,7 @@ enum PostProcessPass {
     },
     Bloom {
         strength: f32,
+        threshold: f32,
     },
     Fog {
         strength: f32,
@@ -14299,6 +14312,9 @@ fn post_process_stack(
             atmosphere.bloom_intensity * (0.80 + daylight * 0.28) + life_delta.max(0.0) * 0.20,
         )
         .clamp(0.0, 1.0);
+    let bloom_threshold = bloom
+        .and_then(|settings| settings.threshold)
+        .unwrap_or(atmosphere.bloom_threshold);
 
     let fog = post.and_then(|settings| settings.fog.as_ref());
     let fog_mode = fog
@@ -14352,6 +14368,7 @@ fn post_process_stack(
     if bloom_enabled && bloom_strength > 0.0 {
         passes.push(PostProcessPass::Bloom {
             strength: bloom_strength,
+            threshold: bloom_threshold,
         });
     }
     if vignette_enabled && vignette_strength > 0.0 {
@@ -14428,6 +14445,46 @@ struct CanvasState {
 }
 
 impl RenderFrame {
+    fn gpu_bloom_controls(&self) -> scriptbots_world_gfx::BloomControls {
+        self.post_stack
+            .passes
+            .iter()
+            .find_map(|pass| match pass {
+                PostProcessPass::Bloom {
+                    strength,
+                    threshold,
+                } => Some(scriptbots_world_gfx::BloomControls {
+                    intensity: *strength,
+                    threshold: *threshold,
+                }),
+                _ => None,
+            })
+            .unwrap_or(scriptbots_world_gfx::BloomControls {
+                intensity: 0.0,
+                threshold: visual::visual_style().atmosphere.bloom_threshold,
+            })
+    }
+
+    fn gpu_vignette_controls(&self) -> scriptbots_world_gfx::VignetteControls {
+        self.post_stack
+            .passes
+            .iter()
+            .find_map(|pass| match pass {
+                PostProcessPass::Vignette {
+                    strength,
+                    smoothness,
+                } => Some(scriptbots_world_gfx::VignetteControls {
+                    strength: *strength,
+                    smoothness: *smoothness,
+                }),
+                _ => None,
+            })
+            .unwrap_or(scriptbots_world_gfx::VignetteControls {
+                strength: 0.0,
+                smoothness: 0.0,
+            })
+    }
+
     fn gpu_fog_controls(&self) -> scriptbots_world_gfx::FogControls {
         self.post_stack
             .passes
@@ -17346,7 +17403,7 @@ fn apply_post_processing(
                     }
                 }
             }
-            PostProcessPass::Bloom { strength } => {
+            PostProcessPass::Bloom { strength, .. } => {
                 if strength > 0.01 {
                     // Four gradients converge on the scene centre, approximating a
                     // broad emissive glow without the hard rectangle used before.
@@ -18884,6 +18941,142 @@ mod command_characterization_tests {
         eprintln!(
             "production offscreen fog red sums: {red:?}; green sums: {green:?}; top_delta={top_delta} bottom_delta={bottom_delta}"
         );
+    }
+
+    #[test]
+    fn published_snapshot_bloom_and_vignette_reach_the_gpu_frame() {
+        use scriptbots_core::{RenderBloomSettings, RenderPostSettings, RenderVignetteSettings};
+        use std::io::Write as _;
+
+        const SIZE: (u32, u32) = (128, 64);
+        let mut pixels = Vec::new();
+        let mut world_digest = None;
+        for (
+            bloom_enabled,
+            intensity,
+            threshold,
+            vignette_enabled,
+            strength,
+            smoothness,
+            name,
+        ) in [
+            (true, 0.0, 0.0, true, 0.0, 0.0, "post-off.png"),
+            (true, 0.25, 0.0, true, 0.0, 0.0, "bloom-low.png"),
+            (true, 0.75, 0.0, true, 0.0, 0.0, "bloom-high.png"),
+            (true, 0.75, 16.0, true, 0.0, 0.0, "bloom-blocked.png"),
+            (false, 0.75, 0.0, true, 0.0, 0.0, "bloom-disabled.png"),
+            (true, 0.0, 0.0, true, 0.25, 0.0, "vignette-low.png"),
+            (true, 0.0, 0.0, true, 0.75, 0.0, "vignette-high.png"),
+            (true, 0.0, 0.0, true, 0.75, 1.0, "vignette-wide.png"),
+            (true, 0.0, 0.0, false, 0.75, 0.0, "vignette-disabled.png"),
+            (true, 0.0, 0.0, true, 0.0, 0.0, "post-restored.png"),
+        ] {
+            let mut config = ScriptBotsConfig {
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            };
+            config.render.quality = Some(RenderQuality::Potato);
+            config.render.post = Some(RenderPostSettings {
+                bloom: Some(RenderBloomSettings {
+                    enabled: bloom_enabled,
+                    intensity: Some(intensity),
+                    threshold: Some(threshold),
+                }),
+                vignette: Some(RenderVignetteSettings {
+                    enabled: vignette_enabled,
+                    intensity: Some(strength),
+                    smoothness: Some(smoothness),
+                }),
+                ..RenderPostSettings::default()
+            });
+            let world = WorldState::new(config).expect("post world");
+            let digest = world.world_digest_v1().expect("initial post science digest");
+            if let Some(expected) = &world_digest {
+                assert_eq!(&digest, expected);
+            } else {
+                world_digest = Some(digest);
+            }
+            let expected = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+                .expect("owner post frame");
+            let host = HostCore::new(HostSessionId::new(80), world, HostCoreOptions::default())
+                .expect("post host");
+            let snapshot = host.snapshot_hub().latest();
+            let actual = RenderFrame::from_snapshot(&snapshot, ColorPaletteMode::Natural)
+                .expect("published post frame");
+            assert_eq!(actual.gpu_bloom_controls(), expected.gpu_bloom_controls());
+            assert_eq!(actual.gpu_vignette_controls(), expected.gpu_vignette_controls());
+            assert_eq!(
+                actual.gpu_bloom_controls().intensity,
+                if bloom_enabled { intensity } else { 0.0 }
+            );
+            assert_eq!(
+                actual.gpu_vignette_controls().strength,
+                if vignette_enabled { strength } else { 0.0 }
+            );
+            if bloom_enabled && intensity > 0.0 {
+                assert_eq!(actual.gpu_bloom_controls().threshold, threshold);
+            }
+            if vignette_enabled && strength > 0.0 {
+                assert_eq!(actual.gpu_vignette_controls().smoothness, smoothness);
+            }
+            let png = world_compositor::render_wgpu_png_offscreen(&snapshot, SIZE.0, SIZE.1)
+                .expect("production post capture requires an allowed adapter");
+            let image = image::load_from_memory(&png)
+                .expect("actual post PNG")
+                .to_rgba8();
+            assert_eq!(image.dimensions(), SIZE);
+            pixels.push(image.into_raw());
+            if let Some(directory) = std::env::var_os("SCRIPTBOTS_POST_EVIDENCE_ROOT") {
+                let directory = std::path::PathBuf::from(directory);
+                assert!(directory.is_absolute() && directory.is_dir());
+                std::fs::File::create_new(directory.join(name))
+                    .expect("unique post proof artifact")
+                    .write_all(&png)
+                    .expect("retain actual post PNG");
+            }
+        }
+        let rgb_sum = |pixels: &[u8]| -> u64 {
+            let (rgba, _) = pixels.as_chunks::<4>();
+            rgba.iter()
+                .flat_map(|pixel| &pixel[..3])
+                .map(|value| u64::from(*value))
+                .sum()
+        };
+        let sums: Vec<_> = pixels.iter().map(|image| rgb_sum(image)).collect();
+        assert!(sums[0] > 0 && sums[1] > sums[0] && sums[2] > sums[1]);
+        for image in [&pixels[3], &pixels[4], &pixels[8], &pixels[9]] {
+            assert_eq!(
+                image, &pixels[0],
+                "threshold, explicit disabled flags and restored off reach pixels"
+            );
+        }
+        assert!(sums[5] < sums[0] && sums[6] < sums[5] && sums[7] < sums[6]);
+        let center = ((SIZE.1 / 2 * SIZE.0 + SIZE.0 / 2) * 4) as usize;
+        for image in &pixels[5..8] {
+            assert_eq!(&image[center..center + 4], &pixels[0][center..center + 4]);
+        }
+        let strip_sum = |pixels: &[u8]| -> u64 {
+            let mut sum = 0;
+            for y in SIZE.1 / 4..SIZE.1 * 3 / 4 {
+                for x in SIZE.0 / 10..SIZE.0 / 8 {
+                    let start = ((y * SIZE.0 + x) * 4) as usize;
+                    sum += pixels[start..start + 3]
+                        .iter()
+                        .map(|value| u64::from(*value))
+                        .sum::<u64>();
+                }
+            }
+            sum
+        };
+        let narrow = strip_sum(&pixels[6]);
+        let wide = strip_sum(&pixels[7]);
+        assert_eq!(narrow, strip_sum(&pixels[0]));
+        assert!(
+            narrow > 0 && wide < narrow,
+            "smoothness widens actual production darkening: {narrow} -> {wide}"
+        );
+        eprintln!("production post RGB sums: {sums:?}; narrow_strip={narrow} wide_strip={wide}");
     }
 
     #[test]
