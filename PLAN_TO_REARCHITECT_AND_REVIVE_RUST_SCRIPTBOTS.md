@@ -1468,6 +1468,11 @@ mixed-representation file recovery pass; workspace check, strict Clippy, formatt
 dependency guards pass in pinned DSR. Full storage observes 372 passed / 2 failed / 5 existing
 ignored: writer-lease readiness and persistence-admission timeouts remain unresolved. Full
 qualification and original live A/B throughput acceptance remain open; no speedup is claimed.
+Merged v0.4.0 source `d72791e8` is published on both remote branches: fresh pinned DSR
+checks pass all eleven source commands and four focused cases. Final cache verification
+refuses a linked/special Proptest README, so collection and full qualification remain open;
+the prior failed suites are retained and no passing lease result is claimed under the
+owner's imported sixty-second child wait.
 
 **Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact descriptor-bound recovery identity and structural-schema proof is completed under `bd-2z0.8.9.4.2`; direct-write/root-cause unification is completed under `bd-2z0.8.9.4.4` at `60e06b3` with DSR format, UBS, focused-test, workspace-check, strict-Clippy, and workspace-test proof (TopazCastle, 2026-07-15); DuckDB closure, dead-edge cleanup, and active-contract updates are completed under `bd-2z0.8.9.9` (CalmMink, 2026-07-17); durability/retry/rollback/concurrent-read proofs are completed under `bd-2z0.8.9.7` and the mock-free terminal-to-replay E2E with production Action/WorldDigest instrumentation is completed under `bd-2z0.8.9.8` (CalmMink, 2026-07-17); queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open]
 

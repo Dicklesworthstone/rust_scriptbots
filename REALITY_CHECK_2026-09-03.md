@@ -26,6 +26,14 @@ Durable outbox continuation (`bd-50bg`, 2026-10-14):
 - [x] Read back exact source, logs, named test completions, byte counts and retained hashes.
 - [x] Prepare reviewed implementation and tracked TODO/Beads for publication, with original
   acceptance unchanged and failed full qualification disclosed.
+- [x] Inspect and merge the concurrently published v0.4.0 main history without conflicts,
+  discarded work, force pushes or a push-guard bypass.
+- [x] Recheck mandatory commands and the affected correctness cases at the merged revision;
+  retain the earlier full-suite failures under their original source identities.
+- [x] Read back the merged source's eleven command/log pairs, four named completions,
+  complete source/state inventories and the containing collection refusal.
+- [x] Publish reviewed source and verify both remote branches at `d72791e8`.
+- [ ] Obtain complete DSR artifact collection without bypassing the private-cache guard.
 - [ ] Resolve the observed writer-lease readiness and persistence-admission failures and
   obtain full storage qualification without weakening their guards or deadlines.
 - [ ] Meet original live incumbent/candidate DSR throughput acceptance before claiming a
@@ -220,6 +228,62 @@ names), RH-2/PL-2 (constructed probes do not become throughput/full proof), SM-1
 first failures), RH-4/SM-1 (no credit for correction commits), and the machinery freeze
 above. Past time and missed updates cannot be recovered. The report's pending qualification
 is explicit; no self-certification or independent verifier is claimed.
+
+Publication encounters remote `482dc733`: the guard cannot enumerate a remote commit not
+yet fetched and refuses the first push. Normal fetch and inspected, conflict-free merge
+produce `d72791e8181096876eb36936c54d818d7688084a` /
+tree `d4250778e753415e90aa02d813c926f105fc285b`, retaining both parents. Normal Beads
+import confirms unchanged JSONL. Published owner-authored `43a74bf0` changes writer-lease
+child readiness/exit waits from ten to sixty seconds; `0205d218` adds archive-version writer
+hints, and the release changes workspace version and rustls lockfile pin. The original
+R177/R180 failures and claims remain bound to their pre-merge commits. Importing that gate
+change is disclosed; it does not prove this block fixed the timeouts or make an old failed
+run green. No full-suite comparison under the changed wait is claimed.
+
+Merge-candidate static UBS executes before the normal merge: exit one, four critical /
+3,261 warnings / 1,143 info. Reviewed critical contexts are the unchanged caught public
+reaper-poison hook and three unchanged `Command::new(&exe)` calls whose producer is
+`std::env::current_exe()`. No suppression or scanner-clean claim. The actual merged tree
+equals the inspected merge candidate. R182 is an additional integration check, not a
+replacement for original full acceptance: eleven command pairs and four focused cases
+(codec, both real file cases and the existing archive-version refusal). It uses clean
+merged main and the same frozen runner/stack/thread configuration; no full suite or TPS
+comparison is scheduled. Source/profile/launcher transport hashes match; PID 3960979
+starts at 16:29:09 UTC. Its initial dynamic launch-log redirect is blocked by DCG before
+execution; the documented safe alternative uses a fresh literal path and noclobber, with
+`dcg test` accepting it. No guard or approval bypass. Results follow below.
+
+R182 ends at 17:00:43 UTC, run `d32dc1af-aacf-49a4-ab5b-d4e91a025f8f`. All eleven
+source command/log pairs pass, including workspace check, strict Clippy, formatting, four
+guards and the analyzer build. The frozen structured reader and local re-execution observe
+four passing focused cases, zero failed/ignored/measured. Real file payloads remain
+223,821 -> 6,939/6,919 bytes. Typed **merge-check** verdict is `pass`/0; it explicitly
+excludes full-suite qualification and throughput. The containing DSR fails final private-cache
+verification on `git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md` as a linked or
+special entry: outer exit 6, runner identity 0, null collection identity. No cache guard is
+changed or bypassed, and this is not a full DSR pass. Earlier storage failures remain open.
+
+Local `r182-custody/` retains the proof, state and outer log. Readback verifies all 48
+source manifest entries / 3,053,013 bytes, five state files, five latest duplicates, all
+eleven log hashes, exact source/tree/profile and empty dirty-state files. Source verdict
+SHA256 `0e6aa4392167fd88c36b2b6f3d17b92bbefef9d5d9b20cf2e5939607123ba54c`;
+artifact inventory `0a6dfc1a60d7ee8dd2e8feba7785de04b7c1b9eca6cda28839e530f792ce74b6`;
+outer log `195e28f315f54d01ef181dc2c8274c96e4ddc89991a8f30acb1342017cca2069`;
+state inventory `491de7e38405e5a66178143a24fb4fce32230ff4e08cd6d1037933d924a149cc`.
+All leases are released before ordinary guarded main and legacy-mirror pushes. Remote
+readback at 17:08 UTC observes both at `d72791e8181096876eb36936c54d818d7688084a`.
+Source is published; this documentation/Beads handoff adds no runtime change.
+
+Final audit extension: the remote merge is ENABLER, exercised by those four actual cases
+and mandatory checks; this handoff remains PROCESS with zero capability credit. Re-read
+all imported hunks and the exact merged storage diff. Honesty 1/4 now also disclose the
+owner-authored ten-to-sixty-second test-wait import; no passing lease/full-suite result or
+win/lose split is claimed under it. Original failed-source evidence remains the counterweight.
+The disk-sleep metadata observation did not establish a deadlock; it completed without
+cache relocation or process termination. A read-only PID inspection raced its exit and
+failed, with no artifact mutation or green claim. Verdict stays DRIFTING, with the prior
+RH-1/RH-2/SM-11 dispositions intact. No bead is closed, no independent verifier is claimed,
+and source-check pass cannot be promoted to collection, full-suite or performance acceptance.
 
 Bloom/vignette continuation (`bd-2z0.7.11`, 2026-10-14):
 
