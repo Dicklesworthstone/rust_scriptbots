@@ -10,6 +10,200 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Bloom/vignette continuation (`bd-2z0.7.11`, 2026-10-14):
+
+- [x] Confirm both GPU producers omit resolved bloom/vignette settings and the frontend
+  drops bloom threshold before shader consumption.
+- [x] Carry the resolved threshold/intensity and strength/smoothness, including explicit off.
+- [x] Consume bounded finite controls in one frozen frame; preserve raw environment defaults
+  and make configured vignette smoothness change the edge width.
+- [x] Execute real raw GPU strength/threshold/width/off/restore and invalid-field probes.
+- [x] Correct the public threshold comment to name observed peak-linear-RGB extraction.
+- [x] Apply R175's five exact formatting corrections manually; retain the failed attempt.
+- [x] Execute actual HostCore-to-production-PNG controls and initial science-digest equality.
+- [x] Qualify through pinned DSR tests/compiler/lint/format/dependency checks and verify all
+  source-bound artifacts, failures and PNGs before publication.
+- [x] Update Beads and publish qualified source; prepare separate documentation/metadata handoff.
+- [ ] Meet remaining native/platform, CPU/GPU parity and capture-only-readback acceptance.
+
+Creation gate: reuse this operator-requested granular TODO and the required exact-source DSR
+profile. Consumer is the operator and source publication; observed defects are the missing
+GPU controls and dropped threshold. Active entries retire on observed completion; existing
+proof files remain as minimum failure/provenance custody, with deletion requiring permission.
+No new governance framework or process capability credit. The owned P0 is higher priority
+than local P1/P2 work; the other P0 depends on the unavailable macOS host.
+
+Bloom/vignette source `0cd0d4196e38b4f4b191d07d72f618a4616d85da` carries both controls
+through both GPU producers and the frozen shader inputs. Raw `None` preserves existing
+environment controls; resolved zero disables them. The threshold is the existing shader's
+peak linear RGB extraction threshold, not a new luminance operator. Configured vignette
+width consumes the former padding float without increasing the 48-byte uniform. CPU bloom
+remains a gradient approximation; framebuffer threshold/parity is not established.
+
+Inputs fixed before execution: eight 64×64 raw gray-terrain cases and ten seed-42 128×64
+production PNGs. Bloom intensity 0/0.25/0.75 must monotonically increase actual RGB sums;
+threshold 16 must restore off bytes. Vignette strength 0/0.25/0.75 must darken in order;
+smoothness 0/1 must widen darkening, with an unchanged center and a predeclared near-edge
+pixel/strip. Explicit disabled flags and restored off must equal off bytes. Sums exclude alpha;
+five invalid values across four fields give twenty negative cases, with typed configuration
+errors and unchanged generation. Separate raw `None` cases must exercise bloom and vignette
+independently under the profile's active environment. Initial WorldDigestV1 equality is narrow
+initial-state evidence. DSR R175, PID 1167147/run `810c6ffe-2659-4dd7-a4c1-814503c5a7a2`,
+binds clean source/tree `6e7038ab2524f6775c8e8a8b35eeb9cb332a3292` to eighteen commands
+and twenty-one required completions. Its failed final result is retained below.
+
+R175's isolated post command passes: actual llvmpipe LLVM 21.1.8 / Mesa 26.0.8-1ubuntu0.3 /
+CPU Vulkan; RGB sums across the eight declared cases are 1,253,376 / 1,400,832 / 1,634,304 /
+1,253,376 / 1,230,684 / 1,169,052 / 1,031,064 / 1,253,376, and edge red changes 102 → 72.
+Both independent raw-environment cells complete. Full default-settings world-gfx also observes
+the new pixel test and passes its unchanged canonical capture, then aborts in existing
+`test_negative_poly_acos_vs_driver_builtin_divergence`: `device.poll` returns Timeout at its
+unchanged five-second bound, and wgpu queue cleanup panics again before signal 11/SIGSEGV.
+Command 101, no passing suite summary; root cause is unestablished. Formatting also fails/1.
+Five exact layout changes are manually committed at `ca311c89`; `a51f70c4` changes only the
+public core field documentation to match the existing extraction operation. The replacement
+R176 profile/checkout is prepared with identical commands/guards/deadlines/golden and new
+source/tree `0c13b46cf7d5679b4e2cfc9650b61b2915d074f3`. It launches as PID 1902611 after
+the first attempt finishes. At that checkpoint final qualification is pending; no pass is claimed.
+
+The production post command passes at R175: ten actual PNG RGB totals are 629,245 /
+651,995 / 690,440 / 629,245 / 629,245 / 615,580 / 583,263 / 490,347 / 629,245 / 629,245;
+the declared near-edge strip changes 15,003 → 11,055 for sharp versus wide. The test asserts
+off-byte equality for blocked bloom, each explicit disabled flag and restored off, unchanged
+vignette center, and equal initial science digests. Existing production exposure/fog, palette,
+projection and CPU-tonemap commands also pass. All-target workspace check, strict Clippy,
+four dependency guards and analyzer build pass. The existing `proc-macro-error2` future-
+compatibility warning remains in the logs. The aborted suite is not a passing denominator.
+
+R175 finishes at 11:33:30 UTC: sixteen of eighteen command/log pairs pass, typed source
+failed/1, outer DSR failed/6 because the prefix returns one, runner identity zero and null
+collected identity. This attempt does not reach the post-build private-cache verifier.
+There are thirty observed successful test completions / twenty-seven unique names, only ten
+covered by successful suite summaries; fifteen of twenty-one required names complete. Six
+required world-gfx tests never complete after the abort. All 62 manifest files, eighteen PNGs,
+seven full-depth state/raw/outer files and eighteen command hashes are copied and recomputed;
+five `latest` duplicates match. All ten post PNGs are viewed: tiny, dark initial-world captures,
+not the living native GUI or hardware acceptance. Verdict SHA256
+`062d2964de3ddb239aacfe7fca0a2f9e42211abbfbb7509f647aa2826b21ec57`; outer log SHA256
+`ae64afea86c533c76233e38d3298223f1cabdf0c8d958299919095ee0b8592a3`.
+The first ad-hoc count reader overescapes its regex and reports zero, contradicting its fifteen
+required completions. The read-only regex is corrected, thirty completions are verified, and
+an explicit count-versus-required invariant now rejects that mistake. No artifact changes.
+R176 repeats the original scope at clean `a51f70c497c7cd0afa45f1cd58ea7b1df7fd79df`.
+
+**Final post-control source qualification:** R176 starts at 11:35:06 UTC and finishes at
+12:04:20 UTC, run `3a127b17-d2e3-4dcd-ad79-59314d5f7592`. All eighteen command/log pairs
+pass, including formatting, workspace all-targets check, strict Clippy, four dependency guards
+and analyzer build. All 63 scoped test executions / sixty unique names and twenty-one required
+completions pass, zero failures or ignores. Typed source pass/0 at clean `a51f70c4`, verdict
+SHA256 `491908d91a4091de58f16e834135e6ecd5fa4690a8427bdd3d3ebf8d87b97f50`.
+Retained proof: `/data/tmp/scriptbots-cull-20261013-lilacelm/post-20261014-a51f70c4-r176-hz4/`;
+profile/launcher in `r176-profile/`, raw state in `r176-state/`, outer log `launch-post-r176.log`.
+All 62 manifest files, seven full-depth state/raw/outer files, eighteen command hashes and
+five `latest` duplicates are copied and verified. The complete frozen profile reader is
+re-executed in a separate namespace, including its positive and negative completion cases;
+observed completion counts equal the successful summary counts. All eighteen PNGs are
+byte-identical to R175; the ten viewed post images and prior eight exposure/fog images apply
+to this fresh execution. The isolated/raw/production measurements above remain unchanged.
+
+Outer DSR fails/6 because its unchanged cache verifier rejects
+`git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md` and refuses collection.
+Runner identity zero, collected identity null; outer SHA256
+`a4a35973d0198263a308284a4ad66204f434ea00b791dd6dc10e3fb46ecc13eb`.
+R175's timeout/cleanup panic/SIGSEGV does not reproduce in the unchanged sensor test during
+R176; its cause remains unestablished and its failed evidence remains retained. This is scoped
+software-Vulkan source self-verification, not overall DSR/release, full-workspace tests,
+native-window, hardware, cross-platform, CPU/GPU visual parity or independent acceptance.
+Qualified source is published by ordinary pushes; both required remote references read back
+`a51f70c497c7cd0afa45f1cd58ea7b1df7fd79df` at 12:11:27 UTC. Final documentation and
+Beads use a separate reviewed handoff, with remote readback after its push. Original P0
+stays in progress, with its original acceptance and dependencies intact.
+
+Real-work audit, this block beginning 10:50 UTC: README purpose is a faithful, deterministic
+evolution simulator with a GPU UI, pluggable brains and analytics. Actual three-commit inventory
+is USER 2 (`0cd0d419`, control wiring with actual tests; `a51f70c4`, public field documentation),
+ENABLER 1 (`ca311c89`, mandated formatting), PROCESS 0 / UNKNOWN 0. Planned report/Beads
+commits are PROCESS 2, with zero capability credit; this delivers one rendering fix, no closures.
+Answers: (1) the two-minute demo is the ten actual post-effect PNGs, with their deliberately
+changed pixels and restored off bytes; these are tiny dark initial worlds, not a native-window
+demo. (2) Without process edits the pixels would be identical, but task/failure continuity would
+be lost. (3) The formatting enabler is exercised by R176's passing check; it is not speculative
+infrastructure. (4) Oldest active `bd-2z0` (2026-07-11) remains unfinished; this owned P0 is part
+of that revival, not a replacement for the full native journey. (5) No active delegated pane or
+swarm contribution applies. (6) No original acceptance is edited or moved into a new follow-up;
+plan edits describe the implemented slice. Verdict: bounded implementation progress; waiting
+and repeat validation earn zero capability credit. Keep the next block on actual frontend or
+durable-run behavior, not optional report machinery.
+
+Honesty inventory, this block against final R176 artifacts:
+
+1. No (checked: every source hunk, profiles and unchanged original test/gate paths): no weakened,
+   removed, skipped or ignored test; the first abort and five-second deadline remain intact.
+2. No (checked: actual WorldState/HostCore/renderer/readback/PNG calls): no specialized mock.
+3. No (checked: changed paths and passing unchanged canonical capture): no golden regeneration.
+4. Yes: runtime validation and real tests land with the feature; the profile adds two commands
+   and three required completions to R174. No old assertion, timeout, guard, pin, suppression
+   or failure conjunction is relaxed. The format-only commit has no behavior/assertion change.
+5. No (checked: both actual GPU producers and generic shader controls): no demo success branch
+   or environment-specific production shortcut. Raw `None` retains its existing declared path.
+6. No (checked: 63 nonzero summary executions, 21 completions and parser negatives): no zero-run
+   green. R175's six missing required names remain missing, not silently counted as success.
+7. Yes: a progress update calls locally committed source "published" before a push. The next
+   update corrects that claim explicitly. Publication is pending at that checkpoint; subsequent
+   publication claims use actual remote SHA readback. Initial CASS physical-line followups use the
+   canonical message-index coordinate before interpreting the bounded hits.
+8. No (checked: profile/report scope and actual adapter info): software offscreen evidence is
+   never presented as native-window, hardware, performance or independent verification.
+9. No (checked: failed R175 verdict, missing names, SIGSEGV and both outer receipts): no material
+   failure is omitted; successful isolated probes do not certify the aborted whole suite.
+10. No (checked: command/log pairs and full redirected UBS output): cited stderr is retained.
+11. No (checked: canonical 718-ID comparison): no closures; original P0 remains in progress.
+12. No (checked: original criteria/dependencies/matrix): no spec edit replaces acceptance.
+13. Not applicable: solo block, no delegated closure. Old children supply no new credit.
+14. Not applicable: solo block, no subagent dispatch or success criteria.
+15. Not applicable: solo block, no accepted peer proof.
+16. Not applicable: solo block, no pane or refusal-farming contribution.
+17. No (checked: one source origin and explicit self-verification): no agent agreement credit.
+18. No (checked: source/profile fixed before runs): case geometry, regions and required names
+   precede results; failed commands, missing names and outer failure are reported countermetrics.
+19. Yes: formatting requires a retry; a dynamic-path inventory redirect is rejected and safely
+   replaced by a literal protected target; an overescaped read-only regex briefly counts zero
+   despite fifteen required completions, then is corrected and guarded by a count invariant.
+   No source artifact, failed log or history is deleted. Long silent analysis gaps also exceeded
+   the requested update cadence; later updates are kept bounded by short waits.
+20. Strongest evidence is actual changed/restored production PNG bytes and raw GPU pixels,
+   invalid-control assertions, initial digest equality, and source-bound receipts. Re-executable,
+   self-verified, with no independent verifier or original P0 closure.
+
+CASS: five bounded phrase queries and a session-derived bloom/vignette query, six canonical
+message-index followups after correcting the initial coordinate mistake. Older excerpts mix
+status, source/help and golden material; two are truncated. No historical clearance is claimed.
+Disposition: premature publication wording, reader/coordinate errors and the refused command
+are corrected and disclosed here. RH-1/RH-2 countermeasures are unchanged gates/goldens,
+each receipt read separately, explicit proof scope and complete failure custody; remote SHA
+readback gates publication claims. No new governance framework or process feature is created.
+UBS scans the two changed renderer files in static-only mode: exit one, two critical findings,
+1,630 warnings / 788 info. Both critical samples are existing test-only temporary-file timestamp
+names, not security tokens; their contexts are read. This is a bounded review, not scanner-clean
+or whole-codebase bug clearance. The core addition is field documentation only.
+
+Creation worksheet for this block (2026-10-14): (1) the runtime controls are FEATURE;
+this requested TODO/report is PROCESS and DSR validation is a required ENABLER.
+(2) Consumer is the operator who explicitly requested a granular TODO and project reality
+check. (3) Gate is publication of the configured post-effect consumer with the mandated
+source checks and truthful scope. (4) Observed defects are the dropped threshold and missing
+GPU consumers; the failed/partial suite also demonstrates why a successful isolated probe
+cannot certify the whole scope. (5) Entries retire on observed completion; proof files persist
+only for failure/provenance custody, with deletion requiring explicit permission.
+(6) The integrity exception prevents the already-observed external-reset loss of unpushed
+source and uncommitted reports. (7) It is necessary on this shared checkout. (8) Existing
+source bundles and one three-file progress copy are the minimum recovery material here.
+(9) No cheaper equal protection is available for those demonstrated losses. (10) The owned
+P0 rendering consumer is the highest-priority actionable capability in this block; the other
+ready P0 needs the unavailable macOS host. (11) An extra hour of optional report machinery
+would have less user value than frontend implementation; none is authorized by this gate.
+(12) Verdict: minimum requested gate/integrity custody, zero process capability credit.
+
 Configured fog continuation (`bd-2z0.7.11`, 2026-10-14):
 
 - [x] Trace the omitted GPU fog consumer and inverted `1 - screen_y` gradient.
@@ -26,8 +220,9 @@ Configured fog continuation (`bd-2z0.7.11`, 2026-10-14):
   readback; all commands pass, with the separate outer collection failure retained below.
 - [x] Update Beads and publish the qualified source; both required remote references are
   read back at `6a5d5a32`. Final documentation/metadata uses the separate reviewed handoff.
-- [ ] Wire the separately observed bloom/vignette settings and meet original native/platform,
-  framebuffer and capture-only-readback acceptance. The original P0 stays in progress.
+- [x] Wire the separately observed bloom/vignette settings, qualified through R176 above.
+- [ ] Meet original native/platform, framebuffer and capture-only-readback acceptance.
+  The original P0 stays in progress.
 
 Fog proof inputs were fixed before execution: 64×64 raw dark terrain and five 128×64
 seed-42 production captures (off, low red, high red, high green, restored off). Sums exclude

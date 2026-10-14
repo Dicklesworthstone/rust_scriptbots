@@ -1804,6 +1804,20 @@ If the answer is no, stop investing in GPUI as the world renderer. It may remain
 
 ### 9.6 GUI acceptance matrix
 
+**[Currently In Progress] `bd-2z0.7.11`, bloom/vignette continuation, 2026-10-14:**
+`0cd0d419`, `ca311c89` and `a51f70c4` carry resolved bloom threshold/intensity and vignette
+strength/smoothness through both GPU producers. Explicit off overrides the environment;
+raw `None` retains it, configured smoothness changes edge width, and the public threshold
+comment names existing peak-linear-RGB extraction. R175 observes actual strength/threshold/
+edge-width/disabled/restoration/invalid-input pixels but fails formatting and aborts in an
+existing sensor test after a GPU timeout/cleanup panic/SIGSEGV. R176 repeats the unchanged
+deadline/golden scope: all eighteen commands and 63 scoped test executions pass (sixty unique
+names; twenty-one required completions; zero failures/ignores), including workspace check,
+strict Clippy and formatting. Complete source/artifact readback verifies typed source pass;
+outer DSR still refuses the Proptest README link during cache collection. The first timeout's
+cause remains unestablished. Native/platform, CPU/GPU visual parity and capture-only-readback
+acceptance stay open; this software offscreen source qualification does not close them.
+
 **[Currently In Progress] `bd-2z0.7.11`, 2026-10-14:** source `748cedbf` connects the existing
 snapshot-derived exposure factor to both GPUI wgpu consumers and frozen shader controls.
 R172 qualifies actual production offscreen brightness, same-input pixel restoration and
