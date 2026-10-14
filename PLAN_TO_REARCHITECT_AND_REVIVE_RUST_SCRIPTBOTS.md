@@ -1812,6 +1812,16 @@ invalid-multiplier refusal, plus all-target workspace check/strict Clippy/fmt (5
 collection. Original cross-platform, capture-only readback and native framebuffer acceptance
 remain open; these software Vulkan captures do not satisfy them.
 
+**[Currently In Progress] `bd-2z0.7.11`, configured fog continuation:** `af68b620` and
+`6a5d5a32` carry resolved strength and linear RGB through both wgpu producers, encode for
+the CPU canvas and correct the inverted bottom-height gradient. R173 observes actual
+color/strength/height/off/restoration pixels and invalid-control refusal, but fails formatting.
+R174 qualifies the formatting-only revision with all sixteen command/log pairs and 60 test
+executions passing (58 unique names; zero failures/ignores), including workspace check,
+strict Clippy and formatting. Typed source pass; outer DSR still refuses the tracked Proptest
+README link in private-cache collection. Native/platform, complete post-processing and
+capture-only-readback acceptance remain open.
+
 - native macOS explicit GUI launch;
 - Windows D3D12 launch;
 - Linux Vulkan launch with a clear explicit-mode headless failure and terminal preselection only in Auto;

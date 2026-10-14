@@ -10,6 +10,168 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Configured fog continuation (`bd-2z0.7.11`, 2026-10-14):
+
+- [x] Trace the omitted GPU fog consumer and inverted `1 - screen_y` gradient.
+- [x] Carry resolved strength and linear RGB through live and offscreen GPU snapshots;
+  explicit zero overrides environment fog, while raw `None` retains its fallback.
+- [x] Keep configured linear RGB, decode the palette's sRGB once, encode for the CPU canvas,
+  validate finite `0..=1` controls before submission and make height increase downward.
+- [x] Execute real world-gfx and HostCore-to-production-PNG strength/color/height/off/restore
+  probes, twenty invalid field cases and initial science-digest equality at `af68b620`.
+- [x] Apply the first DSR run's five formatting changes manually at `6a5d5a32`.
+- [x] Retain and verify the complete first run, its failure and actual PNGs.
+- [x] Restore reviewed source and ordinary Beads exports after two external checkout resets.
+- [x] Finish the unchanged sixteen-command final source qualification and complete evidence
+  readback; all commands pass, with the separate outer collection failure retained below.
+- [x] Update Beads and publish the qualified source; both required remote references are
+  read back at `6a5d5a32`. Final documentation/metadata uses the separate reviewed handoff.
+- [ ] Wire the separately observed bloom/vignette settings and meet original native/platform,
+  framebuffer and capture-only-readback acceptance. The original P0 stays in progress.
+
+Fog proof inputs were fixed before execution: 64×64 raw dark terrain and five 128×64
+seed-42 production captures (off, low red, high red, high green, restored off). Sums exclude
+alpha. Direction compares equal-sized halves, subtracting the off frame for heterogeneous
+production terrain. At pixel-center height 63.5/64, linear red 0.25 encodes near byte 136;
+the predeclared 134–139 bound rejects an extra decode or missing output encode. Five invalid
+values × strength/three color components produce twenty negative cases, with typed errors
+and unchanged frame generation. Initial digest equality does not establish long-run science
+neutrality. Live producer wiring is source-inspected; CPU/GPU visual parity is unqualified.
+
+`af68b6205ce8bde5b65e1752034e74617e1a7bb7` implements the fog consumer and tests;
+`6a5d5a323452bc6ec3e8332a9c4a0e7ecb52683b` applies formatting only. R173 binds the
+first revision/tree `39f72a600b2412edcee131ef52125cb5cf7e3043` to sixteen commands and
+eighteen required completions. It finishes at 01:36:25 UTC, run
+`2f4be547-40ce-42c6-9a63-dafde0a10a88`: fifteen command/log pairs pass, including
+all four dependency guards, workspace all-targets check, strict Clippy and analyzer build.
+Formatting fails/1. All 60 test executions pass, with 58 unique names and zero failures or
+ignores; raw exposure/fog probes repeat under differing controls and are not independent.
+Typed source failed/1, outer DSR failed/6 because the build prefix returns one, runner
+identity zero and no collected identity. It does not reach the post-build cache verifier;
+R172's Proptest-link refusal is not R173's cause. Verdict SHA256
+`70aab5f238cf51a7c6530446416c7fb8c55fc359ab54d28c60f1a6f10cc05f2f`; outer log SHA256
+`aea82df57b61e455819bc65f5e1fa2f5732155144e7cf7d1839229c3c2346cde`.
+
+All 48 manifest files, sixteen command-log hashes and seven state/raw/outer files are copied
+and verified under `/data/tmp/scriptbots-cull-20261013-lilacelm/`. The first depth-limited
+inventory checked six but omitted the already-copied nested native log; the full-depth
+inventory verifies that seventh file and equality of `latest` copies. Both lists remain.
+All five fog PNGs are viewed: small dark initial-world captures, not a living native-window,
+hardware, performance or cross-platform proof. Actual adapter: llvmpipe LLVM 21.1.8,
+Mesa 26.0.8-1ubuntu0.3, CPU Vulkan. Raw red sums across the declared sequence are
+12,288 / 192,256 / 331,904 / 380,544 / 6,336 / 12,288 / 380,544; full-red upper/lower
+sums are 136,320 / 244,224 and final red byte is 136. Production red sums are
+164,064 / 252,088 / 379,591 / 153,332 / 164,064; green sums are
+173,562 / 169,544 / 161,121 / 381,382 / 173,562; upper/lower red deltas are 64,741 / 150,786.
+Exposure retains its previous measurements. R174 runs after readback against the formatted
+source/tree `c5fd89772fc7cfecb2215db9e4256bcf219fc8ea`, with identical commands,
+completions, limits, golden, runner and seed. Its final result follows.
+
+**Final fog source qualification, 2026-10-14:** R174 starts at 01:39:56 UTC and finishes
+at 01:57:44 UTC, run `ceb49d07-09aa-46c4-bd0e-3346bb5f9ee5`. All sixteen command/log
+pairs pass, including formatting, workspace all-targets check, strict Clippy, four dependency
+guards and analyzer build. All eighteen required named completions and 60 test executions
+pass, with 58 unique names, zero failures and zero ignores. The typed source verdict is
+pass/0 at clean `6a5d5a323452bc6ec3e8332a9c4a0e7ecb52683b`, SHA256
+`76ef296785c1a16b8494b6a3f4d66c9b773e3a77c9cea186e405950c03167c2f`.
+All 48 manifest files, seven full-depth state/raw/outer files and sixteen command hashes
+are copied and recomputed. The eight actual exposure/fog PNGs are byte-identical to R173;
+the five inspected fog images therefore also describe this fresh run. The independent
+readback namespace avoids the earlier exposure reader's variable-collision mistake.
+
+Outer DSR remains failed/6 because its unchanged private-cache verifier rejects
+`git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md` and refuses collection.
+Runner identity remains zero; collected identity is null. Outer log SHA256
+`15639aa193311d761edae41945e40fb636c05e246066002655ddf8d1e5dcc1d7`.
+This is scoped source self-verification, not an overall DSR/release, full-workspace test,
+native-window, hardware, cross-platform or independently verified acceptance pass. Original
+`bd-2z0.7.11` remains in progress with its original matrix and acceptance intact.
+Ordinary source pushes to both required remote references read back
+`6a5d5a323452bc6ec3e8332a9c4a0e7ecb52683b` at 02:04:21 UTC. Final documentation and
+Beads commits carry this completed source milestone; their remote handoff is checked afterward.
+
+Git records external resets to `origin/main` at 01:41:12 and 01:42:21 UTC. No caller is
+identified. At discovery, tracked files were clean and own exclusive reservations remained
+conflict-free. A non-destructive fast-forward restores the two reviewed source commits;
+ordinary `br sync --flush-only` restores surviving comments 2803–2806 from the database.
+The uncommitted TODO/report edits were lost and are reconstructed from observed tool output.
+The source bundles, isolated DSR copies and retained evidence were unaffected. No destructive
+Git operation, file deletion or history rewrite was performed by this agent.
+
+Bounded real-work audit, fog block beginning 01:06 UTC: README purpose is a faithful,
+deterministic evolution simulator with a GPU UI, pluggable brains and analytics. Actual
+source inventory is USER 1 (`af68b620`, fog consumer/fix with actual tests), ENABLER 1
+(`6a5d5a32`, requested formatting), PROCESS 0 / UNKNOWN 0. Planned report/Beads commits
+are PROCESS 2 with zero capability credit. This is one product fix, zero closures and no
+delegated contribution. Waiting earns no credit. Real-work answers: (1) the two-minute demo
+is the five actual PNGs, not an unexecuted native window; (2) without process edits, pixels
+would be identical, but failure/task continuity would be lost; (3) formatting enables the
+required source gate, whose R174 check passes; (4) the older revival epic and native-world
+journey remain unfinished, while this owned P0 fixes a demonstrated dead consumer;
+(5) no active swarm or pane comparison applies; (6) no follow-up is minted, no original
+acceptance is removed and plan edits do not stand in for code. Verdict: HEALTHY for this
+bounded implementation block; keep subsequent effort on working frontend/persistence,
+rather than additional report machinery. Recovery of observed reset losses is minimum
+integrity work, not a second feature.
+
+Honesty inventory for this block, read back against final R174 receipts:
+1. No (checked: both source diffs, original tests, profile diff): no weakened/deleted/ignored test.
+2. No (checked: actual WorldState/HostCore, renderer/readback/PNG calls): no specialized mock.
+3. No (checked: changed path set and passing unchanged golden): no golden regeneration.
+4. Yes: stricter runtime fog validation and real tests land with the feature; the external
+   profile adds three probes to the prior thirteen commands. No guard, assertion, suppression,
+   threshold, deadline or failure conjunction is relaxed; the format failure stays failed.
+5. No (checked: both production consumers and code paths): no demo-specific success branch.
+6. No (checked: nonzero summaries and eighteen required completions): no zero-run test green.
+7. Yes: one progress line inferred the production fog step's success from later stages before
+   reading its own receipt. Its raw receipt immediately confirmed success; all later claims
+   bind each individual receipt. This inference was premature and is not evidence itself.
+8. No (checked: profile/report scope): software Vulkan offscreen is never native/hardware proof.
+9. No (checked: retained failed source verdict, outer receipt and custody correction): no buried failure.
+10. No (checked: command/log pairs and redirected full UBS output): cited stderr is retained.
+11. No (checked: canonical export delta): the original P0 remains in progress, with no closures.
+12. No (checked: unchanged original acceptance/matrix): no spec edit substitutes for acceptance.
+13–17. Not applicable to this solo block: no dispatch, delegated close, accepted peer evidence,
+   refusal-farming pane or agent-agreement credit. Existing agents are listed only to check
+   whether any remained active during checkout-reset diagnosis; all listed children completed.
+18. No (checked: frozen inputs/profiles): geometry and required names precede results; test
+   execution counts are observed scope, with failures/ignores and outer failure as countermetrics.
+19. Yes: formatting retries were avoidable; the depth-limited inventory omitted one already-
+   copied raw log; an escaped-shell process query failed read-only; and an uncommitted review
+   message briefly said "qualified formatting" before qualification. The layout is corrected,
+   full-depth hashes verified, query failure discarded and accurate "requested formatting"
+   message used. No failed record is deleted. External resets are recorded without attributing
+   them to an identified caller or to this agent.
+20. Strongest evidence is actual production PNG bytes plus raw GPU color/height/restore/error
+   assertions, initial science-digest equality and pinned source receipts. They are re-executable;
+   this is self-verification, with no independent verifier or original P0 closure.
+
+CASS: five bounded phrase searches plus this session's new fog-test name; five actual archive
+message-index followups, one truncated large source/golden excerpt, and no hit for the new
+fog name. Read excerpts include old status/source/help and an older authoring-only closure;
+they do not establish historical compliance or independent acceptance. No broad historical
+clearance is claimed. Disposition: premature status/custody/wording mistakes are corrected
+and disclosed here; RH-1/RH-2 countermeasures are unchanged goldens/guards, each receipt read
+individually, full-depth inventory, explicit software scope and preserved red results. No new
+governance artifact is created to turn these corrections into feature credit.
+
+Static UBS scans both changed Rust files: exit one, 22 critical / 1,547 warnings / 776 info.
+The sampled critical sites are old test panics and temporary-directory nonces, not newly
+introduced security tokens. No scanner suppression or test weakening is used. This is neither
+a clean scan nor an exhaustive findings audit; compiler/lint qualification is separate.
+Markdown/JSONL UBS invocations return three with no supported scanner; they are not passes.
+
+Creation worksheet: (1) this operator-requested granular TODO is PROCESS, while the runtime
+controls are FEATURE. (2) Consumer: the operator's explicit request for TODO/Beads continuity;
+publication gate: required pinned DSR checks. Actual defects: omitted settings, reversed
+gradient and mixed color spaces. Active entries retire on observed completion; historical
+evidence remains for review, and later deletion needs permission. (3) Exact-source profiles
+and raw custody prevent misattribution and preserve failures; required at this scale, existing
+files/hashes are minimal and there is no cheaper equally reliable replacement. (4) Highest
+local capability priority is this owned P0; the other P0 macOS exFAT incident needs its
+unavailable host. An extra hour of report machinery would deliver less value than these
+captures. Verdict: required gate and existing TODO only, zero process capability credit.
+
 Current GPU exposure wiring (`bd-2z0.7.11`):
 
 - [x] Initial inspection found that `post_process_stack` computed configured/daylight exposure,
