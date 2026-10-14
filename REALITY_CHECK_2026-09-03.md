@@ -1,6 +1,6 @@
-# Reality Check — rust_scriptbots — reassessed 2026-10-13
+# Reality Check — rust_scriptbots — reassessed 2026-10-14
 
-## Current assessment — 2026-10-13
+## Current assessment — 2026-10-14
 
 **This is a substantial deterministic simulator with real control, persistence, replay and
 research machinery. It is still an unfinished Evolution Lab. The remaining gap is the complete
@@ -8,7 +8,156 @@ user journey: a useful live frontend, a responsive durable run, a trustworthy co
 qualified scientific results and an independently verifiable release. The cinematic hardware-GPU
 meadow and durable browser laboratory also remain unfinished.**
 
-### Current implementation and granular TODO — 2026-10-13
+### Current implementation and granular TODO — 2026-10-14
+
+Current GPU exposure wiring (`bd-2z0.7.11`):
+
+- [x] Initial inspection found that `post_process_stack` computed configured/daylight exposure,
+  while both wgpu snapshot producers omitted it.
+- [x] Carry that resolved factor through live and offscreen GPUI snapshots; the offscreen
+  consumer is executed below, while native-window input/presentation remains unexecuted.
+- [x] Consume it in the frozen post controls, preserving environment fallback when omitted
+  (source inspection and actual pixel probes).
+- [x] Reject invalid factors before GPU submission; retain the last valid frame generation
+  (the negative runtime probe is executed below).
+- [x] Verify the actual snapshot producer, positive pixel change, same-input pixel restoration
+  and invalid-control negatives through pinned DSR, including workspace check/Clippy/fmt.
+- [x] Retain the complete source-bound results and publish the reviewed source change; Beads
+  retains the original in-progress acceptance and the actual run outcomes.
+- [ ] Meet original native/platform/framebuffer and capture-only-readback acceptance;
+  `bd-2z0.7.11` remains in progress.
+
+Source commits `d19006ed7c62`, `190f8342ef7a` and `6cafaf665f67` connect the
+existing producer and consumer and add actual-pixel probes. R169 stopped at formatting:
+typed source verdict `failed`, exit 1, one command and zero tests; outer DSR exit 6.
+All ten manifest entries and six state/raw/outer files were copied and hash-checked before
+the three reported Rustfmt changes were applied manually. No test, guard or deadline was
+weakened. The next profile, `scriptbots-exposure-r170-hz4`, binds source
+`6cafaf665f67b4fd840e2d4d1b871555ff19898d` and tree
+`0f35159550758e4b255967dd289251582953995f` to twelve commands and thirteen named probes.
+Its explicit software Vulkan scope does not satisfy native-window, hardware, performance or
+cross-platform acceptance. No passing R170 result is asserted here.
+
+R170 finished at 23:23:14 UTC: five checks passed, then the world-gfx suite reported
+49 passed / 2 failed / 0 ignored. The new exposure/restore/invalid test passed on
+`llvmpipe (LLVM 21.1.8, 256 bits)`, Vulkan, Mesa `26.0.8-1ubuntu0.3` (CPU device).
+The canonical reference hash differed (`0f2a8bd5…` versus committed `5ddbd6cc…`),
+then the sensing fault-injection test failed on the shared mutex poisoned by that panic.
+The profile incorrectly applied the isolated all-effects-off environment to the full suite;
+the golden provenance declares no post settings, so default-setting execution must establish
+whether that explains the mismatch. No hash regeneration or assertion edit was made.
+Typed source failed/1, world-gfx command 101/log 0, outer DSR 6, identity 0;
+later commands were unexecuted. All twenty manifest files, six state/raw/outer files and
+six command hashes were copied and recomputed; verdict SHA-256
+`13ef3ff86d851e408fde5198dd16c10fdfa6d8057703135a95a3fdd2ae1dc596`.
+R171 retains the same source/runner/seed and all original probes, runs the full world-gfx
+suite with default post settings and adds a separate all-effects-off exposure invocation.
+It executes all thirteen commands to expose later failures, but any failed command still
+fails the final typed verdict. Fourteen named completions are required. This sequencing
+admits additional diagnostic observations, never a passing result with a failed command.
+R171's full default-setting world-gfx suite reports 51 passed / 0 failed / 0 ignored,
+including the unchanged canonical hash; its separate all-effects-off exposure test reports
+1 passed / 0 failed. This observed split establishes the R170 configuration error without
+regenerating a golden or changing a test. Production GPUI capture and compiler checks remain
+pending at this observation.
+
+R171 finished at 23:42:21 UTC after all thirteen commands: twelve passed, while strict
+workspace Clippy rejected the new world-gfx RGB helper's constant `chunks_exact(4)`.
+Formatting, workspace all-targets check, analyzer build and all 56 scoped test executions passed
+(zero failures/ignores); all fourteen required named completions were read back.
+Typed source failed/1, Clippy command 101/log 0, outer DSR 6, identity 0. All 37 manifest
+files, six state/raw/outer files and thirteen command hashes were copied and recomputed;
+verdict SHA-256 `8464a9f15400802be31170450e3254885fbfcbaf4949416a0ed0ddfd3b0b8658`.
+The production capture's dim/default/bright RGB sums were 429,403 / 629,245 / 1,024,750,
+excluding alpha; all three 128×64 PNGs were viewed. They are small software offscreen
+initial-world captures, not a living native-window or hardware meadow proof.
+`748cedbffe8b6113930e499790ca787c7b0ab078` replaces both new RGB helpers with
+fixed-array iteration; the sampled channels, remainder handling and assertions are unchanged.
+R172 launches as PID 886549 with tree `46b54bdf1514c273fa150388cbed7fb0fe5baa81`,
+profile `scriptbots-exposure-r172-hz4` / version `exposure-20261013-748cedbf-r172-hz4`.
+Only source/tree/version/path bindings differ from R171; all thirteen commands, fourteen
+required completions, guards, deadlines, golden, runner and seed remain unchanged.
+R172 results are recorded below. Static exact-file UBS exits one with 22 critical, 1,481 warning
+and 772 informational findings; the existing test panic/temporary-name critical categories
+were reviewed, not silenced. This is not a clean or exhaustive UBS audit.
+
+**Exposure source qualification published, 2026-10-14:** R172 runs from 23:44:23 UTC on
+October 13 through 00:01:05 UTC on October 14, run
+`baff2173-5f38-4562-9b9d-637e761e30d6`. All thirteen command/log pairs pass, including
+workspace all-targets check, strict Clippy, formatting, four dependency guards and analyzer
+build. All fourteen required named completions and 56 scoped test executions pass, with zero
+failures or ignores. There are 55 unique test names: the exposure probe executes under both
+default and disabled post settings. Those two executions are not independent evidence.
+The typed source verdict is pass/0, SHA-256
+`84f7b0e0a7680cf0d7147056eea56ba1e12a0ee3f18dab18ca0ac15f640c841c`.
+All 37 manifest files, six state/raw/outer files and thirteen command hashes were copied and
+recomputed under `/data/tmp/scriptbots-cull-20261013-lilacelm/`. The three actual PNGs are
+byte-identical to the inspected R171 captures and retain the same brightness sums and initial
+science-digest equality. The first local custody reader reused a variable from the extracted
+profile reader and failed its outer-log lookup; separate namespaces correct it, and the
+complete readback passes without changing any product artifact or assertion.
+
+Outer DSR remains failed/6: its unchanged private-cache verifier rejects
+`git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md`, refuses artifact collection and
+reports no collected identity. Runner identity remains zero; outer log SHA-256
+`713be48a9b15f98bf19c7426d2ccce0cab8f8a28e37cc3f2603d253385de349a`.
+This is scoped source qualification, not an overall DSR/release, full-workspace test,
+native-window, hardware, cross-platform or independent acceptance pass. Both required remote
+references read back source `748cedbffe8b6113930e499790ca787c7b0ab078` after ordinary pushes
+at 00:03 UTC. The original P0 stays in progress; no acceptance or dependency is removed.
+
+**Bounded anti-ceremony review, exposure block 22:44–00:06 UTC:** README purpose is a faithful,
+deterministic evolution simulator with a GPU UI, pluggable brains and analytics. Actual
+four-commit inventory is USER 1 (`d19006ed`, exposure wiring plus probes), ENABLER 3
+(`190f8342`, production capture; `6cafaf66`, digest/formatting; `748cedbf`, strict-lint fix),
+PROCESS 0 / UNKNOWN 0 for source commits; pending report/Beads commits are PROCESS 2, not
+capability credit. There are zero closures and one product fix, not four features.
+Real-work worksheet: (1) two-minute demo is the three real production PNGs; a native-window
+demo is unexecuted. (2) Without process updates, pixels are unchanged; only task/failure
+continuity differs. (3) The actual capture and Clippy runs consume the enablers. (4) The older
+July 11 revival epic remains unfinished; this ready P0 fixes an existing dead exposure
+consumer. (5) Solo, no pane comparison applies. (6) No spec edits replace implementation and
+no follow-up is minted to close the original. Verdict: useful source progress, with costly
+formatter/profile/lint retries; stop machinery expansion and keep the next block on product.
+
+Honesty inventory, same bounded window:
+1. No (checked all four source diffs and R169–R172 profiles): no assertion/ignore deletion.
+2. No (checked both new tests): real WorldState/HostCore, production PNG and wgpu execution.
+3. No (checked source path set and the unchanged canonical hash): no golden regeneration.
+4. Yes: external R171 fixes profile scope and continues commands while retaining any failure
+   as final failed/1. Its actual Clippy failure proves it cannot promote a red command.
+5. No (checked source/fixture paths): no success hardcoding or denominator shrinkage.
+6. No (checked all fourteen named completions and nonzero test summaries): no zero-run green.
+7. No (checked raw receipts against claims): failed/pending and passing runs remain distinct.
+8. No (checked report/profile scope): CPU Vulkan captures are not native/hardware evidence.
+9. No (checked retained failures and paragraphs above): R169/R170/R171 and outer six persist.
+10. No (checked command/log channels): cited test stderr is retained.
+11. No (checked JSONL changes): no closure; original P0 acceptance stays open.
+12. No (checked plan/Bead acceptance): the original matrix is preserved.
+13–17. Solo: no dispatch, delegated closure, accepted agent report or agreement credit.
+18. No (checked frozen profiles): required commands/names predate results; observed test
+    totals are labelled scope, and failures/ignores are retained as countermetrics.
+19. Yes: the initial full-suite environment was wrong, formatting/lint retries were avoidable,
+    and the local readback variable collision cost a retry. All are disclosed and corrected.
+20. Strongest evidence: actual production PNG bytes plus source-bound pixel/digest assertions,
+    re-executable via the pinned profile; this is self-verification, not independent review.
+CASS's five bounded phrase queries plus the exposure query were followed up; the old hits
+were worksheet/search echoes and documentation/source excerpts, not misconduct observations.
+The large excerpt followups were truncated, so they do not establish full historical review.
+Initial physical-line followups used the wrong coordinate; installed `--message-index`
+readback corrects them. No broad
+historical clearance follows. Disposition: profile/readback mistakes corrected and disclosed;
+RH-1/RH-2 countermeasures are the unchanged golden, extra isolated probe, explicit software
+scope, failed-command conjunction and retained red results. No new governance artifact.
+
+R170 creation/continuation check: this existing TODO is process requested by the operator;
+the pinned DSR profile is the required consumer/gate before publishing the exposure fix.
+Its observed defect is R169's unexecuted pixel/compiler qualification. The TODO retires when
+its original acceptance is observed; proof snapshots remain only as minimum failure custody
+(required at this scale, existing raw files/hashes are sufficient, no cheaper reliable record).
+The highest-value ready work is the exposure consumer itself, already implemented; another
+hour of report machinery would deliver less value than finishing its real captures/checks.
+Verdict: use the existing report and minimum DSR profile, add no new governance machinery.
 
 Current map-placement work (`bd-2z0.10.7`):
 

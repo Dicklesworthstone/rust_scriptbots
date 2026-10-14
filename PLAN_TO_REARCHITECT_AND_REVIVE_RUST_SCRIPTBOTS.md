@@ -1804,6 +1804,14 @@ If the answer is no, stop investing in GPUI as the world renderer. It may remain
 
 ### 9.6 GUI acceptance matrix
 
+**[Currently In Progress] `bd-2z0.7.11`, 2026-10-14:** source `748cedbf` connects the existing
+snapshot-derived exposure factor to both GPUI wgpu consumers and frozen shader controls.
+R172 qualifies actual production offscreen brightness, same-input pixel restoration and
+invalid-multiplier refusal, plus all-target workspace check/strict Clippy/fmt (56 test executions,
+55 unique names, zero failures/ignores). Its typed source verdict passes; outer DSR still refuses cache
+collection. Original cross-platform, capture-only readback and native framebuffer acceptance
+remain open; these software Vulkan captures do not satisfy them.
+
 - native macOS explicit GUI launch;
 - Windows D3D12 launch;
 - Linux Vulkan launch with a clear explicit-mode headless failure and terminal preselection only in Auto;
