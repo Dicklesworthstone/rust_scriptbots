@@ -49,6 +49,25 @@ const MAX_JOURNAL_BYTES: usize = 1 << 30;
 // V6 binds all three typed existing-agent policies, including lifecycle culling.
 pub(super) const HOST_JOURNAL_ARCHIVE_VERSION: u32 = 6;
 
+/// Refusal reason for a journal archive written at another version. Older runs are refused, not
+/// converted (#6); the reason names the release that wrote the versions a user can still have, so
+/// they know which binary opens that run.
+pub(super) fn unsupported_archive_version_reason(version: i64) -> String {
+    let writer = match version {
+        3 => {
+            "; journal archive version 3 was written by rust_scriptbots v0.2.0: open this run with a v0.2.0 binary"
+        }
+        4 => {
+            "; journal archive version 4 was written by rust_scriptbots v0.3.0: open this run with a v0.3.0 binary"
+        }
+        5 => {
+            "; journal archive version 5 was written by an unreleased main build after v0.3.0: open this run with that build"
+        }
+        _ => "",
+    };
+    format!("unsupported version {version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}{writer}")
+}
+
 /// Bounded admission and catch-up limits for one HostCore journal adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageJournalOptions {
@@ -2197,10 +2216,7 @@ impl HostJournalArchive {
         if self.version != HOST_JOURNAL_ARCHIVE_VERSION {
             return Err(StorageError::InvalidData {
                 context: "host_journal_archive.payload_version",
-                reason: format!(
-                    "unsupported version {}, expected {HOST_JOURNAL_ARCHIVE_VERSION}",
-                    self.version
-                ),
+                reason: unsupported_archive_version_reason(i64::from(self.version)),
             });
         }
         if self.run_id != expected_run_id {
@@ -4020,6 +4036,38 @@ mod tests {
                     })
                 ),
                 "archive version {version} must be refused explicitly"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_version_refusal_names_the_release_that_wrote_it() {
+        let evidence = scheduled_patch_evidence();
+        for (version, writer) in [
+            (3, "written by rust_scriptbots v0.2.0"),
+            (4, "written by rust_scriptbots v0.3.0"),
+            (5, "written by an unreleased main build after v0.3.0"),
+        ] {
+            let mut stale = scheduled_archive(evidence.clone());
+            stale.version = version;
+            let Err(StorageError::InvalidData { context, reason }) = decode_test_archive(&stale)
+            else {
+                panic!("archive version {version} must be refused as invalid data");
+            };
+            assert_eq!(context, "host_journal_archive.payload_version");
+            assert!(
+                reason.starts_with(&format!(
+                    "unsupported version {version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}; "
+                )),
+                "{reason}"
+            );
+            assert!(reason.contains(writer), "{reason}");
+        }
+        for version in [2, HOST_JOURNAL_ARCHIVE_VERSION + 1] {
+            assert_eq!(
+                unsupported_archive_version_reason(i64::from(version)),
+                format!("unsupported version {version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"),
+                "no writer is named for a version no release wrote"
             );
         }
     }

@@ -476,6 +476,7 @@ use journal::{
     decode_command_envelope_postcard_hex, decode_host_command_postcard_hex, decode_journal_u64,
     encode_application_state_postcard_hex, encode_command_envelope_postcard_hex,
     encode_host_command_postcard_hex, encode_journal_u64, prepare_host_journal_archive,
+    unsupported_archive_version_reason,
 };
 use scriptbots_core::{
     AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainExecutionFault,
@@ -7632,9 +7633,7 @@ impl HostJournalPageMetadata {
         if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
             return Err(StorageError::InvalidData {
                 context: "host_journal_archive.payload_version",
-                reason: format!(
-                    "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
-                ),
+                reason: unsupported_archive_version_reason(payload_version),
             });
         }
         let payload_digest = decode(row, 2, "host_journal_archive.payload_digest")?;
@@ -14434,9 +14433,7 @@ fn read_host_journal_events(
             if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
                 return Err(StorageError::InvalidData {
                     context: "host_journal_archive.payload_version",
-                    reason: format!(
-                        "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
-                    ),
+                    reason: unsupported_archive_version_reason(payload_version),
                 });
             }
             let digest: String = decode(metadata, 2, "host_journal_archive.payload_digest")?;
@@ -16557,9 +16554,7 @@ impl Storage {
                 if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
                     return Err(StorageError::InvalidData {
                         context: "host_journal_archive.payload_version",
-                        reason: format!(
-                            "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
-                        ),
+                        reason: unsupported_archive_version_reason(payload_version),
                     });
                 }
                 let payload_digest: String = decode(row, 2, "host_journal_archive.payload_digest")?;
@@ -20297,9 +20292,7 @@ impl Storage {
             if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
                 return Err(StorageError::InvalidData {
                     context: "host_journal_archive.payload_version",
-                    reason: format!(
-                        "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
-                    ),
+                    reason: unsupported_archive_version_reason(payload_version),
                 });
             }
             let payload_digest: String = decode(row, 3, "host_journal_archive.payload_digest")?;
@@ -30350,6 +30343,13 @@ mod tests {
         Ok(())
     }
 
+    // A writer-lease child is a re-exec of this debug test binary that opens the storage engine.
+    // Under a loaded suite its startup can take longer than 10 s (#7: in a 3320 s v0.3.0 gate
+    // run at worker load ~13 the child missed the old 10 s readiness bound and was SIGKILLed;
+    // the same test passed alone in 19.7 s). A child that never becomes ready or never exits
+    // still fails the test, after this bound.
+    const WRITER_LEASE_CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
     struct WriterLeaseChild {
         child: Child,
     }
@@ -30359,7 +30359,7 @@ mod tests {
             &mut self,
             context: &str,
         ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + WRITER_LEASE_CHILD_DEADLINE;
             loop {
                 if let Some(status) = self.child.try_wait()? {
                     return Ok(status);
@@ -30426,7 +30426,7 @@ mod tests {
         child: &mut WriterLeaseChild,
         ready_path: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WRITER_LEASE_CHILD_DEADLINE;
         loop {
             if ready_path.try_exists()? {
                 return Ok(());
