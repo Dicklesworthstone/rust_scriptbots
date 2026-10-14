@@ -10,6 +10,63 @@ Repository: <https://github.com/Dicklesworthstone/rust_scriptbots>
 
 ---
 
+## [v0.4.0] - 2026-10-14
+
+Source release (GitHub Release notes, same venue as v0.3.0; no prebuilt binaries).
+230 commits since v0.3.0.
+
+### Compatibility: v0.2.0 and v0.3.0 run databases
+- **v0.4.0 cannot recover, replay or analyze a run database written by v0.2.0 or v0.3.0. No data is lost: keep a v0.2.0 or v0.3.0 binary to work with the runs it recorded.**
+  - Why: the host journal archive is now version 6. v0.3.0 wrote version 4 and v0.2.0 version 3. Archive versions are checked strictly, as in every release so far, and this release adds no reader for older versions ([#6](https://github.com/Dicklesworthstone/rust_scriptbots/issues/6)).
+    - Version 5 binds the explicit map placement policy in `ApplyMap` command evidence.
+    - Version 6 binds the typed existing-agent policy (retain, reposition to a safe tile, cull incompatible).
+  - Affected (unchanged from v0.3.0): `--recover-storage`, `--replay-db` on a journaled recording, `sb_analyze`, the `control_cli` domain-events export, and the library APIs that open a finished or existing run: `Storage`/`StoragePipeline` `append_run` and `recover_existing*`, `StorageReader::open_finished*`, and `scriptbots_analytics::ReaderCtx::open*`.
+  - Each of these refuses an older database before writing anything. The refusal now names the release that wrote it, for example `unsupported version 4, expected 6; journal archive version 4 was written by rust_scriptbots v0.3.0: open this run with a v0.3.0 binary`. The `--replay-db` hint points to that cause.
+  - Plain reads through `StorageReader::open` are unaffected.
+- The reverse also holds: v0.2.0 and v0.3.0 cannot read run databases written by v0.4.0 (archive v6).
+
+### Added
+- **Maps:**
+  - bounded sample-map generation through the controls;
+  - atomic wrapped agent placement;
+  - a typed policy for agents an applied map displaces: retain, reposition to a safe tile, or cull incompatible. The policy is carried through REST, MCP and replay, and a map apply is guarded by the scientific revision the caller observed.
+- **Checkpoints** capture and continue complete host sessions.
+- **Terminal:** the live science shell runs on FrankenTUI and honours `NO_COLOR`.
+- **Web:** the generated WASM is packaged and tested against a real Canvas consumer.
+- **Brains:** bounded inspection of Assembly working cells.
+
+### Changed
+- **The loopback control servers validate requests**, closing the three v0.2.0-era hardening items in #5:
+  - **Host/Origin.** REST, Swagger, streams, WebSocket upgrades and MCP HTTP accept only their bound authority (plus `SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES`). A browser `Origin` must be allowed (`SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS`), forwarded headers are refused, and a refused request gets HTTP 403.
+  - **Checkpoints.** Retention is bounded by `--checkpoint-max-count` and `--checkpoint-max-bytes` (defaults 256 and 256 MiB), shared by every producer. Once the quota is used, `POST /api/v1/checkpoints` returns HTTP 507.
+  - **Bundles.** `--create-bundle` exports only a finished, checkpointed database. It refuses a live run, unfinished persistence, non-empty WAL/journal files and changed or aliased source paths. `--verify-bundle` repeats those checks.
+- MCP HTTP, WebSocket commands and the initial summary scans run off the async workers.
+- **Rendering:** configured fog is connected, its height gradient corrected, and configured exposure reaches wgpu frames.
+
+### Fixed
+- **Replay:**
+  - map commands at the same tick keep their flush order, and apply before a recorded cut is sealed;
+  - every completed host cadence batch anchors replay;
+  - anchors resolve at disabled recording boundaries.
+- **Checkpoints:** handoffs keep recording gaps, sealed owner boundaries, the schedule cursor and the payload-free persistence boundary. A flush that would exceed capacity is refused before admission.
+- **Terminal:** commands, receipts, selections and shutdown results are presented exactly as the owner reported them.
+- **Storage:** WAL checksums are validated as typed word pairs, bundle copy leases are held through publication, and sensing reproducibility is kept separate from build provenance.
+- The writer-lease process tests give their child process 60 s instead of 10 s to become ready or exit. A loaded gate host exceeded the old bound ([#7](https://github.com/Dicklesworthstone/rust_scriptbots/issues/7)).
+
+### Security
+- rustls 0.23.46 (RUSTSEC-2026-0346..0349). This is a lockfile-only bump from 0.23.45.
+
+### Known issues
+- No reader for journal archives from earlier releases (#6); see Compatibility.
+- `--replay-db` on a journaled recording whose server did not shut down cleanly needs `--recover-storage` first.
+- `--replay-db` refuses a recording whose islands exchanged migrants (archipelago runs), with a clear error.
+- `cargo audit` ignores RUSTSEC-2026-0194/0195 (quick-xml 0.39.4 via `fnx-readwrite`). No compatible fixed version exists, and XML parsing on those paths runs only in tests, on the crate's own output.
+- RUSTSEC-2026-0344 (ruzstd 0.8.3, a zstd decompression bomb) applies only to builds with the optional `bevy_render` feature, through bevy 0.17's `bevy_image`. Default builds of `scriptbots-app` and `scriptbots-analytics` do not link ruzstd. The fix is ruzstd 0.9.1, which bevy 0.17 cannot take.
+- Workspace member crates other than `scriptbots-runtime` and `scriptbots-index` keep their own `0.1.0` package versions. Those two inherit the workspace version, now 0.4.0. The release version is the workspace version and tag.
+- No other dependency refresh in this release: the gate ran on the shipped lockfile before the rustls patch bump above.
+
+---
+
 ## [v0.3.0] - 2026-10-08
 
 Source release (GitHub Release notes, same venue as v0.2.0; no prebuilt binaries).
