@@ -10,6 +10,217 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Durable outbox continuation (`bd-50bg`, 2026-10-14):
+
+- [x] Read current P0/storage evidence: file read-cost code is implemented; memory commit
+  growth is upstream-owned. Identify the local outbox's plain write-ahead copy.
+- [x] Claim the existing bead and reserve the exact source/report/export paths.
+- [x] Implement physical compression only when smaller, retaining logical JSON/BLAKE3
+  identities, schema, indexes, scientific rows and all three watermarks.
+- [x] Implement and execute bounded, canonical decoding with planted corruptions.
+- [x] Execute the actual codec and file admission, same-identity retry, changed-payload
+  refusal, mixed plain/compressed recovery and no-partial-replay corruption probes.
+- [x] Execute the strengthened specific upper-bound rejection at the corrected source.
+- [x] Execute the full storage suite, workspace compiler/strict Clippy/format and four
+  dependency guards through a clean pinned DSR profile; retain failed attempts.
+- [x] Read back exact source, logs, named test completions, byte counts and retained hashes.
+- [x] Prepare reviewed implementation and tracked TODO/Beads for publication, with original
+  acceptance unchanged and failed full qualification disclosed.
+- [ ] Resolve the observed writer-lease readiness and persistence-admission failures and
+  obtain full storage qualification without weakening their guards or deadlines.
+- [ ] Meet original live incumbent/candidate DSR throughput acceptance before claiming a
+  speedup or closing the broader bead.
+
+Creation worksheet: encoding is FEATURE; this requested TODO and required DSR profile are
+PROCESS/ENABLER. Consumer is the operator and source publication, gate is tracked delivery
+with mandatory checks, observed defect is bd-50bg comment 2560's large plain outbox copy.
+Entries retire on observed completion. Existing minimal source/log custody protects against
+observed external resets, is necessary, is the smallest reliable mechanism and has no cheaper
+equal replacement. The macOS P0 requires a separate host-specific proof; this is an actionable
+durable-run slice, not evidence that that host is currently unreachable. More report machinery
+would delay delivery. Verdict: minimum tracking and
+validation, zero process capability credit.
+
+Source-only checkpoint: local `276716ef64aecc16bc46331463c32f199e5c12d3` /
+tree `372aceb2219471877f0724c1363ffb0f8522aec5` adds physical
+`deflate-json-v1:<length>:<base64>` copies, only when smaller, with a 256 MiB expansion
+limit. Larger explicitly admitted payloads remain plain JSON. Logical v4/BLAKE3 identity
+and host-journal links stay unchanged. Four old semantic-corruption tests decode the new
+representation before applying their same rehashed corruptions; no assertion is relaxed.
+R177 is launched as PID 202806 with hash-matched source/profile/launcher and requires 11
+command pairs and 16 named completions. Its formatting check fails on two line wraps;
+manual formatting-only `c60869db4049302ad1fd5f5f7555a53337258ec6` /
+tree `88959ffc10c74717e2a1800549f51161f7ca12ca` corrects them. Dependency guards pass;
+runtime tests remain unexecuted at this checkpoint. Precommit static UBS exits one with
+one critical / 1,914 warnings / 707 info; critical context is the unchanged deliberately
+caught public reaper-poison test hook. No scanner-clean or performance claim.
+
+External resets at 13:34:09 and 13:35:35 UTC move the shared tree to origin/main and discard
+the uncommitted tracking edits. Caller is unknown. After a conflict-free lease/readback,
+ordinary `git merge --ff-only c60869db...` restores both reviewed commits at 13:36:44–46;
+the nine foreign untracked WAL directories are preserved. Beads still retains the claim and
+comment 2817; tracking prose is manually reconstructed. The separate pinned DSR copy is
+unaffected. The new upper-limit negative is strengthened to observe the specific bound
+rejection before valid compressed bytes are decoded; this test edit is source-only.
+
+R177's isolated codec executes 1/0/0 and the two real file cases execute 2/0/0 at the
+original source. Logical JSON is 223,821 bytes; stored copies are 6,939 / 6,919 bytes.
+The file probe compares all rows in six nonempty science tables against an ordinary applied
+oracle, including 512 agent rows and 128 exact interaction values, checks unchanged retries
+and changed-payload refusal, completes all watermarks and compacts the recovered outbox.
+The corrupt-second-batch case refuses before any science replay and retains both outbox
+rows and zero application/durability prefixes. These are constructed recovery workloads,
+not a natural 5k server or throughput comparison. Full storage is still in progress.
+Corrected source `d71c03a00f87c3317e8a0327e925c7f649b18a3c` /
+tree `a53c64df1c374f7e0a47ab13370e478c5b5d6145` retains both formatting fixes and
+adds the specific upper-bound negative. R178 transport/source/profile hashes match;
+it is prepared, not launched. Source publication and final qualification are pending.
+Upstream issue 494 remains open; its referenced
+[89b79b7 prerequisite](https://github.com/Dicklesworthstone/frankensqlite/commit/89b79b71740795e27a156e878d63153b526a71d4)
+explicitly leaves the connection snapshot/mirror consumers unwired and claims no SQL win.
+Issue 496 also remains open. No speculative dependency bump is credited as a fix.
+
+R177 finishes at 14:35:50 UTC, run `04e3c80d-9dd2-42b6-bce4-4029ceeaac38`, with
+typed source `failed`/1 and containing DSR 6 / final runner identity 0. All eleven command
+pairs complete: nine pass; formatting exits one and full storage exits 101. The storage
+library observes 264 passed / 3 failed / 1 existing ignore in 2,877.71 seconds. Its failures
+are checkpoint same-tick later-control/Shutdown startup acknowledgement at 120 seconds,
+analytics-publication fault command stuck at journal Pending, and the forced-child writer
+lease timeout during expect-open. Default Cargo stops before the fifteen integration targets
+declared by the actual source files. Compiler, strict Clippy, analyzer and four guards pass;
+the existing proc-macro-error2 future-compatibility warning remains. No full qualification.
+Completed storage log SHA256 `fa2b522c0d50342a1faad3260219a18ef401a0305388dcf45fabd28ce0d9f690`
+matches independently after copying. Source verdict SHA256
+`4d7787a3236d0461a14071b849089de4d6253188116c2798720046cfc43a81e7`;
+outer log `df3fa3344dca23a9d20f4f8b33076ae8d099cc339e2090bbadd7ad65e2333948`.
+The outer failure follows the failed source prefix; this attempt does not reach final cache
+collection. At 14:06:39, a storage thread waits in `folio_wait_bit_common`, with host I/O
+some/full avg60 pressure 73.54/71.54 percent and 109 GiB free disk. That observation does not
+establish the root cause. Other workers are checked: hz1/hz2 are 98%/97% disk full, while hz3
+has about 80% I/O pressure. No cleanup, other-process termination or timeout changes occur.
+
+The actual subprocess log also exposes the pretty-text observer's false negative: parent
+abrupt-process recovery completes, but its `ok` attaches to the second child header. Its
+named completion therefore cannot be inferred reliably with the inherited line reader.
+Prepared R178/R179 remain unexecuted and retained. Final R180 uses the same sixteen required
+names, eleven required commands and 7,200-second deadline, with Cargo `--no-fail-fast` and
+the pinned Rust libtest's structured start/completion/suite events. The reader reconciles
+actual terminal counts and rejects failed, missing, duplicate, truncated, embedded-fake and
+zero-run results. Two positive fixtures (ordinary and subprocess-prefixed completion), seven
+named-result negatives and four invalid-suite cases are checked before launch; the old pretty
+log remains inadmissible, not retroactively relabeled. This is observer repair, with no test,
+deadline, source criterion, production gate, pin or golden weakened. Fixture checks alone do
+not qualify the source. R180 starts as PID 2013551 on clean `d71c03a0` after complete transport
+hash checks. Formatting and four guards pass, the strengthened codec test passes 1/0/0, and
+the two real-file tests pass 2/0/0; full default storage is running at this checkpoint.
+
+R180 finishes at 16:04:11 UTC, run `5db80cef-c7a3-4637-a59b-aff0e631321e`, on
+clean `d71c03a00f87c3317e8a0327e925c7f649b18a3c`. Ten of eleven command pairs pass:
+formatting, four dependency guards, both focused selections, workspace check, strict Clippy
+and the analytics binary build. Full storage exits 101, observing **372 passed, 2 failed,
+5 existing ignored**, with all fifteen integration binaries and doc tests attempted.
+The library's writer-lease graceful-exit test fails its existing ten-second child-readiness
+wait. The ancestry rebuild integration fails at tick 194 on an Indeterminate admission
+acknowledgement after 120 seconds, before comparing graphs. This is a persistence failure,
+not evidence of unequal ancestry graphs. No root cause or attribution to this patch is
+established. A sampled owner thread later waits in `jbd2_log_wait_commit`; host I/O pressure
+is an observation, not a reason to relabel either failure. No test, timeout, ignore, schema,
+index, pin, assertion or golden is relaxed. The original performance bead stays in progress.
+
+All sixteen required named completions are observed in the structured logs, including the
+successful parent abrupt-exit test whose pretty output was ambiguous in R177. An independent
+readback of the frozen reader rejects the full failed suite; the source profile does not
+run its final success validator after a nonzero command. Typed source verdict is `failed`/1;
+containing DSR exits 6, final frozen-runner identity is 0 and collection identity is null.
+This failure occurs at the source prefix, before final cache collection. These observations
+are solo re-verification, not an independent agent's acceptance or a full DSR pass.
+
+Retained local custody is `/data/tmp/scriptbots-cull-20261013-lilacelm/`:
+R177's `outbox-20261014-276716ef-r177-hz4/` and `r177-state/`; R180's
+`r180-custody/proof/`, `r180-custody/state/` and `r180-custody/launch-outbox-r180.log`.
+R177 readback verifies 1,881 manifest entries / 165,726,038 bytes; R180 verifies
+2,595 / 205,863,751 bytes, every eleven command/log hash pair, five full-depth state files,
+five latest duplicates, source/tree/profile identities and empty dirty-state files.
+R180 verdict SHA256 `6f77086c793712f076759e662971aa4dfb59e96daba557dc0692a18e5b04e575`;
+outer log `6031b066e139957cbcd61e452c448a7dab417f20ef867dff8759b30aa60b8fc7`;
+artifact inventory `3ed2090d787d3479a9676cd4bc6ec2a99f94891f7b335773324de91ad0295d3e`;
+state inventory `298dd48dd059963af1c2b391dde82d8d5c12244b8e69103893af6b415626e581`.
+Prepared R178/R179 are retained and never credited as executions. No TPS measurement or
+speedup claim is made. The 32 MiB Cargo test stack remains the existing proof configuration;
+this run does not establish production two-MiB reader-stack behavior.
+
+Real-work worksheet, this outbox work block: README purpose is a faithful, deterministic
+evolution simulator with GPU UI, pluggable brains and first-class analytics. Actual last
+three source commits are one USER implementation (`276716ef`) and two ENABLER corrections
+(`c60869db`, `d71c03a0`). This report/plan and Beads handoff are two PROCESS units, not
+capability. Tally: USER 1, ENABLER 2, PROCESS 2, UNKNOWN 0; no bead closed.
+Q1: demo the admitted file copy and its exact recovered science rows; the tested payload
+shrinks from 223,821 bytes to 6,939/6,919. Publication is still the final handoff step.
+Q2: omitting tracking would not change those bytes; it would hide incomplete qualification
+and violate the operator's requested TODO. Q3: real file recovery and the corrected DSR
+formatter/upper-bound probe consume the enablers. Q4: oldest open item is `bd-2z0`, the
+Evolution Lab (2026-07-11); this local durable-run improvement supports it, while native,
+browser and scientific release acceptance remains open. Q5: N/A, this block is solo.
+Q6: no plan substitution or follow-up laundering; original criteria and dependencies remain.
+Verdict: **DRIFTING**. Repeated proof copying, reader preparation and private rumination
+cost too much time after the implementation; commentary also exceeded the sixty-second
+cadence repeatedly. Correction: finish this concrete handoff, freeze further observer/profile
+work and avoid another full rerun without a diagnosed defect. Waiting earns no capability.
+
+Honesty inventory, this outbox block, reviewed source diff `276716ef^..d71c03a0`, three
+commit stats, reflog, both completed source/outer artifacts and the original bead:
+
+1. No (checked: full source/test diff; four existing corruption assertions remain, no new
+   ignore or deadline; no workflow/lint/test configuration changes).
+2. No (checked: actual file admission/recovery against an ordinary applied memory oracle;
+   the constructed batch is labeled, and decoder fixtures are only reader checks).
+3. No (checked: all changed paths; no golden or snapshot changes).
+4. Yes: the external named-test observer changed after the actual parent/child pretty-output
+   false negative. Corrected with pinned libtest structured events, the same sixteen names,
+   terminal-count reconciliation and rejection fixtures; failed suites still reject. This
+   is disclosed here, not a test relaxation. No suppression, bypass or widened tolerance.
+5. No (checked: production encode/decode/stage call sites; no benchmark or demo detection).
+6. No (checked: focused selections execute one and two tests; full count comes from actual
+   terminal events; empty benchmark/doc binaries receive zero capability credit).
+7. No (checked: source/profile transport and completed command/log pairs; R178/R179 are
+   explicitly unexecuted; mandatory checks pass, full storage fails).
+8. No (checked: constructed byte probes have no natural-run/TPS/native claim; solo evidence
+   is not independent verification).
+9. No (checked: both failed attempts retained, latest two failures and unchanged critical
+   UBS finding disclosed; no full qualification or scanner-clean summary).
+10. No (checked: raw DSR command logs retain stdout/stderr; local readback only bounds
+    display, it does not modify or discard the underlying evidence).
+11. No (checked: bd-50bg remains in progress; zero closures and no new follow-up bead).
+12. No (checked: plan records observed implementation and pending qualification; original
+    scientific, throughput and broader frontend criteria are unchanged).
+13. N/A: no agent delegation or peer closure in this block.
+14. N/A: no subagent dispatched in this block.
+15. N/A: no subagent report accepted in this block.
+16. N/A: solo block; no pane-close metric or refusal farming credited.
+17. No (checked: byte counts and hashes read from actual artifacts; no agent agreement used).
+18. No (checked: predefined payload/workload and exact source's integration roster; no
+    speed denominator selected after observing results).
+19. Yes: R177 launched with two formatting defects, repeated evidence handling and long
+    private-analysis gaps delayed delivery. An initial scanner shell status was masked by
+    a trailing file-existence check; the recorded precommit scans were rerun with actual
+    UBS exit one. Read-only script/JSON errors were corrected; failed/partial observations
+    were never promoted. This is wasted effort and poor update cadence, disclosed here.
+20. Strongest evidence: actual compressed file recovery preserves every value in six
+    nonempty science tables, stable retry IDs and all three watermarks, while a corrupt
+    second batch refuses before application. Re-executable at d71c03a0 via the retained
+    pinned profile; the full qualification still fails and must also be retained.
+
+Historical CASS check: six workspace-scoped lexical queries (five inventory prompts plus
+`compressed_outbox`), two-hit bounds, followed with bounded view windows. The returned
+September sessions contain prior proof-scope cautions and storage investigations; some
+large windows truncate. This is limited historical context, not an exhaustive clean audit
+or execution of today's code. Disposition for 4/19: corrected in place where possible,
+failure chain disclosed, with countermeasures RH-1 (retain negative controls and original
+names), RH-2/PL-2 (constructed probes do not become throughput/full proof), SM-11 (retain
+first failures), RH-4/SM-1 (no credit for correction commits), and the machinery freeze
+above. Past time and missed updates cannot be recovered. The report's pending qualification
+is explicit; no self-certification or independent verifier is claimed.
+
 Bloom/vignette continuation (`bd-2z0.7.11`, 2026-10-14):
 
 - [x] Confirm both GPU producers omit resolved bloom/vignette settings and the frontend

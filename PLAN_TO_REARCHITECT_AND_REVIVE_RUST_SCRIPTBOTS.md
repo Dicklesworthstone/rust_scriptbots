@@ -1461,6 +1461,14 @@ Empty-versus-empty is reported as `NoEvidence`, never “matched.”
 
 ### 7.5 bounded storage worker
 
+Outbox representation [Currently In Progress — bd-50bg, LilacElm, 2026-10-14]:
+retain canonical logical payload/BLAKE3 identities and scientific rows while compressing the
+database's write-ahead copy only when it saves bytes. At `d71c03a0`, bounded decoding and
+mixed-representation file recovery pass; workspace check, strict Clippy, formatting and four
+dependency guards pass in pinned DSR. Full storage observes 372 passed / 2 failed / 5 existing
+ignored: writer-lease readiness and persistence-admission timeouts remain unresolved. Full
+qualification and original live A/B throughput acceptance remain open; no speedup is claimed.
+
 **Status:** [Currently In Progress — durable file outbox, BLAKE3 batch identities, monotonic admitted/applied/durable watermarks, OS companion-file writer lease, ordered/idempotent recovery, controller deadlines with supervised shutdown ownership, and process-exit/rollback/ordering/duplicate proofs are integrated under `bd-2z0.8.9.4`; exact descriptor-bound recovery identity and structural-schema proof is completed under `bd-2z0.8.9.4.2`; direct-write/root-cause unification is completed under `bd-2z0.8.9.4.4` at `60e06b3` with DSR format, UBS, focused-test, workspace-check, strict-Clippy, and workspace-test proof (TopazCastle, 2026-07-15); DuckDB closure, dead-edge cleanup, and active-contract updates are completed under `bd-2z0.8.9.9` (CalmMink, 2026-07-17); durability/retry/rollback/concurrent-read proofs are completed under `bd-2z0.8.9.7` and the mock-free terminal-to-replay E2E with production Action/WorldDigest instrumentation is completed under `bd-2z0.8.9.8` (CalmMink, 2026-07-17); queue telemetry, byte/time bounds, and strict-run pause/fail-closed policy remain open]
 
 The current unbounded storage channel carrying cloned full batches can exhaust memory. The new worker uses:
