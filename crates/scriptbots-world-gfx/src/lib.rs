@@ -1099,7 +1099,9 @@ mod capture_smoke_test {
             snapshot.bloom = Some(bloom_off);
             snapshot.vignette = None;
             let frame = renderer.render(&snapshot).expect("raw vignette frame");
-            renderer.copy_to_readback(&frame).expect("raw vignette copy");
+            renderer
+                .copy_to_readback(&frame)
+                .expect("raw vignette copy");
             let view = renderer.mapped_rgba().expect("raw vignette pixels");
             assert!(rgb_sum(view.bytes()) < sums[0]);
             eprintln!("raw vignette fallback exercised independently");
@@ -1148,7 +1150,9 @@ mod capture_smoke_test {
         snapshot.bloom = Some(bloom_off);
         snapshot.vignette = Some(vignette_off);
         let frame = renderer.render(&snapshot).expect("post recovery frame");
-        renderer.copy_to_readback(&frame).expect("post recovery copy");
+        renderer
+            .copy_to_readback(&frame)
+            .expect("post recovery copy");
         assert_eq!(
             renderer
                 .mapped_rgba()

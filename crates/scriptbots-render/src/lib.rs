@@ -18951,15 +18951,7 @@ mod command_characterization_tests {
         const SIZE: (u32, u32) = (128, 64);
         let mut pixels = Vec::new();
         let mut world_digest = None;
-        for (
-            bloom_enabled,
-            intensity,
-            threshold,
-            vignette_enabled,
-            strength,
-            smoothness,
-            name,
-        ) in [
+        for (bloom_enabled, intensity, threshold, vignette_enabled, strength, smoothness, name) in [
             (true, 0.0, 0.0, true, 0.0, 0.0, "post-off.png"),
             (true, 0.25, 0.0, true, 0.0, 0.0, "bloom-low.png"),
             (true, 0.75, 0.0, true, 0.0, 0.0, "bloom-high.png"),
@@ -18991,7 +18983,9 @@ mod command_characterization_tests {
                 ..RenderPostSettings::default()
             });
             let world = WorldState::new(config).expect("post world");
-            let digest = world.world_digest_v1().expect("initial post science digest");
+            let digest = world
+                .world_digest_v1()
+                .expect("initial post science digest");
             if let Some(expected) = &world_digest {
                 assert_eq!(&digest, expected);
             } else {
@@ -19005,7 +18999,10 @@ mod command_characterization_tests {
             let actual = RenderFrame::from_snapshot(&snapshot, ColorPaletteMode::Natural)
                 .expect("published post frame");
             assert_eq!(actual.gpu_bloom_controls(), expected.gpu_bloom_controls());
-            assert_eq!(actual.gpu_vignette_controls(), expected.gpu_vignette_controls());
+            assert_eq!(
+                actual.gpu_vignette_controls(),
+                expected.gpu_vignette_controls()
+            );
             assert_eq!(
                 actual.gpu_bloom_controls().intensity,
                 if bloom_enabled { intensity } else { 0.0 }
