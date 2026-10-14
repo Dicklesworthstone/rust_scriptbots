@@ -34513,6 +34513,22 @@ mod tests {
             .ok_or("missing prefix")?
             .split_once(':')
             .ok_or("missing length")?;
+        let oversized = format!(
+            "deflate-json-v1:{}:{encoded}",
+            MAX_HOST_JOURNAL_ARCHIVE_BYTES + 1
+        );
+        let error = outbox_encoding::decode(&oversized)
+            .expect_err("the expansion bound must reject before decoding valid deflate data");
+        assert!(
+            matches!(
+                error,
+                StorageError::InvalidData {
+                    context: "storage_outbox.payload.encoding",
+                    ref reason,
+                } if reason.contains("is outside 1..=")
+            ),
+            "{error}"
+        );
         let mut invalid = vec![
             "deflate-json-v1:missing-separator".to_owned(),
             "deflate-json-v1:0:AAAA".to_owned(),
