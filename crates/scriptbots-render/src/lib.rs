@@ -14314,13 +14314,11 @@ fn post_process_stack(
         RenderFogMode::Medium => 0.14,
         RenderFogMode::High => 0.24,
     };
-    let fog_color = fog
-        .and_then(|settings| settings.color)
-        .unwrap_or_else(|| {
-            atmosphere
-                .fog_srgb
-                .map(scriptbots_world_gfx::srgb_component_to_linear)
-        });
+    let fog_color = fog.and_then(|settings| settings.color).unwrap_or_else(|| {
+        atmosphere
+            .fog_srgb
+            .map(scriptbots_world_gfx::srgb_component_to_linear)
+    });
 
     let temperature = match palette {
         ColorPaletteMode::Natural => 0.07 - night * 0.13 - life_delta * 0.05,
@@ -14435,10 +14433,12 @@ impl RenderFrame {
             .passes
             .iter()
             .find_map(|pass| match pass {
-                PostProcessPass::Fog { strength, color } => Some(scriptbots_world_gfx::FogControls {
-                    strength: *strength,
-                    color_linear: *color,
-                }),
+                PostProcessPass::Fog { strength, color } => {
+                    Some(scriptbots_world_gfx::FogControls {
+                        strength: *strength,
+                        color_linear: *color,
+                    })
+                }
                 _ => None,
             })
             .unwrap_or(scriptbots_world_gfx::FogControls {

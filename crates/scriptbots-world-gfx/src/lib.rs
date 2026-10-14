@@ -877,9 +877,14 @@ mod capture_smoke_test {
         {
             snapshot.fog = None;
             let frame = renderer.render(&snapshot).expect("environment fog frame");
-            renderer.copy_to_readback(&frame).expect("environment fog copy");
+            renderer
+                .copy_to_readback(&frame)
+                .expect("environment fog copy");
             assert_ne!(
-                renderer.mapped_rgba().expect("environment fog pixels").bytes(),
+                renderer
+                    .mapped_rgba()
+                    .expect("environment fog pixels")
+                    .bytes(),
                 captures[0]
             );
         }
@@ -908,9 +913,14 @@ mod capture_smoke_test {
             color_linear: [0.25, 0.0, 0.0],
         });
         let frame = renderer.render(&snapshot).expect("recover after bad fog");
-        renderer.copy_to_readback(&frame).expect("recovered fog copy");
+        renderer
+            .copy_to_readback(&frame)
+            .expect("recovered fog copy");
         assert_eq!(
-            renderer.mapped_rgba().expect("recovered fog pixels").bytes(),
+            renderer
+                .mapped_rgba()
+                .expect("recovered fog pixels")
+                .bytes(),
             captures[0]
         );
     }
@@ -4675,7 +4685,11 @@ impl PostFx {
             ),
             fog_density: controls.fog_strength.unwrap_or(controls.fog_density),
             fog_enabled: u32::from(controls.fog_enabled)
-                * if controls.fog_strength.is_some() { 2 } else { 1 },
+                * if controls.fog_strength.is_some() {
+                    2
+                } else {
+                    1
+                },
             fog_color: controls.fog_color,
             _pad0: 0.0,
         };
