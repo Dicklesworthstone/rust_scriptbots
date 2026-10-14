@@ -34491,7 +34491,10 @@ mod tests {
         assert_eq!(outbox_encoding::decode(&stored)?, plain);
         for representation in [&plain, &stored] {
             let decoded = StorageBuffer::decode_outbox(representation, run, 1, &digest)?;
-            assert_eq!(decoded.encode_outbox(run, 1)?, (plain.clone(), digest.clone()));
+            assert_eq!(
+                decoded.encode_outbox(run, 1)?,
+                (plain.clone(), digest.clone())
+            );
             assert_invalid_data_context(
                 StorageBuffer::decode_outbox(representation, RunId::new(2), 1, &digest),
                 "storage_outbox.payload.run_id",
@@ -34514,7 +34517,10 @@ mod tests {
             "deflate-json-v1:missing-separator".to_owned(),
             "deflate-json-v1:0:AAAA".to_owned(),
             "deflate-json-v1:-1:AAAA".to_owned(),
-            format!("deflate-json-v1:{}:AAAA", MAX_HOST_JOURNAL_ARCHIVE_BYTES + 1),
+            format!(
+                "deflate-json-v1:{}:AAAA",
+                MAX_HOST_JOURNAL_ARCHIVE_BYTES + 1
+            ),
             "deflate-json-v1:4096:not_base64!".to_owned(),
             "deflate-json-v1:4096:bm90IGRlZmxhdGU=".to_owned(),
             format!("deflate-json-v1:{}:{encoded}", plain.len() - 1),
