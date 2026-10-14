@@ -476,6 +476,7 @@ use journal::{
     decode_command_envelope_postcard_hex, decode_host_command_postcard_hex, decode_journal_u64,
     encode_application_state_postcard_hex, encode_command_envelope_postcard_hex,
     encode_host_command_postcard_hex, encode_journal_u64, prepare_host_journal_archive,
+    unsupported_archive_version_reason,
 };
 use scriptbots_core::{
     AgentRngCounterStateV1, AgentState, AgentUid, BirthOrigin, BirthRecord, BrainExecutionFault,
@@ -7632,9 +7633,7 @@ impl HostJournalPageMetadata {
         if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
             return Err(StorageError::InvalidData {
                 context: "host_journal_archive.payload_version",
-                reason: format!(
-                    "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
-                ),
+                reason: unsupported_archive_version_reason(payload_version),
             });
         }
         let payload_digest = decode(row, 2, "host_journal_archive.payload_digest")?;
@@ -14434,9 +14433,7 @@ fn read_host_journal_events(
             if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
                 return Err(StorageError::InvalidData {
                     context: "host_journal_archive.payload_version",
-                    reason: format!(
-                        "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
-                    ),
+                    reason: unsupported_archive_version_reason(payload_version),
                 });
             }
             let digest: String = decode(metadata, 2, "host_journal_archive.payload_digest")?;
@@ -16557,9 +16554,7 @@ impl Storage {
                 if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
                     return Err(StorageError::InvalidData {
                         context: "host_journal_archive.payload_version",
-                        reason: format!(
-                            "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
-                        ),
+                        reason: unsupported_archive_version_reason(payload_version),
                     });
                 }
                 let payload_digest: String = decode(row, 2, "host_journal_archive.payload_digest")?;
@@ -20297,9 +20292,7 @@ impl Storage {
             if payload_version != i64::from(HOST_JOURNAL_ARCHIVE_VERSION) {
                 return Err(StorageError::InvalidData {
                     context: "host_journal_archive.payload_version",
-                    reason: format!(
-                        "unsupported version {payload_version}, expected {HOST_JOURNAL_ARCHIVE_VERSION}"
-                    ),
+                    reason: unsupported_archive_version_reason(payload_version),
                 });
             }
             let payload_digest: String = decode(row, 3, "host_journal_archive.payload_digest")?;
