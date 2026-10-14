@@ -12019,8 +12019,9 @@ pub struct RenderBloomSettings {
     /// Enable/disable the bloom passes.
     #[serde(default = "default_post_effect_enabled")]
     pub enabled: bool,
-    /// Luminance threshold above which texels contribute; None uses the
-    /// frontend default for the active quality tier.
+    /// Peak linear RGB threshold above which texels contribute in the wgpu
+    /// bloom extraction pass, in `[0, 16]`; None uses the frontend default.
+    /// The CPU canvas bloom approximation does not sample framebuffer texels.
     #[serde(default)]
     pub threshold: Option<f32>,
     /// Bloom blend intensity in `[0, 1]`; None uses the tier default.
