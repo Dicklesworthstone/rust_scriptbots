@@ -5035,10 +5035,22 @@ impl Renderer for GuiRenderer {
         prepare_linux_gui_backend();
         let control_health: scriptbots_render::GuiHealthProbe =
             Arc::new(ctx.control_runtime.health_probe());
+        let map_control = ctx
+            .control_runtime
+            .control_handle()
+            .ok_or_else(|| anyhow!("native map editor requires the owner control adapter"))?;
+        let map_apply: scriptbots_render::MapApplySubmit =
+            Arc::new(move |artifact, policy, expected| {
+                map_control
+                    .apply_map(artifact, policy, Some(expected.get()), None)
+                    .map(|status| status.command_id)
+                    .map_err(|error| error.to_string())
+            });
         run_demo(
             ctx.host,
             ctx.analytics.clone(),
             Arc::clone(&ctx.command_submit),
+            map_apply,
             control_health,
         )
         .map_err(anyhow::Error::new)
