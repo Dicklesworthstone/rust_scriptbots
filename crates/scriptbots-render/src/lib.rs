@@ -14630,6 +14630,7 @@ struct AgentRenderData {
     trait_sound: f32,
     trait_hearing: f32,
     trait_eye: f32,
+    #[cfg(feature = "world_wgpu")]
     trait_blood: f32,
     eye_dirs: [f32; NUM_EYES],
     eye_fov: [f32; NUM_EYES],
@@ -14741,6 +14742,7 @@ impl RenderFrame {
         })
     }
 
+    #[cfg(any(test, feature = "world_wgpu"))]
     fn from_snapshot(snapshot: &RenderSnapshot, palette: ColorPaletteMode) -> Option<Self> {
         Self::from_snapshot_with_vfx(snapshot, palette, None)
     }
@@ -14787,6 +14789,7 @@ impl RenderFrame {
                     trait_sound: visual.trait_sound,
                     trait_hearing: visual.trait_hearing,
                     trait_eye: visual.trait_eye,
+                    #[cfg(feature = "world_wgpu")]
                     trait_blood: visual.trait_blood,
                     eye_dirs: visual.eye_direction,
                     eye_fov: visual.eye_fov,
@@ -14921,7 +14924,6 @@ impl RenderFrame {
                 trait_sound,
                 trait_hearing,
                 trait_eye,
-                trait_blood,
                 eye_dirs,
                 eye_fov,
             ) = runtime_entry
@@ -14943,7 +14945,6 @@ impl RenderFrame {
                         rt.trait_modifiers.sound,
                         rt.trait_modifiers.hearing,
                         rt.trait_modifiers.eye,
-                        rt.trait_modifiers.blood,
                         eye_dirs,
                         eye_fov,
                     )
@@ -14961,7 +14962,6 @@ impl RenderFrame {
                         0.3,
                         0.4,
                         1.0,
-                        1.5,
                         1.5,
                         [0.0; NUM_EYES],
                         [1.0; NUM_EYES],
@@ -14990,7 +14990,8 @@ impl RenderFrame {
                 trait_sound,
                 trait_hearing,
                 trait_eye,
-                trait_blood,
+                #[cfg(feature = "world_wgpu")]
+                trait_blood: runtime_entry.map_or(1.5, |rt| rt.trait_modifiers.blood),
                 eye_dirs,
                 eye_fov,
                 selection,
@@ -16709,6 +16710,7 @@ fn terrain_surface_color(
     rgba_from_triplet_with_alpha(srgb, 1.0)
 }
 
+#[cfg(any(test, feature = "world_wgpu"))]
 fn canonical_gpu_terrain_colors(frame: &RenderFrame) -> Vec<[f32; 4]> {
     let daylight = visual::daylight_factor(
         frame.tick,
