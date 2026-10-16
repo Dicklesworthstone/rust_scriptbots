@@ -3738,7 +3738,7 @@ impl SimulationView {
             .py_2()
             .child(
                 div()
-                    .debug_selector(|| "gui-live-session-status")
+                    .debug_selector(|| "gui-live-session-status".to_owned())
                     .text_xs()
                     .text_color(chrome::text_primary())
                     .child("Live session status"),
@@ -14324,7 +14324,11 @@ mod playback_state_tests {
             simulation_fault: Some("historical fault".to_owned()),
             ..HudSnapshot::default()
         };
-        for mode in [PlaybackMode::Live, PlaybackMode::Paused, PlaybackMode::Playing] {
+        for mode in [
+            PlaybackMode::Live,
+            PlaybackMode::Paused,
+            PlaybackMode::Playing,
+        ] {
             let mut playback = PlaybackState::new(2);
             playback.record(&recorded);
             for faulted in [true, false] {
@@ -14400,7 +14404,11 @@ mod playback_state_tests {
 
     #[test]
     fn empty_history_keeps_current_session_status() {
-        for mode in [PlaybackMode::Live, PlaybackMode::Paused, PlaybackMode::Playing] {
+        for mode in [
+            PlaybackMode::Live,
+            PlaybackMode::Paused,
+            PlaybackMode::Playing,
+        ] {
             let mut playback = PlaybackState::new(2);
             playback.mode = mode;
             let live = HudSnapshot {
@@ -21441,7 +21449,10 @@ mod command_characterization_tests {
         let receipts = fixture.applied_receipts();
         assert_eq!(receipts.len(), 1);
         let receipt = &receipts[0];
-        assert!(matches!(receipt.application(), ApplicationState::Applied(_)));
+        assert!(matches!(
+            receipt.application(),
+            ApplicationState::Applied(_)
+        ));
         let observed_paused = fixture.world.snapshot().playback.paused;
         let hud = fixture.app.update(|app| fixture.hud.root(app)).unwrap();
         fixture.app.update_entity(&hud, |view, _| {
@@ -21451,7 +21462,9 @@ mod command_characterization_tests {
             assert_eq!(view.playback.mode(), PlaybackMode::Paused);
             assert_eq!(shown.controls.paused, observed_paused);
             assert_ne!(
-                view.playback.timeline[view.playback.pointer].controls.paused,
+                view.playback.timeline[view.playback.pointer]
+                    .controls
+                    .paused,
                 observed_paused
             );
             assert_eq!(shown.command_feedback.len(), 1);
