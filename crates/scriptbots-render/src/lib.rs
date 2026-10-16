@@ -15,9 +15,9 @@ mod vfx;
 
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
-    App, Background, Bounds, Context, Corners, Div, FocusHandle, InteractiveElement, KeyDownEvent,
-    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, QuitMode, RenderImage, Rgba, Role, ScrollDelta, ScrollWheelEvent, SharedString,
+    App, Background, Bounds, ClipboardItem, Context, Corners, Div, FocusHandle, InteractiveElement,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
+    Pixels, Point, QuitMode, RenderImage, Rgba, Role, ScrollDelta, ScrollWheelEvent, SharedString,
     StyleRefinement, Window, WindowBounds, WindowOptions, canvas, div, fill, linear_color_stop,
     linear_gradient, point, prelude::*, px, rgb, size,
 };
@@ -44,8 +44,9 @@ use scriptbots_core::{
     TickSummary, TraitModifiers, Velocity, WorldState, tier_features, toroidal_delta,
 };
 use scriptbots_core::{
-    DraftGeneratorConfig, ExistingAgentPolicy, MAX_SAMPLE_OUTPUT_CELLS, MapArtifact,
-    MapEditorDraft, PaintedConstraint, default_tileset_spec,
+    ConstraintLayer, DraftGeneratorConfig, DraftState, ExistingAgentPolicy, MAX_SAMPLE_CELL_PAIRS,
+    MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft, PaintedConstraint, SamplePatternSpec,
+    default_tileset_spec,
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
@@ -2837,6 +2838,101 @@ enum DashboardTab {
 
 const MAP_SANDBOX_PREVIEW_SIDE: u32 = 32;
 const MAP_SANDBOX_MAX_CELLS: u64 = MAX_SAMPLE_OUTPUT_CELLS as u64;
+const MAP_DRAFT_MAX_BYTES: usize = 1_048_576;
+const MAP_DRAFT_MAX_RULE_TILES: usize = 64;
+const MAP_DRAFT_SCHEMA: &str = "scriptbots.map-draft.v1";
+
+/// Portable editing inputs only: no imported history, receipt, revision or applied claim.
+/// A record list keeps nonempty painted constraints representable in JSON.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MapDraftDocument {
+    schema: String,
+    width: u32,
+    height: u32,
+    cell_size: u32,
+    seed: u64,
+    generator_config: DraftGeneratorConfig,
+    constraints: Vec<PaintedConstraint>,
+}
+
+impl MapDraftDocument {
+    fn from_draft(draft: &MapEditorDraft) -> Self {
+        let mut constraints: Vec<_> = draft
+            .state
+            .constraints
+            .constraints
+            .values()
+            .cloned()
+            .collect();
+        constraints.sort_unstable_by_key(|constraint| (constraint.y, constraint.x));
+        Self {
+            schema: MAP_DRAFT_SCHEMA.to_owned(),
+            width: draft.state.width,
+            height: draft.state.height,
+            cell_size: draft.state.cell_size,
+            seed: draft.state.seed,
+            generator_config: draft.state.generator_config.clone(),
+            constraints,
+        }
+    }
+
+    fn into_state(self) -> std::result::Result<DraftState, String> {
+        if self.schema != MAP_DRAFT_SCHEMA {
+            return Err(format!("Expected draft schema {MAP_DRAFT_SCHEMA}."));
+        }
+        let cells = u64::from(self.width) * u64::from(self.height);
+        if self.width == 0
+            || self.height == 0
+            || self.cell_size == 0
+            || cells > MAP_SANDBOX_MAX_CELLS
+        {
+            return Err(format!(
+                "Draft needs positive dimensions and at most {MAP_SANDBOX_MAX_CELLS} cells."
+            ));
+        }
+        if self.constraints.len() as u64 > cells {
+            return Err("More painted constraints than map cells.".to_owned());
+        }
+        match &self.generator_config {
+            DraftGeneratorConfig::SampleBased { sample } => {
+                sample.validate().map_err(|error| error.to_string())?;
+                if cells * sample.sample_tiles.len() as u64 > MAX_SAMPLE_CELL_PAIRS as u64 {
+                    return Err(format!(
+                        "Sample/output work exceeds {MAX_SAMPLE_CELL_PAIRS} cell pairs."
+                    ));
+                }
+            }
+            DraftGeneratorConfig::RuleBased { tileset } => {
+                if tileset.tiles.len() > MAP_DRAFT_MAX_RULE_TILES {
+                    return Err(format!(
+                        "Editor rules exceed {MAP_DRAFT_MAX_RULE_TILES} tile prototypes."
+                    ));
+                }
+            }
+        }
+        let mut constraints = ConstraintLayer::new();
+        for constraint in self.constraints {
+            if constraints.get(constraint.x, constraint.y).is_some() {
+                return Err(format!(
+                    "Duplicate painted cell {}, {}.",
+                    constraint.x, constraint.y
+                ));
+            }
+            constraints
+                .paint(constraint)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(DraftState {
+            width: self.width,
+            height: self.height,
+            cell_size: self.cell_size,
+            seed: self.seed,
+            generator_config: self.generator_config,
+            constraints,
+        })
+    }
+}
 
 struct MapPreview {
     artifact: Arc<MapArtifact>,
@@ -2921,6 +3017,33 @@ impl MapSandbox {
         }
     }
 
+    fn export_draft(&self) -> std::result::Result<String, String> {
+        let json = serde_json::to_string_pretty(&MapDraftDocument::from_draft(&self.draft))
+            .map_err(|error| error.to_string())?;
+        if json.len() > MAP_DRAFT_MAX_BYTES {
+            return Err(format!("Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."));
+        }
+        Ok(json)
+    }
+
+    fn import_draft(&mut self, json: &str) -> std::result::Result<(), String> {
+        if json.len() > MAP_DRAFT_MAX_BYTES {
+            return Err(format!("Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."));
+        }
+        let document: MapDraftDocument =
+            serde_json::from_str(json).map_err(|error| error.to_string())?;
+        self.draft
+            .replace_state(document.into_state()?)
+            .map_err(|error| error.to_string())?;
+        // Even an identical imported seed/config is a new local edit. Discard any
+        // outstanding generation and never import another session's owner guard.
+        if let Some(job) = &mut self.job {
+            job.cancelled = true;
+        }
+        self.preview = None;
+        Ok(())
+    }
+
     fn poll(&mut self) {
         let Some(job) = self.job.as_ref() else {
             return;
@@ -2960,6 +3083,36 @@ impl MapSandbox {
         let result = match action {
             MapAction::NextSeed => {
                 self.draft.set_seed(self.draft.state.seed.wrapping_add(1));
+                Ok(())
+            }
+            MapAction::Generator => {
+                let config = match &self.draft.state.generator_config {
+                    DraftGeneratorConfig::RuleBased { .. } => DraftGeneratorConfig::SampleBased {
+                        sample: SamplePatternSpec {
+                            sample_id: "lab_meadow_v1".to_owned(),
+                            sample_width: 3,
+                            sample_height: 3,
+                            pattern_size: 2,
+                            sample_tiles: vec![
+                                TerrainKind::Grass,
+                                TerrainKind::Grass,
+                                TerrainKind::Grass,
+                                TerrainKind::Grass,
+                                TerrainKind::Sand,
+                                TerrainKind::Grass,
+                                TerrainKind::Grass,
+                                TerrainKind::Grass,
+                                TerrainKind::Grass,
+                            ],
+                            all_orientations: true,
+                            periodic: true,
+                        },
+                    },
+                    DraftGeneratorConfig::SampleBased { .. } => DraftGeneratorConfig::RuleBased {
+                        tileset: default_tileset_spec(),
+                    },
+                };
+                self.draft.set_generator_config(config);
                 Ok(())
             }
             MapAction::NextSize => {
@@ -3017,7 +3170,12 @@ impl MapSandbox {
                 }
                 return;
             }
-            MapAction::Generate | MapAction::Apply | MapAction::Pause | MapAction::LiveGrid => {
+            MapAction::Generate
+            | MapAction::Apply
+            | MapAction::Pause
+            | MapAction::LiveGrid
+            | MapAction::CopyDraft
+            | MapAction::PasteDraft => {
                 return;
             }
         };
@@ -3050,6 +3208,9 @@ impl MapSandbox {
 #[derive(Clone, Copy)]
 enum MapAction {
     Generate,
+    Generator,
+    CopyDraft,
+    PasteDraft,
     Cancel,
     NextSeed,
     NextSize,
@@ -3496,7 +3657,7 @@ impl SimulationView {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     if enabled {
-                        this.map_action(action);
+                        this.map_button_action(action, cx);
                         cx.notify();
                     }
                     cx.stop_propagation();
@@ -3505,12 +3666,44 @@ impl SimulationView {
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
                     if enabled {
-                        this.map_action(action);
+                        this.map_button_action(action, cx);
                         cx.notify();
                     }
                     cx.stop_propagation();
                 }
             }))
+    }
+
+    fn map_button_action(&self, action: MapAction, cx: &mut Context<Self>) {
+        if !matches!(action, MapAction::CopyDraft | MapAction::PasteDraft) {
+            self.map_action(action);
+            return;
+        }
+        let Ok(mut sandbox) = self.map_sandbox.lock() else {
+            return;
+        };
+        sandbox.notice = match action {
+            MapAction::CopyDraft => match sandbox.export_draft() {
+                Ok(json) => {
+                    let bytes = json.len();
+                    cx.write_to_clipboard(ClipboardItem::new_string(json));
+                    format!("Copied {bytes} bytes of draft JSON. Save this text to retain the draft; no live world or receipts are exported.")
+                }
+                Err(error) => format!("Draft export refused: {error}"),
+            },
+            MapAction::PasteDraft => {
+                let result = cx
+                    .read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .ok_or_else(|| "Clipboard has no draft text.".to_owned())
+                    .and_then(|json| sandbox.import_draft(&json));
+                result.map_or_else(
+                    |error| format!("Draft import refused: {error}"),
+                    |()| "Imported draft as one undoable edit. Generate a new preview; the live world is unchanged.".to_owned(),
+                )
+            }
+            _ => return,
+        };
     }
 
     fn render_map_sandbox(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
@@ -3522,12 +3715,21 @@ impl SimulationView {
             .read_snapshot()
             .is_ok_and(|snapshot| sandbox.preview_fits_live_grid(&snapshot));
         let draft = &sandbox.draft;
+        let generator_label = match &draft.state.generator_config {
+            DraftGeneratorConfig::RuleBased { tileset } => format!("rules: {}", tileset.id),
+            DraftGeneratorConfig::SampleBased { sample } => format!(
+                "overlapping sample: {} · {} × {} exemplar · pattern {} · periodic {} · rotations/reflections {}",
+                sample.sample_id, sample.sample_width, sample.sample_height,
+                sample.pattern_size, sample.periodic, sample.all_orientations,
+            ),
+        };
         let mut panel = div()
             .flex()
             .flex_col()
             .gap_3()
             .text_color(chrome::text_primary())
-            .child(div().text_sm().child("Map sandbox · rule-based"))
+            .child(div().text_sm().child("Map sandbox"))
+            .child(div().text_xs().child(generator_label))
             .child(div().text_xs().child(format!(
                 "Seed {} · {} × {} cells · cell size {} · draft revision {}",
                 draft.state.seed,
@@ -3535,6 +3737,36 @@ impl SimulationView {
                 draft.state.height,
                 draft.state.cell_size,
                 draft.revision,
+            )))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.render_map_button(
+                        "map-generator",
+                        "Switch rules / sample".to_owned(),
+                        MapAction::Generator,
+                        true,
+                        cx,
+                    ))
+                    .child(self.render_map_button(
+                        "map-copy-draft",
+                        "Copy draft JSON".to_owned(),
+                        MapAction::CopyDraft,
+                        true,
+                        cx,
+                    ))
+                    .child(self.render_map_button(
+                        "map-paste-draft",
+                        "Paste draft JSON".to_owned(),
+                        MapAction::PasteDraft,
+                        true,
+                        cx,
+                    )),
+            )
+            .child(div().text_xs().child(format!(
+                "Draft JSON limit {MAP_DRAFT_MAX_BYTES} bytes, {MAP_DRAFT_MAX_RULE_TILES} rule tiles. Copy, edit and paste generator/paint fields to author custom rules or samples. Switching selects a preset; Undo restores your prior configuration."
             )))
             .child(
                 div()
@@ -3625,9 +3857,10 @@ impl SimulationView {
             let seams = draft.check_seams(artifact);
             panel = panel
                 .child(div().text_xs().child(format!(
-                    "Preview revision {} · owner revision {} · rules {} / {:016x} · seed {}",
+                    "Preview revision {} · owner revision {} · {:?} {} / {:016x} · seed {}",
                     preview.draft_revision,
                     preview.expected_scientific_revision.get(),
+                    metadata.generator,
                     metadata.tileset_id,
                     metadata.tileset_hash,
                     metadata.seed,
@@ -20741,6 +20974,186 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn map_sandbox_portable_drafts_round_trip_both_generators_and_paint() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let expected = host.snapshot().revisions.scientific;
+        let mut sandbox = MapSandbox::new(16, 16, 50);
+        sandbox.edit(MapAction::Paint(7, 4));
+        sandbox.edit(MapAction::Paint(2, 1));
+        let mut paint = sandbox.draft.state.constraints.get(2, 1).unwrap().clone();
+        paint.elevation = Some(0.25);
+        paint.fertility_bias = Some(0.6);
+        paint.temperature_bias = Some(-0.1);
+        paint.permeability = Some(0.4);
+        paint.runoff_bias = Some(0.3);
+        paint.hazard = Some(true);
+        sandbox.draft.paint_constraint(paint).unwrap();
+        let mut generator_hashes = Vec::new();
+        for sample_mode in [false, true] {
+            if sample_mode {
+                sandbox.edit(MapAction::Generator);
+            }
+            sandbox.generate(expected);
+            wait_map_job(&mut sandbox);
+            let artifact = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+            assert_eq!(
+                artifact.metadata().generator,
+                if sample_mode {
+                    scriptbots_core::MapGeneratorKind::SampleBased
+                } else {
+                    scriptbots_core::MapGeneratorKind::RuleBased
+                }
+            );
+            generator_hashes.push(artifact.metadata().tileset_hash);
+            let json = sandbox.export_draft().unwrap();
+            assert_eq!(
+                json,
+                sandbox.export_draft().unwrap(),
+                "stable record ordering"
+            );
+            let document: MapDraftDocument = serde_json::from_str(&json).unwrap();
+            assert_eq!(document.constraints[0].y, 1);
+            assert_eq!(document.constraints[1].y, 4);
+            let mut restored = MapSandbox::new(8, 8, 16);
+            let initial = restored.draft.state.clone();
+            let id = restored.draft.draft_id.clone();
+            restored.import_draft(&json).unwrap();
+            assert_eq!(restored.draft.state, sandbox.draft.state);
+            assert_eq!(restored.draft.draft_id, id);
+            assert_eq!(restored.draft.revision, 1);
+            assert!(restored.preview.is_none());
+            assert!(!restored.can_apply());
+            restored.generate(expected);
+            wait_map_job(&mut restored);
+            assert_eq!(
+                restored
+                    .preview
+                    .as_ref()
+                    .unwrap()
+                    .artifact
+                    .scientific_content_hash(),
+                artifact.scientific_content_hash(),
+                "portable inputs must reproduce scientific layers, excluding timestamp"
+            );
+            restored.edit(MapAction::Undo);
+            assert_eq!(restored.draft.state, initial);
+            restored.edit(MapAction::Redo);
+            assert_eq!(restored.draft.state, sandbox.draft.state);
+        }
+        assert_ne!(generator_hashes[0], generator_hashes[1]);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn map_sandbox_import_refusals_are_atomic_and_success_discards_pending_preview() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let expected = host.snapshot().revisions.scientific;
+        let mut sandbox = MapSandbox::new(16, 16, 50);
+        sandbox.edit(MapAction::Paint(0, 0));
+        sandbox.edit(MapAction::NextSeed);
+        sandbox.edit(MapAction::Undo);
+        sandbox.generate(expected);
+        wait_map_job(&mut sandbox);
+        let original = sandbox.draft.clone();
+        let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        let json = sandbox.export_draft().unwrap();
+        let valid: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut negatives = vec!["{".to_owned(), " ".repeat(MAP_DRAFT_MAX_BYTES + 1)];
+        let mut oversized_rules = MapDraftDocument::from_draft(&sandbox.draft);
+        let DraftGeneratorConfig::RuleBased { tileset } = &mut oversized_rules.generator_config else {
+            panic!("rule fixture");
+        };
+        let prototype = tileset.tiles[0].clone();
+        tileset.tiles = (0..=MAP_DRAFT_MAX_RULE_TILES)
+            .map(|index| {
+                let mut tile = prototype.clone();
+                tile.id = format!("tile_{index}");
+                tile
+            })
+            .collect();
+        tileset.adjacency.clear();
+        negatives.push(serde_json::to_string(&oversized_rules).unwrap());
+        if let DraftGeneratorConfig::RuleBased { tileset } = &mut oversized_rules.generator_config {
+            tileset.tiles.pop();
+        }
+        let mut boundary = MapSandbox::new(8, 8, 50);
+        boundary
+            .import_draft(&serde_json::to_string(&oversized_rules).unwrap())
+            .unwrap();
+        let mut excessive_pairs = valid.clone();
+        excessive_pairs["width"] = serde_json::json!(256);
+        excessive_pairs["height"] = serde_json::json!(256);
+        excessive_pairs["generator_config"] = serde_json::json!({
+            "generator_type": "SampleBased",
+            "sample": {
+                "sample_id": "large_v1", "sample_width": 8, "sample_height": 8,
+                "pattern_size": 1, "sample_tiles": vec![TerrainKind::Sand; scriptbots_core::MAX_SAMPLE_CELLS],
+            }
+        });
+        negatives.push(serde_json::to_string(&excessive_pairs).unwrap());
+        for (field, value) in [
+            ("schema", serde_json::json!("future-schema")),
+            ("width", serde_json::json!(0)),
+            ("height", serde_json::json!(MAX_SAMPLE_OUTPUT_CELLS + 1)),
+            ("cell_size", serde_json::json!(0)),
+            ("revision", serde_json::json!(0)),
+            (
+                "constraints",
+                serde_json::json!([valid["constraints"][0], valid["constraints"][0]]),
+            ),
+            (
+                "constraints",
+                serde_json::json!([{"x":16,"y":0,"terrain_kind":"Sand"}]),
+            ),
+            (
+                "constraints",
+                serde_json::json!([{"x":0,"y":0,"elevation":1e100}]),
+            ),
+            (
+                "generator_config",
+                serde_json::json!({"generator_type":"RuleBased","tileset":{"id":"empty","tiles":[],"adjacency":[]}}),
+            ),
+            (
+                "generator_config",
+                serde_json::json!({"generator_type":"SampleBased","sample":{"sample_id":"bad","sample_width":1,"sample_height":1,"pattern_size":2,"sample_tiles":["Grass"]}}),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            negatives.push(serde_json::to_string(&invalid).unwrap());
+        }
+        for invalid in negatives {
+            assert!(sandbox.import_draft(&invalid).is_err());
+            assert_eq!(
+                sandbox.draft, original,
+                "rejected import must preserve history"
+            );
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
+            assert!(sandbox.can_apply());
+        }
+        sandbox.generate(expected);
+        assert!(sandbox.job.is_some());
+        sandbox.import_draft(&json).unwrap();
+        assert!(sandbox.job.as_ref().unwrap().cancelled);
+        assert!(sandbox.preview.is_none());
+        wait_map_job(&mut sandbox);
+        assert!(
+            sandbox.preview.is_none(),
+            "old job must not restore imported preview"
+        );
+        assert!(!sandbox.can_apply());
+        sandbox.generate(expected);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply());
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
     fn map_sandbox_accepts_the_production_default_grid() {
         let config = ScriptBotsConfig {
             population_minimum: 0,
@@ -21057,6 +21470,37 @@ mod command_characterization_tests {
         );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, 0);
+        click(&mut lab, "map-copy-draft");
+        let exported = context.update(|app| app.read_from_clipboard().unwrap().text().unwrap());
+        let document: MapDraftDocument = serde_json::from_str(&exported).unwrap();
+        assert_eq!(document.seed, 2);
+        assert_eq!(document.constraints.len(), 1);
+        click(&mut lab, "map-seed");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 3);
+        click(&mut lab, "map-paste-draft");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
+        assert!(session.map_sandbox.lock().unwrap().preview.is_none());
+        click(&mut lab, "map-undo");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 3);
+        click(&mut lab, "map-redo");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
+        let draft = session.map_sandbox.lock().unwrap().draft.clone();
+        context.update(|app| app.write_to_clipboard(ClipboardItem::new_string("invalid".to_owned())));
+        click(&mut lab, "map-paste-draft");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft, draft);
+        assert!(
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .notice
+                .starts_with("Draft import refused:")
+        );
+        click(&mut lab, "map-generator");
+        assert!(matches!(
+            session.map_sandbox.lock().unwrap().draft.state.generator_config,
+            DraftGeneratorConfig::SampleBased { .. }
+        ));
         click(&mut lab, "map-policy");
         assert_eq!(
             session.map_sandbox.lock().unwrap().policy,
@@ -21073,6 +21517,20 @@ mod command_characterization_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let apply_revision = host.snapshot().revisions.scientific;
+        assert_eq!(
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .preview
+                .as_ref()
+                .unwrap()
+                .artifact
+                .metadata()
+                .generator,
+            scriptbots_core::MapGeneratorKind::SampleBased
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         click(&mut lab, "map-apply");
         {
             let sandbox = session.map_sandbox.lock().unwrap();

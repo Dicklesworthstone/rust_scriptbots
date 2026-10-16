@@ -19070,6 +19070,32 @@ mod map_sandbox {
             self.state.generator_config = config;
         }
 
+        /// Replace editable state as one undoable edit, validating before touching history.
+        /// Session identity, revision and history limits remain local to this draft.
+        pub fn replace_state(&mut self, state: DraftState) -> Result<(), MapGenerationError> {
+            if state.width == 0 || state.height == 0 || state.cell_size == 0 {
+                return Err(MapGenerationError::InvalidDimensions);
+            }
+            state.constraints.validate_bounds(state.width, state.height)?;
+            for (&position, constraint) in &state.constraints.constraints {
+                if position != (constraint.x, constraint.y) {
+                    return Err(MapGenerationError::DraftError(
+                        "constraint key differs from its cell coordinates".into(),
+                    ));
+                }
+                constraint.validate()?;
+            }
+            match &state.generator_config {
+                DraftGeneratorConfig::RuleBased { tileset } => {
+                    RuleBasedMapGenerator::new(tileset.clone())?;
+                }
+                DraftGeneratorConfig::SampleBased { sample } => sample.validate()?,
+            }
+            self.push_checkpoint();
+            self.state = state;
+            Ok(())
+        }
+
         /// Clear all painted constraints, recording an undo checkpoint if not already empty.
         pub fn clear_constraints(&mut self) {
             if !self.state.constraints.is_empty() {
@@ -20396,6 +20422,85 @@ mod map_sandbox {
             draft.set_seed(6);
             assert!(draft.undo().expect("new history enabled"));
             assert_eq!(draft.state.seed, 4);
+        }
+
+        #[test]
+        fn map_editor_draft_replace_state_is_atomic_and_one_undoable_edit() {
+            let mut draft = MapEditorDraft::new(
+                "local",
+                8,
+                8,
+                16,
+                1,
+                DraftGeneratorConfig::RuleBased {
+                    tileset: default_tileset_spec(),
+                },
+            );
+            draft.set_seed(2);
+            draft.set_seed(3);
+            assert!(draft.undo().unwrap());
+            let before = draft.clone();
+            let mut next = draft.state.clone();
+            next.width = 4;
+            next.height = 6;
+            next.seed = 99;
+            let mut invalid = next.clone();
+            invalid.cell_size = 0;
+            assert!(draft.replace_state(invalid).is_err());
+            assert_eq!(draft, before);
+            let mut invalid = next.clone();
+            let DraftGeneratorConfig::RuleBased { tileset } = &mut invalid.generator_config else {
+                panic!("rule fixture");
+            };
+            tileset.tiles.clear();
+            assert!(draft.replace_state(invalid).is_err());
+            assert_eq!(draft, before);
+            let paint = PaintedConstraint {
+                x: 1,
+                y: 2,
+                terrain_kind: Some(TerrainKind::Sand),
+                elevation: Some(0.25),
+                moisture: None,
+                fertility_bias: None,
+                temperature_bias: None,
+                permeability: None,
+                runoff_bias: None,
+                basin_rank: None,
+                channel_priority: None,
+                swim_cost: None,
+                hazard: None,
+            };
+            for (position, constraint) in [
+                (
+                    (1, 2),
+                    PaintedConstraint {
+                        elevation: Some(f32::NAN),
+                        ..paint
+                    },
+                ),
+                ((4, 2), PaintedConstraint { x: 4, ..paint }),
+                ((0, 0), paint.clone()),
+            ] {
+                let mut invalid = next.clone();
+                invalid.constraints.constraints.insert(position, constraint);
+                assert!(draft.replace_state(invalid).is_err());
+                assert_eq!(
+                    draft, before,
+                    "refusal preserves revision and both histories"
+                );
+            }
+            next.constraints.paint(paint).unwrap();
+            draft.replace_state(next.clone()).unwrap();
+            assert_eq!(draft.state, next);
+            assert_eq!(draft.revision, before.revision + 1);
+            assert_eq!(draft.draft_id, before.draft_id);
+            assert_eq!(draft.name, before.name);
+            assert_eq!(draft.max_history, before.max_history);
+            assert!(!draft.can_redo());
+            assert!(draft.undo().unwrap());
+            assert_eq!(draft.state, before.state);
+            assert!(draft.redo().unwrap());
+            assert_eq!(draft.state, next);
         }
 
         #[test]
