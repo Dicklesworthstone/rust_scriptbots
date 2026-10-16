@@ -21287,7 +21287,11 @@ mod command_characterization_tests {
         let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
         lab.update(|window, app| {
             let canvas = windows.canvas.root(app).unwrap();
-            assert!(canvas.read(app).submit_control_command(ControlCommand::Pause));
+            assert!(
+                canvas
+                    .read(app)
+                    .submit_control_command(ControlCommand::Pause)
+            );
             window.refresh();
             window.draw(app).clear();
         });
