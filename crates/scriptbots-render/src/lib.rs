@@ -14290,7 +14290,11 @@ fn post_process_stack(
     // Potato is the canonical no-post tier. Explicit per-effect blocks and exposure
     // still win: an operator who asks for one effect should not have that intent
     // silently discarded merely because the baseline tier is Potato.
-    let explicit_effect = post.is_some() || render.tonemap_exposure_bias.is_some();
+    // AA is resolved separately for the GPU snapshot. An AA-only block must not
+    // turn on unrelated exposure/post passes, especially an explicit Off request.
+    let explicit_effect = post.is_some_and(|settings| {
+        settings.bloom.is_some() || settings.vignette.is_some() || settings.fog.is_some()
+    }) || render.tonemap_exposure_bias.is_some();
     if potato && !explicit_effect {
         return PostProcessStack { passes: Vec::new() };
     }
@@ -18890,8 +18894,8 @@ mod command_characterization_tests {
                 ..ScriptBotsConfig::default()
             };
             config.render.quality = Some(RenderQuality::Potato);
-            config.render.post = Some(RenderPostSettings {
-                anti_aliasing: mode,
+            config.render.post = mode.map(|anti_aliasing| RenderPostSettings {
+                anti_aliasing: Some(anti_aliasing),
                 ..RenderPostSettings::default()
             });
             let mut world = WorldState::new(config).expect("FXAA world");
