@@ -1817,6 +1817,17 @@ If the answer is no, stop investing in GPUI as the world renderer. It may remain
 
 ### 9.6 GUI acceptance matrix
 
+**[Currently In Progress] `bd-2z0.7.11`, FXAA continuation, 2026-10-16:** source
+`8fbf2d0f` implements bounded edge smoothing and carries typed FXAA/Off through both GPU
+producers without enabling unrelated post effects. R187 passes all fifteen source-check
+commands and 62 scoped test executions (58 unique names, zero failures/ignores), including
+the unchanged production-default world-gfx golden, rendered edge/flat controls and actual
+host-published offscreen captures under both raw environment settings. Source is published
+and both required remote references were read back. R183 wrong-environment/format failures
+and R186 disk exhaustion remain retained. Containing DSR still refuses the Proptest README
+symlink in private-cache collection. Native-window/hardware/platform and overall DSR
+acceptance remain required; software Vulkan source self-verification does not close the P0.
+
 **[Currently In Progress] `bd-2z0.7.11`, bloom/vignette continuation, 2026-10-14:**
 `0cd0d419`, `ca311c89` and `a51f70c4` carry resolved bloom threshold/intensity and vignette
 strength/smoothness through both GPU producers. Explicit off overrides the environment;

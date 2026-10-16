@@ -10,6 +10,180 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+FXAA continuation (`bd-2z0.7.11`, 2026-10-16):
+
+- [x] Read the live toggle, frozen controls, post shader and existing pixel-test consumer.
+- [x] Claim the existing P0 and reserve exact paths; retain original acceptance and failures.
+- [x] Implement bounded edge-directed filtering after exposure/tonemapping, with an exact
+  disabled path and a low-contrast early exit.
+- [x] Connect true/false environment values without mutating process environment in tests.
+- [x] Find the typed-setting gap: carry explicit FXAA/Off through both GPU producers;
+  keep shared tier defaults unchanged and report TAA as unsupported.
+- [x] Observe the real host-published setting's pixels, explicit-Off override of raw
+  environment, initial science-digest equality and unsupported-TAA behavior.
+- [x] Exercise actual post-pipeline pixels: diagonal smoothing, unchanged flat regions,
+  preserved contrast, fresh-pipeline repeatability, flat one-pixel textures and the four
+  currently implemented shader tonemap branches.
+- [x] Execute mandatory formatting, workspace compiler/strict Clippy and relevant renderer
+  tests through a clean pinned DSR profile using an honest project User-Agent.
+- [x] Correct the full-suite invocation to retain production post defaults, as in R176;
+  retain R183/R186's all-effects-off golden mismatches and resulting poisoned-mutex failures.
+  Do not regenerate the canonical image or change an assertion to admit those runs.
+- [x] Read back source-bound results, retain failures, update Beads and publish reviewed source.
+- [ ] Obtain original native/hardware/platform and complete DSR collection acceptance;
+  software offscreen pixels alone cannot close the P0.
+
+Creation worksheet (2026-10-16): shader/toggle are FEATURE, consumed by the existing
+renderer. This requested TODO and mandatory external DSR profile are a LEGITIMATE GATE:
+consumer is the operator/reviewer; gate is this source delivery's required checks; observed
+defect is an enabled FXAA setting with no shader consumer; entries retire on observed
+completion. Integrity exception is unnecessary (no new custody mechanism). Highest-priority
+ready item is the old macOS host blocker; the local alias does not resolve, which establishes
+neither current host health nor repair. More tracking would displace this actionable P0
+rendering work, so reuse the existing report and profile structure, with zero capability
+credit for process.
+
+Source checkpoints: `29e8a27d` implements bounded FXAA, `636189bf` wires typed selection
+through both GPU producers and corrects four formatter differences, and `8fbf2d0f` keeps
+AA-only blocks from enabling unrelated post/exposure effects. The production test compares
+explicit Off against actual `post = None`, rather than an empty post block that already
+enabled exposure. All three remain unpublished at this checkpoint.
+
+R183 (`29e8a27d`, hz4) fails formatting; its four dependency guards and both focused FXAA
+tests pass. R186 (`8fbf2d0f` / tree `e62465da`, hz2) passes formatting, all four guards,
+the same two focused tests and the enabled-environment real-world smoke. Actual llvmpipe
+Vulkan post pixels report 128, 128, 97 and 128 changed/intermediate pixels out of 4,096 for
+shader modes 0–3, respectively; dark/bright bounds are 0/255, 0/232, 0/187 and 0/224.
+Flat regions, low contrast, restoration, repeatability and flat one-pixel extents pass.
+The four cells differ. These are known-texture inputs through the production GPU post
+pipeline, not an interactive native window, hardware GPU, FPS or long-run science proof.
+
+R186's full world-gfx suite observes 53 passes and two failures: canonical-image SHA mismatch
+(`0f2a8bd5` versus checked-in `5ddbd6cc`) followed by a sensor test's poisoned GPU mutex.
+I incorrectly copied the isolated all-effects-off environment into that full-suite command.
+R176 explicitly restores production defaults for this original golden comparison. The
+failed command is retained; correcting its invocation must rerun the unchanged suite and
+golden with the original defaults. This is an execution-profile error, not permission to
+weaken the image guard.
+
+R186's actual host-published production test subsequently passes under both raw FXAA
+environment settings, changing 989/8,192 pixels with typed FXAA, preserving default/Off/TAA
+pixels and initial science digests. Projection and the unchanged core tier test pass too.
+Workspace check then fails on `No space left on device`. The launcher ends 130 with frozen
+runner identity 0 at 03:43:18 UTC; the source verdict is empty, and Clippy/analyzer are not
+observed. I underestimated cold-check growth when admitting the second host with 18 GiB
+available. This is incomplete qualification, not a compiler pass or an explained signal.
+No cleanup/deletion command was run. The corrected final profile returns to hz4 with a unique RAM target
+that has 112 GiB available, keeping source/private-cache/proof staging on disk. Source and
+all fifteen commands/required completions/assertions/deadlines remain unchanged; only the
+full-suite environment is restored to production defaults. R184/R185 were prepared but
+never launched. R183's failed/partial observations remain separately retained.
+
+Bounded real-work audit (three source commits, through R186): one pending user feature in
+three USER commits, one ENABLER validation activity, one PROCESS tracking activity; zero
+closes and zero shipped capability credit yet. Purpose: the README's reproducible Evolution
+Lab with useful rendering and control. (1) A two-minute eventual demo is FXAA Off/On in
+actual production capture; those pixels now exist, publication is pending. (2) Without
+tracking, pixels would be identical; the requested TODO supports handoff only. (3) The
+validation profiles exercised actual post and host-publication consumers; unused prepared
+profiles enabled nothing and earn no credit. (4) Older unfinished native/playable frontend
+acceptance remains open; this bounded P0 rendering consumer was actionable independently.
+(5) Solo: no pane/closure comparison. (6) Plan edits record work, not completion; original
+acceptance/dependencies stay intact. Verdict: DRIFTING due to copied invocation defaults,
+duplicate preparation and underestimated disk cost. Correction: freeze new machinery and
+features, finish the original mandatory qualification at the current source and publish
+the one working consumer with its actual limitations.
+
+Honesty inventory, same bounded window (fresh self-review, not independent verification):
+1. No (checked: all three source diffs and unchanged existing assertions/ignores).
+2. No (checked: known textures run the actual shader; the separate host test runs real
+publication and production offscreen capture; neither is relabeled an interactive window).
+3. No (checked: no golden diff or regeneration flag; the mismatches remain failures).
+4. Yes: new regression tests accompany the feature; no existing assertion, deadline,
+tolerance or suppression is relaxed. The copied full-suite execution environment was
+wrong and is corrected to the original R176 production-default invocation, not a new oracle.
+5. No (checked: the production branch uses the existing typed/environment controls, with
+no proof-path detection; optional test PNG retention does not affect rendered values).
+6. No (checked: named starts/finishes and nonzero suite counts in the observed JSON logs).
+7. No (checked: assertions added but not yet executed were explicitly called pending).
+8. No (checked: llvmpipe CPU Vulkan/offscreen is stated, not hardware/native acceptance).
+9. Yes: a Beads progress comment said compiling after focused completion was already
+available; subsequent observations above supersede that stale status, without hiding the
+full-suite or disk failure. The source verdict is empty, not a typed failure or pass.
+10. No (checked: UBS stderr is retained, command/log channels are separate; no cited stderr
+was discarded). 11. No (checked: no issue closed or acceptance moved to a follow-up).
+12. No (checked: plan/README changes describe the capability and open acceptance).
+13–17. Not applicable: truly solo; no dispatch, peer closure, report acceptance, refusal
+farming or agreement claim. 18. No (checked: 64×64 and 128×64 denominators precede execution;
+unchanged flat regions are countermetrics, and no FPS/TPS improvement is claimed).
+19. Yes: premature transport readback refused before complete SCP, copied full-suite
+defaults and the second host's insufficient disk estimate wasted work. Hash checks were
+repeated only after transport completed; failed runs are retained; final qualification uses
+the unchanged source and ample target capacity. 20. Strongest current evidence: actual
+named GPU and production-capture completions at `8fbf2d0f`; full qualification remains open.
+Older-history limit: six bounded CASS queries (five worksheet phrases plus `FXAA stub`)
+returned hits, but six indexed line views resolve to telemetry/tool starts rather than
+auditable claims; they do not establish or clear older misconduct. The previously disclosed
+missed pre-commit UBS invocations remain on record. Current UBS ran before every source
+commit; its two critical reports are unchanged timestamp-based test filenames, inspected
+against `715eeaca`, not security tokens. No scanner suppression or clean-scan claim.
+Disposition: corrections are explicit above and in the work item; RH-1/RH-2/RH-3 countermeasures
+are unchanged assertions/golden, original invocation defaults and separate proof classes.
+DRIFTING is disclosed; source self-verification cannot close native/hardware or overall DSR
+acceptance. No permission request or new governance mechanism is created.
+
+R186 failed-proof readback: all 60 worker files match the retained local copy; inventory
+SHA256 `7b09e809b4988cb38ce01ba3f7dc2e7f173b47314b0776f98b9fe41726af7b84`.
+Both the source verdict and its artifact inventory are exactly zero bytes. A separate
+read-only transfer inventory preserves that observed receipt failure; it does not repair
+or approve the run. Fresh decoded-pixel readback observes 989 changed pixels in each
+environment cell and exact cross-environment equality for all four typed modes. All eight
+native PNGs have one of two distinct hashes: default/Off/TAA `14612c75eae91dc5…`, FXAA
+`0b5c97f2f2547576…`. Two diagonal PNGs and the actual production FXAA PNG were viewed.
+
+Network-identity correction: routine Git fetches omitted an explicit project User-Agent;
+no `http.userAgent` setting was found, but the new instruction also requires the
+project name. Remaining Git HTTP operations explicitly set the project User-Agent. Curl,
+GitHub API requests and every new DSR profile already use it. This is an instruction lapse,
+not a credential disclosure or justification to spoof a blocked client.
+
+Final source result and publication, 2026-10-16: R187 at clean `8fbf2d0f5dfcb81f2c2df1b7b2535485d9cd2f34`
+/ tree `e62465da001615fabf81e928cb0b599d4d46a32c`, run
+`433d1bb0-4cb6-49fe-bf17-27a54d1ca4a0`, finishes at 04:19:44 UTC. All fifteen
+command/log pairs pass, including workspace all-targets compiler/strict Clippy, formatting,
+four dependency guards and analyzer build. All **62 scoped test executions / 58 unique
+names**, including all fourteen required named completions, pass with zero failures or
+ignores. The full world-gfx suite passes 55/0/0 with production post defaults and the
+unchanged checked-in canonical image. This correct invocation admits the original default
+comparison; the earlier all-effects-off mismatch remains a failed comparison, not a new
+golden or accepted exception.
+
+The original frozen reader is re-executed against the retained logs, including its positive
+and planted-negative fixtures. All 62 manifest files (377,962 bytes), fifteen command-log
+hashes and five state/raw files match worker bytes. All twenty-four PNGs exactly match the
+earlier same-source captures. Source receipt is `pass/0`, SHA256
+`576e43fca3c34888046001ac421b1050a40e172fc6b272f051adfb1920c8c354`;
+artifact inventory `a127ed289b0084ea277494808edcb9e80869a424f8b2e87e664209fee258f510`;
+state inventory `edf148ebf514b14fb5214bf55b14f0fdd7791247bbc6b6b90a562c00baacd343`.
+Containing DSR remains **failed/6**: the unchanged private-cache verifier rejects
+`git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md` and refuses artifact collection.
+Both artifact/collection identities are null; frozen runner identity is zero. Outer log
+SHA256 `4b70e679df5963f692cae8cf11a4b1a1ae4df5c5cf86a3c0c28c92e3fc540c99`.
+The local fallback has matching tool/helper hashes and prepared inputs, but no build was
+launched there. No source, gate or assertion changed after the qualified source pin.
+
+Source was published through ordinary pushes; both required remote references read back
+`8fbf2d0f` at 04:26 UTC. This delivers one optional GPU-rendering capability, not three
+features for three commits. No Bead is closed. The original P0, full DSR collection,
+native-window/hardware/platform and broader project acceptance remain open. R183 ends with
+source `failed/1` / outer 6, nine of eleven commands passing, with the formatting/full-suite
+failures retained; all 38 manifest entries match, source-verdict SHA256
+`54de4001e33b8fb776bad7c15762b7a7d7ba4c63797bdd4f33bbc496cf77ef23`.
+R186 remains incomplete after disk exhaustion, as recorded above. The audit disposition
+stays **DRIFTING** for wasted validation setup; correction is complete source verification
+and delivery, not more machinery. This is fresh self-verification, not independent review,
+full-workspace test execution, release qualification or a performance improvement claim.
+
 Durable outbox continuation (`bd-50bg`, 2026-10-14):
 
 - [x] Read current P0/storage evidence: file read-cost code is implemented; memory commit
