@@ -53,6 +53,8 @@ pub struct WorldSnapshot<'a> {
     pub bloom: Option<BloomControls>,
     /// Resolved vignette. Zero strength explicitly disables it; `None` uses the environment.
     pub vignette: Option<VignetteControls>,
+    /// Explicit FXAA selection. `None` retains the raw environment fallback.
+    pub fxaa: Option<bool>,
 }
 
 /// Snapshot-selected bottom-height fog, blended in linear RGB.
@@ -410,6 +412,9 @@ impl WorldRenderer {
         // environment independently in `ensure_post` and `PostFx::run` made
         // one frozen snapshot depend on wall-clock cache refreshes.
         let mut post_controls = PostControls::from_env()?;
+        if let Some(enabled) = snapshot.fxaa {
+            post_controls.fxaa = u32::from(enabled);
+        }
         post_controls.exposure = snapshot.exposure_factor.unwrap_or(post_controls.exposure);
         if let Some(fog) = snapshot.fog {
             post_controls.fog_strength = Some(fog.strength);
@@ -720,6 +725,7 @@ mod capture_smoke_test {
             fog: None,
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
         let frame = renderer.render(&snapshot).expect("valid render snapshot");
         renderer
@@ -785,6 +791,7 @@ mod capture_smoke_test {
             fog: None,
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
         let mut renderer =
             pollster::block_on(WorldRenderer::new(&adapter, (64, 64))).expect("exposure renderer");
@@ -866,6 +873,7 @@ mod capture_smoke_test {
             }),
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
         let mut renderer =
             pollster::block_on(WorldRenderer::new(&adapter, (64, 64))).expect("fog renderer");
@@ -1019,6 +1027,7 @@ mod capture_smoke_test {
             }),
             bloom: Some(bloom_off),
             vignette: Some(vignette_off),
+            fxaa: None,
         };
         let mut renderer = pollster::block_on(WorldRenderer::new(&adapter, (EXTENT, EXTENT)))
             .expect("post renderer");
@@ -1167,7 +1176,8 @@ mod capture_smoke_test {
         let _gpu_lock = crate::GPU_TEST_MUTEX
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let adapter = live_adapter("FXAA pixels").expect("FXAA proof requires an actual wgpu adapter");
+        let adapter =
+            live_adapter("FXAA pixels").expect("FXAA proof requires an actual wgpu adapter");
         eprintln!("FXAA post adapter: {:?}", adapter.get_info());
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
@@ -1215,8 +1225,8 @@ mod capture_smoke_test {
             });
             post.run(&device, &queue, &mut encoder, &view, size, None, &controls);
             queue.submit(Some(encoder.finish()));
-            let mut readback = ReadbackRing::new(&device, size, WORLD_COLOR_FORMAT)
-                .expect("post readback ring");
+            let mut readback =
+                ReadbackRing::new(&device, size, WORLD_COLOR_FORMAT).expect("post readback ring");
             readback
                 .copy(&device, &queue, &post.target)
                 .expect("post readback copy");
@@ -1381,6 +1391,7 @@ mod capture_smoke_test {
             fog: None,
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
 
         // Each closure owns its renderer for its whole lifetime, so the second
@@ -1687,6 +1698,7 @@ mod capture_smoke_test {
             fog: None,
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
 
         let t_start = std::time::Instant::now();
@@ -2314,13 +2326,9 @@ fn parse_fxaa_env(previous: u32) -> Result<u32, ReadbackError> {
 }
 
 fn parse_fxaa_value(value: &str) -> Result<u32, ReadbackError> {
-    parse_toggle_value(value)
-        .map(u32::from)
-        .ok_or_else(|| {
-            ReadbackError::Configuration(format!(
-                "SB_WGPU_FXAA={value:?}; expected a boolean toggle"
-            ))
-        })
+    parse_toggle_value(value).map(u32::from).ok_or_else(|| {
+        ReadbackError::Configuration(format!("SB_WGPU_FXAA={value:?}; expected a boolean toggle"))
+    })
 }
 
 // ---------------- View uniforms (viewport size) ----------------
@@ -3148,16 +3156,18 @@ mod tests {
                 Err(ReadbackError::Configuration(_))
             ));
         }
-        assert!(PostControls {
-            fxaa: 1,
-            exposure: 1.0,
-            vignette: 0.0,
-            tonemap: 0,
-            bloom_enabled: false,
-            fog_enabled: false,
-            ..PostControls::default()
-        }
-        .wants_post(None));
+        assert!(
+            PostControls {
+                fxaa: 1,
+                exposure: 1.0,
+                vignette: 0.0,
+                tonemap: 0,
+                bloom_enabled: false,
+                fog_enabled: false,
+                ..PostControls::default()
+            }
+            .wants_post(None)
+        );
     }
 
     #[test]
@@ -3256,6 +3266,7 @@ mod tests {
             fog: None,
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
         assert!(matches!(
             validate_snapshot(&snapshot),

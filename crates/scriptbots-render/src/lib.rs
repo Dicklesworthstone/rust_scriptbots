@@ -937,6 +937,7 @@ pub mod world_compositor {
             fog: Some(frame.gpu_fog_controls()),
             bloom: Some(frame.gpu_bloom_controls()),
             vignette: Some(frame.gpu_vignette_controls()),
+            fxaa: Some(frame.fxaa),
         };
 
         // Fit camera into the requested viewport
@@ -1090,6 +1091,7 @@ pub mod world_compositor {
                 fog: None,
                 bloom: None,
                 vignette: None,
+                fxaa: None,
             }
         }
 
@@ -1407,6 +1409,7 @@ mod wgpu_capture_test {
             fog: None,
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
         comp.set_camera_params(1.0, (0.0, 0.0));
         comp.render_snapshot(&snapshot, viewport)
@@ -1553,6 +1556,7 @@ mod wgpu_capture_test {
             fog: None,
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
 
         comp.render_snapshot(&snapshot, viewport)
@@ -1613,6 +1617,7 @@ mod wgpu_capture_test {
             fog: None,
             bloom: None,
             vignette: None,
+            fxaa: None,
         };
         comp.render_snapshot(&empty, viewport)
             .expect("comparison capture must either render or return a typed GPU failure");
@@ -1885,6 +1890,7 @@ fn paint_world_with_wgpu(state: &CanvasState, bounds: Bounds<Pixels>, window: &m
         fog: Some(state.frame.gpu_fog_controls()),
         bloom: Some(state.frame.gpu_bloom_controls()),
         vignette: Some(state.frame.gpu_vignette_controls()),
+        fxaa: Some(state.frame.fxaa),
     };
 
     emit_wgpu_camera_mapping_diagnostic(width_px, height_px, world_dims, layout, cam_offset);
@@ -14098,6 +14104,7 @@ fn color_swatch(color: [f32; 3]) -> Div {
 struct RenderFrame {
     tick: u64,
     tonemap_mode: Option<RenderTonemapMode>,
+    fxaa: bool,
     day_night_cycle_ticks: u32,
     day_night_start_phase: f32,
     world_size: (f32, f32),
@@ -14444,6 +14451,16 @@ struct CanvasState {
     perf: PerfSnapshot,
 }
 
+fn resolved_gpu_fxaa(config: &ScriptBotsConfig) -> bool {
+    let mode = config
+        .render
+        .post
+        .as_ref()
+        .and_then(|post| post.anti_aliasing)
+        .unwrap_or_else(|| tier_features(config.render.requested_quality()).anti_aliasing);
+    matches!(mode, scriptbots_core::RenderAntiAliasing::Fxaa)
+}
+
 impl RenderFrame {
     fn gpu_bloom_controls(&self) -> scriptbots_world_gfx::BloomControls {
         self.post_stack
@@ -14612,6 +14629,7 @@ impl RenderFrame {
         Some(Self {
             tick: snapshot.world.tick,
             tonemap_mode: config.render.tonemap_mode,
+            fxaa: resolved_gpu_fxaa(config),
             day_night_cycle_ticks,
             day_night_start_phase,
             world_size: (config.world_width as f32, config.world_height as f32),
@@ -14790,6 +14808,7 @@ impl RenderFrame {
         Some(Self {
             tick: world.tick().0,
             tonemap_mode: config.render.tonemap_mode,
+            fxaa: resolved_gpu_fxaa(config),
             day_night_cycle_ticks,
             day_night_start_phase,
             world_size: (config.world_width as f32, config.world_height as f32),
@@ -16788,6 +16807,7 @@ mod continuous_world_raster_tests {
         RenderFrame {
             tick: 17,
             tonemap_mode: None,
+            fxaa: false,
             day_night_cycle_ticks: 0,
             day_night_start_phase: 0.25,
             world_size: (
@@ -18842,6 +18862,111 @@ mod command_characterization_tests {
             "production offscreen exposure RGB sums: dim={dim_rgb} default={default_rgb} bright={bright_rgb}"
         );
         assert!(dim_rgb > 0 && default_rgb > dim_rgb && bright_rgb > default_rgb);
+    }
+
+    #[test]
+    fn published_snapshot_fxaa_reaches_gpu_pixels_and_explicit_off_wins() {
+        use scriptbots_core::{RenderAntiAliasing, RenderPostSettings};
+        use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId};
+        use std::io::Write as _;
+
+        let mut captures = Vec::new();
+        let mut digest = None;
+        for (mode, name) in [
+            (None, "default"),
+            (Some(RenderAntiAliasing::Fxaa), "on"),
+            (Some(RenderAntiAliasing::Off), "off"),
+            (Some(RenderAntiAliasing::Taa), "unsupported-taa"),
+        ] {
+            let mut config = ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 128,
+                world_height: 64,
+                food_cell_size: 16,
+                bot_radius: 10.0,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            };
+            config.render.quality = Some(RenderQuality::Potato);
+            config.render.post = Some(RenderPostSettings {
+                anti_aliasing: mode,
+                ..RenderPostSettings::default()
+            });
+            let mut world = WorldState::new(config).expect("FXAA world");
+            world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(64.0, 32.0),
+                    heading: 0.37,
+                    ..AgentData::default()
+                })
+                .expect("visible FXAA agent");
+            let actual_digest = world.world_digest_v1().expect("initial FXAA digest");
+            if let Some(expected) = &digest {
+                assert_eq!(&actual_digest, expected);
+            } else {
+                digest = Some(actual_digest);
+            }
+            let expected = RenderFrame::from_world(&world, ColorPaletteMode::Natural)
+                .expect("owner FXAA frame");
+            let host = HostCore::new(
+                HostSessionId::new(79),
+                world,
+                HostCoreOptions {
+                    capture_agent_visuals: true,
+                    ..HostCoreOptions::default()
+                },
+            )
+            .expect("FXAA host");
+            let snapshot = host.snapshot_hub().latest();
+            let actual = RenderFrame::from_snapshot(&snapshot, ColorPaletteMode::Natural)
+                .expect("published FXAA frame");
+            assert_eq!(actual.fxaa, mode == Some(RenderAntiAliasing::Fxaa));
+            assert_eq!(actual.fxaa, expected.fxaa);
+            let png = world_compositor::render_wgpu_png_offscreen(&snapshot, 128, 64)
+                .expect("production FXAA capture requires an allowed adapter");
+            captures.push(
+                image::load_from_memory(&png)
+                    .expect("FXAA PNG")
+                    .to_rgba8()
+                    .into_raw(),
+            );
+            if let Some(directory) = std::env::var_os("SCRIPTBOTS_FXAA_NATIVE_CAPTURE_DIR") {
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::File::create_new(directory.join(format!("fxaa-native-{name}.png")))
+                    .expect("unique FXAA capture")
+                    .write_all(&png)
+                    .expect("retain actual FXAA PNG");
+            }
+        }
+        assert_eq!(
+            captures[0], captures[2],
+            "explicit off equals the unchanged default"
+        );
+        assert_eq!(
+            captures[0], captures[3],
+            "unsupported TAA must not select FXAA"
+        );
+        let changed = captures[0]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(captures[1].as_chunks::<4>().0)
+            .filter(|(off, on)| off != on)
+            .count();
+        assert!(
+            changed > 0,
+            "typed FXAA must change actual production edge pixels"
+        );
+        assert!(
+            changed < captures[0].len() / 8,
+            "FXAA must preserve flat regions"
+        );
+        eprintln!(
+            "production snapshot FXAA changed_pixels={changed}/{}; initial science digest unchanged",
+            captures[0].len() / 4
+        );
     }
 
     #[test]
@@ -23577,6 +23702,7 @@ mod backend_agreement_tests {
         let mut frame = RenderFrame {
             tick: 100,
             tonemap_mode: None,
+            fxaa: false,
             day_night_cycle_ticks: 2400,
             day_night_start_phase: 0.0,
             world_size: (1000.0, 1000.0),

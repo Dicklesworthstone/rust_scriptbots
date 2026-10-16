@@ -12196,9 +12196,8 @@ pub const fn tier_features(tier: RenderQuality) -> TierFeatures {
             tui_subcell: true,
             tui_animation: false,
         },
-        // Anti-aliasing rows stay Off across every tier until a renderer actually
-        // implements the mode (bd-2z0.7.11): no FXAA or TAA path exists in the wgpu
-        // post pipeline or the CPU rasterizer, so the matrix must not claim one.
+        // Shared tier defaults remain conservative across frontends. The wgpu post
+        // pipeline supports explicit FXAA; the CPU canvas and TAA remain unsupported.
         RenderQuality::Low => TierFeatures {
             shadows: true,
             shadow_resolution: 1024,
@@ -12636,15 +12635,12 @@ impl RenderSettings {
         }
         if let Some(post) = &self.post
             && let Some(mode) = post.anti_aliasing
-            && mode != RenderAntiAliasing::Off
+            && mode == RenderAntiAliasing::Taa
         {
-            // Truthful-controls rule (bd-2z0.7.11): the value is accepted so configs
-            // stay forward-compatible, but it must never be mistaken for a working
-            // feature while no renderer implements AA.
             diag_warn!(
                 mode = ?mode,
-                "render.post.anti_aliasing selects an anti-aliasing mode, but no renderer \
-                 implements one yet; the setting has no effect"
+                "render.post.anti_aliasing selects TAA, which no renderer implements; \
+                 the setting has no effect (the wgpu post pipeline supports FXAA)"
             );
         }
         Ok(())
@@ -56303,8 +56299,8 @@ mod tests {
         assert!(low.shadows && low.shadow_cascades == 1);
         assert!(medium.bloom && !medium.ssao);
         assert!(high.ssao);
-        // No renderer implements an anti-aliasing mode today, so every tier must report
-        // AA off rather than claim FXAA/TAA (bd-2z0.7.11).
+        // Shared defaults do not enable backend-specific AA. Explicit wgpu FXAA is
+        // selected through RenderPostSettings rather than changing every frontend.
         for features in [potato, low, medium, high, ultra] {
             assert_eq!(features.anti_aliasing, RenderAntiAliasing::Off);
         }
