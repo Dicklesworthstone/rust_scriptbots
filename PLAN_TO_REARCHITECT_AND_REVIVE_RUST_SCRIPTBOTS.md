@@ -1823,6 +1823,14 @@ on a mirror miss, and application and journal outcomes remain separate. The broa
 cross-surface and native-input acceptance stays open. Published `61c1c99a` passes all
 fifteen R191 source checks, including actual-owner/lost-receipt cases, shared bounded
 feedback and production GPUI label layout. Headless layout does not qualify native input.
+**[Currently In Progress] playback continuation, 2026-10-16:** keep these live session
+observations visible while scrubbing recorded science; the current whole-HUD substitution
+otherwise hides subsequent command results and faults. Preserve historical world inspection.
+Published `2cafaaa8` corrects that substitution and labels live session status. R195 passes
+all fifteen source checks and both full renderer variants, including real-owner/headless
+input, rejection and production label layout during history. Original native/cross-surface
+acceptance remains open; containing DSR collection still fails on the Proptest README
+symlink. The reality-check TODO records all earlier failed runs and the exact final proof.
 
 **[Currently In Progress] `bd-2z0.7.10`, regression reopened 2026-10-16:** R189
 observes fourteen optional-GPU references in the feature-off renderer. Restore exact

@@ -10,6 +10,201 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Live status during historical playback (`bd-0oro`, 2026-10-16):
+
+- [x] Recheck actionable Beads and trace the live receipt consumer through production render.
+- [x] Confirm that history playback substitutes stale receipts, controls and health status.
+- [x] Preserve historical science/inspection while carrying current session observations.
+- [x] Label the session status live and exercise real-owner/headless input during history.
+- [x] Exercise paused/playing/live/empty-history and fault/error clearing in both feature modes.
+- [x] Run the fifteen pinned DSR source checks with both renderer feature modes.
+- [x] Review and publish source, update evidence and export Beads; retain original acceptance.
+- [ ] Qualify native OS input and the broader cross-surface journey, resolve containing DSR
+  collection and meet original UBS acceptance before closing the defect class.
+
+Creation gate: this is a correction to the delivered receipt consumer, not a new framework.
+The operator consumes this requested TODO; it gates the handoff and retires as items finish.
+The observed defect is whole-HUD history substitution hiding new owner outcomes and faults.
+Reuse the existing status panel, playback state and qualification profile. Native interaction,
+full cross-surface acceptance and the containing DSR cache failure remain separate open work.
+
+`3b2a6064` changes only the existing renderer: history retains its science/inspection but
+receipts, simulation faults, storage status, controls and frame timing come from the current
+session. Closed-environment state remains historical science. R192 starts once at 05:47:37
+UTC, launcher PID 2357766, clean commit `3b2a60647bd0bd153cb58b3befbeedda1ea3dbcc` /
+tree `931aef6102e5373bceaafd12087f940ea7939204`. The same fifteen-command frozen DSR lane
+now requires 35 named completions; original reader functions, planted negatives, defaults,
+deadlines and goldens are unchanged. Profile SHA256
+`0ce305b995fc2af65ebb6060f5fffa628254084f9a9047a6fe6020eeae212255`.
+Formatting fails four new test-layout differences, applied manually in the working tree.
+Four dependency guards pass; compiler/test acceptance and publication remain pending.
+Static UBS precedes the source commit and remains non-green (two unchanged timestamp-file
+heuristics); this is not a clean-scan claim. No broad item closes.
+
+R192 also finds that the new debug selector requires `String`, not `&str`; `56c6fa0c`
+corrects that contract plus the four exact formatter differences. The earlier failed build
+is stopped with SIGTERM only to its verified owned native process group, after the compile
+failure, at 05:52:10 UTC. Its eight recorded command/log pairs contain five passes and three
+failures (formatting, feature-off Clippy and feature-off test compilation); no renderer tests
+run and no final source verdict or artifact manifest is produced. All eight recorded log
+hashes verify; 25 retained partial files total 122,888 bytes. Commands SHA256
+`4a2b26c433eab8edf247412e3051b24394b7c0918992576e4969bce1c4d6313a`.
+Outer DSR is 6, final runner identity check zero. No final cache-refusal claim for this partial
+run. All run-session processes are observed absent before the corrected run reuses the target.
+
+R193 starts once at 05:52:19 UTC, launcher PID 2399252, clean source
+`56c6fa0ce181ca0c6f93b210fad9daad68f9db44`, tree
+`c337d1b6e9b4ef6db332a5f84caf67e8da225a08`. All fifteen commands and 35 named completions
+remain required, with the same reader/negative controls and deadlines. Profile SHA256
+`fc7a92ea9c33363acb270441c7eb4db3ccfe38a85bc09a40c715265e4365ac72`.
+Formatting now passes; remaining source qualification and publication are pending.
+
+R193 passes strict feature-off Clippy but its full feature-off library reports 136 passes,
+two failures and three unchanged ignores. The two new pure history tests and actual-owner
+rejection during history pass. The label-layout setup looks up the currently lent window;
+the new keyboard test observes journal Pending before acknowledgement. `47a8e8f4` moves
+history setup outside that callback and waits for the actual published CommittedVolatile
+observation under the fixture's existing ten-second budget. The exact final journal text
+and visible-bounds assertions are retained. This changes test setup/observation, not the
+owner or a production timeout. No integration binary runs after the failed library.
+
+The known-failed owned native process group is interrupted at 05:57:46 UTC after the red
+suite; all session processes are observed absent before target reuse. Eight recorded pairs
+contain seven passes and one failure. Source receipt is `failed` with exit zero after this
+interruption, emphatically not a pass; containing DSR is 6 and runner identity check zero.
+All 26 manifest files (164,670 bytes) and eight completed command-log hashes verify;
+verdict SHA256 `6034c0c28bb4a535a2ecf9a518b8f2724e4f59cb99cf2b6515c27ad532e27de9`,
+manifest `c716383363e0c1caf676b242a59d6a2e6db5f86dfdd974e18e95eaeeba61fab9`.
+The unpaired interrupted compiler log is retained; no completed workspace check is claimed.
+
+R194 starts at 05:59 UTC at clean `47a8e8f42f230446e11d0c4dd15161e2184559f0` /
+tree `e5d053ad8a1a1f54c76186d8cb395da2993ca986`, with the same fifteen commands,
+35 required completions, reader/negative controls and deadlines. Profile SHA256
+`6126d092738eef5a938ac231fb8340b54278a1c1f91dac3521d31b6a6a1acde9`.
+Qualification and publication remain pending; source and machinery are frozen.
+
+R194's actual record: workspace all-target compilation and strict feature-off Clippy pass;
+feature-off library is 137/1/3. The sole failed input probe resumes the owner after
+`record_frames` has paused it via Step (`HostCore::apply_step_command` sets paused=true).
+With ManualInstant fixed at zero, a running owner's next deadline never arrives, so its
+journal cannot settle. This is a fixture scheduling assumption, not production-stall proof.
+There is also one formatting failure: my earlier commentary inferred formatting success
+without reading its first record. That claim is corrected explicitly; the exact assertion
+layout is now applied. Nine completed command/log pairs are seven passes/two failures;
+hashes verify, commands SHA256
+`7a124e20684cbe1f1cef3da43b48bd0ddb7e97c28d683bd0cfd2d7d27c24bfc5`.
+The known-failed owned native group is stopped at 06:07:17 UTC; all session processes are
+observed absent. No final source verdict/manifest exists; outer is 6 / runner identity 0.
+
+`2cafaaa8` uses the actual World speed shortcut while keeping the owner paused. It requires
+observed speed 1.25, different historical speed, matching applied identity, actual in-memory
+journal commitment, the exact journal label, the historical tick and unchanged science.
+The pure merge matrix still exercises changed paused booleans. This is a different real
+control trigger, not qualification of journal finalization after Resume at a frozen clock.
+R195 starts once at 06:08:52 UTC, launcher PID 2524175, clean source
+`2cafaaa8c3b3ff30a431fb3490459e6dae67741b`, tree
+`133c9e63f793f0b86b327fde4333220cd56497d7`, identical fifteen commands/35 required names,
+reader/negative controls and deadlines. Profile SHA256
+`3e3714caf1e62a7ba7e52643df83abba2f404e801850289aa90851619279942a`.
+Formatting is actually observed as command/log 0/0 with an empty log; other results and
+publication remain pending. No further source or machinery changes are planned.
+
+Final R195 readback supersedes the pending checkpoints: run
+`aea1235e-1c27-4b40-bc2a-094a8293811e` finishes at 06:22:59 UTC with typed source
+`pass/0` and all fifteen command/log pairs zero. Workspace all-target compiler and strict
+Clippy, formatting, all four dependency guards and strict feature-off Clippy pass. Default
+render library is 154/0/3; feature-off is 138/0/3. Each mode additionally passes both real
+file-backed genome-browser integrations and the unchanged semantic PNG comparison. The
+five focused feedback tests, one focused mirror test and all 37 channel tests pass. Raw
+events and suite totals yield 341 passing executions / 194 unique passing names, zero
+failures and six ignored executions of the same three existing diagnostics. No full
+workspace-test or warning-free claim: the existing future-incompatibility notice remains.
+
+Fresh self-verification re-executes the retained original reader and its planted malformed,
+failed, duplicate and zero-run controls, then requires all 35 named completions. It also
+checks the actual feature-off GPU dependency absence and unchanged default GPU completions.
+All 64 manifest files (91,525,690 bytes) and fifteen command-log hashes verify locally.
+Proof: `/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/feedback-20261016-2cafaaa8-r195-local`.
+Verdict SHA256 `472ec6caf33bd00b9f638172f3004a2c79c2ad281a9209451991fa6927ee2d5a`;
+manifest SHA256 `260e96e0ec7e3be0c0ebcde0c4e562e77c0b10fcb1836ced2c19a4db173d055e`.
+The staged integration CSV/PNG/SVG outputs remain outside this manifest; no independent
+two-mode image identity comparison or native-window interaction is claimed.
+
+Containing DSR remains failed/6: final private-cache verification refuses the Proptest
+README symlink and artifact collection; collected identity/hash/size are null, runner
+identity check zero. The native stage and all raw proof files are retained. UBS still
+reports the two unchanged timestamp-filename heuristics; no scanner-clean claim. Original
+native OS input, ControlRuntime/TCP, hardware, platform and full cross-surface acceptance
+remain open; this is source self-verification. Source publishes through normal guarded
+pushes, and both required remote references read back
+`2cafaaa8c3b3ff30a431fb3490459e6dae67741b` at 06:24 UTC. Beads comment 2841 records the
+evidence and limitations; export completes and cycles remain empty. No Bead closes.
+
+Bounded worksheets, playback continuation `af0d81ae..2cafaaa8`:
+
+Creation: runtime consumes the corrected presentation state (FEATURE). This requested TODO
+and retained DSR output are process: consumer is the operator reviewing this history/status
+fix; gate is its source-checked handoff; incident is R192's observed compile failure and
+the traced whole-HUD substitution; active tracking retires on delivery. Integrity exception
+questions 1–4 are inapplicable: no separate integrity artifact is proposed. Opportunity
+cost: `bd-0oro` is an actionable P1 consumer; native/storage P0s retain their external proof
+requirements. Reusing the existing panel/profile is cheaper than another framework or a new
+map-editor interaction surface. Verdict: FEATURE and minimum LEGITIMATE GATE.
+
+Real work: README's purpose is deterministic artificial life with GPU UI and observable,
+reproducible research. Actual four-commit inventory: `3b2a6064` USER (one history/status fix),
+`56c6fa0c`/`47a8e8f4`/`2cafaaa8` ENABLER (my compile/format/test setup corrections);
+TODO/Beads are PROCESS, zero capability
+credit. No Bead closes. (1) Demo would scrub history, issue a World control and show the
+current receipt while historical science stays fixed; native demonstration remains absent.
+(2) Omitting tracking changes no pixels, but loses the explicitly requested TODO/handoff.
+(3) The enabling corrections are consumed by the production status panel and both full
+renderer test variants at R195; they are not speculative infrastructure.
+(4) The older unfinished native Evolution Lab still matters; this observed integration bug
+is fixable without hardware or another renderer. (5) Solo: no pane or closure comparison.
+(6) Original acceptance/dependencies are unchanged; no follow-up laundering. DRIFTING for
+the avoidable type/format retry and overlarge initial query output. Correction: freeze the
+source/profile, finish the same checks and publish their actual result.
+
+Honesty inventory, complete four-commit diff plus raw R192–R195 observations:
+1. Yes: the newly introduced input probe changes from Pause/Resume to Speed while paused,
+and the discriminating control comparison changes from paused to speed. The exact applied/
+journal/historical-tick/digest conditions remain; pure tests retain changed paused states.
+The admitted/lost coverage split is above. No existing ignore, golden, CI or baseline change.
+2. No (checked: existing actual HostCore and GPUI input fixtures; synthetic merge matrix is
+explicitly separate, with deliberately different historical/current values).
+3. No (checked: only renderer source changed; goldens are untouched).
+4. Yes: external required-test names expand from 20 to 35; original reader functions and
+planted negatives, fifteen commands and all production deadlines stay unchanged. The new
+test waits for observed journal commitment before the unchanged exact label assertion;
+it does not relabel Pending as committed or widen an existing timeout. No relaxation.
+5. No (checked: same production history path, no fixture-specific runtime branch).
+6. No (checked: final reader re-execution and raw suite/event totals, including unchanged
+ignores; all required named completions execute and pass).
+7. Yes: R194 formatting success was asserted from incomplete status readback. Its actual
+failure is disclosed above, corrected manually, and R195's first 0/0 record and empty log
+are read directly. Final graph/test acceptance uses that reader's observed pass.
+8. No (checked: synthetic merge, real-owner protocol and headless GPUI input/layout are
+named separately from native OS input, hardware or independent verification).
+9. No (checked: format/type errors, both red UI tests, interruptions, missing R192 receipt
+and R193's typed failed/exit-zero discrepancy are above; R194's false format update is corrected).
+10. No (checked: stdout/stderr retained; partial logs are named partial, not a final proof).
+11. No (checked: `bd-0oro` stays in progress; no item closes).
+12. No (checked: plan marks work in progress; original scope/acceptance are unchanged).
+13–17. Inapplicable: truly solo, no delegation, peer closure/report, pane output or agreement.
+18. No (checked: no speedup/latency claim; eventual counts derive from raw test/suite events).
+19. Yes: excessive initial queries, formatter/API/test-clock mistakes and a premature
+format claim wasted work. The earlier real-work verdict is retained, not polished to green.
+The owned failed run is explicitly interrupted after its compiler error, all its processes
+are observed absent, and the corrected source must still run every original check. The
+status panel's closed-environment field was also inspected and kept as historical science.
+20. Strongest evidence is actual-owner speed input and rejection while history stays
+frozen, plus nonzero production label bounds, all completed at the published R195 pin.
+The retained profile/logs allow re-execution; this is self-verification, not independence.
+Older-session scope stays the previously disclosed six CASS queries/views; no fresh blanket
+clearance of earlier behavior is claimed. Disposition DRIFTING; failures are disclosed and
+retained (RH-17), proof classes are explicit (RH-2), and gates are not weakened (RH-1).
+
 GPUI command feedback (`bd-0oro`, 2026-10-16):
 
 - [x] Inspect submission IDs, the status mirror and the existing Lab consumer; claim Beads
