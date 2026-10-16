@@ -19076,7 +19076,9 @@ mod map_sandbox {
             if state.width == 0 || state.height == 0 || state.cell_size == 0 {
                 return Err(MapGenerationError::InvalidDimensions);
             }
-            state.constraints.validate_bounds(state.width, state.height)?;
+            state
+                .constraints
+                .validate_bounds(state.width, state.height)?;
             for (&position, constraint) in &state.constraints.constraints {
                 if position != (constraint.x, constraint.y) {
                     return Err(MapGenerationError::DraftError(

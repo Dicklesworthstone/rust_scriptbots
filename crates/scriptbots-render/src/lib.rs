@@ -16,10 +16,10 @@ mod vfx;
 use camera::{Camera, CameraSnapshot, ViewLayout};
 use gpui::{
     App, Background, Bounds, ClipboardItem, Context, Corners, Div, FocusHandle, InteractiveElement,
-    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
-    Pixels, Point, QuitMode, RenderImage, Rgba, Role, ScrollDelta, ScrollWheelEvent, SharedString,
-    StyleRefinement, Window, WindowBounds, WindowOptions, canvas, div, fill, linear_color_stop,
-    linear_gradient, point, prelude::*, px, rgb, size,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point, QuitMode, RenderImage, Rgba, Role, ScrollDelta, ScrollWheelEvent,
+    SharedString, StyleRefinement, Window, WindowBounds, WindowOptions, canvas, div, fill,
+    linear_color_stop, linear_gradient, point, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use scriptbots_core::PresetKind;
@@ -3687,7 +3687,9 @@ impl SimulationView {
                 Ok(json) => {
                     let bytes = json.len();
                     cx.write_to_clipboard(ClipboardItem::new_string(json));
-                    format!("Copied {bytes} bytes of draft JSON. Save this text to retain the draft; no live world or receipts are exported.")
+                    format!(
+                        "Copied {bytes} bytes of draft JSON. Save this text to retain the draft; no live world or receipts are exported."
+                    )
                 }
                 Err(error) => format!("Draft export refused: {error}"),
             },
@@ -3719,8 +3721,12 @@ impl SimulationView {
             DraftGeneratorConfig::RuleBased { tileset } => format!("rules: {}", tileset.id),
             DraftGeneratorConfig::SampleBased { sample } => format!(
                 "overlapping sample: {} · {} × {} exemplar · pattern {} · periodic {} · rotations/reflections {}",
-                sample.sample_id, sample.sample_width, sample.sample_height,
-                sample.pattern_size, sample.periodic, sample.all_orientations,
+                sample.sample_id,
+                sample.sample_width,
+                sample.sample_height,
+                sample.pattern_size,
+                sample.periodic,
+                sample.all_orientations,
             ),
         };
         let mut panel = div()
@@ -21060,9 +21066,11 @@ mod command_characterization_tests {
         let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
         let json = sandbox.export_draft().unwrap();
         let valid: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let mut negatives = vec!["{".to_owned(), " ".repeat(MAP_DRAFT_MAX_BYTES + 1)];
+        let oversized_json = format!("{json}{}", " ".repeat(MAP_DRAFT_MAX_BYTES + 1 - json.len()));
+        let mut negatives = vec!["{".to_owned(), oversized_json];
         let mut oversized_rules = MapDraftDocument::from_draft(&sandbox.draft);
-        let DraftGeneratorConfig::RuleBased { tileset } = &mut oversized_rules.generator_config else {
+        let DraftGeneratorConfig::RuleBased { tileset } = &mut oversized_rules.generator_config
+        else {
             panic!("rule fixture");
         };
         let prototype = tileset.tiles[0].clone();
@@ -21082,6 +21090,24 @@ mod command_characterization_tests {
         boundary
             .import_draft(&serde_json::to_string(&oversized_rules).unwrap())
             .unwrap();
+        let boundary_json = format!("{json}{}", " ".repeat(MAP_DRAFT_MAX_BYTES - json.len()));
+        boundary.import_draft(&boundary_json).unwrap();
+        let mut large = MapSandbox::new(64, 64, 50);
+        for y in 0..large.draft.state.height {
+            for x in 0..large.draft.state.width {
+                let mut constraint = original.state.constraints.get(0, 0).unwrap().clone();
+                constraint.x = x;
+                constraint.y = y;
+                large.draft.state.constraints.paint(constraint).unwrap();
+            }
+        }
+        assert!(
+            serde_json::to_string_pretty(&MapDraftDocument::from_draft(&large.draft))
+                .unwrap()
+                .len()
+                > MAP_DRAFT_MAX_BYTES
+        );
+        assert!(large.export_draft().unwrap_err().contains("bytes"));
         let mut excessive_pairs = valid.clone();
         excessive_pairs["width"] = serde_json::json!(256);
         excessive_pairs["height"] = serde_json::json!(256);
@@ -21485,7 +21511,8 @@ mod command_characterization_tests {
         click(&mut lab, "map-redo");
         assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
         let draft = session.map_sandbox.lock().unwrap().draft.clone();
-        context.update(|app| app.write_to_clipboard(ClipboardItem::new_string("invalid".to_owned())));
+        context
+            .update(|app| app.write_to_clipboard(ClipboardItem::new_string("invalid".to_owned())));
         click(&mut lab, "map-paste-draft");
         assert_eq!(session.map_sandbox.lock().unwrap().draft, draft);
         assert!(
@@ -21498,7 +21525,13 @@ mod command_characterization_tests {
         );
         click(&mut lab, "map-generator");
         assert!(matches!(
-            session.map_sandbox.lock().unwrap().draft.state.generator_config,
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .draft
+                .state
+                .generator_config,
             DraftGeneratorConfig::SampleBased { .. }
         ));
         click(&mut lab, "map-policy");
