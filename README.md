@@ -629,13 +629,24 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   cell size; **Use live grid** restores them after size experiments. Applying requires
   that exact grid. Large maps display a bounded sample; painting affects the named cell.
   Paint grass/water/sand cells, undo/redo or clear draft paint,
-  and generate again to preview the edits. Inspect the rules identity and opposite-edge
+  and generate again to preview the edits. Inspect the generator identity and opposite-edge
   seam measurements, choose an existing-agent policy, then **Apply preview to live world**.
   The owner rejects a preview if science has changed since generation. Draft edits never
   step the world; application and journal status appear separately below the controls.
   Generation runs in one bounded background slot. Cancellation discards the result;
-  that slot remains occupied until the underlying generator finishes. This first native
-  flow exposes rule generation; sample authoring, import/export, additional field controls,
+  that slot remains occupied until the underlying generator finishes.
+  **Switch rules / sample** selects the default rule tileset or the versioned
+  `lab_meadow_v1` overlapping sample (3×3 exemplar, 2×2 patterns, periodic extraction,
+  all rotations/reflections). Undo restores the previous configuration.
+  **Copy draft JSON** and **Paste draft JSON** transfer a versioned editing recipe through
+  the clipboard. Save the copied text to retain it, or edit its seed, dimensions,
+  `generator_config` and `constraints` records to author custom rules, exemplars and
+  terrain/environment/hydrology overrides. The recipe schema is `scriptbots.map-draft.v1`;
+  constraints are a list with explicit `x`/`y` coordinates. Imports are limited to 1 MiB,
+  64 rule prototypes and the existing sample/output work bounds. Invalid imports preserve
+  the current draft and preview. A valid import is one undoable edit and requires a fresh
+  preview before Apply. Session history, owner revisions, receipts and live world state
+  are not imported. File dialogs, persisted-artifact inspection, additional field controls,
   accessible palettes and actual native OS-input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.

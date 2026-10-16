@@ -2414,10 +2414,22 @@ Skill inventory/census/verification scripts may produce evidence outside project
 existing editor into a Lab Maps tab: bounded background generation, seed/dimensions,
 terrain painting and undo/redo, preview/provenance/seams, explicit agent policy and
 owner-enforced scientific-revision application. Draft work must leave science unchanged.
+Current continuation: connect the distinct sample backend and bounded versioned draft
+clipboard import/export, with atomic validation, undo and stale-preview invalidation.
 Retain the original sample/import/export/native-input acceptance until observed; a
 headless GPUI input test does not close native acceptance.
 
-Source continuation qualified at `3f29e70d` (R199): the draft starts from the actual live
+Sample/portability source qualified and published at `9e78617e` (R201): real overlapping
+sample selection, versioned clipboard recipes, field-preserving round trips, atomic import
+validation, one-edit undo and pending-preview invalidation. All nineteen source checks pass,
+including 383 passing executions / 229 distinct tests / zero failures and both full renderer
+feature lanes. The headless production-input journey reaches clipboard, sample generation
+and actual owner Apply; the retained reader validates all 56 required named completions.
+DSR still fails collection on the tracked Proptest README symlink. Original native OS input,
+interactive exemplar/field controls, file dialogs, artifact inspection and accessibility
+remain open under `bd-2z0.10.7`; no broader editor or release closure is claimed.
+
+Earlier rule-only source qualified at `3f29e70d` (R199): the draft starts from the actual live
 food grid; Use live grid restores applicable dimensions, and large maps have a bounded
 sampled preview. Seventeen source checks pass, including explicit app-GUI compiler/strict
 Clippy and both full renderer feature lanes (351 passing executions, zero failures).

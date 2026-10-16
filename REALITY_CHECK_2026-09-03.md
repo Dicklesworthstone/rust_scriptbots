@@ -10,6 +10,146 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Map portability/sample continuation (`bd-2z0.10.7`, 2026-10-16):
+
+- [x] Inspect the pinned clipboard API, draft history and real sample generator.
+- [x] Confirm the original Bead still owns sample/import/export/native acceptance.
+- [x] Add one validated atomic draft replacement with one undo checkpoint (core probe passes).
+- [x] Define bounded versioned portable JSON with sorted constraint records in source.
+- [x] Wire Copy/Paste draft controls through the actual platform clipboard in source.
+- [x] Expose the distinct overlapping sample backend with explicit exemplar identity in source.
+- [x] Show actual generator provenance; retain science-inert draft assertions.
+- [x] Exercise round trips, invalid imports, undo/redo and superseded workers (R201 feature-off).
+- [x] Exercise production Lab clipboard/sample inputs and retained Apply journey (headless).
+- [x] Pin source and run the existing DSR checks plus focused core draft tests.
+- [x] Review evidence, publish qualified source changes and update the original open Bead.
+
+Creation gate: this extends the operator-requested existing TODO, consumed at handoff;
+the observed gaps are absent native draft portability and a disconnected sample backend.
+It retires as this work completes. No new reporting or qualification framework is added.
+
+At launch, R200 source pin `32002aaa2bd7f396f36dbe4dc0bb1ce9e133e799`, tree
+`09eb9c8c417990a4e6e77848dbbee4a311e6d85c`, was not yet published or qualified.
+The retained profile adds core map Clippy/tests to all seventeen R199 commands, with all
+old reader/negative controls intact and eleven added named completions (56 required).
+Its initial formatting check fails seven layout hunks; the exact suggestions are manually
+corrected in working source, with no semantic or test relaxation. Core strict all-target
+Clippy and all 28 map tests pass; renderer and workspace qualification remain pending.
+Static UBS exits 1 (two existing renderer timestamp heuristics, 7,015 warnings, 1,741 info);
+it is not a clean scanner result. No original editor acceptance or Bead is closed.
+
+R200 is stopped after the completed feature-off renderer suite: 28 core map tests and
+all seven map probes (including production Lab clipboard/sample/Apply input) pass.
+Ten completed command/log hashes recompute; only formatting is red. The partial proof
+contains 38 files / 45,763,060 bytes, with no final verdict or manifest. The owned native
+process group is verified before SIGTERM; the launcher exits 6 at 16:57:17 UTC with frozen
+runner identity zero, and no session processes remain before target reuse. No full-workspace
+or final cache-collection result is inferred from this interrupted run.
+
+Correction pin `9e78617e44d341a1f5dcef88a1df6b6da4e3814a`, tree
+`d9977222edd21dfc13340fc4df981f0c2ec274d2`, also repairs an initially weak negative:
+oversized whitespace is malformed JSON even without a byte guard. The corrected test
+uses valid JSON padded to exactly 1 MiB (accepted) and 1 MiB + 1 (refused), and constructs
+a genuinely oversized painted draft for export refusal. The earlier negative earns no
+byte-limit proof. No guard, timeout, ignore, assertion or original acceptance is relaxed.
+R201 retains all nineteen commands and 56 required named completions; formatting passes.
+Profile SHA256 `805c661b90877b0b78bda4e32791174ebed2725167789d4a6c9e9bc6cf8cad93`;
+launcher `0134d46312acca63e553b19632d5e08ada62db75dceed654b8dcdde51ae9d062`.
+At R201 launch, corrected-source qualification and publication were pending.
+
+**Published result:** R201 finishes at 17:13:59 UTC, source
+`9e78617e44d341a1f5dcef88a1df6b6da4e3814a`, with all nineteen command/log pairs zero
+and typed source `pass/0`. The retained reader and its planted negatives are re-executed;
+all 56 required named completions are observed. Actual totals: 383 passing executions,
+229 distinct passing tests, zero failures, and six executions of three unchanged ignored
+diagnostics. Core maps contribute 28 passes, runtime focused/channel 1/37, renderer focused
+5, full default renderer 164, and full feature-off renderer 148. Both renderer feature lanes
+exercise all seven map probes, including production Lab clipboard/sample/Apply input.
+Workspace all-target check/strict Clippy, explicit GUI-app all-target check/strict Clippy,
+formatting, four dependency guards, the no-GPU production graph and analyzer build pass.
+Cargo's existing `proc-macro-error2` future-incompatibility notice remains.
+
+All 72 manifest files / 91,559,772 bytes, exact manifest membership, all nineteen log hashes,
+profile byte identity and clean expected-source identity are recomputed in a separate pass
+by this agent. Build run `f5afb170-0ae4-48f9-8f98-946741b00dcd`; outer envelope
+`26b43803-0694-4497-a985-7f85892b007b`. Proof:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-20261016-9e78617e-r201-local`.
+Verdict SHA256 `3e3786cca03cf44847cc4c788f496cc6989e69f4d2f082338e9d418cac782c00`;
+manifest `8e85fa6e2e7dc483e8ec8f9d76692bd4def59782c432c76da27e1c44c9cc5d0a`.
+
+Containing DSR fails 6 at final private-cache verification of
+`git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md`; no collected identity/hash/size.
+Frozen runner identity check is zero. Read-only inspection of the prior retained cache
+confirms this is a tracked mode-120000 link to `proptest/README.md`, already recorded in
+`bd-build-farm-reliability-lb19.2`; no guard is bypassed or changed. This is a successful
+source/headless self-verification with failed collection, not a release, native OS-input,
+hardware, full-workspace-test or new durability qualification. Latest exact-file UBS
+remains exit 1: two existing renderer timestamp heuristics, 7,020 warnings and 1,743 info.
+Normal source pushes to both required remote branches succeed before this handoff update.
+`bd-2z0.10.7` stays in progress (comment 2850), with original interactive exemplar/field
+controls, file dialogs, artifact inspection, accessible palettes/keyboard and native OS
+journeys still owed. No original criterion, blocker or dependency is reassigned.
+
+Anti-ceremony worksheets for this continuation, bounded to these changes:
+
+- **Process worksheet:** runtime does not branch on this TODO/plan/tracker update, so it
+  is PROCESS. Consumer: the operator explicitly requesting detailed tracking. Gate: the
+  requested handoff of this map-authoring increment. Observed defect: real draft/sample
+  APIs had no portable native consumer. Retirement: completion of the original editor
+  acceptance; preserve only this existing report's historical evidence. Integrity exception
+  not used (all four exception questions are inapplicable because the explicit creation
+  gate applies). Highest-ranked ready item is the old macOS host incident `bd-e6ff`, which
+  this Linux source run cannot resolve; the useful local continuation is the existing editor.
+  An hour implementing it beats another report; this is the minimum update to the requested
+  existing tracking, with no new framework. Verdict: LEGITIMATE GATE, zero capability credit.
+- **Real-work inventory:** `32002aaa` USER (sample/portable drafts), `9e78617e` ENABLER
+  (format and discriminating boundary tests), README edits USER, existing report/plan/Beads
+  PROCESS. Two USER, one ENABLER, three PROCESS groups, zero UNKNOWN; this is a classification,
+  not a productivity metric. Most visible increment: Copy a painted draft, change it,
+  Paste/undo/redo, generate via the distinct sample backend and use guarded Apply. The actual
+  headless input journey exercises it; a native demonstration remains owed. Without PROCESS
+  edits runtime is identical; only requested tracking/evidence is lost. The import consumer
+  exercises the new core replacement, so it is not speculative. Older native/GPU acceptance
+  remains important; this block connects an already implemented generator instead. Solo:
+  no pane/agent close counts apply. No follow-up is minted and no acceptance is reassigned.
+  Verdict DRIFTING: seven avoidable formatting hunks cost a correction run, and the first
+  oversized-input negative was non-discriminating. Correct both; use valid boundary inputs
+  and preserve the failed run rather than claiming its partial results as overall acceptance.
+- **Honesty 1:** No weakening (checked both complete source diffs, unchanged original Apply,
+  stale, science digest, viewport, deadline and duplicate-request assertions; tests strengthened).
+  **2:** No specialized success double added (checked real draft generators and actual
+  `TestHost` owner; GPUI's test platform remains explicitly headless). The first whitespace
+  negative was weak and is corrected above. **3:** No regenerated golden (checked path set).
+  **4:** No suppression, tolerance/retry/deadline/config/CI relaxation (checked both diffs and
+  profile derivation); the retained external reader only adds required test completions.
+  **5:** No demo/benchmark special case (checked production clipboard/sample dispatch and
+  schema validation; preset selection is disclosed and arbitrary recipes are importable).
+  **6:** No zero-run green claim (checked all suite totals/terminals and all 56 required
+  completions with the retained reader and its planted negatives).
+  **7:** No unrun-command claim (checked all nineteen raw commands/logs and source receipt).
+  **8:** No proof promotion (source/headless owner tests are labelled; native OS, hardware,
+  full-workspace tests, durability and release acceptance are not inferred).
+  **9:** Formatting failure and weak negative are disclosed, corrected and retained; partial
+  R200 has no final verdict/manifest, not a pass. **10:** No discarded cited stderr (checked
+  UBS stdout/stderr, tee channel statuses, and retained DSR logs). **11:** No false closure
+  (original Bead stays in progress). **12:** No spec rewritten to match this increment
+  (original sample/file/artifact/fields/accessibility/native acceptance remains).
+  **13–17:** Not applicable: this continuation is solo, with no delegated work or accepted
+  subagent evidence. **18:** Denominators remain the predeclared 19 command/log pairs,
+  56 named completions and all actual test terminals; countermetrics are failures/ignores,
+  changed live science only after Apply, and exact-source/outer-collection failures.
+  **Older-session check:** five suggested CASS searches and the touched input-test name were
+  run; the latter has no hits. Broad hits include historical policy/coordination material
+  and truncated contexts; these are not an exhaustive history clearance or new findings.
+  **19:** The avoidable formatter retry and weak original size negative are the moments
+  requiring explanation. **20:** Strongest evidence is re-executable pinned
+  DSR source plus the production-click journey and retained raw-result reader; this is
+  solo self-verification, not an independent reviewer. Disposition: corrections are in place,
+  failure chain is recorded and disclosed; RH-5 tautological testing is countered with
+  valid JSON on both sides of the actual byte boundary. Source qualification passes;
+  containing collection and original native acceptance remain open. Final audit: DRIFTING,
+  corrected and disclosed; no false closure or independent-review claim.
+
 Native map draft consumer (`bd-2z0.10.7`, 2026-10-16):
 
 - [x] Trace the existing draft/generators and confirm the missing native consumer.
