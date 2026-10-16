@@ -2484,7 +2484,7 @@ const GUI_RECENT_COMMANDS: usize = 4;
 enum GuiCommandSubmission {
     Enqueued(scriptbots_runtime::CommandId),
     Uncorrelated,
-    Refused,
+    Unconfirmed,
 }
 
 #[derive(Clone)]
@@ -2518,8 +2518,8 @@ impl GuiCommandRequest {
                 feedback.problem = true;
                 return feedback;
             }
-            GuiCommandSubmission::Refused => {
-                feedback.application = "Not enqueued".to_owned();
+            GuiCommandSubmission::Unconfirmed => {
+                feedback.application = "Submission unconfirmed · check control log".to_owned();
                 feedback.problem = true;
                 return feedback;
             }
@@ -3034,7 +3034,7 @@ impl SimulationView {
         };
         let submission = admitted
             .as_ref()
-            .map_or(GuiCommandSubmission::Refused, |id| {
+            .map_or(GuiCommandSubmission::Unconfirmed, |id| {
                 serde_json::from_value(serde_json::Value::String(id.clone())).map_or(
                     GuiCommandSubmission::Uncorrelated,
                     GuiCommandSubmission::Enqueued,
@@ -3051,7 +3051,7 @@ impl SimulationView {
                 debug!(?tick, source = "gui", %command_id, payload = ?command, "GPUI control command enqueued");
             }
             None => {
-                warn!(?tick, source = "gui", payload = ?command, "failed to enqueue GPUI control command");
+                warn!(?tick, source = "gui", payload = ?command, "GPUI control submission returned no receipt; outcome unconfirmed");
             }
         }
         admitted.is_some()
@@ -3111,9 +3111,9 @@ impl SimulationView {
     /// submit warns on refusal, but a warning in the log does not tell the code
     /// what happened.
     ///
-    /// Returns false when the world lock is poisoned as well as when the queue
-    /// refuses: in both cases the edit did not reach the simulation, which is
-    /// the only distinction a caller acts on.
+    /// Returns false when a current publication or admission receipt is unavailable.
+    /// A missing receipt does not prove that the owner rejected the command; the
+    /// original transport diagnostic remains in the control log.
     fn submit_config_update<F>(&self, update: F) -> bool
     where
         F: FnOnce(&mut ScriptBotsConfig),
@@ -7552,7 +7552,7 @@ impl SimulationView {
                         if !this.apply_preset(preset, cx) {
                             warn!(
                                 ?preset,
-                                "preset could not be enqueued; the configuration is unchanged"
+                                "preset submission is unconfirmed; check the control log"
                             );
                         }
                     });
@@ -19949,11 +19949,18 @@ mod command_characterization_tests {
         assert!(feedback.problem);
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
 
-        view.command_submit = Arc::new(|_| None);
-        assert!(!view.submit_control_command(ControlCommand::Pause));
+        // Lose the transport receipt AFTER real owner application. No receipt
+        // cannot be rendered as "not enqueued" or "configuration unchanged".
+        let applied_without_receipt = Arc::clone(&host);
+        view.command_submit = Arc::new(move |command| {
+            applied_without_receipt.apply(command.try_into().unwrap());
+            None
+        });
+        assert!(!view.submit_control_command(ControlCommand::SetSpeed(2.0)));
+        assert_eq!(host.snapshot().playback.speed_multiplier, 2.0);
         assert_eq!(
             view.snapshot().command_feedback[0].application,
-            "Not enqueued"
+            "Submission unconfirmed · check control log"
         );
         view.command_submit = Arc::new(|_| Some("bad receipt".to_owned()));
         assert!(view.submit_control_command(ControlCommand::Pause));
