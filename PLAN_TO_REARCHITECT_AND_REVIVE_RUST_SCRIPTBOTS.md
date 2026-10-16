@@ -2410,6 +2410,22 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native draft consumer, 2026-10-16 (`bd-2z0.10.7`):** wire the
+existing editor into a Lab Maps tab: bounded background generation, seed/dimensions,
+terrain painting and undo/redo, preview/provenance/seams, explicit agent policy and
+owner-enforced scientific-revision application. Draft work must leave science unchanged.
+Retain the original sample/import/export/native-input acceptance until observed; a
+headless GPUI input test does not close native acceptance.
+
+Source continuation qualified at `3f29e70d` (R199): the draft starts from the actual live
+food grid; Use live grid restores applicable dimensions, and large maps have a bounded
+sampled preview. Seventeen source checks pass, including explicit app-GUI compiler/strict
+Clippy and both full renderer feature lanes (351 passing executions, zero failures).
+The five map probes include actual headless window clicks through Apply, exact owner
+terrain/hydrology, and stale refusal. The containing DSR run still refuses collection at
+its tracked-Proptest-README cache guard. Native OS input, sample/import/export authoring,
+remaining field controls and accessibility stay open under the original issue.
+
 **[Currently In Progress] `bd-2z0.10.7`, 2026-10-13:** connect the existing safe-placement
 policy to acknowledged CLI/REST/MCP map application and durable replay. Wrapped nearest-tile
 selection and atomic all-water refusal are implemented in `0425c43a`; its inner source checks

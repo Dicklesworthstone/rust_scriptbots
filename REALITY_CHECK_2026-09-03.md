@@ -10,6 +10,217 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Native map draft consumer (`bd-2z0.10.7`, 2026-10-16):
+
+- [x] Trace the existing draft/generators and confirm the missing native consumer.
+- [x] Identify the guarded application adapter and preserve owner enforcement.
+- [x] Add a Lab Maps tab with bounded background generation and honest cancellation.
+- [x] Expose seed/dimensions, terrain painting and draft undo/redo in source.
+- [x] Show preview provenance/seams and wire an explicit existing-agent policy in source.
+- [x] Exercise real generation, cancellation/edit invalidation, owner application and stale refusal.
+- [x] Run seventeen pinned clean-source DSR checks and both complete renderer feature lanes.
+- [x] Review/publish source and retain the exact evidence and original open Bead acceptance.
+- [ ] Add native sample authoring, import/export and the remaining field/constraint controls.
+- [ ] Complete accessible palettes, keyboard/native OS-input journeys and original editor acceptance.
+- [ ] Resolve containing DSR cache verification/collection and broader release qualification.
+
+Creation worksheet: the existing requested TODO is PROCESS; the operator consumes it to
+track this requested editor work and it retires as work completes. Its gate is this
+handoff; the observed gap is real generators/drafts with no native UI consumer. No new
+ledger/framework is created. The integrity exception is unnecessary (no extra recovery
+artifact); the existing pinned proof retains execution evidence. High-priority blockers
+include durable storage and hardware rendering; this ready editor integration offers a
+concrete user flow while those require separate environment/engine work. Keep this
+tracking brief and spend the block on the consumer. Verdict: minimum LEGITIMATE GATE.
+
+Initial source pin `0740cb745ee284dc515945e926e68a9f5489698a`, tree
+`eeaa654e721e7efa250c6c0973bee7f930d79c24`: R196 starts once at 09:15:09 UTC,
+launcher PID 2965397, run `904db1c3-ba1f-4cae-9e05-c2fa5657447f`. The existing
+fifteen-command lane retains every prior required completion and adds four named map
+probes to each full renderer feature lane. Profile SHA256
+`fd2ac063398fce7589246c2b67aa2a9c36deb60bd4ac468999e0cc40465f9749`.
+Formatting fails new source layout; exact changes are applied manually. Four dependency
+guards and strict feature-off all-target Clippy pass; test acceptance remains pending.
+Review also catches the new stale test reading the oldest displayed receipt; use the
+actual newest receipt, preserving the required stale rejection, and strengthen application
+checks with exact terrain/hydrology and production-click Apply. No publication yet.
+
+Static-only UBS over both changed source files exits 1 with five critical heuristics:
+two existing SystemTime capture filenames and three existing `Command::new(&exe)` calls
+whose executable comes from `std::env::current_exe()`. All are outside the changed hunks.
+Raw JSON/text/stderr remain under `map-editor-ubs-r196*` in the existing external proof
+root. This is an inspected non-green scan, not a clean-scan claim; no suppression is added.
+
+R196's full feature-off library records 141 passes, one failure and three existing ignores.
+The real generator/draft/cancellation/GPUI-input probes pass; the first owner application
+does not apply. The production map contract requires the existing food grid's dimensions
+and cell size. The initial editor's fixed 16×16 default violated that contract, so this is
+a real integration miss, not merely the receipt-order test bug. `33f2be134e55d2ab47855deb294d4fce62d9e4fd`
+initializes from the published live grid, adds Use live grid and a local mismatch refusal,
+and retains the ordered owner guard. GUI generation uses the core's `MAX_SAMPLE_OUTPUT_CELLS`
+bound (65,536), while painting displays at most 32×32 sampled cells; the normal default grid
+now has its own positive generator probe. This replaces the unusable 32-cell-per-side
+production cap. Original acceptance budgets, deadlines and perf gates are unchanged; the
+new bound-negative tracks the revised product limit, with default-grid success required.
+Exact terrain/hydrology, stale refusal and production-click application are required.
+
+The known-failed owned native process group is stopped after the red suite. At 09:23:13 UTC
+the launcher exits 6, frozen runner identity zero; all session processes are observed absent
+before target reuse. Eight completed command/log pairs include six passes and two failures
+(formatting and the full feature-off test). All 26 manifest files, 209,271 bytes, and eight
+completed log hashes verify. Source receipt is `failed` with exit zero after interruption,
+not pass. Verdict SHA256 `dd08305550d271b2d6d5e080b20ccb3a29e83aed1350c72077436a4f58b7de81`;
+manifest `d2fe78e48a48f3929da9c5c7f32af236f837e0f9cc92a0f7d99ada2296bafdfd`.
+No completed workspace acceptance or final cache-refusal claim for this interrupted run.
+
+R197 freezes `33f2be13`, tree `19cb00bcc24cbdde8c65063330a2da73668100d3`, with all fifteen
+commands and all prior reader/negative controls unchanged. Five named map completions are
+required in each full renderer feature lane, including the actual default grid and production
+input through Apply. Profile SHA256
+`a6cfd16f6544f37ed47b9e8b2ca40cb51817d9eb53acc8cee70a16385ddabc03`.
+Qualification and publication remain pending; original native/sample/editor acceptance stays open.
+
+R197's default-grid generation, cancelled/edited jobs, painting/undo and exact owner
+application/stale refusal pass. Its full feature-off suite reports 142 passes, one failure
+and three unchanged ignores. The longer production-input test reaches Apply but does not
+observe its owner effect. The pinned GPUI `TestWindow::resize` only updates platform bounds;
+`simulate_resize` invokes the resize callback. `3f29e70d5ba7783a3ce3dea4531685db8183f4fe`
+uses that actual event, keeps the intended 480×1400 viewport and ten-second deadlines, and
+adds visible-bounds and submitted-state assertions around the real click. `492e1ce7` is
+only the three exact formatter hunks; it earns no feature credit. The original Apply/terrain/
+digest/tick assertions remain. This fixture correction still requires fresh execution.
+
+The known-red owned native group is stopped; launcher finishes 09:32:12 UTC, outer 6,
+frozen runner identity zero, all session processes absent before target reuse. Eight
+completed log pairs have six passes and two failures (format and feature-off suite);
+their hashes verify. Twenty-five partial files total 174,694 bytes. No final verdict or
+manifest exists; do not infer a source pass or a final cache refusal from this interruption.
+
+R198 is prepared but never launched. Its added app-GUI checks are retained in R199:
+the app defaults omit `gui`, so workspace defaults cannot type-check the new `main.rs`
+adapter. R199 binds clean `3f29e70d`, tree `626886262c50a3d546483ec6932023013378ef83`,
+retaining all fifteen existing commands and adding explicit app-GUI all-target check and
+strict Clippy (seventeen total). All 45 required named completions, reader negatives,
+existing ignores, deadlines, goldens, cache/runner guards and feature graph controls remain.
+Profile SHA256 `555490dd4b0d0290abeb7c154dc808fb4fde735f371dd1389b8d3d471f3b83be`;
+launcher `1a6533337fbcf9907d629d69d4459e842753a4c7084824a8d02eb614da3d0525`.
+Static renderer UBS still reports the two unchanged timestamp heuristics, exit 1.
+Qualification, final input observation and publication remain pending.
+
+R199 observes all five map probes passing in the feature-off full suite, including the
+actual production-window click through Apply after the resize-event correction. The whole
+feature-off library/integration command and strict Clippy pass. GUI app compilation, the
+remaining workspace/default-feature suites and final source verdict are still pending.
+
+Bounded real-work audit, baseline `8089e67a` through the four implementation commits:
+the README's purpose is an evolutionary agent simulation with usable visualization and
+control. Mechanical inventory is the four source diffs plus BR's closed rows since 09:00
+UTC (none). `0740cb74` is USER (initial draft consumer, with broken Apply dimensions),
+`33f2be13` is USER (live-grid repair and bounded large previews), `492e1ce7` is ENABLER
+(format only), `3f29e70d` is ENABLER (real resize delivery and input assertions). The
+README/report/plan and Beads handoff are two PROCESS units; they earn no feature credit.
+Tally: two USER, two ENABLER, two PROCESS, zero UNKNOWN; one new product flow.
+
+Real-work questions: (1) the two-minute demo is Maps → pause → generate → paint/undo →
+regenerate → apply; headless production input has exercised it, native OS input has not.
+(2) Without the process units, the feature would behave identically; the operator would
+lose the requested TODO and exact failure/qualification handoff. (3) Formatting enables
+the required check; resize delivery enables the real input probe, not a new product
+capability. (4) Durable run/continuation and hardware rendering remain more consequential
+open work; this block connects an already-implemented service as explicitly requested.
+(5) Solo: no swarm closes or delegation. (6) No original acceptance was rewritten and no
+follow-up was minted to close it. Verdict: DRIFTING because the live-grid miss and avoidable
+fixture/format errors caused repeated qualification. Correction: finish this one consumer,
+retain the negative assertions and exact evidence, then hand it off without extra machinery.
+
+Honesty inventory for this block (self-review, not independent verification):
+
+1. No test was removed, skipped or ignored (checked: all four implementation diffs and
+   existing diagnostic ignores). The new generation-bound negative changed with the
+   production limit: the first 32-per-side limit excluded the real default grid; the new
+   core-derived output-cell bound retains an oversized refusal and adds default-grid success.
+2. No fake result callback was added (checked: the new test callback submits actual guarded
+   owner envelopes). It does not invoke the app's ControlHandle; explicit app-GUI compilation
+   and existing service tests are different evidence, and native process acceptance stays open.
+3. No golden was regenerated (checked: path lists and complete source diffs).
+4. Test setup and the external profile changed: exact same intended viewport now receives
+   its real resize callback, visible bounds/submission are added, and two GUI app checks are
+   added. Original assertions, deadlines, reader negatives, cache/runner guards and goldens
+   remain. The production cell limit change is disclosed above; no performance gate changes.
+5. No release-gate shortcut (checked: normal live dimensions, actual owner input, no fixture
+   branch in production, and all existing source checks retained).
+6. No zero-run green (checked: original suite reader, planted negatives and all 45 named
+   completions re-executed; final test counts are recorded below).
+7. No unrun command is reported as run (checked: command journals and launcher logs); R198
+   is explicitly never launched, and interrupted R197 has no final verdict/manifest.
+8. No fixture is called native OS or hardware proof (checked: README and commentary labels).
+9. The initial integration failure and resize/format retries are material; they are disclosed
+   above and in Beads. No overall DSR or full-editor completion is claimed.
+10. No cited stderr was discarded (checked: retained compiler/UBS/CASS/launcher logs).
+11. No Bead closes (checked: BR closed inventory and the one changed issue).
+12. No original requirement was edited to match this slice (checked: original Bead acceptance
+    remains; plan adds only an in-progress continuation).
+13–17. Not applicable: this block is solo; no subagent, delegated close, unverified report,
+       refusal farming or cross-agent agreement is used as evidence.
+18. Denominators are the pinned seventeen command/log pairs, both complete renderer lanes
+    and 45 required named completions; failures, unchanged ignores and outer collection are
+    countermetrics. No speedup, hardware or full-workspace-test metric is claimed.
+19. The moments requiring explanation are my missed live-grid contract, formatting retries
+    and incorrect test resize API. They cost extra runs; their source and evidence stay visible.
+20. The strongest evidence is the exact-source R199 raw tests and re-executed retained
+    reader/negative controls; this remains author self-verification.
+
+Older-session check: the five requested CASS phrases were searched globally and in this
+workspace, plus the new map probe name. Five selected project-hit contexts and the map-name
+context were opened. Several coordinates resolve to administrative usage events or unrelated
+text, so those limited searches cannot clear older conduct. No new older-session exoneration
+is claimed; earlier findings in this report remain. Disposition: DRIFTING, with source repairs,
+explicit failure disclosure and stronger actual-input observations already recorded. Existing
+RH-1/RH-2 defenses apply: preserve guards and distinguish source/headless evidence from native
+and collected release evidence. The completed R199 outcome and its limits follow.
+
+Final R199 source result at `3f29e70d5ba7783a3ce3dea4531685db8183f4fe` /
+tree `626886262c50a3d546483ec6932023013378ef83`: all seventeen command/log pairs
+pass and typed source verdict is `pass` / 0. The original retained reader is re-executed,
+including its malformed/failed/duplicate/zero-run controls; all 45 required named completions
+are observed. The GPU-absent production graph and its positive/negative controls pass;
+the default lane retains all four GPU capture requirements. Both GUI-app all-target check
+and strict Clippy, workspace check/strict Clippy, formatting and four dependency guards pass.
+
+Actual test denominator: 351 passing executions, 199 distinct passing names, zero failures;
+six ignored executions of the same three diagnostic names. Feature-off has 143 library,
+two genome-browser and one semantic-golden passes; default has 159, two and one. Runtime
+focused has one pass, channel has 37, and renderer focused has five. Both full lanes execute
+the five map probes: production default grid, cancellation/edit invalidation/bounds/errors,
+paint/undo with unchanged science, exact terrain/hydrology application plus stale rejection,
+and production-window input through Apply. This is headless/owner self-verification, not
+native OS input, hardware qualification or the full-workspace test suite.
+
+All 68 manifest files (91,543,807 bytes), exact file-set membership, seventeen completed
+log hashes, clean source identity and byte-identical pinned profile are recomputed.
+Verdict SHA256 `11b928d0a73bdba87b5d11021d7d55df8f0f12632b617ae1270eca11f69be6c2`;
+manifest `93ba7b3e8a8a20a2cfc238b64f46196fda7eb4724646964e5e5a70bde6b94cc7`.
+The retained proof is `/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-20261016-3f29e70d-r199-local`.
+Relative genome-browser images remain in the retained staged source; their two feature
+invocations are not independently compared or claimed as separately manifested images.
+
+Containing DSR finishes failed / 6 at 09:50:06 UTC, build run
+`16fa38fc-2cb1-430b-af19-20ecdfc322db` (outer envelope
+`761d94e7-21bd-4dee-bd5c-dd902b4d6d3a`). Its final private-cache guard rejects
+`git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md` and refuses artifact collection.
+Collected identity/hash/size are absent; frozen runner identity check is zero. No guard,
+runner or cache policy is bypassed, and no overall DSR/release pass is claimed. The existing
+Cargo future-incompatibility notice for proc-macro-error2 remains; strict Clippy exit zero
+is not an assertion that Cargo emitted no notices. Static UBS remains non-green as recorded.
+
+The qualified source is pushed normally to both required remote branches at `3f29e70d`.
+Only metadata/documentation follow; the original editor issue remains in progress, with
+sample/import/export, additional fields, accessibility and real native journeys still owed.
+No issue closes, no graph structure changes and no old acceptance is moved into a new item.
+Final audit disposition stays DRIFTING for the avoidable authoring/qualification retries;
+the actual consumer and all five positive/negative probes are delivered, with failures and
+proof boundaries visible. Final source verification adds no independent-verifier claim.
+
 Live status during historical playback (`bd-0oro`, 2026-10-16):
 
 - [x] Recheck actionable Beads and trace the live receipt consumer through production render.

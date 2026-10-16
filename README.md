@@ -624,6 +624,19 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - **Closed worlds & seeding**: enforce closed ecosystems; maintain population floors and scheduled spawns.
 
 ### Procedural maps (WFC sandbox; in progress)
+- In the native Lab's **Maps** tab, choose **Pause world**, a disclosed seed and map size,
+  then **Generate preview**. The draft starts with the live food grid's dimensions and
+  cell size; **Use live grid** restores them after size experiments. Applying requires
+  that exact grid. Large maps display a bounded sample; painting affects the named cell.
+  Paint grass/water/sand cells, undo/redo or clear draft paint,
+  and generate again to preview the edits. Inspect the rules identity and opposite-edge
+  seam measurements, choose an existing-agent policy, then **Apply preview to live world**.
+  The owner rejects a preview if science has changed since generation. Draft edits never
+  step the world; application and journal status appear separately below the controls.
+  Generation runs in one bounded background slot. Cancellation discards the result;
+  that slot remains occupied until the underlying generator finishes. This first native
+  flow exposes rule generation; sample authoring, import/export, additional field controls,
+  accessible palettes and actual native OS-input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.
 - A sample specifies `sample_id`, `sample_width`, `sample_height`, `pattern_size`, and row-major `sample_tiles` terrain kinds. `all_orientations` and `periodic` default to true; `periodic: false` is refused because non-periodic extraction is not implemented. Core bounds (`MAX_SAMPLE_CELLS`, `MAX_SAMPLE_OUTPUT_CELLS`, `MAX_SAMPLE_CELL_PAIRS`) admit at most 64 exemplar cells, 65,536 output cells, and 1,048,576 output/exemplar cell pairs before model construction. These are input-work bounds, not wall-clock or exact-byte guarantees. For example, a 2×2 all-sand sample is:
@@ -635,7 +648,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - Live CLI `control_cli map-generate`/`control_cli map-apply`, REST `/api/v1/map/generate` and `/api/v1/map/apply`, and MCP `map_generate`/`map_apply` use the shared map service and acknowledged owner commands. The main binary's offline `map-apply` command validates an artifact file. `existing_agent_policy` defaults to `retain`. CLI `control_cli map-apply --file map.json --existing-agent-policy reposition-to-safe-tile`, or REST/MCP `existing_agent_policy: "reposition_to_safe_tile"`, moves agents on deep water to the nearest non-deep-water tile using wrapped distance and row-major tie breaking. If no such tile exists for a present agent, application fails without changing the world.
 - CLI `--existing-agent-policy cull-incompatible`, or REST/MCP `existing_agent_policy: "cull_incompatible"`, records explicit map-incompatibility deaths for deep-water agents and removes their live companions. Culling requires enabled persistence, a bound recording session and a completed open tick after that session's actual binding cut; genesis, same-tick arrivals and pending/sealed or discarded recording cuts refuse atomically. Use a recording cadence greater than one and advance to an open recorded tick before submitting a new culling command. Retain and reposition do not retire agents. Inspect application and journal statuses separately; application alone does not establish durability.
 - To guard a preview against an intervening science change, read `scientific_revision` from REST `/api/status` or MCP `get_status` before preparing it. Pass that exact value as CLI `control_cli map-apply --file map.json --expected-scientific-revision REV`, or REST/MCP `expected_scientific_revision: REV`. The owner checks it at ordered application; a stale request ends as `rejected` without applying the map. Its `rejection_reason` reports the requested and actual revisions. Omission leaves application unguarded. An identical keyed retry retains its original outcome; changing the guard requires a new idempotency key.
-- The typed policy is included in the durable command and replayed explicitly. Host archive v6 refuses older archives rather than guessing the policy. The interactive rule/sample sandbox and its real-process/native acceptance remain open under `bd-2z0.10.7` and `bd-2z0.10.8`; the hydrology system builds atop terrain for dynamic water flows (see below).
+- The typed policy is included in the durable command and replayed explicitly. Host archive v6 refuses older archives rather than guessing the policy. The full interactive rule/sample sandbox and its real-process/native acceptance remain open under `bd-2z0.10.7` and `bd-2z0.10.8`; the hydrology system builds atop terrain for dynamic water flows (see below).
 
 ### Hydrology snapshot (experimental)
 - Runtime hydrology state models per-cell flow direction, accumulation, basins, and a water depth field. Use `GET /api/hydrology` for a snapshot with:
