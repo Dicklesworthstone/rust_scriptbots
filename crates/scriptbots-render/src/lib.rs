@@ -20972,8 +20972,8 @@ mod command_characterization_tests {
         let context = gpui::TestAppContext::single();
         let windows = context.update(|app| session.install(app)).unwrap();
         let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(480.0), px(1400.0)));
         lab.update(|window, app| {
-            window.resize(size(px(480.0), px(1400.0)));
             window.refresh();
             window.draw(app).clear();
         });
@@ -20981,6 +20981,14 @@ mod command_characterization_tests {
             let bounds = lab
                 .debug_bounds(selector)
                 .expect("production map control laid out");
+            let viewport = lab.update(|window, _| window.viewport_size());
+            assert!(
+                bounds.origin.x >= px(0.0)
+                    && bounds.origin.y >= px(0.0)
+                    && bounds.right() <= viewport.width
+                    && bounds.bottom() <= viewport.height,
+                "{selector} must be visible before input: {bounds:?}, viewport {viewport:?}"
+            );
             lab.simulate_click(bounds.center(), gpui::Modifiers::default());
             lab.update(|window, app| {
                 window.refresh();
@@ -21066,6 +21074,14 @@ mod command_characterization_tests {
         }
         let apply_revision = host.snapshot().revisions.scientific;
         click(&mut lab, "map-apply");
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            assert!(
+                sandbox.preview.as_ref().unwrap().submitted,
+                "Apply input did not submit: {}",
+                sandbox.notice
+            );
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         while host.snapshot().revisions.scientific == apply_revision {
             assert!(
