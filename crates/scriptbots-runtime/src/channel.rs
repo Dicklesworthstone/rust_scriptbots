@@ -3382,7 +3382,10 @@ mod tests {
         let ingress = driver.receiver.try_recv().expect("actual command ingress");
         driver.process_ingress(ingress);
         let admitted = receipt.try_recv().unwrap().unwrap();
-        assert_eq!(port.try_published_command_status(id).unwrap(), Some(admitted));
+        assert_eq!(
+            port.try_published_command_status(id).unwrap(),
+            Some(admitted)
+        );
         assert!(matches!(
             port.try_published_command_status(id)
                 .unwrap()
@@ -3394,7 +3397,10 @@ mod tests {
             driver.step(ManualInstant::from_nanos(0)).unwrap();
         }
         let settled = port.try_published_command_status(id).unwrap().unwrap();
-        assert!(matches!(settled.application(), ApplicationState::Applied(_)));
+        assert!(matches!(
+            settled.application(),
+            ApplicationState::Applied(_)
+        ));
         assert_eq!(settled.journal(), &crate::JournalState::CommittedVolatile);
         assert_eq!(driver.host().core().scientific_digest_v1().unwrap(), before);
 
@@ -3402,7 +3408,10 @@ mod tests {
         let writer = port.statuses.write().unwrap();
         assert_eq!(port.try_published_command_status(id).unwrap(), None);
         drop(writer);
-        assert_eq!(port.try_published_command_status(id).unwrap(), Some(settled));
+        assert_eq!(
+            port.try_published_command_status(id).unwrap(),
+            Some(settled)
+        );
 
         let rejected = queue_command(&port, 602, HostCommand::SetSpeed(f32::NAN));
         let ingress = driver.receiver.try_recv().unwrap();

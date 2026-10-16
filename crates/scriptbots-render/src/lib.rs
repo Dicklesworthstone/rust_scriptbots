@@ -2581,7 +2581,10 @@ impl GuiCommandFeedback {
             }
             ApplicationState::Failed(failure) => {
                 self.problem = true;
-                format!("Application failed · {} · {}", failure.code, failure.message)
+                format!(
+                    "Application failed · {} · {}",
+                    failure.code, failure.message
+                )
             }
         };
         self.journal = match status.journal() {
@@ -3029,12 +3032,14 @@ impl SimulationView {
             ControlCommand::ApplyMap { .. } => "Map",
             ControlCommand::Intervention(_) => "Intervention",
         };
-        let submission = admitted.as_ref().map_or(GuiCommandSubmission::Refused, |id| {
-            serde_json::from_value(serde_json::Value::String(id.clone())).map_or(
-                GuiCommandSubmission::Uncorrelated,
-                GuiCommandSubmission::Enqueued,
-            )
-        });
+        let submission = admitted
+            .as_ref()
+            .map_or(GuiCommandSubmission::Refused, |id| {
+                serde_json::from_value(serde_json::Value::String(id.clone())).map_or(
+                    GuiCommandSubmission::Uncorrelated,
+                    GuiCommandSubmission::Enqueued,
+                )
+            });
         if let Ok(mut recent) = self.recent_commands.lock() {
             if recent.len() == GUI_RECENT_COMMANDS {
                 recent.pop_front();
@@ -3738,26 +3743,43 @@ impl SimulationView {
                     .child(storage),
             )
             .child(div().text_xs().text_color(chrome::text_muted()).child(perf))
-            .children(snapshot.command_feedback.iter().map(|feedback| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(if feedback.problem {
-                        rgb(0xfca5a5)
-                    } else {
-                        chrome::text_secondary()
-                    })
-                    .child(format!("{} · {}", feedback.label, feedback.application))
-                    .child(feedback.journal.clone())
-                    .children(feedback.command_id.map(|id| {
+            .children(
+                snapshot
+                    .command_feedback
+                    .iter()
+                    .enumerate()
+                    .map(|(index, feedback)| {
                         div()
-                            .text_color(chrome::text_muted())
-                            .child(format!("Request {id}"))
-                    }))
-            }))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .pt_2()
+                            .text_xs()
+                            .text_color(if feedback.problem {
+                                rgb(0xfca5a5).into()
+                            } else {
+                                chrome::text_secondary()
+                            })
+                            .child(
+                                div()
+                                    .debug_selector(|| format!("gui-command-application-{index}"))
+                                    .child(format!(
+                                        "{} · {}",
+                                        feedback.label, feedback.application
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| format!("gui-command-journal-{index}"))
+                                    .child(feedback.journal.clone()),
+                            )
+                            .children(feedback.command_id.map(|id| {
+                                div()
+                                    .text_color(chrome::text_muted())
+                                    .child(format!("Request {id}"))
+                            }))
+                    }),
+            )
             .children(snapshot.simulation_fault.as_ref().map(|error| {
                 div()
                     .text_xs()
@@ -19929,7 +19951,10 @@ mod command_characterization_tests {
 
         view.command_submit = Arc::new(|_| None);
         assert!(!view.submit_control_command(ControlCommand::Pause));
-        assert_eq!(view.snapshot().command_feedback[0].application, "Not enqueued");
+        assert_eq!(
+            view.snapshot().command_feedback[0].application,
+            "Not enqueued"
+        );
         view.command_submit = Arc::new(|_| Some("bad receipt".to_owned()));
         assert!(view.submit_control_command(ControlCommand::Pause));
         let invalid = view.snapshot().command_feedback.remove(0);
@@ -19938,7 +19963,10 @@ mod command_characterization_tests {
         view.command_submit = Arc::new(|_| Some(CommandId::new(999).to_string()));
         assert!(view.submit_control_command(ControlCommand::Pause));
         let missing = view.snapshot().command_feedback.remove(0);
-        assert_eq!(missing.application, "Enqueued · status not observed locally");
+        assert_eq!(
+            missing.application,
+            "Enqueued · status not observed locally"
+        );
         assert_eq!(missing.journal, "Journal · not observed");
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
@@ -21229,6 +21257,40 @@ mod command_characterization_tests {
         assert_eq!(fixture.read(read_feedback), expected);
         assert_eq!(fixture.read_world(read_feedback), expected);
         assert_eq!(fixture.world.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn gui_command_feedback_labels_exist_in_the_production_lab_layout() {
+        let host = TestHost::take(command_characterization_world());
+        let submit_host = Arc::clone(&host);
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(move |command| {
+                Some(
+                    submit_host
+                        .apply(command.try_into().unwrap())
+                        .command_id()
+                        .to_string(),
+                )
+            }),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.update(|window, app| {
+            let canvas = windows.canvas.root(app).unwrap();
+            assert!(canvas.read(app).submit_control_command(ControlCommand::Pause));
+            window.refresh();
+            window.draw(app).clear();
+        });
+        for selector in ["gui-command-application-0", "gui-command-journal-0"] {
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("production receipt label was laid out");
+            assert!(bounds.size.width > px(0.0) && bounds.size.height > px(0.0));
+        }
+        context.quit();
     }
 
     /// bd-jw6f, tier 3 and the panel/accessibility group: every view-local
