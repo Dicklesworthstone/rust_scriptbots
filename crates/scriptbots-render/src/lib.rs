@@ -45,7 +45,7 @@ use scriptbots_core::{
 };
 use scriptbots_core::{
     DraftGeneratorConfig, ExistingAgentPolicy, MapArtifact, MapEditorDraft, PaintedConstraint,
-    default_tileset_spec,
+    MAX_SAMPLE_OUTPUT_CELLS, default_tileset_spec,
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
@@ -2636,12 +2636,18 @@ impl GuiSession {
             }
         }
 
+        let snapshot = host.snapshot_hub().latest();
+        let map_sandbox = MapSandbox::new(
+            snapshot.layers.food.width,
+            snapshot.layers.food.height,
+            snapshot.config.food_cell_size,
+        );
         Self {
             host,
             analytics,
             command_submit,
             map_apply_submit: None,
-            map_sandbox: Arc::new(Mutex::new(MapSandbox::new())),
+            map_sandbox: Arc::new(Mutex::new(map_sandbox)),
             recent_commands: Arc::new(Mutex::new(VecDeque::new())),
             inspector: Arc::new(Mutex::new(inspector_state)),
             accessibility: Arc::new(Mutex::new(AccessibilitySettings::default())),
@@ -2731,7 +2737,11 @@ fn open_gui_session_windows(
 
 /// Map application uses the app's guarded owner adapter, including its receipt identity.
 pub type MapApplySubmit = Arc<
-    dyn Fn(MapArtifact, ExistingAgentPolicy, ScientificRevision) -> std::result::Result<String, String>
+    dyn Fn(
+            MapArtifact,
+            ExistingAgentPolicy,
+            ScientificRevision,
+        ) -> std::result::Result<String, String>
         + Send
         + Sync,
 >;
@@ -2825,7 +2835,8 @@ enum DashboardTab {
     Maps,
 }
 
-const MAP_SANDBOX_MAX_SIDE: u32 = 32;
+const MAP_SANDBOX_PREVIEW_SIDE: u32 = 32;
+const MAP_SANDBOX_MAX_CELLS: u64 = MAX_SAMPLE_OUTPUT_CELLS as u64;
 
 struct MapPreview {
     artifact: Arc<MapArtifact>,
@@ -2853,13 +2864,13 @@ struct MapSandbox {
 }
 
 impl MapSandbox {
-    fn new() -> Self {
+    fn new(width: u32, height: u32, cell_size: u32) -> Self {
         Self {
             draft: MapEditorDraft::new(
                 "Lab map".to_owned(),
-                16,
-                16,
-                50,
+                width,
+                height,
+                cell_size,
                 1,
                 DraftGeneratorConfig::RuleBased {
                     tileset: default_tileset_spec(),
@@ -2882,10 +2893,11 @@ impl MapSandbox {
         let state = &self.draft.state;
         if state.width == 0
             || state.height == 0
-            || state.width > MAP_SANDBOX_MAX_SIDE
-            || state.height > MAP_SANDBOX_MAX_SIDE
+            || u64::from(state.width) * u64::from(state.height) > MAP_SANDBOX_MAX_CELLS
         {
-            self.notice = format!("Preview dimensions must be 1–{MAP_SANDBOX_MAX_SIDE} cells.");
+            self.notice = format!(
+                "Generation dimensions must be positive and at most {MAP_SANDBOX_MAX_CELLS} cells."
+            );
             return;
         }
         let draft = self.draft.clone();
@@ -2895,8 +2907,7 @@ impl MapSandbox {
             .spawn(move || {
                 let result = draft.generate_artifact().map_err(|error| error.to_string());
                 let _ = sender.send(result);
-            })
-        {
+            }) {
             Ok(_worker) => {
                 self.job = Some(MapGenerationJob {
                     draft_revision: self.draft.revision,
@@ -2936,7 +2947,9 @@ impl MapSandbox {
                         expected_scientific_revision: expected,
                         submitted: false,
                     });
-                    self.notice = "Preview ready. Painting changes the draft; generate again to apply edits.".to_owned();
+                    self.notice =
+                        "Preview ready. Painting changes the draft; generate again to apply edits."
+                            .to_owned();
                 }
                 Err(error) => self.notice = format!("Generation failed: {error}"),
             }
@@ -2952,7 +2965,7 @@ impl MapSandbox {
             MapAction::NextSize => {
                 let side = match self.draft.state.width {
                     8 => 16,
-                    16 => MAP_SANDBOX_MAX_SIDE,
+                    16 => MAP_SANDBOX_PREVIEW_SIDE,
                     _ => 8,
                 };
                 self.draft
@@ -3004,7 +3017,7 @@ impl MapSandbox {
                 }
                 return;
             }
-            MapAction::Generate | MapAction::Apply | MapAction::Pause => return,
+            MapAction::Generate | MapAction::Apply | MapAction::Pause | MapAction::LiveGrid => return,
         };
         self.notice = result.map_or_else(
             |error| format!("Draft edit refused: {error}"),
@@ -3021,6 +3034,15 @@ impl MapSandbox {
                 preview.draft_revision == self.draft.revision && !preview.submitted
             })
     }
+
+    fn preview_fits_live_grid(&self, snapshot: &RenderSnapshot) -> bool {
+        self.preview.as_ref().is_some_and(|preview| {
+            let terrain = preview.artifact.terrain();
+            terrain.width() == snapshot.layers.food.width
+                && terrain.height() == snapshot.layers.food.height
+                && terrain.cell_size() == snapshot.config.food_cell_size
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3029,6 +3051,7 @@ enum MapAction {
     Cancel,
     NextSeed,
     NextSize,
+    LiveGrid,
     Brush,
     Paint(u32, u32),
     Undo,
@@ -3181,6 +3204,12 @@ impl SimulationView {
             }
         }
 
+        let snapshot = host.snapshot_hub().latest();
+        let map_sandbox = MapSandbox::new(
+            snapshot.layers.food.width,
+            snapshot.layers.food.height,
+            snapshot.config.food_cell_size,
+        );
         Self {
             host,
             analytics_provider,
@@ -3188,7 +3217,7 @@ impl SimulationView {
             command_submit,
             recent_commands: Arc::new(Mutex::new(VecDeque::new())),
             map_apply_submit: None,
-            map_sandbox: Arc::new(Mutex::new(MapSandbox::new())),
+            map_sandbox: Arc::new(Mutex::new(map_sandbox)),
             camera: Arc::new(Mutex::new(Camera::default())),
             world_raster_cache: Arc::new(Mutex::new(WorldRasterCache::default())),
             world_raster_cleanup_registered: false,
@@ -3350,6 +3379,25 @@ impl SimulationView {
             }
             return;
         }
+        if matches!(action, MapAction::LiveGrid) {
+            if let Ok(snapshot) = self.read_snapshot()
+                && let Ok(mut sandbox) = self.map_sandbox.lock()
+            {
+                let result = sandbox.draft.set_dimensions(
+                    snapshot.layers.food.width,
+                    snapshot.layers.food.height,
+                    snapshot.config.food_cell_size,
+                );
+                sandbox.notice = result.map_or_else(
+                    |error| format!("Live grid edit refused: {error}"),
+                    |()| {
+                        "Using live grid dimensions. Clear paint outside these bounds, then generate."
+                            .to_owned()
+                    },
+                );
+            }
+            return;
+        }
         if !matches!(action, MapAction::Apply) {
             if let Ok(mut sandbox) = self.map_sandbox.lock() {
                 sandbox.edit(action);
@@ -3362,6 +3410,15 @@ impl SimulationView {
             };
             if !sandbox.can_apply() {
                 sandbox.notice = "Generate the current draft before applying it.".to_owned();
+                return;
+            }
+            if !self
+                .read_snapshot()
+                .is_ok_and(|snapshot| sandbox.preview_fits_live_grid(&snapshot))
+            {
+                sandbox.notice =
+                    "Preview must match the live food grid. Choose Use live grid, then generate."
+                        .to_owned();
                 return;
             }
             let policy = sandbox.policy;
@@ -3393,7 +3450,12 @@ impl SimulationView {
                     format!("Map request {id}. See live application and journal status below."),
                 )
             }
-            Err(error) => (GuiCommandSubmission::Unconfirmed, format!("Map outcome unconfirmed: {error}. Inspect live status before generating another request.")),
+            Err(error) => (
+                GuiCommandSubmission::Unconfirmed,
+                format!(
+                    "Map outcome unconfirmed: {error}. Inspect live status before generating another request."
+                ),
+            ),
         };
         self.record_gui_command("Map", submission);
         if let Ok(mut sandbox) = self.map_sandbox.lock() {
@@ -3454,6 +3516,9 @@ impl SimulationView {
             return div().child("Map editor state unavailable");
         };
         let busy = sandbox.job.is_some();
+        let fits_live = self
+            .read_snapshot()
+            .is_ok_and(|snapshot| sandbox.preview_fits_live_grid(&snapshot));
         let draft = &sandbox.draft;
         let mut panel = div()
             .flex()
@@ -3475,19 +3540,46 @@ impl SimulationView {
                     .flex_wrap()
                     .gap_2()
                     .child(self.render_map_button(
-                        "map-pause", "Pause world".to_owned(), MapAction::Pause, true, cx,
+                        "map-pause",
+                        "Pause world".to_owned(),
+                        MapAction::Pause,
+                        true,
+                        cx,
                     ))
                     .child(self.render_map_button(
-                        "map-seed", "Next seed".to_owned(), MapAction::NextSeed, true, cx,
+                        "map-seed",
+                        "Next seed".to_owned(),
+                        MapAction::NextSeed,
+                        true,
+                        cx,
                     ))
                     .child(self.render_map_button(
-                        "map-size", "Cycle size 8/16/32".to_owned(), MapAction::NextSize, true, cx,
+                        "map-size",
+                        format!("Cycle size 8/16/{MAP_SANDBOX_PREVIEW_SIDE}"),
+                        MapAction::NextSize,
+                        true,
+                        cx,
                     ))
                     .child(self.render_map_button(
-                        "map-undo", "Undo draft".to_owned(), MapAction::Undo, draft.can_undo(), cx,
+                        "map-live-grid",
+                        "Use live grid".to_owned(),
+                        MapAction::LiveGrid,
+                        true,
+                        cx,
                     ))
                     .child(self.render_map_button(
-                        "map-redo", "Redo draft".to_owned(), MapAction::Redo, draft.can_redo(), cx,
+                        "map-undo",
+                        "Undo draft".to_owned(),
+                        MapAction::Undo,
+                        draft.can_undo(),
+                        cx,
+                    ))
+                    .child(self.render_map_button(
+                        "map-redo",
+                        "Redo draft".to_owned(),
+                        MapAction::Redo,
+                        draft.can_redo(),
+                        cx,
                     )),
             )
             .child(
@@ -3496,17 +3588,32 @@ impl SimulationView {
                     .flex_wrap()
                     .gap_2()
                     .child(self.render_map_button(
-                        "map-generate", "Generate preview".to_owned(), MapAction::Generate, !busy, cx,
+                        "map-generate",
+                        "Generate preview".to_owned(),
+                        MapAction::Generate,
+                        !busy,
+                        cx,
                     ))
                     .child(self.render_map_button(
-                        "map-cancel", "Cancel preview".to_owned(), MapAction::Cancel, busy, cx,
+                        "map-cancel",
+                        "Cancel preview".to_owned(),
+                        MapAction::Cancel,
+                        busy,
+                        cx,
                     ))
                     .child(self.render_map_button(
-                        "map-brush", format!("Brush: {:?}", sandbox.brush), MapAction::Brush, true, cx,
+                        "map-brush",
+                        format!("Brush: {:?}", sandbox.brush),
+                        MapAction::Brush,
+                        true,
+                        cx,
                     ))
                     .child(self.render_map_button(
-                        "map-clear", "Clear paint".to_owned(), MapAction::ClearPaint,
-                        !draft.state.constraints.is_empty(), cx,
+                        "map-clear",
+                        "Clear paint".to_owned(),
+                        MapAction::ClearPaint,
+                        !draft.state.constraints.is_empty(),
+                        cx,
                     )),
             )
             .child(div().text_xs().child(sandbox.notice.clone()));
@@ -3531,11 +3638,17 @@ impl SimulationView {
                     seams.seam_kind_discontinuities_ew,
                 )));
             let width = artifact.terrain().width();
-            let cell_pixels = 256.0 / width as f32;
+            let height = artifact.terrain().height();
+            let stride = width.max(height).div_ceil(MAP_SANDBOX_PREVIEW_SIDE);
+            let columns = width.div_ceil(stride);
+            let rows = height.div_ceil(stride);
+            let cell_pixels = 256.0 / columns.max(rows) as f32;
             let mut grid = div().flex().flex_col().w(px(256.0)).flex_none();
-            for y in 0..artifact.terrain().height() {
+            for row_index in 0..rows {
+                let y = row_index * height / rows;
                 let mut row = div().flex().h(px(cell_pixels));
-                for x in 0..width {
+                for column in 0..columns {
+                    let x = column * width / columns;
                     let Some(tile) = artifact.terrain().tile(x, y) else {
                         continue;
                     };
@@ -3549,38 +3662,43 @@ impl SimulationView {
                     };
                     row = row.child(
                         div()
-                        .id(("map-cell", (y * width + x) as usize))
-                        .debug_selector(move || format!("map-cell-{x}-{y}"))
-                        .focusable()
-                        .tab_stop(true)
-                        .role(Role::Button)
-                        .aria_label(format!("Paint cell {x}, {y}; preview {:?}", tile.kind))
-                        .w(px(cell_pixels))
-                        .h(px(cell_pixels))
-                        .flex_none()
-                        .bg(rgb(color))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.map_action(MapAction::Paint(x, y));
-                                cx.notify();
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                            if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
-                                this.map_action(MapAction::Paint(x, y));
-                                cx.notify();
-                                cx.stop_propagation();
-                            }
-                        })),
+                            .id(("map-cell", (y * width + x) as usize))
+                            .debug_selector(move || format!("map-cell-{x}-{y}"))
+                            .focusable()
+                            .tab_stop(true)
+                            .role(Role::Button)
+                            .aria_label(format!("Paint cell {x}, {y}; preview {:?}", tile.kind))
+                            .w(px(cell_pixels))
+                            .h(px(cell_pixels))
+                            .flex_none()
+                            .bg(rgb(color))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.map_action(MapAction::Paint(x, y));
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                                    this.map_action(MapAction::Paint(x, y));
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }
+                            })),
                     );
                 }
                 grid = grid.child(row);
             }
-            panel = panel.child(grid).child(div().text_xs().child(
-                "Preview colours: blue water · tan sand · green grass/bloom · grey rock. Opposite edges join. Paint, then regenerate; undo changes only the draft.",
-            ));
+            panel = panel
+                .child(grid)
+                .child(div().text_xs().child(
+                    "Preview colours: blue water · tan sand · green grass/bloom · grey rock. Opposite edges join. Paint, then regenerate; undo changes only the draft.",
+                ))
+                .child(div().text_xs().child(format!(
+                    "Showing {columns} × {rows} sampled cells of {width} × {height}; painting affects the named cell only. Use live grid before applying a different preview size."
+                )));
         }
         let policy = match sandbox.policy {
             ExistingAgentPolicy::Retain => "retain existing agents",
@@ -3595,11 +3713,16 @@ impl SimulationView {
                 true,
                 cx,
             ))
+            .child(div().text_xs().child(if fits_live {
+                "Preview dimensions match the live grid."
+            } else {
+                "Application requires matching dimensions and cell size. Choose Use live grid, then generate."
+            }))
             .child(self.render_map_button(
                 "map-apply",
                 "Apply preview to live world".to_owned(),
                 MapAction::Apply,
-                sandbox.can_apply() && self.map_apply_submit.is_some(),
+                sandbox.can_apply() && fits_live && self.map_apply_submit.is_some(),
                 cx,
             ))
             .child(div().text_xs().child("Applying replaces live terrain/hydrology. An intervening science change rejects the preview; regenerate while paused. Culling requires a recorded open lifecycle boundary."))
@@ -20604,18 +20727,44 @@ mod command_characterization_tests {
                 artifact: Box::new(artifact),
                 existing_agent_policy: policy,
             };
-            host.port.clone().submit(
-                CommandEnvelope::new(id, command.try_into().unwrap())
-                    .expecting_scientific_revision(expected),
-            ).map(|status| status.command_id().to_string()).map_err(|error| error.to_string())
+            host.port
+                .clone()
+                .submit(
+                    CommandEnvelope::new(id, command.try_into().unwrap())
+                        .expecting_scientific_revision(expected),
+                )
+                .map(|status| status.command_id().to_string())
+                .map_err(|error| error.to_string())
         })
+    }
+
+    #[test]
+    fn map_sandbox_accepts_the_production_default_grid() {
+        let config = ScriptBotsConfig {
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let host = Arc::new(TestHost::new(WorldState::new(config).unwrap()));
+        let view = SimulationView::headless(host.port.clone());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let live = host.snapshot();
+        view.map_action(MapAction::Generate);
+        let mut sandbox = view.map_sandbox.lock().unwrap();
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
+        assert!(sandbox.preview_fits_live_grid(&live));
+        assert_eq!(sandbox.draft.state.width, live.layers.food.width);
+        assert_eq!(sandbox.draft.state.height, live.layers.food.height);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
     #[test]
     fn map_sandbox_generation_paint_and_undo_leave_science_unchanged() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
-        let mut sandbox = MapSandbox::new();
+        let mut sandbox = MapSandbox::new(16, 16, 50);
         let original = sandbox.draft.state.clone();
         sandbox.generate(host.snapshot().revisions.scientific);
         wait_map_job(&mut sandbox);
@@ -20623,12 +20772,27 @@ mod command_characterization_tests {
         let terrain = sandbox.preview.as_ref().unwrap().artifact.terrain().clone();
         sandbox.brush = TerrainKind::DeepWater;
         sandbox.edit(MapAction::Paint(0, 0));
-        assert!(!sandbox.can_apply(), "old preview must not apply after painting");
+        assert!(
+            !sandbox.can_apply(),
+            "old preview must not apply after painting"
+        );
         sandbox.edit(MapAction::Undo);
         assert_eq!(sandbox.draft.state, original);
-        assert!(!sandbox.can_apply(), "undo still requires a new preview identity");
+        assert!(
+            !sandbox.can_apply(),
+            "undo still requires a new preview identity"
+        );
         sandbox.edit(MapAction::Redo);
-        assert_eq!(sandbox.draft.state.constraints.get(0, 0).unwrap().terrain_kind, Some(TerrainKind::DeepWater));
+        assert_eq!(
+            sandbox
+                .draft
+                .state
+                .constraints
+                .get(0, 0)
+                .unwrap()
+                .terrain_kind,
+            Some(TerrainKind::DeepWater)
+        );
         sandbox.generate(host.snapshot().revisions.scientific);
         wait_map_job(&mut sandbox);
         let painted = sandbox.preview.as_ref().unwrap().artifact.terrain();
@@ -20646,7 +20810,7 @@ mod command_characterization_tests {
     fn map_sandbox_discards_cancelled_and_edited_jobs_and_bounds_work() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
-        let mut sandbox = MapSandbox::new();
+        let mut sandbox = MapSandbox::new(16, 16, 50);
         let expected = host.snapshot().revisions.scientific;
         sandbox.generate(expected);
         sandbox.edit(MapAction::Cancel);
@@ -20657,19 +20821,31 @@ mod command_characterization_tests {
         sandbox.generate(expected);
         sandbox.edit(MapAction::NextSeed);
         wait_map_job(&mut sandbox);
-        assert!(sandbox.preview.is_none(), "outdated worker output must be discarded");
-        sandbox.draft.set_dimensions(MAP_SANDBOX_MAX_SIDE + 1, 8, 50).unwrap();
+        assert!(
+            sandbox.preview.is_none(),
+            "outdated worker output must be discarded"
+        );
+        sandbox
+            .draft
+            .set_dimensions(u32::try_from(MAX_SAMPLE_OUTPUT_CELLS + 1).unwrap(), 1, 50)
+            .unwrap();
         sandbox.generate(expected);
         assert!(sandbox.job.is_none());
         assert!(sandbox.notice.contains("dimensions"));
         sandbox.draft.set_dimensions(8, 8, 50).unwrap();
         let mut invalid = default_tileset_spec();
         invalid.tiles.clear();
-        sandbox.draft.set_generator_config(DraftGeneratorConfig::RuleBased { tileset: invalid });
+        sandbox
+            .draft
+            .set_generator_config(DraftGeneratorConfig::RuleBased { tileset: invalid });
         sandbox.generate(expected);
         wait_map_job(&mut sandbox);
         assert!(sandbox.preview.is_none());
-        assert!(sandbox.notice.starts_with("Generation failed:"), "{}", sandbox.notice);
+        assert!(
+            sandbox.notice.starts_with("Generation failed:"),
+            "{}",
+            sandbox.notice
+        );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
@@ -20679,24 +20855,74 @@ mod command_characterization_tests {
         let mut view = SimulationView::headless(host.port.clone());
         view.map_apply_submit = Some(map_owner_submit(Arc::clone(&host)));
         let before = host.port.scientific_digest_v1().unwrap();
+        view.map_action(MapAction::NextSize);
+        view.map_action(MapAction::Generate);
+        wait_map_job(&mut view.map_sandbox.lock().unwrap());
+        view.map_action(MapAction::Apply);
+        assert!(view.recent_commands.lock().unwrap().is_empty());
+        assert!(
+            view.map_sandbox.lock().unwrap().notice.contains("live food grid")
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        view.map_action(MapAction::LiveGrid);
         view.map_action(MapAction::Generate);
         {
             let mut sandbox = view.map_sandbox.lock().unwrap();
             wait_map_job(&mut sandbox);
             assert!(sandbox.can_apply());
         }
+        let expected = {
+            let sandbox = view.map_sandbox.lock().unwrap();
+            Arc::clone(&sandbox.preview.as_ref().unwrap().artifact)
+        };
         view.map_action(MapAction::Apply);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let snapshot = view.snapshot();
-            if snapshot.command_feedback.last().is_some_and(|status| status.application.starts_with("Applied")) {
+            if snapshot
+                .command_feedback
+                .first()
+                .is_some_and(|status| status.application.starts_with("Applied"))
+            {
                 break;
             }
             assert!(Instant::now() < deadline, "map did not apply");
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_ne!(host.port.scientific_digest_v1().unwrap(), before);
-        assert_eq!(host.snapshot().world.tick, 0, "applying must not step science");
+        let applied = host.snapshot();
+        assert_eq!(applied.layers.terrain.width, expected.terrain().width());
+        assert_eq!(applied.layers.terrain.height, expected.terrain().height());
+        assert_eq!(
+            applied.layers.terrain.tiles.len(),
+            expected.terrain().tiles().len()
+        );
+        for (actual, tile) in applied
+            .layers
+            .terrain
+            .tiles
+            .iter()
+            .zip(expected.terrain().tiles())
+        {
+            assert_eq!(actual.kind, tile.kind);
+            assert_eq!(actual.elevation, tile.elevation);
+            assert_eq!(actual.moisture, tile.moisture);
+            assert_eq!(actual.fertility_bias, tile.fertility_bias);
+            assert_eq!(actual.temperature_bias, tile.temperature_bias);
+            assert_eq!(actual.accent, tile.accent);
+            assert_eq!(actual.palette_index, tile.palette_index);
+        }
+        let hydrology = applied.layers.hydrology.as_ref().unwrap();
+        let field = expected.hydrology_field().unwrap();
+        assert_eq!(hydrology.flow_directions, field.flow_directions());
+        assert_eq!(hydrology.accumulation, field.accumulation());
+        assert_eq!(hydrology.spill_elevation, field.spill_elevation());
+        assert_eq!(hydrology.basin_ids, field.basin_ids());
+        assert_eq!(
+            host.snapshot().world.tick,
+            0,
+            "applying must not step science"
+        );
         view.map_action(MapAction::Generate);
         wait_map_job(&mut view.map_sandbox.lock().unwrap());
         host.apply(scriptbots_runtime::HostCommand::Step);
@@ -20706,7 +20932,9 @@ mod command_characterization_tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let snapshot = view.snapshot();
-            if snapshot.command_feedback.last().is_some_and(|status| status.problem && status.application.contains("science revision")) {
+            if snapshot.command_feedback.first().is_some_and(|status| {
+                status.problem && status.application.contains("science revision")
+            }) {
                 break;
             }
             assert!(Instant::now() < deadline, "stale preview was not rejected");
@@ -20717,14 +20945,22 @@ mod command_characterization_tests {
         assert!(!view.map_sandbox.lock().unwrap().can_apply());
         let requests = view.recent_commands.lock().unwrap().len();
         view.map_action(MapAction::Apply);
-        assert_eq!(view.recent_commands.lock().unwrap().len(), requests, "repeated clicks must not resubmit one preview");
+        assert_eq!(
+            view.recent_commands.lock().unwrap().len(),
+            requests,
+            "repeated clicks must not resubmit one preview"
+        );
     }
 
     #[test]
     fn map_sandbox_production_lab_input_generates_paints_and_undoes() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
-        let mut session = GuiSession::new(host.port.clone(), AnalyticsSnapshotProvider::empty(), Arc::new(|_| None));
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        );
         session.map_apply_submit = Some(map_owner_submit(Arc::clone(&host)));
         let session = Arc::new(session);
         let context = gpui::TestAppContext::single();
@@ -20736,7 +20972,9 @@ mod command_characterization_tests {
             window.draw(app).clear();
         });
         let click = |lab: &mut gpui::VisualTestContext, selector| {
-            let bounds = lab.debug_bounds(selector).expect("production map control laid out");
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("production map control laid out");
             lab.simulate_click(bounds.center(), gpui::Modifiers::default());
             lab.update(|window, app| {
                 window.refresh();
@@ -20746,6 +20984,10 @@ mod command_characterization_tests {
         click(&mut lab, "dashboard-tab-maps");
         click(&mut lab, "map-seed");
         assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
+        click(&mut lab, "map-size");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.width, 8);
+        click(&mut lab, "map-live-grid");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.width, 2);
         click(&mut lab, "map-generate");
         let deadline = Instant::now() + Duration::from_secs(10);
         while session.map_sandbox.lock().unwrap().job.is_some() {
@@ -20753,7 +20995,10 @@ mod command_characterization_tests {
                 window.refresh();
                 window.draw(app).clear();
             });
-            assert!(Instant::now() < deadline, "production map preview did not arrive");
+            assert!(
+                Instant::now() < deadline,
+                "production map preview did not arrive"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(session.map_sandbox.lock().unwrap().can_apply());
@@ -20761,14 +21006,73 @@ mod command_characterization_tests {
         click(&mut lab, "map-cell-0-0");
         {
             let sandbox = session.map_sandbox.lock().unwrap();
-            assert_eq!(sandbox.draft.state.constraints.get(0, 0).unwrap().terrain_kind, Some(TerrainKind::DeepWater));
+            assert_eq!(
+                sandbox
+                    .draft
+                    .state
+                    .constraints
+                    .get(0, 0)
+                    .unwrap()
+                    .terrain_kind,
+                Some(TerrainKind::DeepWater)
+            );
             assert!(!sandbox.can_apply());
         }
         click(&mut lab, "map-undo");
-        assert!(session.map_sandbox.lock().unwrap().draft.state.constraints.is_empty());
+        assert!(
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .draft
+                .state
+                .constraints
+                .is_empty()
+        );
         click(&mut lab, "map-redo");
-        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.constraints.count(), 1);
+        assert_eq!(
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .draft
+                .state
+                .constraints
+                .count(),
+            1
+        );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+        click(&mut lab, "map-policy");
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().policy,
+            ExistingAgentPolicy::RepositionToSafeTile
+        );
+        click(&mut lab, "map-generate");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.map_sandbox.lock().unwrap().job.is_some() {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            });
+            assert!(Instant::now() < deadline, "edited preview did not arrive");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let apply_revision = host.snapshot().revisions.scientific;
+        click(&mut lab, "map-apply");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.snapshot().revisions.scientific == apply_revision {
+            assert!(
+                Instant::now() < deadline,
+                "input map application did not reach owner"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            host.snapshot().layers.terrain.tiles[0].kind,
+            TerrainKind::DeepWater
+        );
+        assert_ne!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, 0);
         context.quit();
     }
