@@ -10,6 +10,231 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+GPUI command feedback (`bd-0oro`, 2026-10-16):
+
+- [x] Inspect submission IDs, the status mirror and the existing Lab consumer; claim Beads
+  and reserve exact paths without changing the original cross-surface scope.
+- [x] Add a nonblocking, mirror-only status observation; absence must never consult the owner.
+- [x] Share a bounded recent-request list between World and Lab and display actual application
+  and journal outcomes, including unavailable status, malformed IDs and unconfirmed submission.
+- [x] Exercise real owner application/rejection and separate journal states; cover missing,
+  busy, evicted and poisoned mirrors and shared-window feedback with meaningful controls.
+- [x] Run pinned clean-source DSR compiler, strict Clippy, formatting and relevant tests;
+  retain raw failures and distinguish source results from containing DSR collection.
+- [x] Reopen `bd-2z0.7.10` on R189's fourteen feature-off compilation errors.
+- [x] Guard only GPU-specific fields/helpers/tests with the actual optional feature;
+  shared fog uses the already-existing, coefficient-identical CPU sRGB decoder.
+- [x] Qualify the full default and feature-off renderer library/integration suites, strict
+  Clippy in both modes and an absent production world-gfx/wgpu dependency edge.
+- [x] Review and publish source; read both required remote references back at the qualified pin.
+- [x] Update this TODO and export Beads with original acceptance open and no dependency cycles.
+- [ ] Resolve non-green UBS and containing DSR collection before claiming complete original
+  feature-boundary acceptance; keep source-check success separate from those outcomes.
+- [ ] Obtain the broader cross-surface and native-input acceptance before closing the defect class.
+
+Creation gate: feedback is FEATURE, consumed by existing Lab UI; the operator-requested TODO
+and mandatory pinned DSR checks serve delivery review and retire as work completes. A queued
+request currently has no visible owner outcome. Reuse existing runtime, report and proof
+structure; no new framework or process capability credit. This P1 consumer is actionable while
+P0 native/platform and storage-engine blockers remain open; the lower-priority native map editor
+would require a larger new interaction surface.
+
+Source checkpoints `4f194868` and `2dcada5b` connect four recent requests to the existing
+Overview status panel, share them across the two views, and keep application and journal
+axes separate. A missing/busy/evicted mirror is unobserved, never a blocking owner query.
+The second checkpoint corrects an `Rgba`/`Hsla` branch mismatch and seven formatter hunks,
+then adds a production label-layout assertion using GPUI's existing test support. The
+formatter output is applied manually; no assertion, golden, deadline, feature pin or
+suppression changes. No new dependency or source file.
+
+R188 at clean `4f194868` / tree `60549102`, local native Linux, run
+`fceed122-28e8-4f10-a142-c4915cc1e9c2`, starts at 04:41:34 UTC. All four dependency
+guards pass. Formatting and workspace compiler/Clippy fail on the differences above.
+The new actual-owner mirror test passes, as do all 37 channel tests (zero failed/ignored);
+the focused test repeats one of those names, so this is 38 executions, not 38 unique tests.
+Renderer tests are not yet observed: dependency compilation precedes the same known color
+type error. R189 is prepared at clean `2dcada5b` / tree `2abc8713`, with the same thirteen
+commands and original reader functions/negative controls plus the new required layout test.
+It has not launched at this checkpoint. The two source commits remain unpublished.
+
+R188 finishes at 04:51:45 UTC: seven of thirteen commands pass; formatting plus workspace
+compiler/Clippy and all three render test builds fail. No renderer test executes. Source
+verdict is `failed/1`, containing DSR is 6 and final frozen runner identity is zero. All
+34 manifest files (132,606 bytes) and thirteen command-log hashes verify locally; source
+verdict SHA256 `b6e3beacfb01e0bef74ee9006e7fe70ca1847c2799d4446737ac6c2dafbb388b`, inventory
+`6168792f3fcecf03dce8712539b0c00e99de9a7fbde925e1d6dc32d974bd3bc6`. This outer failure
+follows the source failure; no final-cache symlink refusal is observed in R188.
+
+Inspecting the actual `ControlRuntime` submit adapter then exposes another claim gap: `None`
+also covers transport errors/timeouts, so the new "Not enqueued" wording was too strong.
+`8a1f4d6d` changes the display and related GPUI/preset logs to submission-unconfirmed, and
+corrects the stale config-helper comment. A real-owner test applies speed 2.0 before losing
+its transport receipt and requires uncertainty despite observed application. Synthetic
+invalid/missing-ID and two-axis formatting cases stay separate from that owner observation;
+the stale-revision test injects its guard at the owner protocol, not through the production
+ControlRuntime adapter or live transport. No complete transport/native journey is claimed.
+
+R189's unlaunched `2dcada5b` preparation is updated before its sole launch to clean
+`8a1f4d6d` / tree `f957d5bd`, run `ca273307-35d5-4014-85a2-16320f6a47e4`, at
+04:53:09 UTC. The thirteen commands and reader functions/negative controls are unchanged;
+sixteen named completions are required, including real label layout. Source/private cache
+and proofs are on disk, with a fresh staged source and download cache; the prior external
+Cargo target is reused only after R188 exits. No performance comparison is made. All four
+guards pass; formatting finds one new multiline assertion, corrected manually in the
+working tree. Compiler/Clippy and test results remain pending at this checkpoint.
+
+R189 subsequently passes workspace compiler/strict Clippy, the focused mirror test and
+37 channel tests, all four new feedback tests, and full default render library: 151 pass,
+zero fail, three existing explicitly ignored diagnostics. Feature-off test compilation
+fails with fourteen `E0433` errors: four GPU-only tests, GPU-control return types/constructors
+and a shared fog conversion reach the disabled optional crate. The no-default lane stays
+required. The existing P0 `bd-2z0.7.10` is reopened as a regression, not a claim that its
+historical close was false. Exact `world_wgpu` guards restore the boundary; the four GPU
+tests retain their default-feature assertions, and the final lane expands to full library/
+integration tests plus strict feature-off Clippy and a production dependency-graph check.
+`bc36c0f5` separately records the last required formatting correction, with zero feature
+credit. Qualification of this additional boundary fix remains pending.
+
+R189 final custody: eleven of thirteen commands pass, source `failed/1`, outer 6 / frozen
+runner identity 0. All 42 manifest files (256,357 bytes) and thirteen command-log hashes
+verify. Source-verdict SHA256 `4ff4f76aa58e610101b0a4ab9c8cd05e09d8defac117ea72c42f2283391161d3`;
+inventory `889d0b5ac9e716b08d7dfffdb557a1fe4a0b7636b21ab32bd37f31b2499469bc`.
+
+R190 at clean `df4e0e20` / tree `3b612eb6` starts at 05:08:16 UTC and ends at
+05:21:54 UTC. Fourteen of fifteen commands pass. Formatting, four guards, workspace compiler/
+strict Clippy, both full renderer variants and channel tests pass; strict feature-off Clippy
+alone fails on three unused GPU-owned pieces. Both feature modes run the real file-backed
+genome-browser integrations and the unchanged semantic PNG golden. Totals are 334 passing
+test executions / 191 unique passing names, zero test failures, six ignored executions of
+three existing diagnostic names. Feature-off library is 135/0/3; default library 151/0/3;
+each mode additionally passes two genome-browser and one semantic snapshot integration.
+Source remains `failed/1`, outer 6 / runner identity 0. All 64 manifest files (91,524,605
+bytes) and fifteen command-log hashes verify; source-verdict SHA256
+`7977275bbca8a6e117839877cd0ba03f0a10d8b669006b9051edfb21302de15e`, inventory
+`e70248b2221ecca720c143acec664edcdf27595422b8590b95cdc49d4d92a071`.
+
+`61c1c99a` removes GPU-only blood data from the feature-off private frame, preserves its
+original default-feature value, and compiles two pure projection helpers for their actual
+GPU/test consumers. No struct field is made test-only. R191 starts once at 05:22:51 UTC,
+run `6d81ff7b-7f03-4bd3-9aae-43934499b1fd`, clean `61c1c99a` / tree `1b7e0df5`,
+with the identical fifteen commands, twenty named completions, reader functions/negative
+controls and deadlines. Profile SHA256 `b3e5070cbe65cb6358098781d032de66ce5afe08c9c96cea3c991eb0b6648eee`.
+Formatting, four guards and strict feature-off Clippy pass first; the following final
+readback supersedes that pending checkpoint. The code remains frozen.
+
+R191 ends at 05:36:39 UTC with all fifteen command/log exit pairs zero and source verdict
+`pass/0` at exact commit `61c1c99a1aef3de06d0eb8afe1466d0cf828a2a5`, tree
+`1b7e0df5b971c94cb2ac48d40978762717999ab9`. Workspace all-target compiler/strict Clippy,
+formatting, four dependency guards and strict feature-off Clippy pass. Full renderer
+library/integration suites pass in both modes: default 151 library plus two genome-browser
+and one unchanged semantic PNG comparison; feature-off 135 library plus the same two and
+one integrations. Each library retains its three existing ignored diagnostics. The focused
+mirror test passes, all 37 channel tests pass, and all four focused feedback tests pass.
+Raw JSON and suite totals yield 334 passing executions / 191 unique passing names, zero
+failures and six ignored executions of three names. This is scoped self-verification, not
+the full workspace test suite. Cargo's existing `proc-macro-error2` future-incompatibility
+notice remains; strict Clippy success is not a claim that every diagnostic disappeared.
+
+Fresh readback re-executes the retained reader, including its planted malformed/failed/
+zero-run test records and GPU graph controls. All twenty required named completions are
+observed, all four GPU capture tests run in default mode, and the actual feature-off
+production graph has no world-gfx/wgpu edge. All 64 manifest files (91,522,531 bytes) and
+fifteen command-log hashes verify locally. Proof directory:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/feedback-20261016-61c1c99a-r191-local`.
+Source-verdict SHA256 `f8f709a620cc9edb2904bdf8d4f830f585373734a7482847a1f4c1137d2e5be8`;
+manifest SHA256 `e1241d357951bc131736ba326a22e5457b7bf34b10d61d3b45a7bb9ecdcc54b0`.
+The first extra readback incorrectly expects a bare SHA in `source.txt`; it fails after
+the reader/hash checks because that file deliberately contains `git show --format=fuller`.
+Reading that actual format and checking its `commit` line succeeds. No proof or gate changes.
+
+Containing DSR fails with exit 6: final private-cache verification rejects
+`git/checkouts/proptest-1f80a76f161d5085/3dca198/README.md` as a linked/special entry and
+refuses artifact collection. Collected identity is null; frozen runner identity check is
+zero. The staged source is retained, including the genome-browser integration's relative
+CSV/PNG/SVG outputs, which are outside this proof manifest. No native-window input,
+ControlRuntime/TCP timeout journey, hardware GPU, platform, release or performance proof
+is inferred. UBS remains non-green on the two unchanged capture timestamp-filename findings.
+
+Source publishes through ordinary guarded pushes; both required remote references read
+back `61c1c99a1aef3de06d0eb8afe1466d0cf828a2a5` at 05:38 UTC. Beads comments 2834/2835
+record the exact proof and limits; export completes and dependency cycles remain empty.
+`bd-0oro` and `bd-2z0.7.10` remain in progress under their original scope. This TODO and
+the plan are the remaining metadata handoff; no new capability is credited for them.
+
+Bounded creation worksheet, this feedback/feature-boundary block: (1) Runtime feedback and
+feature ownership are FEATURE; the requested TODO/report and mandatory DSR profiles are
+process. (2.1) Consumer is the operator reviewing the explicitly requested task list.
+(2.2) Gate is publication of these two changes under the repository's DSR/check rules.
+(2.3) Observed defects are missing visible owner outcomes and R189's disabled-dependency
+compile errors. (2.4) Entries retire from active tracking on observed completion; evidence
+persists in this report. (3.1–4) No integrity exception is invoked: existing source-bound
+logs/hashes suffice, so no new ledger or custody framework is added. (4.1) Current actionable
+P0 is the feature-off regression; the older macOS incident still needs its actual host.
+(4.2) Another hour of optional machinery would deliver less than finishing the frozen code's
+required checks. Verdict: FEATURE plus the minimum LEGITIMATE GATE, zero process capability credit.
+
+Real-work worksheet, six source commits `4f194868..61c1c99a`: README purpose is an evolving,
+reproducible simulation with useful real-time control. Inventory: five USER commits deliver
+one feedback capability and one feature-boundary repair; one ENABLER is formatting. Their
+mandatory validation and requested tracking are separate enabler/process activities, not
+extra capabilities. No Bead closes. (1) Most visible change is four recent Lab requests with
+separate application/journal outcomes; actual native demonstration remains unobserved,
+while real-owner/headless-layout tests exist. (2) Omitting tracking changes no pixels; it
+only loses the operator-requested handoff. (3) The new mirror API is exercised by the real
+production view and tests, not speculative infrastructure. (4) The oldest unfinished native
+Evolution Lab journey remains open; this consumer and the P0 build regression are actionable
+without a new renderer or unavailable hardware. (5) Solo, so no pane/closure comparison.
+(6) No plan edit or follow-up replaces original acceptance. Verdict: DRIFTING for avoidable
+color/formatter mistakes and repeated qualification rounds. Correction: freeze code and
+machinery, complete the same gates, publish the actual results and retain the failures.
+
+Honesty inventory, same six-commit window, fresh self-review of the complete consolidated
+diff and raw R188–R191 results; final R191 source checks and subsequent publication are observed:
+1. Yes: four genuinely GPU-only tests now require the actual optional feature. Their
+default assertions are unchanged and explicitly required by the final reader; the entire
+feature-off CPU/UI suite and absent production GPU dependency are additional controls.
+2. No (checked: real HostCore application/rejection, intentionally lost callback receipt,
+separately labeled synthetic formatting inputs and actual GPUI test-context layout).
+3. No (checked: consolidated diff has no golden edit; both original semantic comparisons pass).
+4. Yes: feature guards touch tests and production code together; the final matrix is
+expanded rather than relaxed. No new ignore/suppression, tolerance, pin or deadline change.
+5. No (checked: production branches on normal commands/statuses/features; existing GPUI
+debug selectors observe label layout and do not manufacture a release-only success path).
+6. No (checked: actual terminal events and suite totals, including three existing ignores;
+no zero-test suite is relabeled complete coverage).
+7. Yes: the first no-GPU-edge update inferred absence from the emitted listing before
+reading it. Readback later examines all 1,544 lines and observes zero matching edges; the
+final reader requires actual absence and planted negative/control graph lines before pass.
+8. No (checked: owner-protocol, synthetic, headless layout and software/offscreen proof
+classes stay distinct from live ControlRuntime/TCP/native/hardware acceptance).
+9. No (checked: each failed source/format/lint/feature run is retained above; no source pass
+or publication is asserted for a pending run).
+10. No (checked: all cited DSR commands retain stdout/stderr and both pipeline exits;
+UBS has separate retained JSON/stderr, not a clean-scan claim).
+11. No (checked: original items remain in progress; one actual regression is reopened).
+12. No (checked: plan edits only mark observed work; no acceptance is cut or transferred).
+13–17. Not applicable: truly solo; no agent dispatch, peer report, agreement or closure is
+used as independent evidence. 18. No (checked: bounds derive from `GUI_RECENT_COMMANDS`,
+formatting cells assert distinct tuples, and test counts derive from actual JSON events;
+no throughput/FPS improvement is claimed).
+19. Yes: the initial color-type error, seven plus one formatting hunks, overly strong
+missing-receipt wording, missed feature-off ownership, one mistyped prepared-clone fetch
+and blocked inline shell-syntax check wasted work. The fetch failed before supplying a
+source; actual IDs are subsequently read from Git. The command guard stays enabled and
+checks a retained script file instead. Existing compiler/test/collection failures are not
+hidden or bypassed; the final readback's source-file format mistake is disclosed above.
+20. Strongest current evidence is real owner application despite a lost receipt, visible
+production label layout and full passing variants plus strict checks at published R191.
+This is fresh self-verification, not independent or native/hardware qualification.
+
+Older-session scope remains the six CASS queries/views disclosed in the FXAA block below;
+they do not clear older behavior. Current static UBS precedes every source commit and still
+reports the two unchanged timestamp-based capture filenames, not authentication tokens.
+Disposition: yes-findings are corrected and disclosed here; RH-1 countermeasure is the
+unchanged default assertions plus full feature-off/graph gates, RH-2 is explicit proof-class
+separation, and RH-3 is unchanged goldens. Audit remains DRIFTING for avoidable retries,
+with fresh self-verification only. No new permission flow or process framework is created.
+
 FXAA continuation (`bd-2z0.7.11`, 2026-10-16):
 
 - [x] Read the live toggle, frozen controls, post shader and existing pixel-test consumer.

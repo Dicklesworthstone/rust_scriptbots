@@ -1817,6 +1817,24 @@ If the answer is no, stop investing in GPUI as the world renderer. It may remain
 
 ### 9.6 GUI acceptance matrix
 
+**[Currently In Progress] `bd-0oro`, 2026-10-16:** connect the existing published
+command-status mirror to shared GPUI request feedback. Paint must never consult the owner
+on a mirror miss, and application and journal outcomes remain separate. The broader
+cross-surface and native-input acceptance stays open. Published `61c1c99a` passes all
+fifteen R191 source checks, including actual-owner/lost-receipt cases, shared bounded
+feedback and production GPUI label layout. Headless layout does not qualify native input.
+
+**[Currently In Progress] `bd-2z0.7.10`, regression reopened 2026-10-16:** R189
+observes fourteen optional-GPU references in the feature-off renderer. Restore exact
+feature guards, reuse the existing CPU sRGB decoder in shared fog construction, and qualify
+both full renderer variants, strict Clippy and the production dependency graph. Default
+GPU tests remain enabled; original acceptance stays intact. Published `61c1c99a` passes
+both full library/integration variants and strict Clippy; the feature-off production graph
+has no world-gfx/wgpu edge and all four GPU capture tests still pass in default mode.
+R191 source is `pass/0`, containing DSR still refuses Proptest's README symlink at final
+cache collection, and UBS retains two unchanged timestamp-filename findings. The P0 stays
+in progress; exact logs, raw counts and hashes are in the reality-check report.
+
 **[Currently In Progress] `bd-2z0.7.11`, FXAA continuation, 2026-10-16:** source
 `8fbf2d0f` implements bounded edge smoothing and carries typed FXAA/Off through both GPU
 producers without enabling unrelated post effects. R187 passes all fifteen source-check
