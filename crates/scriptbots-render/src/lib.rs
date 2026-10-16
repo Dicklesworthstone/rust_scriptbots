@@ -3738,6 +3738,13 @@ impl SimulationView {
             .py_2()
             .child(
                 div()
+                    .debug_selector(|| "gui-live-session-status")
+                    .text_xs()
+                    .text_color(chrome::text_primary())
+                    .child("Live session status"),
+            )
+            .child(
+                div()
                     .text_xs()
                     .text_color(chrome::text_secondary())
                     .child(storage),
@@ -14099,19 +14106,15 @@ impl PlaybackState {
     }
 
     fn snapshot_for_render(&mut self, live: HudSnapshot) -> HudSnapshot {
-        match self.mode {
-            PlaybackMode::Live => live,
-            PlaybackMode::Paused => self.timeline.get(self.pointer).cloned().unwrap_or(live),
+        let recorded = match self.mode {
+            PlaybackMode::Live => return live,
+            PlaybackMode::Paused => self.timeline.get(self.pointer).cloned(),
             PlaybackMode::Playing => {
                 if self.timeline.is_empty() {
                     self.mode = PlaybackMode::Live;
                     return live;
                 }
-                let snapshot = self
-                    .timeline
-                    .get(self.pointer)
-                    .cloned()
-                    .unwrap_or_else(|| live.clone());
+                let snapshot = self.timeline.get(self.pointer).cloned();
                 if self.pointer + 1 < self.timeline.len() {
                     self.pointer += 1;
                 } else {
@@ -14120,7 +14123,19 @@ impl PlaybackState {
                 }
                 snapshot
             }
-        }
+        };
+        let Some(mut snapshot) = recorded else {
+            return live;
+        };
+        // History replays science and inspection, not the session's current
+        // controls, health or receipts. In particular, a new owner rejection
+        // must remain visible while the user inspects an earlier world frame.
+        snapshot.controls = live.controls;
+        snapshot.storage = live.storage;
+        snapshot.simulation_fault = live.simulation_fault;
+        snapshot.command_feedback = live.command_feedback;
+        snapshot.perf = live.perf;
+        snapshot
     }
 
     fn restart(&mut self) {
@@ -14287,6 +14302,117 @@ mod playback_state_tests {
         assert_eq!(status.index, 2);
         assert_eq!(status.total, 3);
         assert_eq!(status.current_tick, Some(3));
+    }
+
+    #[test]
+    fn historical_frames_keep_session_status_live_and_science_recorded() {
+        // Deliberately distinct synthetic observations test the presentation
+        // merge. Real owner input is covered by the GPUI feedback tests.
+        let feedback = |label| GuiCommandFeedback {
+            label,
+            command_id: None,
+            application: label.to_owned(),
+            journal: label.to_owned(),
+            problem: true,
+        };
+        let recorded = HudSnapshot {
+            tick: 7,
+            epoch: 3,
+            agent_count: 4,
+            is_closed: true,
+            command_feedback: vec![feedback("historical")],
+            simulation_fault: Some("historical fault".to_owned()),
+            ..HudSnapshot::default()
+        };
+        for mode in [PlaybackMode::Live, PlaybackMode::Paused, PlaybackMode::Playing] {
+            let mut playback = PlaybackState::new(2);
+            playback.record(&recorded);
+            for faulted in [true, false] {
+                playback.mode = mode;
+                playback.pointer = 0;
+                let error = faulted.then(|| "current fault".to_owned());
+                let live = HudSnapshot {
+                    tick: 9,
+                    epoch: 5,
+                    agent_count: 6,
+                    is_closed: false,
+                    controls: ControlsSnapshot {
+                        paused: faulted,
+                        speed_multiplier: 2.0,
+                        draw_agents: false,
+                        draw_food: false,
+                        draw_vfx: false,
+                        follow_mode: FollowMode::Selected,
+                        agent_outline: true,
+                    },
+                    storage: StorageUiStatus {
+                        revision: 11,
+                        committed_tick: Some(8),
+                        lag: Some(1),
+                        last_error: error.clone(),
+                        stopped: faulted,
+                    },
+                    simulation_fault: error.clone(),
+                    command_feedback: vec![feedback("current")],
+                    perf: PerfSnapshot {
+                        sample_count: 12,
+                        latest_ms: 2.0,
+                        ..PerfSnapshot::default()
+                    },
+                    ..HudSnapshot::default()
+                };
+                let shown = playback.snapshot_for_render(live);
+                let science = (shown.tick, shown.epoch, shown.agent_count, shown.is_closed);
+                assert_eq!(
+                    science,
+                    if mode == PlaybackMode::Live {
+                        (9, 5, 6, false)
+                    } else {
+                        (7, 3, 4, true)
+                    }
+                );
+                assert_eq!(shown.controls.paused, faulted);
+                assert_eq!(shown.controls.speed_multiplier, 2.0);
+                assert!(!shown.controls.draw_agents);
+                assert!(!shown.controls.draw_food);
+                assert!(!shown.controls.draw_vfx);
+                assert!(matches!(shown.controls.follow_mode, FollowMode::Selected));
+                assert!(shown.controls.agent_outline);
+                assert_eq!(shown.storage.revision, 11);
+                assert_eq!(shown.storage.committed_tick, Some(8));
+                assert_eq!(shown.storage.lag, Some(1));
+                assert_eq!(shown.storage.last_error, error);
+                assert_eq!(shown.storage.stopped, faulted);
+                assert_eq!(shown.simulation_fault, error);
+                assert_eq!(shown.command_feedback.len(), 1);
+                assert_eq!(shown.command_feedback[0].application, "current");
+                assert_eq!(shown.command_feedback[0].journal, "current");
+                assert_eq!(shown.perf.sample_count, 12);
+                assert_eq!(shown.perf.latest_ms, 2.0);
+                assert_eq!(playback.timeline[0].command_feedback[0].label, "historical");
+                assert_eq!(
+                    playback.timeline[0].simulation_fault.as_deref(),
+                    Some("historical fault")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_history_keeps_current_session_status() {
+        for mode in [PlaybackMode::Live, PlaybackMode::Paused, PlaybackMode::Playing] {
+            let mut playback = PlaybackState::new(2);
+            playback.mode = mode;
+            let live = HudSnapshot {
+                tick: 9,
+                simulation_fault: Some("current fault".to_owned()),
+                ..HudSnapshot::default()
+            };
+            let shown = playback.snapshot_for_render(live);
+            assert_eq!(shown.tick, 9);
+            assert_eq!(shown.simulation_fault.as_deref(), Some("current fault"));
+            assert!(playback.timeline.is_empty());
+        }
     }
 }
 
@@ -19938,6 +20064,8 @@ mod command_characterization_tests {
         let before = host.port.scientific_digest_v1().unwrap();
         let id = CommandId::new(701);
         let mut view = SimulationView::headless(host.port.clone());
+        let _ = view.snapshot();
+        view.playback.restart();
         let submit_port = host.port.clone();
         view.command_submit = Arc::new(move |command| {
             let envelope = CommandEnvelope::new(id, command.try_into().unwrap())
@@ -19954,7 +20082,12 @@ mod command_characterization_tests {
         assert!(view.submit_control_command(ControlCommand::Pause));
         let deadline = Instant::now() + Duration::from_secs(10);
         let feedback = loop {
-            let feedback = view.snapshot().command_feedback.remove(0);
+            let live = view.snapshot();
+            let feedback = view
+                .playback
+                .snapshot_for_render(live)
+                .command_feedback
+                .remove(0);
             if feedback.application.starts_with("Rejected") {
                 break feedback;
             }
@@ -21287,6 +21420,65 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn gui_command_feedback_stays_live_during_history_input() {
+        let mut fixture = ShortcutFixture::install();
+        fixture.record_frames(4);
+        fixture.press("space");
+        fixture.press("space");
+        assert_eq!(
+            fixture.read(|view| view.playback.mode()),
+            PlaybackMode::Paused
+        );
+        let historical_tick = fixture.read(|view| view.playback.status().current_tick.unwrap());
+        let live_tick = fixture.world.snapshot().world.tick;
+        assert!(historical_tick < live_tick);
+        let before = fixture.world.port.scientific_digest_v1().unwrap();
+
+        // The command originates in the other production window while the
+        // Lab remains on history. It reaches the actual owner through the
+        // fixture submitter; this is headless GPUI input, not native OS input.
+        fixture.press_world("p");
+        let receipts = fixture.applied_receipts();
+        assert_eq!(receipts.len(), 1);
+        let receipt = &receipts[0];
+        assert!(matches!(receipt.application(), ApplicationState::Applied(_)));
+        let observed_paused = fixture.world.snapshot().playback.paused;
+        let hud = fixture.app.update(|app| fixture.hud.root(app)).unwrap();
+        fixture.app.update_entity(&hud, |view, _| {
+            let live = view.snapshot();
+            let shown = view.playback.snapshot_for_render(live);
+            assert_eq!(shown.tick, historical_tick);
+            assert_eq!(view.playback.mode(), PlaybackMode::Paused);
+            assert_eq!(shown.controls.paused, observed_paused);
+            assert_ne!(
+                view.playback.timeline[view.playback.pointer].controls.paused,
+                observed_paused
+            );
+            assert_eq!(shown.command_feedback.len(), 1);
+            assert_eq!(
+                shown.command_feedback[0].command_id,
+                Some(receipt.command_id())
+            );
+            assert!(
+                shown.command_feedback[0]
+                    .application
+                    .starts_with("Applied · tick")
+            );
+            assert_eq!(
+                shown.command_feedback[0].journal,
+                "Journal · committed in memory"
+            );
+            assert!(
+                view.playback
+                    .timeline
+                    .iter()
+                    .all(|frame| frame.command_feedback.is_empty())
+            );
+        });
+        assert_eq!(fixture.world.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
     fn gui_command_feedback_labels_exist_in_the_production_lab_layout() {
         let host = TestHost::take(command_characterization_world());
         let submit_host = Arc::clone(&host);
@@ -21306,6 +21498,12 @@ mod command_characterization_tests {
         let windows = context.update(|app| session.install(app)).unwrap();
         let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
         lab.update(|window, app| {
+            let hud = windows.hud.root(app).unwrap();
+            hud.update(app, |view, _| {
+                let _ = view.snapshot();
+                view.playback.restart();
+                assert_eq!(view.playback.mode(), PlaybackMode::Paused);
+            });
             let canvas = windows.canvas.root(app).unwrap();
             assert!(
                 canvas
@@ -21315,7 +21513,11 @@ mod command_characterization_tests {
             window.refresh();
             window.draw(app).clear();
         });
-        for selector in ["gui-command-application-0", "gui-command-journal-0"] {
+        for selector in [
+            "gui-live-session-status",
+            "gui-command-application-0",
+            "gui-command-journal-0",
+        ] {
             let bounds = lab
                 .debug_bounds(selector)
                 .expect("production receipt label was laid out");
