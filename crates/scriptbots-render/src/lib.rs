@@ -44,8 +44,8 @@ use scriptbots_core::{
     TickSummary, TraitModifiers, Velocity, WorldState, tier_features, toroidal_delta,
 };
 use scriptbots_core::{
-    DraftGeneratorConfig, ExistingAgentPolicy, MapArtifact, MapEditorDraft, PaintedConstraint,
-    MAX_SAMPLE_OUTPUT_CELLS, default_tileset_spec,
+    DraftGeneratorConfig, ExistingAgentPolicy, MAX_SAMPLE_OUTPUT_CELLS, MapArtifact,
+    MapEditorDraft, PaintedConstraint, default_tileset_spec,
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
@@ -3017,7 +3017,9 @@ impl MapSandbox {
                 }
                 return;
             }
-            MapAction::Generate | MapAction::Apply | MapAction::Pause | MapAction::LiveGrid => return,
+            MapAction::Generate | MapAction::Apply | MapAction::Pause | MapAction::LiveGrid => {
+                return;
+            }
         };
         self.notice = result.map_or_else(
             |error| format!("Draft edit refused: {error}"),
@@ -20861,7 +20863,11 @@ mod command_characterization_tests {
         view.map_action(MapAction::Apply);
         assert!(view.recent_commands.lock().unwrap().is_empty());
         assert!(
-            view.map_sandbox.lock().unwrap().notice.contains("live food grid")
+            view.map_sandbox
+                .lock()
+                .unwrap()
+                .notice
+                .contains("live food grid")
         );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         view.map_action(MapAction::LiveGrid);
