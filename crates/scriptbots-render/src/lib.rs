@@ -21441,11 +21441,14 @@ mod command_characterization_tests {
         let live_tick = fixture.world.snapshot().world.tick;
         assert!(historical_tick < live_tick);
         let before = fixture.world.port.scientific_digest_v1().unwrap();
+        assert!(fixture.world.snapshot().playback.paused);
 
         // The command originates in the other production window while the
         // Lab remains on history. It reaches the actual owner through the
         // fixture submitter; this is headless GPUI input, not native OS input.
-        fixture.press_world("p");
+        // Keep the owner paused so journal maintenance can settle without
+        // advancing this fixture's deliberately frozen scientific clock.
+        fixture.press_world("shift-=");
         let receipts = fixture.applied_receipts();
         assert_eq!(receipts.len(), 1);
         let receipt = &receipts[0];
@@ -21468,10 +21471,16 @@ mod command_characterization_tests {
             }) {
                 break;
             }
-            assert!(Instant::now() < deadline, "owner journal commit not published");
+            assert!(
+                Instant::now() < deadline,
+                "owner journal commit not published"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         let observed_paused = fixture.world.snapshot().playback.paused;
+        assert!(observed_paused);
+        let observed_speed = fixture.world.snapshot().playback.speed_multiplier;
+        assert_eq!(observed_speed, 1.25);
         let hud = fixture.app.update(|app| fixture.hud.root(app)).unwrap();
         fixture.app.update_entity(&hud, |view, _| {
             let live = view.snapshot();
@@ -21479,11 +21488,12 @@ mod command_characterization_tests {
             assert_eq!(shown.tick, historical_tick);
             assert_eq!(view.playback.mode(), PlaybackMode::Paused);
             assert_eq!(shown.controls.paused, observed_paused);
+            assert_eq!(shown.controls.speed_multiplier, observed_speed);
             assert_ne!(
                 view.playback.timeline[view.playback.pointer]
                     .controls
-                    .paused,
-                observed_paused
+                    .speed_multiplier,
+                observed_speed
             );
             assert_eq!(shown.command_feedback.len(), 1);
             assert_eq!(
