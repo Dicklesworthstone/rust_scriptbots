@@ -430,7 +430,7 @@ impl WorldRenderer {
             RenderTonemapMode::Agx => 3_u32,
         });
 
-        // Post‑FX (ACES + vignette; FXAA stub): color_view → post.target
+        // Post‑FX (tonemap, FXAA, vignette, fog and bloom): color_view → post.target
         self.post_ran = false;
         if self.ensure_post(&post_controls, selected_tonemap)?
             && let Some(p) = self.post.as_mut()
@@ -1160,6 +1160,176 @@ mod capture_smoke_test {
                 .bytes(),
             captures[0]
         );
+    }
+
+    #[test]
+    fn fxaa_post_pixels_smooth_edges_preserve_flats_and_bound_degenerate_extents() {
+        let _gpu_lock = crate::GPU_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let adapter = live_adapter("FXAA pixels").expect("FXAA proof requires an actual wgpu adapter");
+        eprintln!("FXAA post adapter: {:?}", adapter.get_info());
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("FXAA device");
+        let capture = |size: (u32, u32), input: &[u8], tonemap: u32, fxaa: u32| {
+            assert_eq!(input.len(), (size.0 * size.1 * 4) as usize);
+            let source = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("fxaa.test-source"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: WORLD_COLOR_FORMAT,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                source.as_image_copy(),
+                input,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size.0 * 4),
+                    rows_per_image: Some(size.1),
+                },
+                source.size(),
+            );
+            let view = source.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut post = PostFx::new(&device, WORLD_COLOR_FORMAT, &view, size)
+                .expect("production post pipeline");
+            let controls = PostControls {
+                exposure: 1.0,
+                vignette: 0.0,
+                tonemap,
+                fxaa,
+                bloom_enabled: false,
+                fog_enabled: false,
+                ..PostControls::default()
+            };
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fxaa.test-post"),
+            });
+            post.run(&device, &queue, &mut encoder, &view, size, None, &controls);
+            queue.submit(Some(encoder.finish()));
+            let mut readback = ReadbackRing::new(&device, size, WORLD_COLOR_FORMAT)
+                .expect("post readback ring");
+            readback
+                .copy(&device, &queue, &post.target)
+                .expect("post readback copy");
+            let pixels = readback.mapped().expect("actual post pixels");
+            pixels
+                .bytes()
+                .chunks_exact(pixels.bytes_per_row as usize)
+                .flat_map(|row| &row[..(size.0 * 4) as usize])
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let size = (64, 64);
+        let diagonal: Vec<_> = (0..size.1)
+            .flat_map(|y| {
+                (0..size.0).flat_map(move |x| {
+                    let value = if x >= 16 + y / 2 { 255 } else { 0 };
+                    [value, value, value, 255]
+                })
+            })
+            .collect();
+        let flat = [48, 96, 192, 255].repeat((size.0 * size.1) as usize);
+        for tonemap in 0..=3 {
+            let off = capture(size, &diagonal, tonemap, 0);
+            let on = capture(size, &diagonal, tonemap, 1);
+            let restored = capture(size, &diagonal, tonemap, 0);
+            assert_eq!(off, restored, "disabled path must restore exactly");
+            assert_eq!(on, capture(size, &diagonal, tonemap, 1));
+            assert_eq!(
+                capture(size, &flat, tonemap, 0),
+                capture(size, &flat, tonemap, 1)
+            );
+            if tonemap == 0 {
+                assert_eq!(
+                    off, diagonal,
+                    "disabled passthrough must preserve source bytes"
+                );
+            }
+            let (off_pixels, _) = off.as_chunks::<4>();
+            let (on_pixels, _) = on.as_chunks::<4>();
+            let changed = off_pixels
+                .iter()
+                .zip(on_pixels)
+                .filter(|(a, b)| a != b)
+                .count();
+            let dark = off_pixels[0][0];
+            let bright = off_pixels[63][0];
+            let intermediate = on_pixels
+                .iter()
+                .filter(|p| dark < p[0] && p[0] < bright)
+                .count();
+            assert!(
+                changed > 0 && changed < off_pixels.len() / 8,
+                "local edge changes: {changed}"
+            );
+            assert!(
+                intermediate > 0,
+                "FXAA must add actual intermediate edge coverage"
+            );
+            for y in 0..size.1 {
+                for x in 0..size.0 {
+                    let edge = 16 + y / 2;
+                    if x.abs_diff(edge) > 2 {
+                        let index = (y * size.0 + x) as usize;
+                        assert_eq!(
+                            off_pixels[index], on_pixels[index],
+                            "flat/contrast at {x},{y}"
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "FXAA tonemap={tonemap} changed={changed}/{} intermediate={intermediate} dark={dark} bright={bright}",
+                off_pixels.len()
+            );
+            if let Some(directory) = std::env::var_os("SCRIPTBOTS_FXAA_CAPTURE_DIR") {
+                let directory = std::path::PathBuf::from(directory);
+                for (name, pixels) in [("off", &off), ("on", &on)] {
+                    image::save_buffer(
+                        directory.join(format!("fxaa-{tonemap}-{name}.png")),
+                        pixels,
+                        size.0,
+                        size.1,
+                        image::ColorType::Rgba8,
+                    )
+                    .expect("retain actual post pixels");
+                }
+            }
+        }
+        // A low-contrast edge must take the early exit, not blur the entire image.
+        let low_contrast: Vec<_> = diagonal
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| {
+                if index % 4 == 3 {
+                    255
+                } else if *byte == 0 {
+                    128
+                } else {
+                    129
+                }
+            })
+            .collect();
+        assert_eq!(
+            capture(size, &low_contrast, 0, 0),
+            capture(size, &low_contrast, 0, 1)
+        );
+        for extent in [(1, 1), (1, 17), (17, 1)] {
+            let pixels = [48, 96, 192, 255].repeat((extent.0 * extent.1) as usize);
+            assert_eq!(
+                capture(extent, &pixels, 0, 0),
+                capture(extent, &pixels, 0, 1)
+            );
+        }
     }
 
     /// Deterministic ACROSS RENDERER INSTANCES, not merely across two draws.
@@ -2132,30 +2302,25 @@ impl ReadbackRing {
     }
 }
 
-/// Parse the `SB_WGPU_FXAA` toggle truthfully: FXAA is not implemented in the post
-/// pipeline, so any nonzero request logs a one-time warning and resolves to disabled
-/// rather than silently claiming the feature (bd-2z0.7.11).
+/// Freeze the FXAA toggle alongside the other controls for this draw.
 fn parse_fxaa_env(previous: u32) -> Result<u32, ReadbackError> {
-    static WARNED: AtomicBool = AtomicBool::new(false);
     match std::env::var("SB_WGPU_FXAA") {
         Err(std::env::VarError::NotPresent) => Ok(previous),
         Err(error) => Err(ReadbackError::Configuration(format!(
             "SB_WGPU_FXAA is not valid Unicode: {error}"
         ))),
-        Ok(value) if parse_toggle_value(&value) == Some(false) => Ok(0),
-        Ok(value) if parse_toggle_value(&value) == Some(true) => {
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    "SB_WGPU_FXAA requests FXAA, but FXAA is not implemented in the post \
-                     pipeline; the request is ignored"
-                );
-            }
-            Ok(0)
-        }
-        Ok(value) => Err(ReadbackError::Configuration(format!(
-            "SB_WGPU_FXAA={value:?}; expected a boolean toggle"
-        ))),
+        Ok(value) => parse_fxaa_value(&value),
     }
+}
+
+fn parse_fxaa_value(value: &str) -> Result<u32, ReadbackError> {
+    parse_toggle_value(value)
+        .map(u32::from)
+        .ok_or_else(|| {
+            ReadbackError::Configuration(format!(
+                "SB_WGPU_FXAA={value:?}; expected a boolean toggle"
+            ))
+        })
 }
 
 // ---------------- View uniforms (viewport size) ----------------
@@ -2967,6 +3132,32 @@ mod tests {
                 "{value} must enable bloom"
             );
         }
+    }
+
+    #[test]
+    fn fxaa_toggle_preserves_the_requested_boolean_and_rejects_invalid_values() {
+        for value in ["0", "off", "false", "no", "OFF", "False"] {
+            assert_eq!(super::parse_fxaa_value(value).expect("off toggle"), 0);
+        }
+        for value in ["1", "2", "on", "true", "yes", "ON", "True"] {
+            assert_eq!(super::parse_fxaa_value(value).expect("on toggle"), 1);
+        }
+        for value in ["enabled", "NaN", "-1"] {
+            assert!(matches!(
+                super::parse_fxaa_value(value),
+                Err(ReadbackError::Configuration(_))
+            ));
+        }
+        assert!(PostControls {
+            fxaa: 1,
+            exposure: 1.0,
+            vignette: 0.0,
+            tonemap: 0,
+            bloom_enabled: false,
+            fog_enabled: false,
+            ..PostControls::default()
+        }
+        .wants_post(None));
     }
 
     #[test]
@@ -5098,14 +5289,8 @@ fn reinhard_tonemap(c: vec3<f32>) -> vec3<f32> {
   return clamp(c / (vec3<f32>(1.0) + c), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-@fragment
-fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-  let tex_size = vec2<f32>(textureDimensions(src_tex));
-  // Pixel coords from builtin position -> normalize to [0,1]
-  let uv01 = pos.xy / tex_size;
-  var col = textureSampleLevel(src_tex, src_smp, uv01, 0.0);
-  // FXAA stub: none (placeholder for later)
-  // Tonemap (0 = passthrough, 1 = aces, 2 = reinhard) + mild vignette
+fn display_color(uv: vec2<f32>) -> vec3<f32> {
+  let col = textureSampleLevel(src_tex, src_smp, uv, 0.0);
   var rgb = col.rgb * params.exposure;
   if (params.tonemap == 1u) {
     rgb = aces_tonemap(rgb);
@@ -5117,6 +5302,98 @@ fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     rgb = aces_tonemap(rgb / (rgb + vec3<f32>(0.3)));
   } else {
     rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+  }
+  return rgb;
+}
+
+// FXAA's local contrast, edge orientation and bounded span search, described in
+// NVIDIA's FXAA white paper (2011). Work in display-referred color, using square
+// root luminance for perceptual edge decisions; blend linear RGB, encode once
+// at the sRGB attachment. Explicit LOD keeps divergent searches derivative-free.
+fn edge_luma(rgb: vec3<f32>) -> f32 {
+  return sqrt(max(dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0));
+}
+
+fn fxaa_color(uv: vec2<f32>, texel: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
+  let m = edge_luma(center);
+  let n = edge_luma(display_color(uv - vec2<f32>(0.0, texel.y)));
+  let s = edge_luma(display_color(uv + vec2<f32>(0.0, texel.y)));
+  let w = edge_luma(display_color(uv - vec2<f32>(texel.x, 0.0)));
+  let e = edge_luma(display_color(uv + vec2<f32>(texel.x, 0.0)));
+  let low = min(m, min(min(n, s), min(w, e)));
+  let high = max(m, max(max(n, s), max(w, e)));
+  let contrast = high - low;
+  if (contrast < max(0.0312, high * 0.125)) {
+    return center;
+  }
+  let nw = edge_luma(display_color(uv - texel));
+  let ne = edge_luma(display_color(uv + vec2<f32>(texel.x, -texel.y)));
+  let sw = edge_luma(display_color(uv + vec2<f32>(-texel.x, texel.y)));
+  let se = edge_luma(display_color(uv + texel));
+  let across_y = abs(nw - 2.0 * w + sw) + 2.0 * abs(n - 2.0 * m + s)
+               + abs(ne - 2.0 * e + se);
+  let across_x = abs(nw - 2.0 * n + ne) + 2.0 * abs(w - 2.0 * m + e)
+               + abs(sw - 2.0 * s + se);
+  let horizontal = across_y >= across_x;
+  let negative_luma = select(w, n, horizontal);
+  let positive_luma = select(e, s, horizontal);
+  let negative_gradient = abs(negative_luma - m);
+  let positive_gradient = abs(positive_luma - m);
+  let toward_negative = negative_gradient >= positive_gradient;
+  let normal = select(vec2<f32>(texel.x, 0.0), vec2<f32>(0.0, texel.y), horizontal)
+             * select(1.0, -1.0, toward_negative);
+  let along = select(vec2<f32>(0.0, texel.y), vec2<f32>(texel.x, 0.0), horizontal);
+  let pair_luma = 0.5 * (m + select(positive_luma, negative_luma, toward_negative));
+  let threshold = 0.25 * max(negative_gradient, positive_gradient);
+  let origin = uv + 0.5 * normal;
+  var negative_distance = 8.0;
+  var positive_distance = 8.0;
+  var negative_delta = 0.0;
+  var positive_delta = 0.0;
+  var negative_done = false;
+  var positive_done = false;
+  for (var step = 1u; step <= 8u; step += 1u) {
+    let distance = f32(step);
+    if (!negative_done) {
+      negative_delta = edge_luma(display_color(origin - distance * along)) - pair_luma;
+      if (abs(negative_delta) >= threshold) {
+        negative_done = true;
+        negative_distance = distance;
+      }
+    }
+    if (!positive_done) {
+      positive_delta = edge_luma(display_color(origin + distance * along)) - pair_luma;
+      if (abs(positive_delta) >= threshold) {
+        positive_done = true;
+        positive_distance = distance;
+      }
+    }
+    if (negative_done && positive_done) { break; }
+  }
+  let nearer_negative = negative_distance <= positive_distance;
+  let endpoint_delta = select(positive_delta, negative_delta, nearer_negative);
+  let endpoint_found = select(positive_done, negative_done, nearer_negative);
+  var span_blend = 0.0;
+  if (endpoint_found && ((endpoint_delta < 0.0) != (m < pair_luma))) {
+    span_blend = 0.5 - min(negative_distance, positive_distance)
+                          / (negative_distance + positive_distance);
+  }
+  // Subpixel features also need coverage when no finite span end was found.
+  let mean = (2.0 * (n + s + w + e) + nw + ne + sw + se) / 12.0;
+  let ratio = clamp(abs(mean - m) / contrast, 0.0, 1.0);
+  let smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio);
+  let subpixel_blend = 0.75 * smooth_ratio * smooth_ratio;
+  return display_color(uv + normal * max(span_blend, subpixel_blend));
+}
+
+@fragment
+fn fs_post(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let tex_size = vec2<f32>(textureDimensions(src_tex));
+  // Pixel coords from builtin position -> normalize to [0,1]
+  let uv01 = pos.xy / tex_size;
+  var rgb = display_color(uv01);
+  if (params.fxaa != 0u) {
+    rgb = fxaa_color(uv01, vec2<f32>(1.0) / tex_size, rgb);
   }
   let p = uv01 * 2.0 - 1.0;
   var vign = clamp(1.0 - dot(p, p) * params.vignette, 0.85, 1.0);
