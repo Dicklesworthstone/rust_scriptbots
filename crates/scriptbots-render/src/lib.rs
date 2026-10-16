@@ -14304,7 +14304,9 @@ fn color_swatch(color: [f32; 3]) -> Div {
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct RenderFrame {
     tick: u64,
+    #[cfg(feature = "world_wgpu")]
     tonemap_mode: Option<RenderTonemapMode>,
+    #[cfg(feature = "world_wgpu")]
     fxaa: bool,
     day_night_cycle_ticks: u32,
     day_night_start_phase: f32,
@@ -14424,6 +14426,7 @@ enum PostProcessPass {
     },
     Bloom {
         strength: f32,
+        #[cfg(feature = "world_wgpu")]
         threshold: f32,
     },
     Fog {
@@ -14524,6 +14527,7 @@ fn post_process_stack(
             atmosphere.bloom_intensity * (0.80 + daylight * 0.28) + life_delta.max(0.0) * 0.20,
         )
         .clamp(0.0, 1.0);
+    #[cfg(feature = "world_wgpu")]
     let bloom_threshold = bloom
         .and_then(|settings| settings.threshold)
         .unwrap_or(atmosphere.bloom_threshold);
@@ -14542,11 +14546,9 @@ fn post_process_stack(
         RenderFogMode::Medium => 0.14,
         RenderFogMode::High => 0.24,
     };
-    let fog_color = fog.and_then(|settings| settings.color).unwrap_or_else(|| {
-        atmosphere
-            .fog_srgb
-            .map(scriptbots_world_gfx::srgb_component_to_linear)
-    });
+    let fog_color = fog
+        .and_then(|settings| settings.color)
+        .unwrap_or_else(|| atmosphere.fog_srgb.map(srgb_to_linear));
 
     let temperature = match palette {
         ColorPaletteMode::Natural => 0.07 - night * 0.13 - life_delta * 0.05,
@@ -14580,6 +14582,7 @@ fn post_process_stack(
     if bloom_enabled && bloom_strength > 0.0 {
         passes.push(PostProcessPass::Bloom {
             strength: bloom_strength,
+            #[cfg(feature = "world_wgpu")]
             threshold: bloom_threshold,
         });
     }
@@ -14656,6 +14659,7 @@ struct CanvasState {
     perf: PerfSnapshot,
 }
 
+#[cfg(feature = "world_wgpu")]
 fn resolved_gpu_fxaa(config: &ScriptBotsConfig) -> bool {
     let mode = config
         .render
@@ -14667,6 +14671,7 @@ fn resolved_gpu_fxaa(config: &ScriptBotsConfig) -> bool {
 }
 
 impl RenderFrame {
+    #[cfg(feature = "world_wgpu")]
     fn gpu_bloom_controls(&self) -> scriptbots_world_gfx::BloomControls {
         self.post_stack
             .passes
@@ -14687,6 +14692,7 @@ impl RenderFrame {
             })
     }
 
+    #[cfg(feature = "world_wgpu")]
     fn gpu_vignette_controls(&self) -> scriptbots_world_gfx::VignetteControls {
         self.post_stack
             .passes
@@ -14707,6 +14713,7 @@ impl RenderFrame {
             })
     }
 
+    #[cfg(feature = "world_wgpu")]
     fn gpu_fog_controls(&self) -> scriptbots_world_gfx::FogControls {
         self.post_stack
             .passes
@@ -14726,6 +14733,7 @@ impl RenderFrame {
             })
     }
 
+    #[cfg(feature = "world_wgpu")]
     fn gpu_exposure_factor(&self) -> Option<f32> {
         self.post_stack.passes.iter().find_map(|pass| match pass {
             PostProcessPass::Exposure { factor } => Some(*factor),
@@ -14833,7 +14841,9 @@ impl RenderFrame {
         });
         Some(Self {
             tick: snapshot.world.tick,
+            #[cfg(feature = "world_wgpu")]
             tonemap_mode: config.render.tonemap_mode,
+            #[cfg(feature = "world_wgpu")]
             fxaa: resolved_gpu_fxaa(config),
             day_night_cycle_ticks,
             day_night_start_phase,
@@ -15012,7 +15022,9 @@ impl RenderFrame {
 
         Some(Self {
             tick: world.tick().0,
+            #[cfg(feature = "world_wgpu")]
             tonemap_mode: config.render.tonemap_mode,
+            #[cfg(feature = "world_wgpu")]
             fxaa: resolved_gpu_fxaa(config),
             day_night_cycle_ticks,
             day_night_start_phase,
@@ -17011,7 +17023,9 @@ mod continuous_world_raster_tests {
     ) -> RenderFrame {
         RenderFrame {
             tick: 17,
+            #[cfg(feature = "world_wgpu")]
             tonemap_mode: None,
+            #[cfg(feature = "world_wgpu")]
             fxaa: false,
             day_night_cycle_ticks: 0,
             day_night_start_phase: 0.25,
@@ -18994,6 +19008,7 @@ mod command_characterization_tests {
     }
 
     #[test]
+    #[cfg(feature = "world_wgpu")]
     fn published_snapshot_exposure_reaches_the_gpu_frame() {
         use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId};
         use std::io::Write as _;
@@ -19070,6 +19085,7 @@ mod command_characterization_tests {
     }
 
     #[test]
+    #[cfg(feature = "world_wgpu")]
     fn published_snapshot_fxaa_reaches_gpu_pixels_and_explicit_off_wins() {
         use scriptbots_core::{RenderAntiAliasing, RenderPostSettings};
         use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId};
@@ -19175,6 +19191,7 @@ mod command_characterization_tests {
     }
 
     #[test]
+    #[cfg(feature = "world_wgpu")]
     fn published_snapshot_fog_reaches_the_gpu_frame() {
         use scriptbots_core::{RenderFogSettings, RenderPostSettings};
         use std::io::Write as _;
@@ -19274,6 +19291,7 @@ mod command_characterization_tests {
     }
 
     #[test]
+    #[cfg(feature = "world_wgpu")]
     fn published_snapshot_bloom_and_vignette_reach_the_gpu_frame() {
         use scriptbots_core::{RenderBloomSettings, RenderPostSettings, RenderVignetteSettings};
         use std::io::Write as _;
@@ -24133,7 +24151,9 @@ mod backend_agreement_tests {
 
         let mut frame = RenderFrame {
             tick: 100,
+            #[cfg(feature = "world_wgpu")]
             tonemap_mode: None,
+            #[cfg(feature = "world_wgpu")]
             fxaa: false,
             day_night_cycle_ticks: 2400,
             day_night_start_phase: 0.0,
