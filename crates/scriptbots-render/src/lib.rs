@@ -21453,6 +21453,24 @@ mod command_characterization_tests {
             receipt.application(),
             ApplicationState::Applied(_)
         ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = fixture
+                .world
+                .port
+                .try_published_command_status(receipt.command_id())
+                .unwrap();
+            if status.is_some_and(|status| {
+                matches!(
+                    status.journal(),
+                    scriptbots_runtime::JournalState::CommittedVolatile
+                )
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "owner journal commit not published");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let observed_paused = fixture.world.snapshot().playback.paused;
         let hud = fixture.app.update(|app| fixture.hud.root(app)).unwrap();
         fixture.app.update_entity(&hud, |view, _| {
@@ -21509,14 +21527,16 @@ mod command_characterization_tests {
         ));
         let context = gpui::TestAppContext::single();
         let windows = context.update(|app| session.install(app)).unwrap();
-        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
-        lab.update(|window, app| {
+        context.update(|app| {
             let hud = windows.hud.root(app).unwrap();
             hud.update(app, |view, _| {
                 let _ = view.snapshot();
                 view.playback.restart();
                 assert_eq!(view.playback.mode(), PlaybackMode::Paused);
             });
+        });
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.update(|window, app| {
             let canvas = windows.canvas.root(app).unwrap();
             assert!(
                 canvas
