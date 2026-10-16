@@ -322,6 +322,25 @@ impl Clone for ChannelHostPort {
 }
 
 impl ChannelHostPort {
+    /// Observe only the locally published status, without owner ingress or waiting.
+    ///
+    /// `None` means no observation was available: the bounded mirror may not contain
+    /// this identity, or its writer may be publishing. It does not mean the command
+    /// was rejected, forgotten by durable authority, or finished applying. UI paint
+    /// paths can retry on a later frame; authoritative callers use `command_status`.
+    pub fn try_published_command_status(
+        &self,
+        command_id: CommandId,
+    ) -> Result<Option<CommandStatus>, HostAccessError> {
+        match self.statuses.try_read() {
+            Ok(board) => Ok(board.get(command_id)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                Err(Self::protocol_violation("channel status board poisoned"))
+            }
+        }
+    }
+
     /// Submit within both this port's per-call limit and a caller's total budget.
     /// An expired budget refuses before enqueueing; this never changes the port's
     /// configured limit or assigns a new command identity.
@@ -3339,6 +3358,84 @@ mod tests {
             }
         );
         drop(stalled_retry);
+    }
+
+    #[test]
+    fn published_status_observes_real_owner_without_ingress_or_lock_waits() {
+        let (mut driver, port) = ChannelHostDriver::new(
+            test_host(true),
+            ChannelHostOptions {
+                status_board_capacity: 1,
+                ..fast_options()
+            },
+        )
+        .expect("mirror-only host");
+        let id = CommandId::new(601);
+        let before = driver.host().core().scientific_digest_v1().unwrap();
+        assert_eq!(port.try_published_command_status(id).unwrap(), None);
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let receipt = queue_command(&port, id.get(), HostCommand::Pause);
+        let ingress = driver.receiver.try_recv().expect("actual command ingress");
+        driver.process_ingress(ingress);
+        let admitted = receipt.try_recv().unwrap().unwrap();
+        assert_eq!(port.try_published_command_status(id).unwrap(), Some(admitted));
+        assert!(matches!(
+            port.try_published_command_status(id)
+                .unwrap()
+                .unwrap()
+                .application(),
+            ApplicationState::Admitted
+        ));
+        for _ in 0..4 {
+            driver.step(ManualInstant::from_nanos(0)).unwrap();
+        }
+        let settled = port.try_published_command_status(id).unwrap().unwrap();
+        assert!(matches!(settled.application(), ApplicationState::Applied(_)));
+        assert_eq!(settled.journal(), &crate::JournalState::CommittedVolatile);
+        assert_eq!(driver.host().core().scientific_digest_v1().unwrap(), before);
+
+        // Holding the writer on this same thread would deadlock a blocking read.
+        let writer = port.statuses.write().unwrap();
+        assert_eq!(port.try_published_command_status(id).unwrap(), None);
+        drop(writer);
+        assert_eq!(port.try_published_command_status(id).unwrap(), Some(settled));
+
+        let rejected = queue_command(&port, 602, HostCommand::SetSpeed(f32::NAN));
+        let ingress = driver.receiver.try_recv().unwrap();
+        driver.process_ingress(ingress);
+        let rejected = rejected.try_recv().unwrap().unwrap();
+        assert!(matches!(
+            rejected.application(),
+            ApplicationState::Rejected(_)
+        ));
+        assert_eq!(
+            port.try_published_command_status(CommandId::new(602))
+                .unwrap(),
+            Some(rejected)
+        );
+        assert_eq!(port.try_published_command_status(id).unwrap(), None);
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let statuses = Arc::clone(&port.statuses);
+        assert!(
+            std::thread::spawn(move || {
+                let _writer = statuses.write().unwrap();
+                panic!("deliberately poison only the test's status mirror");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(matches!(
+            port.try_published_command_status(id),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
     }
 
     #[test]

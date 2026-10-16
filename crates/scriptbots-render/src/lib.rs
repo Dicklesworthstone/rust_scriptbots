@@ -2478,10 +2478,130 @@ mod gui_window_layout_tests {
     }
 }
 
+const GUI_RECENT_COMMANDS: usize = 4;
+
+#[derive(Clone)]
+enum GuiCommandSubmission {
+    Enqueued(scriptbots_runtime::CommandId),
+    Uncorrelated,
+    Refused,
+}
+
+#[derive(Clone)]
+struct GuiCommandRequest {
+    label: &'static str,
+    submission: GuiCommandSubmission,
+}
+
+#[derive(Clone)]
+struct GuiCommandFeedback {
+    label: &'static str,
+    command_id: Option<scriptbots_runtime::CommandId>,
+    application: String,
+    journal: String,
+    problem: bool,
+}
+
+impl GuiCommandRequest {
+    fn feedback(&self, host: &ChannelHostPort) -> GuiCommandFeedback {
+        let mut feedback = GuiCommandFeedback {
+            label: self.label,
+            command_id: None,
+            application: String::new(),
+            journal: "Journal · not observed".to_owned(),
+            problem: false,
+        };
+        let command_id = match self.submission {
+            GuiCommandSubmission::Enqueued(id) => id,
+            GuiCommandSubmission::Uncorrelated => {
+                feedback.application = "Enqueued · invalid receipt identity".to_owned();
+                feedback.problem = true;
+                return feedback;
+            }
+            GuiCommandSubmission::Refused => {
+                feedback.application = "Not enqueued".to_owned();
+                feedback.problem = true;
+                return feedback;
+            }
+        };
+        feedback.command_id = Some(command_id);
+        let status = match host.try_published_command_status(command_id) {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                feedback.application = "Enqueued · status not observed locally".to_owned();
+                return feedback;
+            }
+            Err(error) => {
+                feedback.application = format!("Status unavailable · {error}");
+                feedback.problem = true;
+                return feedback;
+            }
+        };
+        feedback.observe(&status);
+        feedback
+    }
+}
+
+impl GuiCommandFeedback {
+    fn observe(&mut self, status: &scriptbots_runtime::CommandStatus) {
+        use scriptbots_runtime::{ApplicationState, JournalState, RejectionReason};
+
+        self.application = match status.application() {
+            ApplicationState::Admitted => "Admitted · awaiting application".to_owned(),
+            ApplicationState::Applied(boundary) => format!(
+                "Applied · tick {} · science revision {}",
+                boundary.tick.0,
+                boundary.revisions.scientific.get()
+            ),
+            ApplicationState::Rejected(reason) => {
+                self.problem = true;
+                let reason = match reason {
+                    RejectionReason::Validation { message } => message.clone(),
+                    RejectionReason::ControlRevisionConflict { expected, actual } => format!(
+                        "control revision: expected {}, current {}",
+                        expected.get(),
+                        actual.get()
+                    ),
+                    RejectionReason::ScientificRevisionConflict { expected, actual } => format!(
+                        "science revision: expected {}, current {}",
+                        expected.get(),
+                        actual.get()
+                    ),
+                    RejectionReason::ConfigRevisionConflict { expected, actual } => format!(
+                        "config revision: expected {}, current {}",
+                        expected.get(),
+                        actual.get()
+                    ),
+                    RejectionReason::Overloaded { capacity } => {
+                        format!("command capacity {capacity} reached")
+                    }
+                    RejectionReason::HostStopping => "host is stopping".to_owned(),
+                };
+                format!("Rejected · {reason}")
+            }
+            ApplicationState::Failed(failure) => {
+                self.problem = true;
+                format!("Application failed · {} · {}", failure.code, failure.message)
+            }
+        };
+        self.journal = match status.journal() {
+            JournalState::NotRequired => "Journal · no record observed".to_owned(),
+            JournalState::Pending => "Journal · pending".to_owned(),
+            JournalState::CommittedVolatile => "Journal · committed in memory".to_owned(),
+            JournalState::Durable => "Journal · durable".to_owned(),
+            JournalState::Failed(failure) => {
+                self.problem = true;
+                format!("Journal failed · {} · {}", failure.code, failure.message)
+            }
+        };
+    }
+}
+
 struct GuiSession {
     host: ChannelHostPort,
     analytics: AnalyticsSnapshotProvider,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
+    recent_commands: Arc<Mutex<VecDeque<GuiCommandRequest>>>,
     /// Focus and hover describe one experiment, not one window. Sharing the
     /// inspector state keeps Lab selection, World highlighting, and camera
     /// follow on the same agent while each window retains its own presentation.
@@ -2511,6 +2631,7 @@ impl GuiSession {
             host,
             analytics,
             command_submit,
+            recent_commands: Arc::new(Mutex::new(VecDeque::new())),
             inspector: Arc::new(Mutex::new(inspector_state)),
             accessibility: Arc::new(Mutex::new(AccessibilitySettings::default())),
             selection_projection: Arc::new(Mutex::new(None)),
@@ -2528,6 +2649,7 @@ impl GuiSession {
             Arc::clone(&self.selection_submission),
         );
         view.inspector = Arc::clone(&self.inspector);
+        view.recent_commands = Arc::clone(&self.recent_commands);
         view.accessibility = Arc::clone(&self.accessibility);
         view.focus_handle = Some(focus_handle);
         if role == GuiViewRole::WorldCanvas {
@@ -2703,6 +2825,7 @@ pub struct SimulationView {
     analytics_provider: AnalyticsSnapshotProvider,
     title: SharedString,
     command_submit: Arc<dyn Fn(ControlCommand) -> Option<String> + Send + Sync + 'static>,
+    recent_commands: Arc<Mutex<VecDeque<GuiCommandRequest>>>,
     camera: Arc<Mutex<Camera>>,
     /// Window-local GPUI atlas images for the continuously sampled world field.
     ///
@@ -2823,6 +2946,7 @@ impl SimulationView {
             analytics_provider,
             title,
             command_submit,
+            recent_commands: Arc::new(Mutex::new(VecDeque::new())),
             camera: Arc::new(Mutex::new(Camera::default())),
             world_raster_cache: Arc::new(Mutex::new(WorldRasterCache::default())),
             world_raster_cleanup_registered: false,
@@ -2890,6 +3014,33 @@ impl SimulationView {
         // under, so the GPUI layer can finally NAME what it submitted instead
         // of only knowing that something was accepted (bd-k7nq).
         let admitted = (self.command_submit.as_ref())(command.clone());
+        let label = match &command {
+            ControlCommand::UpdateConfig(_) => "Configuration",
+            ControlCommand::UpdateSelection(_) => "Selection",
+            ControlCommand::AdjustAgentMutationRates { .. } => "Mutation rates",
+            ControlCommand::SpawnAgent { .. } => "Add agent",
+            ControlCommand::SpawnCrossover { .. } => "Crossover",
+            ControlCommand::UpdateSimulation(_) => "Playback",
+            ControlCommand::Pause => "Pause",
+            ControlCommand::Resume => "Resume",
+            ControlCommand::Step => "Step",
+            ControlCommand::SetSpeed(_) => "Speed",
+            ControlCommand::Shutdown => "Shutdown",
+            ControlCommand::ApplyMap { .. } => "Map",
+            ControlCommand::Intervention(_) => "Intervention",
+        };
+        let submission = admitted.as_ref().map_or(GuiCommandSubmission::Refused, |id| {
+            serde_json::from_value(serde_json::Value::String(id.clone())).map_or(
+                GuiCommandSubmission::Uncorrelated,
+                GuiCommandSubmission::Enqueued,
+            )
+        });
+        if let Ok(mut recent) = self.recent_commands.lock() {
+            if recent.len() == GUI_RECENT_COMMANDS {
+                recent.pop_front();
+            }
+            recent.push_back(GuiCommandRequest { label, submission });
+        }
         match admitted.as_deref() {
             Some(command_id) => {
                 debug!(?tick, source = "gui", %command_id, payload = ?command, "GPUI control command enqueued");
@@ -3311,6 +3462,13 @@ impl SimulationView {
     }
     fn snapshot(&mut self) -> HudSnapshot {
         let mut snapshot = HudSnapshot::default();
+        if let Ok(recent) = self.recent_commands.lock() {
+            snapshot.command_feedback = recent
+                .iter()
+                .rev()
+                .map(|request| request.feedback(&self.host))
+                .collect();
+        }
         let published = match self.read_snapshot() {
             Ok(published) => published,
             Err(error) => {
@@ -3580,6 +3738,26 @@ impl SimulationView {
                     .child(storage),
             )
             .child(div().text_xs().text_color(chrome::text_muted()).child(perf))
+            .children(snapshot.command_feedback.iter().map(|feedback| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .pt_2()
+                    .text_xs()
+                    .text_color(if feedback.problem {
+                        rgb(0xfca5a5)
+                    } else {
+                        chrome::text_secondary()
+                    })
+                    .child(format!("{} · {}", feedback.label, feedback.application))
+                    .child(feedback.journal.clone())
+                    .children(feedback.command_id.map(|id| {
+                        div()
+                            .text_color(chrome::text_muted())
+                            .child(format!("Request {id}"))
+                    }))
+            }))
             .children(snapshot.simulation_fault.as_ref().map(|error| {
                 div()
                     .text_xs()
@@ -11293,6 +11471,7 @@ struct HudSnapshot {
     analytics: Option<HudAnalytics>,
     storage: StorageUiStatus,
     simulation_fault: Option<String>,
+    command_feedback: Vec<GuiCommandFeedback>,
     recent_history: Vec<HudHistoryEntry>,
     render_frame: Option<RenderFrame>,
     inspector: InspectorSnapshot,
@@ -19712,6 +19891,148 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn gui_command_feedback_reads_real_rejection_and_preserves_science() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let id = CommandId::new(701);
+        let mut view = SimulationView::headless(host.port.clone());
+        let submit_port = host.port.clone();
+        view.command_submit = Arc::new(move |command| {
+            let envelope = CommandEnvelope::new(id, command.try_into().unwrap())
+                .expecting_scientific_revision(scriptbots_runtime::ScientificRevision::new(999));
+            Some(
+                submit_port
+                    .clone()
+                    .submit(envelope)
+                    .unwrap()
+                    .command_id()
+                    .to_string(),
+            )
+        });
+        assert!(view.submit_control_command(ControlCommand::Pause));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let feedback = loop {
+            let feedback = view.snapshot().command_feedback.remove(0);
+            if feedback.application.starts_with("Rejected") {
+                break feedback;
+            }
+            assert!(Instant::now() < deadline, "owner rejection not published");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(feedback.command_id, Some(id));
+        assert_eq!(
+            feedback.application,
+            "Rejected · science revision: expected 999, current 0"
+        );
+        assert!(feedback.problem);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+
+        view.command_submit = Arc::new(|_| None);
+        assert!(!view.submit_control_command(ControlCommand::Pause));
+        assert_eq!(view.snapshot().command_feedback[0].application, "Not enqueued");
+        view.command_submit = Arc::new(|_| Some("bad receipt".to_owned()));
+        assert!(view.submit_control_command(ControlCommand::Pause));
+        let invalid = view.snapshot().command_feedback.remove(0);
+        assert_eq!(invalid.application, "Enqueued · invalid receipt identity");
+        assert_eq!(invalid.command_id, None);
+        view.command_submit = Arc::new(|_| Some(CommandId::new(999).to_string()));
+        assert!(view.submit_control_command(ControlCommand::Pause));
+        let missing = view.snapshot().command_feedback.remove(0);
+        assert_eq!(missing.application, "Enqueued · status not observed locally");
+        assert_eq!(missing.journal, "Journal · not observed");
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn gui_command_feedback_keeps_application_and_journal_axes_distinct() {
+        use scriptbots_runtime::{
+            AdmissionSequence, ApplicationFailure, AppliedCommand, HostRevisions, JournalFailure,
+            JournalState,
+        };
+
+        // Synthetic formatting matrix, separate from the real-owner tests.
+        let applied = ApplicationState::Applied(AppliedCommand {
+            tick: scriptbots_core::Tick(7),
+            revisions: HostRevisions {
+                scientific: scriptbots_runtime::ScientificRevision::new(9),
+                ..HostRevisions::default()
+            },
+        });
+        let cases = [
+            (
+                ApplicationState::Admitted,
+                JournalState::Pending,
+                "Admitted · awaiting application",
+                "Journal · pending",
+                false,
+            ),
+            (
+                applied.clone(),
+                JournalState::Pending,
+                "Applied · tick 7 · science revision 9",
+                "Journal · pending",
+                false,
+            ),
+            (
+                applied.clone(),
+                JournalState::CommittedVolatile,
+                "Applied · tick 7 · science revision 9",
+                "Journal · committed in memory",
+                false,
+            ),
+            (
+                applied.clone(),
+                JournalState::Durable,
+                "Applied · tick 7 · science revision 9",
+                "Journal · durable",
+                false,
+            ),
+            (
+                applied,
+                JournalState::Failed(JournalFailure {
+                    code: "disk".into(),
+                    message: "write failed".into(),
+                }),
+                "Applied · tick 7 · science revision 9",
+                "Journal failed · disk · write failed",
+                true,
+            ),
+            (
+                ApplicationState::Failed(ApplicationFailure {
+                    code: "brain".into(),
+                    message: "owner failure".into(),
+                }),
+                JournalState::Durable,
+                "Application failed · brain · owner failure",
+                "Journal · durable",
+                true,
+            ),
+        ];
+        let mut observed = std::collections::BTreeSet::new();
+        for (application, journal, application_text, journal_text, problem) in cases {
+            let status = scriptbots_runtime::CommandStatus::try_new(
+                CommandId::new(702),
+                Some(AdmissionSequence::new(1)),
+                application,
+                journal,
+            )
+            .unwrap();
+            let mut feedback = GuiCommandFeedback {
+                label: "Playback",
+                command_id: Some(status.command_id()),
+                application: String::new(),
+                journal: String::new(),
+                problem: false,
+            };
+            feedback.observe(&status);
+            assert_eq!(feedback.application, application_text);
+            assert_eq!(feedback.journal, journal_text);
+            assert_eq!(feedback.problem, problem);
+            assert!(observed.insert((feedback.application, feedback.journal)));
+        }
+    }
+
+    #[test]
     fn manual_agent_injection_refuses_a_sealed_persistence_boundary() {
         let config = ScriptBotsConfig {
             world_width: 100,
@@ -20874,6 +21195,40 @@ mod command_characterization_tests {
             })
             .expect("draw production GPUI test window");
         });
+    }
+
+    #[test]
+    fn gui_command_feedback_is_shared_bounded_and_repainted_in_both_windows() {
+        let mut fixture = ShortcutFixture::install();
+        let before = fixture.world.port.scientific_digest_v1().unwrap();
+        for _ in 0..(GUI_RECENT_COMMANDS + 2) {
+            assert!(fixture.read_world(|view| view.submit_control_command(ControlCommand::Pause)));
+        }
+        let receipts = fixture.applied_receipts();
+        assert_eq!(receipts.len(), GUI_RECENT_COMMANDS + 2);
+        let expected: Vec<_> = receipts
+            .iter()
+            .rev()
+            .take(GUI_RECENT_COMMANDS)
+            .map(|status| status.command_id())
+            .collect();
+        let read_feedback = |view: &SimulationView| {
+            view.recent_commands
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|request| request.feedback(&view.host))
+                .map(|feedback| {
+                    assert!(feedback.application.starts_with("Applied · tick 0"));
+                    assert!(!feedback.problem);
+                    feedback.command_id.unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fixture.read(read_feedback), expected);
+        assert_eq!(fixture.read_world(read_feedback), expected);
+        assert_eq!(fixture.world.port.scientific_digest_v1().unwrap(), before);
     }
 
     /// bd-jw6f, tier 3 and the panel/accessibility group: every view-local
