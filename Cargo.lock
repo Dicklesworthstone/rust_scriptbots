@@ -11358,6 +11358,7 @@ dependencies = [
  "kira",
  "naga 27.0.3",
  "pollster 0.4.0",
+ "postcard",
  "rand 0.9.5",
  "scriptbots-brain",
  "scriptbots-core",

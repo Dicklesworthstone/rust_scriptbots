@@ -46,7 +46,7 @@ use scriptbots_core::{
 use scriptbots_core::{
     ConstraintLayer, DraftGeneratorConfig, DraftState, ExistingAgentPolicy, MAX_SAMPLE_CELL_PAIRS,
     MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft, PaintedConstraint, SamplePatternSpec,
-    default_tileset_spec,
+    ToroidalSeamReport, check_toroidal_seams, default_tileset_spec,
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
@@ -2839,6 +2839,7 @@ enum DashboardTab {
 const MAP_SANDBOX_PREVIEW_SIDE: u32 = 32;
 const MAP_SANDBOX_MAX_CELLS: u64 = MAX_SAMPLE_OUTPUT_CELLS as u64;
 const MAP_DRAFT_MAX_BYTES: usize = 1_048_576;
+const MAP_ARTIFACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAP_DRAFT_MAX_RULE_TILES: usize = 64;
 const MAP_DRAFT_SCHEMA: &str = "scriptbots.map-draft.v1";
 
@@ -2948,7 +2949,15 @@ struct MapGenerationJob {
     cancelled: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapFileKind {
+    SaveDraft,
+    OpenDraft,
+    InspectArtifact,
+}
+
 struct MapFileRequest {
+    kind: MapFileKind,
     draft_revision: u64,
     save_json: Option<String>,
 }
@@ -2956,6 +2965,15 @@ struct MapFileRequest {
 enum MapFileResult {
     Saved(usize),
     Loaded(String),
+    Inspected(Arc<MapArtifactInspection>),
+}
+
+struct MapArtifactInspection {
+    artifact: MapArtifact,
+    path: std::path::PathBuf,
+    encoding: &'static str,
+    scientific_hash: u64,
+    seams: ToroidalSeamReport,
 }
 
 struct MapFileJob {
@@ -2965,24 +2983,128 @@ struct MapFileJob {
 }
 
 fn read_map_draft_file(path: &std::path::Path) -> std::result::Result<String, String> {
+    String::from_utf8(read_map_file_bytes(path, MAP_DRAFT_MAX_BYTES)?)
+        .map_err(|error| error.to_string())
+}
+
+fn read_map_file_bytes(
+    path: &std::path::Path,
+    maximum_bytes: usize,
+) -> std::result::Result<Vec<u8>, String> {
     use std::io::Read as _;
 
     let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_file() {
-        return Err("Choose a regular draft JSON file.".to_owned());
+        return Err("Choose a regular map file.".to_owned());
     }
-    if metadata.len() > MAP_DRAFT_MAX_BYTES as u64 {
-        return Err(format!("Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."));
+    if metadata.len() > maximum_bytes as u64 {
+        return Err(format!("Map file exceeds {maximum_bytes} bytes."));
     }
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
-    let mut json = String::new();
-    file.take(MAP_DRAFT_MAX_BYTES as u64 + 1)
-        .read_to_string(&mut json)
+    let mut bytes = Vec::new();
+    file.take(maximum_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    if json.len() > MAP_DRAFT_MAX_BYTES {
-        return Err(format!("Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."));
+    if bytes.len() > maximum_bytes {
+        return Err(format!("Map file exceeds {maximum_bytes} bytes."));
     }
-    Ok(json)
+    Ok(bytes)
+}
+
+fn inspect_map_artifact_file(
+    path: &std::path::Path,
+) -> std::result::Result<Arc<MapArtifactInspection>, String> {
+    let bytes = read_map_file_bytes(path, MAP_ARTIFACT_MAX_BYTES)?;
+    let (artifact, encoding): (MapArtifact, _) =
+        if let Ok(artifact) = serde_json::from_slice(&bytes) {
+            (artifact, "JSON")
+        } else {
+            let (artifact, remaining) = postcard::take_from_bytes(&bytes)
+                .map_err(|error| format!("Not a JSON or Postcard map artifact: {error}"))?;
+            if !remaining.is_empty() {
+                return Err("Postcard map artifact has trailing bytes.".to_owned());
+            }
+            (artifact, "Postcard")
+        };
+    let terrain = artifact.terrain();
+    let cells = u64::from(terrain.width()) * u64::from(terrain.height());
+    if cells == 0 || cells > MAP_SANDBOX_MAX_CELLS {
+        return Err(format!(
+            "Inspection requires 1..={MAP_SANDBOX_MAX_CELLS} terrain cells."
+        ));
+    }
+    if terrain.cell_size() == 0 {
+        return Err("Artifact cell size must be nonzero.".to_owned());
+    }
+    let metadata = artifact.metadata();
+    if (metadata.width, metadata.height) != (terrain.width(), terrain.height()) {
+        return Err("Artifact provenance dimensions disagree with its terrain.".to_owned());
+    }
+    artifact.validate().map_err(|error| error.to_string())?;
+    // These traverse the artifact, so compute once on the file worker, never in paint.
+    let scientific_hash = artifact.scientific_content_hash();
+    let seams = check_toroidal_seams(&artifact);
+    Ok(Arc::new(MapArtifactInspection {
+        artifact,
+        path: path.to_owned(),
+        encoding,
+        scientific_hash,
+        seams,
+    }))
+}
+
+const fn map_preview_color(kind: TerrainKind) -> u32 {
+    match kind {
+        TerrainKind::DeepWater => 0x244e82,
+        TerrainKind::ShallowWater => 0x4596ae,
+        TerrainKind::Sand => 0xd4b77d,
+        TerrainKind::Grass => 0x57925d,
+        TerrainKind::Bloom => 0xb7ca71,
+        TerrainKind::Rock => 0x898f9b,
+    }
+}
+
+fn map_artifact_cell_details(artifact: &MapArtifact, x: u32, y: u32) -> Vec<String> {
+    let terrain = artifact.terrain();
+    let Some(tile) = terrain.tile(x, y) else {
+        return vec!["Select a cell inside the artifact.".to_owned()];
+    };
+    let index = y as usize * terrain.width() as usize + x as usize;
+    let scalar = |value: Option<&f32>| {
+        value.map_or_else(|| "absent".to_owned(), |value| format!("{value:.3}"))
+    };
+    let mut details = vec![
+        format!(
+            "Cell {x}, {y}: {:?} · elevation {:.3} · moisture {:.3} · accent {:.3}",
+            tile.kind, tile.elevation, tile.moisture, tile.accent,
+        ),
+        format!(
+            "Terrain fertility bias {:.3} · temperature bias {:.3} · palette {}",
+            tile.fertility_bias, tile.temperature_bias, tile.palette_index,
+        ),
+        format!(
+            "Fertility field {} · temperature field {}",
+            scalar(artifact.fertility().and_then(|field| field.values().get(index))),
+            scalar(artifact.temperature().and_then(|field| field.values().get(index))),
+        ),
+    ];
+    if let Some(tile) = artifact.hydrology_tiles().and_then(|layer| layer.tiles().get(index)) {
+        details.push(format!(
+            "Hydrology permeability {:.3} · runoff {:.3} · basin rank {:.3} · channel priority {:.3} · swim cost {:.3}",
+            tile.permeability, tile.runoff_bias, tile.basin_rank, tile.channel_priority, tile.swim_cost,
+        ));
+    }
+    if let Some(field) = artifact.hydrology_field() {
+        details.push(format!(
+            "Flow {:?} · accumulation {:.3} · spill elevation {:.3} · basin {} · initial water depth {:.3}",
+            field.flow_directions()[index],
+            field.accumulation()[index],
+            field.spill_elevation()[index],
+            field.basin_ids()[index],
+            field.initial_water_depth()[index],
+        ));
+    }
+    details
 }
 
 fn write_new_map_draft_file(
@@ -3013,6 +3135,8 @@ struct MapSandbox {
     job: Option<MapGenerationJob>,
     file_dialog_pending: bool,
     file_job: Option<MapFileJob>,
+    inspection: Option<Arc<MapArtifactInspection>>,
+    inspection_cell: (u32, u32),
     policy: ExistingAgentPolicy,
     brush: TerrainKind,
     notice: String,
@@ -3035,6 +3159,8 @@ impl MapSandbox {
             job: None,
             file_dialog_pending: false,
             file_job: None,
+            inspection: None,
+            inspection_cell: (0, 0),
             policy: ExistingAgentPolicy::Retain,
             brush: TerrainKind::Grass,
             notice: "Draft only. Pause the world before generating a map to apply.".to_owned(),
@@ -3114,23 +3240,33 @@ impl MapSandbox {
         self.file_dialog_pending || self.file_job.is_some()
     }
 
-    fn begin_file_dialog(&mut self, save: bool) -> std::result::Result<MapFileRequest, String> {
+    fn begin_file_dialog(
+        &mut self,
+        kind: MapFileKind,
+    ) -> std::result::Result<MapFileRequest, String> {
         if self.file_busy() {
             return Err("A draft file dialog or operation is already active.".to_owned());
         }
         let request = MapFileRequest {
+            kind,
             draft_revision: self.draft.revision,
-            save_json: if save {
+            save_json: if kind == MapFileKind::SaveDraft {
                 Some(self.export_draft()?)
             } else {
                 None
             },
         };
         self.file_dialog_pending = true;
-        self.notice = if save {
-            "Choose a new filename for this draft revision. Existing files are never overwritten."
-        } else {
-            "Choose a draft JSON file. Editing while Open is pending discards the loaded result."
+        self.notice = match kind {
+            MapFileKind::SaveDraft => {
+                "Choose a new filename for this draft revision. Existing files are never overwritten."
+            }
+            MapFileKind::OpenDraft => {
+                "Choose a draft JSON file. Editing while Open is pending discards the loaded result."
+            }
+            MapFileKind::InspectArtifact => {
+                "Choose a JSON or Postcard map artifact to inspect. Draft and live world stay unchanged."
+            }
         }
         .to_owned();
         Ok(request)
@@ -3145,15 +3281,16 @@ impl MapSandbox {
         let path = match selection {
             Ok(Some(path)) => path,
             Ok(None) => {
-                self.notice = "Draft file dialog cancelled; draft unchanged.".to_owned();
+                self.notice =
+                    "Map file dialog cancelled; draft and inspection unchanged.".to_owned();
                 return;
             }
             Err(error) => {
-                self.notice = format!("Draft file dialog failed: {error}");
+                self.notice = format!("Map file dialog failed: {error}");
                 return;
             }
         };
-        if request.save_json.is_none() && request.draft_revision != self.draft.revision {
+        if request.kind == MapFileKind::OpenDraft && request.draft_revision != self.draft.revision {
             self.notice =
                 "Draft changed while Open was pending; selected file was not loaded.".to_owned();
             return;
@@ -3164,11 +3301,20 @@ impl MapSandbox {
         match std::thread::Builder::new()
             .name("scriptbots-map-file".to_owned())
             .spawn(move || {
-                let result = match request.save_json {
-                    Some(json) => {
+                let result = match request.kind {
+                    MapFileKind::SaveDraft => {
+                        let Some(json) = request.save_json else {
+                            let _ = sender.send(Err("Save request has no captured recipe.".to_owned()));
+                            return;
+                        };
                         write_new_map_draft_file(&worker_path, &json).map(MapFileResult::Saved)
                     }
-                    None => read_map_draft_file(&worker_path).map(MapFileResult::Loaded),
+                    MapFileKind::OpenDraft => {
+                        read_map_draft_file(&worker_path).map(MapFileResult::Loaded)
+                    }
+                    MapFileKind::InspectArtifact => {
+                        inspect_map_artifact_file(&worker_path).map(MapFileResult::Inspected)
+                    }
                 };
                 let _ = sender.send(result);
             }) {
@@ -3178,9 +3324,9 @@ impl MapSandbox {
                     path,
                     receiver,
                 });
-                self.notice = "Draft file IO running in the background…".to_owned();
+                self.notice = "Map file IO running in the background…".to_owned();
             }
-            Err(error) => self.notice = format!("Could not start draft file IO: {error}"),
+            Err(error) => self.notice = format!("Could not start map file IO: {error}"),
         }
     }
 
@@ -3218,7 +3364,13 @@ impl MapSandbox {
                     )
                 },
             ),
-            Err(error) => format!("Draft file IO failed for {}: {error}", job.path.display()),
+            Ok(MapFileResult::Inspected(inspection)) => {
+                self.inspection = Some(inspection);
+                self.inspection_cell = (0, 0);
+                "Opened validated map artifact for inspection only. Draft, preview and live world unchanged."
+                    .to_owned()
+            }
+            Err(error) => format!("Map file IO failed for {}: {error}", job.path.display()),
         };
     }
 
@@ -3331,6 +3483,18 @@ impl MapSandbox {
                 };
                 return;
             }
+            MapAction::InspectCell(x, y) => {
+                if self.inspection.as_ref().is_some_and(|inspection| {
+                    inspection.artifact.terrain().tile(x, y).is_some()
+                }) {
+                    self.inspection_cell = (x, y);
+                }
+                return;
+            }
+            MapAction::BackToDraft => {
+                self.inspection = None;
+                return;
+            }
             MapAction::Policy => {
                 self.policy = match self.policy {
                     ExistingAgentPolicy::Retain => ExistingAgentPolicy::RepositionToSafeTile,
@@ -3355,7 +3519,8 @@ impl MapSandbox {
             | MapAction::CopyDraft
             | MapAction::PasteDraft
             | MapAction::SaveDraft
-            | MapAction::OpenDraft => {
+            | MapAction::OpenDraft
+            | MapAction::InspectArtifact => {
                 return;
             }
         };
@@ -3393,6 +3558,9 @@ enum MapAction {
     PasteDraft,
     SaveDraft,
     OpenDraft,
+    InspectArtifact,
+    InspectCell(u32, u32),
+    BackToDraft,
     Cancel,
     NextSeed,
     NextSize,
@@ -3857,8 +4025,14 @@ impl SimulationView {
     }
 
     fn map_button_action(&self, action: MapAction, cx: &mut Context<Self>) {
-        if matches!(action, MapAction::SaveDraft | MapAction::OpenDraft) {
-            self.map_file_dialog(matches!(action, MapAction::SaveDraft), cx);
+        let file_kind = match action {
+            MapAction::SaveDraft => Some(MapFileKind::SaveDraft),
+            MapAction::OpenDraft => Some(MapFileKind::OpenDraft),
+            MapAction::InspectArtifact => Some(MapFileKind::InspectArtifact),
+            _ => None,
+        };
+        if let Some(kind) = file_kind {
+            self.map_file_dialog(kind, cx);
             return;
         }
         if !matches!(action, MapAction::CopyDraft | MapAction::PasteDraft) {
@@ -3894,22 +4068,22 @@ impl SimulationView {
         };
     }
 
-    fn map_file_dialog(&self, save: bool, cx: &mut Context<Self>) {
+    fn map_file_dialog(&self, kind: MapFileKind, cx: &mut Context<Self>) {
         let request = {
             let Ok(mut sandbox) = self.map_sandbox.lock() else {
                 return;
             };
-            match sandbox.begin_file_dialog(save) {
+            match sandbox.begin_file_dialog(kind) {
                 Ok(request) => request,
                 Err(error) => {
-                    sandbox.notice = format!("Draft file request refused: {error}");
+                    sandbox.notice = format!("Map file request refused: {error}");
                     return;
                 }
             }
         };
         let sandbox = Arc::clone(&self.map_sandbox);
         cx.spawn(async move |this, cx| {
-            let selection = if save {
+            let selection = if kind == MapFileKind::SaveDraft {
                 match std::env::current_dir() {
                     Ok(directory) => {
                         let pending = cx.update(|app| {
@@ -3928,7 +4102,13 @@ impl SimulationView {
                         files: true,
                         directories: false,
                         multiple: false,
-                        prompt: Some("Open map draft JSON".into()),
+                        prompt: Some(
+                            match kind {
+                                MapFileKind::InspectArtifact => "Inspect JSON or Postcard map artifact",
+                                _ => "Open map draft JSON",
+                            }
+                            .into(),
+                        ),
                     })
                 });
                 pending
@@ -3938,7 +4118,7 @@ impl SimulationView {
                     .and_then(|paths| match paths {
                         None => Ok(None),
                         Some(mut paths) if paths.len() == 1 => Ok(paths.pop()),
-                        Some(_) => Err("Choose exactly one draft JSON file.".to_owned()),
+                        Some(_) => Err("Choose exactly one map file.".to_owned()),
                     })
             };
             // Complete the shared session even if the view that opened the dialog
@@ -3951,10 +4131,145 @@ impl SimulationView {
         .detach();
     }
 
+    fn render_map_inspection(
+        &self,
+        sandbox: &MapSandbox,
+        inspection: &MapArtifactInspection,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let artifact = &inspection.artifact;
+        let terrain = artifact.terrain();
+        let metadata = artifact.metadata();
+        let presence = |present| if present { "present" } else { "absent" };
+        let mut name_chars = metadata.tileset_id.chars();
+        let mut name: String = name_chars.by_ref().take(128).collect();
+        if name_chars.next().is_some() {
+            name.push('…');
+        }
+        let mut panel = div()
+            .id("map-artifact-inspection")
+            .debug_selector(|| "map-artifact-inspection".to_owned())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .text_color(chrome::text_primary())
+            .child(div().text_sm().child("Saved map artifact · inspection only"))
+            .child(self.render_map_button(
+                "map-artifact-back",
+                "Back to unchanged draft".to_owned(),
+                MapAction::BackToDraft,
+                !sandbox.file_busy(),
+                cx,
+            ))
+            .child(self.render_map_button(
+                "map-inspect-artifact",
+                "Inspect another artifact…".to_owned(),
+                MapAction::InspectArtifact,
+                !sandbox.file_busy(),
+                cx,
+            ))
+            .child(div().text_xs().child(sandbox.notice.clone()))
+            .child(div().text_xs().child(format!(
+                "{} · {} · {} × {} cells · cell size {}",
+                inspection.path.display(),
+                inspection.encoding,
+                terrain.width(),
+                terrain.height(),
+                terrain.cell_size(),
+            )))
+            .child(div().text_xs().child(format!(
+                "{:?} · source {name} · rules/sample hash {:016x} · seed {} · attempt {} of {}",
+                metadata.generator,
+                metadata.tileset_hash,
+                metadata.seed,
+                metadata.succeeded_on,
+                metadata.attempt_count,
+            )))
+            .child(div().text_xs().child(format!(
+                "Computed scientific content hash {:016x} · generated at epoch {} ms",
+                inspection.scientific_hash, metadata.generated_at_epoch_ms,
+            )))
+            .child(div().text_xs().child(format!(
+                "Fields: fertility {} · temperature {} · hydrology {}",
+                presence(artifact.fertility().is_some()),
+                presence(artifact.temperature().is_some()),
+                presence(artifact.hydrology_field().is_some()),
+            )))
+            .child(div().text_xs().child(format!(
+                "Toroidal elevation steps N/S {:.3}, E/W {:.3} · kind seams N/S {}, E/W {}",
+                inspection.seams.max_elevation_step_ns,
+                inspection.seams.max_elevation_step_ew,
+                inspection.seams.seam_kind_discontinuities_ns,
+                inspection.seams.seam_kind_discontinuities_ew,
+            )));
+        let width = terrain.width();
+        let height = terrain.height();
+        let stride = width.max(height).div_ceil(MAP_SANDBOX_PREVIEW_SIDE);
+        let columns = width.div_ceil(stride);
+        let rows = height.div_ceil(stride);
+        let cell_pixels = 256.0 / columns.max(rows) as f32;
+        let mut grid = div().flex().flex_col().w(px(256.0)).flex_none();
+        for row_index in 0..rows {
+            let y = row_index * height / rows;
+            let mut row = div().flex().h(px(cell_pixels));
+            for column_index in 0..columns {
+                let x = column_index * width / columns;
+                let Some(tile) = terrain.tile(x, y) else {
+                    continue;
+                };
+                row = row.child(
+                    div()
+                        .id(("map-artifact-cell", (y * width + x) as usize))
+                        .debug_selector(move || format!("map-artifact-cell-{x}-{y}"))
+                        .focusable()
+                        .tab_stop(true)
+                        .role(Role::Button)
+                        .aria_label(format!("Inspect saved cell {x}, {y}: {:?}", tile.kind))
+                        .w(px(cell_pixels))
+                        .h(px(cell_pixels))
+                        .flex_none()
+                        .bg(rgb(map_preview_color(tile.kind)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.map_action(MapAction::InspectCell(x, y));
+                                cx.notify();
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                                this.map_action(MapAction::InspectCell(x, y));
+                                cx.notify();
+                                cx.stop_propagation();
+                            }
+                        })),
+                );
+            }
+            grid = grid.child(row);
+        }
+        panel = panel.child(grid).child(div().text_xs().child(format!(
+            "Showing {columns} × {rows} sampled cells of {width} × {height}. Select a cell to inspect its stored values."
+        )));
+        for detail in map_artifact_cell_details(
+            artifact,
+            sandbox.inspection_cell.0,
+            sandbox.inspection_cell.1,
+        ) {
+            panel = panel.child(div().text_xs().child(detail));
+        }
+        div().child(panel.child(div().text_xs().child(
+            "Viewing never imports a recipe or applies terrain. Return to the draft to generate and use guarded Apply.",
+        )))
+    }
+
     fn render_map_sandbox(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
         let Ok(sandbox) = self.map_sandbox.lock() else {
             return div().child("Map editor state unavailable");
         };
+        if let Some(inspection) = &sandbox.inspection {
+            return self.render_map_inspection(&sandbox, inspection, cx);
+        }
         let busy = sandbox.job.is_some();
         let fits_live = self
             .read_snapshot()
@@ -4024,6 +4339,13 @@ impl SimulationView {
                         "map-open-draft",
                         "Open draft file…".to_owned(),
                         MapAction::OpenDraft,
+                        !sandbox.file_busy(),
+                        cx,
+                    ))
+                    .child(self.render_map_button(
+                        "map-inspect-artifact",
+                        "Inspect artifact…".to_owned(),
+                        MapAction::InspectArtifact,
                         !sandbox.file_busy(),
                         cx,
                     )),
@@ -4150,14 +4472,7 @@ impl SimulationView {
                     let Some(tile) = artifact.terrain().tile(x, y) else {
                         continue;
                     };
-                    let color = match tile.kind {
-                        TerrainKind::DeepWater => 0x244e82,
-                        TerrainKind::ShallowWater => 0x4596ae,
-                        TerrainKind::Sand => 0xd4b77d,
-                        TerrainKind::Grass => 0x57925d,
-                        TerrainKind::Bloom => 0xb7ca71,
-                        TerrainKind::Rock => 0x898f9b,
-                    };
+                    let color = map_preview_color(tile.kind);
                     row = row.child(
                         div()
                             .id(("map-cell", (y * width + x) as usize))
@@ -21235,6 +21550,176 @@ mod command_characterization_tests {
         }
     }
 
+    fn write_map_test_file(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[test]
+    fn map_sandbox_inspects_json_and_postcard_without_importing_or_applying() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(16, 16, 50);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        let mut persisted = MapSandbox::new(16, 16, 50);
+        persisted.edit(MapAction::Generator);
+        persisted.edit(MapAction::Paint(0, 0));
+        let mut paint = persisted.draft.state.constraints.get(0, 0).unwrap().clone();
+        paint.elevation = Some(0.25);
+        paint.fertility_bias = Some(0.6);
+        paint.temperature_bias = Some(-0.1);
+        paint.permeability = Some(0.4);
+        paint.runoff_bias = Some(0.3);
+        persisted.draft.paint_constraint(paint).unwrap();
+        let artifact = persisted.draft.generate_artifact().unwrap();
+        let expected_seams = check_toroidal_seams(&artifact);
+        let directory = map_file_test_directory();
+        for (filename, encoding, bytes) in [
+            ("map.json", "JSON", serde_json::to_vec(&artifact).unwrap()),
+            ("map.postcard", "Postcard", postcard::to_allocvec(&artifact).unwrap()),
+        ] {
+            let path = directory.join(filename);
+            write_map_test_file(&path, &bytes);
+            let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+            assert!(sandbox.begin_file_dialog(MapFileKind::OpenDraft).is_err());
+            sandbox.edit(MapAction::NextSeed);
+            let edited = sandbox.draft.clone();
+            let can_apply = sandbox.can_apply();
+            sandbox.finish_file_dialog(request, Ok(Some(path.clone())));
+            wait_map_file(&mut sandbox);
+            let inspection = sandbox.inspection.as_ref().unwrap();
+            assert_eq!(inspection.path, path);
+            assert_eq!(inspection.encoding, encoding);
+            assert_eq!(inspection.artifact, artifact);
+            assert_eq!(inspection.scientific_hash, artifact.scientific_content_hash());
+            assert_eq!(
+                inspection.seams.max_elevation_step_ns.to_bits(),
+                expected_seams.max_elevation_step_ns.to_bits()
+            );
+            assert_eq!(sandbox.draft, edited);
+            assert_eq!(sandbox.can_apply(), can_apply);
+            assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &preview));
+            let details = map_artifact_cell_details(&inspection.artifact, 0, 0).join("\n");
+            assert!(details.contains("elevation 0.250"));
+            assert!(details.contains("fertility bias 0.600"));
+            assert!(details.contains("permeability 0.400"));
+            sandbox.edit(MapAction::InspectCell(1, 1));
+            assert_eq!(sandbox.inspection_cell, (1, 1));
+            sandbox.edit(MapAction::InspectCell(16, 1));
+            assert_eq!(sandbox.inspection_cell, (1, 1));
+            sandbox.edit(MapAction::BackToDraft);
+            assert!(sandbox.inspection.is_none());
+            assert_eq!(sandbox.draft, edited);
+            assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &preview));
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_artifact_refusals_preserve_inspection_and_bound_inputs() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(4, 4, 50);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let artifact = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        let directory = map_file_test_directory();
+        let valid = directory.join("valid.json");
+        let json = serde_json::to_vec(artifact.as_ref()).unwrap();
+        write_map_test_file(&valid, &json);
+        let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+        sandbox.finish_file_dialog(request, Ok(Some(valid)));
+        wait_map_file(&mut sandbox);
+        let inspection = Arc::clone(sandbox.inspection.as_ref().unwrap());
+        let draft = sandbox.draft.clone();
+        for selection in [Ok(None), Err("platform unavailable".to_owned())] {
+            let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+            sandbox.finish_file_dialog(request, selection);
+            assert!(!sandbox.file_busy());
+            assert!(Arc::ptr_eq(sandbox.inspection.as_ref().unwrap(), &inspection));
+            assert_eq!(sandbox.draft, draft);
+        }
+        let mut wrong_metadata = serde_json::to_value(artifact.as_ref()).unwrap();
+        wrong_metadata["metadata"]["width"] = 5.into();
+        let mut missing_tile = serde_json::to_value(artifact.as_ref()).unwrap();
+        missing_tile["terrain"]["tiles"].as_array_mut().unwrap().pop();
+        let mut zero_cell_size = serde_json::to_value(artifact.as_ref()).unwrap();
+        zero_cell_size["terrain"]["cell_size"] = 0.into();
+        let encoded = postcard::to_allocvec(artifact.as_ref()).unwrap();
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        let (_, remaining) = postcard::take_from_bytes::<MapArtifact>(&trailing).unwrap();
+        assert_eq!(remaining, &[0]);
+        let mut paths = vec![directory.join("missing.json"), directory.clone()];
+        for (name, bytes) in [
+            ("empty.json", Vec::new()),
+            ("malformed.json", b"{".to_vec()),
+            ("recipe.json", sandbox.export_draft().unwrap().into_bytes()),
+            ("metadata.json", serde_json::to_vec(&wrong_metadata).unwrap()),
+            ("tiles.json", serde_json::to_vec(&missing_tile).unwrap()),
+            ("cell-size.json", serde_json::to_vec(&zero_cell_size).unwrap()),
+            ("truncated.postcard", encoded[..encoded.len() - 1].to_vec()),
+            ("trailing.postcard", trailing),
+        ] {
+            let path = directory.join(name);
+            write_map_test_file(&path, &bytes);
+            paths.push(path);
+        }
+        let boundary = directory.join("boundary.json");
+        let mut padded_json = json;
+        padded_json.resize(MAP_ARTIFACT_MAX_BYTES, b' ');
+        write_map_test_file(&boundary, &padded_json);
+        assert_eq!(
+            inspect_map_artifact_file(&boundary).unwrap().scientific_hash,
+            artifact.scientific_content_hash()
+        );
+        padded_json.push(b' ');
+        let oversized = directory.join("oversized.json");
+        write_map_test_file(&oversized, &padded_json);
+        paths.push(oversized);
+        for cells in [MAP_SANDBOX_MAX_CELLS, MAP_SANDBOX_MAX_CELLS + 1] {
+            let width = u32::try_from(cells).unwrap();
+            let terrain = TerrainLayer::from_tiles(
+                width,
+                1,
+                50,
+                vec![artifact.terrain().tiles()[0]; usize::try_from(cells).unwrap()],
+            ).unwrap();
+            let mut metadata = artifact.metadata().clone();
+            metadata.width = width;
+            metadata.height = 1;
+            let large = MapArtifact::new(terrain, None, None, None, None, metadata).unwrap();
+            large.validate().unwrap();
+            let path = directory.join(format!("cells-{cells}.postcard"));
+            write_map_test_file(&path, &postcard::to_allocvec(&large).unwrap());
+            if cells == MAP_SANDBOX_MAX_CELLS {
+                let inspected = inspect_map_artifact_file(&path).unwrap();
+                assert_eq!(inspected.artifact.terrain().tiles().len() as u64, cells);
+            } else {
+                paths.push(path);
+            }
+        }
+        for path in paths {
+            let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+            sandbox.finish_file_dialog(request, Ok(Some(path)));
+            wait_map_file(&mut sandbox);
+            assert!(sandbox.notice.contains("failed"), "{}", sandbox.notice);
+            assert!(Arc::ptr_eq(sandbox.inspection.as_ref().unwrap(), &inspection));
+            assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &artifact));
+            assert_eq!(sandbox.draft, draft);
+            assert!(sandbox.can_apply());
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
     #[test]
     fn map_sandbox_file_round_trip_preserves_captured_revision_and_science() {
         let host = TestHost::take(command_characterization_world());
@@ -21246,11 +21731,17 @@ mod command_characterization_tests {
         let json = sandbox.export_draft().unwrap();
         let directory = map_file_test_directory();
         let path = directory.join("painted-sample.json");
-        let request = sandbox.begin_file_dialog(true).unwrap();
-        assert!(sandbox.begin_file_dialog(false).is_err(), "one dialog slot");
+        let request = sandbox.begin_file_dialog(MapFileKind::SaveDraft).unwrap();
+        assert!(
+            sandbox.begin_file_dialog(MapFileKind::OpenDraft).is_err(),
+            "one dialog slot"
+        );
         sandbox.edit(MapAction::NextSeed);
         sandbox.finish_file_dialog(request, Ok(Some(path.clone())));
-        assert!(sandbox.begin_file_dialog(true).is_err(), "one IO slot");
+        assert!(
+            sandbox.begin_file_dialog(MapFileKind::SaveDraft).is_err(),
+            "one IO slot"
+        );
         wait_map_file(&mut sandbox);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), json);
         assert!(
@@ -21263,7 +21754,7 @@ mod command_characterization_tests {
             "Save must not change the draft"
         );
         let edited = sandbox.draft.state.clone();
-        let request = sandbox.begin_file_dialog(false).unwrap();
+        let request = sandbox.begin_file_dialog(MapFileKind::OpenDraft).unwrap();
         sandbox.finish_file_dialog(request, Ok(Some(path.clone())));
         wait_map_file(&mut sandbox);
         assert!(sandbox.notice.starts_with("Opened "), "{}", sandbox.notice);
@@ -21289,7 +21780,7 @@ mod command_characterization_tests {
                 .scientific_content_hash()
         );
         sandbox.edit(MapAction::NextSeed);
-        let request = sandbox.begin_file_dialog(true).unwrap();
+        let request = sandbox.begin_file_dialog(MapFileKind::SaveDraft).unwrap();
         assert_ne!(request.save_json.as_ref().unwrap(), &json);
         sandbox.edit(MapAction::NextSeed);
         sandbox.finish_file_dialog(request, Ok(Some(path.clone())));
@@ -21316,11 +21807,11 @@ mod command_characterization_tests {
         write_new_map_draft_file(&valid, &json).unwrap();
         let original = sandbox.draft.clone();
         let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
-        let request = sandbox.begin_file_dialog(false).unwrap();
+        let request = sandbox.begin_file_dialog(MapFileKind::OpenDraft).unwrap();
         sandbox.finish_file_dialog(request, Ok(None));
         assert!(!sandbox.file_busy());
         assert_eq!(sandbox.draft, original);
-        let request = sandbox.begin_file_dialog(false).unwrap();
+        let request = sandbox.begin_file_dialog(MapFileKind::OpenDraft).unwrap();
         sandbox.finish_file_dialog(request, Err("platform dialog unavailable".to_owned()));
         assert!(sandbox.notice.contains("platform dialog unavailable"));
         assert_eq!(sandbox.draft, original);
@@ -21366,7 +21857,7 @@ mod command_characterization_tests {
             oversized,
             directory.clone(),
         ] {
-            let request = sandbox.begin_file_dialog(false).unwrap();
+            let request = sandbox.begin_file_dialog(MapFileKind::OpenDraft).unwrap();
             sandbox.finish_file_dialog(request, Ok(Some(path)));
             wait_map_file(&mut sandbox);
             assert!(sandbox.notice.contains("failed") || sandbox.notice.contains("refused"));
@@ -21376,7 +21867,7 @@ mod command_characterization_tests {
                 &preview
             ));
         }
-        let request = sandbox.begin_file_dialog(false).unwrap();
+        let request = sandbox.begin_file_dialog(MapFileKind::OpenDraft).unwrap();
         sandbox.edit(MapAction::NextSeed);
         let edited = sandbox.draft.clone();
         sandbox.finish_file_dialog(request, Ok(Some(valid.clone())));
@@ -21385,7 +21876,7 @@ mod command_characterization_tests {
             "edit during dialog refuses before IO"
         );
         assert_eq!(sandbox.draft, edited);
-        let request = sandbox.begin_file_dialog(false).unwrap();
+        let request = sandbox.begin_file_dialog(MapFileKind::OpenDraft).unwrap();
         sandbox.finish_file_dialog(request, Ok(Some(valid)));
         sandbox.edit(MapAction::NextSeed);
         let edited = sandbox.draft.clone();
@@ -22029,6 +22520,43 @@ mod command_characterization_tests {
         context.run_until_parked();
         assert!(!session.map_sandbox.lock().unwrap().file_busy());
         assert_eq!(session.map_sandbox.lock().unwrap().draft, before_cancel);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        let inspected_draft = session.map_sandbox.lock().unwrap().draft.clone();
+        let artifact = inspected_draft.generate_artifact().unwrap();
+        let artifact_path = directory.join("lab-artifact.postcard");
+        write_map_test_file(&artifact_path, &postcard::to_allocvec(&artifact).unwrap());
+        click(&mut lab, "map-inspect-artifact");
+        context.run_until_parked();
+        assert!(context.did_prompt_for_paths());
+        context.simulate_path_prompt_response(|options| {
+            assert!(options.files && !options.directories && !options.multiple);
+            assert!(options.prompt.as_ref().unwrap().to_string().contains("artifact"));
+            Some(vec![artifact_path.clone()])
+        });
+        context.run_until_parked();
+        wait_file(&mut lab);
+        assert!(lab.debug_bounds("map-artifact-inspection").is_some());
+        let inspection = {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            assert_eq!(sandbox.draft, inspected_draft);
+            let inspection = Arc::clone(sandbox.inspection.as_ref().unwrap());
+            assert_eq!(inspection.artifact, artifact);
+            assert_eq!(inspection.encoding, "Postcard");
+            inspection
+        };
+        click(&mut lab, "map-artifact-cell-1-1");
+        assert_eq!(session.map_sandbox.lock().unwrap().inspection_cell, (1, 1));
+        click(&mut lab, "map-inspect-artifact");
+        context.run_until_parked();
+        context.simulate_path_prompt_response(|_| None);
+        context.run_until_parked();
+        assert!(Arc::ptr_eq(
+            session.map_sandbox.lock().unwrap().inspection.as_ref().unwrap(),
+            &inspection,
+        ));
+        click(&mut lab, "map-artifact-back");
+        assert!(session.map_sandbox.lock().unwrap().inspection.is_none());
+        assert_eq!(session.map_sandbox.lock().unwrap().draft, inspected_draft);
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         click(&mut lab, "map-policy");
         assert_eq!(
