@@ -3154,8 +3154,8 @@ impl MapSandbox {
             }
         };
         if request.save_json.is_none() && request.draft_revision != self.draft.revision {
-            self.notice = "Draft changed while Open was pending; selected file was not loaded."
-                .to_owned();
+            self.notice =
+                "Draft changed while Open was pending; selected file was not loaded.".to_owned();
             return;
         }
         let worker_path = path.clone();
@@ -21327,6 +21327,8 @@ mod command_characterization_tests {
 
         let malformed = directory.join("malformed.json");
         write_new_map_draft_file(&malformed, "{").unwrap();
+        let empty = directory.join("empty.json");
+        write_new_map_draft_file(&empty, "").unwrap();
         let invalid_utf8 = directory.join("invalid-utf8.json");
         let oversized = directory.join("oversized.json");
         {
@@ -21358,6 +21360,7 @@ mod command_characterization_tests {
         assert!(!refused_output.exists());
         for path in [
             directory.join("missing.json"),
+            empty,
             malformed,
             invalid_utf8,
             oversized,
@@ -21988,14 +21991,20 @@ mod command_characterization_tests {
                     window.refresh();
                     window.draw(app).clear();
                 });
-                assert!(Instant::now() < deadline, "production file IO did not finish");
+                assert!(
+                    Instant::now() < deadline,
+                    "production file IO did not finish"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
         };
         wait_file(&mut lab);
         let saved: MapDraftDocument =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved.seed, 2, "Save captures the revision before the dialog");
+        assert_eq!(
+            saved.seed, 2,
+            "Save captures the revision before the dialog"
+        );
         assert_eq!(saved.constraints.len(), 1);
         assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 3);
         click(&mut lab, "map-open-draft");
