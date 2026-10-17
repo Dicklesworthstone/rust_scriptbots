@@ -646,7 +646,15 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   64 rule prototypes and the existing sample/output work bounds. Invalid imports preserve
   the current draft and preview. A valid import is one undoable edit and requires a fresh
   preview before Apply. Session history, owner revisions, receipts and live world state
-  are not imported. File dialogs, persisted-artifact inspection, additional field controls,
+  are not imported.
+  **Save draft file…** opens the platform save dialog and writes the captured draft revision
+  to a new file. Pick an unused filename; existing files are refused. **Open draft file…**
+  opens one recipe through the same validator and undo history. File reads/writes run in
+  one background slot and retain the 1 MiB recipe limit. A cancelled dialog leaves the
+  draft unchanged. Editing while Open is pending discards its result; Save still writes
+  the revision captured when its dialog opened and reports that revision separately from
+  the current draft. These are input-work bounds, not filesystem latency guarantees.
+  Persisted-artifact inspection, additional field controls,
   accessible palettes and actual native OS-input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.

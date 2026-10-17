@@ -2410,6 +2410,24 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native map recipe files, 2026-10-17 (`bd-2z0.10.7`):** connect
+Save/Open platform dialogs to the existing recipe serializer/validator. Use one background
+file slot, bounded reads, create-new writes, captured save revisions and late-load rejection
+after edits. Exercise real files and production dialog input; keep original native OS and
+remaining editor acceptance open until observed.
+
+Source `a4ed312e45453b7af09b450054af49793a9f1676` is published to both required remote
+branches. R203 passes all nineteen source command/log pairs and typed `pass/0`; the retained
+reader/negatives re-execute all sixty required completions. Actual totals are 387 passing
+executions / 231 distinct tests / zero failures / six executions of three existing ignored
+diagnostics. Both full renderer modes exercise real-file round trips, overwrite/size/error
+refusals, stale loads, captured save revisions and actual headless platform callbacks through
+the retained owner Apply journey. All 88 manifest files and command hashes recompute.
+Containing DSR fails final private-cache verification on the tracked Proptest README link;
+no collected artifacts, guard unchanged. This is solo source/headless qualification; original
+native OS, artifact/field/accessibility and collection acceptance stay open. Exact evidence
+and the corrected three-hunk formatting retry are retained in `REALITY_CHECK_2026-09-03.md`.
+
 **[Currently In Progress] Native draft consumer, 2026-10-16 (`bd-2z0.10.7`):** wire the
 existing editor into a Lab Maps tab: bounded background generation, seed/dimensions,
 terrain painting and undo/redo, preview/provenance/seams, explicit agent policy and

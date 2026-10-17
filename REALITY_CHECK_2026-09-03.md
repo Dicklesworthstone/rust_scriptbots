@@ -10,6 +10,148 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Native recipe files (`bd-2z0.10.7`, 2026-10-17):
+
+- [x] Reassess authoritative Beads and inspect the real platform dialog APIs.
+- [x] Check the debug stack reliability issue; explicit sizing is already implemented.
+- [x] Add single-slot background recipe Save/Open with the existing byte bound.
+- [x] Refuse overwrites and report captured save revision and actual IO outcomes.
+- [x] Reject late loads after edits; preserve drafts on cancellation and invalid files.
+- [x] Add Save/Open controls to the existing Lab Maps tab.
+- [x] Test real-file round trips, malformed/oversized/missing input and existing-file refusal.
+- [x] Exercise the actual platform-dialog callbacks through production Lab input (headless).
+- [x] Run pinned source checks, review evidence, publish and update the original Bead.
+
+Remaining original editor acceptance (kept on `bd-2z0.10.7`):
+
+- [ ] Add interactive rule/sample exemplar and resource/field/hydrology/hazard controls.
+- [ ] Inspect persisted map artifacts in the native editor.
+- [ ] Complete accessible palettes, keyboard/focus and native toroidal-seam journeys.
+- [ ] Retain real native OS input through generate/edit/undo/export/import/Apply/stale refusal,
+      with source, adapter, input, content identities and acknowledged owner revisions.
+- [ ] Resolve containing DSR collection qualification (`bd-build-farm-reliability-lb19.2`).
+
+Creation worksheet: this is the requested existing TODO, PROCESS, consumed by the operator
+at handoff. The observed gap is clipboard-only draft portability. The explicit request
+gates this minimal tracking update; retire it as the original editor acceptance completes.
+No integrity exception or new framework is needed. Native recipe files are the useful
+local continuation; another hour of reporting would deliver less value. Verdict:
+LEGITIMATE GATE, zero capability credit.
+
+Source `9c72758329c75a05855ed7331e51dfe8525916f5`, tree
+`e3f2e863a41f335b5b9d86a2fc593cd248b1380a`, adds native recipe Save/Open controls.
+R202 preserves all nineteen checks and 56 existing required completions, adding the two
+file probes in both renderer modes (60 total). Core map tests and the complete feature-off
+renderer pass, including real-file round trips, existing-file refusal with a different
+payload, late-load rejection and production Lab dialog callbacks through Save/Open/undo/
+redo/cancellation and guarded owner Apply. Formatting fails three layout hunks. Stop the
+owned native group after the completed renderer command: all ten completed log hashes
+recompute, only formatting is red. Launcher finishes 2026-10-17 19:22:43 UTC, exit 6,
+frozen runner identity zero; no session processes remain before target reuse. The partial
+proof has 46 files / 47,865,671 bytes, an empty verdict and no manifest. It provides no
+final source, workspace or cache-collection result.
+
+Correction pin `a4ed312e45453b7af09b450054af49793a9f1676`, tree
+`3ae0e474a3da1dae406647169ee794460314ee83`, manually fixes those three hunks and adds
+empty-file refusal to the existing real-file test. Static exact-file UBS remains exit 1:
+two existing timestamp filename heuristics, 1,756 warnings and 744 informational results.
+R203 repeats all nineteen checks; its reader/negative controls are byte-identical to R202.
+Profile SHA256 `8fb18e21d4e27592fdd280090206512d507d080e1c1ba941cc5d383b1cf28ad0`;
+launcher `6b34326472036e76b88b57de5b90caa48a2d6697e5113c35d4a3a922e205c152`.
+At launch, corrected-source qualification and publication remain pending. The original
+Bead stays in progress; real native OS-input acceptance is still owed.
+
+**Published result:** R203 finishes 2026-10-17 19:41:00 UTC at clean source
+`a4ed312e45453b7af09b450054af49793a9f1676`. All nineteen command/log pairs have exit
+zero and the source receipt is typed `pass/0`. A separate pass by this agent re-executes
+the retained reader and planted negatives, observes all sixty required completions and
+recomputes actual totals: 387 passing executions, 231 distinct passing tests, zero failures,
+six executions of three unchanged ignored diagnostics. Core maps contribute 28 passes,
+runtime focused/channel 1/37, renderer focused 5, full default renderer 166 and full
+feature-off renderer 150. Both full renderer lanes pass the two file probes and the
+extended production Lab Save/Open/undo/redo/cancel/sample/Apply journey. Workspace and
+explicit GUI-app all-target checks/strict Clippy, formatting, four dependency guards,
+feature-off production graph and analyzer build pass. Existing Cargo future-incompatibility
+and README pin soft notices remain; the latter cites the troubleshooting SQLite submodule OID.
+
+All 88 manifest files / 95,765,226 bytes, exact file membership, all nineteen log hashes,
+profile byte identity and clean expected-source identity recompute. Proof:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-files-20261017-a4ed312e-r203-local`.
+Build run `7b963810-4868-4b88-a1f7-d4615e4dcb4e`; outer envelope
+`4590f11d-7f2e-40c5-bd07-a18c9e5e9c3f`. Verdict SHA256
+`affa91eed36ed5793a1dc872f327642fb2243e6bf94726d837781271cda9d796`;
+manifest `83651949bb7f6d4345d5cbae54710a0aecc6f84c69011e32919a504514cad5f9`.
+Containing DSR exits 6: its private-cache guard refuses the tracked Proptest README link
+before collection. This run's actual cache entry is Git mode 120000, target
+`proptest/README.md`; no collected identity/hash/size, no guard bypass. Frozen runner
+identity check is zero and no launcher-session process remains. This is successful source/
+headless self-verification with failed collection, not native OS, hardware, full-workspace
+tests, performance, independent review or release acceptance. Source pushes to both required
+remote branches succeed. The original editor remains in progress (comment 2854).
+Original editor acceptance and `bd-build-farm-reliability-lb19.2`
+remain open; no dependency, blocker or acceptance criterion is reassigned.
+
+Bounded anti-ceremony review for the 2026-10-17 Save/Open work:
+
+- **Creation worksheet:** this existing requested TODO/plan/Beads handoff is PROCESS;
+  runtime does not branch on it. Consumer: the operator requesting detailed tracking.
+  Gate: that requested handoff of native recipe portability. Observed defect: the Lab
+  had clipboard recipes but no file-dialog consumer. Retirement: original editor
+  acceptance, retaining only this report's history. No integrity exception is used, so
+  its four exception questions do not apply; the explicit request is the creation gate.
+  The highest-ranked ready item is the macOS host incident `bd-e6ff`; this Linux host
+  cannot resolve it. An hour connecting existing recipe APIs delivers more capability
+  than another report; keep this update bounded. Verdict: LEGITIMATE GATE, zero credit.
+- **Real-work worksheet:** window is the two source commits `9c727583`/`a4ed312e` and
+  their README/plan/report/tracker changes. README purpose: a deterministic artificial
+  life laboratory with GPU UI, pluggable brains and analytics. Inventory: feature USER,
+  format/edge-test correction ENABLER, README USER, plan/report/Beads PROCESS: two USER,
+  one ENABLER, three PROCESS groups, no UNKNOWN. No Bead closes; only the original editor
+  row changes, all other 717 rows byte-identical. Demo: save a painted recipe, edit the
+  seed, open it, undo/redo and regenerate before guarded Apply. The production headless
+  journey observes it; a real native OS demonstration remains owed. Without PROCESS,
+  runtime is identical and only requested tracking is lost. The correction is exercised
+  by formatting and the file tests; no speculative infrastructure. Older macOS/native GPU
+  blockers remain important and require their own hosts; this block connects existing
+  serialization to a usable local flow. Solo: no pane close counts. No follow-up, edge or
+  spec change substitutes for original acceptance. Verdict DRIFTING: three avoidable
+  formatting hunks cost a correction run. Correct manually, retain the failed run, freeze
+  further reporting machinery and finish the feature qualification.
+- **Honesty 1:** No weakening (checked the complete two-commit renderer diff and unchanged
+  prior input, owner Apply/stale, science, viewport, deadline and duplicate assertions).
+  **2:** No specialized success double (checked real files, actual generators and existing
+  `TestHost` owner; the platform callbacks remain explicitly GPUI headless tests).
+  **3:** No golden regeneration (checked the exact changed path set).
+  **4:** No suppression, timeout/tolerance/retry, CI/config or gate relaxation (checked both
+  source diffs and the external profile; final reader is byte-identical to R202, which
+  retains old requirements and adds the two file probes in each renderer mode).
+  **5:** No demo-only success branch (checked production dialog dispatch, bounded file
+  helpers and the shared atomic importer). **6:** No zero-run green (checked every raw
+  suite summary/terminal and all sixty required completions with the retained reader and
+  its planted negatives). **7:** No unrun-command claim (checked all nineteen raw
+  command/log pairs and the typed source receipt).
+  **8:** No proof promotion (headless callbacks/owner tests are not native OS, hardware,
+  full-workspace tests, performance or release evidence). **9:** The formatting failure,
+  stopped partial run and empty verdict/no manifest are disclosed; this run's actual
+  collection refusal is recorded separately. **10:** No cited stderr discarded (checked retained
+  UBS stderr and the DSR combined logs/channel statuses). **11:** No false closure
+  (original editor remains in progress). **12:** No requirements edited to match the
+  increment (checked original Bead; artifact/fields/accessibility/native input remain).
+  **13–17:** Not applicable: solo continuation, no delegation, accepted subagent evidence
+  or counted agent agreement. **18:** No post-result denominator (nineteen command/log
+  pairs, sixty required completions and every actual test terminal were predeclared;
+  countermetrics are failures/ignores, source/collection failures and live science before
+  versus after Apply). Older-session check: the new file round-trip test name has no CASS
+  hits; previous broad searches are recorded below, not an exhaustive history clearance.
+  **19:** The formatter retry is the avoidable moment requiring explanation.
+  **20:** Strongest evidence is the exact pinned source, real-file tests and production
+  dialog/owner input journey; a skeptic can rerun them. Final retained-result verification
+  is re-executed in a separate solo pass, not an independent review.
+  Disposition: formatting corrected and disclosed, no relaxed gate (RH-1) or proof inflation
+  (RH-2); retain the first attempt (SM-11). The failed partial run earns no final pass.
+  Source qualification and publication pass; containing DSR collection and original native
+  acceptance remain open. Audit DRIFTING, with the avoidable retry corrected and on record.
+
 Map portability/sample continuation (`bd-2z0.10.7`, 2026-10-16):
 
 - [x] Inspect the pinned clipboard API, draft history and real sample generator.
