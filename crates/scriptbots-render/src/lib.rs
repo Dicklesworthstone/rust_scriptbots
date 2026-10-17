@@ -2948,12 +2948,71 @@ struct MapGenerationJob {
     cancelled: bool,
 }
 
-/// Presentation-only draft. A single bounded worker produces previews; only the
-/// guarded app callback can submit an artifact to the scientific owner.
+struct MapFileRequest {
+    draft_revision: u64,
+    save_json: Option<String>,
+}
+
+enum MapFileResult {
+    Saved(usize),
+    Loaded(String),
+}
+
+struct MapFileJob {
+    draft_revision: u64,
+    path: std::path::PathBuf,
+    receiver: std::sync::mpsc::Receiver<std::result::Result<MapFileResult, String>>,
+}
+
+fn read_map_draft_file(path: &std::path::Path) -> std::result::Result<String, String> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("Choose a regular draft JSON file.".to_owned());
+    }
+    if metadata.len() > MAP_DRAFT_MAX_BYTES as u64 {
+        return Err(format!("Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."));
+    }
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut json = String::new();
+    file.take(MAP_DRAFT_MAX_BYTES as u64 + 1)
+        .read_to_string(&mut json)
+        .map_err(|error| error.to_string())?;
+    if json.len() > MAP_DRAFT_MAX_BYTES {
+        return Err(format!("Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."));
+    }
+    Ok(json)
+}
+
+fn write_new_map_draft_file(
+    path: &std::path::Path,
+    json: &str,
+) -> std::result::Result<usize, String> {
+    use std::io::Write as _;
+
+    if json.len() > MAP_DRAFT_MAX_BYTES {
+        return Err(format!("Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("Could not create a new file: {error}. Choose a new filename."))?;
+    file.write_all(json.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("Write failed: {error}; partial file may remain."))?;
+    Ok(json.len())
+}
+
+/// Presentation-only draft with one generator and one file operation at a time.
+/// Only the guarded app callback submits artifacts to the scientific owner.
 struct MapSandbox {
     draft: MapEditorDraft,
     preview: Option<MapPreview>,
     job: Option<MapGenerationJob>,
+    file_dialog_pending: bool,
+    file_job: Option<MapFileJob>,
     policy: ExistingAgentPolicy,
     brush: TerrainKind,
     notice: String,
@@ -2974,6 +3033,8 @@ impl MapSandbox {
             ),
             preview: None,
             job: None,
+            file_dialog_pending: false,
+            file_job: None,
             policy: ExistingAgentPolicy::Retain,
             brush: TerrainKind::Grass,
             notice: "Draft only. Pause the world before generating a map to apply.".to_owned(),
@@ -3045,6 +3106,123 @@ impl MapSandbox {
     }
 
     fn poll(&mut self) {
+        self.poll_generation();
+        self.poll_file();
+    }
+
+    fn file_busy(&self) -> bool {
+        self.file_dialog_pending || self.file_job.is_some()
+    }
+
+    fn begin_file_dialog(&mut self, save: bool) -> std::result::Result<MapFileRequest, String> {
+        if self.file_busy() {
+            return Err("A draft file dialog or operation is already active.".to_owned());
+        }
+        let request = MapFileRequest {
+            draft_revision: self.draft.revision,
+            save_json: if save {
+                Some(self.export_draft()?)
+            } else {
+                None
+            },
+        };
+        self.file_dialog_pending = true;
+        self.notice = if save {
+            "Choose a new filename for this draft revision. Existing files are never overwritten."
+        } else {
+            "Choose a draft JSON file. Editing while Open is pending discards the loaded result."
+        }
+        .to_owned();
+        Ok(request)
+    }
+
+    fn finish_file_dialog(
+        &mut self,
+        request: MapFileRequest,
+        selection: std::result::Result<Option<std::path::PathBuf>, String>,
+    ) {
+        self.file_dialog_pending = false;
+        let path = match selection {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                self.notice = "Draft file dialog cancelled; draft unchanged.".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.notice = format!("Draft file dialog failed: {error}");
+                return;
+            }
+        };
+        if request.save_json.is_none() && request.draft_revision != self.draft.revision {
+            self.notice = "Draft changed while Open was pending; selected file was not loaded."
+                .to_owned();
+            return;
+        }
+        let worker_path = path.clone();
+        let draft_revision = request.draft_revision;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("scriptbots-map-file".to_owned())
+            .spawn(move || {
+                let result = match request.save_json {
+                    Some(json) => {
+                        write_new_map_draft_file(&worker_path, &json).map(MapFileResult::Saved)
+                    }
+                    None => read_map_draft_file(&worker_path).map(MapFileResult::Loaded),
+                };
+                let _ = sender.send(result);
+            }) {
+            Ok(_worker) => {
+                self.file_job = Some(MapFileJob {
+                    draft_revision,
+                    path,
+                    receiver,
+                });
+                self.notice = "Draft file IO running in the background…".to_owned();
+            }
+            Err(error) => self.notice = format!("Could not start draft file IO: {error}"),
+        }
+    }
+
+    fn poll_file(&mut self) {
+        let Some(job) = &self.file_job else {
+            return;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("File worker stopped without a result.".to_owned())
+            }
+        };
+        let Some(job) = self.file_job.take() else {
+            return;
+        };
+        self.notice = match result {
+            Ok(MapFileResult::Saved(bytes)) => format!(
+                "Saved draft revision {} ({bytes} bytes) to {}. Current draft revision {}.",
+                job.draft_revision,
+                job.path.display(),
+                self.draft.revision,
+            ),
+            Ok(MapFileResult::Loaded(_)) if job.draft_revision != self.draft.revision => {
+                "Draft changed while reading; loaded result discarded. Open again to replace it."
+                    .to_owned()
+            }
+            Ok(MapFileResult::Loaded(json)) => self.import_draft(&json).map_or_else(
+                |error| format!("Draft file import refused: {error}"),
+                |()| {
+                    format!(
+                        "Opened {} as one undoable draft edit. Generate a fresh preview.",
+                        job.path.display()
+                    )
+                },
+            ),
+            Err(error) => format!("Draft file IO failed for {}: {error}", job.path.display()),
+        };
+    }
+
+    fn poll_generation(&mut self) {
         let Some(job) = self.job.as_ref() else {
             return;
         };
@@ -3175,7 +3353,9 @@ impl MapSandbox {
             | MapAction::Pause
             | MapAction::LiveGrid
             | MapAction::CopyDraft
-            | MapAction::PasteDraft => {
+            | MapAction::PasteDraft
+            | MapAction::SaveDraft
+            | MapAction::OpenDraft => {
                 return;
             }
         };
@@ -3211,6 +3391,8 @@ enum MapAction {
     Generator,
     CopyDraft,
     PasteDraft,
+    SaveDraft,
+    OpenDraft,
     Cancel,
     NextSeed,
     NextSize,
@@ -3675,6 +3857,10 @@ impl SimulationView {
     }
 
     fn map_button_action(&self, action: MapAction, cx: &mut Context<Self>) {
+        if matches!(action, MapAction::SaveDraft | MapAction::OpenDraft) {
+            self.map_file_dialog(matches!(action, MapAction::SaveDraft), cx);
+            return;
+        }
         if !matches!(action, MapAction::CopyDraft | MapAction::PasteDraft) {
             self.map_action(action);
             return;
@@ -3706,6 +3892,63 @@ impl SimulationView {
             }
             _ => return,
         };
+    }
+
+    fn map_file_dialog(&self, save: bool, cx: &mut Context<Self>) {
+        let request = {
+            let Ok(mut sandbox) = self.map_sandbox.lock() else {
+                return;
+            };
+            match sandbox.begin_file_dialog(save) {
+                Ok(request) => request,
+                Err(error) => {
+                    sandbox.notice = format!("Draft file request refused: {error}");
+                    return;
+                }
+            }
+        };
+        let sandbox = Arc::clone(&self.map_sandbox);
+        cx.spawn(async move |this, cx| {
+            let selection = if save {
+                match std::env::current_dir() {
+                    Ok(directory) => {
+                        let pending = cx.update(|app| {
+                            app.prompt_for_new_path(&directory, Some("scriptbots-map-draft.json"))
+                        });
+                        pending
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result.map_err(|error| error.to_string()))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            } else {
+                let pending = cx.update(|app| {
+                    app.prompt_for_paths(gpui::PathPromptOptions {
+                        files: true,
+                        directories: false,
+                        multiple: false,
+                        prompt: Some("Open map draft JSON".into()),
+                    })
+                });
+                pending
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                    .and_then(|paths| match paths {
+                        None => Ok(None),
+                        Some(mut paths) if paths.len() == 1 => Ok(paths.pop()),
+                        Some(_) => Err("Choose exactly one draft JSON file.".to_owned()),
+                    })
+            };
+            // Complete the shared session even if the view that opened the dialog
+            // was closed. The surviving window still polls the bounded file job.
+            if let Ok(mut sandbox) = sandbox.lock() {
+                sandbox.finish_file_dialog(request, selection);
+            }
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
     }
 
     fn render_map_sandbox(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
@@ -3768,6 +4011,20 @@ impl SimulationView {
                         "Paste draft JSON".to_owned(),
                         MapAction::PasteDraft,
                         true,
+                        cx,
+                    ))
+                    .child(self.render_map_button(
+                        "map-save-draft",
+                        "Save draft file…".to_owned(),
+                        MapAction::SaveDraft,
+                        !sandbox.file_busy(),
+                        cx,
+                    ))
+                    .child(self.render_map_button(
+                        "map-open-draft",
+                        "Open draft file…".to_owned(),
+                        MapAction::OpenDraft,
+                        !sandbox.file_busy(),
                         cx,
                     )),
             )
@@ -20958,6 +21215,186 @@ mod command_characterization_tests {
         }
     }
 
+    fn map_file_test_directory() -> std::path::PathBuf {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "scriptbots-map-file-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    fn wait_map_file(sandbox: &mut MapSandbox) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sandbox.file_job.is_some() {
+            sandbox.poll();
+            assert!(Instant::now() < deadline, "map file IO did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn map_sandbox_file_round_trip_preserves_captured_revision_and_science() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(16, 16, 50);
+        sandbox.edit(MapAction::Generator);
+        sandbox.edit(MapAction::Paint(0, 0));
+        let captured = sandbox.draft.clone();
+        let json = sandbox.export_draft().unwrap();
+        let directory = map_file_test_directory();
+        let path = directory.join("painted-sample.json");
+        let request = sandbox.begin_file_dialog(true).unwrap();
+        assert!(sandbox.begin_file_dialog(false).is_err(), "one dialog slot");
+        sandbox.edit(MapAction::NextSeed);
+        sandbox.finish_file_dialog(request, Ok(Some(path.clone())));
+        assert!(sandbox.begin_file_dialog(true).is_err(), "one IO slot");
+        wait_map_file(&mut sandbox);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), json);
+        assert!(
+            sandbox
+                .notice
+                .starts_with(&format!("Saved draft revision {}", captured.revision))
+        );
+        assert_ne!(
+            sandbox.draft.state, captured.state,
+            "Save must not change the draft"
+        );
+        let edited = sandbox.draft.state.clone();
+        let request = sandbox.begin_file_dialog(false).unwrap();
+        sandbox.finish_file_dialog(request, Ok(Some(path.clone())));
+        wait_map_file(&mut sandbox);
+        assert!(sandbox.notice.starts_with("Opened "), "{}", sandbox.notice);
+        assert_eq!(sandbox.draft.state, captured.state);
+        assert!(sandbox.preview.is_none());
+        assert!(!sandbox.can_apply());
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state, edited);
+        sandbox.edit(MapAction::Redo);
+        assert_eq!(sandbox.draft.state, captured.state);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert_eq!(
+            sandbox
+                .preview
+                .as_ref()
+                .unwrap()
+                .artifact
+                .scientific_content_hash(),
+            captured
+                .generate_artifact()
+                .unwrap()
+                .scientific_content_hash()
+        );
+        sandbox.edit(MapAction::NextSeed);
+        let request = sandbox.begin_file_dialog(true).unwrap();
+        assert_ne!(request.save_json.as_ref().unwrap(), &json);
+        sandbox.edit(MapAction::NextSeed);
+        sandbox.finish_file_dialog(request, Ok(Some(path.clone())));
+        wait_map_file(&mut sandbox);
+        assert!(sandbox.notice.contains("Choose a new filename"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            json,
+            "never overwrite"
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn map_sandbox_file_refusals_and_late_loads_preserve_the_draft() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(16, 16, 50);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let directory = map_file_test_directory();
+        let valid = directory.join("valid.json");
+        let json = sandbox.export_draft().unwrap();
+        write_new_map_draft_file(&valid, &json).unwrap();
+        let original = sandbox.draft.clone();
+        let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        let request = sandbox.begin_file_dialog(false).unwrap();
+        sandbox.finish_file_dialog(request, Ok(None));
+        assert!(!sandbox.file_busy());
+        assert_eq!(sandbox.draft, original);
+        let request = sandbox.begin_file_dialog(false).unwrap();
+        sandbox.finish_file_dialog(request, Err("platform dialog unavailable".to_owned()));
+        assert!(sandbox.notice.contains("platform dialog unavailable"));
+        assert_eq!(sandbox.draft, original);
+
+        let malformed = directory.join("malformed.json");
+        write_new_map_draft_file(&malformed, "{").unwrap();
+        let invalid_utf8 = directory.join("invalid-utf8.json");
+        let oversized = directory.join("oversized.json");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&invalid_utf8)
+                .unwrap();
+            file.write_all(&[0xff]).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&oversized)
+                .unwrap();
+            let oversized_json =
+                format!("{json}{}", " ".repeat(MAP_DRAFT_MAX_BYTES + 1 - json.len()));
+            file.write_all(oversized_json.as_bytes()).unwrap();
+        }
+        let boundary = directory.join("boundary.json");
+        let boundary_json = format!("{json}{}", " ".repeat(MAP_DRAFT_MAX_BYTES - json.len()));
+        write_new_map_draft_file(&boundary, &boundary_json).unwrap();
+        assert_eq!(read_map_draft_file(&boundary).unwrap(), boundary_json);
+        let refused_output = directory.join("refused-output.json");
+        assert!(
+            write_new_map_draft_file(&refused_output, &" ".repeat(MAP_DRAFT_MAX_BYTES + 1))
+                .is_err()
+        );
+        assert!(!refused_output.exists());
+        for path in [
+            directory.join("missing.json"),
+            malformed,
+            invalid_utf8,
+            oversized,
+            directory.clone(),
+        ] {
+            let request = sandbox.begin_file_dialog(false).unwrap();
+            sandbox.finish_file_dialog(request, Ok(Some(path)));
+            wait_map_file(&mut sandbox);
+            assert!(sandbox.notice.contains("failed") || sandbox.notice.contains("refused"));
+            assert_eq!(sandbox.draft, original);
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
+        }
+        let request = sandbox.begin_file_dialog(false).unwrap();
+        sandbox.edit(MapAction::NextSeed);
+        let edited = sandbox.draft.clone();
+        sandbox.finish_file_dialog(request, Ok(Some(valid.clone())));
+        assert!(
+            sandbox.file_job.is_none(),
+            "edit during dialog refuses before IO"
+        );
+        assert_eq!(sandbox.draft, edited);
+        let request = sandbox.begin_file_dialog(false).unwrap();
+        sandbox.finish_file_dialog(request, Ok(Some(valid)));
+        sandbox.edit(MapAction::NextSeed);
+        let edited = sandbox.draft.clone();
+        wait_map_file(&mut sandbox);
+        assert!(sandbox.notice.contains("result discarded"));
+        assert_eq!(
+            sandbox.draft, edited,
+            "edit after dispatch rejects completed load"
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
     fn map_owner_submit(host: Arc<TestHost>) -> MapApplySubmit {
         Arc::new(move |artifact, policy, expected| {
             let id = CommandId::from_client_sequence(
@@ -21534,6 +21971,56 @@ mod command_characterization_tests {
                 .generator_config,
             DraftGeneratorConfig::SampleBased { .. }
         ));
+        let directory = map_file_test_directory();
+        let path = directory.join("lab-dialog-draft.json");
+        click(&mut lab, "map-save-draft");
+        context.run_until_parked();
+        assert!(context.did_prompt_for_new_path());
+        click(&mut lab, "map-seed");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 3);
+        context.simulate_new_path_selection(|_| Some(path.clone()));
+        context.run_until_parked();
+        let wait_file = |lab: &mut gpui::VisualTestContext| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while session.map_sandbox.lock().unwrap().file_busy() {
+                context.run_until_parked();
+                lab.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear();
+                });
+                assert!(Instant::now() < deadline, "production file IO did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wait_file(&mut lab);
+        let saved: MapDraftDocument =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.seed, 2, "Save captures the revision before the dialog");
+        assert_eq!(saved.constraints.len(), 1);
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 3);
+        click(&mut lab, "map-open-draft");
+        context.run_until_parked();
+        assert!(context.did_prompt_for_paths());
+        context.simulate_path_prompt_response(|options| {
+            assert!(options.files && !options.directories && !options.multiple);
+            Some(vec![path.clone()])
+        });
+        context.run_until_parked();
+        wait_file(&mut lab);
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
+        click(&mut lab, "map-undo");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 3);
+        click(&mut lab, "map-redo");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
+        let before_cancel = session.map_sandbox.lock().unwrap().draft.clone();
+        click(&mut lab, "map-open-draft");
+        context.run_until_parked();
+        assert!(context.did_prompt_for_paths());
+        context.simulate_path_prompt_response(|_| None);
+        context.run_until_parked();
+        assert!(!session.map_sandbox.lock().unwrap().file_busy());
+        assert_eq!(session.map_sandbox.lock().unwrap().draft, before_cancel);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         click(&mut lab, "map-policy");
         assert_eq!(
             session.map_sandbox.lock().unwrap().policy,
