@@ -3084,11 +3084,22 @@ fn map_artifact_cell_details(artifact: &MapArtifact, x: u32, y: u32) -> Vec<Stri
         ),
         format!(
             "Fertility field {} · temperature field {}",
-            scalar(artifact.fertility().and_then(|field| field.values().get(index))),
-            scalar(artifact.temperature().and_then(|field| field.values().get(index))),
+            scalar(
+                artifact
+                    .fertility()
+                    .and_then(|field| field.values().get(index))
+            ),
+            scalar(
+                artifact
+                    .temperature()
+                    .and_then(|field| field.values().get(index))
+            ),
         ),
     ];
-    if let Some(tile) = artifact.hydrology_tiles().and_then(|layer| layer.tiles().get(index)) {
+    if let Some(tile) = artifact
+        .hydrology_tiles()
+        .and_then(|layer| layer.tiles().get(index))
+    {
         details.push(format!(
             "Hydrology permeability {:.3} · runoff {:.3} · basin rank {:.3} · channel priority {:.3} · swim cost {:.3}",
             tile.permeability, tile.runoff_bias, tile.basin_rank, tile.channel_priority, tile.swim_cost,
@@ -3304,7 +3315,8 @@ impl MapSandbox {
                 let result = match request.kind {
                     MapFileKind::SaveDraft => {
                         let Some(json) = request.save_json else {
-                            let _ = sender.send(Err("Save request has no captured recipe.".to_owned()));
+                            let _ =
+                                sender.send(Err("Save request has no captured recipe.".to_owned()));
                             return;
                         };
                         write_new_map_draft_file(&worker_path, &json).map(MapFileResult::Saved)
@@ -3484,9 +3496,11 @@ impl MapSandbox {
                 return;
             }
             MapAction::InspectCell(x, y) => {
-                if self.inspection.as_ref().is_some_and(|inspection| {
-                    inspection.artifact.terrain().tile(x, y).is_some()
-                }) {
+                if self
+                    .inspection
+                    .as_ref()
+                    .is_some_and(|inspection| inspection.artifact.terrain().tile(x, y).is_some())
+                {
                     self.inspection_cell = (x, y);
                 }
                 return;
@@ -4104,7 +4118,9 @@ impl SimulationView {
                         multiple: false,
                         prompt: Some(
                             match kind {
-                                MapFileKind::InspectArtifact => "Inspect JSON or Postcard map artifact",
+                                MapFileKind::InspectArtifact => {
+                                    "Inspect JSON or Postcard map artifact"
+                                }
                                 _ => "Open map draft JSON",
                             }
                             .into(),
@@ -4153,7 +4169,11 @@ impl SimulationView {
             .flex_col()
             .gap_3()
             .text_color(chrome::text_primary())
-            .child(div().text_sm().child("Saved map artifact · inspection only"))
+            .child(
+                div()
+                    .text_sm()
+                    .child("Saved map artifact · inspection only"),
+            )
             .child(self.render_map_button(
                 "map-artifact-back",
                 "Back to unchanged draft".to_owned(),
@@ -21583,11 +21603,17 @@ mod command_characterization_tests {
         let directory = map_file_test_directory();
         for (filename, encoding, bytes) in [
             ("map.json", "JSON", serde_json::to_vec(&artifact).unwrap()),
-            ("map.postcard", "Postcard", postcard::to_allocvec(&artifact).unwrap()),
+            (
+                "map.postcard",
+                "Postcard",
+                postcard::to_allocvec(&artifact).unwrap(),
+            ),
         ] {
             let path = directory.join(filename);
             write_map_test_file(&path, &bytes);
-            let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+            let request = sandbox
+                .begin_file_dialog(MapFileKind::InspectArtifact)
+                .unwrap();
             assert!(sandbox.begin_file_dialog(MapFileKind::OpenDraft).is_err());
             sandbox.edit(MapAction::NextSeed);
             let edited = sandbox.draft.clone();
@@ -21598,14 +21624,20 @@ mod command_characterization_tests {
             assert_eq!(inspection.path, path);
             assert_eq!(inspection.encoding, encoding);
             assert_eq!(inspection.artifact, artifact);
-            assert_eq!(inspection.scientific_hash, artifact.scientific_content_hash());
+            assert_eq!(
+                inspection.scientific_hash,
+                artifact.scientific_content_hash()
+            );
             assert_eq!(
                 inspection.seams.max_elevation_step_ns.to_bits(),
                 expected_seams.max_elevation_step_ns.to_bits()
             );
             assert_eq!(sandbox.draft, edited);
             assert_eq!(sandbox.can_apply(), can_apply);
-            assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &preview));
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
             let details = map_artifact_cell_details(&inspection.artifact, 0, 0).join("\n");
             assert!(details.contains("elevation 0.250"));
             assert!(details.contains("fertility bias 0.600"));
@@ -21617,7 +21649,10 @@ mod command_characterization_tests {
             sandbox.edit(MapAction::BackToDraft);
             assert!(sandbox.inspection.is_none());
             assert_eq!(sandbox.draft, edited);
-            assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &preview));
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
         }
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, 0);
@@ -21635,22 +21670,32 @@ mod command_characterization_tests {
         let valid = directory.join("valid.json");
         let json = serde_json::to_vec(artifact.as_ref()).unwrap();
         write_map_test_file(&valid, &json);
-        let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+        let request = sandbox
+            .begin_file_dialog(MapFileKind::InspectArtifact)
+            .unwrap();
         sandbox.finish_file_dialog(request, Ok(Some(valid)));
         wait_map_file(&mut sandbox);
         let inspection = Arc::clone(sandbox.inspection.as_ref().unwrap());
         let draft = sandbox.draft.clone();
         for selection in [Ok(None), Err("platform unavailable".to_owned())] {
-            let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+            let request = sandbox
+                .begin_file_dialog(MapFileKind::InspectArtifact)
+                .unwrap();
             sandbox.finish_file_dialog(request, selection);
             assert!(!sandbox.file_busy());
-            assert!(Arc::ptr_eq(sandbox.inspection.as_ref().unwrap(), &inspection));
+            assert!(Arc::ptr_eq(
+                sandbox.inspection.as_ref().unwrap(),
+                &inspection
+            ));
             assert_eq!(sandbox.draft, draft);
         }
         let mut wrong_metadata = serde_json::to_value(artifact.as_ref()).unwrap();
         wrong_metadata["metadata"]["width"] = 5.into();
         let mut missing_tile = serde_json::to_value(artifact.as_ref()).unwrap();
-        missing_tile["terrain"]["tiles"].as_array_mut().unwrap().pop();
+        missing_tile["terrain"]["tiles"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
         let mut zero_cell_size = serde_json::to_value(artifact.as_ref()).unwrap();
         zero_cell_size["terrain"]["cell_size"] = 0.into();
         let encoded = postcard::to_allocvec(artifact.as_ref()).unwrap();
@@ -21663,9 +21708,15 @@ mod command_characterization_tests {
             ("empty.json", Vec::new()),
             ("malformed.json", b"{".to_vec()),
             ("recipe.json", sandbox.export_draft().unwrap().into_bytes()),
-            ("metadata.json", serde_json::to_vec(&wrong_metadata).unwrap()),
+            (
+                "metadata.json",
+                serde_json::to_vec(&wrong_metadata).unwrap(),
+            ),
             ("tiles.json", serde_json::to_vec(&missing_tile).unwrap()),
-            ("cell-size.json", serde_json::to_vec(&zero_cell_size).unwrap()),
+            (
+                "cell-size.json",
+                serde_json::to_vec(&zero_cell_size).unwrap(),
+            ),
             ("truncated.postcard", encoded[..encoded.len() - 1].to_vec()),
             ("trailing.postcard", trailing),
         ] {
@@ -21678,7 +21729,9 @@ mod command_characterization_tests {
         padded_json.resize(MAP_ARTIFACT_MAX_BYTES, b' ');
         write_map_test_file(&boundary, &padded_json);
         assert_eq!(
-            inspect_map_artifact_file(&boundary).unwrap().scientific_hash,
+            inspect_map_artifact_file(&boundary)
+                .unwrap()
+                .scientific_hash,
             artifact.scientific_content_hash()
         );
         padded_json.push(b' ');
@@ -21692,7 +21745,8 @@ mod command_characterization_tests {
                 1,
                 50,
                 vec![artifact.terrain().tiles()[0]; usize::try_from(cells).unwrap()],
-            ).unwrap();
+            )
+            .unwrap();
             let mut metadata = artifact.metadata().clone();
             metadata.width = width;
             metadata.height = 1;
@@ -21708,12 +21762,20 @@ mod command_characterization_tests {
             }
         }
         for path in paths {
-            let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+            let request = sandbox
+                .begin_file_dialog(MapFileKind::InspectArtifact)
+                .unwrap();
             sandbox.finish_file_dialog(request, Ok(Some(path)));
             wait_map_file(&mut sandbox);
             assert!(sandbox.notice.contains("failed"), "{}", sandbox.notice);
-            assert!(Arc::ptr_eq(sandbox.inspection.as_ref().unwrap(), &inspection));
-            assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &artifact));
+            assert!(Arc::ptr_eq(
+                sandbox.inspection.as_ref().unwrap(),
+                &inspection
+            ));
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &artifact
+            ));
             assert_eq!(sandbox.draft, draft);
             assert!(sandbox.can_apply());
         }
@@ -22530,7 +22592,14 @@ mod command_characterization_tests {
         assert!(context.did_prompt_for_paths());
         context.simulate_path_prompt_response(|options| {
             assert!(options.files && !options.directories && !options.multiple);
-            assert!(options.prompt.as_ref().unwrap().to_string().contains("artifact"));
+            assert!(
+                options
+                    .prompt
+                    .as_ref()
+                    .unwrap()
+                    .to_string()
+                    .contains("artifact")
+            );
             Some(vec![artifact_path.clone()])
         });
         context.run_until_parked();
@@ -22551,7 +22620,13 @@ mod command_characterization_tests {
         context.simulate_path_prompt_response(|_| None);
         context.run_until_parked();
         assert!(Arc::ptr_eq(
-            session.map_sandbox.lock().unwrap().inspection.as_ref().unwrap(),
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .inspection
+                .as_ref()
+                .unwrap(),
             &inspection,
         ));
         click(&mut lab, "map-artifact-back");
