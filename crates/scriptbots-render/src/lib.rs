@@ -21696,6 +21696,19 @@ mod command_characterization_tests {
             .as_array_mut()
             .unwrap()
             .pop();
+        let mut field_case = serde_json::to_value(artifact.as_ref()).unwrap();
+        field_case["fertility"] = serde_json::json!({
+            "width": artifact.terrain().width(),
+            "height": artifact.terrain().height(),
+            "values": vec![0.5_f32; artifact.terrain().tiles().len()],
+        });
+        let valid_field = directory.join("valid-field.json");
+        write_map_test_file(&valid_field, &serde_json::to_vec(&field_case).unwrap());
+        assert!(inspect_map_artifact_file(&valid_field).is_ok());
+        field_case["fertility"]["values"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
         let mut zero_cell_size = serde_json::to_value(artifact.as_ref()).unwrap();
         zero_cell_size["terrain"]["cell_size"] = 0.into();
         let encoded = postcard::to_allocvec(artifact.as_ref()).unwrap();
@@ -21713,6 +21726,7 @@ mod command_characterization_tests {
                 serde_json::to_vec(&wrong_metadata).unwrap(),
             ),
             ("tiles.json", serde_json::to_vec(&missing_tile).unwrap()),
+            ("field.json", serde_json::to_vec(&field_case).unwrap()),
             (
                 "cell-size.json",
                 serde_json::to_vec(&zero_cell_size).unwrap(),
@@ -21768,6 +21782,11 @@ mod command_characterization_tests {
             sandbox.finish_file_dialog(request, Ok(Some(path)));
             wait_map_file(&mut sandbox);
             assert!(sandbox.notice.contains("failed"), "{}", sandbox.notice);
+            assert!(
+                !sandbox.notice.contains("stopped without a result"),
+                "Refused input must return an error instead of losing its worker: {}",
+                sandbox.notice
+            );
             assert!(Arc::ptr_eq(
                 sandbox.inspection.as_ref().unwrap(),
                 &inspection
