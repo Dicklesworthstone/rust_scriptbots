@@ -4545,9 +4545,9 @@ impl SimulationView {
             grid = grid.child(row);
         }
         panel = panel.child(grid);
-        panel.child(div().text_xs().child(
+        div().child(panel.child(div().text_xs().child(
             "This exemplar contains terrain kinds only. Environmental fields come from generator defaults and the draft's output-cell constraints. Editing never steps or applies to the live world.",
-        ))
+        )))
     }
 
     fn render_map_inspection(
