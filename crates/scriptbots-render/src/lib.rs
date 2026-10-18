@@ -3581,7 +3581,9 @@ impl MapSandbox {
                 Ok(())
             }
             MapAction::EditSample => {
-                if let DraftGeneratorConfig::SampleBased { sample } = &self.draft.state.generator_config {
+                if let DraftGeneratorConfig::SampleBased { sample } =
+                    &self.draft.state.generator_config
+                {
                     match sample.validate() {
                         Ok(()) => self.sample_editor_open = true,
                         Err(error) => self.notice = format!("Sample editor unavailable: {error}"),
@@ -3671,7 +3673,10 @@ impl MapSandbox {
                 return;
             }
         };
-        if !matches!(self.draft.state.generator_config, DraftGeneratorConfig::SampleBased { .. }) {
+        if !matches!(
+            self.draft.state.generator_config,
+            DraftGeneratorConfig::SampleBased { .. }
+        ) {
             self.sample_editor_open = false;
         }
         self.notice = result.map_or_else(
@@ -3690,7 +3695,9 @@ impl MapSandbox {
     fn replace_sample(&mut self, sample: SamplePatternSpec) -> Result<(), MapGenerationError> {
         let mut document = MapDraftDocument::from_draft(&self.draft);
         document.generator_config = DraftGeneratorConfig::SampleBased { sample };
-        let state = document.into_state().map_err(MapGenerationError::DraftError)?;
+        let state = document
+            .into_state()
+            .map_err(MapGenerationError::DraftError)?;
         if state == self.draft.state {
             return Ok(());
         }
@@ -3698,8 +3705,11 @@ impl MapSandbox {
     }
 
     fn edit_sample(&mut self, action: MapAction) -> Result<(), MapGenerationError> {
-        let DraftGeneratorConfig::SampleBased { sample } = &self.draft.state.generator_config else {
-            return Err(MapGenerationError::DraftError("Choose sample mode first.".to_owned()));
+        let DraftGeneratorConfig::SampleBased { sample } = &self.draft.state.generator_config
+        else {
+            return Err(MapGenerationError::DraftError(
+                "Choose sample mode first.".to_owned(),
+            ));
         };
         sample.validate()?;
         let mut sample = sample.clone();
@@ -3718,7 +3728,11 @@ impl MapSandbox {
             MapAction::SamplePattern => {
                 // The validated exemplar cell bound also bounds the smaller side.
                 let maximum = sample.sample_width.min(sample.sample_height);
-                sample.pattern_size = if sample.pattern_size >= maximum { 1 } else { sample.pattern_size + 1 };
+                sample.pattern_size = if sample.pattern_size >= maximum {
+                    1
+                } else {
+                    sample.pattern_size + 1
+                };
             }
             MapAction::SampleOrientations => sample.all_orientations = !sample.all_orientations,
             _ => return Ok(()),
@@ -3728,7 +3742,9 @@ impl MapSandbox {
 
     fn extract_inspected_sample(&mut self) -> Result<(), MapGenerationError> {
         if self.file_busy() {
-            return Err(MapGenerationError::DraftError("Finish the pending file operation first.".to_owned()));
+            return Err(MapGenerationError::DraftError(
+                "Finish the pending file operation first.".to_owned(),
+            ));
         }
         let inspection = self.inspection.as_ref().ok_or_else(|| {
             MapGenerationError::DraftError("Open a saved artifact first.".to_owned())
@@ -3748,13 +3764,17 @@ impl MapSandbox {
         let mut tiles = Vec::with_capacity((width * height) as usize);
         for dy in 0..height {
             for dx in 0..width {
-                let tile = terrain.tile((x + dx) % terrain.width(), (y + dy) % terrain.height())
+                let tile = terrain
+                    .tile((x + dx) % terrain.width(), (y + dy) % terrain.height())
                     .ok_or(MapGenerationError::InvalidDimensions)?;
                 tiles.push(tile.kind);
             }
         }
         let sample = SamplePatternSpec {
-            sample_id: format!("artifact-{:016x}-{x}-{y}-{width}x{height}-v1", inspection.scientific_hash),
+            sample_id: format!(
+                "artifact-{:016x}-{x}-{y}-{width}x{height}-v1",
+                inspection.scientific_hash
+            ),
             sample_width: width,
             sample_height: height,
             pattern_size: width.min(height).min(2),
@@ -4497,15 +4517,22 @@ impl SimulationView {
                     div()
                         .id(("map-sample-cell", index))
                         .debug_selector(move || format!("map-sample-cell-{x}-{y}"))
-                        .focusable().tab_stop(true).role(Role::Button)
+                        .focusable()
+                        .tab_stop(true)
+                        .role(Role::Button)
                         .aria_label(format!("Paint exemplar cell {x}, {y}: {kind:?}"))
-                        .w(px(cell_pixels)).h(px(cell_pixels)).flex_none()
+                        .w(px(cell_pixels))
+                        .h(px(cell_pixels))
+                        .flex_none()
                         .bg(rgb(map_preview_color(kind)))
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                            this.map_action(MapAction::SampleCell(x, y));
-                            cx.notify();
-                            cx.stop_propagation();
-                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.map_action(MapAction::SampleCell(x, y));
+                                cx.notify();
+                                cx.stop_propagation();
+                            }),
+                        )
                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                             if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
                                 this.map_action(MapAction::SampleCell(x, y));
@@ -4678,7 +4705,8 @@ impl SimulationView {
             return self.render_map_inspection(&sandbox, inspection, cx);
         }
         if sandbox.sample_editor_open
-            && let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config
+            && let DraftGeneratorConfig::SampleBased { sample } =
+                &sandbox.draft.state.generator_config
         {
             return self.render_map_sample_editor(&sandbox, sample, cx);
         }
@@ -22836,9 +22864,18 @@ mod command_characterization_tests {
         let before = host.port.scientific_digest_v1().unwrap();
         let mut source = MapSandbox::new(4, 3, 50);
         let kinds = [
-            TerrainKind::Grass, TerrainKind::Sand, TerrainKind::DeepWater, TerrainKind::Grass,
-            TerrainKind::Sand, TerrainKind::Grass, TerrainKind::Sand, TerrainKind::DeepWater,
-            TerrainKind::DeepWater, TerrainKind::Sand, TerrainKind::Grass, TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Sand,
+            TerrainKind::DeepWater,
+            TerrainKind::Grass,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Sand,
+            TerrainKind::DeepWater,
+            TerrainKind::DeepWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Sand,
         ];
         for (index, kind) in kinds.into_iter().enumerate() {
             source.brush = kind;
@@ -22849,7 +22886,10 @@ mod command_characterization_tests {
         let path = directory.join("sample-source.postcard");
         write_map_test_file(&path, &postcard::to_allocvec(&artifact).unwrap());
         let inspection = Arc::new(inspect_map_artifact_file(&path).unwrap());
-        assert_eq!(inspection.scientific_hash, artifact.scientific_content_hash());
+        assert_eq!(
+            inspection.scientific_hash,
+            artifact.scientific_content_hash()
+        );
         let mut sandbox = MapSandbox::new(8, 8, 50);
         sandbox.draft.set_seed(11);
         sandbox.paint_channel = MapPaintChannel::Elevation;
@@ -22868,19 +22908,41 @@ mod command_characterization_tests {
         let DraftGeneratorConfig::SampleBased { sample } = &extracted.generator_config else {
             panic!("extraction must select the actual sample generator");
         };
-        assert_eq!((sample.sample_width, sample.sample_height, sample.pattern_size), (3, 3, 2));
-        assert_eq!(sample.sample_tiles, vec![
-            TerrainKind::Sand, TerrainKind::DeepWater, TerrainKind::Sand,
-            TerrainKind::Grass, TerrainKind::Grass, TerrainKind::Sand,
-            TerrainKind::DeepWater, TerrainKind::Sand, TerrainKind::Grass,
-        ]);
-        assert_eq!(sample.sample_id, format!("artifact-{:016x}-3-2-3x3-v1", inspection.scientific_hash));
+        assert_eq!(
+            (
+                sample.sample_width,
+                sample.sample_height,
+                sample.pattern_size
+            ),
+            (3, 3, 2)
+        );
+        assert_eq!(
+            sample.sample_tiles,
+            vec![
+                TerrainKind::Sand,
+                TerrainKind::DeepWater,
+                TerrainKind::Sand,
+                TerrainKind::Grass,
+                TerrainKind::Grass,
+                TerrainKind::Sand,
+                TerrainKind::DeepWater,
+                TerrainKind::Sand,
+                TerrainKind::Grass,
+            ]
+        );
+        assert_eq!(
+            sample.sample_id,
+            format!("artifact-{:016x}-3-2-3x3-v1", inspection.scientific_hash)
+        );
         assert!(sample.all_orientations && sample.periodic);
         let mut expected = prior.clone();
         expected.generator_config = extracted.generator_config.clone();
         assert_eq!(extracted, expected, "only generator config may change");
         assert!(!sandbox.can_apply());
-        assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &preview));
+        assert!(Arc::ptr_eq(
+            &sandbox.preview.as_ref().unwrap().artifact,
+            &preview
+        ));
         sandbox.edit(MapAction::Undo);
         assert_eq!(sandbox.draft.state, prior);
         assert!(!sandbox.sample_editor_open);
@@ -22916,15 +22978,36 @@ mod command_characterization_tests {
         assert!(!sandbox.sample_editor_open);
         let generated = sandbox.draft.generate_artifact().unwrap();
         generated.validate().unwrap();
-        assert!(generated.terrain().tiles().iter().all(|tile| tile.kind == TerrainKind::Sand));
+        assert!(
+            generated
+                .terrain()
+                .tiles()
+                .iter()
+                .all(|tile| tile.kind == TerrainKind::Sand)
+        );
         assert_eq!(generated.terrain().tile(7, 7).unwrap().elevation, 0.2);
-        assert_eq!(generated.metadata().tileset_hash, compute_sample_hash(sample));
+        assert_eq!(
+            generated.metadata().tileset_hash,
+            compute_sample_hash(sample)
+        );
         assert_eq!(generated.metadata().seed, 11);
         let mut imported = MapSandbox::new(1, 1, 1);
-        imported.import_draft(&sandbox.export_draft().unwrap()).unwrap();
+        imported
+            .import_draft(&sandbox.export_draft().unwrap())
+            .unwrap();
         assert_eq!(imported.draft.state, edited);
-        assert_eq!(imported.draft.generate_artifact().unwrap().scientific_content_hash(), generated.scientific_content_hash());
-        assert_eq!(inspection.artifact, artifact, "sampling must not mutate the saved map");
+        assert_eq!(
+            imported
+                .draft
+                .generate_artifact()
+                .unwrap()
+                .scientific_content_hash(),
+            generated.scientific_content_hash()
+        );
+        assert_eq!(
+            inspection.artifact, artifact,
+            "sampling must not mutate the saved map"
+        );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, 0);
     }
@@ -22938,13 +23021,21 @@ mod command_characterization_tests {
         wait_map_job(&mut sandbox);
         let original = sandbox.draft.clone();
         let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
-        for action in [MapAction::ExtractSample, MapAction::SampleCell(0, 0), MapAction::SamplePattern, MapAction::SampleOrientations] {
+        for action in [
+            MapAction::ExtractSample,
+            MapAction::SampleCell(0, 0),
+            MapAction::SamplePattern,
+            MapAction::SampleOrientations,
+        ] {
             sandbox.edit(action);
             assert!(sandbox.notice.starts_with("Draft edit refused:"));
             assert_eq!(sandbox.draft, original);
             assert!(sandbox.can_apply());
         }
-        assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &preview));
+        assert!(Arc::ptr_eq(
+            &sandbox.preview.as_ref().unwrap().artifact,
+            &preview
+        ));
         let path = map_file_test_directory().join("one-cell.json");
         write_map_test_file(&path, &serde_json::to_vec(&*preview).unwrap());
         let inspection = Arc::new(inspect_map_artifact_file(&path).unwrap());
@@ -22953,19 +23044,35 @@ mod command_characterization_tests {
         sandbox.edit(MapAction::ExtractSample);
         assert!(sandbox.notice.starts_with("Draft edit refused:"));
         assert_eq!(sandbox.draft, original);
-        assert!(Arc::ptr_eq(sandbox.inspection.as_ref().unwrap(), &inspection));
+        assert!(Arc::ptr_eq(
+            sandbox.inspection.as_ref().unwrap(),
+            &inspection
+        ));
         sandbox.inspection_cell = (0, 0);
-        let request = sandbox.begin_file_dialog(MapFileKind::InspectArtifact).unwrap();
+        let request = sandbox
+            .begin_file_dialog(MapFileKind::InspectArtifact)
+            .unwrap();
         sandbox.edit(MapAction::ExtractSample);
         assert!(sandbox.notice.contains("pending file"));
         assert_eq!(sandbox.draft, original);
         sandbox.finish_file_dialog(request, Ok(None));
         sandbox.edit(MapAction::ExtractSample);
-        let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config else {
+        let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config
+        else {
             panic!("one-cell sampling must succeed");
         };
-        assert_eq!((sample.sample_width, sample.sample_height, sample.pattern_size), (1, 1, 1));
-        assert_eq!(sample.sample_tiles, vec![preview.terrain().tile(0, 0).unwrap().kind]);
+        assert_eq!(
+            (
+                sample.sample_width,
+                sample.sample_height,
+                sample.pattern_size
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            sample.sample_tiles,
+            vec![preview.terrain().tile(0, 0).unwrap().kind]
+        );
         sandbox.generate(host.snapshot().revisions.scientific);
         wait_map_job(&mut sandbox);
         let draft = sandbox.draft.clone();
@@ -22983,7 +23090,10 @@ mod command_characterization_tests {
             assert_eq!(sandbox.draft, draft);
             assert!(sandbox.can_apply());
         }
-        assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &current_preview));
+        assert!(Arc::ptr_eq(
+            &sandbox.preview.as_ref().unwrap().artifact,
+            &current_preview
+        ));
         sandbox.edit(MapAction::SampleOrientations);
         sandbox.edit(MapAction::Undo);
         let redo = sandbox.draft.clone();
@@ -23002,15 +23112,17 @@ mod command_characterization_tests {
         let before = host.port.scientific_digest_v1().unwrap();
         let mut sandbox = MapSandbox::new(8, 8, 50);
         let count = scriptbots_core::MAX_SAMPLE_CELLS;
-        sandbox.replace_sample(SamplePatternSpec {
-            sample_id: "maximum-thin-sample-v1".to_owned(),
-            sample_width: u32::try_from(count).unwrap(),
-            sample_height: 1,
-            pattern_size: 1,
-            sample_tiles: vec![TerrainKind::Sand; count],
-            all_orientations: true,
-            periodic: true,
-        }).unwrap();
+        sandbox
+            .replace_sample(SamplePatternSpec {
+                sample_id: "maximum-thin-sample-v1".to_owned(),
+                sample_width: u32::try_from(count).unwrap(),
+                sample_height: 1,
+                pattern_size: 1,
+                sample_tiles: vec![TerrainKind::Sand; count],
+                all_orientations: true,
+                periodic: true,
+            })
+            .unwrap();
         sandbox.generate(host.snapshot().revisions.scientific);
         wait_map_job(&mut sandbox);
         let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
@@ -23018,17 +23130,32 @@ mod command_characterization_tests {
         sandbox.brush = TerrainKind::DeepWater;
         sandbox.edit(MapAction::SampleCell(0, 0));
         wait_map_job(&mut sandbox);
-        assert!(sandbox.notice.contains("Discarded cancelled or edited draft result"));
+        assert!(
+            sandbox
+                .notice
+                .contains("Discarded cancelled or edited draft result")
+        );
         assert!(!sandbox.can_apply());
-        assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &preview));
-        sandbox.draft.set_dimensions(
-            u32::try_from(scriptbots_core::MAX_SAMPLE_OUTPUT_CELLS).unwrap(), 1, 50,
-        ).unwrap();
+        assert!(Arc::ptr_eq(
+            &sandbox.preview.as_ref().unwrap().artifact,
+            &preview
+        ));
+        sandbox
+            .draft
+            .set_dimensions(
+                u32::try_from(scriptbots_core::MAX_SAMPLE_OUTPUT_CELLS).unwrap(),
+                1,
+                50,
+            )
+            .unwrap();
         let draft = sandbox.draft.clone();
         sandbox.edit(MapAction::SampleOrientations);
         assert!(sandbox.notice.contains("cell pairs"));
         assert_eq!(sandbox.draft, draft);
-        assert!(Arc::ptr_eq(&sandbox.preview.as_ref().unwrap().artifact, &preview));
+        assert!(Arc::ptr_eq(
+            &sandbox.preview.as_ref().unwrap().artifact,
+            &preview
+        ));
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, 0);
     }
@@ -23772,7 +23899,10 @@ mod command_characterization_tests {
         for _ in 0..3 {
             click(&mut lab, "map-undo");
         }
-        assert_eq!(session.map_sandbox.lock().unwrap().draft.state, inspected_draft.state);
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            inspected_draft.state
+        );
         for _ in 0..3 {
             click(&mut lab, "map-redo");
         }
@@ -23794,7 +23924,14 @@ mod command_characterization_tests {
         let DraftGeneratorConfig::SampleBased { sample } = &extracted.generator_config else {
             panic!("artifact sampling must select overlapping generation");
         };
-        assert_eq!((sample.sample_width, sample.sample_height, sample.pattern_size), (2, 2, 2));
+        assert_eq!(
+            (
+                sample.sample_width,
+                sample.sample_height,
+                sample.pattern_size
+            ),
+            (2, 2, 2)
+        );
         assert!(sample.sample_id.starts_with("artifact-"));
         assert_eq!(sample.sample_tiles[3], TerrainKind::DeepWater);
         assert_eq!(extracted.constraints, inspected_draft.state.constraints);
@@ -23817,7 +23954,16 @@ mod command_characterization_tests {
         }
         let apply_revision = host.snapshot().revisions.scientific;
         assert_eq!(
-            session.map_sandbox.lock().unwrap().preview.as_ref().unwrap().artifact.metadata().tileset_hash,
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .preview
+                .as_ref()
+                .unwrap()
+                .artifact
+                .metadata()
+                .tileset_hash,
             compute_sample_hash(sample)
         );
         assert_eq!(
