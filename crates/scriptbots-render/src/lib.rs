@@ -3138,6 +3138,85 @@ fn write_new_map_draft_file(
     Ok(json.len())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapPaintChannel {
+    Terrain,
+    Elevation,
+    Moisture,
+    Fertility,
+    Temperature,
+    Permeability,
+    Runoff,
+    BasinRank,
+    ChannelPriority,
+    SwimCost,
+}
+
+impl MapPaintChannel {
+    const fn next(self) -> Self {
+        match self {
+            Self::Terrain => Self::Elevation,
+            Self::Elevation => Self::Moisture,
+            Self::Moisture => Self::Fertility,
+            Self::Fertility => Self::Temperature,
+            Self::Temperature => Self::Permeability,
+            Self::Permeability => Self::Runoff,
+            Self::Runoff => Self::BasinRank,
+            Self::BasinRank => Self::ChannelPriority,
+            Self::ChannelPriority => Self::SwimCost,
+            Self::SwimCost => Self::Terrain,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Terrain => "Terrain",
+            Self::Elevation => "Elevation",
+            Self::Moisture => "Moisture",
+            Self::Fertility => "Fertility",
+            Self::Temperature => "Temperature",
+            Self::Permeability => "Permeability",
+            Self::Runoff => "Runoff bias",
+            Self::BasinRank => "Basin rank",
+            Self::ChannelPriority => "Channel priority",
+            Self::SwimCost => "Swim cost",
+        }
+    }
+
+    // Integer tenths keep the controls finite and avoid accumulated float drift.
+    // These UI ranges fit the core's clamp domains; JSON can still author larger swim costs.
+    const fn range(self) -> (i16, i16) {
+        match self {
+            Self::Runoff => (-10, 10),
+            Self::SwimCost => (0, 100),
+            _ => (0, 10),
+        }
+    }
+
+    fn preview_value(self, artifact: &MapArtifact, x: u32, y: u32) -> Option<String> {
+        let tile = artifact.terrain().tile(x, y)?;
+        if self == Self::Terrain {
+            return Some(format!("{:?}", tile.kind));
+        }
+        let hydro = artifact
+            .hydrology_tiles()
+            .and_then(|layer| layer.tiles().get((y * artifact.terrain().width() + x) as usize));
+        let value = match self {
+            Self::Terrain => return None,
+            Self::Elevation => tile.elevation,
+            Self::Moisture => tile.moisture,
+            Self::Fertility => tile.fertility_bias,
+            Self::Temperature => tile.temperature_bias,
+            Self::Permeability => hydro?.permeability,
+            Self::Runoff => hydro?.runoff_bias,
+            Self::BasinRank => hydro?.basin_rank,
+            Self::ChannelPriority => hydro?.channel_priority,
+            Self::SwimCost => hydro?.swim_cost,
+        };
+        Some(format!("{value:.1}"))
+    }
+}
+
 /// Presentation-only draft with one generator and one file operation at a time.
 /// Only the guarded app callback submits artifacts to the scientific owner.
 struct MapSandbox {
@@ -3150,6 +3229,9 @@ struct MapSandbox {
     inspection_cell: (u32, u32),
     policy: ExistingAgentPolicy,
     brush: TerrainKind,
+    paint_channel: MapPaintChannel,
+    paint_tenths: i16,
+    painted_cell: Option<(u32, u32)>,
     notice: String,
 }
 
@@ -3174,6 +3256,9 @@ impl MapSandbox {
             inspection_cell: (0, 0),
             policy: ExistingAgentPolicy::Retain,
             brush: TerrainKind::Grass,
+            paint_channel: MapPaintChannel::Terrain,
+            paint_tenths: 5,
+            painted_cell: None,
             notice: "Draft only. Pause the world before generating a map to apply.".to_owned(),
         }
     }
@@ -3472,21 +3557,54 @@ impl MapSandbox {
                 self.draft.clear_constraints();
                 Ok(())
             }
-            MapAction::Paint(x, y) => self.draft.paint_constraint(PaintedConstraint {
-                x,
-                y,
-                terrain_kind: Some(self.brush),
-                elevation: None,
-                moisture: None,
-                fertility_bias: None,
-                temperature_bias: None,
-                permeability: None,
-                runoff_bias: None,
-                basin_rank: None,
-                channel_priority: None,
-                swim_cost: None,
-                hazard: None,
-            }),
+            MapAction::Paint(x, y) => {
+                let mut constraint = self.draft.state.constraints.get(x, y).cloned().unwrap_or(
+                    PaintedConstraint {
+                        x,
+                        y,
+                        terrain_kind: None,
+                        elevation: None,
+                        moisture: None,
+                        fertility_bias: None,
+                        temperature_bias: None,
+                        permeability: None,
+                        runoff_bias: None,
+                        basin_rank: None,
+                        channel_priority: None,
+                        swim_cost: None,
+                        hazard: None,
+                    },
+                );
+                let value = Some(f32::from(self.paint_tenths) / 10.0);
+                match self.paint_channel {
+                    MapPaintChannel::Terrain => constraint.terrain_kind = Some(self.brush),
+                    MapPaintChannel::Elevation => constraint.elevation = value,
+                    MapPaintChannel::Moisture => constraint.moisture = value,
+                    MapPaintChannel::Fertility => constraint.fertility_bias = value,
+                    MapPaintChannel::Temperature => constraint.temperature_bias = value,
+                    MapPaintChannel::Permeability => constraint.permeability = value,
+                    MapPaintChannel::Runoff => constraint.runoff_bias = value,
+                    MapPaintChannel::BasinRank => constraint.basin_rank = value,
+                    MapPaintChannel::ChannelPriority => constraint.channel_priority = value,
+                    MapPaintChannel::SwimCost => constraint.swim_cost = value,
+                }
+                let result = self.draft.paint_constraint(constraint);
+                if result.is_ok() {
+                    self.painted_cell = Some((x, y));
+                }
+                result
+            }
+            MapAction::PaintChannel => {
+                self.paint_channel = self.paint_channel.next();
+                let (minimum, maximum) = self.paint_channel.range();
+                self.paint_tenths = self.paint_tenths.clamp(minimum, maximum);
+                return;
+            }
+            MapAction::PaintValue(delta) => {
+                let (minimum, maximum) = self.paint_channel.range();
+                self.paint_tenths = self.paint_tenths.saturating_add(delta).clamp(minimum, maximum);
+                return;
+            }
             MapAction::Brush => {
                 self.brush = match self.brush {
                     TerrainKind::Grass => TerrainKind::DeepWater,
@@ -3580,6 +3698,8 @@ enum MapAction {
     NextSize,
     LiveGrid,
     Brush,
+    PaintChannel,
+    PaintValue(i16),
     Paint(u32, u32),
     Undo,
     Redo,
@@ -4455,6 +4575,41 @@ impl SimulationView {
                         cx,
                     )),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.render_map_button(
+                        "map-paint-channel",
+                        format!("Paint: {}", sandbox.paint_channel.label()),
+                        MapAction::PaintChannel,
+                        true,
+                        cx,
+                    ))
+                    .child(self.render_map_button(
+                        "map-paint-decrease",
+                        "Value −0.1".to_owned(),
+                        MapAction::PaintValue(-1),
+                        sandbox.paint_channel != MapPaintChannel::Terrain
+                            && sandbox.paint_tenths > sandbox.paint_channel.range().0,
+                        cx,
+                    ))
+                    .child(self.render_map_button(
+                        "map-paint-increase",
+                        "Value +0.1".to_owned(),
+                        MapAction::PaintValue(1),
+                        sandbox.paint_channel != MapPaintChannel::Terrain
+                            && sandbox.paint_tenths < sandbox.paint_channel.range().1,
+                        cx,
+                    )),
+            )
+            .child(div().text_xs().child(format!(
+                "Numeric brush {:.1} [{:.1}, {:.1}]. Paint, then regenerate. Other painted fields are preserved; Terrain uses the terrain brush.",
+                f32::from(sandbox.paint_tenths) / 10.0,
+                f32::from(sandbox.paint_channel.range().0) / 10.0,
+                f32::from(sandbox.paint_channel.range().1) / 10.0,
+            )))
             .child(div().text_xs().child(sandbox.notice.clone()));
         if let Some(preview) = &sandbox.preview {
             let artifact = &preview.artifact;
@@ -4532,6 +4687,17 @@ impl SimulationView {
                 .child(div().text_xs().child(format!(
                     "Showing {columns} × {rows} sampled cells of {width} × {height}; painting affects the named cell only. Use live grid before applying a different preview size."
                 )));
+            if let Some((x, y)) = sandbox.painted_cell {
+                let value = sandbox
+                    .paint_channel
+                    .preview_value(artifact, x, y)
+                    .unwrap_or_else(|| "not stored".to_owned());
+                panel = panel.child(div().text_xs().child(format!(
+                    "Stored preview {} at ({x}, {y}): {value} · revision {} (regenerate after edits).",
+                    sandbox.paint_channel.label(),
+                    preview.draft_revision,
+                )));
+            }
         }
         let policy = match sandbox.policy {
             ExistingAgentPolicy::Retain => "retain existing agents",
@@ -22260,6 +22426,161 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn map_sandbox_scalar_brushes_preserve_channels_history_and_generated_fields() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        for sample_based in [false, true] {
+            let mut sandbox = MapSandbox::new(8, 8, 50);
+            if sample_based {
+                sandbox.edit(MapAction::Generator);
+            }
+            let original = sandbox.draft.generate_artifact().unwrap();
+            sandbox.brush = TerrainKind::Sand;
+            sandbox.edit(MapAction::Paint(0, 0));
+            let mut constraint = sandbox.draft.state.constraints.get(0, 0).unwrap().clone();
+            constraint.hazard = Some(false);
+            sandbox.draft.paint_constraint(constraint).unwrap();
+            for (channel, tenths) in [
+                (MapPaintChannel::Elevation, 2),
+                (MapPaintChannel::Moisture, 3),
+                (MapPaintChannel::Fertility, 4),
+                (MapPaintChannel::Temperature, 5),
+                (MapPaintChannel::Permeability, 6),
+                (MapPaintChannel::Runoff, -7),
+                (MapPaintChannel::BasinRank, 8),
+                (MapPaintChannel::ChannelPriority, 9),
+                (MapPaintChannel::SwimCost, 12),
+            ] {
+                sandbox.paint_channel = channel;
+                sandbox.paint_tenths = tenths;
+                let prior = sandbox.draft.state.clone();
+                sandbox.edit(MapAction::Paint(0, 0));
+                let painted = sandbox.draft.state.clone();
+                assert_ne!(painted, prior, "{channel:?} must edit its own channel");
+                sandbox.edit(MapAction::Undo);
+                assert_eq!(sandbox.draft.state, prior);
+                sandbox.edit(MapAction::Redo);
+                assert_eq!(sandbox.draft.state, painted);
+                assert_eq!(
+                    sandbox.draft.state.constraints.get(0, 0).unwrap().terrain_kind,
+                    Some(TerrainKind::Sand),
+                );
+            }
+            // Painting terrain again must preserve every numeric override, including
+            // channels imported through the recipe instead of selected in the UI.
+            let prior = sandbox.draft.state.constraints.get(0, 0).unwrap().clone();
+            sandbox.paint_channel = MapPaintChannel::Terrain;
+            sandbox.brush = TerrainKind::Grass;
+            sandbox.edit(MapAction::Paint(0, 0));
+            let mut expected = prior;
+            expected.terrain_kind = Some(TerrainKind::Grass);
+            assert_eq!(sandbox.draft.state.constraints.get(0, 0), Some(&expected));
+            let artifact = sandbox.draft.generate_artifact().unwrap();
+            artifact.validate().unwrap();
+            let tile = artifact.terrain().tile(0, 0).unwrap();
+            assert_eq!(tile.kind, TerrainKind::Grass);
+            assert_eq!(tile.elevation, 0.2);
+            assert_eq!(tile.moisture, 0.3);
+            assert_eq!(tile.fertility_bias, 0.4);
+            assert_eq!(tile.temperature_bias, 0.5);
+            assert_eq!(artifact.fertility().unwrap().values()[0], 0.4);
+            assert_eq!(artifact.temperature().unwrap().values()[0], 0.5);
+            let hydro = &artifact.hydrology_tiles().unwrap().tiles()[0];
+            assert_eq!(hydro.permeability, 0.6);
+            assert_eq!(hydro.runoff_bias, -0.7);
+            assert_eq!(hydro.basin_rank, 0.8);
+            assert_eq!(hydro.channel_priority, 0.9);
+            assert_eq!(hydro.swim_cost, 1.2);
+            assert_eq!(artifact.terrain().tiles()[1..], original.terrain().tiles()[1..]);
+            assert_ne!(artifact.scientific_hash(), original.scientific_hash());
+            let mut imported = MapSandbox::new(1, 1, 1);
+            imported
+                .import_draft(&sandbox.export_draft().unwrap())
+                .unwrap();
+            assert_eq!(imported.draft.state, sandbox.draft.state);
+            assert_eq!(
+                imported.draft.generate_artifact().unwrap().scientific_hash(),
+                artifact.scientific_hash(),
+            );
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_scalar_controls_bound_values_and_refuse_invalid_cells_atomically() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let draft = sandbox.draft.clone();
+        let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        let mut observed = std::collections::HashSet::new();
+        loop {
+            assert!(observed.insert(sandbox.paint_channel.label()));
+            let (minimum, maximum) = sandbox.paint_channel.range();
+            sandbox.edit(MapAction::PaintValue(i16::MIN));
+            assert_eq!(sandbox.paint_tenths, minimum);
+            sandbox.edit(MapAction::PaintValue(-1));
+            assert_eq!(sandbox.paint_tenths, minimum);
+            sandbox.edit(MapAction::PaintValue(i16::MAX));
+            assert_eq!(sandbox.paint_tenths, maximum);
+            sandbox.edit(MapAction::PaintValue(1));
+            assert_eq!(sandbox.paint_tenths, maximum);
+            assert_eq!(sandbox.draft, draft, "choosing a brush must not edit history");
+            sandbox.edit(MapAction::Paint(8, 0));
+            assert!(sandbox.notice.starts_with("Draft edit refused:"));
+            assert_eq!(sandbox.draft, draft);
+            assert_eq!(sandbox.painted_cell, None);
+            assert!(sandbox.can_apply());
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview,
+            ));
+            sandbox.edit(MapAction::PaintChannel);
+            let (minimum, maximum) = sandbox.paint_channel.range();
+            assert!((minimum..=maximum).contains(&sandbox.paint_tenths));
+            if sandbox.paint_channel == MapPaintChannel::Terrain {
+                break;
+            }
+        }
+        let expected: std::collections::HashSet<_> = [
+            MapPaintChannel::Terrain,
+            MapPaintChannel::Elevation,
+            MapPaintChannel::Moisture,
+            MapPaintChannel::Fertility,
+            MapPaintChannel::Temperature,
+            MapPaintChannel::Permeability,
+            MapPaintChannel::Runoff,
+            MapPaintChannel::BasinRank,
+            MapPaintChannel::ChannelPriority,
+            MapPaintChannel::SwimCost,
+        ]
+        .into_iter()
+        .map(MapPaintChannel::label)
+        .collect();
+        assert_eq!(observed, expected, "every paint channel must be reachable");
+        // Endpoints are real field values, not merely button-label bounds.
+        sandbox.paint_channel = MapPaintChannel::Runoff;
+        sandbox.edit(MapAction::PaintValue(i16::MIN));
+        sandbox.edit(MapAction::Paint(0, 0));
+        sandbox.edit(MapAction::PaintValue(i16::MAX));
+        sandbox.edit(MapAction::Paint(1, 0));
+        let artifact = sandbox.draft.generate_artifact().unwrap();
+        let hydro = artifact.hydrology_tiles().unwrap().tiles();
+        assert_eq!(hydro[0].runoff_bias, -1.0);
+        assert_eq!(hydro[1].runoff_bias, 1.0);
+        sandbox.paint_channel = MapPaintChannel::SwimCost;
+        sandbox.edit(MapAction::PaintValue(i16::MAX));
+        sandbox.edit(MapAction::Paint(2, 0));
+        let artifact = sandbox.draft.generate_artifact().unwrap();
+        assert_eq!(artifact.hydrology_tiles().unwrap().tiles()[2].swim_cost, 10.0);
+        assert!(!sandbox.can_apply());
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
     fn map_sandbox_discards_cancelled_and_edited_jobs_and_bounds_work() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
@@ -22508,6 +22829,35 @@ mod command_characterization_tests {
         );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, 0);
+        for _ in 0..3 {
+            click(&mut lab, "map-paint-channel");
+        }
+        click(&mut lab, "map-paint-increase");
+        click(&mut lab, "map-paint-increase");
+        click(&mut lab, "map-cell-0-0");
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            assert_eq!(sandbox.paint_channel, MapPaintChannel::Fertility);
+            let constraint = sandbox.draft.state.constraints.get(0, 0).unwrap();
+            assert_eq!(constraint.fertility_bias, Some(0.7));
+            assert_eq!(constraint.terrain_kind, Some(TerrainKind::DeepWater));
+        }
+        click(&mut lab, "map-undo");
+        assert_eq!(
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .draft
+                .state
+                .constraints
+                .get(0, 0)
+                .unwrap()
+                .fertility_bias,
+            None,
+        );
+        click(&mut lab, "map-redo");
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         click(&mut lab, "map-copy-draft");
         let exported = context.update(|app| app.read_from_clipboard().unwrap().text().unwrap());
         let document: MapDraftDocument = serde_json::from_str(&exported).unwrap();
@@ -22703,6 +23053,7 @@ mod command_characterization_tests {
             host.snapshot().layers.terrain.tiles[0].kind,
             TerrainKind::DeepWater
         );
+        assert_eq!(host.snapshot().layers.terrain.tiles[0].fertility_bias, 0.7);
         assert_ne!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, 0);
         context.quit();
