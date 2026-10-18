@@ -3226,8 +3226,7 @@ impl MapPaintChannel {
             Self::Hazard => {
                 return Some(format!(
                     "accent {:.1} · swim cost {:.1}",
-                    tile.accent,
-                    hydro?.swim_cost,
+                    tile.accent, hydro?.swim_cost,
                 ));
             }
         };
@@ -3665,27 +3664,27 @@ impl MapSandbox {
                 height: self.draft.state.height,
             });
         }
-        let mut constraint = self
-            .draft
-            .state
-            .constraints
-            .get(x, y)
-            .cloned()
-            .unwrap_or(PaintedConstraint {
-                x,
-                y,
-                terrain_kind: None,
-                elevation: None,
-                moisture: None,
-                fertility_bias: None,
-                temperature_bias: None,
-                permeability: None,
-                runoff_bias: None,
-                basin_rank: None,
-                channel_priority: None,
-                swim_cost: None,
-                hazard: None,
-            });
+        let mut constraint =
+            self.draft
+                .state
+                .constraints
+                .get(x, y)
+                .cloned()
+                .unwrap_or(PaintedConstraint {
+                    x,
+                    y,
+                    terrain_kind: None,
+                    elevation: None,
+                    moisture: None,
+                    fertility_bias: None,
+                    temperature_bias: None,
+                    permeability: None,
+                    runoff_bias: None,
+                    basin_rank: None,
+                    channel_priority: None,
+                    swim_cost: None,
+                    hazard: None,
+                });
         let value = Some(f32::from(self.paint_tenths) / 10.0);
         match self.paint_channel {
             MapPaintChannel::Terrain => constraint.terrain_kind = Some(self.brush),
@@ -4480,27 +4479,24 @@ impl SimulationView {
         if sandbox.paint_channel != MapPaintChannel::Erase {
             let hazard = sandbox.paint_channel == MapPaintChannel::Hazard;
             paint_controls = paint_controls
-                .child(self.render_map_button(
-                    "map-paint-decrease",
-                    if hazard {
-                        "Generated default"
-                    } else {
-                        "Value −0.1"
-                    }
-                    .to_owned(),
-                    MapAction::PaintValue(-1),
-                    sandbox.paint_channel != MapPaintChannel::Terrain
-                        && sandbox.paint_tenths > sandbox.paint_channel.range().0,
-                    cx,
-                ))
+                .child(
+                    self.render_map_button(
+                        "map-paint-decrease",
+                        if hazard {
+                            "Generated default"
+                        } else {
+                            "Value −0.1"
+                        }
+                        .to_owned(),
+                        MapAction::PaintValue(-1),
+                        sandbox.paint_channel != MapPaintChannel::Terrain
+                            && sandbox.paint_tenths > sandbox.paint_channel.range().0,
+                        cx,
+                    ),
+                )
                 .child(self.render_map_button(
                     "map-paint-increase",
-                    if hazard {
-                        "Stamp hazard"
-                    } else {
-                        "Value +0.1"
-                    }
-                    .to_owned(),
+                    if hazard { "Stamp hazard" } else { "Value +0.1" }.to_owned(),
                     MapAction::PaintValue(1),
                     sandbox.paint_channel != MapPaintChannel::Terrain
                         && sandbox.paint_tenths < sandbox.paint_channel.range().1,
@@ -22638,13 +22634,18 @@ mod command_characterization_tests {
             let mut expected_hydro = painted.hydrology_tiles().unwrap().tiles()[0];
             expected_hydro.swim_cost = 10.0;
             assert_eq!(hazard.hydrology_tiles().unwrap().tiles()[0], expected_hydro);
-            assert_eq!(hazard.terrain().tiles()[1..], painted.terrain().tiles()[1..]);
+            assert_eq!(
+                hazard.terrain().tiles()[1..],
+                painted.terrain().tiles()[1..]
+            );
             assert_ne!(
                 hazard.scientific_content_hash(),
                 painted.scientific_content_hash()
             );
             assert_eq!(
-                MapPaintChannel::Hazard.preview_value(&hazard, 0, 0).unwrap(),
+                MapPaintChannel::Hazard
+                    .preview_value(&hazard, 0, 0)
+                    .unwrap(),
                 "accent 1.0 · swim cost 10.0",
             );
             sandbox.edit(MapAction::Undo);
