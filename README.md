@@ -647,12 +647,19 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   Hazards supplied by the generator may remain. **Erase cell overrides** removes all paint
   at the clicked cell while preserving other cells; regenerate for the generator's values.
   Erasure is undoable, and erasing an unpainted cell preserves history and the preview.
-  Custom rules/exemplars, resource controls and native OS acceptance remain open.
+  Custom rule controls, resource controls and native OS acceptance remain open.
   Generation runs in one bounded background slot. Cancellation discards the result;
   that slot remains occupied until the underlying generator finishes.
   **Switch rules / sample** selects the default rule tileset or the versioned
   `lab_meadow_v1` overlapping sample (3×3 exemplar, 2×2 patterns, periodic extraction,
   all rotations/reflections). Undo restores the previous configuration.
+  In sample mode, **Edit sample** opens a separate exemplar view. Use the existing
+  grass/water/sand brush to paint its cells, cycle the pattern size from 1 to the smaller
+  exemplar dimension, or toggle rotations/reflections. Edits retain the sample label,
+  update its computed content hash, and share the draft's undo/redo history. Painting an
+  unchanged cell preserves history and the current preview. **Back to draft** returns to
+  generation and guarded Apply; editing alone never changes the live world. Imported
+  recipes can supply other terrain kinds and exemplar dimensions within the core bounds.
   **Copy draft JSON** and **Paste draft JSON** transfer a versioned editing recipe through
   the clipboard. Save the copied text to retain it, or edit its seed, dimensions,
   `generator_config` and `constraints` records to author custom rules, exemplars and
@@ -676,8 +683,17 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   the background; the view displays at most 32 × 32 sampled cells. Inspection accepts
   files up to 64 MiB and maps up to the editor's 65,536-cell limit. Draft/history, generated
   preview and live world stay unchanged; **Back to unchanged draft** returns to the editor.
-  Inspection does not import a recipe or apply the saved map. Additional resource/hazard/exemplar
-  controls, accessible palettes and actual native OS-input acceptance remain open.
+  Viewing does not change the draft or apply the saved map. **Use selected … sample**
+  explicitly copies a terrain-kind patch starting at the selected cell, wrapping across
+  opposite edges. The patch is at most 3×3 cells, shrinking to the source dimensions for
+  smaller maps. The new sample label records the source content hash, origin and patch
+  dimensions; its pattern starts at 2, or 1 for a one-cell-wide/tall patch, with periodic
+  extraction and rotations/reflections enabled. This is one undoable generator-config edit
+  that opens the exemplar view. Output dimensions, seed and painted output constraints
+  are retained. Fertility, temperature and hydrology are not copied into the exemplar;
+  they come from generation defaults and output constraints. Generate a fresh preview
+  before applying. Resource/rule controls, additional sample sizing controls, accessible
+  palettes and actual native OS-input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.
 - A sample specifies `sample_id`, `sample_width`, `sample_height`, `pattern_size`, and row-major `sample_tiles` terrain kinds. `all_orientations` and `periodic` default to true; `periodic: false` is refused because non-periodic extraction is not implemented. Core bounds (`MAX_SAMPLE_CELLS`, `MAX_SAMPLE_OUTPUT_CELLS`, `MAX_SAMPLE_CELL_PAIRS`) admit at most 64 exemplar cells, 65,536 output cells, and 1,048,576 output/exemplar cell pairs before model construction. These are input-work bounds, not wall-clock or exact-byte guarantees. For example, a 2×2 all-sand sample is:

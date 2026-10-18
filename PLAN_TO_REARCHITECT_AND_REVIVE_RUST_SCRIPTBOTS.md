@@ -2410,6 +2410,27 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native custom sample authoring, 2026-10-18 (`bd-2z0.10.7`):**
+connect bounded toroidal exemplar extraction from a saved map to the real overlapping
+generator, and expose sample-cell, pattern-size and orientation editing in a dedicated
+view. Preserve validation, original draft constraints/history, recipes and guarded Apply;
+viewing remains read-only until an explicit extraction action. Keep original native OS
+and full editor acceptance open and retain all existing checks/input assertions.
+
+Source `4c59aa47e36e0aca5720437afa1a1c993b9de7f8` is published to both required remote
+refs. R217 passes nineteen source command/log pairs and typed `pass/0`; fresh retained
+reader/planted-negative re-execution verifies 78 required completions. Raw totals are
+405 passing executions / 240 distinct passing test names / zero failures / six executions
+of three unchanged ignored diagnostics. Both full renderer modes observe bounded wrapped
+artifact extraction, cell/pattern/orientation edits, real generated terrain/metadata hashes,
+recipe/history/no-op/refusal/work-bound behavior and production headless input through
+guarded Apply. All 128 manifest files / 370,238,585 bytes, hashes and source/profile
+identities recompute. Containing DSR exits 6 on the actual tracked Proptest README symlink
+before collection; guard unchanged, no collected release artifact. Resource/rule controls,
+additional sample sizing, accessible palettes, native OS and full editor acceptance remain
+open. Failed attempts and the solo honesty audit remain in `REALITY_CHECK_2026-09-03.md`;
+no original acceptance condition narrows.
+
 **[Currently In Progress] Native hazard and cell eraser, 2026-10-18 (`bd-2z0.10.7`):**
 connect existing core hazard stamping and undoable per-cell erasure to the paint controls.
 Removing a hazard override must preserve other fields and disclose generated hazards;

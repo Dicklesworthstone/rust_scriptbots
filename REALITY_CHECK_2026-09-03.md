@@ -10,6 +10,165 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Native custom sample authoring (`bd-2z0.10.7`, 2026-10-18):
+
+- [x] Reassess ready work, original acceptance and actual sample/inspection APIs.
+- [x] Reserve existing files and record the bounded implementation on the original Bead.
+- [x] Extract a validated, bounded toroidal exemplar from an explicitly selected saved-map cell (both R217 renderer modes).
+- [x] Add a dedicated sample editor with terrain painting, pattern size and orientation controls (R217).
+- [x] Reuse draft validation/history; preserve other constraints, source inspection and live science on refusals (R217).
+- [x] Observe real generated maps, extraction row order/wrapping, hashes, recipe round trips and undo/redo (R217).
+- [x] Extend production headless input while preserving old viewport, visibility, deadlines and assertions (both R217 modes).
+- [x] Review/scan/commit source, run pinned DSR, retain all attempts and re-verify actual evidence.
+- [x] Publish qualified source to both refs and prepare existing documentation/tracker updates; keep full original acceptance open.
+
+Creation worksheet: this update is PROCESS, consumed by the operator's explicit granular
+TODO request and gated on that handoff. Observed defect: sample generation and saved-map
+inspection exist, but custom exemplars require JSON editing. Retire this checklist on
+original editor acceptance, retaining report history. No integrity exception applies (no
+new recovery artifact). The P0 macOS host incident cannot be fixed on Linux; connecting
+these existing capabilities has more user value than another standalone report. Verdict
+LEGITIMATE GATE for this bounded existing checklist, zero capability credit.
+
+Initial custom-sample source `352d95fd6aaa894a9f615c0f80c5ad616deebee2`, tree
+`1f1f0fbd8ce0a900546978fe4c192fad3a0383e6`, starts pinned R215. Nineteen existing
+checks and prior reader/planted negatives remain; three new probes in both renderer modes
+increase the predeclared required completions from 72 to 78. Profile SHA256
+`00eb304455dd2c5ba0d95bfa2262f10e5481e08c7d018d00913ca914c4405351`;
+launcher `45ad8628943bae3245acbea5c8edcfe30aafe38c3cff3c828de35815c911e6cb`.
+Exact-file static UBS exits 1: two existing timestamp critical heuristics, 2,127 warnings
+and 801 informational. Qualification/publication are pending, with no native OS, hardware,
+independent, performance, full-workspace-test or release-collection claim.
+
+R215 stops at formatting before compiler/tests: typed `failed/1`, one command/log pair
+`1/0`, outer 6/runner identity zero, finished 2026-10-18 19:39:33 UTC. All ten manifest
+files / 51,243 bytes, hashes and exact membership recompute; SID 2281708 is absent.
+Apply the requested layouts manually, retaining every operator/assertion/bound. Correction
+source `62d14b33677f408396ce1a26f288dde299959556`, tree
+`c1bab1bad3514212aad07cd146fcd14da6fe9811`, starts R216 with unchanged nineteen checks,
+reader/planted negatives and 78 required completions. Profile SHA256
+`caf08d406bd0ccf98ec305989dd87fafd3d070e314f9718553693b9e8597d812`;
+launcher `29f3c3343fb93505978fb46452387be5e2d703c49707ca279e08930abc034a06`.
+Exact-file UBS remains exit 1: two existing timestamp critical heuristics, 2,126 warnings
+and 801 informational. Qualification/publication are pending; no first-attempt success claim.
+
+R216 passes eight checks, then renderer all-target Clippy fails compilation (101): the
+identified sample panel is `Stateful<Div>`, but its method returns `Div` (E0308). Wrap the
+panel in a `Div`, matching the existing inspector composition; retain every assertion and
+control. Stop the following test build via verified own PGID 2294737/SID 2293302.
+Launcher finishes 2026-10-18 19:46:07 UTC, outer 6/identity zero; source receipt is
+`failed/0`, not a pass. All nine completed command/log hashes and all 28 manifest files /
+129,637 bytes plus exact membership recompute; session absent. No renderer test result
+is inferred. Correction source `4c59aa47e36e0aca5720437afa1a1c993b9de7f8`, tree
+`28b99bc7f20c131716a4987080665dc9584b4ac2`, starts R217 with the unchanged nineteen
+checks and 78 required completions. Profile SHA256
+`320c3069d604ab651478d65f8b406ab1201b522847e354bc00a859648d8eb4fe`;
+launcher `f5451115f60dd4b3de069b2b4b1d8c84e47f077d3110ce3c7c15da184bd102c8`.
+Exact UBS remains exit 1, two existing timestamp critical heuristics / 2,126 warnings /
+801 informational. Qualification/publication are pending.
+
+**Published custom-sample result:** clean source
+`4c59aa47e36e0aca5720437afa1a1c993b9de7f8` is pushed normally to `main` and its mirror.
+R217 finishes 2026-10-18 20:04:28 UTC: all nineteen command/log pairs exit zero and the
+source receipt is typed `pass/0`. Fresh self-review re-executes the retained reader and
+planted negatives, verifies all 78 required completions, and separately recounts raw
+terminal events against suite summaries: 405 passing executions / 240 distinct passing
+test names / zero failures / six executions of three unchanged ignored HUD diagnostics.
+Core maps pass 28, runtime focused/channel 1/37, renderer focused 5, default renderer 175,
+feature-off renderer 159. Both full renderer modes observe real JSON/Postcard inspection,
+bounded toroidal extraction with exact row order, sample editing, actual generated terrain
+and metadata hash, recipe/history round trips, no-op/refusal preservation, work limits and
+edited-job invalidation. Production headless input reaches sample painting/pattern/orientation,
+undo/redo, explicit file inspection/extraction, generation and guarded owner Apply. Existing
+viewport, visibility, deadlines and assertions remain. Workspace and GUI-app all-target
+check/strict Clippy, formatting, four guards, feature-off production graph and analyzer
+binary build pass. Existing Cargo future-incompatibility and SQLite-submodule soft notices
+remain; the static UBS scan is not clean.
+
+All 128 manifest files / 370,238,585 bytes, exact membership, nineteen log hashes, profile
+byte identity and clean source commit/tree recompute. Launcher SID 2336138 is absent.
+Proof: `/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-sample-20261018-4c59aa47-r217-local`.
+Build run `a78e57b4-946d-4294-be88-0f080a82eb51`; outer envelope
+`3304fa9a-7e86-4474-9654-b8e3049e38ee`. Verdict SHA256
+`88b85ff05fdb71262ad0108d03721f1e14e01a7e0c1691877e1a18a12a6b0f8e`;
+manifest `88811c5104a4922feb2177f2a1e5396c5acad30d7d54bd4fdec50413ae7aa665`.
+Containing DSR exits 6, runner identity zero: final private-cache verification refuses
+the actual Proptest README symlink (Git index mode 120000, target `proptest/README.md`)
+before artifact collection. Guard unchanged; no collected release artifact is claimed.
+`bd-build-farm-reliability-lb19.2` remains open. Native OS, hardware, independent,
+performance, full-workspace-test and full editor acceptance are not proven.
+`bd-2z0.10.7` stays in progress on its original terms, including resource/rule controls,
+additional sample sizing, accessible palettes and native input. No task/edge/closure is
+created. The separate `/dp` sweep remains inventory-only in this continuation.
+
+Custom-sample real-work audit (2026-10-18, three actual source commits since `5310acda`
+plus the two existing documentation/tracker publication snapshots): README purpose is a
+deterministic evolutionary-agent laboratory. Actual log classifies `352d95fd` USER
+(sample authoring/extraction), `62d14b33` ENABLER (format), `4c59aa47` ENABLER (GPUI
+return-type correction); each documentation/tracker snapshot is PROCESS, with zero
+capability credit despite the included README usage. Tally: USER 1, ENABLER 2, PROCESS 2,
+UNKNOWN 0; no closures. Q1: a two-minute demo selects a saved patch, paints its exemplar,
+changes patterns/orientations, undoes/redoes, generates and requests guarded Apply.
+Q2: omitting process changes no runtime outcome; it loses requested tracking, instructions
+and failure disclosure. Q3: both corrections are consumed by the real renderer builds/tests.
+Q4: oldest user-facing open root `bd-2z0` dates to 2026-07-11; this is its bounded editor
+journey, while the first ready macOS host incident cannot be fixed on Linux. Q5: solo,
+no agents or closes. Q6: no new follow-up, narrowed acceptance or spec-as-implementation;
+all other 717 issue rows, original criteria/dependencies/status and old comment prefix
+match. Verdict **DRIFTING**: the repeated audit trail is growing, and two avoidable
+format/type retries cost time. Keep this disclosure inside existing requested records;
+reserve the next work block for user capability, with no new process machinery. The
+tally is diagnostic, never a quota.
+
+Custom-sample honesty inventory (same bounded window, fresh solo self-review):
+
+1. No (checked all three frozen source diffs, aggregate removals and reflog): no old
+   assertion, ignore, viewport, deadline or tolerance is removed or relaxed; no rewrite.
+2. No (checked new probes and production calls): real generation, files, hashes and
+   HostCore; the existing headless platform input backend is not native OS evidence.
+3. No (checked changed paths): no golden/snapshot regeneration.
+4. No (checked source/config paths and external profile reader): no suppression/gate
+   relaxation; nineteen commands and old 72 required completions remain, six added;
+   removing only that added name group makes the reader/negatives identical to R214.
+5. No (checked production sample dispatch): no environment/demo-only branch. The explicit
+   3×3 extraction preset is bounded product behavior, not a benchmark shortcut.
+6. No (checked started/terminal events, nonzero summaries and reader negatives): all
+   78 required completions execute. R216's `failed/0` is explicitly not green.
+7. No (checked claims against raw logs): final totals are recounted; 78 was derived from
+   the required-name arrays before outcomes, not guessed from added test declarations.
+8. No (checked report wording): source/headless/software evidence never becomes native
+   OS, hardware, independent, performance, full-workspace-test or collected-release proof.
+9. Failed R215 formatting and R216 GPUI compilation are disclosed above and retained.
+   R217 source `pass/0` and outer collection failure 6 are both reported.
+10. No (checked command/launch/UBS/CASS captures): cited stdout/stderr are retained.
+11. No (checked original Bead and all other rows): no closure or acceptance moved elsewhere.
+12. No (checked README/plan/criteria): usage/progress additions preserve full acceptance.
+13. Solo: no own/peer delegated closure (checked tool calls and issue status).
+14. Solo: no subagent dispatch (checked this window's calls).
+15. Solo: no subagent report accepted (same check).
+16. Solo: no panes farming refusals/closes (same check and no closures).
+17. No (checked claims): no agreement counted as independent evidence; this is self-review.
+18. No (checked prelaunch profile): nineteen commands / 78 required completions are the
+    predeclared denominators; failed/missing tests and unchanged ignores are countermetrics.
+19. Explain the avoidable formatting/type assumptions and retries before presenting
+    success. A generic read-only Git helper was blocked by DCG; its literal Git checks
+    and separate hash/reader verification then ran without an override. An earlier local
+    reader inspection omitted argv and failed; the corrected executions are the evidence.
+20. Strongest evidence is the actual new probes and production input terminal `ok`
+    events at exact clean source `4c59aa47`, plus retained reader/negative re-execution
+    and verified command/manifest/source identities. A skeptic can rerun that profile;
+    this author verification does not satisfy native OS or independent acceptance.
+
+Older-session review stays bounded: the prior five skill-phrase CASS sweeps and their
+coordinate/empty-expansion limitations are retained below. The current derived query
+`map_sandbox_extracts_toroidal_exemplar`, scoped to this workspace with limit two,
+returns zero matches (external `sample-cass-derived-20261018.json`, stderr retained).
+This does not clear the older history. Disposition: format/type defects corrected in
+place; exact failures and limits disclosed; retain SM-11 first attempts, RH-17 no-rewrite
+history, RH-2 proof-class limits and PL-1 exact-name/nonzero-run checks. Read GPUI return
+types before composition and apply formatter layouts manually. No new governance
+machinery, self-close or assertion weakening; collection and full acceptance remain open.
+
 Native hazard and cell-eraser controls (`bd-2z0.10.7`, 2026-10-18):
 
 - [x] Reassess current Beads and read core hazard/erase semantics before choosing work.
