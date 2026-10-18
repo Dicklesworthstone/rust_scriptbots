@@ -10,6 +10,185 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Native scalar-field brushes (`bd-2z0.10.7`, 2026-10-18):
+
+- [x] Reassess Beads and distinguish the macOS-only blocker from local editor work.
+- [x] Read the existing constraint validation, application and undo path; keep the original Bead in progress.
+- [x] Add explicit field selection and bounded numeric brush adjustment.
+- [x] Preserve other channels when painting one existing cell; retain terrain behavior.
+- [x] Show the selected channel/value and real preview cell fields in the Lab.
+- [x] Verify generated terrain/environment/hydrology values, edits, boundary/error preservation and undo/redo (both full R210 renderer modes).
+- [x] Extend production headless input through numeric painting, recipe round trip and guarded Apply (both R210 modes, unchanged viewport/assertions).
+- [x] Run pinned source checks; retain raw evidence and all unsuccessful attempts.
+- [x] Re-verify, publish source, update Beads/documentation and retain original unproven acceptance.
+
+Creation worksheet: this is the requested existing TODO, PROCESS, consumed by the operator
+at handoff. The observed gap is existing scalar constraint code without native controls.
+The explicit tracking request gates this bounded update; retire the checklist on original
+editor acceptance, retaining report history. No integrity exception. The macOS-only first
+ready blocker cannot be resolved here; connecting scalar painting beats another report.
+Verdict LEGITIMATE GATE, zero capability credit. The separate `/dp` commit/sync request
+has a read-only inventory at `/data/tmp/scriptbots-dp-git-inventory-20261018.json`;
+no cross-project commits, merges or worktree edits have been made by this continuation.
+
+Initial scalar source `9da82ffb31829c68275c676a46da209af132abfd`, tree
+`aa92e6870f12d3076774efdcae5ee630a7c67bf6`, starts R207 with nineteen checks and
+68 required completions (the prior 64 plus both new probes in both renderer modes).
+Profile SHA256 `3defe0d086f397bf19d236e485ebcd7b57078afc355f6eb6f77633789b2f13af`;
+launcher `4111d971a86313298f316150f5d89cffafd6a04d2095d912a5b6f77d5d39817c`.
+It stops at formatting, before compilation/tests: source `failed/1`, one command/log
+pair `1/0`, outer 6, runner identity zero, finished 2026-10-18 02:13:22 UTC. All ten
+manifest files / 29,686 bytes and their hashes/membership recompute; launcher session
+is absent before target reuse. Eight formatter layouts are corrected manually; all
+original assertions, limits, ignores, deadlines and required completions are retained.
+No compile, test or collection result is inferred from this attempt.
+
+Correction source `277186f67025ba328bd992148a26af0736e94752`, tree
+`754807b4496af32039ec95e40b45fb813c9b7930`, starts R208 with the same nineteen checks
+and byte-identical reader/negatives (68 required). Profile SHA256
+`33b6c1dff270c2016d737e233b6b02270cc76bbb4335b015425f93ed97640d94`;
+launcher `3f04bf3717ee2f3195d85f6093b1e39661a1dccbd1355294c7a6dcf5bc6c1b58`.
+Static exact-file UBS exits 1: two pre-existing timestamp critical heuristics, 1,939
+warnings and 769 informational. Neither source nor correction scan is a clean scan.
+Qualification/publication remains pending at launch; the original editor stays in progress.
+
+R208 completes eight successful checks, including 28 core map tests, then feature-off
+renderer all-target Clippy fails compilation (101): four new test calls use a nonexistent
+`scientific_hash` method. The existing method is `scientific_content_hash`. The owned
+native group is identified before SIGTERM; launcher finishes 2026-10-18 02:19:29 UTC,
+outer 6/runner identity zero, no session process remains. All nine completed command/log
+hashes recompute. The partial proof has 27 files / 128,627 bytes, no final verdict or
+manifest. Its begun renderer test command supplies no completed test result.
+
+Correction pin `6ed279212d906362b77336b7f210d2578f9b0ba5`, tree
+`1c6b3ef8021749dbaa04e1f1fee9f4e0fab5f925`, changes only the four method calls and
+their formatting. R209 repeats all nineteen checks with the unchanged reader/negatives
+and 68 required completions. Profile SHA256
+`42c548b073f83e20deec093e25a6233a4d58667e349c9c04790ad5fa74d7b674`;
+launcher `95d74490cc5b6d5ec7fe9a32c169649ed9e0dfa1904e7f2f9a4188c0b6e97e7c`.
+Exact-file UBS remains exit 1 (two existing critical heuristics / 1,939 warnings /
+769 informational). Qualification/publication remains pending at launch. No original
+assertion, gate, deadline, ignore or acceptance criterion relaxes.
+
+R209 passes formatting, all guards, core Clippy/map tests, feature-off dependency graph
+and strict renderer Clippy. Both new scalar probes pass, but the unchanged production
+input journey fails its Apply visibility assertion: y=1471.5, height=29.5 against the
+unchanged 480×1400 viewport. The feature-off library records 150 passes, one failure and
+three existing ignores; its integration binaries do not run. Stop the verified owned
+native group during the following app check. Launcher finishes 2026-10-18 02:27:46 UTC,
+outer 6/runner identity zero, no session remains. All ten completed log hashes and all
+56 manifest files / 139,522,765 bytes plus exact membership recompute. Source receipt is
+`failed/0` after interruption, not a pass. No app, workspace or collection result inferred.
+
+Layout pin `f0292f09d662cf506f8770da41f4443967fc5a83`, tree
+`738fd47c988f417a87951787c8b45897bbf8961e`, moves the original policy/grid-match/Apply
+controls between preview provenance/seams and the grid, retaining their pre-generation
+availability and every guard, label and test. Neither viewport nor visibility assertions
+change. R210 repeats nineteen checks and the byte-identical reader/negatives, 68 required
+completions. Profile SHA256 `ed25dc11f5049409fe9bdf0519339d7be6b1cedcfe8656aace47ed7d9d4e4d62`;
+launcher `978ffc072028465d7fbf7834cf9b78f451c437a6ddc477dd86fa8336524a7b35`.
+Exact UBS remains exit 1, two existing critical heuristics / 1,939 warnings / 769 info.
+Full source/headless qualification and publication remain pending at launch.
+
+**Published scalar-brush result:** R210 finishes 2026-10-18 02:46:20 UTC at clean source
+`f0292f09d662cf506f8770da41f4443967fc5a83`. All nineteen command/log pairs exit zero
+and the source receipt is typed `pass/0`. A fresh pass by this author re-executes the
+retained reader and planted negatives, confirms all 68 required completions and separately
+recounts raw terminal events against suite summaries: 395 passing executions, 235 distinct
+passing test names, zero failures and six executions of three unchanged ignored HUD tests.
+Core maps contribute 28 passes, runtime focused/channel 1/37, renderer focused 5, full
+default renderer 170 and full feature-off renderer 154. Both full modes pass the two scalar
+probes and production input through fertility painting over water, undo/redo, recipe/file
+round trips, artifact inspection/back and guarded owner Apply. The viewport and visibility
+assertion are unchanged. Workspace and explicit GUI-app all-target checks/strict Clippy,
+formatting, all four dependency guards, feature-off production graph and analyzer build pass.
+Existing Cargo future-incompatibility and README SQLite-submodule pin soft notices remain.
+
+All 124 manifest files / 370,230,933 bytes, exact membership, nineteen log hashes, profile
+byte identity and clean expected source binding recompute. Proof:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-fields-20261018-f0292f09-r210-local`.
+Build run `b96f7d1d-7bc5-492f-88a9-c54f21b86e17`; outer envelope
+`2867f106-470d-42bf-93c0-102fb00d078e`. Verdict SHA256
+`3c172e212117c917b8bffa297285fdd5b65fb4632e230f24b4dbe7cbc6f462bc`;
+manifest `2a8f0601bc34d4caaf9be24804351a3d143c066385dae52c151b2768f293e7b3`.
+Containing DSR exits 6 when final private-cache verification refuses the actual tracked
+Proptest README symlink (Git mode 120000, target `proptest/README.md`) before collection.
+No collected identity/hash/size; guard unchanged. Frozen runner identity exits zero and
+no launcher-session process remains. Both normal source pushes succeed; working source
+matches the qualified pin. This is source/headless self-verification, not native OS,
+hardware, performance, full-workspace tests, independent verification or release acceptance.
+Exact static UBS remains non-green (two existing critical heuristics / 1,939 warnings /
+769 informational). Documentation/export-only UBS reports unsupported languages (exit 3),
+not a clean scan. Original editor and `bd-build-farm-reliability-lb19.2` stay open.
+No task closes, acceptance criterion narrows or dependency changes. The separate `/dp`
+maintenance request remains at inventory, not a completed commit/push/pull sweep.
+
+Bounded anti-ceremony worksheets for the scalar-brush continuation:
+
+- **Creation:** the existing requested TODO/plan/Beads handoff is PROCESS, with the operator
+  as consumer. The explicit request gates it; the observed defect is disconnected scalar
+  authoring and terrain paint replacing other overrides. Retire the active checklist when
+  original editor acceptance is observed, retaining this existing report's history. No
+  integrity exception, so its four questions do not apply. Highest ready work is the
+  macOS incident `bd-e6ff`; this host cannot resolve it. An hour connecting actual fields
+  delivers more than another report. LEGITIMATE GATE; no capability credit for tracking.
+- **Real work:** window is the four scalar source commits through `f0292f09` and their
+  README/plan/report/Beads changes.
+  README purpose: a faithful deterministic artificial-life lab with GPU UI, pluggable brains
+  and analytics. Commit inventory: feature and Apply layout USER; formatter/API corrections
+  ENABLER; documentation handoff and tracker PROCESS: two USER, two ENABLER, two PROCESS,
+  no UNKNOWN. The documentation grouping contains user-facing README instructions alongside
+  the larger plan/report handoff; its process classification earns no capability credit.
+  Demo target: paint fertility over water, undo/redo, round-trip the recipe, generate and
+  apply the actual value. R209 fails its visibility gate; R210 observes the corrected
+  complete journey through production headless input in both renderer modes. Actual
+  native OS demonstration remains owed.
+  Without PROCESS, runtime is identical and only requested tracking is lost. Formatting,
+  strict Clippy and both renderer suites exercise the enablers. Oldest nonclosed
+  user item is root `bd-2z0`; this advances its map editor instead of building machinery.
+  Solo, so no pane close counts. No criterion changes or replacement follow-up closes.
+  DRIFTING: eight avoidable formatter layouts and an unchecked API name cost retries;
+  the input test also catches a real layout regression. Correction: fix actual layout,
+  output/API manually, retain all failed attempts, freeze scope and complete qualification.
+- **Honesty 1:** No weakening (read all four full immutable source diffs; original tests,
+  viewport, deadlines, ignores and CI/config paths unchanged). **2:** No specialized success
+  double (real rule/sample generation, files and existing owner TestHost; GPUI input remains
+  explicitly headless). **3:** No golden changes (exact path set). **4:** External profile
+  retains nineteen checks and the prior 64 required completions, adding four; retained
+  reader/negative bytes match R207 through R210. No bypass, suppression, tolerance, timeout, retry
+  or CI relaxation (source/profile review). **5:** No gate-only branch (actual UI actions
+  use the existing constraint, history, generator and owner paths; no new dependency).
+  **6:** No zero-run green (both full R210 suites, all 68 required completions and actual
+  terminal/suite counts). The reader correctly refuses the prior
+  real R206 logs missing the new scalar probes. **7:** No unobserved execution claimed:
+  R207/R208/R209's failures and R210's nineteen successful command/log pairs are separately scoped.
+  **8:** No source/headless/software evidence promoted to native OS/hardware/performance/
+  release or independent proof. **9:** Formatting, API compile error, failed viewport journey
+  and non-green UBS are retained; source/headless success and failed collection are
+  reported separately. **10:** No cited stderr discarded
+  (UBS outputs retained separately, DSR command and tee exits captured). **11:** No
+  premature closure (original issue remains in progress). **12:** No spec editing into
+  success (resource/hazard/exemplar/accessibility/native OS criteria stay open).
+  **13–17:** Inapplicable: solo, no dispatched agents, accepted agent reports or agreement
+  claims in this window. **18:** No after-the-result denominator (nineteen checks and
+  68 named completions predeclared; actual R210 totals include zero failures and six
+  executions of three existing ignores).
+  The new test-name CASS search returns zero; earlier bounded sweeps below are not an
+  exhaustive clearance. **19:** Explain the formatter/API retries, the offscreen Apply
+  regression fixed in the UI, and the scope
+  assumption: latest implementation request follows a separate `/dp` no-code-edit sweep
+  request. A clarification was sent; absent an answer, latest implementation was resumed
+  explicitly, with the sweep left at inventory and no cross-project code edits. The first
+  generic read-only inventory runner was blocked by DCG and replaced with statically named
+  Git read commands; no override. `ru status` fetched refs using its default Git identity;
+  subsequent project network commands retain the explicit project User-Agent.
+  **20:** Strongest evidence is pinned source and actual rule/sample field outputs,
+  recipe round trips and production headless input through owner Apply in both renderer
+  modes. Raw commands/logs and the retained reader are re-executable; this remains the
+  author's self-verification, not independent or native OS acceptance.
+  Disposition: formatter/API/layout corrected in place, failed runs disclosed and retained (SM-11);
+  original acceptance stays open (RH-2). No independent verification is claimed.
+
 Persisted map inspection (`bd-2z0.10.7`, 2026-10-17 continuation):
 
 - [x] Reassess BR/BV priorities and inspect the existing artifact validator and native files.

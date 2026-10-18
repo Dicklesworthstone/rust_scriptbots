@@ -633,6 +633,16 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   seam measurements, choose an existing-agent policy, then **Apply preview to live world**.
   The owner rejects a preview if science has changed since generation. Draft edits never
   step the world; application and journal status appear separately below the controls.
+  **Paint: …** cycles between terrain and elevation, moisture, fertility, temperature,
+  permeability, runoff bias, basin rank, channel priority and swim cost. For numeric
+  channels, **Value −0.1 / +0.1** adjusts the disclosed brush value: 0–1 for normalized
+  fields, −1–1 for runoff and 0–10 for swim cost. Terrain uses the existing terrain brush.
+  Painting preserves the cell's other overrides and is one undoable draft edit. Changing
+  the brush alone does not change the draft or invalidate its preview. Regenerate to see
+  the actual stored value for the selected channel at the last painted cell; that label
+  names the preview revision, which may precede newer edits. Recipe files preserve every
+  painted channel. Custom rules/exemplars, resource/hazard controls and native OS acceptance
+  remain open.
   Generation runs in one bounded background slot. Cancellation discards the result;
   that slot remains occupied until the underlying generator finishes.
   **Switch rules / sample** selects the default rule tileset or the versioned
@@ -661,7 +671,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   the background; the view displays at most 32 × 32 sampled cells. Inspection accepts
   files up to 64 MiB and maps up to the editor's 65,536-cell limit. Draft/history, generated
   preview and live world stay unchanged; **Back to unchanged draft** returns to the editor.
-  Inspection does not import a recipe or apply the saved map. Additional field/exemplar
+  Inspection does not import a recipe or apply the saved map. Additional resource/hazard/exemplar
   controls, accessible palettes and actual native OS-input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.

@@ -2410,6 +2410,27 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native scalar-field brushes, 2026-10-18 (`bd-2z0.10.7`):**
+connect the existing per-cell terrain/environment/hydrology constraint fields to numeric
+brush controls. Painting one channel must preserve other painted values; use the existing
+undo/redo, recipe serialization, generation and guarded owner Apply. Test actual field
+outputs and production headless input. Remaining native OS and broader editor acceptance
+stay open.
+
+Source `f0292f09d662cf506f8770da41f4443967fc5a83` is published to both required remote
+branches. R210 passes nineteen source command/log pairs and typed `pass/0`. The retained
+reader/negatives re-execute all 68 required completions; actual totals are 395 passing
+executions / 235 distinct test names / zero failures / six executions of three existing
+ignored diagnostics. Both full renderer configurations observe distinct rule/sample scalar
+outputs, preserved channels/history, recipe round trips and production headless input
+through fertility painting and guarded owner Apply. The existing viewport and visibility
+assertions remain unchanged; Apply now sits beside provenance above the grid. All 124
+manifest files / 370,230,933 bytes and log/source/profile identities recompute. Containing
+DSR exits 6 on the tracked Proptest README symlink before collection; guard unchanged,
+no collected artifacts. Native OS, resource/hazard/exemplar/accessibility and collection
+acceptance remain open. The formatting, accessor and actual layout failures and their
+corrections are retained in `REALITY_CHECK_2026-09-03.md`; no criterion is narrowed.
+
 **[Currently In Progress] Persisted native map inspection, 2026-10-17 (`bd-2z0.10.7`):**
 connect the existing validated JSON/Postcard artifact to a separate Lab inspection view.
 Bound file/cell inputs, compute hash/seams outside paint, retain provenance and selectable
