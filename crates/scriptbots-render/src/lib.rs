@@ -4620,6 +4620,34 @@ impl SimulationView {
                 f32::from(sandbox.paint_channel.range().1) / 10.0,
             )))
             .child(div().text_xs().child(sandbox.notice.clone()));
+        let policy = match sandbox.policy {
+            ExistingAgentPolicy::Retain => "retain existing agents",
+            ExistingAgentPolicy::RepositionToSafeTile => "reposition to safe tiles",
+            ExistingAgentPolicy::CullIncompatible => "cull incompatible agents",
+        };
+        let application_controls = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.render_map_button(
+                "map-policy",
+                format!("Agent policy: {policy} (change)"),
+                MapAction::Policy,
+                true,
+                cx,
+            ))
+            .child(div().text_xs().child(if fits_live {
+                "Preview dimensions match the live grid."
+            } else {
+                "Application requires matching dimensions and cell size. Choose Use live grid, then generate."
+            }))
+            .child(self.render_map_button(
+                "map-apply",
+                "Apply preview to live world".to_owned(),
+                MapAction::Apply,
+                sandbox.can_apply() && fits_live && self.map_apply_submit.is_some(),
+                cx,
+            ));
         if let Some(preview) = &sandbox.preview {
             let artifact = &preview.artifact;
             let metadata = artifact.metadata();
@@ -4640,7 +4668,8 @@ impl SimulationView {
                     seams.max_elevation_step_ew,
                     seams.seam_kind_discontinuities_ns,
                     seams.seam_kind_discontinuities_ew,
-                )));
+                )))
+                .child(application_controls);
             let width = artifact.terrain().width();
             let height = artifact.terrain().height();
             let stride = width.max(height).div_ceil(MAP_SANDBOX_PREVIEW_SIDE);
@@ -4707,32 +4736,10 @@ impl SimulationView {
                     preview.draft_revision,
                 )));
             }
+        } else {
+            panel = panel.child(application_controls);
         }
-        let policy = match sandbox.policy {
-            ExistingAgentPolicy::Retain => "retain existing agents",
-            ExistingAgentPolicy::RepositionToSafeTile => "reposition to safe tiles",
-            ExistingAgentPolicy::CullIncompatible => "cull incompatible agents",
-        };
         panel
-            .child(self.render_map_button(
-                "map-policy",
-                format!("Agent policy: {policy} (change)"),
-                MapAction::Policy,
-                true,
-                cx,
-            ))
-            .child(div().text_xs().child(if fits_live {
-                "Preview dimensions match the live grid."
-            } else {
-                "Application requires matching dimensions and cell size. Choose Use live grid, then generate."
-            }))
-            .child(self.render_map_button(
-                "map-apply",
-                "Apply preview to live world".to_owned(),
-                MapAction::Apply,
-                sandbox.can_apply() && fits_live && self.map_apply_submit.is_some(),
-                cx,
-            ))
             .child(div().text_xs().child("Applying replaces live terrain/hydrology. An intervening science change rejects the preview; regenerate while paused. Culling requires a recorded open lifecycle boundary."))
             .child(self.render_dashboard_status(snapshot))
     }
