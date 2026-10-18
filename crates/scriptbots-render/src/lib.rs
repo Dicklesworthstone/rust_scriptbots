@@ -3524,6 +3524,7 @@ impl MapSandbox {
     }
 
     fn edit(&mut self, action: MapAction) {
+        let prior_revision = self.draft.revision;
         let result = match action {
             MapAction::NextSeed => {
                 self.draft.set_seed(self.draft.state.seed.wrapping_add(1));
@@ -3649,8 +3650,12 @@ impl MapSandbox {
         self.notice = result.map_or_else(
             |error| format!("Draft edit refused: {error}"),
             |()| {
-                "Draft edited. Generate to preview this revision; the live world is unchanged."
-                    .to_owned()
+                if self.draft.revision == prior_revision {
+                    "No draft change. Existing preview and history are unchanged.".to_owned()
+                } else {
+                    "Draft edited. Generate to preview this revision; the live world is unchanged."
+                        .to_owned()
+                }
             },
         );
     }
@@ -22724,6 +22729,10 @@ mod command_characterization_tests {
         sandbox.paint_channel = MapPaintChannel::Erase;
         sandbox.edit(MapAction::Paint(7, 7));
         assert_eq!(sandbox.draft, draft);
+        assert_eq!(
+            sandbox.notice,
+            "No draft change. Existing preview and history are unchanged."
+        );
         assert!(sandbox.can_apply());
         assert!(sandbox.draft.can_redo());
         for (x, y) in [(8, 0), (0, 8), (u32::MAX, u32::MAX)] {
