@@ -10,6 +10,183 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Native hazard and cell-eraser controls (`bd-2z0.10.7`, 2026-10-18):
+
+- [x] Reassess current Beads and read core hazard/erase semantics before choosing work.
+- [x] Keep original editor acceptance in progress and reserve the existing files.
+- [x] Connect hazard stamp/generated-default selection and per-cell erasure to existing controls (R214 source-qualified).
+- [x] Preserve other channels/cells; verify undo/redo and no-op erasure history (R214).
+- [x] Observe rule/sample terrain and hydrology, hazard removal, recipe round trips and erasure restoration (both R214 renderer modes).
+- [x] Extend production headless input without relaxing viewport, visibility, deadlines or old assertions (both R214 modes).
+- [x] Review exact source, scan it, commit and run pinned DSR qualification with existing checks intact.
+- [x] Re-verify raw evidence, document limitations, record Beads progress and publish qualified source to both required refs.
+
+Creation worksheet (bounded to this update): running code does not branch on this TODO;
+it is PROCESS. Consumer: the operator's explicit granular-tracking request. Gate: that
+requested handoff, not a runtime feature. Observed gap: existing hazard and per-cell erase
+APIs have no editor consumer. Retirement: original editor acceptance, with history retained.
+No integrity exception is needed (no new recovery artifact; all four exception questions
+are inapplicable). The first ready macOS toolchain issue cannot be resolved on this Linux
+host; an hour wiring existing editor behavior has more value than another status report.
+Verdict LEGITIMATE GATE for this minimal existing checklist, zero capability credit.
+
+Initial hazard source `05a103b9a50be6561ebd18e0f1949044f2c8fa12`, tree
+`aa4a173bb7697c4bee30946bf3ed91b3221c9ae5`, starts R211 with the existing nineteen
+checks and unchanged result reader/planted negatives plus four new required completions
+(both new probes in both renderer modes), 72 total. Profile SHA256
+`7843d07505e3b502eacad42478c3c0683f987b2c3868167bb69f65030e895100`;
+launcher `a06eedfae149fc1abaaa813e9c9cb756a6723c01ed6bc5359c7e0b01e44a810c`.
+Exact-file static UBS exits 1: two existing timestamp critical heuristics, 2,011 warnings
+and 775 informational. This is not a clean scan. Qualification and publication are
+pending at launch; no native OS, hardware, performance, release or full editor claim.
+
+R211 stops before compilation/tests at formatting (`failed/1`, command/log `1/0`).
+The outer runner exits 6 with runner identity zero at 2026-10-18 17:50:43 UTC.
+All ten manifest files / 29,269 bytes, hashes and membership recompute; its launcher
+session is absent. Apply the six formatter layouts manually, with no semantic change.
+Correction source `9bac2f5faf5cfedb04cb2869a1e6d91de0c53e9b`, tree
+`940f1b95998696c7473fa9fbc35682101fa00bc2`, starts R212 with the same nineteen checks,
+reader/negatives and 72 required completions. Profile SHA256
+`19e049a4137ed467da330f47460042e01f69e168b8b57e914a10b21d8e32608d`;
+launcher `b0c98b2622ad9ea4d1fd5224615e4937dd3c48a64bf823e36b4e8ff21eb5459d`.
+Qualification remains pending.
+
+R212 is intentionally stopped before renderer tests after source review catches the
+misleading no-op success notice: empty-cell erasure would say "Draft edited" despite
+unchanged history/revision. Eight completed command/log pairs pass (format, four guards,
+core Clippy/tests, feature-off graph), and their hashes recompute. The next renderer
+Clippy command is interrupted by SIGTERM to verified owned native PGID 1711928 in SID
+1709869. Launcher finishes 2026-10-18 17:53:50 UTC, outer 6 / identity zero, no session
+process remains. Partial proof has 25 files / 96,272 bytes and no verdict/manifest; no
+renderer or later check result is inferred. Correction source
+`868de9c700429d71be7533d57bd31a0702f95fc1`, tree
+`26d112ebdf3ad599b5c398a409fc2001ef6575fe`, compares actual before/after revision for
+its success notice and asserts that notice in the no-op probe. R213 preserves all nineteen
+checks and 72 required completions. Profile SHA256
+`b0e86fb814d3c995be5736cfc3ddaf2a07565d86378976e179ac8490ed1cedd8`;
+launcher `1dd693bd98b6a8f7807574ee457bcf3d345ecf32389a390035694b9e300cec4a`.
+Notice-correction exact-file UBS still exits 1: two existing timestamp critical heuristics, 2,012
+warnings and 775 informational. Qualification/publication remain pending at launch.
+
+R213 passes the first eight checks, then feature-off renderer all-target Clippy fails
+compilation (101): the new expected hydrology tile tries to move a non-Copy value from
+a borrowed slice. Clone that test value; the field assertion stays exact. Stop the next
+test build via verified owned native PGID 1754716/SID 1752703. Launcher finishes
+2026-10-18 17:58:44 UTC, outer 6/identity zero, no session remains. All nine completed
+command/log hashes recompute; partial proof has 27 files / 128,463 bytes and no final
+verdict/manifest. No renderer test result is inferred. Correction source
+`6e19ebcb73cc2449fe3a5c859f9db0dddb16ee45`, tree
+`ebf85db3004030388e3ffd2a333f72d328b88569`, starts R214 with the same nineteen checks,
+reader/planted negatives and 72 required completions. Profile SHA256
+`1af87a4bfe73ee982f058750b642f5e12212d4f26f0d3ca1e5d2733a2a371609`;
+launcher `d68b58fe320d4e61ce486968850010ba488241d01951e8e31d8892b2668398e0`.
+Exact UBS exits 1: two existing critical timestamp heuristics, 2,013 warnings and 776
+informational. This is not a clean scan; qualification/publication remain pending.
+
+**Published hazard/eraser result:** clean source
+`6e19ebcb73cc2449fe3a5c859f9db0dddb16ee45` is pushed normally to `main` and its mirror.
+R214 finishes 2026-10-18 18:16:58 UTC: all nineteen command/log pairs exit zero and the
+source receipt is typed `pass/0`. Fresh self-review re-executes the retained reader and
+planted negatives, verifies all 72 required completions, and separately recounts raw
+terminal events against suite summaries: 399 passing executions / 237 distinct passing
+test names / zero failures / six executions of three unchanged ignored HUD diagnostics.
+Core maps pass 28, runtime focused/channel 1/37, renderer focused 5, default renderer 172,
+feature-off renderer 156. Both full renderer configurations pass the new rule/sample
+hazard/generated-default/erase/history/recipe guards and production headless input through
+files, inspection/back and guarded owner Apply with unchanged viewport and visibility
+assertions. Workspace and GUI-app all-target check/strict Clippy, formatting, four guards,
+feature-off production graph and analyzer binary build pass. Existing Cargo future-
+incompatibility and README SQLite-submodule pin soft notices remain.
+
+All 124 manifest files / 370,232,549 bytes, exact membership, nineteen log hashes, profile
+byte identity and clean source commit/tree recompute. Launcher SID 1833166 is absent.
+Proof: `/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-hazard-20261018-6e19ebcb-r214-local`.
+Build run `c40920d5-e8c4-44fc-a4d5-9d7155aef105`; outer envelope
+`197646b1-6a48-4fed-98ba-9a090e3a706f`. Verdict SHA256
+`ffa39e3073ecde4e1d715d2356e5c3c2fd76860a03cfcf12e9145bfdc8202f6a`;
+manifest `3a37df07368349830eaca8fe95200281d6893d19b00967d2cb1aea9b1f5c1664`.
+Containing DSR exits 6, runner identity zero: final private-cache verification refuses
+the actual Proptest README symlink (Git index mode 120000, target `proptest/README.md`)
+before artifact collection. No guard is changed, no collected artifact is claimed, and
+`bd-build-farm-reliability-lb19.2` remains open. Native OS, hardware, independent, performance,
+full-workspace-test and full editor acceptance are not proven. `bd-2z0.10.7` stays in
+progress with resource/exemplar/accessibility and native journey work on its original terms.
+The separate `/dp` sweep remains inventory-only in this continuation.
+
+Hazard increment real-work audit (2026-10-18, four source commits since `3df18c20`,
+plus the pending existing documentation/tracker snapshots): README purpose is a
+deterministic evolutionary-agent laboratory. Actual log classifies `05a103b9` USER
+(hazard/erase controls), `9bac2f5f` ENABLER (format), `868de9c7` USER (truthful no-op
+notice), `6e19ebcb` ENABLER (test compile correction); documentation/tracker publication
+is PROCESS, zero capability credit. No closure. Q1: demo stamp/remove a hazard, erase a
+single cell, undo and regenerate/apply. Q2: omitting process changes no runtime result;
+it loses requested tracking, user instructions and failed-attempt disclosure. Q3: compiler
+and renderer tests consume the two actual corrections; neither is speculative. Q4: the
+oldest user-facing open root is `bd-2z0` (2026-07-11); this is a bounded part of its editor
+journey, whereas the first ready macOS incident cannot be repaired on Linux. Q5: solo,
+no agents or closes. Q6: no new follow-up, narrowed acceptance or spec-as-implementation;
+all other 717 issue rows, original criteria/dependencies/status and old comments match.
+Verdict **DRIFTING**: avoidable formatting and non-Copy test retries cost time, and the
+misleading no-op notice was caught late. Corrections are recorded; keep the next block
+on user capability rather than new process machinery. No count or ratio is a success KPI.
+
+Hazard increment honesty inventory (same bounded window, solo fresh self-review, not
+independent verification):
+
+1. No (checked all four frozen source diffs): no test deletion, ignore, skipped assertion,
+   changed viewport, deadline or tolerance; the reachable-channel expected set only grows.
+2. No (checked new probes): real generators, stored fields, recipe hashes and existing
+   HostCore/input consumers; headless platform input is a test backend, not native OS proof.
+3. No (checked changed paths): no golden or snapshot regeneration.
+4. No (checked repository paths and external profile reader): no gate/config/suppression
+   edits; nineteen commands retained, four completions added, old reader/negatives intact.
+5. No (checked production dispatch and field comparisons): no demo-only path or environment
+   branch; no erasure-as-hazard-free claim. Natural generated hazard is an explicit guard.
+6. No (checked actual required probe starts/terminal results and nonzero summaries in
+   both full renderer modes): all 72 required completions execute; final source receipt
+   and analyzer pass are verified in the published-result readback above.
+7. An early progress count of 28 preceded my raw recount; the subsequent exact suite
+   summary confirms 28. Final totals must come from raw events. A local reader call first
+   omitted argv and failed before parsing; the corrected call runs, not the failed one.
+8. No (checked wording): headless/software/source evidence never becomes native OS,
+   hardware, independent, performance, full-workspace-test or release evidence.
+9. Failures and limits are disclosed above: R211 formatting, intentionally stopped R212
+   notice correction, R213 test compile failure; no incomplete run is a green result.
+10. No (checked launch/command/UBS/CASS captures): cited stdout and stderr are retained;
+    redirected output is retained externally, not discarded.
+11. No (checked Beads row): original task remains in progress, no new closure/edge/task.
+12. No (checked plan/README and original acceptance): additive progress/usage notes keep
+    native OS and resource/exemplar/accessibility acceptance open.
+13. Solo: no delegated or peer closure (checked current work/commit authorship).
+14. Solo: no dispatch (checked this window's tool calls).
+15. Solo: no subagent report accepted (same check).
+16. Solo: no panes farming refusals or closes (same check and unchanged issue status).
+17. No (checked claims): no agent agreement or inherited counts counted as verification.
+18. No (checked prelaunch profiles): 72 required completions declared before outcomes,
+    countermetrics are missing/failed tests and retained ignores; no perf metric claimed.
+19. Explain the avoidable retry cost, late no-op notice discovery and the early count.
+    An uncommitted note briefly had an incorrect full source SHA; replace it with actual
+    `rev-parse` output before review/publication. Do not infer source identity from memory.
+20. Strongest observed evidence is R214's actual new probes and production input
+    terminal `ok` events at the exact clean pin. The fresh reader/negative re-execution
+    confirms all 72 required completions, 399 passing executions / 237 distinct passing
+    names / zero failures / six executions of three unchanged ignored diagnostics. Final
+    source receipt, analyzer and hash checks pass in the readback above. A skeptic can rerun the retained
+    pinned profile. This is self-review.
+
+Older-session check is bounded: six CASS queries (five skill phrases plus
+`map_sandbox_hazard`), three hits per query retained under external `hazard-cass-*` files.
+Follow each first hit with a retained CASS view; the physical coordinates often resolve
+to token/tool metadata or unrelated reads. Derived-hit expansion has empty content at
+those file coordinates. Those excerpts cannot clear the older history; no whole-history
+honesty claim. The earlier session audit remains bounded too.
+Disposition: misleading notice and compile/format defects corrected in place; failed
+attempts and limits disclosed; retain SM-11 first-attempt records and RH-17 no-rewrite
+history, RH-2 proof-class limits, and PL-1 exact required-name checks. Recount before
+reporting, use actual source identities and read type declarations before assuming Copy.
+No new governance machinery is introduced; source qualification is completed before handoff,
+while collection/native/full editor acceptance remain open.
+
 Native scalar-field brushes (`bd-2z0.10.7`, 2026-10-18):
 
 - [x] Reassess Beads and distinguish the macOS-only blocker from local editor work.

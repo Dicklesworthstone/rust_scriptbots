@@ -2410,6 +2410,25 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native hazard and cell eraser, 2026-10-18 (`bd-2z0.10.7`):**
+connect existing core hazard stamping and undoable per-cell erasure to the paint controls.
+Removing a hazard override must preserve other fields and disclose generated hazards;
+erasing a cell must preserve other cells and restore generated values after regeneration.
+Retain original native OS acceptance, all prior checks and production input assertions.
+
+Source `6e19ebcb73cc2449fe3a5c859f9db0dddb16ee45` is published to both required remote
+refs. R214 passes nineteen source command/log pairs and typed `pass/0`; fresh reader and
+planted-negative re-execution confirms 72 required completions, with actual totals of
+399 passing executions / 237 distinct passing test names / zero failures / six executions
+of three unchanged ignored diagnostics. Both full renderer modes observe actual hazard
+terrain/hydrology, preserved overrides, generated hazards after erasure, recipe/history
+round trips, no-op/invalid erasure, and production headless input through guarded Apply.
+All 124 manifest files / 370,232,549 bytes, log hashes and source/profile identities
+recompute. Containing DSR exits 6 on the actual tracked Proptest README symlink before
+collection; guard unchanged, no collected artifact. Original resource/exemplar/accessibility,
+native OS and full editor acceptance remain open. Failed/stopped attempts and the bounded
+honesty audit are retained in `REALITY_CHECK_2026-09-03.md`; no acceptance criterion narrows.
+
 **[Currently In Progress] Native scalar-field brushes, 2026-10-18 (`bd-2z0.10.7`):**
 connect the existing per-cell terrain/environment/hydrology constraint fields to numeric
 brush controls. Painting one channel must preserve other painted values; use the existing
