@@ -2410,6 +2410,25 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Persisted native map inspection, 2026-10-17 (`bd-2z0.10.7`):**
+connect the existing validated JSON/Postcard artifact to a separate Lab inspection view.
+Bound file/cell inputs, compute hash/seams outside paint, retain provenance and selectable
+cell/field details, and preserve the draft, preview and live world. Exercise actual files
+and headless platform input; retain original native OS and remaining editor acceptance.
+
+Source `81fdb72f26673a1dc9dca87674c2b8c2fa59447b` is published to both required remote
+branches. R206 passes all nineteen source command/log pairs and typed `pass/0`; the retained
+reader and planted negatives re-execute all 64 required completions. Actual totals are 391
+passing executions / 233 distinct tests / zero failures / six executions of three existing
+ignored diagnostics. Both full renderer configurations exercise real JSON/Postcard files,
+paired valid/invalid field lengths, byte/cell boundaries and production headless inspection,
+cell selection, cancellation and return to the preserved editor before owner Apply.
+All 124 manifest files and nineteen log hashes recompute. Containing DSR exits 6 on the
+tracked Proptest README symlink before collection; no collected artifacts or guard bypass.
+This is solo source/headless qualification. Remaining field/exemplar controls, accessibility,
+real native OS input and collection acceptance stay open. The formatting failure and
+strengthened negative-test retry are retained in `REALITY_CHECK_2026-09-03.md`.
+
 **[Currently In Progress] Native map recipe files, 2026-10-17 (`bd-2z0.10.7`):** connect
 Save/Open platform dialogs to the existing recipe serializer/validator. Use one background
 file slot, bounded reads, create-new writes, captured save revisions and late-load rejection

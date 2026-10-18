@@ -10,6 +10,153 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Persisted map inspection (`bd-2z0.10.7`, 2026-10-17 continuation):
+
+- [x] Reassess BR/BV priorities and inspect the existing artifact validator and native files.
+- [x] Keep the original editor Bead in progress and mark the active plan in place.
+- [x] Decode JSON/Postcard through the existing structural validator in one background slot.
+- [x] Bound file bytes and inspectable cells; require consistent declared/actual dimensions.
+- [x] Compute content hash and seam diagnostics before publishing the inspection model.
+- [x] Show actual provenance, optional-field presence, sampled terrain and selected cell data.
+- [x] Preserve draft/history, generated preview and live science through inspect/cancel/errors.
+- [x] Return from inspection to the unchanged editor; keep artifact viewing separate from Apply.
+- [x] Test both real file formats, boundary/error cases and retained previous inspection (both R206 renderer modes).
+- [x] Exercise real Lab dialog/select/back input and preserve Apply (both R206 headless modes).
+- [x] Pin source; run the full retained DSR checks and required completions.
+- [x] Re-verify results, publish source, update documentation/Beads and retain outstanding acceptance.
+
+Creation worksheet: this extends the operator-requested existing tracking, PROCESS,
+consumed at handoff. The observed gap is a CLI artifact validator with no native inspector.
+The explicit request gates this minimal TODO; retire it when original editor acceptance
+completes. No integrity exception or new framework. The macOS-only top-ranked blocker
+cannot be resolved on this host; implementing this consumer beats further reporting.
+Verdict LEGITIMATE GATE, zero capability credit.
+
+Initial source pin `86d92e310dc10594600a435d668eefaa619210d9`, tree
+`7545898beae308f85ee04706ed36bd3cb739d83d`, adds persisted-artifact inspection.
+R204 starts 2026-10-17 23:48:04 UTC and stops at formatting, before compilation or tests.
+The single completed command/log pair is `1/0`; source receipt is `failed/1`, outer 6,
+runner identity zero at 23:48:19 UTC. All ten manifest files / 36,122 bytes and their
+hashes recompute; no session processes remain before reuse. No test or final cache result
+is inferred. Manual corrections follow the retained formatter output, including ordinary
+trailing commas. A read-only whitespace-only comparison fails on those commas; it is not
+used as semantic or compiler evidence. The complete correction diff is reviewed directly.
+
+Corrected source `71d7136dbbd49f09da94a37d89a4f006f532f819`, tree
+`49a87f7df56193b39e6899aee27f7540a82cba11`, starts R205 with all nineteen checks and
+64 required named completions, unchanged reader/negatives from R204. Profile SHA256
+`689786af7839989649b48625643a1b4ed216faa6b277a653cdaf988485e96d5a`;
+launcher `f78fd4bb5870032b6c53ae28c6a69e256b00b035224904e3e20afe26e92c3bf7`.
+Formatting passes. Full source qualification/publication remain pending. Static-only UBS
+over the three source paths exits 1 (two existing timestamp critical heuristics, 1,859
+warnings, 768 informational); the exact-file correction scan also exits 1 (two critical,
+1,858 warnings, 763 informational). Neither is a clean scan. All original editor and
+native OS acceptance stays open; no task is closed or requirement reassigned.
+
+Review finds a weak original negative: deleting validation could make missing terrain tiles
+panic in seam traversal, and the broad `failed` notice would still pass. Strengthen the
+same test to reject worker loss and add a valid fertility array followed by the same
+array with one value removed. Its terrain/seams remain valid, so omitting structural
+validation would publish the bad field and fail the test. Earlier generic failure earns
+no proof that validation ran. No assertion, deadline, ignore or original criterion relaxes.
+R205 is stopped after its ninth completed check, strict feature-off all-target Clippy;
+all nine command/log hashes and all 28 manifest files / 126,741 bytes recompute. Core map
+tests contribute 28 passes; renderer tests have not run. The owned native group is verified
+before SIGTERM; launcher finishes 2026-10-17 23:53:52 UTC, outer 6/runner identity zero,
+with no session processes remaining. Source receipt is `failed/0` after interruption;
+exit zero is not a pass. No final workspace, renderer or cache-collection result is inferred.
+
+Strengthened test pin `81fdb72f26673a1dc9dca87674c2b8c2fa59447b`, tree
+`ed0eda0d47d4007228afe68e66a00b9723d34a47`, starts R206 with unchanged nineteen-check
+profile and reader/negatives (64 required completions). Profile SHA256
+`5e9cbf9823bee08f4a407001e4e12235f79b5fd8467cde796d92ed8390ab5eea`;
+launcher `fe82dc490d6de5b51feedf058e35c7ff047e46cf7daec39b94da1aae180c0de2`.
+Latest exact-file UBS exits 1: two existing critical heuristics, 1,867 warnings and
+763 informational. Source qualification/publication remain pending at launch.
+
+**Published source result:** R206 finishes 2026-10-18 00:12:12 UTC at clean source
+`81fdb72f26673a1dc9dca87674c2b8c2fa59447b`. All nineteen command/log pairs exit zero;
+the source receipt is typed `pass/0`. This agent separately re-executes the retained reader
+and planted negatives, observing all 64 required completions. Raw terminal events and suite
+counts agree: 391 passing executions, 233 distinct passing tests, zero failures and six
+executions of three unchanged ignored HUD diagnostics. Core map tests contribute 28 passes,
+runtime focused/channel 1/37, renderer focused 5, default renderer 168 and feature-off
+renderer 152. Both renderer modes pass real JSON/Postcard inspection, positive/negative
+field validation, exact byte/cell boundaries, preserved previous inspection and the extended
+production Lab dialog/select/cancel/back/Apply journey. Workspace and explicit GUI-app
+all-target checks/strict Clippy, formatting, four dependency guards, feature-off production
+graph and analyzer build pass. Existing Cargo future-incompatibility and README pin soft
+notices remain; the latter refers to the troubleshooting SQLite submodule OID.
+
+All 124 manifest files / 370,227,513 bytes, exact file membership, all nineteen log hashes,
+profile byte identity and clean expected source binding recompute. Proof:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-inspection-20261017-81fdb72f-r206-local`.
+Build run `5c7d246b-ca17-4d34-9de4-972d9c70ddcc`; outer envelope
+`aff8e38f-f0e4-416a-8c3c-dbbf1321b15f`. Verdict SHA256
+`9fd7a00890e385684424f9ffe0197ae0c2f49340c64050e1a3066c1e648698a2`;
+manifest `d2ee570b2d5b50cad8c06c6034ee059cdcd45622c8e19b6fc32b244d083f72de`.
+Containing DSR exits 6: final private-cache verification refuses the tracked Proptest
+README symlink, Git mode 120000, target `proptest/README.md`. No collected artifact
+identity/hash/size exists; the guard is unchanged. Frozen runner identity check exits zero
+and no launcher-session process remains. Source pushes to both required remote branches
+succeed; working source matches the qualified pin. This is source/headless self-verification
+with failed collection, not native OS, hardware, full-workspace tests, performance,
+independent review or release acceptance. The original editor stays in progress;
+`bd-build-farm-reliability-lb19.2` and remaining editor acceptance stay open. No task closes,
+criterion narrows or dependency changes.
+
+Bounded anti-ceremony review for persisted inspection (three source commits above plus
+the README, existing plan/report and Beads handoff):
+
+- **Creation worksheet:** the requested existing TODO is PROCESS; runtime does not branch
+  on it. Consumer: the operator who requested detailed tracking. Gate/observed gap: that
+  explicit handoff request and the artifact validator lacking a native inspection consumer.
+  Retirement: original editor acceptance; retain the existing report as history. No integrity
+  exception is used, so all four exception questions are inapplicable. The highest-ranked
+  ready item is the macOS host incident `bd-e6ff`; this Linux host cannot resolve it. An hour
+  implementing this consumer beats further reporting. LEGITIMATE GATE, zero capability credit.
+- **Real-work worksheet:** README purpose is a faithful deterministic artificial-life lab
+  with GPU UI, pluggable brains and analytics. Inventory: feature USER; formatting and stronger
+  negative test ENABLER; README USER; plan/report/Beads PROCESS: two USER, two ENABLER, three
+  PROCESS groups, no UNKNOWN. No Bead closes. Demo: inspect saved map cells and diagnostics,
+  return to the unchanged draft and retain guarded Apply. Observed through actual files and
+  headless production input; native OS demonstration remains owed. Removing PROCESS changes
+  no runtime outcome, only requested tracking. Formatting and both renderer suites exercise
+  the enablers. Oldest nonclosed item is root `bd-2z0`, the deterministic Evolution Lab;
+  this consumer advances one part of it. Solo: no pane close counts. No spec or follow-up
+  substitutes for implementation. Verdict DRIFTING: avoidable formatting and a weak first
+  negative cost retries. Correction: strengthen the witness, retain failures, freeze further
+  machinery and finish source qualification/publication. Those corrections are now executed.
+- **Honesty 1:** No weakening (checked full three-commit source diffs and retained original
+  assertions, viewport, deadlines, ignores and unchanged CI/config paths). **2:** No specialized
+  success double (checked real files/generators and existing owner TestHost; platform input
+  remains explicitly headless). **3:** No golden regeneration (checked changed paths).
+  **4:** The external profile adds an early formatting fail-fast and four required inspector
+  completions; all prior nineteen checks and sixty completions remain required, negatives
+  retained. No suppressions, bypass, tolerance, deadline, retry or CI relaxation (source/profile
+  diffs). **5:** No gate-only runtime branch (production inspector consumes the real artifact;
+  Postcard is an existing workspace dependency, and reads have real byte/cell bounds).
+  **6:** No zero-run green (actual events, suite summaries and all 64 named completions).
+  **7:** No unobserved execution claim (nineteen commands/logs, partial attempts scoped above).
+  **8:** No proof-class promotion (headless/software/source and failed collection kept distinct
+  from native OS/hardware/performance/release). **9:** Failures retained: R204 formatting,
+  R205 stopped for a stronger witness with `failed/0`, R206 collection refusal; no clean UBS
+  claim. **10:** No cited stderr discarded (UBS stdout/stderr and DSR tee statuses retained).
+  **11:** No premature closure (original in-progress row and unchanged original criteria).
+  **12:** No spec edited into success (remaining controls, accessibility and native OS criteria
+  retained). **13–17:** Inapplicable: solo, no delegation, accepted agent reports or agreement
+  claims in this window. **18:** No selected-after-result denominator (nineteen checks/64 names
+  required before launch; actual passes/failures/ignores also counted; no performance metric).
+  Older-session search for the actual new inspector test returned zero; the earlier bounded
+  CASS sweeps below remain limited evidence, not an exhaustive historical clearance.
+  **19:** Explain the avoidable formatting retry, the original negative that could accept worker
+  panic, and the whitespace-only diagnostic that failed on trailing commas. All are recorded;
+  neither that comparison nor the interrupted run supports final proof. **20:** Strongest
+  evidence is pinned source plus real-file and production headless input executions, retained
+  commands/raw logs and re-executable reader. These are the author's results, not independent
+  verification. Disposition: corrected in place and disclosed; RH-5 requires a valid/short-field
+  pair and rejects worker loss, SM-11 retains every attempt. No gate weakening or proof inflation.
+
 Native recipe files (`bd-2z0.10.7`, 2026-10-17):
 
 - [x] Reassess authoritative Beads and inspect the real platform dialog APIs.
@@ -25,7 +172,8 @@ Native recipe files (`bd-2z0.10.7`, 2026-10-17):
 Remaining original editor acceptance (kept on `bd-2z0.10.7`):
 
 - [ ] Add interactive rule/sample exemplar and resource/field/hydrology/hazard controls.
-- [ ] Inspect persisted map artifacts in the native editor.
+- [x] Add persisted artifact inspection to the native editor (source/headless qualified above;
+      real native OS input remains owed).
 - [ ] Complete accessible palettes, keyboard/focus and native toroidal-seam journeys.
 - [ ] Retain real native OS input through generate/edit/undo/export/import/Apply/stale refusal,
       with source, adapter, input, content identities and acknowledged owner revisions.

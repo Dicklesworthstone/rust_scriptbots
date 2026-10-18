@@ -654,8 +654,15 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   draft unchanged. Editing while Open is pending discards its result; Save still writes
   the revision captured when its dialog opened and reports that revision separately from
   the current draft. These are input-work bounds, not filesystem latency guarantees.
-  Persisted-artifact inspection, additional field controls,
-  accessible palettes and actual native OS-input acceptance remain open.
+  **Inspect artifact…** opens saved JSON or Postcard map output in a separate inspection
+  view. It validates structure and provenance dimensions, computes the scientific content
+  hash and toroidal seam diagnostics, and shows stored terrain/environment/hydrology
+  values when you select a sampled cell. File decoding and full-map diagnostics run in
+  the background; the view displays at most 32 × 32 sampled cells. Inspection accepts
+  files up to 64 MiB and maps up to the editor's 65,536-cell limit. Draft/history, generated
+  preview and live world stay unchanged; **Back to unchanged draft** returns to the editor.
+  Inspection does not import a recipe or apply the saved map. Additional field/exemplar
+  controls, accessible palettes and actual native OS-input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.
 - A sample specifies `sample_id`, `sample_width`, `sample_height`, `pattern_size`, and row-major `sample_tiles` terrain kinds. `all_orientations` and `periodic` default to true; `periodic: false` is refused because non-periodic extraction is not implemented. Core bounds (`MAX_SAMPLE_CELLS`, `MAX_SAMPLE_OUTPUT_CELLS`, `MAX_SAMPLE_CELL_PAIRS`) admit at most 64 exemplar cells, 65,536 output cells, and 1,048,576 output/exemplar cell pairs before model construction. These are input-work bounds, not wall-clock or exact-byte guarantees. For example, a 2×2 all-sand sample is:
