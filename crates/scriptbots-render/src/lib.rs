@@ -3198,9 +3198,11 @@ impl MapPaintChannel {
         if self == Self::Terrain {
             return Some(format!("{:?}", tile.kind));
         }
-        let hydro = artifact
-            .hydrology_tiles()
-            .and_then(|layer| layer.tiles().get((y * artifact.terrain().width() + x) as usize));
+        let hydro = artifact.hydrology_tiles().and_then(|layer| {
+            layer
+                .tiles()
+                .get((y * artifact.terrain().width() + x) as usize)
+        });
         let value = match self {
             Self::Terrain => return None,
             Self::Elevation => tile.elevation,
@@ -3558,23 +3560,27 @@ impl MapSandbox {
                 Ok(())
             }
             MapAction::Paint(x, y) => {
-                let mut constraint = self.draft.state.constraints.get(x, y).cloned().unwrap_or(
-                    PaintedConstraint {
-                        x,
-                        y,
-                        terrain_kind: None,
-                        elevation: None,
-                        moisture: None,
-                        fertility_bias: None,
-                        temperature_bias: None,
-                        permeability: None,
-                        runoff_bias: None,
-                        basin_rank: None,
-                        channel_priority: None,
-                        swim_cost: None,
-                        hazard: None,
-                    },
-                );
+                let mut constraint =
+                    self.draft
+                        .state
+                        .constraints
+                        .get(x, y)
+                        .cloned()
+                        .unwrap_or(PaintedConstraint {
+                            x,
+                            y,
+                            terrain_kind: None,
+                            elevation: None,
+                            moisture: None,
+                            fertility_bias: None,
+                            temperature_bias: None,
+                            permeability: None,
+                            runoff_bias: None,
+                            basin_rank: None,
+                            channel_priority: None,
+                            swim_cost: None,
+                            hazard: None,
+                        });
                 let value = Some(f32::from(self.paint_tenths) / 10.0);
                 match self.paint_channel {
                     MapPaintChannel::Terrain => constraint.terrain_kind = Some(self.brush),
@@ -3602,7 +3608,10 @@ impl MapSandbox {
             }
             MapAction::PaintValue(delta) => {
                 let (minimum, maximum) = self.paint_channel.range();
-                self.paint_tenths = self.paint_tenths.saturating_add(delta).clamp(minimum, maximum);
+                self.paint_tenths = self
+                    .paint_tenths
+                    .saturating_add(delta)
+                    .clamp(minimum, maximum);
                 return;
             }
             MapAction::Brush => {
@@ -22462,7 +22471,13 @@ mod command_characterization_tests {
                 sandbox.edit(MapAction::Redo);
                 assert_eq!(sandbox.draft.state, painted);
                 assert_eq!(
-                    sandbox.draft.state.constraints.get(0, 0).unwrap().terrain_kind,
+                    sandbox
+                        .draft
+                        .state
+                        .constraints
+                        .get(0, 0)
+                        .unwrap()
+                        .terrain_kind,
                     Some(TerrainKind::Sand),
                 );
             }
@@ -22491,7 +22506,10 @@ mod command_characterization_tests {
             assert_eq!(hydro.basin_rank, 0.8);
             assert_eq!(hydro.channel_priority, 0.9);
             assert_eq!(hydro.swim_cost, 1.2);
-            assert_eq!(artifact.terrain().tiles()[1..], original.terrain().tiles()[1..]);
+            assert_eq!(
+                artifact.terrain().tiles()[1..],
+                original.terrain().tiles()[1..]
+            );
             assert_ne!(artifact.scientific_hash(), original.scientific_hash());
             let mut imported = MapSandbox::new(1, 1, 1);
             imported
@@ -22499,7 +22517,11 @@ mod command_characterization_tests {
                 .unwrap();
             assert_eq!(imported.draft.state, sandbox.draft.state);
             assert_eq!(
-                imported.draft.generate_artifact().unwrap().scientific_hash(),
+                imported
+                    .draft
+                    .generate_artifact()
+                    .unwrap()
+                    .scientific_hash(),
                 artifact.scientific_hash(),
             );
         }
@@ -22528,7 +22550,10 @@ mod command_characterization_tests {
             assert_eq!(sandbox.paint_tenths, maximum);
             sandbox.edit(MapAction::PaintValue(1));
             assert_eq!(sandbox.paint_tenths, maximum);
-            assert_eq!(sandbox.draft, draft, "choosing a brush must not edit history");
+            assert_eq!(
+                sandbox.draft, draft,
+                "choosing a brush must not edit history"
+            );
             sandbox.edit(MapAction::Paint(8, 0));
             assert!(sandbox.notice.starts_with("Draft edit refused:"));
             assert_eq!(sandbox.draft, draft);
@@ -22575,7 +22600,10 @@ mod command_characterization_tests {
         sandbox.edit(MapAction::PaintValue(i16::MAX));
         sandbox.edit(MapAction::Paint(2, 0));
         let artifact = sandbox.draft.generate_artifact().unwrap();
-        assert_eq!(artifact.hydrology_tiles().unwrap().tiles()[2].swim_cost, 10.0);
+        assert_eq!(
+            artifact.hydrology_tiles().unwrap().tiles()[2].swim_cost,
+            10.0
+        );
         assert!(!sandbox.can_apply());
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
