@@ -22636,7 +22636,7 @@ mod command_characterization_tests {
             let mut expected_tile = *painted.terrain().tile(0, 0).unwrap();
             expected_tile.accent = 1.0;
             assert_eq!(hazard.terrain().tile(0, 0), Some(&expected_tile));
-            let mut expected_hydro = painted.hydrology_tiles().unwrap().tiles()[0];
+            let mut expected_hydro = painted.hydrology_tiles().unwrap().tiles()[0].clone();
             expected_hydro.swim_cost = 10.0;
             assert_eq!(hazard.hydrology_tiles().unwrap().tiles()[0], expected_hydro);
             assert_eq!(
