@@ -22510,7 +22510,10 @@ mod command_characterization_tests {
                 artifact.terrain().tiles()[1..],
                 original.terrain().tiles()[1..]
             );
-            assert_ne!(artifact.scientific_hash(), original.scientific_hash());
+            assert_ne!(
+                artifact.scientific_content_hash(),
+                original.scientific_content_hash()
+            );
             let mut imported = MapSandbox::new(1, 1, 1);
             imported
                 .import_draft(&sandbox.export_draft().unwrap())
@@ -22521,8 +22524,8 @@ mod command_characterization_tests {
                     .draft
                     .generate_artifact()
                     .unwrap()
-                    .scientific_hash(),
-                artifact.scientific_hash(),
+                    .scientific_content_hash(),
+                artifact.scientific_content_hash(),
             );
         }
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
