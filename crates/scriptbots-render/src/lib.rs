@@ -3775,8 +3775,7 @@ impl MapSandbox {
     }
 
     fn edit_rule(&mut self, action: MapAction) -> Result<(), MapGenerationError> {
-        let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config
-        else {
+        let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config else {
             return Err(MapGenerationError::DraftError(
                 "Choose rules mode first.".to_owned(),
             ));
@@ -3829,9 +3828,7 @@ impl MapSandbox {
                     MapPaintChannel::BasinRank => &mut tile.basin_rank,
                     MapPaintChannel::ChannelPriority => &mut tile.channel_priority,
                     MapPaintChannel::SwimCost => &mut tile.swim_cost,
-                    MapPaintChannel::Terrain
-                    | MapPaintChannel::Hazard
-                    | MapPaintChannel::Erase => {
+                    MapPaintChannel::Terrain | MapPaintChannel::Hazard | MapPaintChannel::Erase => {
                         return Err(MapGenerationError::DraftError(
                             "Choose a prototype scalar field.".to_owned(),
                         ));
@@ -4647,7 +4644,11 @@ impl SimulationView {
             ),
             (
                 "map-rule-next",
-                format!("Prototype {} / {} (next)", sandbox.rule_tile + 1, tileset.tiles.len()),
+                format!(
+                    "Prototype {} / {} (next)",
+                    sandbox.rule_tile + 1,
+                    tileset.tiles.len()
+                ),
                 MapAction::RuleNextTile,
                 tileset.tiles.len() > 1,
             ),
@@ -23225,8 +23226,7 @@ mod command_characterization_tests {
         let DraftGeneratorConfig::RuleBased { tileset } = &edited.generator_config else {
             panic!("prototype edits retain rules mode");
         };
-        let DraftGeneratorConfig::RuleBased { tileset: prior } = &original.generator_config
-        else {
+        let DraftGeneratorConfig::RuleBased { tileset: prior } = &original.generator_config else {
             panic!("original rules");
         };
         assert_eq!(tileset.id, prior.id);
@@ -23234,10 +23234,7 @@ mod command_characterization_tests {
         assert_eq!(tileset.adjacency, prior.adjacency);
         assert_eq!(tileset.tiles[0].id, prior.tiles[0].id);
         assert_eq!(tileset.tiles[0].label, prior.tiles[0].label);
-        assert_eq!(
-            tileset.tiles[0].palette_index,
-            prior.tiles[0].palette_index
-        );
+        assert_eq!(tileset.tiles[0].palette_index, prior.tiles[0].palette_index);
         assert_eq!(tileset.tiles[0].accent, prior.tiles[0].accent);
         assert_eq!(tileset.tiles[0].weight, 5);
         assert_eq!(edited.constraints, original.constraints);
@@ -23277,7 +23274,11 @@ mod command_characterization_tests {
         restored.import_draft(&json).unwrap();
         assert_eq!(restored.draft.state, edited);
         assert_eq!(
-            restored.draft.generate_artifact().unwrap().scientific_content_hash(),
+            restored
+                .draft
+                .generate_artifact()
+                .unwrap()
+                .scientific_content_hash(),
             hash
         );
         sandbox.edit(MapAction::RuleDefault);
@@ -23288,7 +23289,10 @@ mod command_characterization_tests {
         };
         tileset.tiles[0].swim_cost = None;
         assert_eq!(sandbox.draft.state, expected);
-        assert_eq!(defaulted.hydrology_tiles().unwrap().tiles()[0].swim_cost, 0.3);
+        assert_eq!(
+            defaulted.hydrology_tiles().unwrap().tiles()[0].swim_cost,
+            0.3
+        );
         sandbox.edit(MapAction::Undo);
         assert_eq!(sandbox.draft.state, edited);
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
@@ -23418,7 +23422,9 @@ mod command_characterization_tests {
         sandbox.edit(MapAction::RuleWeight(1));
         wait_map_job(&mut sandbox);
         assert!(
-            sandbox.notice.contains("Discarded cancelled or edited draft result")
+            sandbox
+                .notice
+                .contains("Discarded cancelled or edited draft result")
         );
         assert!(Arc::ptr_eq(
             &sandbox.preview.as_ref().unwrap().artifact,
@@ -23436,7 +23442,8 @@ mod command_characterization_tests {
         assert_eq!(sandbox.draft, draft);
         assert!(sandbox.notice.contains("out of range"));
         sandbox.rule_tenths = 5;
-        if let DraftGeneratorConfig::RuleBased { tileset } = &mut sandbox.draft.state.generator_config
+        if let DraftGeneratorConfig::RuleBased { tileset } =
+            &mut sandbox.draft.state.generator_config
         {
             tileset.adjacency.push(scriptbots_core::AdjacencySpec {
                 tile_a: "missing".to_owned(),
@@ -23451,14 +23458,19 @@ mod command_characterization_tests {
         assert_eq!(sandbox.draft, draft);
         assert!(sandbox.notice.contains("unknown tile"));
         sandbox.draft.state = initial.clone();
-        if let DraftGeneratorConfig::RuleBased { tileset } = &mut sandbox.draft.state.generator_config
+        if let DraftGeneratorConfig::RuleBased { tileset } =
+            &mut sandbox.draft.state.generator_config
         {
             tileset.tiles[0].weight = MAP_RULE_EDITOR_MAX_WEIGHT + 1;
         }
         let draft = sandbox.draft.clone();
         sandbox.edit(MapAction::RuleWeight(-1));
         assert_eq!(sandbox.draft, draft);
-        assert!(sandbox.notice.contains("Imported weight exceeds editor range"));
+        assert!(
+            sandbox
+                .notice
+                .contains("Imported weight exceeds editor range")
+        );
         sandbox.draft.state = initial;
         sandbox.edit(MapAction::Generator);
         let draft = sandbox.draft.clone();
@@ -24227,11 +24239,20 @@ mod command_characterization_tests {
         for _ in 0..4 {
             click(&mut lab, "map-undo");
         }
-        assert_eq!(session.map_sandbox.lock().unwrap().draft.state, original_rules);
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            original_rules
+        );
         click(&mut lab, "map-redo");
-        assert_ne!(session.map_sandbox.lock().unwrap().draft.state, original_rules);
+        assert_ne!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            original_rules
+        );
         click(&mut lab, "map-undo");
-        assert_eq!(session.map_sandbox.lock().unwrap().draft.state, original_rules);
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            original_rules
+        );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         click(&mut lab, "map-rules-back");
         click(&mut lab, "map-seed");
