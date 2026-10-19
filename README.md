@@ -647,7 +647,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   Hazards supplied by the generator may remain. **Erase cell overrides** removes all paint
   at the clicked cell while preserving other cells; regenerate for the generator's values.
   Erasure is undoable, and erasing an unpainted cell preserves history and the preview.
-  Adjacency authoring, resource controls and native OS acceptance remain open.
+  Resource controls and native OS acceptance remain open.
   Generation runs in one bounded background slot. Cancellation discards the result;
   that slot remains occupied until the underlying generator finishes.
   **Switch rules / sample** selects the default rule tileset or the versioned
@@ -664,7 +664,18 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   change them through the recipe. Selection and brush changes do not edit the draft;
   actual edits share undo/redo, and unchanged values preserve preview/history. Return
   to the draft and generate again to inspect the real rules hash and output before Apply.
-  Adding/removing prototypes and editing adjacency or palette still require a recipe.
+  **Edit adjacency** opens the ordered rule entries. Select prototypes A/B and A's
+  cardinal side to append a rule joining B's opposite side. **Append forbid** excludes
+  that neighbor; **Append allow-list entry** restricts the endpoint/side to its explicit
+  allow list. Order matters, and every entry affects both endpoints; a physical pair
+  must satisfy both facing endpoint lists. Inspect existing
+  entries with **Next existing entry**, then toggle or remove the selected record.
+  Imported direction spellings and unrelated entries stay intact. Native appends are
+  bounded to 256 entries, and the complete portable recipe must stay within 1 MiB.
+  Empty neighbor lists are refused without changing the draft; a valid rule list may
+  still contradict the requested toroidal dimensions when generated. Entries share
+  undo/redo. Return to the draft and generate before using guarded Apply.
+  Adding/removing prototypes and palette editing still require a recipe.
   In sample mode, **Edit sample** opens a separate exemplar view. Use the existing
   grass/water/sand brush to paint its cells, cycle the pattern size from 1 to the smaller
   exemplar dimension, or toggle rotations/reflections. Edits retain the sample label,
@@ -704,7 +715,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   that opens the exemplar view. Output dimensions, seed and painted output constraints
   are retained. Fertility, temperature and hydrology are not copied into the exemplar;
   they come from generation defaults and output constraints. Generate a fresh preview
-  before applying. Resource/adjacency controls, additional sample sizing controls, accessible
+  before applying. Resource controls, additional sample sizing controls, accessible
   palettes and actual native OS-input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.

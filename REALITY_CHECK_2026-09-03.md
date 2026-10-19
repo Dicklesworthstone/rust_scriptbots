@@ -10,6 +10,183 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Native adjacency authoring (`bd-2z0.10.7`, 2026-10-19, in progress):
+
+- [x] Recheck ready work, original acceptance and the compiler's ordered two-endpoint rule semantics.
+- [x] Reserve existing files and retain the original in-progress task and acceptance.
+- [x] Connect bounded opposite-side allow-list/forbid entry authoring and existing-entry inspection/toggle/removal (both R223 renderer modes).
+- [x] Repair the R222-observed compiler support-list asymmetry without weakening the failing probes (29 core maps; both renderer modes).
+- [x] Preserve full draft validation, unrelated recipe data, shared undo/redo, no-ops and preview/job guards (both modes).
+- [x] Observe generated neighbor relationships, toroidal contradictions, recipe/history round trips and unchanged live science (both modes).
+- [x] Extend actual production headless input without weakening previous assertions, viewport or deadlines (both modes).
+- [x] Review exact diffs, scan changed paths and run all nineteen pinned DSR checks with old required probes retained.
+- [x] Recompute raw evidence, publish qualified source and prepare existing instructions/tracker snapshots; leave native/full acceptance open.
+
+Creation gate: this in-place TODO is PROCESS for the operator's explicit granular tracking
+request. The observed defect is an existing rule compiler without native adjacency inputs.
+Retire the active list on original editor acceptance, retaining history; no integrity exception.
+Opportunity cost remains the broader visual redesign and the unavailable macOS P0 incident.
+Prefer this bounded generator consumer to additional planning; no new task, edge or process tool.
+
+Initial adjacency source `56d8d31012d24597b136b23ca4da4610b4d560ab`, tree
+`abf8af96c0b8b2661fa73e2566d9a9e91ebdc94f`, starts pinned R220. All nineteen checks,
+the old 84 required completions and the old reader/planted negatives remain; the three
+new probes in both modes make 90 predeclared required completions. Profile SHA256
+`6b26f15f3989ccb6809518ab86dd3ade5ecf43d21c2fc1ecf4dc1213d2227061`;
+launcher `cbefc24e48e91df64bf2c0625074776e732c10fd78980aafe9008da98b34ee6c`.
+Exact-file UBS exits 1: two critical timestamp heuristics, 2,356 warnings, 842 informational;
+not a clean scan. Qualification/publication remain pending; source/headless evidence will
+not substitute for native OS, hardware, independent, performance or collection proof.
+
+R220 stops at five formatting layouts before compilation/tests: source `failed/1`,
+one command/log pair `1/0`, outer 6 / runner identity zero; finished 2026-10-19
+17:28:49 UTC. All ten manifest files / 27,950 bytes and log hashes recompute, exact
+membership matches, and launcher SID 2648662 is absent. Apply layouts manually and
+strengthen the direction probe with a third kind and an observed asymmetric reverse
+neighbor; the two-kind alternating case could not distinguish opposite directions.
+Retain every existing assertion and required probe; repeat qualification at a new pin.
+
+Correction source `6461985fa9e142648eb4bc8b0d9f4cf802ff7418`, tree
+`c6a953fb70dc85999218d8f3ca18490a582c2fb4`, starts R221 with the same nineteen
+checks and byte-identical reader/planted negatives/90 required completions. Profile
+SHA256 `5737cffa97cb058e3f78b895d1b6b4afe9569073d5299c643b9f9caab65a5b4e`;
+launcher `060ff535453496d9b9d95d85fc979dbf8dbacde6a2518e8cc0a29eff82a4eb72`.
+Repeated exact-file UBS exits 1: two critical heuristics, 2,359 warnings, 842 informational;
+not clean. Source qualification and publication remain pending.
+
+R221 passes format, four guards, core Clippy/28 map tests and the feature-off dependency
+graph, then renderer compilation reports E0282 at the new label helper's untyped index.
+Its recorded Clippy/log pair is `101/0`. Stop only its inspected native process group
+2679026 (SID 2676664), retaining the failure; no renderer test result is claimed. The
+interrupted source receipt is `failed/0`, nine command rows, outer 6 / runner identity
+zero, finished 2026-10-19 17:35:06 UTC. Status is failed despite its trap exit zero.
+All 28 manifest files / 134,400 bytes, exact membership and recorded log hashes
+recompute; the entire owned SID is absent. Ordinary correction
+`287781ffdfeec25ea6da630ef89f1458a26567bd`, tree
+`8170924422c17ad79fa7f9a14d8156b8a9ae02ee`, supplies explicit `usize` and starts R222.
+Profile SHA256 `a1bd3ffb4bdd1dcf82cd3d71b02075ece7e12e1675c67ae19ef88f46f13f91b6`;
+launcher `b016cc3f9b0314e90dd8c8c7c5500ce4498deebd76b543d88e7f82bcac196257`.
+All nineteen checks, the 90 required completions and reader/planted negatives remain
+identical. Repeated exact-file UBS retains the same non-clean 2/2,359/842 counts.
+Qualification/publication remain pending; do not infer a green result from an exit code.
+
+R222 passes the nine preceding command/log pairs, including renderer strict Clippy,
+then the feature-off library suite reports 159 passes / three failures / three existing
+ignores. All three failures are the new adjacency probes: generation produces no preview;
+the existing production-input journey passes. Stop only inspected native group 2744084
+(SID 2741948); no later check is claimed. Source receipt `failed/0`, ten recorded rows,
+test/log pair `101/0`, outer 6 / runner identity zero, finished 2026-10-19 17:42:03 UTC.
+All 58 manifest files / 139,523,039 bytes, exact membership and recorded log hashes
+recompute; the owned SID is absent. Preserve the failing probes.
+
+The compiler hands WFC asymmetric compatibility lists after a one-sided allow list.
+The pinned [WFC implementation](https://raw.githubusercontent.com/gridbugs/wfc/4b03bf9f43b22febc9b9be360f1f13d328a15ac6/wfc/src/wfc.rs)
+initializes support counts from opposite lists but propagates through forward lists.
+Resolve ordered authoring first, then intersect each physical pair with its facing
+endpoint's permission. This preserves raw recipes and refuses a resulting empty list.
+Add a core regression for nonempty authored lists whose physical endpoints conflict;
+keep all three observed failing renderer probes and improve their error diagnostics.
+This is a producer fix, not a gate relaxation; full qualification remains pending.
+
+Producer correction `12efb62f1df7e560dfbcf0a1da42b62af8db8db3`, tree
+`cc18facf27f99ccf3884e86998a861abb8acdb24`, starts R223. Retain all nineteen checks,
+the previous 90 required completions and every reader/planted-negative assertion; the
+new core regression makes 91 required completions declared before launch. Profile
+SHA256 `c24f147fee189259cda97363e2dad49eab1d881fc88292ff38166655180aef57`;
+launcher `cdeb079a5951a4df1d47f0e7aa0eb682e6a593da61cd1ce9aea042d754883fdb`.
+Exact-file UBS: core exits 0 with 0 critical / 5,356 warnings / 1,033 informational;
+renderer exits 1 with 2 critical / 2,361 warnings / 842 informational. Neither scan is
+called clean; renderer criticals remain the existing temporary-capture timestamp heuristics.
+Source qualification/publication and full original acceptance remain pending.
+
+**Published adjacency result:** source `12efb62f1df7e560dfbcf0a1da42b62af8db8db3`
+is pushed normally to both required refs. R223 finishes 2026-10-19 18:05:07 UTC:
+nineteen command/log pairs exit zero and the source receipt is `pass/0`. A fresh solo
+re-execution of the retained reader/planted negatives verifies all 91 required completions.
+Raw events agree with nonzero suite summaries: 418 passing executions / 247 distinct
+passing names / zero failures / six executions of three unchanged ignored HUD diagnostics.
+Core maps 29, runtime focused/channel 1/37, renderer focused 5, full default renderer 181,
+feature-off renderer 165. The three exact R222 failing adjacency probes now pass; all
+159 prior feature-off library passes and all three ignores are preserved. Both modes
+observe asymmetric generated neighbors on all four toroidal sides, forbid behavior,
+recipe/hash/history round trips, byte/count bounds, atomic refusals and edited-job
+invalidation. The valid alternating model generates, while its odd-width torus still
+fails; the core also refuses conflicting facing lists. Production headless input reaches
+every new control before the existing sample/file/guarded-Apply journey. Viewport,
+visibility assertions, deadlines, old assertions and ignores remain unchanged.
+
+Workspace and GUI-app all-target check/strict Clippy, both renderer Clippy configurations,
+format, four guards, feature-off production dependency graph and analyzer build pass.
+All nineteen captured command files are byte-identical to R219. Existing upstream
+future-incompatibility/submodule notices and the non-clean UBS results remain.
+All 128 manifest files / 370,244,835 bytes, exact membership, nineteen log hashes,
+profile byte identity and clean source/runner commit/tree identities recompute. Launcher
+SID 2945820 is absent; five frozen helper identities pass before and after. Proof:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-adjacency-20261019-12efb62f-r223-local`.
+Build run `947c907b-5b40-4cb3-9d8b-73d2463c7e53`; envelope
+`6a04998f-0945-41de-8d81-165abdb56946`. Verdict SHA256
+`1a3fe74ed909133b7f518c69da8d45b72a73b5b8e0a47a889ea13191322b3db8`;
+manifest `c8a433ab1c4963c8fae4de3ac9b9b78cacb96b897def3279d805494b9602ae83`.
+Outer DSR exits 6 / runner identity zero: final cache verification refuses the actual
+tracked mode-120000 Proptest README symlink to `proptest/README.md` before collection.
+Guard unchanged; no collected release artifact. `bd-build-farm-reliability-lb19.2` stays
+open. `bd-2z0.10.7` stays in progress with original acceptance: prototype roster/palette
+authoring, resource strata, additional sample sizing, accessible palettes and actual
+native OS/full editor acceptance remain. No native OS, hardware, independent, performance
+or full-workspace-test qualification is inferred. Separate `/dp` work remains inventory-only.
+
+Adjacency increment real-work audit (four actual source commits since `eb5696ae`, plus
+the final existing documentation/tracker snapshots): README purpose is a deterministic
+artificial-life laboratory. `56d8d310` and `12efb62f` are USER; `6461985f` and `287781ff`
+are ENABLER exercised by real compiler/renderer checks; conservatively classify each mixed
+documentation/tracker snapshot as PROCESS. Tally 2 USER / 2 ENABLER / 2 PROCESS / 0 UNKNOWN,
+zero closures; counts are diagnostic, not a quota. Q1: demo adjacency authoring, inspection,
+toggle/removal, undo, generation and guarded Apply. Q2: omitting process changes no runtime
+behavior; it loses the explicitly requested TODO, instructions and failure disclosure.
+Q3: the stronger direction witness and typed index actually enable renderer qualification.
+Q4: the oldest active user-facing root is `bd-2z0`, created 2026-07-11; this work implements
+its map-authoring path while the higher-ready P0 incident needs macOS and the local visual
+redesign is broader. Q5: solo, no close-farming. Q6: no new task/edge/closure or narrowed
+criterion; no plan is credited as implementation. Verdict **HEALTHY** for the capability
+increment, with avoidable format/inference retries and growing recordkeeping cost disclosed.
+Keep the next block on USER capability; no new process tooling. The existing report/TODO
+is PROCESS under the creation gate above; per-attempt profiles retire from active use at
+completion while their required evidence is retained. No integrity exception is invoked.
+
+Adjacency increment honesty inventory (same bounded window, fresh self-review):
+
+1. No (checked all four frozen source diffs, aggregate removals and reflog): no old test/assertion/ignore/deadline/viewport weakened or history rewritten; the new direction guard is stronger.
+2. No (checked probes): actual generators, generated artifacts and HostCore are exercised; GPUI input remains a headless test backend.
+3. No (checked paths): no golden/snapshot regeneration.
+4. Yes, product compiler validation changed in separately reviewed `12efb62f`: facing permissions are intersected, and empty physical lists refuse. Positive allow-list maps now generate; conflicting opposite lists refuse. No release/test gate, suppression or tolerance relaxed; nineteen command files remain identical, and one core regression is added.
+5. No (checked dispatch/configuration): no demo/environment/benchmark shortcut; disclosed native append and recipe bounds are product input policy.
+6. No (checked starts, terminal events, nonzero summaries and planted negatives): all 91 required completions execute; interrupted `failed/0` receipts remain explicitly failed.
+7. No (checked raw logs and recomputed hashes): the final counts/identities are observed; no unexecuted result is credited.
+8. No (checked claims): headless/software/source proof stays below native OS, hardware, independent, performance and collected-release proof.
+9. No (checked retained attempts and this report): R220 formatting, R221 inference, R222 generator failures, non-clean UBS and R223 outer collection refusal are disclosed above; original acceptance remains open.
+10. No (checked captures): cited stdout/stderr and first failures are retained; none is discarded for a green claim.
+11. No (checked Beads): original in-progress status, criteria and dependencies remain; no follow-up laundering or closure.
+12. No (checked README/plan and original criteria): additive usage/progress preserves unmet native/full acceptance.
+13. Solo (checked this window's calls): no own or peer delegated closure.
+14. Solo (same check): no subagent dispatch.
+15. Solo (same check): no subagent report accepted.
+16. Solo (same check): no panes farming refusals or closes.
+17. No (checked labels): fresh self-review is not independent verification or independent agreement.
+18. No (checked prelaunch profiles): nineteen checks / 91 final required completions / six test-log categories were declared before results; failures, missing completions and unchanged ignores remain countermetrics.
+19. Explain the avoidable formatter/inference retries, the initial two-kind direction ambiguity, and source pass versus outer collection failure before presenting success.
+20. Strongest evidence is the same three R222 failures becoming R223 passes at exact clean `12efb62f`, with prior passes preserved, observed generated asymmetric neighbors, the core conflict regression and freshly re-executed reader/negatives; the retained pinned profile is reproducible.
+
+CASS scope: prior five phrase sweeps and their coordinate limits remain below. Current
+workspace-derived `map_sandbox_adjacency` query (limit two) returns two older plan/tool-output
+hits from the September 4 session. Following the physical lines and bounded expansion
+returns metadata/tool events rather than the indexed match; this does not clear older
+behavior. Status says healthy/fresh while `last_indexed_at` remains 2026-09-16; no
+broad history conclusion follows. Captures are external `adjacency-cass-{status,derived,view,expand}-20261019`
+JSON/stderr. Disposition: corrections are ordinary additive commits, failures and proof
+limits are disclosed, and SM-11 first-attempt retention, RH-17 no-rewrite history, RH-2
+proof-class limits and PL-1 required-name/nonzero checks remain the countermeasures.
+No broad history innocence claim or new governance machinery is made.
+
 Native rule-prototype authoring (`bd-2z0.10.7`, 2026-10-19):
 
 - [x] Refresh instructions, ready work and original acceptance; inspect real prototype/compiler/history consumers.

@@ -2410,6 +2410,28 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native adjacency authoring, 2026-10-19 (`bd-2z0.10.7`):**
+connect ordered allow-list/forbid entries to the existing compiler, with bounded endpoint
+selection, existing-entry inspection/toggle/removal, atomic validation and shared history.
+Verify actual toroidal output and contradictory cases; keep original native OS/full editor
+acceptance unchanged and open.
+
+Source `12efb62f1df7e560dfbcf0a1da42b62af8db8db3` is published to both required refs.
+R223 passes nineteen source command/log pairs and typed `pass/0`; a fresh retained-reader
+and planted-negative pass verifies 91 required completions. Raw totals: 418 passing
+executions / 247 distinct names / zero failures / six executions of three unchanged
+ignored diagnostics. Both renderer modes exercise adjacency controls and actual directed
+toroidal neighbors, recipe/history/no-op/refusal and edited-job behavior. The new probes
+exposed a core support-list asymmetry in R222; the producer fix preserves all three probes
+and intersects facing permissions before WFC. Valid allow-list maps now generate, odd-width
+alternation still contradicts, and a new core probe refuses conflicting opposite lists.
+All 128 manifest files / 370,244,835 bytes, exact membership, hashes and clean source/profile
+identities recompute. Outer DSR still exits 6 on the tracked Proptest README symlink before
+collection; guard unchanged, no collected release artifact. Keep prototype roster/palette
+authoring, resource strata, additional sample sizing, accessible palettes and native OS/full
+original acceptance open. R220/R221/R222 failures and the bounded solo audit are retained
+in the existing reality-check report; no criterion narrows.
+
 **[Currently In Progress] Native rule-prototype authoring, 2026-10-19 (`bd-2z0.10.7`):**
 connect existing terrain/weight/environment/hydrology prototype inputs to a dedicated
 validated draft view, preserving adjacency, other prototypes, output constraints, history
