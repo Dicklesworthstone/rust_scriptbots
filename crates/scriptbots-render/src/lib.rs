@@ -44,10 +44,10 @@ use scriptbots_core::{
     TickSummary, TraitModifiers, Velocity, WorldState, tier_features, toroidal_delta,
 };
 use scriptbots_core::{
-    ConstraintLayer, DraftGeneratorConfig, DraftState, ExistingAgentPolicy, MAX_SAMPLE_CELL_PAIRS,
-    MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft, MapGenerationError, PaintedConstraint,
-    SamplePatternSpec, TileSpec, TilesetSpec, ToroidalSeamReport, check_toroidal_seams,
-    compute_sample_hash, default_tileset_spec,
+    AdjacencySpec, ConstraintLayer, DraftGeneratorConfig, DraftState, ExistingAgentPolicy,
+    MAX_SAMPLE_CELL_PAIRS, MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft,
+    MapGenerationError, PaintedConstraint, SamplePatternSpec, TileSpec, TilesetSpec,
+    ToroidalSeamReport, check_toroidal_seams, compute_sample_hash, default_tileset_spec,
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
@@ -2845,6 +2845,13 @@ const MAP_DRAFT_MAX_RULE_TILES: usize = 64;
 const MAP_DRAFT_SCHEMA: &str = "scriptbots.map-draft.v1";
 const MAP_EXTRACT_SAMPLE_SIDE: u32 = 3;
 const MAP_RULE_EDITOR_MAX_WEIGHT: u32 = 1000;
+const MAP_RULE_SIDES: [(&str, &str); 4] = [
+    ("north", "south"),
+    ("east", "west"),
+    ("south", "north"),
+    ("west", "east"),
+];
+const MAP_RULE_EDITOR_MAX_ADJACENCY: usize = MAP_DRAFT_MAX_RULE_TILES * MAP_RULE_SIDES.len();
 
 /// Portable editing inputs only: no imported history, receipt, revision or applied claim.
 /// A record list keeps nonempty painted constraints representable in JSON.
@@ -3264,7 +3271,11 @@ struct MapSandbox {
     inspection_cell: (u32, u32),
     sample_editor_open: bool,
     rules_editor_open: bool,
+    adjacency_editor_open: bool,
     rule_tile: usize,
+    rule_neighbor: usize,
+    rule_side: usize,
+    rule_entry: usize,
     rule_field: MapPaintChannel,
     rule_tenths: i16,
     policy: ExistingAgentPolicy,
@@ -3296,7 +3307,11 @@ impl MapSandbox {
             inspection_cell: (0, 0),
             sample_editor_open: false,
             rules_editor_open: false,
+            adjacency_editor_open: false,
             rule_tile: 0,
+            rule_neighbor: 0,
+            rule_side: 0,
+            rule_entry: 0,
             rule_field: MapPaintChannel::Elevation,
             rule_tenths: 5,
             policy: ExistingAgentPolicy::Retain,
@@ -3371,6 +3386,7 @@ impl MapSandbox {
         self.preview = None;
         self.sample_editor_open = false;
         self.rules_editor_open = false;
+        self.adjacency_editor_open = false;
         Ok(())
     }
 
@@ -3614,6 +3630,7 @@ impl MapSandbox {
                     } else {
                         self.rule_tile = self.rule_tile.min(tileset.tiles.len() - 1);
                         self.rules_editor_open = true;
+                        self.adjacency_editor_open = false;
                         self.sample_editor_open = false;
                     }
                 } else {
@@ -3623,7 +3640,48 @@ impl MapSandbox {
             }
             MapAction::BackFromRules => {
                 self.rules_editor_open = false;
+                self.adjacency_editor_open = false;
                 return;
+            }
+            MapAction::EditAdjacency => {
+                if let DraftGeneratorConfig::RuleBased { tileset } =
+                    &self.draft.state.generator_config
+                    && !tileset.tiles.is_empty()
+                    && tileset.tiles.len() <= MAP_DRAFT_MAX_RULE_TILES
+                {
+                    self.rule_neighbor = self.rule_neighbor.min(tileset.tiles.len() - 1);
+                    self.adjacency_editor_open = true;
+                }
+                return;
+            }
+            MapAction::BackFromAdjacency => {
+                self.adjacency_editor_open = false;
+                return;
+            }
+            MapAction::RuleNeighbor => {
+                if let DraftGeneratorConfig::RuleBased { tileset } =
+                    &self.draft.state.generator_config
+                    && !tileset.tiles.is_empty()
+                {
+                    self.rule_neighbor = (self.rule_neighbor.saturating_add(1)) % tileset.tiles.len();
+                }
+                return;
+            }
+            MapAction::RuleSide => {
+                self.rule_side = (self.rule_side.saturating_add(1)) % MAP_RULE_SIDES.len();
+                return;
+            }
+            MapAction::RuleNextEntry => {
+                if let DraftGeneratorConfig::RuleBased { tileset } =
+                    &self.draft.state.generator_config
+                    && !tileset.adjacency.is_empty()
+                {
+                    self.rule_entry = (self.rule_entry.saturating_add(1)) % tileset.adjacency.len();
+                }
+                return;
+            }
+            MapAction::RuleAppend(_) | MapAction::RuleToggleEntry | MapAction::RuleRemoveEntry => {
+                self.edit_adjacency(action)
             }
             MapAction::RuleNextTile => {
                 if let DraftGeneratorConfig::RuleBased { tileset } =
@@ -3772,6 +3830,72 @@ impl MapSandbox {
                 }
             },
         );
+        if let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config {
+            self.rule_entry = self.rule_entry.min(tileset.adjacency.len().saturating_sub(1));
+        }
+    }
+
+    fn edit_adjacency(&mut self, action: MapAction) -> Result<(), MapGenerationError> {
+        let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config else {
+            return Err(MapGenerationError::DraftError(
+                "Choose rules mode first.".to_owned(),
+            ));
+        };
+        let mut tileset = tileset.clone();
+        match action {
+            MapAction::RuleAppend(allowed) => {
+                let tile_a = tileset.tiles.get(self.rule_tile);
+                let tile_b = tileset.tiles.get(self.rule_neighbor);
+                let sides = MAP_RULE_SIDES.get(self.rule_side);
+                let (Some(tile_a), Some(tile_b), Some((side_a, side_b))) = (tile_a, tile_b, sides)
+                else {
+                    return Err(MapGenerationError::DraftError(
+                        "Select existing prototypes and an opposite-side direction.".to_owned(),
+                    ));
+                };
+                let entry = AdjacencySpec {
+                    tile_a: tile_a.id.clone(),
+                    side_a: (*side_a).to_owned(),
+                    tile_b: tile_b.id.clone(),
+                    side_b: (*side_b).to_owned(),
+                    allowed,
+                };
+                if tileset.adjacency.last() == Some(&entry) {
+                    return Ok(());
+                }
+                if tileset.tiles.len() > MAP_DRAFT_MAX_RULE_TILES
+                    || tileset.adjacency.len() >= MAP_RULE_EDITOR_MAX_ADJACENCY
+                {
+                    return Err(MapGenerationError::DraftError(format!(
+                        "Native authoring supports at most {MAP_DRAFT_MAX_RULE_TILES} prototypes and {MAP_RULE_EDITOR_MAX_ADJACENCY} ordered entries; remove entries or edit the recipe."
+                    )));
+                }
+                tileset.adjacency.push(entry);
+            }
+            MapAction::RuleToggleEntry => {
+                let entry = tileset.adjacency.get_mut(self.rule_entry).ok_or_else(|| {
+                    MapGenerationError::DraftError("Select an existing adjacency entry.".to_owned())
+                })?;
+                entry.allowed = !entry.allowed;
+            }
+            MapAction::RuleRemoveEntry => {
+                if self.rule_entry >= tileset.adjacency.len() {
+                    return Err(MapGenerationError::DraftError(
+                        "Select an existing adjacency entry.".to_owned(),
+                    ));
+                }
+                tileset.adjacency.remove(self.rule_entry);
+            }
+            _ => return Ok(()),
+        }
+        let next_entry = if matches!(action, MapAction::RuleAppend(_)) {
+            tileset.adjacency.len().saturating_sub(1)
+        } else {
+            self.rule_entry.min(tileset.adjacency.len().saturating_sub(1))
+        };
+        self.replace_rules(tileset)?;
+        self.rule_entry = next_entry;
+        Ok(())
     }
 
     fn edit_rule(&mut self, action: MapAction) -> Result<(), MapGenerationError> {
@@ -3839,8 +3963,19 @@ impl MapSandbox {
             }
             _ => return Ok(()),
         }
+        self.replace_rules(tileset)
+    }
+
+    fn replace_rules(&mut self, tileset: TilesetSpec) -> Result<(), MapGenerationError> {
         let mut document = MapDraftDocument::from_draft(&self.draft);
         document.generator_config = DraftGeneratorConfig::RuleBased { tileset };
+        let json = serde_json::to_string_pretty(&document)
+            .map_err(|error| MapGenerationError::DraftError(error.to_string()))?;
+        if json.len() > MAP_DRAFT_MAX_BYTES {
+            return Err(MapGenerationError::DraftError(format!(
+                "Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."
+            )));
+        }
         let state = document
             .into_state()
             .map_err(MapGenerationError::DraftError)?;
@@ -4031,6 +4166,14 @@ enum MapAction {
     SampleOrientations,
     EditRules,
     BackFromRules,
+    EditAdjacency,
+    BackFromAdjacency,
+    RuleNeighbor,
+    RuleSide,
+    RuleNextEntry,
+    RuleAppend(bool),
+    RuleToggleEntry,
+    RuleRemoveEntry,
     RuleNextTile,
     RuleTerrain,
     RuleWeight(i16),
@@ -4618,6 +4761,9 @@ impl SimulationView {
         tileset: &TilesetSpec,
         cx: &mut Context<Self>,
     ) -> Div {
+        if sandbox.adjacency_editor_open {
+            return self.render_map_adjacency_editor(sandbox, tileset, cx);
+        }
         let Some(tile) = tileset.tiles.get(sandbox.rule_tile) else {
             return div().child(self.render_map_button(
                 "map-rules-back",
@@ -4651,6 +4797,12 @@ impl SimulationView {
                 ),
                 MapAction::RuleNextTile,
                 tileset.tiles.len() > 1,
+            ),
+            (
+                "map-rule-adjacency",
+                "Edit adjacency".to_owned(),
+                MapAction::EditAdjacency,
+                true,
             ),
             (
                 "map-rule-terrain",
@@ -4735,11 +4887,146 @@ impl SimulationView {
                     f32::from(minimum) / 10.0, f32::from(maximum) / 10.0,
                 )))
                 .child(div().text_xs().child(
-                    "Prototype edits affect every generated occurrence, except painted output-cell overrides. Terrain changes preserve explicit fields and palette; clear a field to use its terrain-derived default. IDs, labels, adjacency and other prototypes are preserved. Adjacency and palette authoring still use recipes.",
+                    "Prototype edits affect every generated occurrence, except painted output-cell overrides. Terrain changes preserve explicit fields and palette; clear a field to use its terrain-derived default. IDs, labels, adjacency and other prototypes are preserved. Palette authoring still uses recipes.",
                 ))
                 .child(div().text_xs().child(sandbox.notice.clone()))
                 .child(div().text_xs().child(
                     "All edits share draft undo/redo. Return and generate a new preview to observe the actual rules hash and output before guarded Apply. Editing never steps or applies to the live world.",
+                )),
+        )
+    }
+
+    fn render_map_adjacency_editor(
+        &self,
+        sandbox: &MapSandbox,
+        tileset: &TilesetSpec,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let short_id = |index| {
+            tileset.tiles.get(index).map_or_else(
+                || "unavailable".to_owned(),
+                |tile| tile.id.chars().take(64).collect::<String>(),
+            )
+        };
+        let side = MAP_RULE_SIDES.get(sandbox.rule_side);
+        let direction = side.map_or("unavailable", |sides| sides.0);
+        let entry = tileset.adjacency.get(sandbox.rule_entry);
+        let entry_description = entry.map_or_else(
+            || "No selected entry. An empty rule list permits every neighbor.".to_owned(),
+            |entry| {
+                let a: String = entry.tile_a.chars().take(64).collect();
+                let b: String = entry.tile_b.chars().take(64).collect();
+                let side_a: String = entry.side_a.chars().take(16).collect();
+                let side_b: String = entry.side_b.chars().take(16).collect();
+                format!(
+                    "Entry {} / {}: {a} {side_a} ↔ {b} {side_b}: {}",
+                    sandbox.rule_entry + 1,
+                    tileset.adjacency.len(),
+                    if entry.allowed {
+                        "allow-list entry"
+                    } else {
+                        "forbid"
+                    },
+                )
+            },
+        );
+        let can_append = tileset.tiles.get(sandbox.rule_tile).is_some()
+            && tileset.tiles.get(sandbox.rule_neighbor).is_some()
+            && side.is_some()
+            && tileset.tiles.len() <= MAP_DRAFT_MAX_RULE_TILES
+            && tileset.adjacency.len() < MAP_RULE_EDITOR_MAX_ADJACENCY;
+        let mut controls = div().flex().flex_wrap().gap_2();
+        for (id, label, action, enabled) in [
+            (
+                "map-adjacency-back",
+                "Back to prototypes".to_owned(),
+                MapAction::BackFromAdjacency,
+                true,
+            ),
+            (
+                "map-rule-next",
+                format!("A: {} (next)", short_id(sandbox.rule_tile)),
+                MapAction::RuleNextTile,
+                tileset.tiles.len() > 1,
+            ),
+            (
+                "map-rule-neighbor",
+                format!("B: {} (next)", short_id(sandbox.rule_neighbor)),
+                MapAction::RuleNeighbor,
+                tileset.tiles.len() > 1,
+            ),
+            (
+                "map-rule-side",
+                format!("A side: {direction} (cycle)"),
+                MapAction::RuleSide,
+                true,
+            ),
+            (
+                "map-rule-append-forbid",
+                "Append forbid".to_owned(),
+                MapAction::RuleAppend(false),
+                can_append,
+            ),
+            (
+                "map-rule-append-allow",
+                "Append allow-list entry".to_owned(),
+                MapAction::RuleAppend(true),
+                can_append,
+            ),
+            (
+                "map-rule-entry",
+                "Next existing entry".to_owned(),
+                MapAction::RuleNextEntry,
+                tileset.adjacency.len() > 1,
+            ),
+            (
+                "map-rule-toggle-entry",
+                "Toggle selected entry".to_owned(),
+                MapAction::RuleToggleEntry,
+                entry.is_some(),
+            ),
+            (
+                "map-rule-remove-entry",
+                "Remove selected entry".to_owned(),
+                MapAction::RuleRemoveEntry,
+                entry.is_some(),
+            ),
+            (
+                "map-undo",
+                "Undo draft".to_owned(),
+                MapAction::Undo,
+                sandbox.draft.can_undo(),
+            ),
+            (
+                "map-redo",
+                "Redo draft".to_owned(),
+                MapAction::Redo,
+                sandbox.draft.can_redo(),
+            ),
+        ] {
+            controls = controls.child(self.render_map_button(id, label, action, enabled, cx));
+        }
+        div().child(
+            div()
+                .id("map-adjacency-editor")
+                .debug_selector(|| "map-adjacency-editor".to_owned())
+                .flex()
+                .flex_col()
+                .gap_3()
+                .text_color(chrome::text_primary())
+                .child(div().text_sm().child("Ordered adjacency rules"))
+                .child(controls)
+                .child(div().text_xs().child(entry_description))
+                .child(div().text_xs().child(format!(
+                    "New entries join A's {direction} side to B's opposite side. Native append limit: {MAP_RULE_EDITOR_MAX_ADJACENCY} entries. IDs above show their first 64 characters. Draft revision {}.",
+                    sandbox.draft.revision,
+                )))
+                .child(div().text_xs().child(
+                    "Order matters. Each entry changes both named endpoints. The first allow-list entry for an endpoint/side replaces its unrestricted neighbors; later allows add neighbors and forbids remove them. With no allow list, a forbid excludes only that neighbor. Toggle/remove act on the selected existing entry, including imported rules. Invalid or empty neighbor lists are refused atomically; a valid rule set can still contradict the toroidal output dimensions.",
+                ))
+                .child(div().text_xs().child(sandbox.notice.clone()))
+                .child(div().text_xs().child(
+                    "Entries share draft undo/redo. Return to the draft and generate to observe output or a contradiction. Generation and editing leave live science unchanged; guarded Apply is separate.",
                 )),
         )
     }
@@ -23171,6 +23458,298 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn map_sandbox_adjacency_generates_neighbors_on_every_toroidal_side() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut hashes = std::collections::HashSet::new();
+        for (side, (side_a, side_b)) in MAP_RULE_SIDES.iter().enumerate() {
+            let mut sandbox = MapSandbox::new(8, 8, 50);
+            let mut tileset = default_tileset_spec();
+            tileset.tiles.truncate(2);
+            let prototypes = tileset.tiles.clone();
+            sandbox
+                .draft
+                .set_generator_config(DraftGeneratorConfig::RuleBased { tileset });
+            sandbox.paint_channel = MapPaintChannel::Fertility;
+            sandbox.paint_tenths = 4;
+            sandbox.edit(MapAction::Paint(7, 7));
+            let original = sandbox.draft.state.clone();
+            let baseline = sandbox.draft.generate_artifact().unwrap();
+            sandbox.rule_neighbor = 1;
+            sandbox.rule_side = side;
+            sandbox.edit(MapAction::RuleAppend(true));
+            assert!(
+                !sandbox.notice.starts_with("Draft edit refused:"),
+                "{}",
+                sandbox.notice
+            );
+            let allowed_state = sandbox.draft.state.clone();
+            let DraftGeneratorConfig::RuleBased { tileset } = &allowed_state.generator_config else {
+                panic!("adjacency edits retain rules mode");
+            };
+            assert_eq!(tileset.tiles, prototypes);
+            assert_eq!(allowed_state.constraints, original.constraints);
+            assert_eq!(tileset.adjacency.len(), 1);
+            assert_eq!(tileset.adjacency[0].side_a, *side_a);
+            assert_eq!(tileset.adjacency[0].side_b, *side_b);
+            sandbox.generate(host.snapshot().revisions.scientific);
+            wait_map_job(&mut sandbox);
+            let artifact = &sandbox.preview.as_ref().unwrap().artifact;
+            assert_ne!(
+                artifact.metadata().tileset_hash,
+                baseline.metadata().tileset_hash
+            );
+            hashes.insert(artifact.metadata().tileset_hash);
+            let neighbor = |x: u32, y: u32| match *side_a {
+                "north" => (x, (y + 7) % 8),
+                "east" => ((x + 1) % 8, y),
+                "south" => (x, (y + 1) % 8),
+                "west" => ((x + 7) % 8, y),
+                _ => panic!("declared editor sides must be cardinal"),
+            };
+            let mut allowed_pairs = 0;
+            for y in 0..8 {
+                for x in 0..8 {
+                    if artifact.terrain().tile(x, y).unwrap().kind == prototypes[0].terrain_kind {
+                        let (nx, ny) = neighbor(x, y);
+                        assert_eq!(
+                            artifact.terrain().tile(nx, ny).unwrap().kind,
+                            prototypes[1].terrain_kind
+                        );
+                        allowed_pairs += 1;
+                    }
+                }
+            }
+            assert!(
+                allowed_pairs > 0,
+                "the allowed-pair assertion must observe a source tile"
+            );
+            assert_eq!(artifact.terrain().tile(7, 7).unwrap().fertility_bias, 0.4);
+            let hash = artifact.scientific_content_hash();
+            let mut restored = MapSandbox::new(1, 1, 1);
+            restored
+                .import_draft(&sandbox.export_draft().unwrap())
+                .unwrap();
+            assert_eq!(restored.draft.state, allowed_state);
+            assert_eq!(
+                restored
+                    .draft
+                    .generate_artifact()
+                    .unwrap()
+                    .scientific_content_hash(),
+                hash
+            );
+            sandbox.edit(MapAction::RuleToggleEntry);
+            let forbidden = sandbox.draft.generate_artifact().unwrap();
+            let mut forbidden_source_tiles = 0;
+            for y in 0..8 {
+                for x in 0..8 {
+                    if forbidden.terrain().tile(x, y).unwrap().kind == prototypes[0].terrain_kind {
+                        let (nx, ny) = neighbor(x, y);
+                        assert_ne!(
+                            forbidden.terrain().tile(nx, ny).unwrap().kind,
+                            prototypes[1].terrain_kind
+                        );
+                        forbidden_source_tiles += 1;
+                    }
+                }
+            }
+            assert!(
+                forbidden_source_tiles > 0,
+                "forbid must be observed on real source tiles"
+            );
+            assert_ne!(forbidden.scientific_content_hash(), hash);
+            sandbox.edit(MapAction::Undo);
+            assert_eq!(sandbox.draft.state, allowed_state);
+            sandbox.edit(MapAction::RuleRemoveEntry);
+            assert_eq!(sandbox.draft.state, original);
+            assert_eq!(
+                sandbox
+                    .draft
+                    .generate_artifact()
+                    .unwrap()
+                    .scientific_content_hash(),
+                baseline.scientific_content_hash()
+            );
+            sandbox.edit(MapAction::Undo);
+            assert_eq!(sandbox.draft.state, allowed_state);
+            sandbox.edit(MapAction::Redo);
+            assert_eq!(sandbox.draft.state, original);
+        }
+        assert_eq!(
+            hashes.len(),
+            MAP_RULE_SIDES.len(),
+            "the side matrix must contain different rules"
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_adjacency_noops_refusals_and_bounds_preserve_history() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        let mut tileset = default_tileset_spec();
+        tileset.tiles.truncate(2);
+        sandbox
+            .draft
+            .set_generator_config(DraftGeneratorConfig::RuleBased { tileset });
+        sandbox.rule_neighbor = 1;
+        sandbox.edit(MapAction::RuleAppend(true));
+        sandbox.edit(MapAction::RuleWeight(1));
+        sandbox.edit(MapAction::Undo);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        let revision = sandbox.draft.revision;
+        let state = sandbox.draft.state.clone();
+        assert!(sandbox.draft.can_redo());
+        sandbox.edit(MapAction::RuleAppend(true));
+        assert_eq!(sandbox.draft.revision, revision);
+        assert!(sandbox.draft.can_redo());
+        assert!(sandbox.can_apply());
+        for (source, neighbor, side, entry, action) in [
+            (usize::MAX, 1, 0, 0, MapAction::RuleAppend(true)),
+            (0, usize::MAX, 0, 0, MapAction::RuleAppend(true)),
+            (0, 1, usize::MAX, 0, MapAction::RuleAppend(true)),
+            (0, 1, 0, usize::MAX, MapAction::RuleToggleEntry),
+            (0, 1, 0, usize::MAX, MapAction::RuleRemoveEntry),
+            (0, 1, 0, 0, MapAction::RuleAppend(false)),
+        ] {
+            sandbox.rule_tile = source;
+            sandbox.rule_neighbor = neighbor;
+            sandbox.rule_side = side;
+            sandbox.rule_entry = entry;
+            sandbox.edit(action);
+            assert!(
+                sandbox.notice.starts_with("Draft edit refused:"),
+                "{}",
+                sandbox.notice
+            );
+            assert_eq!(sandbox.draft.state, state);
+            assert_eq!(sandbox.draft.revision, revision);
+            assert!(sandbox.draft.can_redo());
+            assert!(sandbox.can_apply());
+            assert!(Arc::ptr_eq(
+                &preview,
+                &sandbox.preview.as_ref().unwrap().artifact
+            ));
+        }
+        sandbox.rule_tile = 0;
+        sandbox.rule_neighbor = 0;
+        sandbox.rule_side = 0;
+        let mut tileset = default_tileset_spec();
+        tileset.tiles.truncate(2);
+        tileset.adjacency = vec![
+            AdjacencySpec {
+                tile_a: tileset.tiles[0].id.clone(),
+                side_a: "UP".to_owned(),
+                tile_b: tileset.tiles[0].id.clone(),
+                side_b: "down".to_owned(),
+                allowed: false,
+            };
+            MAP_RULE_EDITOR_MAX_ADJACENCY
+        ];
+        sandbox.replace_rules(tileset.clone()).unwrap();
+        let bounded = sandbox.draft.state.clone();
+        sandbox.edit(MapAction::RuleAppend(true));
+        assert!(sandbox.notice.contains("ordered entries"));
+        assert_eq!(sandbox.draft.state, bounded);
+        sandbox.rule_entry = MAP_RULE_EDITOR_MAX_ADJACENCY - 1;
+        sandbox.edit(MapAction::RuleRemoveEntry);
+        let DraftGeneratorConfig::RuleBased { tileset: reduced } = &sandbox.draft.state.generator_config
+        else {
+            panic!("rules");
+        };
+        assert_eq!(
+            reduced.adjacency,
+            tileset.adjacency[..tileset.adjacency.len() - 1]
+        );
+        assert_eq!(sandbox.rule_entry, reduced.adjacency.len() - 1);
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state, bounded);
+        tileset.adjacency.clear();
+        tileset.tiles.truncate(1);
+        tileset.tiles[0].id = "x".repeat(MAP_DRAFT_MAX_BYTES / 2);
+        sandbox.replace_rules(tileset).unwrap();
+        assert!(sandbox.export_draft().is_ok());
+        sandbox.rule_entry = 0;
+        let oversized = sandbox.draft.state.clone();
+        sandbox.edit(MapAction::RuleAppend(true));
+        assert!(sandbox.notice.contains("Draft JSON exceeds"));
+        assert_eq!(sandbox.draft.state, oversized);
+        sandbox.edit(MapAction::RuleAppend(false));
+        assert_eq!(sandbox.draft.state, oversized);
+        sandbox.edit(MapAction::Generator);
+        let sample = sandbox.draft.state.clone();
+        sandbox.edit(MapAction::RuleAppend(true));
+        assert!(sandbox.notice.starts_with("Draft edit refused:"));
+        assert_eq!(sandbox.draft.state, sample);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_adjacency_contradictions_and_edited_jobs_keep_live_science() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        let mut tileset = default_tileset_spec();
+        tileset.tiles.truncate(2);
+        sandbox
+            .draft
+            .set_generator_config(DraftGeneratorConfig::RuleBased { tileset });
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let original = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        sandbox.rule_neighbor = 1;
+        sandbox.rule_side = 1;
+        sandbox.edit(MapAction::RuleAppend(true));
+        wait_map_job(&mut sandbox);
+        assert!(Arc::ptr_eq(
+            &original,
+            &sandbox.preview.as_ref().unwrap().artifact
+        ));
+        assert!(!sandbox.can_apply());
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply());
+        let valid = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        assert_ne!(
+            valid.scientific_content_hash(),
+            original.scientific_content_hash()
+        );
+        sandbox.draft.set_dimensions(7, 8, 50).unwrap();
+        assert!(matches!(
+            sandbox.draft.generate_artifact(),
+            Err(MapGenerationError::Contradiction { attempts }) if attempts > 0
+        ));
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.notice.starts_with("Generation failed:"));
+        assert!(sandbox.notice.contains("contradictions"));
+        assert!(Arc::ptr_eq(
+            &valid,
+            &sandbox.preview.as_ref().unwrap().artifact
+        ));
+        assert!(!sandbox.can_apply());
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state.width, 8);
+        let mut single = default_tileset_spec();
+        single.tiles.truncate(1);
+        sandbox.replace_rules(single).unwrap();
+        sandbox.rule_neighbor = 0;
+        let state = sandbox.draft.state.clone();
+        sandbox.edit(MapAction::RuleAppend(false));
+        assert!(sandbox.notice.contains("no compatible neighbors"));
+        assert_eq!(sandbox.draft.state, state);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
     fn map_sandbox_rule_prototypes_generate_real_fields_and_round_trip() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
@@ -24254,6 +24833,69 @@ mod command_characterization_tests {
             original_rules
         );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        click(&mut lab, "map-rule-adjacency");
+        assert!(lab.debug_bounds("map-adjacency-editor").is_some());
+        click(&mut lab, "map-rule-next");
+        click(&mut lab, "map-rule-neighbor");
+        click(&mut lab, "map-rule-side");
+        click(&mut lab, "map-rule-append-forbid");
+        click(&mut lab, "map-rule-append-allow");
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+            else {
+                panic!("production adjacency controls retain rules mode");
+            };
+            assert_eq!(tileset.adjacency.len(), 2);
+            assert_eq!(tileset.adjacency[0].tile_a, tileset.tiles[2].id);
+            assert_eq!(tileset.adjacency[0].tile_b, tileset.tiles[1].id);
+            assert_eq!(tileset.adjacency[0].side_a, "east");
+            assert_eq!(tileset.adjacency[0].side_b, "west");
+            assert!(!tileset.adjacency[0].allowed);
+            assert!(tileset.adjacency[1].allowed);
+            assert_eq!(sandbox.rule_entry, 1);
+        }
+        click(&mut lab, "map-rule-entry");
+        click(&mut lab, "map-rule-toggle-entry");
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+            else {
+                panic!("rules");
+            };
+            assert_eq!(sandbox.rule_entry, 0);
+            assert!(tileset.adjacency.iter().all(|entry| entry.allowed));
+        }
+        click(&mut lab, "map-rule-remove-entry");
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+            else {
+                panic!("rules");
+            };
+            assert_eq!(tileset.adjacency.len(), 1);
+            assert!(tileset.adjacency[0].allowed);
+        }
+        for _ in 0..4 {
+            click(&mut lab, "map-undo");
+        }
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            original_rules
+        );
+        click(&mut lab, "map-redo");
+        assert_ne!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            original_rules
+        );
+        click(&mut lab, "map-undo");
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            original_rules
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        click(&mut lab, "map-adjacency-back");
+        assert!(lab.debug_bounds("map-rules-editor").is_some());
         click(&mut lab, "map-rules-back");
         click(&mut lab, "map-seed");
         assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
