@@ -675,7 +675,14 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   Empty neighbor lists are refused without changing the draft; a valid rule list may
   still contradict the requested toroidal dimensions when generated. Entries share
   undo/redo. Return to the draft and generate before using guarded Apply.
-  Adding/removing prototypes and palette editing still require a recipe.
+  **Clone prototype** copies every field under the first unused `prototype-copy-N` ID,
+  selects the copy, and expands its ordered adjacency references, including self-rules.
+  The copy has its own weight, increasing the combined selection weight until edited.
+  **Remove prototype + its rules** prunes all references to that prototype. The editor
+  refuses an empty roster, invalid remaining permissions, more than 64 prototypes,
+  more than 256 resulting adjacency entries, or a portable recipe over 1 MiB. These
+  edits share undo/redo and preserve output-cell constraints; generate again before Apply.
+  Palette editing still requires a recipe.
   In sample mode, **Edit sample** opens a separate exemplar view. Use the existing
   grass/water/sand brush to paint its cells, cycle the pattern size from 1 to the smaller
   exemplar dimension, or toggle rotations/reflections. Edits retain the sample label,

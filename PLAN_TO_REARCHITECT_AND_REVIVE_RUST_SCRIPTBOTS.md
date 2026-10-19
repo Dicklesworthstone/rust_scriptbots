@@ -2410,6 +2410,26 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native prototype roster, 2026-10-19 (`bd-2z0.10.7`):**
+connect bounded clone/remove to complete-draft validation and shared history. Clone
+prototype data and ordered adjacency permissions under a unique ID; removal explicitly
+prunes its references and refuses an empty or invalid remainder. Observe actual generation,
+recipe/history, science guards and production input before source qualification. Original
+native OS/full editor acceptance remains unchanged and open.
+
+Source `bce2989e2f3a5f19c2f7ceccab3d08954a208766` is published to both required refs.
+R225 passes nineteen source command/log pairs and typed `pass/0`; fresh retained-reader
+and planted-negative execution verifies 97 required completions. Raw totals: 424 passing
+executions / 250 distinct names / zero failures / six executions of three unchanged
+ignored diagnostics. Both renderer modes exercise roster controls, distinct generated
+clone fields and permissions, removal restoring the original output, recipe/history,
+atomic bounds/refusals and edited-job preservation. All 128 manifest files / 370,246,834
+bytes and source/profile/log/helper identities recompute. Outer DSR exits 6 on the
+tracked Proptest README symlink before collection; guard unchanged, no collected release.
+R224 formatting failure and the bounded solo audit remain in the existing report. Palette/
+resource authoring, additional sample sizing/accessibility and actual native OS/full
+editor acceptance remain open; no original criterion narrows.
+
 **[Currently In Progress] Native adjacency authoring, 2026-10-19 (`bd-2z0.10.7`):**
 connect ordered allow-list/forbid entries to the existing compiler, with bounded endpoint
 selection, existing-entry inspection/toggle/removal, atomic validation and shared history.

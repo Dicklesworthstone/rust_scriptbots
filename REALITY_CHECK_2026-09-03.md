@@ -10,6 +10,141 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Native prototype roster (`bd-2z0.10.7`, 2026-10-19, in progress):
+
+- [x] Recheck ready work and unchanged original acceptance; reserve existing files.
+- [x] Connect clone/remove controls, unique IDs, explicit adjacency semantics and selection bounds (both R225 renderer modes).
+- [x] Preserve complete prototype data, unrelated rules, constraints and atomic validation/history (both modes).
+- [x] Observe actual generated clone/removal behavior, recipe round trips and unchanged science (both modes).
+- [x] Probe empty/count/byte/adjacency bounds, invalid remainders and edited background jobs (both modes).
+- [x] Extend production headless input while retaining existing viewport, deadlines and assertions (both modes).
+- [x] Review exact diffs/UBS; qualify all nineteen pinned DSR checks with old probes intact.
+- [x] Recheck retained evidence; publish qualified source and prepare existing docs/tracker snapshots.
+- [ ] Original acceptance: palette/resource authoring, additional sample sizing/accessibility and actual native OS/full editor journeys.
+
+Creation gate: this in-place PROCESS list serves the operator's explicit granular TODO
+request. The observed defect is recipe-only roster authoring despite an existing tileset
+compiler and shared history. It gates this handoff; retire the active list at original
+editor acceptance, retaining history. No integrity exception or new machinery. Opportunity
+cost: broader ready visual work and the unavailable macOS P0 incident.
+
+Initial roster source `3a834d9906eaf03d8e8791d423f7add62862ffa4`, tree
+`cbb81c8310b09352a6c218a8dac345279809d6a0`, starts R224. Retain all nineteen
+commands, old 91 required completions and reader/planted negatives; the three roster
+probes in both renderer modes make 97 required completions. Profile SHA256
+`15a3e1066bad64a1f1296522f2aca6271e2bcef0472f0b2c78f227d1a3cf4f51`;
+launcher `34041906183f904eeb6cec29a2bd1ff39e6767e8e7375df4e0f55e725c61a77a`.
+UBS exits 1: two timestamp critical heuristics, 2,471 warnings and 875 informational;
+not clean. No native OS or full editor acceptance is inferred.
+
+R224 stops before compilation/tests at five formatter layouts: typed `failed/1`,
+one command/log pair `1/0`, outer 6 / runner identity zero; finished 2026-10-19
+18:20:59 UTC. All ten manifest files / 28,996 bytes, exact membership and log hash
+recompute; owned SID 3353549 absent. Apply only reported layouts manually in ordinary
+correction `bce2989e2f3a5f19c2f7ceccab3d08954a208766`, tree
+`88ba6a8062b3eb5e587033094f7118c296675af9`. Pinned R225 retains the nineteen
+commands and byte-identical reader/planted negatives/97 required completions. Profile
+SHA256 `86a22aaa6aee4538198b4fdad51fafec0dabe37dd959f7612078a01df73ef0fc`;
+launcher `8624c101d72d7cc47fae6432dcfbbc1f9e963418c373d62ef9e4994af1c72003`.
+Repeated UBS retains the same non-clean counts. Qualification and publication pending.
+
+R225 final self-review, 2026-10-19: qualified source `bce2989e2f3a5f19c2f7ceccab3d08954a208766`
+is pushed normally to both required refs. Clone copies all prototype fields under a unique
+bounded ID and expands affected ordered adjacency records in place, including both ends of
+self-rules. Remove explicitly prunes references, refusing an empty or invalid remainder.
+The original prototype's weight is unchanged; the copy contributes its own selection weight.
+Complete candidate validation enforces count/byte bounds before one shared history edit.
+Selection indices remain bounded across removal and undo/redo; output constraints survive.
+
+R225 finishes 2026-10-19 18:39:07 UTC: nineteen command/log pairs exit zero and source
+receipt is typed `pass/0`. Fresh solo re-execution of the retained reader and planted negatives
+verifies all 97 predeclared required completions. Six raw test logs agree with their nonzero
+suite summaries: **424 passing executions / 250 distinct passing names / zero failures /
+six executions of three unchanged ignored HUD diagnostics**. Core maps 29, runtime focused/
+channel 1/37, renderer focused 5, full default renderer 184 and feature-off renderer 168.
+Both configurations observe the clone's distinct generated elevation, original and copied
+neighbor permissions, exact original output after removal, recipe/history round trips,
+atomic refusal and pending-job guards. Production input clicks both roster controls and
+undo/redo before continuing the existing sample/file/generation/guarded-Apply journey.
+No earlier assertion, viewport, deadline, ignore, dependency, golden or test gate changes.
+
+Workspace and GUI-app compiler/strict Clippy, both renderer Clippy configurations, format,
+four guards, feature-off production graph and analyzer build pass. All nineteen command
+files are byte-identical to R223. Exact-file UBS remains non-clean at 2/2,471/875; the two
+critical heuristics concern existing timestamp-based temporary-capture filenames.
+
+Retained proof: `/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-roster-20261019-bce2989e-r225-local`.
+Build run `f3f27ab9-ebaf-4d0f-be28-e0375941c8fa`; outer envelope
+`984c3af3-52ae-4e18-941f-a177c35e9235`. All 128 manifest files / 370,246,834 bytes,
+exact membership, command log hashes, profile byte identity, clean source/runner identities
+and five frozen helper identities recompute; owned SID 3361825 is absent. Verdict SHA256
+`5ce80e8c7472be76c405391496865a42a7805b5208827dbe3fa684f132452e11`;
+manifest `36bb697db707f2ffdf81688be4134179e1c9e9af354e69b92e4b0b59592f9b75`.
+Profile/launcher hashes are above. The first generic read-only identity-verification command
+was blocked by DCG's unverified argv rule; fixed-argument read-only calls then completed
+the checks. No bypass or permission escalation was used.
+
+**Outer DSR exits 6 / runner identity zero:** final private-cache verification refuses the
+actual tracked mode-120000 Proptest `README.md` symlink to `proptest/README.md`, blob
+`39f5a6b376a8fe6c42a45e072e5f49bf1e417412`, before collection. Guard unchanged; no
+release artifact collected. `bd-build-farm-reliability-lb19.2` stays open. R224 remains
+retained as a formatting failure; no first-attempt-success claim. The original
+`bd-2z0.10.7` acceptance stays in progress without new tasks, dependencies or narrowed
+criteria. Palette/resource authoring, additional sample sizing, accessible palettes and
+actual native OS/full editor acceptance remain. Headless/software/source checks do not
+establish hardware, independent, performance, full-workspace-test or release-collection
+proof. Separate `/dp` work remains inventory-only in this continuation.
+
+Roster real-work audit (actual `git log --stat e77d4c4d..bce2989e`, closed/ready snapshots
+and the prepared handoff): README purpose is a faithful deterministic evolution simulator
+with GPU UI, pluggable brains and first-class analytics. Actual source commits are
+`3a834d99` USER (roster capability) and `bce2989e` ENABLER (reported formatting layouts).
+Actual committed tally at review: USER 1 / ENABLER 1 / PROCESS 0 / UNKNOWN 0; the two
+prepared documentation/tracker groups are PROCESS and earn no capability credit. This is
+a diagnostic, not a quota. Q1: demo clone, edit its field, generate, remove and undo in the
+existing editor. Q2: omitting process changes no runtime behavior; it loses requested
+tracking, instructions and disclosed failures. Q3: corrected layouts enabled the actual
+R225 formatter and remaining qualification. Q4: user-facing root `bd-2z0` remains open
+since 2026-07-11; this implements its authoring path, while the ready macOS P0 incident
+is unavailable on this host and broader visual work is a larger increment. Q5: solo,
+no close-farming. Q6: no plan/spec substitute or new follow-up/edge/closure. Verdict
+**HEALTHY** for this capability increment; the avoidable formatting retry and growing
+recordkeeping cost are disclosed. Next work remains USER capability, not new machinery.
+The creation gate above covers this requested in-place list/report; active profiles retire
+after the attempt while raw evidence is retained. No integrity exception is invoked.
+
+Roster honesty inventory (same bounded window, fresh self-review):
+
+1. No (checked frozen source diffs, aggregate removals and reflog): old assertions, ignores, deadlines and viewport remain; ordinary commits preserve the failed attempt.
+2. No (checked new probes and production path): real generators/artifacts and HostCore are exercised; GPUI input uses the existing headless test backend.
+3. No (checked all changed paths): no golden or snapshot regenerated.
+4. No (checked source/config/profile diffs): no release/test gate, suppression or tolerance changed; product input bounds reuse complete-draft validation. Only new required probe names extend the unchanged reader.
+5. No (checked dispatch and generation): no fixture-specific runtime branch, environment sniffing or benchmark shortcut.
+6. No (checked starts, terminal events, nonzero summaries and planted negatives): all 97 required completions execute, with failures and unchanged ignores counted.
+7. No (checked retained logs and recomputed hashes): reported checks, identities and totals are observed; no unrun command is credited.
+8. No (checked claims): headless/software/source proof stays below native OS, hardware, independent, performance and collected-release proof.
+9. No (checked this report and retained attempts): R224 formatting failure, non-clean UBS and outer collection refusal are explicit; original acceptance stays open.
+10. No (checked captures): cited stdout/stderr and first failure are retained; no discarded output supports a green claim.
+11. No (checked tracker rows): original in-progress status/acceptance/dependencies remain; no closure or follow-up laundering.
+12. No (checked additive README/plan edits): usage and observed progress do not narrow original requirements.
+13. Solo (checked this window's tool calls): no delegated own/peer closure.
+14. Solo (same check): no subagent dispatch.
+15. Solo (same check): no subagent report accepted.
+16. Solo (same check): no panes farming refusals or closes.
+17. No (checked labels): fresh self-review is not independent confirmation.
+18. No (checked prelaunch profile): nineteen checks, 97 required completions and six test-log categories precede results; zero failures, missing names and ignores are countermetrics.
+19. Explain the avoidable five-layout retry and source pass versus outer collection refusal before presenting success; recordkeeping also has a real cost.
+20. Strongest evidence is exact clean `bce2989e` executing the new controls and producing distinguishable clone terrain/permissions, then restoring the original output; the pinned profile and retained reader are reproducible.
+
+CASS scope: prior five phrase sweeps and their coordinate limitations remain retained
+below. This window adds bounded workspace-derived `prototype-copy` (limit two): zero
+hits, so none to expand. Status says healthy/fresh while `last_indexed_at` is still
+2026-09-16; this cannot clear older behavior or current unindexed sessions. Captures:
+external `roster-cass-{status,derived}-20261019` JSON/stderr. Disposition: retain/disclose
+the formatting correction and proof limits; no first-attempt, independent or broad
+historical-innocence claim. Existing SM-11/RH-17, RH-2 and PL-1 controls remain; no new
+governance machinery.
+
 Native adjacency authoring (`bd-2z0.10.7`, 2026-10-19, in progress):
 
 - [x] Recheck ready work, original acceptance and the compiler's ordered two-endpoint rule semantics.
