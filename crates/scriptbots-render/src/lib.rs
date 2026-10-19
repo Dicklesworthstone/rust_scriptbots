@@ -3684,6 +3684,7 @@ impl MapSandbox {
             MapAction::RuleAppend(_) | MapAction::RuleToggleEntry | MapAction::RuleRemoveEntry => {
                 self.edit_adjacency(action)
             }
+            MapAction::RuleClone | MapAction::RuleRemove => self.edit_rule_roster(action),
             MapAction::RuleNextTile => {
                 if let DraftGeneratorConfig::RuleBased { tileset } =
                     &self.draft.state.generator_config
@@ -3832,10 +3833,89 @@ impl MapSandbox {
             },
         );
         if let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config {
+            self.rule_tile = self.rule_tile.min(tileset.tiles.len().saturating_sub(1));
+            self.rule_neighbor = self.rule_neighbor.min(tileset.tiles.len().saturating_sub(1));
             self.rule_entry = self
                 .rule_entry
                 .min(tileset.adjacency.len().saturating_sub(1));
         }
+    }
+
+    fn edit_rule_roster(&mut self, action: MapAction) -> Result<(), MapGenerationError> {
+        let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config else {
+            return Err(MapGenerationError::DraftError(
+                "Choose rules mode first.".to_owned(),
+            ));
+        };
+        let source = tileset.tiles.get(self.rule_tile).ok_or_else(|| {
+            MapGenerationError::DraftError("Select an existing rule prototype.".to_owned())
+        })?;
+        let mut next = tileset.clone();
+        let selection = match action {
+            MapAction::RuleClone => {
+                if tileset.tiles.len() >= MAP_DRAFT_MAX_RULE_TILES
+                    || tileset.adjacency.len() > MAP_RULE_EDITOR_MAX_ADJACENCY
+                {
+                    return Err(MapGenerationError::DraftError(
+                        "Cloning exceeds the native prototype or adjacency editor bounds.".to_owned(),
+                    ));
+                }
+                let id = (1..=MAP_DRAFT_MAX_RULE_TILES)
+                    .map(|ordinal| format!("prototype-copy-{ordinal}"))
+                    .find(|id| tileset.tiles.iter().all(|tile| tile.id != *id))
+                    .ok_or_else(|| {
+                        MapGenerationError::DraftError("No unused prototype ID.".to_owned())
+                    })?;
+                let mut copy = source.clone();
+                copy.id.clone_from(&id);
+                next.tiles.push(copy);
+                // Expand each record in place: appending all copied records at the end
+                // would reorder last-writer-wins permissions on existing endpoints.
+                next.adjacency.clear();
+                for entry in &tileset.adjacency {
+                    next.adjacency.push(entry.clone());
+                    let copy_a = entry.tile_a == source.id;
+                    let copy_b = entry.tile_b == source.id;
+                    if copy_a {
+                        let mut copied = entry.clone();
+                        copied.tile_a.clone_from(&id);
+                        next.adjacency.push(copied);
+                    }
+                    if copy_b {
+                        let mut copied = entry.clone();
+                        copied.tile_b.clone_from(&id);
+                        next.adjacency.push(copied);
+                    }
+                    if copy_a && copy_b {
+                        let mut copied = entry.clone();
+                        copied.tile_a.clone_from(&id);
+                        copied.tile_b.clone_from(&id);
+                        next.adjacency.push(copied);
+                    }
+                }
+                next.tiles.len() - 1
+            }
+            MapAction::RuleRemove => {
+                if tileset.tiles.len() <= 1 {
+                    return Err(MapGenerationError::DraftError(
+                        "Keep at least one rule prototype.".to_owned(),
+                    ));
+                }
+                next.tiles.remove(self.rule_tile);
+                next.adjacency
+                    .retain(|entry| entry.tile_a != source.id && entry.tile_b != source.id);
+                self.rule_tile.min(next.tiles.len() - 1)
+            }
+            _ => return Ok(()),
+        };
+        if next.adjacency.len() > MAP_RULE_EDITOR_MAX_ADJACENCY {
+            return Err(MapGenerationError::DraftError(format!(
+                "Roster edit would exceed {MAP_RULE_EDITOR_MAX_ADJACENCY} ordered adjacency entries."
+            )));
+        }
+        self.replace_rules(next)?;
+        self.rule_tile = selection;
+        Ok(())
     }
 
     fn edit_adjacency(&mut self, action: MapAction) -> Result<(), MapGenerationError> {
@@ -4179,6 +4259,8 @@ enum MapAction {
     RuleToggleEntry,
     RuleRemoveEntry,
     RuleNextTile,
+    RuleClone,
+    RuleRemove,
     RuleTerrain,
     RuleWeight(i16),
     RuleField,
@@ -4803,6 +4885,18 @@ impl SimulationView {
                 tileset.tiles.len() > 1,
             ),
             (
+                "map-rule-clone",
+                "Clone prototype".to_owned(),
+                MapAction::RuleClone,
+                tileset.tiles.len() < MAP_DRAFT_MAX_RULE_TILES,
+            ),
+            (
+                "map-rule-remove",
+                "Remove prototype + its rules".to_owned(),
+                MapAction::RuleRemove,
+                tileset.tiles.len() > 1,
+            ),
+            (
                 "map-rule-adjacency",
                 "Edit adjacency".to_owned(),
                 MapAction::EditAdjacency,
@@ -4891,7 +4985,7 @@ impl SimulationView {
                     f32::from(minimum) / 10.0, f32::from(maximum) / 10.0,
                 )))
                 .child(div().text_xs().child(
-                    "Prototype edits affect every generated occurrence, except painted output-cell overrides. Terrain changes preserve explicit fields and palette; clear a field to use its terrain-derived default. IDs, labels, adjacency and other prototypes are preserved. Palette authoring still uses recipes.",
+                    "Prototype edits affect every generated occurrence, except painted output-cell overrides. Terrain changes preserve explicit fields and palette; clear a field to use its terrain-derived default. Clone copies all fields and ordered adjacency permissions under a new ID, adding its own weight. Remove prunes every rule naming that prototype; an empty or invalid remainder is refused. Both operations are undoable. Palette authoring still uses recipes.",
                 ))
                 .child(div().text_xs().child(sandbox.notice.clone()))
                 .child(div().text_xs().child(
@@ -23462,6 +23556,292 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn map_sandbox_roster_clones_permissions_and_restores_generated_output() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(16, 16, 50);
+        let mut tileset = default_tileset_spec();
+        tileset.tiles.truncate(2);
+        let source_id = tileset.tiles[0].id.clone();
+        let neighbor_id = tileset.tiles[1].id.clone();
+        tileset.adjacency = vec![
+            AdjacencySpec {
+                tile_a: source_id.clone(),
+                side_a: "UP".to_owned(),
+                tile_b: source_id.clone(),
+                side_b: "down".to_owned(),
+                allowed: false,
+            },
+            AdjacencySpec {
+                tile_a: source_id.clone(),
+                side_a: "north".to_owned(),
+                tile_b: neighbor_id.clone(),
+                side_b: "south".to_owned(),
+                allowed: true,
+            },
+        ];
+        sandbox.replace_rules(tileset.clone()).unwrap();
+        sandbox.paint_channel = MapPaintChannel::Fertility;
+        sandbox.paint_tenths = 4;
+        sandbox.edit(MapAction::Paint(15, 15));
+        let original = sandbox.draft.state.clone();
+        let baseline = sandbox.draft.generate_artifact().unwrap();
+        sandbox.edit(MapAction::RuleClone);
+        let cloned = sandbox.draft.state.clone();
+        let DraftGeneratorConfig::RuleBased { tileset: copied } = &cloned.generator_config
+        else {
+            panic!("roster edits retain rules mode");
+        };
+        assert_eq!(copied.tiles.len(), 3);
+        assert_eq!(sandbox.rule_tile, 2);
+        let copy_id = copied.tiles[2].id.clone();
+        assert_eq!(copy_id, "prototype-copy-1");
+        let mut expected_tile = tileset.tiles[0].clone();
+        expected_tile.id.clone_from(&copy_id);
+        assert_eq!(copied.tiles[2], expected_tile);
+        assert_eq!(copied.tiles[..2], tileset.tiles);
+        let mut expected_rules = Vec::new();
+        for (tile_a, tile_b) in [
+            (&source_id, &source_id),
+            (&copy_id, &source_id),
+            (&source_id, &copy_id),
+            (&copy_id, &copy_id),
+        ] {
+            let mut entry = tileset.adjacency[0].clone();
+            entry.tile_a.clone_from(tile_a);
+            entry.tile_b.clone_from(tile_b);
+            expected_rules.push(entry);
+        }
+        expected_rules.push(tileset.adjacency[1].clone());
+        let mut last = tileset.adjacency[1].clone();
+        last.tile_a.clone_from(&copy_id);
+        expected_rules.push(last);
+        assert_eq!(copied.adjacency, expected_rules);
+        assert_eq!(cloned.constraints, original.constraints);
+        sandbox.rule_tenths = 9;
+        sandbox.edit(MapAction::RuleStamp);
+        let marked = sandbox.draft.state.clone();
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
+        let artifact = &sandbox.preview.as_ref().unwrap().artifact;
+        let mut original_count = 0;
+        let mut copy_count = 0;
+        for y in 0..16 {
+            for x in 0..16 {
+                let tile = artifact.terrain().tile(x, y).unwrap();
+                if tile.kind == tileset.tiles[0].terrain_kind {
+                    assert_eq!(
+                        artifact.terrain().tile(x, (y + 15) % 16).unwrap().kind,
+                        tileset.tiles[1].terrain_kind
+                    );
+                    if tile.elevation == 0.9 {
+                        copy_count += 1;
+                    } else {
+                        assert_eq!(tile.elevation, tileset.tiles[0].elevation.unwrap());
+                        original_count += 1;
+                    }
+                }
+            }
+        }
+        assert!(copy_count > 0, "generation must consume the new prototype");
+        assert!(
+            original_count > 0,
+            "the original prototype must remain usable"
+        );
+        assert_eq!(artifact.terrain().tile(15, 15).unwrap().fertility_bias, 0.4);
+        assert_ne!(
+            artifact.scientific_content_hash(),
+            baseline.scientific_content_hash()
+        );
+        let mut imported = MapSandbox::new(1, 1, 1);
+        imported
+            .import_draft(&sandbox.export_draft().unwrap())
+            .unwrap();
+        assert_eq!(imported.draft.state, marked);
+        assert_eq!(
+            imported
+                .draft
+                .generate_artifact()
+                .unwrap()
+                .scientific_content_hash(),
+            artifact.scientific_content_hash()
+        );
+        sandbox.rule_neighbor = 2;
+        sandbox.rule_entry = expected_rules.len() - 1;
+        sandbox.edit(MapAction::RuleRemove);
+        assert_eq!(sandbox.draft.state, original);
+        assert_eq!(sandbox.rule_tile, 1);
+        assert_eq!(sandbox.rule_neighbor, 1);
+        assert_eq!(sandbox.rule_entry, tileset.adjacency.len() - 1);
+        assert_eq!(
+            sandbox
+                .draft
+                .generate_artifact()
+                .unwrap()
+                .scientific_content_hash(),
+            baseline.scientific_content_hash()
+        );
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state, marked);
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state, cloned);
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state, original);
+        for expected in [&cloned, &marked, &original] {
+            sandbox.edit(MapAction::Redo);
+            assert_eq!(&sandbox.draft.state, expected);
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_roster_refusals_preserve_preview_history_and_bounds() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut cases = Vec::new();
+        let mut one = default_tileset_spec();
+        one.tiles.truncate(1);
+        cases.push((one.clone(), 0, MapAction::RuleRemove));
+        cases.push((one.clone(), usize::MAX, MapAction::RuleClone));
+        cases.push((one.clone(), usize::MAX, MapAction::RuleRemove));
+        one.tiles[0].label = Some("x".repeat(MAP_DRAFT_MAX_BYTES / 2 + 1024));
+        cases.push((one, 0, MapAction::RuleClone));
+        let mut full = default_tileset_spec();
+        let template = full.tiles[0].clone();
+        full.tiles = (0..MAP_DRAFT_MAX_RULE_TILES)
+            .map(|index| {
+                let mut tile = template.clone();
+                tile.id = format!("prototype-copy-{index}");
+                tile
+            })
+            .collect();
+        cases.push((full, 0, MapAction::RuleClone));
+        let mut crowded = default_tileset_spec();
+        crowded.tiles.truncate(2);
+        crowded.adjacency = vec![
+            AdjacencySpec {
+                tile_a: crowded.tiles[0].id.clone(),
+                side_a: "north".to_owned(),
+                tile_b: crowded.tiles[0].id.clone(),
+                side_b: "south".to_owned(),
+                allowed: false,
+            };
+            MAP_RULE_EDITOR_MAX_ADJACENCY
+        ];
+        cases.push((crowded, 0, MapAction::RuleClone));
+        let mut invalid_remainder = default_tileset_spec();
+        invalid_remainder.tiles.truncate(3);
+        for index in [0, 2] {
+            invalid_remainder.adjacency.push(AdjacencySpec {
+                tile_a: invalid_remainder.tiles[2].id.clone(),
+                side_a: "north".to_owned(),
+                tile_b: invalid_remainder.tiles[index].id.clone(),
+                side_b: "south".to_owned(),
+                allowed: false,
+            });
+        }
+        cases.push((invalid_remainder, 1, MapAction::RuleRemove));
+        for (tileset, selected, action) in cases {
+            let mut sandbox = MapSandbox::new(8, 8, 50);
+            sandbox.replace_rules(tileset).unwrap();
+            sandbox.edit(MapAction::RuleWeight(1));
+            sandbox.edit(MapAction::Undo);
+            sandbox.generate(host.snapshot().revisions.scientific);
+            wait_map_job(&mut sandbox);
+            assert!(sandbox.can_apply(), "{}", sandbox.notice);
+            let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+            let state = sandbox.draft.state.clone();
+            let revision = sandbox.draft.revision;
+            assert!(sandbox.draft.can_redo());
+            sandbox.rule_tile = selected;
+            sandbox.edit(action);
+            assert!(
+                sandbox.notice.starts_with("Draft edit refused:"),
+                "{}",
+                sandbox.notice
+            );
+            assert_eq!(sandbox.draft.state, state);
+            assert_eq!(sandbox.draft.revision, revision);
+            assert!(sandbox.draft.can_redo());
+            assert!(sandbox.can_apply());
+            assert!(Arc::ptr_eq(
+                &preview,
+                &sandbox.preview.as_ref().unwrap().artifact
+            ));
+        }
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        let mut tileset = default_tileset_spec();
+        tileset.tiles[0].id = "prototype-copy-1".to_owned();
+        tileset.tiles[1].id = "prototype-copy-3".to_owned();
+        sandbox.replace_rules(tileset).unwrap();
+        sandbox.edit(MapAction::RuleClone);
+        let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config else {
+            panic!("rules");
+        };
+        assert_eq!(tileset.tiles.last().unwrap().id, "prototype-copy-2");
+        sandbox.edit(MapAction::Generator);
+        let sample = sandbox.draft.state.clone();
+        for action in [MapAction::RuleClone, MapAction::RuleRemove] {
+            sandbox.edit(action);
+            assert!(sandbox.notice.starts_with("Draft edit refused:"));
+            assert_eq!(sandbox.draft.state, sample);
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_roster_edits_discard_pending_jobs_without_stepping_science() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
+        let previous = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        sandbox.edit(MapAction::RuleClone);
+        wait_map_job(&mut sandbox);
+        assert!(!sandbox.can_apply());
+        assert!(Arc::ptr_eq(
+            &previous,
+            &sandbox.preview.as_ref().unwrap().artifact
+        ));
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
+        let cloned = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        assert_ne!(
+            previous.metadata().tileset_hash,
+            cloned.metadata().tileset_hash
+        );
+        sandbox.generate(host.snapshot().revisions.scientific);
+        sandbox.edit(MapAction::RuleRemove);
+        wait_map_job(&mut sandbox);
+        assert!(!sandbox.can_apply());
+        assert!(Arc::ptr_eq(
+            &cloned,
+            &sandbox.preview.as_ref().unwrap().artifact
+        ));
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
+        assert_eq!(
+            sandbox
+                .preview
+                .as_ref()
+                .unwrap()
+                .artifact
+                .scientific_content_hash(),
+            previous.scientific_content_hash()
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
     fn map_sandbox_adjacency_generates_neighbors_on_every_toroidal_side() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
@@ -24915,6 +25295,34 @@ mod command_characterization_tests {
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         click(&mut lab, "map-adjacency-back");
         assert!(lab.debug_bounds("map-rules-editor").is_some());
+        click(&mut lab, "map-rule-clone");
+        let cloned_rules = session.map_sandbox.lock().unwrap().draft.state.clone();
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+            else {
+                panic!("production roster controls retain rules mode");
+            };
+            assert_eq!(tileset.tiles.len(), default_tileset_spec().tiles.len() + 1);
+            assert_eq!(sandbox.rule_tile, tileset.tiles.len() - 1);
+            let mut expected = tileset.tiles[2].clone();
+            expected.id = "prototype-copy-1".to_owned();
+            assert_eq!(tileset.tiles.last(), Some(&expected));
+        }
+        click(&mut lab, "map-rule-remove");
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            original_rules
+        );
+        click(&mut lab, "map-undo");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state, cloned_rules);
+        click(&mut lab, "map-redo");
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            original_rules
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
         click(&mut lab, "map-rules-back");
         click(&mut lab, "map-seed");
         assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
