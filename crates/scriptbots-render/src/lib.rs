@@ -5189,11 +5189,10 @@ impl SimulationView {
         let maximum_pattern = sample.sample_width.min(sample.sample_height);
         let output_cells =
             u64::from(sandbox.draft.state.width) * u64::from(sandbox.draft.state.height);
-        let sample_budget = if output_cells == 0 {
-            0
-        } else {
-            (MAX_SAMPLE_CELLS as u64).min(MAX_SAMPLE_CELL_PAIRS as u64 / output_cells)
-        };
+        let sample_budget = (MAX_SAMPLE_CELL_PAIRS as u64)
+            .checked_div(output_cells)
+            .unwrap_or(0)
+            .min(MAX_SAMPLE_CELLS as u64);
         let mut size_controls = div().flex().flex_wrap().gap_2();
         for (id, label, action, enabled) in [
             (
