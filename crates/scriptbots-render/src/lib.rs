@@ -46,8 +46,8 @@ use scriptbots_core::{
 use scriptbots_core::{
     ConstraintLayer, DraftGeneratorConfig, DraftState, ExistingAgentPolicy, MAX_SAMPLE_CELL_PAIRS,
     MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft, MapGenerationError, PaintedConstraint,
-    SamplePatternSpec, ToroidalSeamReport, check_toroidal_seams, compute_sample_hash,
-    default_tileset_spec,
+    SamplePatternSpec, TileSpec, TilesetSpec, ToroidalSeamReport, check_toroidal_seams,
+    compute_sample_hash, default_tileset_spec,
 };
 use scriptbots_runtime::{FoodLayerSnapshot, RenderSnapshot, TerrainLayerSnapshot};
 use scriptbots_runtime::{HostPort, ScientificRevision, channel::ChannelHostPort};
@@ -2844,6 +2844,7 @@ const MAP_ARTIFACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAP_DRAFT_MAX_RULE_TILES: usize = 64;
 const MAP_DRAFT_SCHEMA: &str = "scriptbots.map-draft.v1";
 const MAP_EXTRACT_SAMPLE_SIDE: u32 = 3;
+const MAP_RULE_EDITOR_MAX_WEIGHT: u32 = 1000;
 
 /// Portable editing inputs only: no imported history, receipt, revision or applied claim.
 /// A record list keeps nonempty painted constraints representable in JSON.
@@ -3157,6 +3158,21 @@ enum MapPaintChannel {
 }
 
 impl MapPaintChannel {
+    const fn prototype_override(self, tile: &TileSpec) -> Option<f32> {
+        match self {
+            Self::Elevation => tile.elevation,
+            Self::Moisture => tile.moisture,
+            Self::Fertility => tile.fertility_bias,
+            Self::Temperature => tile.temperature_bias,
+            Self::Permeability => tile.permeability,
+            Self::Runoff => tile.runoff_bias,
+            Self::BasinRank => tile.basin_rank,
+            Self::ChannelPriority => tile.channel_priority,
+            Self::SwimCost => tile.swim_cost,
+            Self::Terrain | Self::Hazard | Self::Erase => None,
+        }
+    }
+
     const fn next(self) -> Self {
         match self {
             Self::Terrain => Self::Elevation,
@@ -3247,6 +3263,10 @@ struct MapSandbox {
     inspection: Option<Arc<MapArtifactInspection>>,
     inspection_cell: (u32, u32),
     sample_editor_open: bool,
+    rules_editor_open: bool,
+    rule_tile: usize,
+    rule_field: MapPaintChannel,
+    rule_tenths: i16,
     policy: ExistingAgentPolicy,
     brush: TerrainKind,
     paint_channel: MapPaintChannel,
@@ -3275,6 +3295,10 @@ impl MapSandbox {
             inspection: None,
             inspection_cell: (0, 0),
             sample_editor_open: false,
+            rules_editor_open: false,
+            rule_tile: 0,
+            rule_field: MapPaintChannel::Elevation,
+            rule_tenths: 5,
             policy: ExistingAgentPolicy::Retain,
             brush: TerrainKind::Grass,
             paint_channel: MapPaintChannel::Terrain,
@@ -3346,6 +3370,7 @@ impl MapSandbox {
         }
         self.preview = None;
         self.sample_editor_open = false;
+        self.rules_editor_open = false;
         Ok(())
     }
 
@@ -3580,12 +3605,67 @@ impl MapSandbox {
                 self.draft.clear_constraints();
                 Ok(())
             }
+            MapAction::EditRules => {
+                if let DraftGeneratorConfig::RuleBased { tileset } =
+                    &self.draft.state.generator_config
+                {
+                    if tileset.tiles.is_empty() || tileset.tiles.len() > MAP_DRAFT_MAX_RULE_TILES {
+                        self.notice = "Rules editor needs a nonempty bounded tileset.".to_owned();
+                    } else {
+                        self.rule_tile = self.rule_tile.min(tileset.tiles.len() - 1);
+                        self.rules_editor_open = true;
+                        self.sample_editor_open = false;
+                    }
+                } else {
+                    self.notice = "Switch to rules mode before editing its prototypes.".to_owned();
+                }
+                return;
+            }
+            MapAction::BackFromRules => {
+                self.rules_editor_open = false;
+                return;
+            }
+            MapAction::RuleNextTile => {
+                if let DraftGeneratorConfig::RuleBased { tileset } =
+                    &self.draft.state.generator_config
+                    && !tileset.tiles.is_empty()
+                {
+                    self.rule_tile = (self.rule_tile.saturating_add(1)) % tileset.tiles.len();
+                }
+                return;
+            }
+            MapAction::RuleField => {
+                self.rule_field = match self.rule_field.next() {
+                    MapPaintChannel::Terrain | MapPaintChannel::Hazard | MapPaintChannel::Erase => {
+                        MapPaintChannel::Elevation
+                    }
+                    next => next,
+                };
+                let (minimum, maximum) = self.rule_field.range();
+                self.rule_tenths = self.rule_tenths.clamp(minimum, maximum);
+                return;
+            }
+            MapAction::RuleValue(delta) => {
+                let (minimum, maximum) = self.rule_field.range();
+                self.rule_tenths = self
+                    .rule_tenths
+                    .saturating_add(delta)
+                    .clamp(minimum, maximum);
+                return;
+            }
+            MapAction::RuleTerrain
+            | MapAction::RuleWeight(_)
+            | MapAction::RuleStamp
+            | MapAction::RuleDefault => self.edit_rule(action),
             MapAction::EditSample => {
                 if let DraftGeneratorConfig::SampleBased { sample } =
                     &self.draft.state.generator_config
                 {
                     match sample.validate() {
-                        Ok(()) => self.sample_editor_open = true,
+                        Ok(()) => {
+                            self.sample_editor_open = true;
+                            self.rules_editor_open = false;
+                        }
                         Err(error) => self.notice = format!("Sample editor unavailable: {error}"),
                     }
                 } else {
@@ -3678,6 +3758,8 @@ impl MapSandbox {
             DraftGeneratorConfig::SampleBased { .. }
         ) {
             self.sample_editor_open = false;
+        } else {
+            self.rules_editor_open = false;
         }
         self.notice = result.map_or_else(
             |error| format!("Draft edit refused: {error}"),
@@ -3690,6 +3772,85 @@ impl MapSandbox {
                 }
             },
         );
+    }
+
+    fn edit_rule(&mut self, action: MapAction) -> Result<(), MapGenerationError> {
+        let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config
+        else {
+            return Err(MapGenerationError::DraftError(
+                "Choose rules mode first.".to_owned(),
+            ));
+        };
+        if tileset.tiles.len() > MAP_DRAFT_MAX_RULE_TILES {
+            return Err(MapGenerationError::DraftError(
+                "Too many rule prototypes for the editor.".to_owned(),
+            ));
+        }
+        let mut tileset = tileset.clone();
+        let tile = tileset.tiles.get_mut(self.rule_tile).ok_or_else(|| {
+            MapGenerationError::DraftError("Select an existing rule prototype.".to_owned())
+        })?;
+        match action {
+            MapAction::RuleTerrain => {
+                tile.terrain_kind = match tile.terrain_kind {
+                    TerrainKind::DeepWater => TerrainKind::ShallowWater,
+                    TerrainKind::ShallowWater => TerrainKind::Sand,
+                    TerrainKind::Sand => TerrainKind::Grass,
+                    TerrainKind::Grass => TerrainKind::Bloom,
+                    TerrainKind::Bloom => TerrainKind::Rock,
+                    TerrainKind::Rock => TerrainKind::DeepWater,
+                };
+            }
+            MapAction::RuleWeight(delta) => {
+                if tile.weight > MAP_RULE_EDITOR_MAX_WEIGHT {
+                    return Err(MapGenerationError::DraftError(format!(
+                        "Imported weight exceeds editor range 1–{MAP_RULE_EDITOR_MAX_WEIGHT}; edit the recipe to change it."
+                    )));
+                }
+                tile.weight = tile
+                    .weight
+                    .saturating_add_signed(i32::from(delta))
+                    .clamp(1, MAP_RULE_EDITOR_MAX_WEIGHT);
+            }
+            MapAction::RuleStamp | MapAction::RuleDefault => {
+                let (minimum, maximum) = self.rule_field.range();
+                if !(minimum..=maximum).contains(&self.rule_tenths) {
+                    return Err(MapGenerationError::DraftError(
+                        "Prototype brush value is out of range.".to_owned(),
+                    ));
+                }
+                let target = match self.rule_field {
+                    MapPaintChannel::Elevation => &mut tile.elevation,
+                    MapPaintChannel::Moisture => &mut tile.moisture,
+                    MapPaintChannel::Fertility => &mut tile.fertility_bias,
+                    MapPaintChannel::Temperature => &mut tile.temperature_bias,
+                    MapPaintChannel::Permeability => &mut tile.permeability,
+                    MapPaintChannel::Runoff => &mut tile.runoff_bias,
+                    MapPaintChannel::BasinRank => &mut tile.basin_rank,
+                    MapPaintChannel::ChannelPriority => &mut tile.channel_priority,
+                    MapPaintChannel::SwimCost => &mut tile.swim_cost,
+                    MapPaintChannel::Terrain
+                    | MapPaintChannel::Hazard
+                    | MapPaintChannel::Erase => {
+                        return Err(MapGenerationError::DraftError(
+                            "Choose a prototype scalar field.".to_owned(),
+                        ));
+                    }
+                };
+                *target = matches!(action, MapAction::RuleStamp)
+                    .then_some(f32::from(self.rule_tenths) / 10.0);
+            }
+            _ => return Ok(()),
+        }
+        let mut document = MapDraftDocument::from_draft(&self.draft);
+        document.generator_config = DraftGeneratorConfig::RuleBased { tileset };
+        let state = document
+            .into_state()
+            .map_err(MapGenerationError::DraftError)?;
+        if state == self.draft.state {
+            return Ok(());
+        }
+        self.draft.replace_state(state)
     }
 
     fn replace_sample(&mut self, sample: SamplePatternSpec) -> Result<(), MapGenerationError> {
@@ -3785,6 +3946,7 @@ impl MapSandbox {
         self.replace_sample(sample)?;
         self.inspection = None;
         self.sample_editor_open = true;
+        self.rules_editor_open = false;
         Ok(())
     }
 
@@ -3870,6 +4032,15 @@ enum MapAction {
     SampleCell(u32, u32),
     SamplePattern,
     SampleOrientations,
+    EditRules,
+    BackFromRules,
+    RuleNextTile,
+    RuleTerrain,
+    RuleWeight(i16),
+    RuleField,
+    RuleValue(i16),
+    RuleStamp,
+    RuleDefault,
     Cancel,
     NextSeed,
     NextSize,
@@ -4444,6 +4615,134 @@ impl SimulationView {
         .detach();
     }
 
+    fn render_map_rules_editor(
+        &self,
+        sandbox: &MapSandbox,
+        tileset: &TilesetSpec,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let Some(tile) = tileset.tiles.get(sandbox.rule_tile) else {
+            return div().child(self.render_map_button(
+                "map-rules-back",
+                "Back to draft".to_owned(),
+                MapAction::BackFromRules,
+                true,
+                cx,
+            ));
+        };
+        let id: String = tile.id.chars().take(128).collect();
+        let current = sandbox.rule_field.prototype_override(tile).map_or_else(
+            || "generated default".to_owned(),
+            |value| format!("explicit {value:.3}"),
+        );
+        let (minimum, maximum) = sandbox.rule_field.range();
+        let editable_weight = tile.weight <= MAP_RULE_EDITOR_MAX_WEIGHT;
+        let mut controls = div().flex().flex_wrap().gap_2();
+        for (id, label, action, enabled) in [
+            (
+                "map-rules-back",
+                "Back to draft".to_owned(),
+                MapAction::BackFromRules,
+                true,
+            ),
+            (
+                "map-rule-next",
+                format!("Prototype {} / {} (next)", sandbox.rule_tile + 1, tileset.tiles.len()),
+                MapAction::RuleNextTile,
+                tileset.tiles.len() > 1,
+            ),
+            (
+                "map-rule-terrain",
+                format!("Terrain: {:?} (cycle)", tile.terrain_kind),
+                MapAction::RuleTerrain,
+                true,
+            ),
+            (
+                "map-rule-weight-decrease",
+                "Weight −1".to_owned(),
+                MapAction::RuleWeight(-1),
+                editable_weight && tile.weight > 1,
+            ),
+            (
+                "map-rule-weight-increase",
+                "Weight +1".to_owned(),
+                MapAction::RuleWeight(1),
+                tile.weight < MAP_RULE_EDITOR_MAX_WEIGHT,
+            ),
+            (
+                "map-rule-field",
+                format!("Field: {} (cycle)", sandbox.rule_field.label()),
+                MapAction::RuleField,
+                true,
+            ),
+            (
+                "map-rule-value-decrease",
+                "Value −0.1".to_owned(),
+                MapAction::RuleValue(-1),
+                sandbox.rule_tenths > minimum,
+            ),
+            (
+                "map-rule-value-increase",
+                "Value +0.1".to_owned(),
+                MapAction::RuleValue(1),
+                sandbox.rule_tenths < maximum,
+            ),
+            (
+                "map-rule-stamp",
+                "Set prototype field".to_owned(),
+                MapAction::RuleStamp,
+                true,
+            ),
+            (
+                "map-rule-default",
+                "Use generated default".to_owned(),
+                MapAction::RuleDefault,
+                sandbox.rule_field.prototype_override(tile).is_some(),
+            ),
+            (
+                "map-undo",
+                "Undo draft".to_owned(),
+                MapAction::Undo,
+                sandbox.draft.can_undo(),
+            ),
+            (
+                "map-redo",
+                "Redo draft".to_owned(),
+                MapAction::Redo,
+                sandbox.draft.can_redo(),
+            ),
+        ] {
+            controls = controls.child(self.render_map_button(id, label, action, enabled, cx));
+        }
+        div().child(
+            div()
+                .id("map-rules-editor")
+                .debug_selector(|| "map-rules-editor".to_owned())
+                .flex()
+                .flex_col()
+                .gap_3()
+                .text_color(chrome::text_primary())
+                .child(div().text_sm().child("Rule prototype defaults"))
+                .child(div().text_xs().child(format!(
+                    "Prototype ID (first 128 characters): {id} · weight {} · draft revision {}",
+                    tile.weight, sandbox.draft.revision,
+                )))
+                .child(controls)
+                .child(div().text_xs().child(format!(
+                    "{}: {current} · brush {:.1} (range {:.1} to {:.1}) · weight controls 1–{MAP_RULE_EDITOR_MAX_WEIGHT}",
+                    sandbox.rule_field.label(), f32::from(sandbox.rule_tenths) / 10.0,
+                    f32::from(minimum) / 10.0, f32::from(maximum) / 10.0,
+                )))
+                .child(div().text_xs().child(
+                    "Prototype edits affect every generated occurrence, except painted output-cell overrides. Terrain changes preserve explicit fields and palette; clear a field to use its terrain-derived default. IDs, labels, adjacency and other prototypes are preserved. Adjacency and palette authoring still use recipes.",
+                ))
+                .child(div().text_xs().child(sandbox.notice.clone()))
+                .child(div().text_xs().child(
+                    "All edits share draft undo/redo. Return and generate a new preview to observe the actual rules hash and output before guarded Apply. Editing never steps or applies to the live world.",
+                )),
+        )
+    }
+
     fn render_map_sample_editor(
         &self,
         sandbox: &MapSandbox,
@@ -4704,6 +5003,12 @@ impl SimulationView {
         if let Some(inspection) = &sandbox.inspection {
             return self.render_map_inspection(&sandbox, inspection, cx);
         }
+        if sandbox.rules_editor_open
+            && let DraftGeneratorConfig::RuleBased { tileset } =
+                &sandbox.draft.state.generator_config
+        {
+            return self.render_map_rules_editor(&sandbox, tileset, cx);
+        }
         if sandbox.sample_editor_open
             && let DraftGeneratorConfig::SampleBased { sample } =
                 &sandbox.draft.state.generator_config
@@ -4933,6 +5238,12 @@ impl SimulationView {
                         row.child(self.render_map_button(
                             "map-edit-sample", "Edit sample".to_owned(),
                             MapAction::EditSample, true, cx,
+                        ))
+                    })
+                    .when(matches!(draft.state.generator_config, DraftGeneratorConfig::RuleBased { .. }), |row| {
+                        row.child(self.render_map_button(
+                            "map-edit-rules", "Edit rules".to_owned(),
+                            MapAction::EditRules, true, cx,
                         ))
                     }),
             )
@@ -22859,6 +23170,306 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn map_sandbox_rule_prototypes_generate_real_fields_and_round_trip() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        let mut tileset = default_tileset_spec();
+        tileset.tiles.truncate(1);
+        tileset.adjacency.push(scriptbots_core::AdjacencySpec {
+            tile_a: tileset.tiles[0].id.clone(),
+            side_a: "east".to_owned(),
+            tile_b: tileset.tiles[0].id.clone(),
+            side_b: "west".to_owned(),
+            allowed: true,
+        });
+        sandbox
+            .draft
+            .set_generator_config(DraftGeneratorConfig::RuleBased { tileset });
+        sandbox.paint_channel = MapPaintChannel::Fertility;
+        sandbox.paint_tenths = 2;
+        sandbox.edit(MapAction::Paint(7, 7));
+        let original = sandbox.draft.state.clone();
+        let baseline_hash = sandbox
+            .draft
+            .generate_artifact()
+            .unwrap()
+            .metadata()
+            .tileset_hash;
+        sandbox.edit(MapAction::EditRules);
+        assert!(sandbox.rules_editor_open);
+        sandbox.edit(MapAction::RuleTerrain);
+        sandbox.edit(MapAction::RuleWeight(3));
+        let channels = [
+            (MapPaintChannel::Elevation, 8),
+            (MapPaintChannel::Moisture, 7),
+            (MapPaintChannel::Fertility, 6),
+            (MapPaintChannel::Temperature, 4),
+            (MapPaintChannel::Permeability, 3),
+            (MapPaintChannel::Runoff, -2),
+            (MapPaintChannel::BasinRank, 9),
+            (MapPaintChannel::ChannelPriority, 1),
+            (MapPaintChannel::SwimCost, 24),
+        ];
+        for (field, value) in channels {
+            sandbox.rule_field = field;
+            sandbox.rule_tenths = value;
+            sandbox.edit(MapAction::RuleStamp);
+            assert!(
+                !sandbox.notice.starts_with("Draft edit refused:"),
+                "{}",
+                sandbox.notice
+            );
+        }
+        let edited = sandbox.draft.state.clone();
+        let DraftGeneratorConfig::RuleBased { tileset } = &edited.generator_config else {
+            panic!("prototype edits retain rules mode");
+        };
+        let DraftGeneratorConfig::RuleBased { tileset: prior } = &original.generator_config
+        else {
+            panic!("original rules");
+        };
+        assert_eq!(tileset.id, prior.id);
+        assert_eq!(tileset.label, prior.label);
+        assert_eq!(tileset.adjacency, prior.adjacency);
+        assert_eq!(tileset.tiles[0].id, prior.tiles[0].id);
+        assert_eq!(tileset.tiles[0].label, prior.tiles[0].label);
+        assert_eq!(
+            tileset.tiles[0].palette_index,
+            prior.tiles[0].palette_index
+        );
+        assert_eq!(tileset.tiles[0].accent, prior.tiles[0].accent);
+        assert_eq!(tileset.tiles[0].weight, 5);
+        assert_eq!(edited.constraints, original.constraints);
+        sandbox.edit(MapAction::Undo);
+        let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+        else {
+            panic!("rules");
+        };
+        assert_eq!(tileset.tiles[0].swim_cost, prior.tiles[0].swim_cost);
+        sandbox.edit(MapAction::Redo);
+        assert_eq!(sandbox.draft.state, edited);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let artifact = &sandbox.preview.as_ref().unwrap().artifact;
+        assert_ne!(artifact.metadata().tileset_hash, baseline_hash);
+        let tile = artifact.terrain().tile(0, 0).unwrap();
+        let hydro = &artifact.hydrology_tiles().unwrap().tiles()[0];
+        assert_eq!(tile.kind, TerrainKind::ShallowWater);
+        assert_eq!(
+            [
+                tile.elevation,
+                tile.moisture,
+                tile.fertility_bias,
+                tile.temperature_bias,
+                hydro.permeability,
+                hydro.runoff_bias,
+                hydro.basin_rank,
+                hydro.channel_priority,
+                hydro.swim_cost,
+            ],
+            [0.8, 0.7, 0.6, 0.4, 0.3, -0.2, 0.9, 0.1, 2.4]
+        );
+        assert_eq!(artifact.terrain().tile(7, 7).unwrap().fertility_bias, 0.2);
+        let hash = artifact.scientific_content_hash();
+        let json = sandbox.export_draft().unwrap();
+        let mut restored = MapSandbox::new(1, 1, 1);
+        restored.import_draft(&json).unwrap();
+        assert_eq!(restored.draft.state, edited);
+        assert_eq!(
+            restored.draft.generate_artifact().unwrap().scientific_content_hash(),
+            hash
+        );
+        sandbox.edit(MapAction::RuleDefault);
+        let defaulted = sandbox.draft.generate_artifact().unwrap();
+        let mut expected = edited.clone();
+        let DraftGeneratorConfig::RuleBased { tileset } = &mut expected.generator_config else {
+            panic!("rules");
+        };
+        tileset.tiles[0].swim_cost = None;
+        assert_eq!(sandbox.draft.state, expected);
+        assert_eq!(defaulted.hydrology_tiles().unwrap().tiles()[0].swim_cost, 0.3);
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state, edited);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_rule_weights_change_generation_and_noops_preserve_redo() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(16, 16, 50);
+        let mut tileset = default_tileset_spec();
+        tileset.tiles.truncate(2);
+        tileset.tiles[0].weight = 1;
+        tileset.tiles[1].weight = 1;
+        tileset.tiles[0].moisture = None;
+        sandbox
+            .draft
+            .set_generator_config(DraftGeneratorConfig::RuleBased { tileset });
+        let baseline = sandbox.draft.generate_artifact().unwrap();
+        sandbox.edit(MapAction::RuleWeight(i16::MAX));
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        let count = |map: &MapArtifact| {
+            map.terrain()
+                .tiles()
+                .iter()
+                .filter(|tile| tile.kind == TerrainKind::DeepWater)
+                .count()
+        };
+        assert!(
+            count(&preview) > count(&baseline),
+            "weight change must affect actual placement"
+        );
+        assert_ne!(
+            preview.metadata().tileset_hash,
+            baseline.metadata().tileset_hash
+        );
+        sandbox.rule_field = MapPaintChannel::Moisture;
+        for action in [MapAction::RuleWeight(1), MapAction::RuleDefault] {
+            let draft = sandbox.draft.clone();
+            sandbox.edit(action);
+            assert_eq!(sandbox.draft, draft);
+            assert!(sandbox.can_apply());
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
+            assert!(sandbox.notice.starts_with("No draft change."));
+        }
+        sandbox.edit(MapAction::RuleStamp);
+        sandbox.edit(MapAction::Undo);
+        assert!(sandbox.draft.can_redo());
+        let draft = sandbox.draft.clone();
+        sandbox.edit(MapAction::RuleDefault);
+        assert_eq!(sandbox.draft, draft);
+        assert!(sandbox.draft.can_redo());
+        sandbox.edit(MapAction::Redo);
+        assert_ne!(sandbox.draft.state, draft.state);
+        sandbox.edit(MapAction::RuleWeight(i16::MIN));
+        let draft = sandbox.draft.clone();
+        sandbox.edit(MapAction::RuleWeight(-1));
+        assert_eq!(sandbox.draft, draft);
+        sandbox.rule_field = MapPaintChannel::Elevation;
+        let draft = sandbox.draft.clone();
+        for expected in [
+            MapPaintChannel::Moisture,
+            MapPaintChannel::Fertility,
+            MapPaintChannel::Temperature,
+            MapPaintChannel::Permeability,
+            MapPaintChannel::Runoff,
+            MapPaintChannel::BasinRank,
+            MapPaintChannel::ChannelPriority,
+            MapPaintChannel::SwimCost,
+            MapPaintChannel::Elevation,
+        ] {
+            sandbox.edit(MapAction::RuleField);
+            assert_eq!(sandbox.rule_field, expected);
+        }
+        sandbox.edit(MapAction::RuleValue(i16::MAX));
+        assert_eq!(sandbox.rule_tenths, 10);
+        sandbox.edit(MapAction::RuleValue(i16::MIN));
+        assert_eq!(sandbox.rule_tenths, 0);
+        assert_eq!(sandbox.draft, draft);
+        for expected in [
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+            TerrainKind::DeepWater,
+        ] {
+            sandbox.edit(MapAction::RuleTerrain);
+            let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+            else {
+                panic!("rules");
+            };
+            assert_eq!(tileset.tiles[0].terrain_kind, expected);
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_rule_edit_refusals_and_edited_jobs_preserve_science() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        let initial = sandbox.draft.state.clone();
+        let DraftGeneratorConfig::RuleBased { tileset: original } = &initial.generator_config
+        else {
+            panic!("rules");
+        };
+        sandbox.rule_tile = 1;
+        sandbox.edit(MapAction::RuleTerrain);
+        let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+        else {
+            panic!("rules");
+        };
+        assert_eq!(tileset.tiles[0], original.tiles[0]);
+        assert_eq!(tileset.tiles[2..], original.tiles[2..]);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        sandbox.edit(MapAction::RuleWeight(1));
+        wait_map_job(&mut sandbox);
+        assert!(
+            sandbox.notice.contains("Discarded cancelled or edited draft result")
+        );
+        assert!(Arc::ptr_eq(
+            &sandbox.preview.as_ref().unwrap().artifact,
+            &preview
+        ));
+        sandbox.rule_tile = usize::MAX;
+        let draft = sandbox.draft.clone();
+        sandbox.edit(MapAction::RuleTerrain);
+        assert_eq!(sandbox.draft, draft);
+        assert!(sandbox.notice.contains("Select an existing"));
+        sandbox.rule_tile = 0;
+        sandbox.rule_tenths = i16::MAX;
+        let draft = sandbox.draft.clone();
+        sandbox.edit(MapAction::RuleStamp);
+        assert_eq!(sandbox.draft, draft);
+        assert!(sandbox.notice.contains("out of range"));
+        sandbox.rule_tenths = 5;
+        if let DraftGeneratorConfig::RuleBased { tileset } = &mut sandbox.draft.state.generator_config
+        {
+            tileset.adjacency.push(scriptbots_core::AdjacencySpec {
+                tile_a: "missing".to_owned(),
+                side_a: "east".to_owned(),
+                tile_b: tileset.tiles[0].id.clone(),
+                side_b: "west".to_owned(),
+                allowed: true,
+            });
+        }
+        let draft = sandbox.draft.clone();
+        sandbox.edit(MapAction::RuleWeight(1));
+        assert_eq!(sandbox.draft, draft);
+        assert!(sandbox.notice.contains("unknown tile"));
+        sandbox.draft.state = initial.clone();
+        if let DraftGeneratorConfig::RuleBased { tileset } = &mut sandbox.draft.state.generator_config
+        {
+            tileset.tiles[0].weight = MAP_RULE_EDITOR_MAX_WEIGHT + 1;
+        }
+        let draft = sandbox.draft.clone();
+        sandbox.edit(MapAction::RuleWeight(-1));
+        assert_eq!(sandbox.draft, draft);
+        assert!(sandbox.notice.contains("Imported weight exceeds editor range"));
+        sandbox.draft.state = initial;
+        sandbox.edit(MapAction::Generator);
+        let draft = sandbox.draft.clone();
+        sandbox.edit(MapAction::RuleTerrain);
+        assert_eq!(sandbox.draft, draft);
+        assert!(sandbox.notice.contains("Choose rules mode"));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
     fn map_sandbox_extracts_toroidal_exemplar_and_edits_real_sample_generation() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
@@ -23586,6 +24197,43 @@ mod command_characterization_tests {
             });
         };
         click(&mut lab, "dashboard-tab-maps");
+        let original_rules = session.map_sandbox.lock().unwrap().draft.state.clone();
+        click(&mut lab, "map-edit-rules");
+        assert!(lab.debug_bounds("map-rules-editor").is_some());
+        click(&mut lab, "map-rule-next");
+        click(&mut lab, "map-rule-terrain");
+        click(&mut lab, "map-rule-weight-increase");
+        click(&mut lab, "map-rule-value-increase");
+        click(&mut lab, "map-rule-stamp");
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+            else {
+                panic!("production prototype controls retain rules mode");
+            };
+            assert_eq!(tileset.tiles[1].terrain_kind, TerrainKind::Sand);
+            assert_eq!(tileset.tiles[1].weight, 3);
+            assert_eq!(tileset.tiles[1].elevation, Some(0.6));
+        }
+        click(&mut lab, "map-rule-default");
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+            else {
+                panic!("rules");
+            };
+            assert_eq!(tileset.tiles[1].elevation, None);
+        }
+        for _ in 0..4 {
+            click(&mut lab, "map-undo");
+        }
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state, original_rules);
+        click(&mut lab, "map-redo");
+        assert_ne!(session.map_sandbox.lock().unwrap().draft.state, original_rules);
+        click(&mut lab, "map-undo");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft.state, original_rules);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        click(&mut lab, "map-rules-back");
         click(&mut lab, "map-seed");
         assert_eq!(session.map_sandbox.lock().unwrap().draft.state.seed, 2);
         click(&mut lab, "map-size");
