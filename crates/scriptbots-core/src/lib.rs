@@ -17703,13 +17703,35 @@ mod map_sandbox {
             update_direction_rule(&mut rules[b_idx][dir_b], a_idx, adjacency.allowed);
         }
 
+        // A physical neighbor must satisfy both endpoints. WFC initializes support
+        // counts from the opposite list and decrements through the forward list;
+        // passing asymmetric lists can report contradictions for valid layouts.
+        let resolved_rules = rules
+            .iter()
+            .map(|tile_rules| {
+                let mut neighbors = CardinalDirectionTable::default();
+                for direction in direction::CardinalDirections {
+                    neighbors[direction] = tile_rules[direction].resolve(compiled_tiles.len());
+                }
+                neighbors
+            })
+            .collect::<Vec<_>>();
+
         let pattern_descriptions = compiled_tiles
             .iter()
             .enumerate()
             .map(|(idx, tile)| {
                 let mut neighbors = CardinalDirectionTable::default();
                 for direction in direction::CardinalDirections {
-                    let resolved = rules[idx][direction].resolve(compiled_tiles.len());
+                    let resolved = resolved_rules[idx][direction]
+                        .iter()
+                        .copied()
+                        .filter(|&neighbor| {
+                            resolved_rules[neighbor][direction.opposite()]
+                                .binary_search(&idx)
+                                .is_ok()
+                        })
+                        .collect::<Vec<_>>();
                     if resolved.is_empty() {
                         return Err(MapGenerationError::EmptyAdjacency {
                             tile: tile.id.clone(),
@@ -19766,6 +19788,39 @@ mod map_sandbox {
                 .expect_err("non-finite hydrology vector must fail");
                 assert_eq!(error.path(), "hydrology.field.accumulation[1]");
             }
+        }
+
+        #[test]
+        fn rule_compilation_refuses_conflicting_opposite_endpoint_lists() {
+            let mut spec = default_tileset_spec();
+            spec.tiles.truncate(2);
+            let a = spec.tiles[0].id.clone();
+            let b = spec.tiles[1].id.clone();
+            spec.adjacency = vec![
+                AdjacencySpec {
+                    tile_a: a.clone(),
+                    side_a: "north".to_owned(),
+                    tile_b: b.clone(),
+                    side_b: "east".to_owned(),
+                    allowed: true,
+                },
+                AdjacencySpec {
+                    tile_a: b.clone(),
+                    side_a: "south".to_owned(),
+                    tile_b: b,
+                    side_b: "north".to_owned(),
+                    allowed: true,
+                },
+            ];
+            // Every authored list is nonempty, but A requires B to its north
+            // while B's south allow list excludes A. No physical pairing exists.
+            assert!(matches!(
+                RuleBasedMapGenerator::new(spec),
+                Err(MapGenerationError::EmptyAdjacency {
+                    tile,
+                    direction: CardinalDirection::North,
+                }) if tile == a
+            ));
         }
 
         #[test]

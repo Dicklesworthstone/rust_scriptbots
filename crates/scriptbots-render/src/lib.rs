@@ -5026,7 +5026,7 @@ impl SimulationView {
                     sandbox.draft.revision,
                 )))
                 .child(div().text_xs().child(
-                    "Order matters. Each entry changes both named endpoints. The first allow-list entry for an endpoint/side replaces its unrestricted neighbors; later allows add neighbors and forbids remove them. With no allow list, a forbid excludes only that neighbor. Toggle/remove act on the selected existing entry, including imported rules. Invalid or empty neighbor lists are refused atomically; a valid rule set can still contradict the toroidal output dimensions.",
+                    "Order matters. Each entry changes both named endpoints. The first allow-list entry for an endpoint/side replaces its unrestricted neighbors; later allows add neighbors and forbids remove them. With no allow list, a forbid excludes only that neighbor. A physical pair must satisfy both facing endpoint lists. Toggle/remove act on the selected existing entry, including imported rules. Invalid or empty neighbor lists are refused atomically; a valid rule set can still contradict the toroidal output dimensions.",
                 ))
                 .child(div().text_xs().child(sandbox.notice.clone()))
                 .child(div().text_xs().child(
@@ -23499,6 +23499,7 @@ mod command_characterization_tests {
             assert_eq!(tileset.adjacency[0].side_b, *side_b);
             sandbox.generate(host.snapshot().revisions.scientific);
             wait_map_job(&mut sandbox);
+            assert!(sandbox.preview.is_some(), "{}", sandbox.notice);
             let artifact = &sandbox.preview.as_ref().unwrap().artifact;
             assert_ne!(
                 artifact.metadata().tileset_hash,
@@ -23617,6 +23618,7 @@ mod command_characterization_tests {
         sandbox.edit(MapAction::Undo);
         sandbox.generate(host.snapshot().revisions.scientific);
         wait_map_job(&mut sandbox);
+        assert!(sandbox.preview.is_some(), "{}", sandbox.notice);
         let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
         let revision = sandbox.draft.revision;
         let state = sandbox.draft.state.clone();
@@ -23732,7 +23734,7 @@ mod command_characterization_tests {
         assert!(!sandbox.can_apply());
         sandbox.generate(host.snapshot().revisions.scientific);
         wait_map_job(&mut sandbox);
-        assert!(sandbox.can_apply());
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
         let valid = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
         assert_ne!(
             valid.scientific_content_hash(),
