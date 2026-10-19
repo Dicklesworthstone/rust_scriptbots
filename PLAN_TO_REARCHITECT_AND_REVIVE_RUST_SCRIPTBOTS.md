@@ -2410,6 +2410,24 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native rectangular sample sizing, 2026-10-19 (`bd-2z0.10.7`):**
+connect exemplar width/height controls to bounded, whole-draft validated crop/repeat edits.
+Preserve seed, output grid and constraints; clamp overlapping pattern size when shrinking.
+Observe actual generated output, recipe/history, no-op/refusal/job guards and production
+input. Original native OS/full editor acceptance remains unchanged and open.
+
+Source `884993f464df39406395b205bbff57e78e768ff2` is published to both required refs.
+R228 passes nineteen source command/log pairs and typed `pass/0`; fresh reader/planted-
+negative execution verifies 103 required completions. Raw totals: 430 passing executions /
+253 distinct names / zero failures / six executions of three unchanged ignored diagnostics.
+Both renderer modes observe four distinct generated outputs, exact crop/repeat behavior,
+pattern clamping, recipe/history, bounds/refusals/job guards and production input. All 128
+manifest files / 370,248,372 bytes and source/profile/log/helper identities recompute.
+Outer DSR exits 6 on the tracked Proptest README symlink before collection; guard unchanged,
+no collected release. R226 formatting and incomplete interrupted R227 Clippy evidence remain
+retained. Resource/palette authoring, configurable saved-artifact patch dimensions,
+accessibility and actual native OS/full editor acceptance stay open; no criterion narrows.
+
 **[Currently In Progress] Native prototype roster, 2026-10-19 (`bd-2z0.10.7`):**
 connect bounded clone/remove to complete-draft validation and shared history. Clone
 prototype data and ordered adjacency permissions under a unique ID; removal explicitly

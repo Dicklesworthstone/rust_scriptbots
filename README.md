@@ -687,9 +687,14 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   grass/water/sand brush to paint its cells, cycle the pattern size from 1 to the smaller
   exemplar dimension, or toggle rotations/reflections. Edits retain the sample label,
   update its computed content hash, and share the draft's undo/redo history. Painting an
-  unchanged cell preserves history and the current preview. **Back to draft** returns to
+  unchanged cell preserves history and the current preview. **Width ±1** and **Height ±1**
+  resize the exemplar independently: growth repeats its current cells from the upper-left
+  corner, while shrinking crops them and clamps the pattern size to fit. The controls show
+  the current output-work budget, up to 64 exemplar cells; invalid or over-budget edits and
+  recipes over 1 MiB are refused atomically. Resizing preserves output dimensions, seed and
+  painted constraints, and shares undo/redo. **Back to draft** returns to
   generation and guarded Apply; editing alone never changes the live world. Imported
-  recipes can supply other terrain kinds and exemplar dimensions within the core bounds.
+  recipes can supply other terrain kinds within the same core bounds.
   **Copy draft JSON** and **Paste draft JSON** transfer a versioned editing recipe through
   the clipboard. Save the copied text to retain it, or edit its seed, dimensions,
   `generator_config` and `constraints` records to author custom rules, exemplars and
@@ -722,8 +727,9 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   that opens the exemplar view. Output dimensions, seed and painted output constraints
   are retained. Fertility, temperature and hydrology are not copied into the exemplar;
   they come from generation defaults and output constraints. Generate a fresh preview
-  before applying. Resource controls, additional sample sizing controls, accessible
-  palettes and actual native OS-input acceptance remain open.
+  before applying. Enlarging the draft exemplar repeats its current cells; it does not
+  extract a larger saved-map region. Resource controls, configurable saved-artifact patch
+  dimensions, accessible palettes and actual native OS-input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.
 - A sample specifies `sample_id`, `sample_width`, `sample_height`, `pattern_size`, and row-major `sample_tiles` terrain kinds. `all_orientations` and `periodic` default to true; `periodic: false` is refused because non-periodic extraction is not implemented. Core bounds (`MAX_SAMPLE_CELLS`, `MAX_SAMPLE_OUTPUT_CELLS`, `MAX_SAMPLE_CELL_PAIRS`) admit at most 64 exemplar cells, 65,536 output cells, and 1,048,576 output/exemplar cell pairs before model construction. These are input-work bounds, not wall-clock or exact-byte guarantees. For example, a 2×2 all-sand sample is:
