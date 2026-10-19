@@ -3663,7 +3663,8 @@ impl MapSandbox {
                     &self.draft.state.generator_config
                     && !tileset.tiles.is_empty()
                 {
-                    self.rule_neighbor = (self.rule_neighbor.saturating_add(1)) % tileset.tiles.len();
+                    self.rule_neighbor =
+                        (self.rule_neighbor.saturating_add(1)) % tileset.tiles.len();
                 }
                 return;
             }
@@ -3831,7 +3832,9 @@ impl MapSandbox {
             },
         );
         if let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config {
-            self.rule_entry = self.rule_entry.min(tileset.adjacency.len().saturating_sub(1));
+            self.rule_entry = self
+                .rule_entry
+                .min(tileset.adjacency.len().saturating_sub(1));
         }
     }
 
@@ -3891,7 +3894,8 @@ impl MapSandbox {
         let next_entry = if matches!(action, MapAction::RuleAppend(_)) {
             tileset.adjacency.len().saturating_sub(1)
         } else {
-            self.rule_entry.min(tileset.adjacency.len().saturating_sub(1))
+            self.rule_entry
+                .min(tileset.adjacency.len().saturating_sub(1))
         };
         self.replace_rules(tileset)?;
         self.rule_entry = next_entry;
@@ -23465,7 +23469,7 @@ mod command_characterization_tests {
         for (side, (side_a, side_b)) in MAP_RULE_SIDES.iter().enumerate() {
             let mut sandbox = MapSandbox::new(8, 8, 50);
             let mut tileset = default_tileset_spec();
-            tileset.tiles.truncate(2);
+            tileset.tiles.truncate(3);
             let prototypes = tileset.tiles.clone();
             sandbox
                 .draft
@@ -23484,7 +23488,8 @@ mod command_characterization_tests {
                 sandbox.notice
             );
             let allowed_state = sandbox.draft.state.clone();
-            let DraftGeneratorConfig::RuleBased { tileset } = &allowed_state.generator_config else {
+            let DraftGeneratorConfig::RuleBased { tileset } = &allowed_state.generator_config
+            else {
                 panic!("adjacency edits retain rules mode");
             };
             assert_eq!(tileset.tiles, prototypes);
@@ -23500,7 +23505,7 @@ mod command_characterization_tests {
                 baseline.metadata().tileset_hash
             );
             hashes.insert(artifact.metadata().tileset_hash);
-            let neighbor = |x: u32, y: u32| match *side_a {
+            let neighbor = |x: u32, y: u32, direction: &str| match direction {
                 "north" => (x, (y + 7) % 8),
                 "east" => ((x + 1) % 8, y),
                 "south" => (x, (y + 1) % 8),
@@ -23508,21 +23513,32 @@ mod command_characterization_tests {
                 _ => panic!("declared editor sides must be cardinal"),
             };
             let mut allowed_pairs = 0;
+            let mut asymmetric_pairs = 0;
             for y in 0..8 {
                 for x in 0..8 {
                     if artifact.terrain().tile(x, y).unwrap().kind == prototypes[0].terrain_kind {
-                        let (nx, ny) = neighbor(x, y);
+                        let (nx, ny) = neighbor(x, y, side_a);
                         assert_eq!(
                             artifact.terrain().tile(nx, ny).unwrap().kind,
                             prototypes[1].terrain_kind
                         );
                         allowed_pairs += 1;
+                        let (px, py) = neighbor(x, y, side_b);
+                        if artifact.terrain().tile(px, py).unwrap().kind
+                            != prototypes[1].terrain_kind
+                        {
+                            asymmetric_pairs += 1;
+                        }
                     }
                 }
             }
             assert!(
                 allowed_pairs > 0,
                 "the allowed-pair assertion must observe a source tile"
+            );
+            assert!(
+                asymmetric_pairs > 0,
+                "a third kind must distinguish the named side from its opposite"
             );
             assert_eq!(artifact.terrain().tile(7, 7).unwrap().fertility_bias, 0.4);
             let hash = artifact.scientific_content_hash();
@@ -23545,7 +23561,7 @@ mod command_characterization_tests {
             for y in 0..8 {
                 for x in 0..8 {
                     if forbidden.terrain().tile(x, y).unwrap().kind == prototypes[0].terrain_kind {
-                        let (nx, ny) = neighbor(x, y);
+                        let (nx, ny) = neighbor(x, y, side_a);
                         assert_ne!(
                             forbidden.terrain().tile(nx, ny).unwrap().kind,
                             prototypes[1].terrain_kind
@@ -23658,7 +23674,8 @@ mod command_characterization_tests {
         assert_eq!(sandbox.draft.state, bounded);
         sandbox.rule_entry = MAP_RULE_EDITOR_MAX_ADJACENCY - 1;
         sandbox.edit(MapAction::RuleRemoveEntry);
-        let DraftGeneratorConfig::RuleBased { tileset: reduced } = &sandbox.draft.state.generator_config
+        let DraftGeneratorConfig::RuleBased { tileset: reduced } =
+            &sandbox.draft.state.generator_config
         else {
             panic!("rules");
         };
