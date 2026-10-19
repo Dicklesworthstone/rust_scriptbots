@@ -4906,7 +4906,7 @@ impl SimulationView {
         tileset: &TilesetSpec,
         cx: &mut Context<Self>,
     ) -> Div {
-        let short_id = |index| {
+        let short_id = |index: usize| {
             tileset.tiles.get(index).map_or_else(
                 || "unavailable".to_owned(),
                 |tile| tile.id.chars().take(64).collect::<String>(),
