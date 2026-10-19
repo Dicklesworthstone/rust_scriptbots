@@ -10,6 +10,129 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Native rule-prototype authoring (`bd-2z0.10.7`, 2026-10-19):
+
+- [x] Refresh instructions, ready work and original acceptance; inspect real prototype/compiler/history consumers.
+- [x] Reserve existing files and mark progress on the original in-progress Bead.
+- [x] Expose bounded prototype selection, all terrain kinds and positive weight adjustment (both R219 renderer modes).
+- [x] Stamp/clear environmental and hydrology defaults while preserving unrelated fields, adjacency and output constraints (R219).
+- [x] Retain atomic validation, shared history, no-op/redo preservation and edited-job invalidation (R219).
+- [x] Observe actual generated terrain/fields/hash, recipe/history round trips and refusal/boundary behavior (both modes).
+- [x] Extend production input without changing old viewport, visibility assertions, deadlines or ignores (both modes).
+- [x] Run exact-file scan and pinned DSR checks, retain all outcomes and re-verify the actual evidence.
+- [x] Publish qualified source to both refs and prepare existing documentation/Beads snapshots; leave unmet original acceptance open.
+
+Creation gate: this existing TODO is PROCESS, consumed by the operator's explicit granular
+tracking request and gated on that handoff. Observed defect: rule prototypes work through
+recipes but have no native editor consumer. Retire the active list on original editor
+acceptance, retaining history; no integrity exception is needed. Verdict LEGITIMATE GATE,
+zero capability credit. Keep the audit bounded inside existing records; no new machinery.
+Opportunity cost: P0 `bd-e6ff` is macOS-only; BV's leading local USER pick is the broader
+`bd-f4x0` cross-frontend visual redesign. This existing owned editor task connects a
+complete generator input path within one bounded change. An hour of capability work
+beats another report; retain only the operator-requested TODO and required evidence.
+
+Initial rule-prototype source `f8ec35596e1e77067d4c41c646ac2f98e8aad027`, tree
+`9d25636648c1c59705dbdc236254f79f25c91719`, starts pinned R218. Retain all nineteen
+checks, the prior 78 required completions and the unchanged reader/planted negatives;
+three new probes in both renderer modes make 84 predeclared required completions.
+Profile SHA256 `983dd7b68d072a96427a6ae92fa5ab0d68e935d35ea3129f87984d9933e06ec3`;
+launcher `b8ba14c1b66067cabde343474cb86df25f1d04a05d6447b229baf9c48b716422`.
+Exact-file UBS exits 1: two existing timestamp critical heuristics, 2,237 warnings and
+824 informational; not a clean scan. Qualification/publication are pending. Native OS,
+hardware, independent, performance, full-workspace-test and collection remain unproven.
+
+R218 stops at formatting before compilation/tests: typed `failed/1`, one command/log pair
+`1/0`, outer 6 / runner identity zero, finished 2026-10-19 02:54:06 UTC. All ten manifest
+files / 33,768 bytes, exact membership and hashes recompute; SID 3425204 is absent.
+Apply its layouts manually without semantic/assertion changes. Correction source
+`8fe0f3cf9c3c9e4855bf927a666201db17c9f114`, tree
+`27ac3e25e2e04c3de3b767d6eb4148dc3ee4b26d`, starts R219 with all nineteen checks,
+byte-identical reader/planted negatives and 84 required completions. Profile SHA256
+`e594e8f78907b9ca1f811be95f9f9dbdda345691eb9b7ded10c1f21f4c0b71fb`;
+launcher `b66e7c0ac92f4bfd352869baf607f452e208680b0b7a7c1026146c78171d2074`.
+UBS remains non-clean; qualification/publication are pending.
+
+**Published rule-prototype result:** source `8fe0f3cf9c3c9e4855bf927a666201db17c9f114`
+is pushed normally to `main` and its mirror. R219 finishes 2026-10-19 03:13:53 UTC:
+nineteen command/log pairs exit zero; source receipt `pass/0`. Fresh solo re-execution
+of the retained reader/planted negatives verifies all 84 required completions. Separate
+raw-event recount agrees with suite summaries: 411 passing executions / 243 distinct
+passing names / zero failures / six executions of three unchanged ignored HUD diagnostics.
+Core maps 28, runtime focused/channel 1/37, renderer focused 5, full default renderer 178,
+feature-off renderer 162. Both renderer modes observe exact generated terrain/nine scalar
+fields, actual weight-dependent placement, generated-default restoration, recipe/hash/history
+round trips, no-op/redo preservation, atomic refusals and edited-job invalidation. Production
+headless input exercises prototype selection, terrain, weight, scalar stamping/defaults and
+undo/redo before the original sample/file/guarded-Apply flow. All old assertions, viewport,
+visibility, deadlines and ignores remain. Workspace and GUI-app all-target check/strict
+Clippy, both renderer Clippy configurations, format, four guards, feature-off production
+dependency graph and analyzer build pass. Existing future-incompatibility/submodule notices
+and the non-clean UBS result remain.
+
+All 128 manifest files / 370,240,729 bytes, exact membership, nineteen log hashes,
+profile byte identity and clean source/runner commit/tree identities recompute. Launcher
+SID 3480009 is absent; five frozen runner/helper identities pass before and after.
+Proof: `/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-rules-20261019-8fe0f3cf-r219-local`.
+Build run `993aad5f-5e80-41c8-82f5-02ce24a6de29`; envelope
+`44553510-cddd-4d26-85d2-18d73b48a271`. Verdict SHA256
+`c243eff98bf15de4ff4440ff37bddea005916ab447b46c44b7adf1542398da7f`;
+manifest `d12d8e7d929061c41b44720cd7177546c39c62843b500c1263b94be3c6f2a9e2`.
+Outer DSR exits 6 / runner identity zero: final cache verification refuses the actual
+tracked mode-120000 Proptest README symlink to `proptest/README.md` before collection.
+Guard unchanged; no collected release artifact. `bd-build-farm-reliability-lb19.2` stays
+open. `bd-2z0.10.7` stays in progress with its original criteria: adjacency/prototype
+roster/palette authoring, resource strata, additional sample sizing, accessibility and
+actual native OS/full editor acceptance remain. No native OS, hardware, independent,
+performance or full-workspace-test qualification is inferred. Separate `/dp` sweep is
+still inventory-only in this continuation.
+
+Rule increment real-work audit (two actual source commits since `13315ce1`, plus the
+two existing documentation/tracker snapshots): README purpose is a faithful deterministic
+artificial-life laboratory. `f8ec3559` is USER; `8fe0f3cf` is ENABLER exercised by actual
+renderer compilation/tests; each mixed documentation/tracker snapshot is conservatively
+PROCESS, zero capability credit. Tally 1 USER / 1 ENABLER / 2 PROCESS / 0 UNKNOWN, no
+closures. Q1: demo prototype terrain/weight/default editing, undo, generate and guarded
+Apply. Q2: omitting process changes no runtime result; it loses requested TODO/instructions
+and failure disclosure. Q3: formatter correction actually enables this renderer's checks.
+Q4: oldest user-facing root `bd-2z0` dates to 2026-07-11; this is its bounded editor path,
+chosen over the broader visual redesign and unavailable macOS incident. Q5: solo, no
+close-farming. Q6: no new follow-up, narrowed criterion or plan-as-implementation; the
+other 717 rows and all original task fields/comments remain. Verdict **HEALTHY** for this
+bounded capability increment, with avoidable formatting retry cost disclosed. Keep future
+work on USER capability and audits compact in existing records; tally is not a quota.
+
+Rule increment honesty inventory (same bounded window, fresh self-review):
+
+1. No (checked both frozen source diffs, aggregate removals and reflog): no old test/assertion/ignore/deadline/viewport weakened, no rewrite.
+2. No (checked new probes): real generators, artifacts, fields and HostCore; existing headless input remains a test backend.
+3. No (checked paths): no golden/snapshot regeneration.
+4. No (checked source/config/profile diffs): no gate/suppression relaxation; nineteen checks retained, old reader/negatives unchanged, six required completions added.
+5. No (checked dispatch): no demo/environment shortcut; disclosed weight range is product input policy, not a benchmark path.
+6. No (checked starts/terminal results/nonzero summaries and planted negatives): all 84 required completions execute; R218 is explicitly failed.
+7. No (checked raw output): final totals/identities are observed, not inferred from declarations or exit zero.
+8. No (checked claims): headless/software/source evidence stays below native OS/hardware/independent/performance/release proof.
+9. R218 formatting failure, unchanged UBS findings and R219 outer collection failure are retained and disclosed above.
+10. No (checked captures): cited stdout/stderr retained; none discarded for a green claim.
+11. No (checked Beads): original in-progress status/acceptance/dependencies retained, no task/edge/closure added.
+12. No (checked README/plan): additive usage/progress keeps unmet original acceptance open.
+13. Solo (checked calls/status): no own or peer delegated closure.
+14. Solo (checked calls): no subagent dispatch.
+15. Solo (same check): no subagent report accepted.
+16. Solo (same check/status): no panes farming refusals/closes.
+17. No (checked evidence labels): no agreement or same-origin repetition claimed as independent verification.
+18. No (checked prelaunch profile): nineteen commands / 84 required completions declared before results; failures/missing tests/unchanged ignores are countermetrics.
+19. Explain the avoidable formatter retry and the difference between source pass and outer collection failure before presenting success.
+20. Strongest evidence is actual generator/input assertions at exact clean `8fe0f3cf`, with fresh reader/negative re-execution and checked hashes/identities; a skeptic can rerun the retained profile.
+
+CASS scope: prior five phrase sweeps/coordinate limitations remain below; current
+workspace-derived `map_sandbox_rule_prototypes` query (limit two) returns zero. The index
+reports healthy/fresh but last-indexed timestamp 2026-09-16; this query clears no older
+history. Captures: external `rules-cass-{status,derived}-20261019` JSON/stderr. Disposition:
+formatting corrected manually in place, failure/limits disclosed; retain SM-11 first
+attempts, RH-17 no-rewrite history, RH-2 proof-class limits and PL-1 required-name/nonzero
+checks. No new governance machinery or self-close.
+
 Native custom sample authoring (`bd-2z0.10.7`, 2026-10-18):
 
 - [x] Reassess ready work, original acceptance and actual sample/inspection APIs.

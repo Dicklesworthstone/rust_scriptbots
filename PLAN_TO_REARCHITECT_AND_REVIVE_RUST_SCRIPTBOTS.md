@@ -2410,6 +2410,26 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Native rule-prototype authoring, 2026-10-19 (`bd-2z0.10.7`):**
+connect existing terrain/weight/environment/hydrology prototype inputs to a dedicated
+validated draft view, preserving adjacency, other prototypes, output constraints, history
+and guarded Apply. Keep adjacency authoring, resource strata and full native OS/editor
+acceptance open; retain original checks and actual source-bound results.
+
+Source `8fe0f3cf9c3c9e4855bf927a666201db17c9f114` is published to both required refs.
+R219 passes nineteen source command/log pairs and typed `pass/0`; fresh retained-reader
+and planted-negative re-execution verifies 84 required completions. Raw totals: 411
+passing executions / 243 distinct passing names / zero failures / six executions of
+three unchanged ignored diagnostics. Both full renderer modes observe real prototype
+fields/defaults, changed placement from weights, recipe/hash/history/no-op/refusal and
+edited-job behavior plus production headless input through the original guarded-Apply
+journey. All 128 manifest files / 370,240,729 bytes, hashes and clean source/profile
+identities recompute. Outer DSR exits 6 on the tracked Proptest README symlink before
+collection; guard unchanged, no collected release artifact. Adjacency/prototype roster/
+palette authoring, resource strata, additional sample sizing and native OS/full original
+acceptance remain open. Failed R218 and the bounded solo audit are retained in the
+existing reality-check report; no criterion narrows.
+
 **[Currently In Progress] Native custom sample authoring, 2026-10-18 (`bd-2z0.10.7`):**
 connect bounded toroidal exemplar extraction from a saved map to the real overlapping
 generator, and expose sample-cell, pattern-size and orientation editing in a dedicated
