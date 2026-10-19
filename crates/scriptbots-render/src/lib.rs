@@ -45,7 +45,7 @@ use scriptbots_core::{
 };
 use scriptbots_core::{
     AdjacencySpec, ConstraintLayer, DraftGeneratorConfig, DraftState, ExistingAgentPolicy,
-    MAX_SAMPLE_CELLS, MAX_SAMPLE_CELL_PAIRS, MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft,
+    MAX_SAMPLE_CELL_PAIRS, MAX_SAMPLE_CELLS, MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft,
     MapGenerationError, PaintedConstraint, SamplePatternSpec, TileSpec, TilesetSpec,
     ToroidalSeamReport, check_toroidal_seams, compute_sample_hash, default_tileset_spec,
 };
@@ -5206,8 +5206,7 @@ impl SimulationView {
                 "map-sample-width-increase",
                 "Width +1".to_owned(),
                 MapAction::SampleResize(1, 0),
-                u64::from(sample.sample_width.saturating_add(1))
-                    * u64::from(sample.sample_height)
+                u64::from(sample.sample_width.saturating_add(1)) * u64::from(sample.sample_height)
                     <= sample_budget,
             ),
             (
@@ -5220,8 +5219,7 @@ impl SimulationView {
                 "map-sample-height-increase",
                 "Height +1".to_owned(),
                 MapAction::SampleResize(0, 1),
-                u64::from(sample.sample_width)
-                    * u64::from(sample.sample_height.saturating_add(1))
+                u64::from(sample.sample_width) * u64::from(sample.sample_height.saturating_add(1))
                     <= sample_budget,
             ),
         ] {
@@ -24601,7 +24599,10 @@ mod command_characterization_tests {
             assert!(sandbox.can_apply(), "{}", sandbox.notice);
             let artifact = &sandbox.preview.as_ref().unwrap().artifact;
             artifact.validate().unwrap();
-            assert_eq!(artifact.metadata().tileset_hash, compute_sample_hash(sample));
+            assert_eq!(
+                artifact.metadata().tileset_hash,
+                compute_sample_hash(sample)
+            );
             hashes.insert(artifact.metadata().tileset_hash);
             let kinds: Vec<_> = artifact
                 .terrain()
@@ -24786,7 +24787,11 @@ mod command_characterization_tests {
             panic!("sample");
         };
         assert_eq!(
-            (sample.sample_width, sample.sample_height, sample.pattern_size),
+            (
+                sample.sample_width,
+                sample.sample_height,
+                sample.pattern_size
+            ),
             (2, 3, 2)
         );
         sandbox.generate(host.snapshot().revisions.scientific);
@@ -24806,7 +24811,11 @@ mod command_characterization_tests {
             panic!("sample");
         };
         assert_eq!(
-            (sample.sample_width, sample.sample_height, sample.pattern_size),
+            (
+                sample.sample_width,
+                sample.sample_height,
+                sample.pattern_size
+            ),
             (2, 1, 1)
         );
         sandbox.generate(host.snapshot().revisions.scientific);
@@ -26008,7 +26017,10 @@ mod command_characterization_tests {
             };
             assert_eq!((sample.sample_width, sample.sample_height), (4, 4));
             assert_eq!(sample.sample_tiles[15], sample.sample_tiles[0]);
-            assert_eq!(enlarged_sample.constraints, inspected_draft.state.constraints);
+            assert_eq!(
+                enlarged_sample.constraints,
+                inspected_draft.state.constraints
+            );
         }
         click(&mut lab, "map-sample-width-decrease");
         click(&mut lab, "map-sample-height-decrease");
