@@ -3834,7 +3834,9 @@ impl MapSandbox {
         );
         if let DraftGeneratorConfig::RuleBased { tileset } = &self.draft.state.generator_config {
             self.rule_tile = self.rule_tile.min(tileset.tiles.len().saturating_sub(1));
-            self.rule_neighbor = self.rule_neighbor.min(tileset.tiles.len().saturating_sub(1));
+            self.rule_neighbor = self
+                .rule_neighbor
+                .min(tileset.tiles.len().saturating_sub(1));
             self.rule_entry = self
                 .rule_entry
                 .min(tileset.adjacency.len().saturating_sub(1));
@@ -3857,7 +3859,8 @@ impl MapSandbox {
                     || tileset.adjacency.len() > MAP_RULE_EDITOR_MAX_ADJACENCY
                 {
                     return Err(MapGenerationError::DraftError(
-                        "Cloning exceeds the native prototype or adjacency editor bounds.".to_owned(),
+                        "Cloning exceeds the native prototype or adjacency editor bounds."
+                            .to_owned(),
                     ));
                 }
                 let id = (1..=MAP_DRAFT_MAX_RULE_TILES)
@@ -23588,8 +23591,7 @@ mod command_characterization_tests {
         let baseline = sandbox.draft.generate_artifact().unwrap();
         sandbox.edit(MapAction::RuleClone);
         let cloned = sandbox.draft.state.clone();
-        let DraftGeneratorConfig::RuleBased { tileset: copied } = &cloned.generator_config
-        else {
+        let DraftGeneratorConfig::RuleBased { tileset: copied } = &cloned.generator_config else {
             panic!("roster edits retain rules mode");
         };
         assert_eq!(copied.tiles.len(), 3);
@@ -23777,7 +23779,8 @@ mod command_characterization_tests {
         tileset.tiles[1].id = "prototype-copy-3".to_owned();
         sandbox.replace_rules(tileset).unwrap();
         sandbox.edit(MapAction::RuleClone);
-        let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config else {
+        let DraftGeneratorConfig::RuleBased { tileset } = &sandbox.draft.state.generator_config
+        else {
             panic!("rules");
         };
         assert_eq!(tileset.tiles.last().unwrap().id, "prototype-copy-2");
@@ -25315,7 +25318,10 @@ mod command_characterization_tests {
             original_rules
         );
         click(&mut lab, "map-undo");
-        assert_eq!(session.map_sandbox.lock().unwrap().draft.state, cloned_rules);
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            cloned_rules
+        );
         click(&mut lab, "map-redo");
         assert_eq!(
             session.map_sandbox.lock().unwrap().draft.state,
