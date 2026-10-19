@@ -45,7 +45,7 @@ use scriptbots_core::{
 };
 use scriptbots_core::{
     AdjacencySpec, ConstraintLayer, DraftGeneratorConfig, DraftState, ExistingAgentPolicy,
-    MAX_SAMPLE_CELL_PAIRS, MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft,
+    MAX_SAMPLE_CELLS, MAX_SAMPLE_CELL_PAIRS, MAX_SAMPLE_OUTPUT_CELLS, MapArtifact, MapEditorDraft,
     MapGenerationError, PaintedConstraint, SamplePatternSpec, TileSpec, TilesetSpec,
     ToroidalSeamReport, check_toroidal_seams, compute_sample_hash, default_tileset_spec,
 };
@@ -3739,6 +3739,7 @@ impl MapSandbox {
             }
             MapAction::ExtractSample => self.extract_inspected_sample(),
             MapAction::SampleCell(_, _)
+            | MapAction::SampleResize(_, _)
             | MapAction::SamplePattern
             | MapAction::SampleOrientations => self.edit_sample(action),
             MapAction::Paint(x, y) => {
@@ -4075,6 +4076,13 @@ impl MapSandbox {
     fn replace_sample(&mut self, sample: SamplePatternSpec) -> Result<(), MapGenerationError> {
         let mut document = MapDraftDocument::from_draft(&self.draft);
         document.generator_config = DraftGeneratorConfig::SampleBased { sample };
+        let json = serde_json::to_string_pretty(&document)
+            .map_err(|error| MapGenerationError::DraftError(error.to_string()))?;
+        if json.len() > MAP_DRAFT_MAX_BYTES {
+            return Err(MapGenerationError::DraftError(format!(
+                "Draft JSON exceeds {MAP_DRAFT_MAX_BYTES} bytes."
+            )));
+        }
         let state = document
             .into_state()
             .map_err(MapGenerationError::DraftError)?;
@@ -4104,6 +4112,40 @@ impl MapSandbox {
                     });
                 }
                 sample.sample_tiles[(y * sample.sample_width + x) as usize] = self.brush;
+            }
+            MapAction::SampleResize(dx, dy) => {
+                let width = sample
+                    .sample_width
+                    .checked_add_signed(i32::from(dx))
+                    .ok_or(MapGenerationError::InvalidSampleDimensions)?;
+                let height = sample
+                    .sample_height
+                    .checked_add_signed(i32::from(dy))
+                    .ok_or(MapGenerationError::InvalidSampleDimensions)?;
+                if width == 0 || height == 0 {
+                    return Err(MapGenerationError::InvalidSampleDimensions);
+                }
+                let cells = u64::from(width) * u64::from(height);
+                if cells > MAX_SAMPLE_CELLS as u64 {
+                    return Err(MapGenerationError::DraftError(format!(
+                        "Sample has {cells} cells; limit is {MAX_SAMPLE_CELLS}."
+                    )));
+                }
+                if width == sample.sample_width && height == sample.sample_height {
+                    return Ok(());
+                }
+                let mut tiles = Vec::with_capacity(cells as usize);
+                for y in 0..height {
+                    for x in 0..width {
+                        let index = (y % sample.sample_height) * sample.sample_width
+                            + x % sample.sample_width;
+                        tiles.push(sample.sample_tiles[index as usize]);
+                    }
+                }
+                sample.sample_width = width;
+                sample.sample_height = height;
+                sample.sample_tiles = tiles;
+                sample.pattern_size = sample.pattern_size.min(width).min(height);
             }
             MapAction::SamplePattern => {
                 // The validated exemplar cell bound also bounds the smaller side.
@@ -4249,6 +4291,7 @@ enum MapAction {
     BackFromSample,
     ExtractSample,
     SampleCell(u32, u32),
+    SampleResize(i16, i16),
     SamplePattern,
     SampleOrientations,
     EditRules,
@@ -5144,6 +5187,47 @@ impl SimulationView {
             name.push('…');
         }
         let maximum_pattern = sample.sample_width.min(sample.sample_height);
+        let output_cells =
+            u64::from(sandbox.draft.state.width) * u64::from(sandbox.draft.state.height);
+        let sample_budget = if output_cells == 0 {
+            0
+        } else {
+            (MAX_SAMPLE_CELLS as u64).min(MAX_SAMPLE_CELL_PAIRS as u64 / output_cells)
+        };
+        let mut size_controls = div().flex().flex_wrap().gap_2();
+        for (id, label, action, enabled) in [
+            (
+                "map-sample-width-decrease",
+                "Width −1".to_owned(),
+                MapAction::SampleResize(-1, 0),
+                sample.sample_width > 1,
+            ),
+            (
+                "map-sample-width-increase",
+                "Width +1".to_owned(),
+                MapAction::SampleResize(1, 0),
+                u64::from(sample.sample_width.saturating_add(1))
+                    * u64::from(sample.sample_height)
+                    <= sample_budget,
+            ),
+            (
+                "map-sample-height-decrease",
+                "Height −1".to_owned(),
+                MapAction::SampleResize(0, -1),
+                sample.sample_height > 1,
+            ),
+            (
+                "map-sample-height-increase",
+                "Height +1".to_owned(),
+                MapAction::SampleResize(0, 1),
+                u64::from(sample.sample_width)
+                    * u64::from(sample.sample_height.saturating_add(1))
+                    <= sample_budget,
+            ),
+        ] {
+            size_controls =
+                size_controls.child(self.render_map_button(id, label, action, enabled, cx));
+        }
         let mut panel = div()
             .id("map-sample-editor")
             .debug_selector(|| "map-sample-editor".to_owned())
@@ -5188,6 +5272,10 @@ impl SimulationView {
                         MapAction::SampleOrientations, true, cx,
                     )),
             )
+            .child(size_controls)
+            .child(div().text_xs().child(format!(
+                "Resize crops or repeats the current exemplar from its upper-left corner. Shrinking clamps the pattern to fit. At most {sample_budget} exemplar cells fit the current output-work budget (core limit {MAX_SAMPLE_CELLS}); portable recipes remain bounded to 1 MiB. Output size, seed and painted constraints are preserved. All edits share undo/redo."
+            )))
             .child(div().text_xs().child(
                 "Select an exemplar cell to paint its terrain kind. Edits change the computed sample hash and are undoable. Return to the draft and generate a new preview before Apply. Periodic extraction is always enabled.",
             ))
@@ -24463,6 +24551,286 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn map_sandbox_sample_resize_changes_real_output_and_round_trips() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let g = TerrainKind::Grass;
+        let s = TerrainKind::Sand;
+        let d = TerrainKind::DeepWater;
+        let b = TerrainKind::Bloom;
+        let mut outputs = Vec::new();
+        let mut hashes = std::collections::HashSet::new();
+        for (dx, dy, width, height, tiles) in [
+            (1, 0, 3, 2, vec![g, s, g, d, b, d]),
+            (0, 1, 2, 3, vec![g, s, d, b, g, s]),
+            (-1, 0, 1, 2, vec![g, d]),
+            (0, -1, 2, 1, vec![g, s]),
+        ] {
+            let mut sandbox = MapSandbox::new(16, 16, 50);
+            sandbox.draft.set_seed(11);
+            let original_sample = SamplePatternSpec {
+                sample_id: "rectangular-test-v1".to_owned(),
+                sample_width: 2,
+                sample_height: 2,
+                pattern_size: 1,
+                sample_tiles: vec![g, s, d, b],
+                all_orientations: false,
+                periodic: true,
+            };
+            sandbox.replace_sample(original_sample.clone()).unwrap();
+            sandbox.paint_channel = MapPaintChannel::Fertility;
+            sandbox.paint_tenths = 4;
+            sandbox.edit(MapAction::Paint(15, 15));
+            let original = sandbox.draft.state.clone();
+            let baseline = sandbox.draft.generate_artifact().unwrap();
+            sandbox.edit(MapAction::SampleResize(dx, dy));
+            let edited = sandbox.draft.state.clone();
+            let DraftGeneratorConfig::SampleBased { sample } = &edited.generator_config else {
+                panic!("resizing retains sample mode");
+            };
+            let mut expected = original_sample;
+            expected.sample_width = width;
+            expected.sample_height = height;
+            expected.sample_tiles.clone_from(&tiles);
+            assert_eq!(sample, &expected);
+            let mut expected_state = original.clone();
+            expected_state.generator_config = edited.generator_config.clone();
+            assert_eq!(edited, expected_state);
+            sandbox.generate(host.snapshot().revisions.scientific);
+            wait_map_job(&mut sandbox);
+            assert!(sandbox.can_apply(), "{}", sandbox.notice);
+            let artifact = &sandbox.preview.as_ref().unwrap().artifact;
+            artifact.validate().unwrap();
+            assert_eq!(artifact.metadata().tileset_hash, compute_sample_hash(sample));
+            hashes.insert(artifact.metadata().tileset_hash);
+            let kinds: Vec<_> = artifact
+                .terrain()
+                .tiles()
+                .iter()
+                .map(|tile| tile.kind)
+                .collect();
+            assert!(kinds.iter().all(|kind| tiles.contains(kind)));
+            for kind in &tiles {
+                assert!(
+                    kinds.contains(kind),
+                    "each retained exemplar kind must occur"
+                );
+            }
+            let old_kinds: Vec<_> = baseline
+                .terrain()
+                .tiles()
+                .iter()
+                .map(|tile| tile.kind)
+                .collect();
+            assert_ne!(kinds, old_kinds, "a changed hash alone is insufficient");
+            outputs.push(kinds);
+            assert_eq!(artifact.terrain().tile(15, 15).unwrap().fertility_bias, 0.4);
+            let hash = artifact.scientific_content_hash();
+            let mut imported = MapSandbox::new(1, 1, 1);
+            imported
+                .import_draft(&sandbox.export_draft().unwrap())
+                .unwrap();
+            assert_eq!(imported.draft.state, edited);
+            assert_eq!(
+                imported
+                    .draft
+                    .generate_artifact()
+                    .unwrap()
+                    .scientific_content_hash(),
+                hash
+            );
+            sandbox.edit(MapAction::Undo);
+            assert_eq!(sandbox.draft.state, original);
+            assert_eq!(
+                sandbox
+                    .draft
+                    .generate_artifact()
+                    .unwrap()
+                    .scientific_content_hash(),
+                baseline.scientific_content_hash()
+            );
+            sandbox.edit(MapAction::Redo);
+            assert_eq!(sandbox.draft.state, edited);
+        }
+        assert_eq!(hashes.len(), outputs.len());
+        for (index, output) in outputs.iter().enumerate() {
+            assert!(
+                outputs[index + 1..].iter().all(|other| other != output),
+                "the four dimension cases must not collapse to the same output"
+            );
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_sample_resize_refusals_and_noops_preserve_history() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        for (width, height, dx, dy, work_bound, byte_bound) in [
+            (1, 1, -1, 0, false, false),
+            (1, 1, 0, -1, false, false),
+            (1, 1, i16::MIN, 0, false, false),
+            (1, 1, i16::MAX, i16::MAX, false, false),
+            (MAX_SAMPLE_CELLS as u32, 1, 1, 0, false, false),
+            (MAX_SAMPLE_CELLS as u32, 1, 0, 1, false, false),
+            (32, 1, 1, 0, true, false),
+            (1, 1, 1, 0, false, true),
+        ] {
+            let mut sandbox = MapSandbox::new(8, 8, 50);
+            let mut sample = SamplePatternSpec {
+                sample_id: "resize-bound-v1".to_owned(),
+                sample_width: width,
+                sample_height: height,
+                pattern_size: 1,
+                sample_tiles: vec![TerrainKind::Sand; (width * height) as usize],
+                all_orientations: true,
+                periodic: true,
+            };
+            sandbox.replace_sample(sample.clone()).unwrap();
+            if byte_bound {
+                let size = sandbox.export_draft().unwrap().len();
+                sample.sample_id =
+                    "x".repeat(MAP_DRAFT_MAX_BYTES - size + sample.sample_id.len() - 4);
+                sandbox.replace_sample(sample).unwrap();
+                assert_eq!(
+                    sandbox.export_draft().unwrap().len(),
+                    MAP_DRAFT_MAX_BYTES - 4
+                );
+            }
+            if work_bound {
+                sandbox.generate(host.snapshot().revisions.scientific);
+                wait_map_job(&mut sandbox);
+                assert!(sandbox.can_apply(), "{}", sandbox.notice);
+                let output_cells = u32::try_from(MAX_SAMPLE_CELL_PAIRS).unwrap() / width;
+                sandbox.draft.set_dimensions(output_cells, 1, 50).unwrap();
+            }
+            sandbox.edit(MapAction::NextSeed);
+            sandbox.edit(MapAction::Undo);
+            if !work_bound {
+                sandbox.generate(host.snapshot().revisions.scientific);
+                wait_map_job(&mut sandbox);
+            }
+            let state = sandbox.draft.state.clone();
+            let revision = sandbox.draft.revision;
+            let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+            let could_apply = sandbox.can_apply();
+            assert_eq!(could_apply, !work_bound);
+            assert!(sandbox.draft.can_redo());
+            sandbox.edit(MapAction::SampleResize(0, 0));
+            assert!(sandbox.notice.starts_with("No draft change."));
+            assert_eq!(sandbox.draft.state, state);
+            assert_eq!(sandbox.draft.revision, revision);
+            assert!(sandbox.draft.can_redo());
+            sandbox.edit(MapAction::SampleResize(dx, dy));
+            assert!(
+                sandbox.notice.starts_with("Draft edit refused:"),
+                "{}",
+                sandbox.notice
+            );
+            if work_bound {
+                assert!(sandbox.notice.contains("cell pairs"));
+            }
+            if byte_bound {
+                assert!(sandbox.notice.contains("Draft JSON exceeds"));
+            }
+            assert_eq!(sandbox.draft.state, state);
+            assert_eq!(sandbox.draft.revision, revision);
+            assert!(sandbox.draft.can_redo());
+            assert_eq!(sandbox.can_apply(), could_apply);
+            assert!(Arc::ptr_eq(
+                &preview,
+                &sandbox.preview.as_ref().unwrap().artifact
+            ));
+        }
+        let mut rules = MapSandbox::new(8, 8, 50);
+        let original = rules.draft.clone();
+        rules.edit(MapAction::SampleResize(1, 0));
+        assert_eq!(rules.draft, original);
+        assert!(rules.notice.contains("Choose sample mode"));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_sample_resize_clamps_patterns_and_discards_pending_jobs() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        sandbox
+            .replace_sample(SamplePatternSpec {
+                sample_id: "resize-pattern-v1".to_owned(),
+                sample_width: 3,
+                sample_height: 3,
+                pattern_size: 3,
+                sample_tiles: vec![TerrainKind::Sand; 9],
+                all_orientations: true,
+                periodic: true,
+            })
+            .unwrap();
+        let original = sandbox.draft.state.clone();
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
+        let previous = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        sandbox.edit(MapAction::SampleResize(-1, 0));
+        wait_map_job(&mut sandbox);
+        assert!(!sandbox.can_apply());
+        assert!(Arc::ptr_eq(
+            &previous,
+            &sandbox.preview.as_ref().unwrap().artifact
+        ));
+        let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config
+        else {
+            panic!("sample");
+        };
+        assert_eq!(
+            (sample.sample_width, sample.sample_height, sample.pattern_size),
+            (2, 3, 2)
+        );
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
+        let resized = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        sandbox.edit(MapAction::SampleResize(0, -2));
+        wait_map_job(&mut sandbox);
+        assert!(!sandbox.can_apply());
+        assert!(Arc::ptr_eq(
+            &resized,
+            &sandbox.preview.as_ref().unwrap().artifact
+        ));
+        let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config
+        else {
+            panic!("sample");
+        };
+        assert_eq!(
+            (sample.sample_width, sample.sample_height, sample.pattern_size),
+            (2, 1, 1)
+        );
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "{}", sandbox.notice);
+        sandbox.edit(MapAction::Undo);
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state, original);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        assert_eq!(
+            sandbox
+                .preview
+                .as_ref()
+                .unwrap()
+                .artifact
+                .scientific_content_hash(),
+            previous.scientific_content_hash()
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
     fn map_sandbox_extracts_toroidal_exemplar_and_edits_real_sample_generation() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
@@ -25630,6 +25998,39 @@ mod command_characterization_tests {
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         click(&mut lab, "map-edit-sample");
         assert!(lab.debug_bounds("map-sample-editor").is_some());
+        click(&mut lab, "map-sample-width-increase");
+        click(&mut lab, "map-sample-height-increase");
+        let enlarged_sample = session.map_sandbox.lock().unwrap().draft.state.clone();
+        {
+            let DraftGeneratorConfig::SampleBased { sample } = &enlarged_sample.generator_config
+            else {
+                panic!("production size controls retain sample mode");
+            };
+            assert_eq!((sample.sample_width, sample.sample_height), (4, 4));
+            assert_eq!(sample.sample_tiles[15], sample.sample_tiles[0]);
+            assert_eq!(enlarged_sample.constraints, inspected_draft.state.constraints);
+        }
+        click(&mut lab, "map-sample-width-decrease");
+        click(&mut lab, "map-sample-height-decrease");
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            inspected_draft.state
+        );
+        for _ in 0..2 {
+            click(&mut lab, "map-undo");
+        }
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            enlarged_sample
+        );
+        for _ in 0..2 {
+            click(&mut lab, "map-redo");
+        }
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            inspected_draft.state
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         click(&mut lab, "map-sample-cell-0-0");
         click(&mut lab, "map-sample-pattern");
         click(&mut lab, "map-sample-orientations");
