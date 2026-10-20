@@ -26620,7 +26620,10 @@ mod command_characterization_tests {
                     Arc::clone(&sandbox.preview.as_ref().unwrap().artifact),
                 )
             };
-            assert_eq!(preview.terrain().tile(0, 0).unwrap().kind, TerrainKind::Sand);
+            assert_eq!(
+                preview.terrain().tile(0, 0).unwrap().kind,
+                TerrainKind::Sand
+            );
             assert_eq!(
                 preview.terrain().tile(0, 0).unwrap().fertility_bias,
                 natural_fertility
@@ -26668,7 +26671,10 @@ mod command_characterization_tests {
             }
             let live = host.snapshot();
             assert_eq!(live.layers.terrain.tiles[0].kind, TerrainKind::Sand);
-            assert_eq!(live.layers.terrain.tiles[0].fertility_bias, natural_fertility);
+            assert_eq!(
+                live.layers.terrain.tiles[0].fertility_bias,
+                natural_fertility
+            );
             assert_eq!(live.world.tick, 0);
             assert_ne!(host.port.scientific_digest_v1().unwrap(), before);
         }
