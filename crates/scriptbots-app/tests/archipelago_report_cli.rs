@@ -413,6 +413,7 @@ fn recorded_archipelago_cli_migration_persists_identity_policy_and_thread_determ
             let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
             assert_eq!(result["status"], "complete");
             assert_eq!(result["migration"], "enabled");
+            assert_eq!(result["rayon_threads"], threads.parse::<u64>()?);
             assert_eq!(result["migration_count"], expected_moves);
             assert_eq!(result["migration_policy"]["selection_rule"], rule);
             assert_eq!(result["migration_policy"]["topology"], stored_topology);
@@ -428,6 +429,14 @@ fn recorded_archipelago_cli_migration_persists_identity_policy_and_thread_determ
             let reader = StorageReader::open(database.to_str().unwrap())?;
             let manifest = reader.run_manifest()?;
             let manifest: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;
+            assert_eq!(
+                manifest["archipelago"]["rayon_threads"],
+                result["rayon_threads"]
+            );
+            assert_eq!(
+                manifest["thread_policy"]["threads"],
+                result["rayon_threads"]
+            );
             assert_eq!(
                 manifest["archipelago"]["migration_policy"],
                 result["migration_policy"]
@@ -466,7 +475,7 @@ fn recorded_archipelago_cli_migration_persists_identity_policy_and_thread_determ
             }
             assert_eq!(by_tick.keys().copied().collect::<Vec<_>>(), vec![2, 4]);
             for moves in by_tick.values() {
-                let edges = moves
+                let edges: std::collections::BTreeSet<_> = moves
                     .iter()
                     .map(|m| (m.island_id_from, m.island_id_to))
                     .collect();

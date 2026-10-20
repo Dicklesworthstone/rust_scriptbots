@@ -288,6 +288,7 @@ pub fn run_recorded_archipelago(
         "recorded archipelago requires persistence_interval=1 so every island supplies every tick"
     );
     let policy = options.migration_policy(island_count)?;
+    let rayon_threads = rayon::current_num_threads();
     let migration_status = if policy.1.is_some() {
         "enabled"
     } else {
@@ -343,6 +344,7 @@ pub fn run_recorded_archipelago(
             "ticks": ticks, "barrier_interval": 1, "migration": migration_status,
             "migration_policy": migration_policy,
             "tick_summary_phase": "before_migration", "membership_phase": "after_migration",
+            "rayon_threads": rayon_threads,
             "step_topology": "sequential_ascending", "host_journal": "committed_volatile",
             "science_storage": "complete_barriers", "islands": islands,
         }),
@@ -419,6 +421,7 @@ pub fn run_recorded_archipelago(
             "db": path, "run_id": run_id, "root_seed": root_seed, "ticks": ticks,
             "island_count": island_count, "migration": migration_status,
             "migration_policy": migration_policy, "migration_count": migration_count,
+            "rayon_threads": rayon_threads,
             "step_topology": "sequential_ascending", "host_journal": "committed_volatile",
             "source": BuildProvenanceV0::current().source_revision,
             "watermarks": {"admitted": watermarks.admitted.map(|id| id.get()),
