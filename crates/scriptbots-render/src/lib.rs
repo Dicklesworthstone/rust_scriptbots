@@ -2844,6 +2844,7 @@ const MAP_ARTIFACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAP_DRAFT_MAX_RULE_TILES: usize = 64;
 const MAP_DRAFT_SCHEMA: &str = "scriptbots.map-draft.v1";
 const MAP_EXTRACT_SAMPLE_SIDE: u32 = 3;
+const MAP_TERRAIN_MARKER_SIZE: f32 = 20.0;
 const MAP_RULE_EDITOR_MAX_WEIGHT: u32 = 1000;
 const MAP_RULE_SIDES: [(&str, &str); 4] = [
     ("north", "south"),
@@ -3063,15 +3064,46 @@ fn inspect_map_artifact_file(
     }))
 }
 
-const fn map_preview_color(kind: TerrainKind) -> u32 {
-    match kind {
+const MAP_TERRAIN_KINDS: [TerrainKind; 6] = [
+    TerrainKind::DeepWater,
+    TerrainKind::ShallowWater,
+    TerrainKind::Sand,
+    TerrainKind::Grass,
+    TerrainKind::Bloom,
+    TerrainKind::Rock,
+];
+
+fn map_preview_color(kind: TerrainKind, palette: ColorPaletteMode) -> Rgba {
+    let natural = match kind {
         TerrainKind::DeepWater => 0x244e82,
         TerrainKind::ShallowWater => 0x4596ae,
         TerrainKind::Sand => 0xd4b77d,
         TerrainKind::Grass => 0x57925d,
         TerrainKind::Bloom => 0xb7ca71,
         TerrainKind::Rock => 0x898f9b,
+    };
+    apply_palette(rgb(natural).into(), palette)
+}
+
+const fn map_terrain_symbol(kind: TerrainKind) -> &'static str {
+    match kind {
+        TerrainKind::DeepWater => "D",
+        TerrainKind::ShallowWater => "W",
+        TerrainKind::Sand => "S",
+        TerrainKind::Grass => "G",
+        TerrainKind::Bloom => "B",
+        TerrainKind::Rock => "R",
     }
+}
+
+fn map_terrain_marker(kind: TerrainKind) -> Div {
+    // Opaque black/white keeps this non-color cue readable in every palette.
+    div()
+        .text_xs()
+        .text_color(rgb(0xffffff))
+        .bg(rgb(0x000000))
+        .px_1()
+        .child(map_terrain_symbol(kind))
 }
 
 fn map_artifact_cell_details(artifact: &MapArtifact, x: u32, y: u32) -> Vec<String> {
@@ -3827,7 +3859,8 @@ impl MapSandbox {
                 }
                 return;
             }
-            MapAction::Generate
+            MapAction::CyclePalette
+            | MapAction::Generate
             | MapAction::Apply
             | MapAction::Pause
             | MapAction::LiveGrid
@@ -4375,6 +4408,7 @@ impl MapSandbox {
 
 #[derive(Clone, Copy)]
 enum MapAction {
+    CyclePalette,
     Generate,
     Generator,
     CopyDraft,
@@ -4876,7 +4910,11 @@ impl SimulationView {
             }))
     }
 
-    fn map_button_action(&self, action: MapAction, cx: &mut Context<Self>) {
+    fn map_button_action(&mut self, action: MapAction, cx: &mut Context<Self>) {
+        if matches!(action, MapAction::CyclePalette) {
+            self.cycle_palette(cx);
+            return;
+        }
         let file_kind = match action {
             MapAction::SaveDraft => Some(MapFileKind::SaveDraft),
             MapAction::OpenDraft => Some(MapFileKind::OpenDraft),
@@ -5273,6 +5311,48 @@ impl SimulationView {
         )
     }
 
+    fn render_map_palette_controls(&self, cx: &mut Context<Self>) -> Div {
+        let palette = self.accessibility_snapshot().palette;
+        let mut legend = div()
+            .id("map-terrain-legend")
+            .debug_selector(|| "map-terrain-legend".to_owned())
+            .flex()
+            .flex_wrap()
+            .gap_2();
+        for kind in MAP_TERRAIN_KINDS {
+            legend = legend.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .w(px(MAP_TERRAIN_MARKER_SIZE))
+                            .h(px(MAP_TERRAIN_MARKER_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(map_preview_color(kind, palette))
+                            .child(map_terrain_marker(kind)),
+                    )
+                    .child(div().text_xs().child(format!("{kind:?}"))),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_color(chrome::text_primary())
+            .child(self.render_map_button(
+                "map-palette",
+                format!("Palette: {} (cycle)", palette.label()),
+                MapAction::CyclePalette,
+                true,
+                cx,
+            ))
+            .child(legend)
+    }
+
     fn render_map_sample_editor(
         &self,
         sandbox: &MapSandbox,
@@ -5370,6 +5450,7 @@ impl SimulationView {
                 "Select an exemplar cell to paint its terrain kind. Edits change the computed sample hash and are undoable. Return to the draft and generate a new preview before Apply. Periodic extraction is always enabled.",
             ))
             .child(div().text_xs().child(sandbox.notice.clone()));
+        let palette = self.accessibility_snapshot().palette;
         let cell_pixels = 256.0 / sample.sample_width.max(sample.sample_height) as f32;
         let mut grid = div().flex().flex_col().w(px(256.0)).flex_none();
         for y in 0..sample.sample_height {
@@ -5390,7 +5471,14 @@ impl SimulationView {
                         .w(px(cell_pixels))
                         .h(px(cell_pixels))
                         .flex_none()
-                        .bg(rgb(map_preview_color(kind)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(map_preview_color(kind, palette))
+                        .children(
+                            (cell_pixels >= MAP_TERRAIN_MARKER_SIZE)
+                                .then(|| map_terrain_marker(kind)),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -5423,6 +5511,7 @@ impl SimulationView {
         cx: &mut Context<Self>,
     ) -> Div {
         let artifact = &inspection.artifact;
+        let palette = self.accessibility_snapshot().palette;
         let terrain = artifact.terrain();
         let metadata = artifact.metadata();
         let presence = |present| if present { "present" } else { "absent" };
@@ -5573,7 +5662,14 @@ impl SimulationView {
                         .w(px(cell_pixels))
                         .h(px(cell_pixels))
                         .flex_none()
-                        .bg(rgb(map_preview_color(tile.kind)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(map_preview_color(tile.kind, palette))
+                        .children(
+                            (cell_pixels >= MAP_TERRAIN_MARKER_SIZE)
+                                .then(|| map_terrain_marker(tile.kind)),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -5612,20 +5708,27 @@ impl SimulationView {
         let Ok(sandbox) = self.map_sandbox.lock() else {
             return div().child("Map editor state unavailable");
         };
+        let palette_controls = self.render_map_palette_controls(cx);
         if let Some(inspection) = &sandbox.inspection {
-            return self.render_map_inspection(&sandbox, inspection, cx);
+            return div()
+                .child(palette_controls)
+                .child(self.render_map_inspection(&sandbox, inspection, cx));
         }
         if sandbox.rules_editor_open
             && let DraftGeneratorConfig::RuleBased { tileset } =
                 &sandbox.draft.state.generator_config
         {
-            return self.render_map_rules_editor(&sandbox, tileset, cx);
+            return div()
+                .child(palette_controls)
+                .child(self.render_map_rules_editor(&sandbox, tileset, cx));
         }
         if sandbox.sample_editor_open
             && let DraftGeneratorConfig::SampleBased { sample } =
                 &sandbox.draft.state.generator_config
         {
-            return self.render_map_sample_editor(&sandbox, sample, cx);
+            return div()
+                .child(palette_controls)
+                .child(self.render_map_sample_editor(&sandbox, sample, cx));
         }
         let busy = sandbox.job.is_some();
         let fits_live = self
@@ -5704,6 +5807,7 @@ impl SimulationView {
             .flex_col()
             .gap_3()
             .text_color(chrome::text_primary())
+            .child(palette_controls)
             .child(div().text_sm().child("Map sandbox"))
             .child(div().text_xs().child(generator_label))
             .child(div().text_xs().child(format!(
@@ -5912,6 +6016,7 @@ impl SimulationView {
                     seams.seam_kind_discontinuities_ew,
                 )))
                 .child(application_controls);
+            let palette = self.accessibility_snapshot().palette;
             let width = artifact.terrain().width();
             let height = artifact.terrain().height();
             let stride = width.max(height).div_ceil(MAP_SANDBOX_PREVIEW_SIDE);
@@ -5927,7 +6032,7 @@ impl SimulationView {
                     let Some(tile) = artifact.terrain().tile(x, y) else {
                         continue;
                     };
-                    let color = map_preview_color(tile.kind);
+                    let color = map_preview_color(tile.kind, palette);
                     row = row.child(
                         div()
                             .id(("map-cell", (y * width + x) as usize))
@@ -5939,7 +6044,14 @@ impl SimulationView {
                             .w(px(cell_pixels))
                             .h(px(cell_pixels))
                             .flex_none()
-                            .bg(rgb(color))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(color)
+                            .children(
+                                (cell_pixels >= MAP_TERRAIN_MARKER_SIZE)
+                                    .then(|| map_terrain_marker(tile.kind)),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
@@ -5961,9 +6073,9 @@ impl SimulationView {
             }
             panel = panel
                 .child(grid)
-                .child(div().text_xs().child(
-                    "Preview colours: blue water · tan sand · green grass/bloom · grey rock. Opposite edges join. Paint, then regenerate; undo changes only the draft.",
-                ))
+                .child(div().text_xs().child(format!(
+                    "Terrain letters match the legend above when cells are at least {MAP_TERRAIN_MARKER_SIZE:.0} pixels wide. Smaller sampled cells retain named keyboard/screen-reader labels. Palette changes affect presentation only. Opposite edges join. Paint, then regenerate; undo changes only the draft.",
+                )))
                 .child(div().text_xs().child(format!(
                     "Showing {columns} × {rows} sampled cells of {width} × {height}; painting affects the named cell only. Use live grid before applying a different preview size."
                 )));
@@ -24974,6 +25086,174 @@ mod command_characterization_tests {
         );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_palette_preserves_natural_colors_and_transforms_each_terrain() {
+        let natural = [0x244e82, 0x4596ae, 0xd4b77d, 0x57925d, 0xb7ca71, 0x898f9b];
+        assert_eq!(natural.len(), MAP_TERRAIN_KINDS.len());
+        let symbols: Vec<_> = MAP_TERRAIN_KINDS
+            .into_iter()
+            .map(map_terrain_symbol)
+            .collect();
+        assert_eq!(symbols, ["D", "W", "S", "G", "B", "R"]);
+        assert_eq!(
+            symbols.iter().collect::<std::collections::HashSet<_>>().len(),
+            symbols.len()
+        );
+        let mut matrices = Vec::new();
+        for palette in ColorPaletteMode::ALL {
+            let mut matrix = Vec::new();
+            for (kind, packed) in MAP_TERRAIN_KINDS.into_iter().zip(natural) {
+                let base: Rgba = rgb(packed).into();
+                let actual = map_preview_color(kind, palette);
+                let expected = visual::apply_accessibility_palette(
+                    [base.r, base.g, base.b],
+                    accessibility_palette(palette),
+                );
+                assert_eq!([actual.r, actual.g, actual.b], expected);
+                assert_eq!(actual.a, 1.0);
+                if matches!(palette, ColorPaletteMode::Natural) {
+                    assert_eq!(actual, base, "Natural map colors must remain unchanged");
+                }
+                matrix.push([actual.r.to_bits(), actual.g.to_bits(), actual.b.to_bits()]);
+            }
+            assert!(matrices.iter().all(|previous| previous != &matrix));
+            matrices.push(matrix);
+        }
+        assert_eq!(matrices.len(), ColorPaletteMode::ALL.len());
+    }
+
+    #[test]
+    fn map_palette_input_is_shared_and_preserves_each_map_surface() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let session = Arc::new(GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        ));
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        let world_view = context.update(|app| windows.canvas.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(480.0), px(1400.0)));
+        let redraw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            });
+        };
+        redraw(&mut lab);
+        let click = |lab: &mut gpui::VisualTestContext, selector| {
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("map palette control laid out");
+            let viewport = lab.update(|window, _| window.viewport_size());
+            assert!(
+                bounds.origin.x >= px(0.0)
+                    && bounds.origin.y >= px(0.0)
+                    && bounds.right() <= viewport.width
+                    && bounds.bottom() <= viewport.height,
+                "{selector} must be visible: {bounds:?}, viewport {viewport:?}"
+            );
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+            redraw(lab);
+        };
+        click(&mut lab, "dashboard-tab-maps");
+        click(&mut lab, "map-live-grid");
+        click(&mut lab, "map-generate");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.map_sandbox.lock().unwrap().job.is_some() {
+            redraw(&mut lab);
+            assert!(Instant::now() < deadline, "palette preview did not arrive");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let original = session.map_sandbox.lock().unwrap().draft.clone();
+        let preview = Arc::clone(
+            &session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .preview
+                .as_ref()
+                .unwrap()
+                .artifact,
+        );
+        for (expected, key) in [
+            (ColorPaletteMode::Deuteranopia, None),
+            (ColorPaletteMode::Protanopia, Some("space")),
+            (ColorPaletteMode::Tritanopia, Some("enter")),
+            (ColorPaletteMode::HighContrast, Some("space")),
+            (ColorPaletteMode::Natural, None),
+        ] {
+            if let Some(key) = key {
+                lab.simulate_keystrokes(key);
+                redraw(&mut lab);
+            } else {
+                click(&mut lab, "map-palette");
+            }
+            assert_eq!(session.accessibility.lock().unwrap().palette, expected);
+            assert_eq!(
+                context.read_entity(&world_view, |view, _| view.accessibility_snapshot().palette),
+                expected
+            );
+            assert!(lab.debug_bounds("map-terrain-legend").is_some());
+            let sandbox = session.map_sandbox.lock().unwrap();
+            assert_eq!(sandbox.draft, original);
+            assert!(sandbox.can_apply());
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
+        }
+        click(&mut lab, "map-edit-rules");
+        click(&mut lab, "map-palette");
+        assert!(lab.debug_bounds("map-rules-editor").is_some());
+        assert_eq!(session.map_sandbox.lock().unwrap().draft, original);
+        click(&mut lab, "map-rules-back");
+        click(&mut lab, "map-generator");
+        click(&mut lab, "map-edit-sample");
+        let sample_draft = session.map_sandbox.lock().unwrap().draft.clone();
+        click(&mut lab, "map-palette");
+        assert!(lab.debug_bounds("map-sample-editor").is_some());
+        assert!(lab.debug_bounds("map-terrain-legend").is_some());
+        assert_eq!(session.map_sandbox.lock().unwrap().draft, sample_draft);
+        click(&mut lab, "map-sample-back");
+        let artifact = map_patch_source_artifact();
+        let path = map_file_test_directory().join("palette-artifact.postcard");
+        write_map_test_file(&path, &postcard::to_allocvec(&artifact).unwrap());
+        click(&mut lab, "map-inspect-artifact");
+        context.run_until_parked();
+        context.simulate_path_prompt_response(|_| Some(vec![path.clone()]));
+        context.run_until_parked();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.map_sandbox.lock().unwrap().file_busy() {
+            context.run_until_parked();
+            redraw(&mut lab);
+            assert!(
+                Instant::now() < deadline,
+                "palette inspection did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        click(&mut lab, "map-artifact-cell-5-4");
+        click(&mut lab, "map-palette");
+        assert!(lab.debug_bounds("map-terrain-legend").is_some());
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            assert_eq!(sandbox.draft, sample_draft);
+            assert_eq!(sandbox.inspection_cell, (5, 4));
+            assert_eq!(sandbox.extraction_dimensions(), Some((3, 3)));
+            assert_eq!(sandbox.inspection.as_ref().unwrap().artifact, artifact);
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+        context.quit();
     }
 
     fn map_patch_source_artifact() -> MapArtifact {
