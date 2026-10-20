@@ -3269,6 +3269,7 @@ struct MapSandbox {
     file_job: Option<MapFileJob>,
     inspection: Option<Arc<MapArtifactInspection>>,
     inspection_cell: (u32, u32),
+    extraction_size: (u32, u32),
     sample_editor_open: bool,
     rules_editor_open: bool,
     adjacency_editor_open: bool,
@@ -3305,6 +3306,7 @@ impl MapSandbox {
             file_job: None,
             inspection: None,
             inspection_cell: (0, 0),
+            extraction_size: (MAP_EXTRACT_SAMPLE_SIDE, MAP_EXTRACT_SAMPLE_SIDE),
             sample_editor_open: false,
             rules_editor_open: false,
             adjacency_editor_open: false,
@@ -3525,6 +3527,18 @@ impl MapSandbox {
                 },
             ),
             Ok(MapFileResult::Inspected(inspection)) => {
+                self.extraction_size = (
+                    inspection
+                        .artifact
+                        .terrain()
+                        .width()
+                        .min(MAP_EXTRACT_SAMPLE_SIDE),
+                    inspection
+                        .artifact
+                        .terrain()
+                        .height()
+                        .min(MAP_EXTRACT_SAMPLE_SIDE),
+                );
                 self.inspection = Some(inspection);
                 self.inspection_cell = (0, 0);
                 "Opened validated map artifact for inspection only. Draft, preview and live world unchanged."
@@ -3779,6 +3793,17 @@ impl MapSandbox {
                 {
                     self.inspection_cell = (x, y);
                 }
+                return;
+            }
+            MapAction::ExtractSize(dx, dy) => {
+                self.notice = self.select_extraction_size(dx, dy).map_or_else(
+                    |error| format!("Patch selection refused: {error}"),
+                    |(width, height)| {
+                        format!(
+                            "Selected {width} × {height} saved-map patch. Draft, history, preview and live world unchanged; Extract copies it."
+                        )
+                    },
+                );
                 return;
             }
             MapAction::BackToDraft => {
@@ -4162,6 +4187,70 @@ impl MapSandbox {
         self.replace_sample(sample)
     }
 
+    fn sample_cell_budget(&self) -> u64 {
+        let output_cells = u64::from(self.draft.state.width) * u64::from(self.draft.state.height);
+        (MAX_SAMPLE_CELL_PAIRS as u64)
+            .checked_div(output_cells)
+            .unwrap_or(0)
+            .min(MAX_SAMPLE_CELLS as u64)
+    }
+
+    fn extraction_dimensions(&self) -> Option<(u32, u32)> {
+        self.inspection.as_ref().map(|inspection| {
+            (
+                self.extraction_size
+                    .0
+                    .min(inspection.artifact.terrain().width()),
+                self.extraction_size
+                    .1
+                    .min(inspection.artifact.terrain().height()),
+            )
+        })
+    }
+
+    fn select_extraction_size(
+        &mut self,
+        dx: i16,
+        dy: i16,
+    ) -> Result<(u32, u32), MapGenerationError> {
+        if self.file_busy() {
+            return Err(MapGenerationError::DraftError(
+                "Finish the pending file operation first.".to_owned(),
+            ));
+        }
+        let inspection = self.inspection.as_ref().ok_or_else(|| {
+            MapGenerationError::DraftError("Open a saved artifact first.".to_owned())
+        })?;
+        let terrain = inspection.artifact.terrain();
+        let (previous_width, previous_height) = self.extraction_dimensions().ok_or_else(|| {
+            MapGenerationError::DraftError("Open a saved artifact first.".to_owned())
+        })?;
+        let width = previous_width
+            .checked_add_signed(i32::from(dx))
+            .ok_or(MapGenerationError::InvalidSampleDimensions)?;
+        let height = previous_height
+            .checked_add_signed(i32::from(dy))
+            .ok_or(MapGenerationError::InvalidSampleDimensions)?;
+        if width == 0 || height == 0 || width > terrain.width() || height > terrain.height() {
+            return Err(MapGenerationError::DraftError(format!(
+                "Patch dimensions must be positive and fit the {} × {} source.",
+                terrain.width(),
+                terrain.height(),
+            )));
+        }
+        let cells = u64::from(width) * u64::from(height);
+        let budget = self.sample_cell_budget();
+        if cells > budget {
+            return Err(MapGenerationError::DraftError(format!(
+                "Patch needs {cells} exemplar cells; current output-work limit is {budget}."
+            )));
+        }
+        if (width, height) != (previous_width, previous_height) {
+            self.extraction_size = (width, height);
+        }
+        Ok((width, height))
+    }
+
     fn extract_inspected_sample(&mut self) -> Result<(), MapGenerationError> {
         if self.file_busy() {
             return Err(MapGenerationError::DraftError(
@@ -4181,8 +4270,16 @@ impl MapSandbox {
                 height: terrain.height(),
             });
         }
-        let width = terrain.width().min(MAP_EXTRACT_SAMPLE_SIDE);
-        let height = terrain.height().min(MAP_EXTRACT_SAMPLE_SIDE);
+        let (width, height) = self.extraction_dimensions().ok_or_else(|| {
+            MapGenerationError::DraftError("Open a saved artifact first.".to_owned())
+        })?;
+        let cells = u64::from(width) * u64::from(height);
+        let budget = self.sample_cell_budget();
+        if width == 0 || height == 0 || cells > budget {
+            return Err(MapGenerationError::DraftError(format!(
+                "Patch needs positive dimensions and at most {budget} exemplar cells for the current output."
+            )));
+        }
         let mut tiles = Vec::with_capacity((width * height) as usize);
         for dy in 0..height {
             for dx in 0..width {
@@ -4290,6 +4387,7 @@ enum MapAction {
     EditSample,
     BackFromSample,
     ExtractSample,
+    ExtractSize(i16, i16),
     SampleCell(u32, u32),
     SampleResize(i16, i16),
     SamplePattern,
@@ -5187,12 +5285,7 @@ impl SimulationView {
             name.push('…');
         }
         let maximum_pattern = sample.sample_width.min(sample.sample_height);
-        let output_cells =
-            u64::from(sandbox.draft.state.width) * u64::from(sandbox.draft.state.height);
-        let sample_budget = (MAX_SAMPLE_CELL_PAIRS as u64)
-            .checked_div(output_cells)
-            .unwrap_or(0)
-            .min(MAX_SAMPLE_CELLS as u64);
+        let sample_budget = sandbox.sample_cell_budget();
         let mut size_controls = div().flex().flex_wrap().gap_2();
         for (id, label, action, enabled) in [
             (
@@ -5338,6 +5431,50 @@ impl SimulationView {
         if name_chars.next().is_some() {
             name.push('…');
         }
+        let (patch_width, patch_height) = sandbox.extraction_dimensions().unwrap_or((0, 0));
+        let sample_budget = sandbox.sample_cell_budget();
+        let patch_fits = patch_width > 0
+            && patch_height > 0
+            && u64::from(patch_width) * u64::from(patch_height) <= sample_budget;
+        let mut patch_controls = div().flex().flex_wrap().gap_2();
+        for (id, label, action, enabled) in [
+            (
+                "map-extract-width-decrease",
+                "Patch width −1".to_owned(),
+                MapAction::ExtractSize(-1, 0),
+                patch_width > 1,
+            ),
+            (
+                "map-extract-width-increase",
+                "Patch width +1".to_owned(),
+                MapAction::ExtractSize(1, 0),
+                patch_width < terrain.width()
+                    && u64::from(patch_width.saturating_add(1)) * u64::from(patch_height)
+                        <= sample_budget,
+            ),
+            (
+                "map-extract-height-decrease",
+                "Patch height −1".to_owned(),
+                MapAction::ExtractSize(0, -1),
+                patch_height > 1,
+            ),
+            (
+                "map-extract-height-increase",
+                "Patch height +1".to_owned(),
+                MapAction::ExtractSize(0, 1),
+                patch_height < terrain.height()
+                    && u64::from(patch_width) * u64::from(patch_height.saturating_add(1))
+                        <= sample_budget,
+            ),
+        ] {
+            patch_controls = patch_controls.child(self.render_map_button(
+                id,
+                label,
+                action,
+                enabled && !sandbox.file_busy(),
+                cx,
+            ));
+        }
         let mut panel = div()
             .id("map-artifact-inspection")
             .debug_selector(|| "map-artifact-inspection".to_owned())
@@ -5366,15 +5503,16 @@ impl SimulationView {
             ))
             .child(self.render_map_button(
                 "map-extract-sample",
-                format!(
-                    "Use selected {} × {} sample",
-                    terrain.width().min(MAP_EXTRACT_SAMPLE_SIDE),
-                    terrain.height().min(MAP_EXTRACT_SAMPLE_SIDE),
-                ),
+                format!("Use selected {patch_width} × {patch_height} sample"),
                 MapAction::ExtractSample,
-                !sandbox.file_busy(),
+                !sandbox.file_busy() && patch_fits,
                 cx,
             ))
+            .child(patch_controls)
+            .child(div().text_xs().child(format!(
+                "Patch {patch_width} × {patch_height} starts at ({}, {}), wrapping across source edges. At most {sample_budget} exemplar cells fit this output; dimensions also fit the source. Selection leaves draft/history/preview unchanged. Use selected sample copies the saved cells in one undoable edit.",
+                sandbox.inspection_cell.0, sandbox.inspection_cell.1,
+            )))
             .child(div().text_xs().child(sandbox.notice.clone()))
             .child(div().text_xs().child(format!(
                 "{} · {} · {} × {} cells · cell size {}",
@@ -24838,6 +24976,293 @@ mod command_characterization_tests {
         assert_eq!(host.snapshot().world.tick, 0);
     }
 
+    fn map_patch_source_artifact() -> MapArtifact {
+        let mut source = MapSandbox::new(6, 5, 50);
+        let kinds = [
+            TerrainKind::DeepWater,
+            TerrainKind::ShallowWater,
+            TerrainKind::Sand,
+            TerrainKind::Grass,
+            TerrainKind::Bloom,
+            TerrainKind::Rock,
+        ];
+        for y in 0..5 {
+            for x in 0..6 {
+                source.brush = kinds[((x + 2 * y) % 6) as usize];
+                source.edit(MapAction::Paint(x, y));
+            }
+        }
+        source.draft.generate_artifact().unwrap()
+    }
+
+    #[test]
+    fn map_sandbox_extracts_selected_saved_cells_beyond_default_patch() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let artifact = map_patch_source_artifact();
+        assert_eq!(artifact.terrain().tile(2, 4).unwrap().kind, TerrainKind::Bloom);
+        assert_eq!(artifact.terrain().tile(5, 0).unwrap().kind, TerrainKind::Rock);
+        let path = map_file_test_directory().join("rectangular-source.postcard");
+        write_map_test_file(&path, &postcard::to_allocvec(&artifact).unwrap());
+        let inspection = Arc::new(inspect_map_artifact_file(&path).unwrap());
+        let mut outputs = Vec::new();
+        for (delta, dimensions, expected_tiles) in [
+            (
+                (1, -1),
+                (4, 2),
+                vec![
+                    TerrainKind::ShallowWater,
+                    TerrainKind::Sand,
+                    TerrainKind::Grass,
+                    TerrainKind::Bloom,
+                    TerrainKind::Rock,
+                    TerrainKind::DeepWater,
+                    TerrainKind::ShallowWater,
+                    TerrainKind::Sand,
+                ],
+            ),
+            (
+                (-1, 1),
+                (2, 4),
+                vec![
+                    TerrainKind::ShallowWater,
+                    TerrainKind::Sand,
+                    TerrainKind::Rock,
+                    TerrainKind::DeepWater,
+                    TerrainKind::ShallowWater,
+                    TerrainKind::Sand,
+                    TerrainKind::Grass,
+                    TerrainKind::Bloom,
+                ],
+            ),
+        ] {
+            let mut sandbox = MapSandbox::new(8, 8, 50);
+            sandbox.draft.set_seed(11);
+            sandbox.paint_channel = MapPaintChannel::Fertility;
+            sandbox.paint_tenths = 4;
+            sandbox.edit(MapAction::Paint(7, 7));
+            sandbox.generate(host.snapshot().revisions.scientific);
+            wait_map_job(&mut sandbox);
+            let original = sandbox.draft.clone();
+            let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+            sandbox.inspection = Some(Arc::clone(&inspection));
+            sandbox.inspection_cell = (5, 4);
+            sandbox.edit(MapAction::ExtractSize(delta.0, delta.1));
+            sandbox.edit(MapAction::ExtractSize(0, 0));
+            assert_eq!(sandbox.extraction_dimensions(), Some(dimensions));
+            assert_eq!(sandbox.draft, original);
+            assert!(sandbox.can_apply());
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
+            sandbox.edit(MapAction::ExtractSample);
+            let extracted = sandbox.draft.state.clone();
+            let DraftGeneratorConfig::SampleBased { sample } = &extracted.generator_config else {
+                panic!("selected source cells must become a sample");
+            };
+            assert_eq!((sample.sample_width, sample.sample_height), dimensions);
+            assert_eq!(sample.sample_tiles, expected_tiles);
+            assert_eq!(sample.pattern_size, 2);
+            assert!(sample.all_orientations && sample.periodic);
+            assert_eq!(
+                sample.sample_id,
+                format!(
+                    "artifact-{:016x}-5-4-{}x{}-v1",
+                    inspection.scientific_hash, dimensions.0, dimensions.1,
+                )
+            );
+            let mut expected = original.state.clone();
+            expected.generator_config = extracted.generator_config.clone();
+            assert_eq!(extracted, expected);
+            assert!(sandbox.sample_editor_open && sandbox.inspection.is_none());
+            assert!(!sandbox.can_apply());
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
+            // Keep the two source axes fixed so generation must consume the
+            // distinguishing fourth column/row, rather than a rotated subset.
+            sandbox.edit(MapAction::SampleOrientations);
+            let authored = sandbox.draft.state.clone();
+            sandbox.generate(host.snapshot().revisions.scientific);
+            wait_map_job(&mut sandbox);
+            assert!(sandbox.can_apply(), "{}", sandbox.notice);
+            let generated = &sandbox.preview.as_ref().unwrap().artifact;
+            generated.validate().unwrap();
+            let kinds: Vec<_> = generated
+                .terrain()
+                .tiles()
+                .iter()
+                .map(|tile| tile.kind)
+                .collect();
+            assert!(kinds.iter().all(|kind| expected_tiles.contains(kind)));
+            assert!(kinds.contains(&TerrainKind::Bloom));
+            assert_eq!(generated.fertility().unwrap().values()[63], 0.4);
+            let DraftGeneratorConfig::SampleBased { sample } = &authored.generator_config else {
+                panic!("sample");
+            };
+            assert_eq!(
+                generated.metadata().tileset_hash,
+                compute_sample_hash(sample)
+            );
+            let hash = generated.scientific_content_hash();
+            let mut imported = MapSandbox::new(1, 1, 1);
+            imported
+                .import_draft(&sandbox.export_draft().unwrap())
+                .unwrap();
+            assert_eq!(imported.draft.state, authored);
+            assert_eq!(
+                imported
+                    .draft
+                    .generate_artifact()
+                    .unwrap()
+                    .scientific_content_hash(),
+                hash
+            );
+            sandbox.edit(MapAction::Undo);
+            assert_eq!(sandbox.draft.state, extracted);
+            sandbox.edit(MapAction::Undo);
+            assert_eq!(sandbox.draft.state, original.state);
+            assert_eq!(
+                sandbox
+                    .draft
+                    .generate_artifact()
+                    .unwrap()
+                    .scientific_content_hash(),
+                preview.scientific_content_hash()
+            );
+            sandbox.edit(MapAction::Redo);
+            sandbox.edit(MapAction::Redo);
+            assert_eq!(sandbox.draft.state, authored);
+            outputs.push((kinds, hash));
+        }
+        assert_ne!(outputs[0].0, outputs[1].0);
+        assert_ne!(outputs[0].1, outputs[1].1);
+        assert_eq!(inspection.artifact, artifact);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
+    fn map_sandbox_patch_selection_refusals_and_jobs_preserve_draft() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut sandbox = MapSandbox::new(8, 8, 50);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        wait_map_job(&mut sandbox);
+        let original = sandbox.draft.clone();
+        let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        sandbox.edit(MapAction::ExtractSize(1, 0));
+        assert!(sandbox.notice.starts_with("Patch selection refused:"));
+        assert_eq!(sandbox.draft, original);
+        let artifact = map_patch_source_artifact();
+        let path = map_file_test_directory().join("selection-source.json");
+        write_map_test_file(&path, &serde_json::to_vec(&artifact).unwrap());
+        let inspection = Arc::new(inspect_map_artifact_file(&path).unwrap());
+        sandbox.inspection = Some(Arc::clone(&inspection));
+        for (dx, dy) in [
+            (-3, 0),
+            (0, -3),
+            (i16::MIN, 0),
+            (i16::MAX, 0),
+            (4, 0),
+            (0, 3),
+        ] {
+            sandbox.edit(MapAction::ExtractSize(dx, dy));
+            assert!(sandbox.notice.starts_with("Patch selection refused:"));
+            assert_eq!(sandbox.extraction_dimensions(), Some((3, 3)));
+            assert_eq!(sandbox.draft, original);
+            assert!(sandbox.can_apply());
+            assert!(Arc::ptr_eq(
+                &sandbox.preview.as_ref().unwrap().artifact,
+                &preview
+            ));
+        }
+        sandbox.edit(MapAction::ExtractSize(1, -1));
+        let request = sandbox
+            .begin_file_dialog(MapFileKind::InspectArtifact)
+            .unwrap();
+        for action in [MapAction::ExtractSize(1, 0), MapAction::ExtractSample] {
+            sandbox.edit(action);
+            assert!(sandbox.notice.contains("pending file"));
+            assert_eq!(sandbox.extraction_dimensions(), Some((4, 2)));
+            assert_eq!(sandbox.draft, original);
+        }
+        sandbox.finish_file_dialog(request, Ok(None));
+        assert_eq!(sandbox.extraction_dimensions(), Some((4, 2)));
+        let request = sandbox
+            .begin_file_dialog(MapFileKind::InspectArtifact)
+            .unwrap();
+        sandbox.finish_file_dialog(request, Ok(Some(path.with_file_name("missing.json"))));
+        wait_map_file(&mut sandbox);
+        assert!(sandbox.notice.starts_with("Map file IO failed"));
+        assert_eq!(sandbox.extraction_dimensions(), Some((4, 2)));
+        assert!(Arc::ptr_eq(
+            sandbox.inspection.as_ref().unwrap(),
+            &inspection
+        ));
+        let large = MapSandbox::new(16, 16, 50)
+            .draft
+            .generate_artifact()
+            .unwrap();
+        let large_path = path.with_file_name("large-source.json");
+        write_map_test_file(&large_path, &serde_json::to_vec(&large).unwrap());
+        let request = sandbox
+            .begin_file_dialog(MapFileKind::InspectArtifact)
+            .unwrap();
+        sandbox.finish_file_dialog(request, Ok(Some(large_path)));
+        wait_map_file(&mut sandbox);
+        assert_eq!(sandbox.extraction_dimensions(), Some((3, 3)));
+        sandbox.edit(MapAction::ExtractSize(5, 5));
+        assert_eq!(sandbox.extraction_dimensions(), Some((8, 8)));
+        assert_eq!(sandbox.sample_cell_budget(), MAX_SAMPLE_CELLS as u64);
+        sandbox.edit(MapAction::ExtractSize(1, 0));
+        assert!(sandbox.notice.starts_with("Patch selection refused:"));
+        assert_eq!(sandbox.extraction_dimensions(), Some((8, 8)));
+        sandbox
+            .draft
+            .set_dimensions(MAX_SAMPLE_OUTPUT_CELLS as u32, 1, 50)
+            .unwrap();
+        let bounded = sandbox.draft.clone();
+        sandbox.edit(MapAction::ExtractSample);
+        assert!(sandbox.notice.starts_with("Draft edit refused:"));
+        assert_eq!(sandbox.draft, bounded);
+        sandbox.extraction_size = (3, 3);
+        sandbox.edit(MapAction::ExtractSize(1, 1));
+        assert_eq!(sandbox.extraction_dimensions(), Some((4, 4)));
+        sandbox.edit(MapAction::ExtractSize(1, 0));
+        assert!(sandbox.notice.starts_with("Patch selection refused:"));
+        assert_eq!(sandbox.extraction_dimensions(), Some((4, 4)));
+        sandbox.extraction_size = (0, 1);
+        sandbox.edit(MapAction::ExtractSample);
+        assert!(sandbox.notice.starts_with("Draft edit refused:"));
+        assert_eq!(sandbox.draft, bounded);
+        sandbox.edit(MapAction::Undo);
+        assert_eq!(sandbox.draft.state, original.state);
+        sandbox.inspection = Some(Arc::clone(&inspection));
+        sandbox.extraction_size = (3, 3);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        sandbox.edit(MapAction::ExtractSize(1, -1));
+        wait_map_job(&mut sandbox);
+        assert!(sandbox.can_apply(), "selection must not discard generation");
+        let current = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+        sandbox.generate(host.snapshot().revisions.scientific);
+        sandbox.edit(MapAction::ExtractSample);
+        wait_map_job(&mut sandbox);
+        assert!(
+            !sandbox.can_apply(),
+            "extraction must discard the old draft result"
+        );
+        assert!(Arc::ptr_eq(
+            &sandbox.preview.as_ref().unwrap().artifact,
+            &current
+        ));
+        assert_eq!(inspection.artifact, artifact);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
     #[test]
     fn map_sandbox_extracts_toroidal_exemplar_and_edits_real_sample_generation() {
         let host = TestHost::take(command_characterization_world());
@@ -25526,6 +25951,194 @@ mod command_characterization_tests {
             requests,
             "repeated clicks must not resubmit one preview"
         );
+    }
+
+    #[test]
+    fn map_sandbox_production_input_extracts_selected_patch_and_applies() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| None),
+        );
+        session.map_apply_submit = Some(map_owner_submit(Arc::clone(&host)));
+        let session = Arc::new(session);
+        let context = gpui::TestAppContext::single();
+        let windows = context.update(|app| session.install(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(480.0), px(1400.0)));
+        lab.update(|window, app| {
+            window.refresh();
+            window.draw(app).clear();
+        });
+        let click = |lab: &mut gpui::VisualTestContext, selector| {
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("production patch control laid out");
+            let viewport = lab.update(|window, _| window.viewport_size());
+            assert!(
+                bounds.origin.x >= px(0.0)
+                    && bounds.origin.y >= px(0.0)
+                    && bounds.right() <= viewport.width
+                    && bounds.bottom() <= viewport.height,
+                "{selector} must be visible before input: {bounds:?}, viewport {viewport:?}"
+            );
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            });
+        };
+        click(&mut lab, "dashboard-tab-maps");
+        click(&mut lab, "map-live-grid");
+        let original = session.map_sandbox.lock().unwrap().draft.clone();
+        let artifact = map_patch_source_artifact();
+        let path = map_file_test_directory().join("input-patch.postcard");
+        write_map_test_file(&path, &postcard::to_allocvec(&artifact).unwrap());
+        click(&mut lab, "map-inspect-artifact");
+        context.run_until_parked();
+        assert!(context.did_prompt_for_paths());
+        context.simulate_path_prompt_response(|options| {
+            assert!(options.files && !options.directories && !options.multiple);
+            Some(vec![path.clone()])
+        });
+        context.run_until_parked();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.map_sandbox.lock().unwrap().file_busy() {
+            context.run_until_parked();
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            });
+            assert!(Instant::now() < deadline, "patch inspection did not arrive");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let inspection = Arc::clone(
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .inspection
+                .as_ref()
+                .unwrap(),
+        );
+        assert_eq!(inspection.artifact, artifact);
+        click(&mut lab, "map-artifact-cell-5-4");
+        for (selector, expected) in [
+            ("map-extract-width-increase", (4, 3)),
+            ("map-extract-height-increase", (4, 4)),
+            ("map-extract-width-decrease", (3, 4)),
+            ("map-extract-height-decrease", (3, 3)),
+            ("map-extract-width-increase", (4, 3)),
+            ("map-extract-height-decrease", (4, 2)),
+        ] {
+            click(&mut lab, selector);
+            let sandbox = session.map_sandbox.lock().unwrap();
+            assert_eq!(sandbox.extraction_dimensions(), Some(expected));
+            assert_eq!(sandbox.inspection_cell, (5, 4));
+            assert_eq!(sandbox.draft, original);
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        click(&mut lab, "map-extract-sample");
+        assert!(lab.debug_bounds("map-sample-editor").is_some());
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config
+            else {
+                panic!("Extract input must copy the selected source cells");
+            };
+            assert_eq!((sample.sample_width, sample.sample_height), (4, 2));
+            assert_eq!(
+                sample.sample_tiles,
+                vec![
+                    TerrainKind::ShallowWater,
+                    TerrainKind::Sand,
+                    TerrainKind::Grass,
+                    TerrainKind::Bloom,
+                    TerrainKind::Rock,
+                    TerrainKind::DeepWater,
+                    TerrainKind::ShallowWater,
+                    TerrainKind::Sand,
+                ]
+            );
+            assert_eq!(
+                sample.sample_id,
+                format!("artifact-{:016x}-5-4-4x2-v1", inspection.scientific_hash)
+            );
+        }
+        // The owner's live grid is 2×2. N=1 is a normal authoring choice
+        // that allows this wider source palette on that smaller output.
+        click(&mut lab, "map-sample-pattern");
+        click(&mut lab, "map-sample-back");
+        click(&mut lab, "map-generate");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.map_sandbox.lock().unwrap().job.is_some() {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            });
+            assert!(
+                Instant::now() < deadline,
+                "selected patch preview did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let preview = {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            assert!(sandbox.can_apply(), "{}", sandbox.notice);
+            let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config
+            else {
+                panic!("sample");
+            };
+            assert_eq!(sample.pattern_size, 1);
+            let artifact = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+            assert_eq!(
+                artifact.metadata().tileset_hash,
+                compute_sample_hash(sample)
+            );
+            artifact
+        };
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        let apply_revision = host.snapshot().revisions.scientific;
+        click(&mut lab, "map-apply");
+        assert!(
+            session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .preview
+                .as_ref()
+                .unwrap()
+                .submitted
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.snapshot().revisions.scientific == apply_revision {
+            assert!(
+                Instant::now() < deadline,
+                "selected patch Apply did not reach owner"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let live = host.snapshot();
+        assert_eq!(
+            live.layers.terrain.tiles.len(),
+            preview.terrain().tiles().len()
+        );
+        for (actual, expected) in live
+            .layers
+            .terrain
+            .tiles
+            .iter()
+            .zip(preview.terrain().tiles())
+        {
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.elevation, expected.elevation);
+        }
+        assert_ne!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(live.world.tick, 0);
+        assert_eq!(inspection.artifact, artifact);
+        context.quit();
     }
 
     #[test]
