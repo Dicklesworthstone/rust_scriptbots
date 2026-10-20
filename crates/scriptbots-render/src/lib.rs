@@ -3817,6 +3817,10 @@ impl MapSandbox {
                 };
                 return;
             }
+            MapAction::SelectBrush(kind) => {
+                self.brush = kind;
+                return;
+            }
             MapAction::InspectCell(x, y) => {
                 if self
                     .inspection
@@ -4450,6 +4454,7 @@ enum MapAction {
     NextSize,
     LiveGrid,
     Brush,
+    SelectBrush(TerrainKind),
     PaintChannel,
     PaintValue(i16),
     Paint(u32, u32),
@@ -5319,9 +5324,15 @@ impl SimulationView {
             .flex()
             .flex_wrap()
             .gap_2();
-        for kind in MAP_TERRAIN_KINDS {
+        for (index, kind) in MAP_TERRAIN_KINDS.into_iter().enumerate() {
             legend = legend.child(
                 div()
+                    .id(("map-terrain-brush", index))
+                    .debug_selector(move || format!("map-terrain-brush-{kind:?}"))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(format!("Choose {kind:?} terrain brush"))
                     .flex()
                     .items_center()
                     .gap_1()
@@ -5335,7 +5346,22 @@ impl SimulationView {
                             .bg(map_preview_color(kind, palette))
                             .child(map_terrain_marker(kind)),
                     )
-                    .child(div().text_xs().child(format!("{kind:?}"))),
+                    .child(div().text_xs().child(format!("{kind:?}")))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.map_action(MapAction::SelectBrush(kind));
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                            this.map_action(MapAction::SelectBrush(kind));
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                    })),
             );
         }
         div()
@@ -25210,6 +25236,74 @@ mod command_characterization_tests {
                 &preview
             ));
         }
+        for (selector, kind) in [
+            ("map-terrain-brush-DeepWater", TerrainKind::DeepWater),
+            ("map-terrain-brush-ShallowWater", TerrainKind::ShallowWater),
+            ("map-terrain-brush-Sand", TerrainKind::Sand),
+            ("map-terrain-brush-Grass", TerrainKind::Grass),
+            ("map-terrain-brush-Bloom", TerrainKind::Bloom),
+            ("map-terrain-brush-Rock", TerrainKind::Rock),
+        ] {
+            let previous = session.map_sandbox.lock().unwrap().draft.clone();
+            click(&mut lab, selector);
+            {
+                let mut sandbox = session.map_sandbox.lock().unwrap();
+                assert_eq!(sandbox.brush, kind);
+                assert_eq!(sandbox.draft, previous);
+                // Give keyboard activation a distinguishing starting value.
+                sandbox.brush = if kind == TerrainKind::Grass {
+                    TerrainKind::Rock
+                } else {
+                    TerrainKind::Grass
+                };
+            }
+            lab.simulate_keystrokes("space");
+            redraw(&mut lab);
+            assert_eq!(session.map_sandbox.lock().unwrap().brush, kind);
+            click(&mut lab, "map-cell-0-0");
+            click(&mut lab, "map-generate");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while session.map_sandbox.lock().unwrap().job.is_some() {
+                redraw(&mut lab);
+                assert!(
+                    Instant::now() < deadline,
+                    "terrain brush preview did not arrive"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            {
+                let sandbox = session.map_sandbox.lock().unwrap();
+                assert!(sandbox.can_apply(), "{}", sandbox.notice);
+                assert_eq!(
+                    sandbox
+                        .preview
+                        .as_ref()
+                        .unwrap()
+                        .artifact
+                        .terrain()
+                        .tile(0, 0)
+                        .unwrap()
+                        .kind,
+                    kind
+                );
+            }
+            click(&mut lab, "map-undo");
+            assert_eq!(
+                session.map_sandbox.lock().unwrap().draft.state,
+                previous.state
+            );
+        }
+        let original = session.map_sandbox.lock().unwrap().draft.clone();
+        let preview = Arc::clone(
+            &session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .preview
+                .as_ref()
+                .unwrap()
+                .artifact,
+        );
         click(&mut lab, "map-edit-rules");
         click(&mut lab, "map-palette");
         assert!(lab.debug_bounds("map-rules-editor").is_some());
@@ -25222,6 +25316,24 @@ mod command_characterization_tests {
         assert!(lab.debug_bounds("map-sample-editor").is_some());
         assert!(lab.debug_bounds("map-terrain-legend").is_some());
         assert_eq!(session.map_sandbox.lock().unwrap().draft, sample_draft);
+        click(&mut lab, "map-terrain-brush-Bloom");
+        assert_eq!(session.map_sandbox.lock().unwrap().draft, sample_draft);
+        click(&mut lab, "map-sample-cell-0-0");
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::SampleBased { sample } =
+                &sandbox.draft.state.generator_config
+            else {
+                panic!("legend brush retains sample mode");
+            };
+            assert_eq!(sample.sample_tiles[0], TerrainKind::Bloom);
+        }
+        click(&mut lab, "map-undo");
+        assert_eq!(
+            session.map_sandbox.lock().unwrap().draft.state,
+            sample_draft.state
+        );
+        let sample_draft = session.map_sandbox.lock().unwrap().draft.clone();
         click(&mut lab, "map-sample-back");
         let artifact = map_patch_source_artifact();
         let path = map_file_test_directory().join("palette-artifact.postcard");
@@ -25242,11 +25354,13 @@ mod command_characterization_tests {
         }
         click(&mut lab, "map-artifact-cell-5-4");
         click(&mut lab, "map-palette");
+        click(&mut lab, "map-terrain-brush-ShallowWater");
         assert!(lab.debug_bounds("map-terrain-legend").is_some());
         {
             let sandbox = session.map_sandbox.lock().unwrap();
             assert_eq!(sandbox.draft, sample_draft);
             assert_eq!(sandbox.inspection_cell, (5, 4));
+            assert_eq!(sandbox.brush, TerrainKind::ShallowWater);
             assert_eq!(sandbox.extraction_dimensions(), Some((3, 3)));
             assert_eq!(sandbox.inspection.as_ref().unwrap().artifact, artifact);
             assert!(Arc::ptr_eq(
