@@ -205,7 +205,185 @@ Disposition: retain limitations here and in the operator handoff, preserve all o
 and proof, and stop this assessment after its publication checks. The earlier bounded CASS
 search remains limited by its September 16 index; no fresh comprehensive archive clearance is claimed.
 
-### Current implementation and granular TODO — 2026-10-14
+### Current implementation and granular TODO — 2026-10-20
+
+Full-owner continuation (`bd-2z0.5.13`, started 2026-10-20, LilacElm;
+original acceptance remains in progress):
+
+- [x] Recheck source, original acceptance, worktree, active agents and remote capacity;
+  retain the existing owner and coordinate strict-remote RCH lanes on separate workers.
+- [x] Trace the real CLI handoff/continue/compare and file-backed E2E; retain its
+  databases and subprocess streams under the existing explicit external-root convention.
+- [x] Execute the original uninterrupted-versus-continued E2E at source `4b1e6652`:
+  R9, vmi1149989 job `30072644099375126`, one passed, zero failed/ignored,
+  four filtered; actual test execution 626.83 seconds, acknowledged exit 0.
+  R1/R2 failed in worker setup; R3 hit the unchanged 1,800-second RCH deadline
+  during compilation before any test ran (`deadline_exceeded`, exit 137, acknowledged).
+  R9 retries the same source, inputs, assertions and deadline with the completed dependencies.
+  - [x] Observe equal science/stage traces and retained run/session/checkpoint identities.
+  - [x] Observe durable readback and preserved initial checkpoint/source database.
+  - [x] Retain actual perturbed first divergence, corrupt/truncated and uncovered-state refusals.
+  Separate report readback confirms ticks 18/7/18, 18 equal six-stage traces,
+  final digest `02d29615da597594`, watermarks 18/18/18, and first observed
+  perturbation at tick 1 / `sense`. Its embedded source field is null.
+- [x] Diagnose and repair the observed missing source identity without changing
+  original assertions, budgets or scientific inputs; final real SQL/canonical-manifest
+  readback retains `d6f89eac7dc948fff05657d1ae9a9dbc8f4f750c`.
+- [x] Recheck existing core checkpoint-start/tick-zero replay and applicable owner units.
+  R8 runs the core/runtime/storage checkpoint unit filter with core's required
+  `economy-faults` feature; R9 runs the original full-host CLI case.
+  R8 at `4b1e6652` observes core 21/0/0, runtime 8/0/0 and storage 13/1/0.
+  The storage witness case exhausts its original 30,000 one-millisecond polls.
+  R13 passes that exact case unchanged; R15 repeats the unchanged original group.
+  R15 (hz4 job `30072644099375131`) passes core 21, runtime 8 and storage 14,
+  with zero failed/ignored. Neither an isolated pass nor this group pass establishes
+  a causal fix for the earlier R8 failure; that original acceptance remains open.
+- [x] Workspace formatting at source `4b1e6652`: strict-remote RCH R5, hz4 job
+  `30072644099375122`, completed exit 0 with acknowledged receipt.
+- [x] Workspace all-target compiler check at the same source: R6, hz4 job
+  `30072644099375123`, completed exit 0 with acknowledged receipt.
+- [x] Run touched-file UBS: initial retention scan 0/374/23 critical/warning/info;
+  final app-library scan 0/297/151 and strengthened E2E scan 0/376/23, all exit 0.
+  No suppressions were added; these are not clean legacy scans. Markdown-only UBS
+  exits 3 because no supported language is scanned; it is not counted as a pass.
+  Documentation and JSONL receive manual review.
+- [x] Strict workspace all-target Clippy with warnings denied at the same source:
+  R7, hz4 job `30072644099375124`, completed exit 0 with acknowledged receipt.
+  Infrastructure refusals are retained separately and qualify none of these checks.
+- [x] Trace the missing source identity to the existing RCH build-time writer and
+  the unconnected app consumer. Implement the final `d6f89eac` fallback only for
+  plain hexadecimal RCH commits, preserving explicit identity precedence and
+  missing-source behavior for unknown/dirty/overlay stamps. Other provenance
+  requirements and all science inputs remain unchanged.
+- [x] Add selection controls and strengthen the real subprocess/SQL E2E with a
+  conflicting runtime RCH source value and embedded-identity readback assertions.
+- [x] Format final source `d6f89eac`: R18, hz2 job `30072644099375134`, acknowledged exit 0.
+- [x] Execute the final-source provenance unit filter, including the existing
+  incomplete/inconsistent-claim refusals. R17 reaches the unchanged 1,800-second
+  compilation deadline before any test executes (exit 137, acknowledged).
+  R23's two-core retry is refused before admission after measured capacity falls
+  to one slot; it executes no compiler or test. Retry the same scope within the
+  worker's actual capacity. R24's admitted one-core retry also reaches the same
+  compilation deadline before tests (job `30072644099375137`, exit 137,
+  acknowledged). R25 retries the same scope with two compiler jobs after measured
+  capacity returns to two slots; no test input, assertion or deadline changes.
+  R25 completes at `d6f89eac`: vmi1149989 job `30072644099375138`, nine passed,
+  zero failed/ignored, 640 filtered, 0.33 seconds of actual test execution,
+  acknowledged strict-remote exit 0. One of those tests executes the nine selection
+  inputs; the suite count is nine tests, not nine selection tests.
+- [x] Requalify workspace all-target check and strict Clippy at `d6f89eac`:
+  R21, hz2 job `30072644099375135`, and R22, hz2 job `30072644099375136`,
+  both completed exit 0 with acknowledged strict-remote receipts. The earlier
+  `4b1e6652` passes above are not attributed to this new source. R19/R20 refused
+  worker pressure before execution; neither is a functional result.
+- [x] Execute the final-source checkpoint CLI cases and existing tick-zero replay.
+  - [x] R26 interval checkpoint replay, checkpoint-start replay and full-host continuation:
+    vmi1149989 job `30072644099375139`, three passed, zero failed/ignored,
+    two filtered, 504.98 seconds of test execution, acknowledged exit 0.
+  - [x] R27 exact tick-zero/export/bundle/replay case: same worker, job
+    `30072644099375140`, one passed, zero failed/ignored, four filtered,
+    201.50 seconds of test execution, acknowledged exit 0.
+  These four selected cases are not the whole five-test E2E file.
+- [x] Read the final real reports and manifests. Source IDs are the expected commit;
+  18 versus 7+11 yields identical eighteen six-stage traces and final digest
+  `02d29615da597594`, with observed watermarks 18/18/18. The new science traces,
+  configurations and boundary digests also equal the earlier R9 artifacts. Perturbation
+  still first diverges at tick 1 / `sense` (`4496f291ad8c8709` versus
+  `72dd87bbe350e57e`); corrupt/truncated and uncovered Neuroflow factory continuations
+  exit 1 with unchanged recorded prefixes. Ordinary manifests remain incomplete,
+  non-reproducible and `checkpoint_replay_guarantee=false`; only the covered full-host
+  report has its existing scoped guarantee. No unverified build evidence was invented.
+- [x] Preserve both 94-file full-host artifact sets, original failed execution logs,
+  final receipts and checksums at `/data/tmp/scriptbots-continuation-20261020-lilacelm`.
+  Final worker proof remains at
+  `/var/tmp/scriptbots-host-continuation-20261020-lilacelm-r26/host-checkpoint-continuation-CqFggf`.
+  Core/tick-zero temporary fixture databases are not claimed as retained artifacts.
+- [ ] Finish original acceptance: causally resolve the intermittent storage-witness
+  failure and complete the original native/DSR qualification; current scoped RCH passes
+  do not close `bd-2z0.5.13`.
+- [ ] Qualify actual science-pool width against the declared CLI policy. R9's manifests
+  record global Rayon width 1 and no launch `RAYON_NUM_THREADS`; R26's record global
+  width 8 and launch value `8`, while both declare CLI policy 1. The preceding core
+  checkpoint test constructs `WorldState`, whose existing `configure_parallelism`
+  writes the default budget into the parent environment. The raw context difference
+  is retained, not normalized. A supplementary whole-build-metadata equality check
+  rejected this difference; the separate source/science checks passed. This is no
+  exact-class performance comparison or new thread-matrix qualification, and declared
+  policy is not substituted for an observed science-pool width (`bd-0oro`).
+- [x] Update the original Beads with observed results (parent comments 2907–2910;
+  the bounded thread-width observation is comment 2911 on `bd-0oro`) and prepare
+  separate reviewed source/handoff/tracker publication, preserving original acceptance
+  and all other work. Active TODO status retires to this bounded increment record;
+  final publication is verified against the actual refs after this record is committed.
+
+Continuation increment self-audit (2026-10-20; `4caab68f` through the current
+`d6f89eac` source and pending handoff; solo review, not independent verification):
+
+The README's purpose is a faithful, deterministic evolution lab with reproducible
+experiments. `0ff329ea` and `d6f89eac` are USER provenance fixes; `4b1e6652`
+and `cd035813` are ENABLER retention/assertion changes. R9 exercises the retention;
+R26 executes the strengthened assertions in that same real CLI case.
+The README recipe is USER documentation;
+this TODO, plan marker and original-Bead comments are PROCESS. The useful demo is
+the real handoff report and persisted manifest retaining the embedded source ID,
+observed in R26 after R25's nine provenance tests. Removing the
+process records would not change that behavior, but would remove the operator-requested
+handoff and its visible unresolved acceptance. The oldest open item in the ascending
+creation query is `bd-2z0` (2026-07-11); continuation serves that determinism goal.
+There is no delegated close count, new follow-up or changed original criterion.
+Verdict: DRIFTING in wall-clock cost, with a small product fix behind long dependency
+compilation. Correction: finish required qualification and publish this increment;
+do not expand the report, invent a framework or start another speculative change.
+
+The process artifact's consumer is the operator who explicitly requested the granular
+TODO. Its gate is this continuation handoff; the observed defects are the null source
+field and RCH cleanup of temporary proof paths. Retire the active TODO into a bounded
+increment record at handoff, retaining original acceptance as open. Raw logs and closed
+databases are the smallest integrity control against that actual evidence-loss mode;
+they are external copies, not a new repository evidence platform. The opportunity-cost
+choice is the original continuation capability, not another process work item.
+
+Honesty inventory, bounded to this increment:
+
+1. No (checked: every source/test hunk from `4caab68f`; no test removed or ignored).
+2. No (checked: retained real child processes and FrankenSQLite; no new test double).
+3. No (checked: changed paths contain no golden, snapshot or baseline).
+4. No relaxation (checked: assertions strengthened; CI, configuration, timeouts,
+   retry limits and warnings policy unchanged).
+5. No (checked: original science inputs and full-host test body; named filters carry
+   explicit scope and are not represented as the full suite).
+6. No claimed zero-run green (checked: per-package executed counts; filtered packages
+   in the exact-case retry and compilation-only timeouts remain explicitly qualified).
+7. Yes: coordination message 48 misstated the active check worker after a refusal;
+   message 50 corrected the running lanes. No compiler/test verdict depended on it.
+   A supplementary readback also assumed complete build-metadata equality; it rejected
+   the measured Rayon context difference. The final report preserves that rejection
+   and claims source/science observations separately, with original gates unchanged.
+8. No (checked: RCH envelopes are functional evidence, not native/DSR/performance proof).
+9. No (checked: R8's actual failure, unchanged passing reruns and unresolved cause
+   remain visible; R17's compilation deadline is not a test failure or pass).
+10. No (checked: raw stdout/stderr and process dispositions retained, including refusals).
+11. No (checked: original parent is still in progress; no close or replacement bead).
+12. No (checked: original acceptance/dependencies retained; only status prose/comments).
+13. Not applicable (checked: no delegated work or peer closure in this increment).
+14. Not applicable (checked: no subagent dispatch).
+15. Not applicable (checked: no accepted subagent result).
+16. Not applicable (checked: no swarm/refusal farming).
+17. No (checked: no agent agreement counted as verification; review is solo).
+18. No (checked: fixed seed, horizons and named test scope; counts come from raw output).
+19. Yes: an early registration response was printed too broadly. The immutable tool
+    output cannot be rewritten; subsequent Mail output is restricted to needed fields,
+    and the registration credential is not repeated in this report or evidence archive.
+20. Strongest evidence is R26's actual CLI/SQL/canonical-manifest identity checks,
+    conflicting runtime source input, retained process/database artifacts and unchanged
+    science/divergence observations, supplemented by R25 and R27. A skeptic can rebuild
+    pinned `d6f89eac` and rerun the same cases. Original native acceptance stays open.
+
+Older-session check: six bounded CASS queries (the five inventory phrases plus
+`replay_e2e`), followed by sampled canonical-message views. The usable index ends
+September 16. Initial physical-line views were not valid hit follow-ups and were
+replaced with `--message-index` archive views; no comprehensive historical clearance
+is inferred. Corrections above are retained in place, with original acceptance open.
 
 Recorded archipelago migration (`bd-16g.5`, 2026-10-20; qualified increment,
 original parent in progress):

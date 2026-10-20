@@ -458,6 +458,21 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
   - `bevy`: require the Bevy frontend and fail clearly unless built with the `bevy_render` application feature.
   - `terminal`: force emoji TUI.
 - `--bootstrap-ticks N`: explicitly run `N` science ticks after seeding and before frontend launch (default `0`, so ordinary startup launches at tick zero).
+ - `--checkpoint-handoff CHECKPOINT_ID`: after explicit bootstrap, save a paused
+   owner checkpoint and retire the owner without closing its host session. Requires
+   `--storage file`. This bounded continuation candidate still has open native qualification
+   under `bd-2z0.5.13`.
+ - `--continue-host-db FILE --host-checkpoint-id CHECKPOINT_ID --continue-ticks N`:
+   restore that exact handoff, advance a positive number of ticks, and hand off again in
+   the same run and session. Supply the original `--brain` preset; the prepared executable
+   registry must match the checkpoint. Configuration overrides and frontend options are
+   refused rather than silently replacing saved state. The JSON result names the new
+   checkpoint and observed admitted/applied/durable watermarks.
+ - `--compare-host-db EXPECTED --compare-host-checkpoint-id ID --host-candidate-db ACTUAL
+   --host-candidate-checkpoint-id ID`: compare two settled full-host artifacts at the same
+   tick. Requires complete retained tick-one-to-boundary stage traces and covered brain
+   state. It reports the first observed divergent tick/stage and both artifact identities;
+   divergence exits nonzero.
  - `--checkpoint-interval TICKS`: record a `WorldCheckpointV1` plus a replay digest into the run database every TICKS ticks of an interactive run (default 1000; `0` disables; env `SCRIPTBOTS_CHECKPOINT_INTERVAL`). `--replay-db FILE --checkpoint-start` later verifies the run from the latest one.
  - `--checkpoint-max-count COUNT` and `--checkpoint-max-bytes BYTES`: retention limits (defaults 256 and 268435456; env `SCRIPTBOTS_CHECKPOINT_MAX_COUNT` / `SCRIPTBOTS_CHECKPOINT_MAX_BYTES`). Every producer shares the storage owner's per-run and whole-database limits. SQL bytes include hexadecimal payloads and UTF-8 metadata. API artifact files have a separate budget with the same limits; downloads read through files without retaining a payload cache. Zero refuses new captures. Existing checkpoints remain intact, and exact retries reuse their row and file. Optional interval capture disables itself on quota exhaustion while science and controls continue.
  - `--dump-png <FILE>` (GUI builds): write an offscreen PNG and exit (no UI). Pair with `--png-size WxH`.
@@ -551,6 +566,33 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
 - Control-server environment is validated before startup side effects. Malformed or non-Unicode control values fail closed; `https://` in either MCP transport/address setting is rejected because the embedded MCP listener is plaintext HTTP rather than silently claiming TLS.
 - `SCRIPTBOTS_STORAGE_PATH` — optional new-run FrankenSQLite file path. Without it, ScriptBots creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`. In either case the app reserves the path with create-new semantics and refuses an existing database or stale `-wal`, `-shm`, `-journal`, `-wal-fec`, or lock sidecar. A cleanly closed run keeps an empty `-wal` and its `-shm` beside the database, so remove the database together with its sidecars before reusing a path. The selected path is printed as `Run database: ...`; save that exact value for later reads and exports.
 - `SCRIPTBOTS_RECOVER_STORAGE` — existing file-backed run to repair and finalize, equivalent to `--recover-storage FILE`. Recovery exits after persistence repair; it does not resume the simulation. Run-bundle export/verification and core checkpoint-start replay are separate implemented paths. Full host/session continuation has an implemented bounded CLI candidate whose original qualification remains open under `bd-2z0.5.13`.
+
+For a deliberate MLP handoff, use a newly chosen database path and an already built
+`scriptbots-app` binary:
+
+```bash
+SCRIPTBOTS_STORAGE_PATH=runs/continued.sqlite scriptbots-app \
+  --storage file --brain mlp --threads 1 --bootstrap-ticks 7 \
+  --checkpoint-handoff first-cut --set rng_seed=42 \
+  --set persistence_interval=1 --set replay_event_tick_cap=65536 \
+  --set population_minimum=20 --set food_growth_rate=0.0005
+scriptbots-app --continue-host-db runs/continued.sqlite \
+  --host-checkpoint-id first-cut --continue-ticks 11 --brain mlp
+```
+
+The second command is a bounded continuation from tick 7 to tick 18. It requires a
+deliberately handed-off owner and its unchanged science/journal cut; it is not a way to
+resume an arbitrary interrupted or already shut-down host. Keep the returned checkpoint
+ID for the next continuation. Opaque factory state, corrupt checkpoints and stale cuts
+are refused. Ordinary launch manifests retain `checkpoint_replay_guarantee=false`;
+the handoff report's scoped guarantee does not discharge the remaining native acceptance.
+
+Source IDs are embedded at build time. RCH's plain hexadecimal commit stamp supplies
+the revision when `SCRIPTBOTS_SOURCE_REVISION` was not supplied; explicit ScriptBots
+identity takes precedence. Unknown, dirty and overlay RCH stamps leave that fallback
+unavailable. Runtime environment changes cannot replace the embedded identity. A known
+commit still requires separate verified clean-tree, status/diff and compiler evidence
+before the manifest can report complete build provenance and reproducibility.
 
 `--create-bundle RUN_DB --bundle-output DIRECTORY` exports a finished, checkpointed database
 under its existing writer/path/identity lease. The destination must be new. Live writers,
@@ -880,7 +922,7 @@ Keybinds: space (pause), +/- (speed), s (single-step), b (toggle metrics baselin
 
 - **One embedded engine:** ScriptBots uses the public `fsqlite` facade from FrankenSQLite with `version = "=0.4.6"`, pinned to immutable revision `ad3f23ca94c0f1d38e3d6cbb919b0d095de0b4ee` at `https://github.com/Dicklesworthstone/frankensqlite`. Defaults remain disabled; `native`, `json`, `fts5`, `icu`, `misc`, and `rtree` preserve the previous native feature's implicit extension surface. Create-free existing-file open and expected-identity verification still precede recovery access. Native validation of this dependency migration is pending.
 - **Two storage targets:** `--storage file` exclusively reserves `SCRIPTBOTS_STORAGE_PATH` or a generated `runs/scriptbots-<unix-ms>-<pid>.sqlite` and prints the selected run database; it refuses reuse or stale sidecars. `--storage memory` opens volatile `:memory:` through the same implementation.
-- **Explicit interrupted-run recovery:** `--recover-storage FILE` (or `SCRIPTBOTS_RECOVER_STORAGE`) is the only application path that opens an existing run database for mutation. It holds the OS writer lease, binds recovery to the identity of the already-open VFS handle, verifies the exact structural schema fingerprint plus the supported migration sequence and persistence invariants, and refuses missing, replaced, unrelated, symlink, and multiply-linked files before replaying admitted-but-unapplied outbox rows and finalizing applied rows. It prints the resulting watermarks and exits. This is persistence repair, not world resume.
+- **Explicit interrupted-run recovery:** `--recover-storage FILE` (or `SCRIPTBOTS_RECOVER_STORAGE`) repairs an existing run database under the OS writer lease. It binds recovery to the identity of the already-open VFS handle, verifies the exact structural schema fingerprint plus the supported migration sequence and persistence invariants, and refuses missing, replaced, unrelated, symlink, and multiply-linked files before replaying admitted-but-unapplied outbox rows and finalizing applied rows. It prints the resulting watermarks and exits. Full-host continuation uses the same leased recovery boundary plus an exact saved owner/science/journal cut through the separate `--continue-host-db` candidate described above.
 - **Thread-confined, single-writer connection:** `fsqlite::Connection` is deliberately `!Send + !Sync`. The storage worker creates, uses, explicitly closes, and drops its connection on that worker thread. File writers hold a nonblocking OS advisory lease on a persistent companion lock file; process-local path/inode tracking is only defense in depth. No connection-owning value is shared through `Arc<Mutex<_>>`.
 - **Bounded admission, distinct proof levels:** persistence batches enter a bounded queue. Configurable `StorageDeadlines` bound startup, admission-gate, command-enqueue, receipt, flush, and shutdown acknowledgement waits, but cannot cancel a database call already executing on the owner thread or bound the supervised reaper. Validation, closed-gate, queue-send, and rolled-back outbox failures are definitely `NotAdmitted`; the external admission session retains the exact completed batch and acknowledgement fault while the world's payload-free `Pending` marker blocks later science ticks until explicit retry succeeds. A lost or timed-out acknowledgement remains typed as `Indeterminate` at the world boundary, but retrying the unchanged canonical payload is idempotent and reuses its stable batch ID; a conflicting payload is rejected by its BLAKE3 identity. Timed-out shutdown retains the exact pending receipt and worker handle for retry; dropping the controller hands both to an independent supervised reaper rather than abandoning connection ownership. `submit_with_receipt` returns the batch ID after the exact payload enters the worker outbox and reports `Durable` for a file database or `CommittedVolatile` for memory. That receipt proves admission, not scientific-table application. Same-thread `Storage::persist` now follows the identical outbox identity and watermark protocol; exact duplicates remain idempotent, conflicting payloads are typed refusals, raw insert SQL is confined to a non-production conformance test, and receipt plus shutdown/join retain the same typed terminal cause (`bd-2z0.8.9.4.4`).
 - **Durable recovery and watermarks:** each file-backed batch advances three monotonic, separately queryable prefixes: `admitted` after the outbox transaction, `applied` in the same transaction as all scientific-table rows, and `durable` in a later marker transaction that permits outbox-payload compaction. Startup replays admitted-but-unapplied payloads in order and finalizes applied-but-not-durable batches without duplicating rows. Exact duplicate retries reuse the original batch identity; a different payload for an already admitted tick is rejected. Flush and shutdown receipts include all three watermarks.

@@ -2424,6 +2424,16 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Qualified provenance increment; parent Currently In Progress] Full-owner continuation,
+2026-10-20 (`bd-2z0.5.13`):** source `d6f89eac` connects the existing clean RCH commit
+stamp to persisted run provenance, preserving explicit identity precedence and unknown,
+dirty and overlay refusals. Nine provenance units, three checkpoint CLI cases and the
+existing tick-zero/export/replay case pass through strict-remote RCH, with formatting,
+workspace all-target check and strict Clippy. Real SQL/manifest readback observes the
+source ID, unchanged science and original negative controls. The reality check retains
+the granular TODO, actual earlier storage-witness failure, measured Rayon context
+difference and remaining native qualification; this increment does not close the parent.
+
 **[Qualified increment; parent Currently In Progress] Recorded archipelago migration, 2026-10-20 (`bd-16g.5`):**
 connect the existing deterministic runtime migration policy and atomic barrier sink
 to the recorded CLI runner. Source `9ce6ef2a` now keeps migration off by default,
