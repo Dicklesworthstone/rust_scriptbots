@@ -21,6 +21,20 @@ use scriptbots_storage::{
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+fn artifact_root() -> Result<PathBuf, std::io::Error> {
+    let root = std::env::var_os("SCRIPTBOTS_TEST_ARTIFACT_ROOT")
+        .map_or_else(std::env::temp_dir, PathBuf::from);
+    std::fs::create_dir_all(&root)?;
+    Ok(root)
+}
+
+fn retained_directory(prefix: &str) -> Result<PathBuf, std::io::Error> {
+    Ok(tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(artifact_root()?)?
+        .keep())
+}
+
 fn recorded_cli() -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_scriptbots-app"));
     for (name, _) in std::env::vars_os() {
@@ -55,10 +69,7 @@ fn retain_cli(
 #[test]
 fn recorded_archipelago_cli_persists_every_island_and_tick()
 -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::Builder::new()
-        .prefix("recorded-archipelago-")
-        .tempdir()?
-        .keep();
+    let directory = retained_directory("recorded-archipelago-")?;
     println!(
         "recorded archipelago CLI artifacts: {}",
         directory.display()
@@ -274,10 +285,7 @@ fn recorded_archipelago_cli_persists_every_island_and_tick()
 #[test]
 fn recorded_archipelago_cli_refuses_invalid_runs_before_creating_storage()
 -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::Builder::new()
-        .prefix("recorded-archipelago-refusals-")
-        .tempdir()?
-        .keep();
+    let directory = retained_directory("recorded-archipelago-refusals-")?;
     println!(
         "recorded archipelago refusal artifacts: {}",
         directory.display()
@@ -342,10 +350,7 @@ fn recorded_archipelago_cli_migration_persists_identity_policy_and_thread_determ
     const ISLANDS: u32 = 4;
     const TICKS: u64 = 4;
     const INTERVAL: u64 = 2;
-    let directory = tempfile::Builder::new()
-        .prefix("recorded-migration-")
-        .tempdir()?
-        .keep();
+    let directory = retained_directory("recorded-migration-")?;
     println!("recorded migration CLI artifacts: {}", directory.display());
     for (rule, topology, stored_topology) in [
         ("random", "ring", "Ring"),
@@ -552,10 +557,7 @@ fn recorded_archipelago_cli_migration_persists_identity_policy_and_thread_determ
 #[test]
 fn recorded_archipelago_cli_migration_rejects_invalid_policy_without_creating_storage()
 -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::Builder::new()
-        .prefix("recorded-migration-refusals-")
-        .tempdir()?
-        .keep();
+    let directory = retained_directory("recorded-migration-refusals-")?;
     for (name, islands, arguments, reason) in [
         (
             "one-island",
@@ -648,10 +650,12 @@ fn recorded_archipelago_cli_migration_rejects_invalid_policy_without_creating_st
 
 fn temp_db_path(label: &str) -> PathBuf {
     let nonce = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "scriptbots-{label}-{}-{nonce}.db",
-        std::process::id()
-    ))
+    artifact_root()
+        .expect("archipelago artifact directory must be writable")
+        .join(format!(
+            "scriptbots-{label}-{}-{nonce}.db",
+            std::process::id()
+        ))
 }
 
 struct HarnessJournal {
