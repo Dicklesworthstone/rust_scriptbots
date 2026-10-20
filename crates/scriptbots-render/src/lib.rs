@@ -26167,6 +26167,142 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn map_sandbox_production_input_identical_paint_preserves_preview_and_redo() {
+        for sample_based in [false, true] {
+            let host = TestHost::take(command_characterization_world());
+            let before = host.port.scientific_digest_v1().unwrap();
+            let mut session = GuiSession::new(
+                host.port.clone(),
+                AnalyticsSnapshotProvider::empty(),
+                Arc::new(|_| None),
+            );
+            session.map_apply_submit = Some(map_owner_submit(Arc::clone(&host)));
+            let session = Arc::new(session);
+            let context = gpui::TestAppContext::single();
+            let windows = context.update(|app| session.install(app)).unwrap();
+            let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+            lab.simulate_resize(size(px(480.0), px(1400.0)));
+            let redraw = |lab: &mut gpui::VisualTestContext| {
+                lab.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear();
+                });
+            };
+            let click = |lab: &mut gpui::VisualTestContext, selector| {
+                let bounds = lab.debug_bounds(selector).expect("production map control");
+                let viewport = lab.update(|window, _| window.viewport_size());
+                assert!(
+                    bounds.origin.x >= px(0.0)
+                        && bounds.origin.y >= px(0.0)
+                        && bounds.right() <= viewport.width
+                        && bounds.bottom() <= viewport.height,
+                    "{selector} must be visible: {bounds:?}, viewport {viewport:?}"
+                );
+                lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+                redraw(lab);
+            };
+            let generate = |lab: &mut gpui::VisualTestContext| {
+                click(lab, "map-generate");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while session.map_sandbox.lock().unwrap().job.is_some() {
+                    redraw(lab);
+                    assert!(Instant::now() < deadline, "paint preview did not arrive");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                redraw(lab);
+                assert!(session.map_sandbox.lock().unwrap().can_apply());
+            };
+            redraw(&mut lab);
+            click(&mut lab, "dashboard-tab-maps");
+            click(&mut lab, "map-live-grid");
+            if sample_based {
+                click(&mut lab, "map-generator");
+            }
+            generate(&mut lab);
+            click(&mut lab, "map-terrain-brush-DeepWater");
+            click(&mut lab, "map-cell-0-0");
+            click(&mut lab, "map-cell-1-0");
+            click(&mut lab, "map-undo");
+            generate(&mut lab);
+            let (retained, preview) = {
+                let sandbox = session.map_sandbox.lock().unwrap();
+                assert!(sandbox.draft.can_undo() && sandbox.draft.can_redo());
+                assert_eq!(sandbox.draft.state.constraints.count(), 1);
+                (
+                    sandbox.draft.clone(),
+                    Arc::clone(&sandbox.preview.as_ref().unwrap().artifact),
+                )
+            };
+            click(&mut lab, "map-cell-0-0");
+            for key in ["space", "enter"] {
+                lab.simulate_keystrokes(key);
+                redraw(&mut lab);
+            }
+            {
+                let sandbox = session.map_sandbox.lock().unwrap();
+                assert_eq!(sandbox.draft, retained);
+                assert!(sandbox.can_apply());
+                assert!(Arc::ptr_eq(
+                    &sandbox.preview.as_ref().unwrap().artifact,
+                    &preview
+                ));
+                assert_eq!(
+                    sandbox.notice,
+                    "No draft change. Existing preview and history are unchanged."
+                );
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+            click(&mut lab, "map-redo");
+            {
+                let sandbox = session.map_sandbox.lock().unwrap();
+                assert_eq!(sandbox.draft.state.constraints.count(), 2);
+                assert!(!sandbox.can_apply(), "actual redo must invalidate the preview");
+            }
+            click(&mut lab, "map-undo");
+            assert_eq!(
+                session.map_sandbox.lock().unwrap().draft.state,
+                retained.state
+            );
+            click(&mut lab, "map-terrain-brush-Sand");
+            click(&mut lab, "map-cell-0-0");
+            {
+                let sandbox = session.map_sandbox.lock().unwrap();
+                assert!(!sandbox.can_apply());
+                assert!(!sandbox.draft.can_redo());
+                assert_eq!(
+                    sandbox
+                        .draft
+                        .state
+                        .constraints
+                        .get(0, 0)
+                        .unwrap()
+                        .terrain_kind,
+                    Some(TerrainKind::Sand),
+                );
+            }
+            click(&mut lab, "map-undo");
+            assert_eq!(
+                session.map_sandbox.lock().unwrap().draft.state,
+                retained.state
+            );
+            click(&mut lab, "map-redo");
+            generate(&mut lab);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+            let expected_revision = host.snapshot().revisions.scientific;
+            click(&mut lab, "map-apply");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while host.snapshot().revisions.scientific == expected_revision {
+                assert!(Instant::now() < deadline, "paint Apply did not reach owner");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let live = host.snapshot();
+            assert_eq!(live.layers.terrain.tiles[0].kind, TerrainKind::Sand);
+            assert_eq!(live.world.tick, 0);
+            assert_ne!(host.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn map_sandbox_scalar_controls_bound_values_and_refuse_invalid_cells_atomically() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();

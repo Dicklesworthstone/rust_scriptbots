@@ -18718,6 +18718,25 @@ mod map_sandbox {
     }
 
     impl PaintedConstraint {
+        // Scientific artifact hashes retain float bits, including signed zero.
+        // Numeric equality alone would silently discard a distinct painted payload.
+        fn identical_to(&self, other: &Self) -> bool {
+            self == other
+                && [
+                    (self.elevation, other.elevation),
+                    (self.moisture, other.moisture),
+                    (self.fertility_bias, other.fertility_bias),
+                    (self.temperature_bias, other.temperature_bias),
+                    (self.permeability, other.permeability),
+                    (self.runoff_bias, other.runoff_bias),
+                    (self.basin_rank, other.basin_rank),
+                    (self.channel_priority, other.channel_priority),
+                    (self.swim_cost, other.swim_cost),
+                ]
+                .into_iter()
+                .all(|(left, right)| left.map(f32::to_bits) == right.map(f32::to_bits))
+        }
+
         /// Check that every specified parameter is finite.
         pub fn validate(&self) -> Result<(), MapGenerationError> {
             for (field, val) in [
@@ -19033,7 +19052,7 @@ mod map_sandbox {
             self.revision = self.revision.wrapping_add(1);
         }
 
-        /// Paint a cell-level constraint into the draft, recording an undo checkpoint.
+        /// Paint a cell-level constraint, checkpointing only a new or changed payload.
         pub fn paint_constraint(
             &mut self,
             constraint: PaintedConstraint,
@@ -19047,6 +19066,14 @@ mod map_sandbox {
                 });
             }
             constraint.validate()?;
+            if self
+                .state
+                .constraints
+                .get(constraint.x, constraint.y)
+                .is_some_and(|existing| existing.identical_to(&constraint))
+            {
+                return Ok(());
+            }
             self.push_checkpoint();
             self.state.constraints.paint(constraint)?;
             Ok(())
@@ -20640,6 +20667,177 @@ mod map_sandbox {
             assert!(!draft.can_redo());
             assert!(draft.undo().expect("valid painting remains undoable"));
             assert_eq!(draft.state, before.state);
+        }
+
+        #[test]
+        fn map_editor_identical_paint_preserves_history_and_explicit_intent() {
+            let mut draft = MapEditorDraft::new(
+                "repeat_paint",
+                8,
+                8,
+                16,
+                1,
+                DraftGeneratorConfig::RuleBased {
+                    tileset: default_tileset_spec(),
+                },
+            );
+            let empty = PaintedConstraint {
+                x: 0,
+                y: 0,
+                terrain_kind: None,
+                elevation: None,
+                moisture: None,
+                fertility_bias: None,
+                temperature_bias: None,
+                permeability: None,
+                runoff_bias: None,
+                basin_rank: None,
+                channel_priority: None,
+                swim_cost: None,
+                hazard: None,
+            };
+            let initial = draft.clone();
+            draft.paint_constraint(empty.clone()).unwrap();
+            assert_eq!(draft.revision, initial.revision + 1);
+            assert_eq!(draft.state.constraints.get(0, 0), Some(&empty));
+            draft.set_seed(2);
+            assert!(draft.undo().unwrap());
+            assert!(draft.can_undo() && draft.can_redo());
+            let retained = draft.clone();
+            for _ in 0..100 {
+                draft.paint_constraint(empty.clone()).unwrap();
+            }
+            assert_eq!(draft, retained, "repeated paint must retain both stacks");
+            assert!(draft.redo().unwrap());
+            assert_eq!(draft.state.seed, 2);
+            assert!(draft.undo().unwrap());
+            assert!(draft.undo().unwrap());
+            assert_eq!(draft.state, initial.state);
+
+            for max_history in [0, 1, 2] {
+                draft.max_history = max_history;
+                let paint = PaintedConstraint {
+                    terrain_kind: Some(TerrainKind::Grass),
+                    hazard: Some(false),
+                    ..empty.clone()
+                };
+                draft.paint_constraint(paint.clone()).unwrap();
+                let retained = draft.clone();
+                for _ in 0..100 {
+                    draft.paint_constraint(paint.clone()).unwrap();
+                }
+                assert_eq!(draft, retained);
+                assert!(draft.undo_stack.len() <= max_history);
+                assert!(draft.redo_stack.len() <= max_history);
+                // Validation still precedes the identical-payload guard, even
+                // when an earlier dimension change leaves an old cell outside.
+                draft.set_dimensions(1, 1, 16).unwrap();
+                let outside = PaintedConstraint { x: 1, ..paint };
+                draft.state.constraints.paint(outside.clone()).unwrap();
+                let retained = draft.clone();
+                assert!(matches!(
+                    draft.paint_constraint(outside),
+                    Err(MapGenerationError::ConstraintOutOfBounds { .. })
+                ));
+                assert_eq!(draft, retained);
+            }
+        }
+
+        #[test]
+        fn map_editor_paint_distinguishes_every_field_and_signed_zero() {
+            let mut draft = MapEditorDraft::new(
+                "paint_payload",
+                8,
+                8,
+                16,
+                1,
+                DraftGeneratorConfig::RuleBased {
+                    tileset: default_tileset_spec(),
+                },
+            );
+            let paint = PaintedConstraint {
+                x: 0,
+                y: 0,
+                terrain_kind: Some(TerrainKind::Grass),
+                elevation: Some(0.0),
+                moisture: Some(0.0),
+                fertility_bias: Some(0.0),
+                temperature_bias: Some(0.0),
+                permeability: Some(0.0),
+                runoff_bias: Some(0.0),
+                basin_rank: Some(0.0),
+                channel_priority: Some(0.0),
+                swim_cost: Some(0.0),
+                hazard: Some(false),
+            };
+            draft.paint_constraint(paint.clone()).unwrap();
+            let fields: &[fn(&mut PaintedConstraint) -> &mut Option<f32>] = &[
+                |p| &mut p.elevation,
+                |p| &mut p.moisture,
+                |p| &mut p.fertility_bias,
+                |p| &mut p.temperature_bias,
+                |p| &mut p.permeability,
+                |p| &mut p.runoff_bias,
+                |p| &mut p.basin_rank,
+                |p| &mut p.channel_priority,
+                |p| &mut p.swim_cost,
+            ];
+            for field in fields {
+                for value in [None, Some(0.7), Some(-0.0)] {
+                    let mut changed = paint.clone();
+                    *field(&mut changed) = value;
+                    let before = draft.clone();
+                    draft.paint_constraint(changed.clone()).unwrap();
+                    assert_eq!(draft.revision, before.revision + 1);
+                    assert_eq!(
+                        field(&mut draft.state.constraints.get(0, 0).unwrap().clone())
+                            .map(f32::to_bits),
+                        value.map(f32::to_bits),
+                    );
+                    let retained = draft.clone();
+                    draft.paint_constraint(changed).unwrap();
+                    assert_eq!(draft, retained);
+                    assert!(draft.undo().unwrap());
+                    assert_eq!(draft.state, before.state);
+                }
+                let mut invalid = paint.clone();
+                *field(&mut invalid) = Some(f32::NAN);
+                let before = draft.clone();
+                assert!(draft.paint_constraint(invalid).is_err());
+                assert_eq!(draft, before);
+            }
+            for changed in [
+                PaintedConstraint {
+                    x: 1,
+                    ..paint.clone()
+                },
+                PaintedConstraint {
+                    y: 1,
+                    ..paint.clone()
+                },
+                PaintedConstraint {
+                    terrain_kind: Some(TerrainKind::Sand),
+                    ..paint.clone()
+                },
+                PaintedConstraint {
+                    terrain_kind: None,
+                    ..paint.clone()
+                },
+                PaintedConstraint {
+                    hazard: Some(true),
+                    ..paint.clone()
+                },
+                PaintedConstraint {
+                    hazard: None,
+                    ..paint
+                },
+            ] {
+                let before = draft.clone();
+                draft.paint_constraint(changed).unwrap();
+                assert_eq!(draft.revision, before.revision + 1);
+                assert!(draft.undo().unwrap());
+                assert_eq!(draft.state, before.state);
+            }
         }
 
         #[test]
