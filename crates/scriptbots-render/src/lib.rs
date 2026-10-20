@@ -25000,8 +25000,14 @@ mod command_characterization_tests {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
         let artifact = map_patch_source_artifact();
-        assert_eq!(artifact.terrain().tile(2, 4).unwrap().kind, TerrainKind::Bloom);
-        assert_eq!(artifact.terrain().tile(5, 0).unwrap().kind, TerrainKind::Rock);
+        assert_eq!(
+            artifact.terrain().tile(2, 4).unwrap().kind,
+            TerrainKind::Bloom
+        );
+        assert_eq!(
+            artifact.terrain().tile(5, 0).unwrap().kind,
+            TerrainKind::Rock
+        );
         let path = map_file_test_directory().join("rectangular-source.postcard");
         write_map_test_file(&path, &postcard::to_allocvec(&artifact).unwrap());
         let inspection = Arc::new(inspect_map_artifact_file(&path).unwrap());
@@ -26044,7 +26050,8 @@ mod command_characterization_tests {
         assert!(lab.debug_bounds("map-sample-editor").is_some());
         {
             let sandbox = session.map_sandbox.lock().unwrap();
-            let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config
+            let DraftGeneratorConfig::SampleBased { sample } =
+                &sandbox.draft.state.generator_config
             else {
                 panic!("Extract input must copy the selected source cells");
             };
@@ -26087,7 +26094,8 @@ mod command_characterization_tests {
         let preview = {
             let sandbox = session.map_sandbox.lock().unwrap();
             assert!(sandbox.can_apply(), "{}", sandbox.notice);
-            let DraftGeneratorConfig::SampleBased { sample } = &sandbox.draft.state.generator_config
+            let DraftGeneratorConfig::SampleBased { sample } =
+                &sandbox.draft.state.generator_config
             else {
                 panic!("sample");
             };
