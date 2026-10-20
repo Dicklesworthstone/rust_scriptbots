@@ -41,7 +41,14 @@ fn retained_host_output(directory: &Path, name: &str, command: &mut Command) -> 
         .get_args()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    command.current_dir(directory).stdout(stdout).stderr(stderr);
+    command
+        .env(
+            "RCH_BUILD_SOURCE",
+            "runtime-source-must-not-replace-embedded-identity",
+        )
+        .current_dir(directory)
+        .stdout(stdout)
+        .stderr(stderr);
     let status = command.status().expect("run actual host checkpoint CLI");
     fs::write(
         directory.join(format!("{name}.process.json")),
@@ -356,6 +363,12 @@ fn assert_host_handoff_readback(
     let manifest = reader.run_manifest().expect("actual stored provenance");
     let launch: scriptbots_app::RunManifestV3 = serde_json::from_str(&manifest.manifest_json)
         .expect("independent immutable launch provenance");
+    let built = scriptbots_app::BuildProvenanceV0::current();
+    assert_eq!(
+        manifest.source_revision, built.source_revision,
+        "stored source must retain the embedded identity despite conflicting runtime input"
+    );
+    assert_eq!(launch.build.source_revision, built.source_revision);
     assert!(!launch.limitations.checkpoint_replay_guarantee);
     assert_eq!(report["run_id"], manifest.run_id.to_string());
     assert_eq!(manifest.root_seed, SEED);
