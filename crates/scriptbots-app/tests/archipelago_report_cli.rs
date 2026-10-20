@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -54,16 +55,39 @@ fn retain_cli(
     command: &mut std::process::Command,
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
     let output = command.output()?;
-    std::fs::write(directory.join(format!("{name}.stdout")), &output.stdout)?;
-    std::fs::write(directory.join(format!("{name}.stderr")), &output.stderr)?;
-    std::fs::write(
-        directory.join(format!("{name}.json")),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "command": format!("{command:?}"), "exit_code": output.status.code(),
-            "stdout": format!("{name}.stdout"), "stderr": format!("{name}.stderr"),
-        }))?,
-    )?;
+    let metadata = serde_json::to_vec_pretty(&serde_json::json!({
+        "command": format!("{command:?}"), "exit_code": output.status.code(),
+        "stdout": format!("{name}.stdout"), "stderr": format!("{name}.stderr"),
+    }))?;
+    for (suffix, bytes) in [
+        ("stdout", output.stdout.as_slice()),
+        ("stderr", output.stderr.as_slice()),
+        ("json", metadata.as_slice()),
+    ] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join(format!("{name}.{suffix}")))?
+            .write_all(bytes)?;
+    }
     Ok(output)
+}
+
+#[test]
+fn archipelago_cli_capture_preserves_an_existing_report() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = retained_directory("archipelago-capture-collision-")?;
+    let report = directory.join("report.json");
+    let original = br#"{"run_id":"existing-report-must-survive"}"#;
+    std::fs::write(&report, original)?;
+    let result = retain_cli(&directory, "report", recorded_cli().arg("--help"));
+    let error = result.expect_err("capture metadata must not overwrite a report");
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(std::fs::read(report)?, original);
+    Ok(())
 }
 
 #[test]
@@ -533,7 +557,7 @@ fn recorded_archipelago_cli_migration_persists_identity_policy_and_thread_determ
             let report_path = directory.join(format!("{name}-report.json"));
             let offline = retain_cli(
                 &directory,
-                &format!("{name}-report"),
+                &format!("{name}-report-cli"),
                 recorded_cli()
                     .arg("report-archipelago")
                     .arg(&database)
