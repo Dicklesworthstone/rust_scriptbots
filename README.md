@@ -475,7 +475,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
  - `--auto-tune N`: quick sweep to pick threads/thresholds for the chosen storage, then continue.
  - `--det-check N`: run determinism self-check (1-thread vs N-threads summaries comparison).
  - `--run-archipelago N --archipelago-db FILE --archipelago-ticks TICKS`: record bounded
-   isolated populations through sole-owner hosts in one new database. Requires an explicit
+   populations through sole-owner hosts in one new database. Requires an explicit
    `rng_seed` and `persistence_interval=1`. Islands step in ascending order with separate
    derived seeds; the inner Rayon pool defaults to one thread and honors `--threads`.
    Each complete tick is atomically applied and flushed before the next tick begins.
@@ -483,7 +483,17 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
    require an explicit island, and narrative search results include it in each event identity.
    Existing single-population interaction graph readers and table exports refuse multi-island
    runs; use `report-archipelago` or explicit island-scoped readers for those databases.
-   This mode currently has no migration, scheduled interventions, bootstrap, or host-session
+   Migration is disabled by default. `--migration-interval N` enables it every N ticks
+   for two or more islands. Optional `--migration-emigrants N` (default 1),
+   `--migration-selection random|fittest|youngest|wanderer` (default `fittest`) and
+   `--migration-topology ring|fully-connected` (default `ring`) use the existing
+   deterministic runtime policy. Connectivity is **bidirectional**: each ring connection
+   permits movement in both directions. Actual moves and all island science are persisted
+   in the same complete-barrier transaction; the manifest records the exact policy.
+   Tick summaries describe the tick before migration; final membership and world digests
+   describe the state after migration. Result fields label these phases and report the
+   number of moves persisted, which can be zero if no migration falls within the run.
+   This mode currently has no scheduled interventions, bootstrap, or host-session
    checkpoint resume. The JSON result names those limits and the observed durability watermarks.
    The manifest's `archipelago` extension records all island configs and the common root seed;
    its ordinary world fields describe island zero. For example:
@@ -492,6 +502,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
    cargo run -p scriptbots-app -- --run-archipelago 3 \
      --archipelago-db runs/islands.sqlite --archipelago-ticks 100 \
      --brain mlp --set rng_seed=42 --set persistence_interval=1
+   # Add --migration-interval 25 --migration-selection random for gene flow.
    cargo run -p scriptbots-app -- report-archipelago runs/islands.sqlite \
      --verify-conservation --json runs/islands-report.json
    ```

@@ -102,6 +102,8 @@ fn recorded_archipelago_cli_persists_every_island_and_tick()
     assert_eq!(result["island_count"], 3);
     assert_eq!(result["host_journal"], "committed_volatile");
     assert_eq!(result["migration"], "disabled");
+    assert_eq!(result["migration_count"], 0);
+    assert!(result["migration_policy"].is_null());
     let digests: std::collections::BTreeSet<_> = result["islands"]
         .as_array()
         .unwrap()
@@ -329,6 +331,307 @@ fn recorded_archipelago_cli_refuses_invalid_runs_before_creating_storage()
         assert!(
             !database.exists(),
             "{name} reserved a database before validation"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn recorded_archipelago_cli_migration_persists_identity_policy_and_thread_determinism()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ISLANDS: u32 = 4;
+    const TICKS: u64 = 4;
+    const INTERVAL: u64 = 2;
+    let directory = tempfile::Builder::new()
+        .prefix("recorded-migration-")
+        .tempdir()?
+        .keep();
+    println!("recorded migration CLI artifacts: {}", directory.display());
+    for (rule, topology, stored_topology) in [
+        ("random", "ring", "Ring"),
+        ("fittest", "fully-connected", "FullyConnected"),
+        ("youngest", "ring", "Ring"),
+        ("wanderer", "fully-connected", "FullyConnected"),
+    ] {
+        let emigrants = if topology == "ring" { 1 } else { 2 };
+        let expected_edges: std::collections::BTreeSet<_> = (0..ISLANDS)
+            .flat_map(|from| (0..ISLANDS).map(move |to| (from, to)))
+            .filter(|&(from, to)| {
+                from != to
+                    && (topology == "fully-connected"
+                        || (from + 1) % ISLANDS == to
+                        || (to + 1) % ISLANDS == from)
+            })
+            .collect();
+        let expected_moves = u64::try_from(expected_edges.len())? * (TICKS / INTERVAL) * emigrants;
+        let mut reference = None;
+        for threads in ["1", "3"] {
+            let name = format!("{rule}-{topology}-{threads}");
+            let database = directory.join(format!("{name}.sqlite"));
+            let output = retain_cli(
+                &directory,
+                &name,
+                recorded_cli()
+                    .args([
+                        "--run-archipelago",
+                        &ISLANDS.to_string(),
+                        "--archipelago-ticks",
+                        &TICKS.to_string(),
+                        "--archipelago-db",
+                    ])
+                    .arg(&database)
+                    .args([
+                        "--threads",
+                        threads,
+                        "--brain",
+                        "mlp",
+                        "--migration-interval",
+                        &INTERVAL.to_string(),
+                        "--migration-emigrants",
+                        &emigrants.to_string(),
+                        "--migration-selection",
+                        rule,
+                        "--migration-topology",
+                        topology,
+                        "--set",
+                        "rng_seed=42",
+                        "--set",
+                        "persistence_interval=1",
+                        "--set",
+                        "world_width=600",
+                        "--set",
+                        "world_height=600",
+                        "--set",
+                        "closed=true",
+                    ]),
+            )?;
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(result["status"], "complete");
+            assert_eq!(result["migration"], "enabled");
+            assert_eq!(result["migration_count"], expected_moves);
+            assert_eq!(result["migration_policy"]["selection_rule"], rule);
+            assert_eq!(result["migration_policy"]["topology"], stored_topology);
+            assert_eq!(
+                result["migration_policy"]["edge_direction"],
+                "bidirectional"
+            );
+            assert_eq!(result["migration_policy"]["interval_ticks"], INTERVAL);
+            assert_eq!(
+                result["migration_policy"]["emigrants_per_directed_edge"],
+                emigrants
+            );
+            let reader = StorageReader::open(database.to_str().unwrap())?;
+            let manifest = reader.run_manifest()?;
+            let manifest: serde_json::Value = serde_json::from_str(&manifest.manifest_json)?;
+            assert_eq!(
+                manifest["archipelago"]["migration_policy"],
+                result["migration_policy"]
+            );
+            assert_eq!(
+                manifest["archipelago"]["tick_summary_phase"],
+                "before_migration"
+            );
+            assert_eq!(
+                manifest["archipelago"]["membership_phase"],
+                "after_migration"
+            );
+            let watermarks = reader.persistence_watermarks()?;
+            assert_eq!(watermarks.admitted.unwrap().get(), TICKS);
+            assert_eq!(watermarks.admitted, watermarks.applied);
+            assert_eq!(watermarks.applied, watermarks.durable);
+            let report = reader.archipelago_report()?;
+            assert!(
+                report.conservation_audit.passed,
+                "{name}: {:?}",
+                report.conservation_audit.breaches
+            );
+            assert_eq!(
+                report.conservation_audit.total_islands_checked,
+                ISLANDS as usize
+            );
+            assert_eq!(u64::try_from(report.migrations.len())?, expected_moves);
+            assert_eq!(report.migrations, reader.migrations()?);
+            let mut by_tick = BTreeMap::<_, Vec<_>>::new();
+            for migration in &report.migrations {
+                assert_eq!(migration.rule.to_ascii_lowercase(), rule);
+                assert!(migration.key_value.is_finite());
+                assert!(migration.agent_uid_to > 0);
+                assert_ne!(migration.island_id_from, migration.island_id_to);
+                by_tick.entry(migration.tick).or_default().push(migration);
+            }
+            assert_eq!(by_tick.keys().copied().collect::<Vec<_>>(), vec![2, 4]);
+            for moves in by_tick.values() {
+                let edges = moves
+                    .iter()
+                    .map(|m| (m.island_id_from, m.island_id_to))
+                    .collect();
+                assert_eq!(expected_edges, edges);
+                let departures: std::collections::BTreeSet<_> = moves
+                    .iter()
+                    .map(|m| (m.island_id_from, m.agent_uid))
+                    .collect();
+                let arrivals: std::collections::BTreeSet<_> = moves
+                    .iter()
+                    .map(|m| (m.island_id_to, m.agent_uid_to))
+                    .collect();
+                assert_eq!(
+                    departures.len(),
+                    moves.len(),
+                    "an organism cannot leave twice"
+                );
+                assert_eq!(
+                    arrivals.len(),
+                    moves.len(),
+                    "arrivals must have unique identities"
+                );
+                assert_eq!(
+                    moves.iter().map(|m| m.seq).collect::<Vec<_>>(),
+                    (0..u64::try_from(moves.len())?).collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(report.migration_graph.len(), expected_edges.len());
+            for island in result["islands"].as_array().unwrap() {
+                assert_eq!(island["population_phase"], "after_migration");
+                assert_eq!(island["total_energy_phase"], "before_migration");
+                let history =
+                    reader.island_history(u32::try_from(island["island_id"].as_u64().unwrap())?)?;
+                assert_eq!(history.points.len(), usize::try_from(TICKS)?);
+                assert_eq!(
+                    island["recorded_population"],
+                    history.points.last().unwrap().agent_count
+                );
+            }
+            let observed = (result["islands"].clone(), report.migrations.clone());
+            if let Some(reference) = &reference {
+                assert_eq!(
+                    reference, &observed,
+                    "{name}: science and moves must be thread-independent"
+                );
+            } else {
+                reference = Some(observed);
+            }
+            reader.close()?;
+            let report_path = directory.join(format!("{name}-report.json"));
+            let offline = retain_cli(
+                &directory,
+                &format!("{name}-report"),
+                recorded_cli()
+                    .arg("report-archipelago")
+                    .arg(&database)
+                    .arg("--json")
+                    .arg(&report_path)
+                    .arg("--verify-conservation"),
+            )?;
+            assert!(
+                offline.status.success(),
+                "{}",
+                String::from_utf8_lossy(&offline.stderr)
+            );
+            let offline: ArchipelagoReport = serde_json::from_slice(&std::fs::read(report_path)?)?;
+            assert_eq!(offline.migrations, report.migrations);
+            assert!(offline.conservation_audit.passed);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn recorded_archipelago_cli_migration_rejects_invalid_policy_without_creating_storage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::Builder::new()
+        .prefix("recorded-migration-refusals-")
+        .tempdir()?
+        .keep();
+    for (name, islands, arguments, reason) in [
+        (
+            "one-island",
+            "1",
+            vec!["--migration-interval", "1"],
+            "at least two islands",
+        ),
+        (
+            "zero-interval",
+            "2",
+            vec!["--migration-interval", "0"],
+            "invalid value",
+        ),
+        (
+            "zero-emigrants",
+            "2",
+            vec!["--migration-interval", "1", "--migration-emigrants", "0"],
+            "invalid value",
+        ),
+        (
+            "missing-interval",
+            "2",
+            vec!["--migration-selection", "random"],
+            "--migration-interval",
+        ),
+        (
+            "bad-selection",
+            "2",
+            vec![
+                "--migration-interval",
+                "1",
+                "--migration-selection",
+                "loudest",
+            ],
+            "invalid value",
+        ),
+        (
+            "bad-topology",
+            "2",
+            vec![
+                "--migration-interval",
+                "1",
+                "--migration-topology",
+                "unknown",
+            ],
+            "invalid value",
+        ),
+        (
+            "out-of-range-overlay",
+            "2",
+            vec!["--island-overlay", "2:{}"],
+            "outside the configured islands",
+        ),
+        (
+            "duplicate-overlay",
+            "2",
+            vec!["--island-overlay", "0:{}", "--island-overlay", "0:{}"],
+            "duplicate overlay",
+        ),
+    ] {
+        let database = directory.join(format!("{name}.sqlite"));
+        let output = retain_cli(
+            &directory,
+            name,
+            recorded_cli()
+                .args([
+                    "--run-archipelago",
+                    islands,
+                    "--archipelago-ticks",
+                    "1",
+                    "--archipelago-db",
+                ])
+                .arg(&database)
+                .args(["--set", "rng_seed=42", "--set", "persistence_interval=1"])
+                .args(arguments),
+        )?;
+        assert!(!output.status.success(), "{name} unexpectedly succeeded");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(reason),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !database.exists(),
+            "{name} created storage before validation"
         );
     }
     Ok(())

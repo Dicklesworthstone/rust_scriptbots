@@ -1,20 +1,21 @@
-//! Recorded isolated-island runs and offline archipelago reports.
+//! Recorded island runs, optional deterministic migration and offline reports.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use scriptbots_core::{PersistenceBatch, ScriptBotsConfig, WorldState, WorldStateError};
+use scriptbots_runtime::migrator::EmigrantSelectionRule;
 use scriptbots_runtime::{
-    Archipelago, ArchipelagoConfig, EventJournalReader, HostCoreOptions, HostSessionId, IslandId,
-    IslandSpec, JournalAdmission, JournalBatch, JournalBatchId, JournalPort, JournalReceipt,
-    ShutdownCommitRequirement, Topology, VolatileJournal,
+    Archipelago, ArchipelagoConfig, ArchipelagoMigration, EventJournalReader, HostCoreOptions,
+    HostSessionId, IslandId, IslandSpec, JournalAdmission, JournalBatch, JournalBatchId,
+    JournalPort, JournalReceipt, ShutdownCommitRequirement, Topology, VolatileJournal,
 };
 use scriptbots_storage::{ArchipelagoBarrierSink, RunManifestRecord, Storage, StorageReader};
 
@@ -22,6 +23,84 @@ use crate::{BrainPreset, BuildProvenanceV0, install_brains, seed_founding_popula
 
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECORDED_TICKS: u64 = 10_000_000;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MigrationSelection {
+    Random,
+    Fittest,
+    Youngest,
+    Wanderer,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MigrationConnections {
+    Ring,
+    FullyConnected,
+}
+
+/// Optional policies for recorded islands; migration is disabled unless requested.
+#[derive(Args, Debug, Clone, Default)]
+pub struct RecordedArchipelagoOptions {
+    /// Per-island scenario overlay, repeatable as ID:JSON_OR_PATH.
+    #[arg(long = "island-overlay", value_name = "ID:SPEC", action = clap::ArgAction::Append)]
+    island_overlays: Vec<String>,
+    /// Migrate every N recorded ticks (positive; requires at least two islands).
+    #[arg(long, value_name = "N", requires = "run_archipelago")]
+    migration_interval: Option<NonZeroU64>,
+    /// Emigrants per directed edge per migration (default: 1).
+    #[arg(long, value_name = "N", requires = "migration_interval")]
+    migration_emigrants: Option<NonZeroU32>,
+    /// Emigrant selection (default: fittest).
+    #[arg(long, value_enum, requires = "migration_interval")]
+    migration_selection: Option<MigrationSelection>,
+    /// Bidirectional island connectivity (default: ring).
+    #[arg(long, value_enum, requires = "migration_interval")]
+    migration_topology: Option<MigrationConnections>,
+}
+
+impl RecordedArchipelagoOptions {
+    fn migration_policy(
+        &self,
+        island_count: u32,
+    ) -> Result<(Topology, Option<ArchipelagoMigration>)> {
+        let Some(interval) = self.migration_interval else {
+            ensure!(
+                self.migration_emigrants.is_none()
+                    && self.migration_selection.is_none()
+                    && self.migration_topology.is_none(),
+                "migration settings require --migration-interval"
+            );
+            return Ok((Topology::Custom(Vec::new()), None));
+        };
+        ensure!(island_count >= 2, "migration requires at least two islands");
+        let topology = match self
+            .migration_topology
+            .unwrap_or(MigrationConnections::Ring)
+        {
+            MigrationConnections::Ring => Topology::Ring,
+            MigrationConnections::FullyConnected => Topology::FullyConnected,
+        };
+        let selection_rule = match self
+            .migration_selection
+            .unwrap_or(MigrationSelection::Fittest)
+        {
+            MigrationSelection::Random => EmigrantSelectionRule::Random,
+            MigrationSelection::Fittest => EmigrantSelectionRule::Fittest,
+            MigrationSelection::Youngest => EmigrantSelectionRule::Youngest,
+            MigrationSelection::Wanderer => EmigrantSelectionRule::Wanderer,
+        };
+        Ok((
+            topology,
+            Some(ArchipelagoMigration {
+                interval_ticks: interval.get(),
+                emigrants_per_edge: usize::try_from(
+                    self.migration_emigrants.map_or(1, NonZeroU32::get),
+                )?,
+                selection_rule,
+            }),
+        ))
+    }
+}
 
 #[derive(Default)]
 struct BarrierCapture {
@@ -122,6 +201,7 @@ fn build_recorded_archipelago(
     preset: BrainPreset,
     overlays: &BTreeMap<u32, serde_json::Value>,
     capture: &Rc<RefCell<BarrierCapture>>,
+    policy: (Topology, Option<ArchipelagoMigration>),
 ) -> Result<Archipelago> {
     let options = HostCoreOptions::default();
     let mut construction_error = None;
@@ -140,11 +220,11 @@ fn build_recorded_archipelago(
     let constructed = Archipelago::with_factories(
         ArchipelagoConfig {
             islands: island_specs,
-            topology: Topology::Custom(Vec::new()),
+            topology: policy.0,
             barrier_interval: NonZeroU64::MIN,
             master_seed: root_seed,
             host_options: options,
-            migration: None,
+            migration: policy.1,
         },
         |meta| {
             let result = (|| -> Result<WorldState> {
@@ -174,7 +254,7 @@ fn build_recorded_archipelago(
     constructed.context("construct recorded archipelago")
 }
 
-/// Run isolated populations through sole-owner hosts and one atomic science writer.
+/// Run populations through sole-owner hosts and one atomic science/migration writer.
 ///
 /// The supplied manifest describes the first island's launch world. The embedded
 /// `archipelago` extension and `islands` table identify the complete experiment. This
@@ -190,7 +270,7 @@ pub fn run_recorded_archipelago(
     ticks: u64,
     preset: BrainPreset,
     path: &str,
-    overlays: &[String],
+    options: &RecordedArchipelagoOptions,
     manifest_for_world: impl FnOnce(&WorldState) -> Result<RunManifestRecord>,
 ) -> Result<serde_json::Value> {
     ensure!(
@@ -207,10 +287,31 @@ pub fn run_recorded_archipelago(
         config.persistence_interval == 1,
         "recorded archipelago requires persistence_interval=1 so every island supplies every tick"
     );
+    let policy = options.migration_policy(island_count)?;
+    let migration_status = if policy.1.is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let migration_policy = policy.1.as_ref().map(|migration| {
+        serde_json::json!({
+            "interval_ticks": migration.interval_ticks,
+            "emigrants_per_directed_edge": migration.emigrants_per_edge,
+            "selection_rule": migration.selection_rule,
+            "topology": policy.0, "edge_direction": "bidirectional",
+        })
+    });
     let mut parsed_overlays = BTreeMap::new();
-    for spec in overlays {
+    for spec in &options.island_overlays {
         let (id, val) = parse_island_overlay(spec)?;
-        parsed_overlays.insert(id, val);
+        ensure!(
+            id < island_count,
+            "overlay island {id} is outside the configured islands"
+        );
+        ensure!(
+            parsed_overlays.insert(id, val).is_none(),
+            "duplicate overlay for island {id}"
+        );
     }
     let root_seed = config
         .rng_seed
@@ -226,6 +327,7 @@ pub fn run_recorded_archipelago(
         preset,
         &parsed_overlays,
         &capture,
+        policy,
     )?;
     let islands: Vec<_> = archipelago.islands().cloned().collect();
     let mut manifest = archipelago.with_island_world(IslandId(0), manifest_for_world)??;
@@ -238,7 +340,9 @@ pub fn run_recorded_archipelago(
         serde_json::json!({
             "schema": "scriptbots.recorded-archipelago.v1", "root_seed": root_seed,
             "primary_manifest_island": 0, "island_count": island_count,
-            "ticks": ticks, "barrier_interval": 1, "migration": "disabled",
+            "ticks": ticks, "barrier_interval": 1, "migration": migration_status,
+            "migration_policy": migration_policy,
+            "tick_summary_phase": "before_migration", "membership_phase": "after_migration",
             "step_topology": "sequential_ascending", "host_journal": "committed_volatile",
             "science_storage": "complete_barriers", "islands": islands,
         }),
@@ -249,6 +353,7 @@ pub fn run_recorded_archipelago(
     let execution = (|| -> Result<serde_json::Value> {
         storage.persist_islands(&islands)?;
         let mut sink = ArchipelagoBarrierSink::new(islands.iter().map(|island| island.id))?;
+        let mut migration_count = 0_u64;
         for expected_tick in 1..=ticks {
             let barrier = archipelago
                 .step_to_barrier()
@@ -269,6 +374,9 @@ pub fn run_recorded_archipelago(
                     sink.admit(*island, (**payload).clone())?;
                 }
             }
+            if let Some(migration) = &barrier.migration {
+                sink.admit_migrations(migration.moves.iter().copied());
+            }
             // An incomplete barrier refuses here without writing any of its rows.
             // Retain both captures until application and durability have been observed.
             storage
@@ -285,8 +393,12 @@ pub fn run_recorded_archipelago(
                 tick = expected_tick,
                 islands = island_count,
                 durable_batch = watermarks.durable.map(|id| id.get()),
+                migrations = sink.migrations().len(),
                 "persisted complete island barrier"
             );
+            migration_count = migration_count
+                .checked_add(u64::try_from(sink.migrations().len())?)
+                .context("recorded migration count overflow")?;
             sink.clear();
             let mut captured = capture.borrow_mut();
             captured.batches.clear();
@@ -297,13 +409,16 @@ pub fn run_recorded_archipelago(
             let snapshot = archipelago.island_snapshot(island.id).context("missing final island snapshot")?;
             let summary = snapshot.completed_summary.as_ref().context("missing completed island summary")?;
             Ok(serde_json::json!({"island_id": island.id.0, "digest": digest,
-                "population": snapshot.world.agents.len(), "total_energy": f64::from(summary.total_energy)}))
+                "population": snapshot.world.agents.len(), "population_phase": "after_migration",
+                "recorded_population": summary.agent_count,
+                "total_energy": f64::from(summary.total_energy), "total_energy_phase": "before_migration"}))
         }).collect::<Result<Vec<_>>>()?;
         let watermarks = storage.persistence_watermarks()?;
         Ok(serde_json::json!({
             "schema": "scriptbots.recorded-archipelago.v1", "status": "complete",
             "db": path, "run_id": run_id, "root_seed": root_seed, "ticks": ticks,
-            "island_count": island_count, "migration": "disabled",
+            "island_count": island_count, "migration": migration_status,
+            "migration_policy": migration_policy, "migration_count": migration_count,
             "step_topology": "sequential_ascending", "host_journal": "committed_volatile",
             "source": BuildProvenanceV0::current().source_revision,
             "watermarks": {"admitted": watermarks.admitted.map(|id| id.get()),
@@ -434,6 +549,30 @@ mod tests {
         CommandEnvelope, CommandId, HostCommand, HostCore, HostPort, JournalState,
         ManualHostDriver, ManualInstant, PlaybackSnapshot,
     };
+
+    #[test]
+    fn recorded_migration_is_opt_in_with_explicit_runtime_defaults() -> Result<()> {
+        let mut options = RecordedArchipelagoOptions::default();
+        let (topology, migration) = options.migration_policy(1)?;
+        assert_eq!(topology, Topology::Custom(Vec::new()));
+        assert!(migration.is_none());
+        options.migration_interval = NonZeroU64::new(2);
+        assert!(options.migration_policy(1).is_err());
+        let (topology, migration) = options.migration_policy(4)?;
+        assert_eq!(topology, Topology::Ring);
+        assert_eq!(
+            migration,
+            Some(ArchipelagoMigration {
+                interval_ticks: 2,
+                emigrants_per_edge: 1,
+                selection_rule: EmigrantSelectionRule::Fittest,
+            })
+        );
+        options.migration_interval = None;
+        options.migration_emigrants = NonZeroU32::new(1);
+        assert!(options.migration_policy(4).is_err());
+        Ok(())
+    }
 
     #[test]
     fn recorded_capture_retries_the_same_tick_and_acknowledges_only_volatile_storage() -> Result<()>

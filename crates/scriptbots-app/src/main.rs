@@ -616,7 +616,7 @@ fn main() -> Result<()> {
                 ticks,
                 cli.brain,
                 path,
-                &cli.island_overlays,
+                &cli.archipelago_options,
                 |world| {
                     let manifest = build_run_manifest_with_sense_policy(
                         world,
@@ -4353,7 +4353,7 @@ struct AppCli {
     #[arg(long = "det-check-archipelago", value_name = "TICKS")]
     det_check_archipelago: Option<u64>,
 
-    /// Record N isolated populations in one database (sequential islands, no migration).
+    /// Record N populations in one database (sequential islands, optional migration).
     #[arg(long, value_name = "ISLANDS", requires = "archipelago_db",
         conflicts_with_all = ["replay_db", "det_check", "det_check_archipelago", "profile_steps", "profile_storage_steps", "profile_sweep", "create_bundle", "verify_bundle", "lab_goal", "characterize_v0"])]
     run_archipelago: Option<u32>,
@@ -4363,9 +4363,8 @@ struct AppCli {
     /// Number of complete recorded island ticks (requires persistence_interval=1).
     #[arg(long, default_value_t = 100, requires = "run_archipelago")]
     archipelago_ticks: u64,
-    /// Per-island scenario overlay JSON string or file path (format: "ID:JSON_OR_PATH", can be specified multiple times).
-    #[arg(long = "island-overlay", value_name = "ID:SPEC", action = ArgAction::Append)]
-    island_overlays: Vec<String>,
+    #[command(flatten)]
+    archipelago_options: archipelago_report::RecordedArchipelagoOptions,
     /// Overlay a tiny debug watermark in the render canvas (diagnostics).
     #[arg(long = "debug-watermark", action = ArgAction::SetTrue)]
     debug_watermark: bool,
