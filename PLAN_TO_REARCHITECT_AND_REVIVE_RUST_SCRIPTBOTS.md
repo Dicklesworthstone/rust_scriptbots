@@ -2410,6 +2410,27 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Per-field generated-default painting, 2026-10-20 (`bd-2z0.10.7`):**
+connect absent per-cell overrides to an explicit native paint-source control. Restore
+only the active field while retaining all other overrides and cells, undo/redo and
+repeat/empty no-op behavior. Regenerate through both existing generators and apply
+through the guarded owner; original native/resource/full editor acceptance stays open.
+No further builds on the capacity-constrained production host; use a capacity-qualified
+remote DSR lane and retain the prior commands/requirements without relaxation.
+Qualified source `572f887ff8b34a97ed22642f6f27d2fd78a2af9a` is pushed normally
+to both required refs. R240 on Hz3 passes all nineteen source command/log pairs and
+typed `pass/0`. Both renderer modes execute every-field/default/history model probes
+and actual mouse/Space/Enter fertility clearing, regeneration and owner Apply for
+both generators. Six raw test lanes total 448 passing executions / 263 distinct
+passing names, zero failures and six executions of three unchanged ignored diagnostics.
+Fresh solo reader/planted negatives verify 121 required completions, preserving all
+117 old requirements; all 140 manifest files / 370,418,792 bytes and identities verify.
+R238 formatting and R239 lint/four-pixel input failures remain retained, with their
+in-place corrections. The outer DSR result is still 6: the unchanged private-cache
+guard refuses the Proptest README symlink before artifact collection. No release or
+native-window/full editor acceptance is claimed. Exact pins, remaining acceptance,
+the production-capacity incident and bounded honesty audit are in the reality check.
+
 **[Currently In Progress] Identical map paint, 2026-10-20 (`bd-2z0.10.7`):**
 make repeated painting preserve draft revision, undo/redo and a current preview at the
 shared core boundary. Validate before the no-op guard; distinguish absent overrides,

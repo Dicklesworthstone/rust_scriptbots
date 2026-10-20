@@ -643,7 +643,14 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   the draft or invalidate its preview. Regenerate to see
   the actual stored value for the selected channel at the last painted cell; that label
   names the preview revision, which may precede newer edits. Recipe files preserve every
-  painted channel. **Hazard override** adds **Generated default / Stamp hazard** choices:
+  painted channel. **Paint source: … (change)** switches between the brush value and
+  the current generator's default for the active terrain, numeric or hazard field.
+  Choose generated default, then paint a cell to remove only that field's override;
+  other fields and cells stay painted. Clearing the last override removes the cell's
+  paint entry, while an already-absent field is unchanged. Undo/redo restores the edit.
+  Numeric value controls are disabled in this mode; changing channel returns to brush
+  values. Regenerate to see the resulting field. **Hazard override** also retains its
+  **Generated default / Stamp hazard** choices:
   select one, paint a cell, then regenerate. Stamping sets accent to 1 and swim cost to 10;
   generated default removes only the hazard override and preserves the other painted fields.
   Hazards supplied by the generator may remain. **Erase cell overrides** removes all paint

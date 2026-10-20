@@ -10,6 +10,209 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Per-field generated-default painting (`bd-2z0.10.7`, 2026-10-20, qualified increment;
+original native acceptance in progress):
+
+- [x] Refresh BR/BV priorities and inspect actual generation/paint/history consumers.
+- [x] Confirm that absent overrides already restore generator values but the native output brushes cannot select that operation.
+- [x] Add a disclosed paint-source control for restoring only the active field; preserve other fields/cells and remove the cell entry only when its last override is cleared (qualified source `572f887f`).
+- [x] Expose a named, focusable paint-source control, disable value adjustments in default mode and return to brush values on channel changes without editing the draft.
+- [x] Verify every terrain/scalar/hazard field, generated output, undo/redo, repeat/empty no-ops, invalid coordinates and pending jobs in both generator modes (both R240 renderer modes).
+- [x] Drive actual production mouse/Space/Enter input, regeneration and guarded owner Apply for field-only fertility restoration while retaining Sand (both generators and both R240 renderer modes).
+- [x] Retain R238 formatting and R239 lint/input failures; correct assertion layouts, the test callback type and product help without weakening the viewport or other checks.
+- [x] Stop local builds after the production disk alert; move DSR to Hz3 with explicit ext4/RAM headroom guards, private Cargo isolation and real-file persistence.
+- [x] Qualify clean pinned source through DSR on a capacity-qualified non-production host; preserve all prior commands/requirements and raw failures (R240 source `pass/0`, all nineteen commands).
+- [x] Publish qualified source normally to both required refs (`572f887f`).
+- [x] Prepare docs/Beads handoff, verify export contents/cycles and finish the bounded audit without closing unmet original native acceptance (comments 2895–2898; 85 retained comments; cycles empty).
+
+Creation worksheet: running paint code is FEATURE; this existing PROCESS TODO is
+explicitly requested by the operator and gates the field-default handoff. The observed
+gap is whole-cell erasure being the only general native override-removal path. Retire
+the active list after qualification; no new integrity-control exception is needed.
+The fleet reports the production host at 16 GiB free, confirmed locally: no further
+builds run here and no retained file is deleted. Native Mac/P0 acceptance remains
+unavailable in this Linux lane; connect the existing field/default operation now.
+
+Creation-gate details: consumer is the operator who requested this granular TODO;
+the gate is the per-field-default implementation handoff. The observed defect is
+the native UI exposing whole-cell erasure but no general field-only removal despite
+the existing optional overrides. Retire this active checklist after the bounded
+handoff, preserving history. Integrity-exception questions 1–4 do not apply: this is
+an explicitly requested process gate, not a new recovery control. Highest-priority
+native Mac/P0 acceptance cannot run on this Linux host; implementing this existing
+operation gives more value than expanding the report. Verdict: FEATURE for the
+running brush, LEGITIMATE GATE for this minimal in-place tracking.
+
+R238, source `fcb5683e97c77c5b3ed578d2869327824e094488`, stops at formatting
+before compilation: typed `failed/1`, command/log `1/0`, outer DSR `6`, runner
+identity zero, finished 2026-10-20 03:44:00 UTC. All twelve manifest files /
+27,977 bytes and exact membership recompute. Profile SHA256
+`b628f0b6faef3e4f67239f99764b8ee9878366afd059beda4954d5c847507384`;
+launcher `c193db47d198ec2ff35590f8e8d8da373c3fb309a8b601308ee7650d02846de6`.
+The two assertion layouts are corrected manually in `b440d6ca`; no condition changes.
+
+R239, source `b440d6caa21ec4ff3d94541738a50fa71ef9a79d`, finishes all nineteen
+commands at 2026-10-20 04:27:41 UTC, typed `failed/1`, outer DSR `6`, runner
+identity zero. Four command/log pairs are `101/0`: renderer feature-off and workspace
+Clippy reject the new test table's complex type; both renderer suites fail the new
+production-input test because the first map cell extends four pixels beyond the
+unchanged 480×1400 viewport. The all-field model probe passes in both modes, but
+that does not establish the failed input journey's later regeneration/Apply steps.
+Feature-off/default libraries have 175/191 passing, one failed and three ignored
+each; their integration suites are not reached. Six raw logs total 440 passing
+executions / 259 distinct passing names / two failures / six executions of three
+unchanged ignored diagnostics. All 122 manifest files / 279,243,760 bytes, exact
+membership and nineteen log hashes recompute. Profile SHA256
+`943ccc69e4ad28e3abd320464c068f9c8a042290619d852178151698e3dbdf1a`;
+launcher `2a520fe63aaa071d583131e7e04172b35f9db025fe17e59384bb397663ca24fc`;
+verdict `3812c8c15b8c936b0a2151dca44c8f100a8df092ea705b8fe464a5090f9fb585`;
+manifest `10a7d2a4ee9478de8bc1e143d929bf605a39ce2b981f3f44299eb04ce15d2bb4`.
+Correction `572f887ff8b34a97ed22642f6f27d2fd78a2af9a`, tree
+`56acd4fd2f99c525da8ee53b776cbfe9c0035abe`, shortens the new product help and
+names the local test callback type. It changes no viewport, cell size, assertion,
+deadline, old ignore, dependency, golden or reader tolerance. R240 on Hz3 retains
+the nineteen previous commands and 117 old completion requirements plus four new
+required completions. A direct comparison verifies every old command definition and
+reader byte is unchanged after removing just those four positive requirements.
+
+R240, `map-field-default-20261020-572f887f-r240-hz3`, finishes at
+2026-10-20 05:21:22 UTC: nineteen command/log pairs `0/0`, typed source `pass/0`.
+Core maps pass 31; runtime focused/channel 1/37; renderer focused 5; default renderer
+195 (192 library + three integration); feature-off renderer 179 (176 + three).
+Six raw logs total 448 passing executions / 263 distinct passing names / zero
+failures / six executions of three unchanged ignored diagnostics. Both renderer
+modes execute the model probe over every declared terrain/scalar/hazard channel
+and both generators. The input probe observes fertility-only clearing with Sand
+retained, distinct Space/Enter edits, no-op preview/redo preservation, regeneration,
+actual owner Apply and unchanged science until Apply at tick zero. No pre-fix red
+run is claimed for field-removal semantics; R239's actual clipping failure is retained.
+
+Fresh solo retained-reader/planted-negative execution verifies all 121 required
+completions; this is self-verification, not independent evidence. All 140 manifest
+files / 370,418,792 bytes, exact membership, nineteen log hashes, unchanged command
+files, profile bytes/pins, clean original/staged source commit/tree and seed receipt
+verify. Ten before/after helper checks and runner identity pass; owned R238/R239/R240
+SIDs 2118335/2197883/9601 are absent. Profile SHA256
+`5710cee750a2f5be4cc2fb32c22557f2cfb0f75f6dcb179dce1c7f74445e6040`;
+launcher `07b336a3d2d3ee93dcb88baac89eb6ca67a4ef526dab1e64443c6fa69f65f456`;
+verdict `c1636f91ab808f5327a5828b598e367351f3c1ddb260d23705985b19f2662bf9`;
+manifest `a310121052cfecf891bf4a36d4b91144290fa25d9f27a2871a80771c0e9dd8d7`.
+Build `25c6da08-d43c-4822-8345-f5659269f5f2`, envelope
+`549bcb1f-ea75-48a5-bfdc-242b1cd2412c`. Complete proof:
+`/var/tmp/scriptbots-field-default-20261020-lilacelm-r238/proofs/map-field-default-20261020-572f887f-r240-hz3`
+on Hz3. The local `field-r240-metadata` subset under
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/` contains 48 manifest-listed
+files / 326,817 bytes plus the manifest; every copied file hash verifies. The large
+test/database artifacts stay on the worker. The parent attempt and launcher logs
+are also retained locally; no complete local-proof-copy claim.
+
+Outer DSR exits 6 with runner identity zero. The actual parent attempt log says
+`linked or special cache entry` for Proptest's `3dca198/README.md`, then refuses
+artifact collection. Its Git mode/blob is
+`120000 / 39f5a6b376a8fe6c42a45e072e5f49bf1e417412`, target
+`proptest/README.md`; the cache guard is unchanged, artifact paths are empty and no
+release is collected. `bd-build-farm-reliability-lb19.2` stays open. Functional tests
+use real ext4 persistence and software LVP on Hz3, not performance comparison,
+hardware, native-window, cross-platform or full-workspace-test proof. UBS's final
+precommit renderer scan exits one with two critical / 3,003 warning / 933 informational
+heuristics; the critical count matches the previous scan. It is not a clean scan.
+No suppression is added. Documentation changes leave runtime code/manifests alone;
+the one compile-time README reader observes only its marked shortcut table, verified
+byte-identical (984 bytes, SHA256
+`f8e89abc8d03ae4bb5d1341c21e09677610da88eccdcc817b22e0e92cd97afb0`).
+
+Complete R238/R239/R240 evidence stays under
+`/var/tmp/scriptbots-field-default-20261020-lilacelm-r238/proofs/` on Hz3.
+Production is not a build worker for this run: earlier local staging accumulated
+without a headroom guard and contributed to the 16 GiB-free production alert.
+That was an operational mistake. Local builds stopped; the worker launch now
+requires ext4 and RAM headroom, keeps private Cargo isolation, puts only compiler
+cache in RAM, and leaves persistence/test files on ext4. No cleanup or direct
+file-deletion command was run.
+The fleet coordinator was notified through the existing Agent Mail skill.
+
+Bounded work audit, `0a33c970..572f887f` plus the prepared docs/tracker handoff:
+the README's purpose is an evolving-agent simulator with interpretable interactive
+experiments. Actual commit inventory is one USER feature (`fcb5683e`), two ENABLER
+corrections (`b440d6ca`, `572f887f`), two prepared PROCESS snapshots (docs/TODO and
+Beads), zero UNKNOWN and zero closes. The two corrections are not two more features.
+The tracker comparison finds 718 unchanged ordered IDs, 717 unchanged other rows,
+and only comments/update time changed on the original in-progress Bead.
+Both final exports are byte-identical; all 717 other raw rows are byte-identical,
+the old 81-comment prefix is retained and comments 2895–2898 append to 85. Status,
+assignee, original acceptance, labels, priorities and dependencies are unchanged;
+the active dependency-cycle result is empty. No new or closed issue is hidden in
+the handoff. Final docs and tracker snapshots are prepared for normal publication.
+Real-work answers: (1) demo painting Sand and fertility, clearing fertility alone,
+undo/redo, regenerating and applying Sand with generated fertility; both renderer
+input probes have done this at the pinned source; (2) without the
+PROCESS work the same brush ships, but the operator's requested tracking/evidence is
+missing; (3) both corrections enabled the feature-off strict lint and actual input
+lane; (4) oldest open umbrella `bd-2z0` still needs a complete Evolution Lab, including
+native acceptance unavailable here; this bounded field operation reuses finished
+generation rather than inventing a new resource contract; (5) no delegation in this
+window, so no pane/close comparison applies; (6) no acceptance edits, splits or closes.
+Verdict: DRIFTING on operational cost. Cold qualification and retained staging cost
+far more than this small feature; the earlier production-capacity mistake is real.
+Correction to this agent: stop local builds, keep one corrected source snapshot and
+the original gates, finish the feature handoff, and add no further process machinery.
+Waiting and this report earn zero capability credit.
+
+Honesty inventory, same bounded window, based on every source hunk, actual commit
+records, tracker comparison, old/new profiles and the retained raw logs to date:
+
+1. No (checked: all changed test hunks; no old assertion, ignore or test removed).
+2. No (checked: production brush/GPUI input and the real runtime owner; no new doubles).
+3. No (checked: the exact changed paths contain no golden or snapshot).
+4. Yes: the retained reader requires four additional positive completions, 117→121;
+   host provenance and launch headroom checks were added. Every old reader byte,
+   command, planted negative and tolerance is preserved; no suppression or relaxation.
+5. No (checked: no environment-specific product branch, fixture shortcut or success path).
+6. No (checked: six nonzero raw test lanes, exact suite totals and 121 required completions).
+7. No (checked: typed failed R238/R239, source pass R240 and outer collection refusal
+   are explicitly distinguished).
+8. No (checked: headless GPUI/software execution is below native-window, hardware,
+   independent, cross-platform, performance and full-workspace-test acceptance).
+9. No (checked: formatting, lint and clipping failures are retained above; no green
+   outer-DSR claim, no hidden first-attempt-success story).
+10. No (checked: cited scans/builds retain stdout/stderr and both command/log exits).
+11. No (checked: original status/acceptance/dependencies unchanged; no new or closed Bead).
+12. No (checked: plan records an increment; original recovery/native criteria remain).
+13. No (checked: no delegation or tracker closure in this window).
+14. No (checked: no subagent dispatch).
+15. No (checked: no delegated report accepted).
+16. No (checked: no refusal/close farming; positive input/Apply remains the feature gate).
+17. No (checked: all source verification is explicitly solo, not independent evidence).
+18. No (checked: nineteen commands, six raw test lanes and 121 required completions
+    declared before launch; repeats are executions, not distinct tests or independent proof).
+19. Yes: manual assertion formatting cost R238; the new table type and four-pixel
+    product clip cost R239. Corrected in place without changing the tests' standard.
+    Earlier local staging accumulated without a capacity guard and contributed to
+    production pressure; local builds stopped and the coordinator was notified again
+    when free space fell to 8.6 GiB. No deletion or isolation bypass. A read-only profile
+    comparer also first used the wrong terminator; its corrected run verifies exact
+    old-command/reader preservation rather than changing evidence to satisfy it.
+    DCG refused an assembled external YAML-reader invocation; direct safe YAML
+    parsing replaced it without an override. A post-run diagnostic then searched
+    for the wrong refusal wording; reading the actual parent log and matching its
+    exact cache-refusal lines corrects that diagnostic, not the product/profile gate.
+20. Strongest current evidence is the actual mouse/Space/Enter journey through
+    regeneration and owner Apply in both renderer modes, plus independently specified
+    expected field edits in the model probe. Pinned profile, raw logs and a fresh solo
+    reader/planted-negative pass make that source result re-executable.
+
+Disposition: RH-1 retains all old gates and strengthens positive requirements;
+RH-2 prevents headless results being promoted to native acceptance; SM-11 keeps the
+failed attempts and corrections visible. The capacity countermeasure is the remote
+launch's explicit headroom refusal, with complete worker evidence retained and only
+small metadata copied locally. These are corrections and disclosure, not feature
+credit. Source qualification is complete; original native/resource/full editor
+acceptance remains in progress and artifact collection still fails closed.
+CASS reports healthy/fresh but last indexed 2026-09-16T19:46:10.964Z; the derived
+`map-paint-source` query (limit two) returns zero results, `genuine_no_match`.
+There are no hits to follow and no historical-clearance claim. Prior broader sweeps
+remain in the earlier reports; this stale index does not cover October work.
+
 Identical map paint (`bd-2z0.10.7`, 2026-10-20, in progress):
 
 - [x] Refresh authoritative BR/BV priorities and inspect remaining native editor gaps.
