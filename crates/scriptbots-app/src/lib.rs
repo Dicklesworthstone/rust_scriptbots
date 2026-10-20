@@ -134,7 +134,8 @@ impl BuildProvenanceV0 {
     /// Capture provenance embedded in the current `scriptbots-app` build.
     ///
     /// Reproducible builds must embed `SCRIPTBOTS_SOURCE_REVISION` (or RCH's build-time
-    /// `RCH_BUILD_SOURCE` when no explicit ScriptBots revision is supplied),
+    /// plain hexadecimal `RCH_BUILD_SOURCE` commit stamp when no explicit ScriptBots
+    /// revision is supplied),
     /// `SCRIPTBOTS_SOURCE_TREE_CLEAN=true`, `SCRIPTBOTS_SOURCE_STATUS_DIGEST`,
     /// `SCRIPTBOTS_SOURCE_DIFF_DIGEST`, and `SCRIPTBOTS_RUSTC_VV` while invoking Cargo. These are
     /// deliberately compile-time inputs: a shipped binary must never describe the caller's
@@ -2232,7 +2233,12 @@ fn compile_time_text(value: Option<&str>) -> Option<String> {
 }
 
 fn embedded_source_revision(explicit: Option<&str>, rch: Option<&str>) -> Option<String> {
-    compile_time_text(explicit).or_else(|| compile_time_text(rch))
+    compile_time_text(explicit).or_else(|| {
+        // RCH also emits unknown, dirty and overlay stamps. None identifies the
+        // exact source as a Git commit; never strip a qualifier to manufacture one.
+        compile_time_text(rch)
+            .filter(|revision| revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    })
 }
 
 fn is_nonblank_text(value: &str) -> bool {
@@ -2384,17 +2390,33 @@ mod characterization_tests {
 
     #[test]
     fn embedded_source_provenance_preserves_explicit_precedence_and_unknown_inputs() {
+        let rch_revision = "0123456789abcdef0123456789abcdef01234567";
         for (explicit, rch, expected) in [
             (
                 Some("explicit-revision"),
-                Some("rch-revision"),
+                Some(rch_revision),
                 Some("explicit-revision"),
             ),
             (Some("explicit-revision"), None, Some("explicit-revision")),
-            (None, Some("rch-revision"), Some("rch-revision")),
-            (Some(" \t"), Some(" rch-revision\n"), Some("rch-revision")),
+            (None, Some(rch_revision), Some(rch_revision)),
+            (
+                Some(" \t"),
+                Some(" 0123456789abcdef0123456789abcdef01234567\n"),
+                Some(rch_revision),
+            ),
             (None, None, None),
             (Some(" \t"), Some("\n"), None),
+            (None, Some("unknown"), None),
+            (
+                None,
+                Some("0123456789abcdef0123456789abcdef01234567-dirty"),
+                None,
+            ),
+            (
+                None,
+                Some("0123456789abcdef0123456789abcdef01234567-overlay-deadbeef"),
+                None,
+            ),
         ] {
             assert_eq!(
                 embedded_source_revision(explicit, rch).as_deref(),
