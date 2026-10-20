@@ -26256,7 +26256,10 @@ mod command_characterization_tests {
             {
                 let sandbox = session.map_sandbox.lock().unwrap();
                 assert_eq!(sandbox.draft.state.constraints.count(), 2);
-                assert!(!sandbox.can_apply(), "actual redo must invalidate the preview");
+                assert!(
+                    !sandbox.can_apply(),
+                    "actual redo must invalidate the preview"
+                );
             }
             click(&mut lab, "map-undo");
             assert_eq!(
