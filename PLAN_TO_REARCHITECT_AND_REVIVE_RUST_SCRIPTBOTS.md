@@ -2410,6 +2410,32 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Map accessibility palette, 2026-10-20 (`bd-2z0.10.7`):**
+connect preview, exemplar and artifact grids to the shared application palette using the
+existing core transform. Preserve Natural colors; show a named terrain legend and
+non-color cues at legible cell sizes. Palette input is presentation-only, shared across
+World/Lab and separate from draft history, generation and science. Retain original native
+OS/full editor acceptance and all existing source checks and authoring journeys.
+The same named legend also directly selects all six core terrain kinds by mouse or
+Space/Enter, without changing the quick cycle. The R234 input probe exposes blocked
+default mouse focus; its production correction lets clicked controls and all three grids
+receive keyboard input. R235 feature-off probes observe six actual generated kinds/undo,
+palette and brush keys, preview/exemplar Space painting and artifact Space selection.
+Qualified source `0fe84b66242e631cc70db995656e90931f53c8f4` is published normally
+to both required refs. R235 passes nineteen source command/log pairs and typed `pass/0`;
+fresh solo reader/planted-negative execution verifies 113 required completions. Both
+renderer modes observe distinct five-mode color matrices with unchanged Natural colors,
+all six brush choices and actual generated kinds/undo, shared palette state, and repaired
+palette/brush/preview/exemplar/artifact keyboard input after mouse focus. Raw totals:
+440 passing executions / 258 distinct names / zero failures / six executions of three
+unchanged ignored diagnostics. All 138 manifest files / 370,415,774 bytes and source/
+profile/log/helper identities recompute; all nineteen command files match R231. Outer
+DSR exits 6 on the actual tracked Proptest README symlink before collection; guard unchanged,
+no collected release. Retain R232 formatting, interrupted R233 and R234 keyboard-failure
+evidence, including R234's absent final source receipt/manifest. Original status, acceptance
+and graph stay unchanged/in progress; resources, full keyboard/focus/native editor and
+actual visual/assistive-technology acceptance remain open. No independent proof is claimed.
+
 **[Currently In Progress] Saved-artifact patch selection, 2026-10-20 (`bd-2z0.10.7`):**
 connect bounded width/height selection to actual saved-map extraction, not draft repetition.
 Selection preserves draft/history/preview; Extract copies wrapped source cells into one

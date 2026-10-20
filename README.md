@@ -647,6 +647,18 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   Hazards supplied by the generator may remain. **Erase cell overrides** removes all paint
   at the clicked cell while preserving other cells; regenerate for the generator's values.
   Erasure is undoable, and erasing an unpainted cell preserves history and the preview.
+  **Palette: … (cycle)** is available throughout the map views and uses the same session
+  palette as World and Lab: Natural, Deuteranopia, Protanopia, Tritanopia and High Contrast.
+  It accepts mouse input or Space/Enter when focused. Preview, exemplar and saved-artifact
+  cell colors use the existing shared accessibility transform; Natural colors are retained.
+  A named terrain legend maps **D** DeepWater, **W** ShallowWater, **S** Sand, **G** Grass,
+  **B** Bloom and **R** Rock. Choose any legend entry by mouse or Space/Enter to select
+  that terrain brush, then paint a preview or exemplar cell. Selection alone is not an edit;
+  painting uses the existing undo history. The quick **Brush: …** cycle is also available.
+  Cells large enough to fit them also show these letters on
+  black/white markers; smaller sampled cells retain terrain and coordinate accessibility
+  labels. Palette changes leave the draft, undo history, generated preview and live science
+  unchanged. Actual native-window and assistive-technology acceptance remains open.
   Resource controls and native OS acceptance remain open.
   Generation runs in one bounded background slot. Cancellation discards the result;
   that slot remains occupied until the underlying generator finishes.
@@ -732,8 +744,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   they come from generation defaults and output constraints. Generate a fresh preview
   before applying. Enlarging the draft exemplar repeats its current cells; it does not
   extract a larger saved-map region; use the inspection patch controls to copy additional
-  saved cells. Resource controls, accessible palettes and actual native OS-input acceptance
-  remain open.
+  saved cells. Resource controls and full native accessibility/input acceptance remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.
 - A sample specifies `sample_id`, `sample_width`, `sample_height`, `pattern_size`, and row-major `sample_tiles` terrain kinds. `all_orientations` and `periodic` default to true; `periodic: false` is refused because non-periodic extraction is not implemented. Core bounds (`MAX_SAMPLE_CELLS`, `MAX_SAMPLE_OUTPUT_CELLS`, `MAX_SAMPLE_CELL_PAIRS`) admit at most 64 exemplar cells, 65,536 output cells, and 1,048,576 output/exemplar cell pairs before model construction. These are input-work bounds, not wall-clock or exact-byte guarantees. For example, a 2×2 all-sand sample is:

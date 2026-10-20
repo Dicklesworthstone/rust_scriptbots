@@ -10,6 +10,211 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Map accessibility palette (`bd-2z0.10.7`, 2026-10-20, in progress):
+
+- [x] Refresh BR/BV readiness, original acceptance and live palette/grid consumers.
+- [x] Route preview, exemplar and artifact cell colors through the existing shared palette transform (source; both R235 probe modes).
+- [x] Expose the same session palette in map views outside draft/history/science (both modes; no job mutation in the palette path).
+- [x] Add named terrain legend and non-color letter cues where cell size permits (source; native visual acceptance open).
+- [x] Connect all six kinds to direct mouse/keyboard choices and actual generated output/undo (both modes).
+- [x] Verify all five modes, unchanged Natural colors and distinct actual transformed matrices (both modes).
+- [x] Exercise palette input and World/Lab sharing, plus preview/exemplar/artifact cell keys after clicks (both modes).
+- [x] Retain existing extraction, authoring, generation, undo and guarded Apply probes.
+- [x] Review exact diffs/UBS; qualify nineteen pinned DSR checks with prior commands/probes intact.
+- [x] Freshly verify evidence, publish source to both required refs and prepare existing docs/tracker snapshots.
+- [ ] Original acceptance: resource/palette authoring, keyboard/focus/native OS and full editor journeys.
+
+Creation worksheet: this in-place PROCESS TODO serves the operator's explicit granular
+tracking request and gates the map-palette handoff. The observed defect is fixed Natural
+colors in all three map grids despite shared accessibility state. Retire the active list
+at original editor acceptance, preserving history. No new recovery control or integrity
+exception. Mac P0/native visual acceptance remains higher priority but unavailable in this
+Linux lane; keep recordkeeping bounded and connect the existing palette consumer now.
+
+Palette source `17c2feced19f4b53a2b4702563497e09154a64cc`, tree
+`2c720a166392878ef9a2752ba4e97f34ceaa73ca`, starts R232. Nineteen existing
+commands and all previous 109 required completions remain; two new probes in both
+renderer modes extend the predeclared requirement to 113. Profile SHA256
+`d60410ecc62532098f344eb8ea349bda199c2b9b21962830a25377a39d035384`;
+launcher `feedafec1bbb4989507449d9ec0ed6ca64625cc049d9a25e4b21f36f417e9c0c`.
+R232 stops at one symbol-set assertion layout before compiler/tests: typed source
+`failed/1`, one command/log pair `1/0`, outer 6 / runner identity zero, finished
+2026-10-20 02:06:45 UTC. All ten manifest files / 26,607 bytes and exact membership
+recompute; owned SID 1655204 is absent.
+
+Manual correction `1011d06c95849990eaa7c91591cbb0073d6fd4e2`, tree
+`3270c4d6b1b17564260bd7121461207f887415c3`, applies that layout and removes two
+identity conversions after local GPUI source confirms `rgb` returns `Rgba`. No palette
+values or assertions change. Pinned R233 retains all nineteen commands, reader/planted
+negatives and 113 required completions. Profile SHA256
+`9e9cd85ffcb72ae9e9161e6d94a4918d6b86d43a75727032b611232a01dea511`;
+launcher `9c48abdf2fa4df9c0edbfa6bf7a4c35dc80fe99bf30725fd1ce0765322f7a549`.
+Exact-file UBS remains non-clean: exit 1, two pre-existing timestamp critical heuristics,
+2,773 warnings and 912 informational findings. Qualification/publication pending.
+
+During palette review, the existing quick brush is found to cycle through only Grass,
+DeepWater and Sand despite all six kinds being supported by the core. Complete the
+connection through direct named legend choices without changing that quick cycle. Stop
+only inspected owned R233 native group 1663843 (SID 1662490) after nine zero command/log
+pairs, including 29 core map tests, during feature-off test compilation. Retain R233 as
+interrupted evidence, not a compiler/test failure. It ends 2026-10-20 02:12:28 UTC,
+outer 6 / runner identity zero. This interruption does produce a typed **`failed/0`**
+source receipt with nine commands: exit zero is not success. All 28 manifest files /
+137,675 bytes and exact membership recompute; the owned SID is absent. Verdict SHA256
+`39663f3602f9a2c148c94ae26bd800916e277f2b2a88a8520e7fc894f40044cf`;
+manifest `6270bdb3a2605cbee7bf01a83b75e355fc0d388d75ee634f53d4b9289797ceef`;
+commands `b4385dcb5da2db48ca2187ffb21ba55db6e58611f15a71505aaafb9691fbc9b4`.
+No renderer test result is claimed for R233. Extend the new input probe to observe each
+brush by mouse and keyboard from a different value, actual selected-kind generation and
+undo, Bloom exemplar editing, and immutable artifact inspection. Old assertions remain.
+
+Source `5a302c38c3364c441462e69d0259777c39cb4c30`, tree
+`8fb7035a640e2b9eda443b3256aa91863f5480ab`, starts pinned R234 with unchanged
+nineteen commands, reader/planted negatives and all 113 required completions. Profile
+SHA256 `c0d34bcbe0da2773b7f5b6e58606478c716f12c398e291da4cda788912ae34f9`;
+launcher `6ef003b237a63cb98b8aa7f0e3549063058f9237ff323593be356c2da60358db`.
+Exact-file UBS remains non-clean at two timestamp critical heuristics / 2,816 warnings /
+915 informational findings. No existing source assertion, viewport, deadline, golden,
+dependency or external gate changed. Qualification/publication pending.
+
+R234 exposes a real keyboard defect: after a mouse change Natural → Deuteranopia,
+Space leaves Deuteranopia instead of the asserted Protanopia. The color-matrix probe and
+both existing production editor input journeys pass. Feature-off library summary is
+172 passed / one failed / three unchanged ignored; its command/log pair is `101/0`
+after nine passing pairs. Stop only inspected native group 1711790 (SID 1709928),
+retaining all ten completed command records and 61 raw files / 139,605,515 bytes.
+Recorded log hashes recompute; command SHA256
+`9afce659db0d524a6c0331de75d9ebae26a540a44db0806faf69a995064b3dad`.
+Outer 6 / runner identity zero ends 2026-10-20 02:21:18 UTC; owned SID is absent.
+Final source receipt and manifest are absent after interruption. No full-suite success.
+
+Local GPUI source shows default mouse focus is blocked by the map handlers' propagation
+stop. Correction `0fe84b66242e631cc70db995656e90931f53c8f4`, tree
+`6779c54e616549beb9298fece64b77de009c8de3`, lets that listener run for map buttons,
+terrain choices and all three cell grids. Keyboard propagation stops remain; Lab
+ancestors have no world mouse-down action. Add distinguishing preview/exemplar Space
+painting and artifact Space selection after clicks to the same new input probe.
+No old assertion, viewport, deadline or palette expectation changes. Pinned R235 keeps
+nineteen commands, reader/planted negatives and all 113 required completions. Profile
+SHA256 `209fa0271e91c5f228757b65257e2fc3dbbc5e23d4aaa201e55227632e1b07fa`;
+launcher `b014f90d6b66c91f974659d86a6bfad878ad567b03868b54618f13bec462b1e7`.
+UBS stays non-clean: two timestamp critical heuristics / 2,833 warnings / 915 informational.
+Qualification/publication pending; actual native OS/pixel/assistive-technology acceptance open.
+
+R235 final self-review: qualified source `0fe84b66242e631cc70db995656e90931f53c8f4`
+is pushed normally to both required refs. All map grids now consume the existing shared
+accessibility transform with Natural colors unchanged. Named terrain markers and legend
+choices expose all six kinds; mouse and Space/Enter selection leave the draft unchanged.
+Both renderer modes observe actual selected-kind generation and undo, Bloom exemplar
+editing, shared World/Lab palette state, and unchanged science. Allowing GPUI's default
+mouse focus repairs actual subsequent keyboard input in buttons, terrain choices and all
+three cell grids. Distinguishing Space probes observe preview/exemplar paint changes and
+artifact selection instead of accepting same-value no-ops. Existing editor assertions,
+viewport/deadlines, ignored diagnostics, dependencies, goldens and external gates remain.
+No native OS, visual-legibility or assistive-technology acceptance is inferred.
+
+R235 finishes 2026-10-20 02:41:10 UTC: nineteen zero command/log pairs and typed source
+`pass/0`. Fresh solo retained-reader/planted-negative execution verifies all 113 required
+completions. Six raw logs agree with nonzero summaries: 440 passing executions / 258
+distinct passing names / zero failures / six executions of three unchanged ignored HUD
+diagnostics. Core maps 29, runtime focused/channel 1/37, renderer focused 5, default
+renderer 192 (189 library + 2 + 1 integration), feature-off renderer 176 (173 + 2 + 1).
+All nineteen command files are byte-identical to R231; no full-workspace-test claim.
+
+Proof:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-accessibility-20261020-0fe84b66-r235-local`.
+All 138 manifest files / 370,415,774 bytes and exact membership recompute. Nineteen raw
+log hashes, profile byte identity/prelaunch SHA256, clean source/runner main commit/tree,
+five helper hashes, ten before/after OK lines and launcher hash verify; owned SID 1773207
+is absent. Verdict SHA256 `59d51480896402e0d38e5bba237de0aad93a1438c0df28cd8fe11241dfa33b81`;
+manifest `f59c7c6e8b9de0139d3a514651e4038a1bf0eff77ea896260fc974e4861d402a`.
+Build `d59e6e56-6222-4f88-a35c-767e7e1cbeb0`;
+outer envelope `71f6ecc7-2813-41bb-a4bf-462d39ff6b2f`.
+
+Outer DSR exits 6 / runner identity zero: the actual parent attempt log records the final
+cache refusal for Proptest's tracked `README.md` symlink to `proptest/README.md`, mode
+`120000`, blob `39f5a6b376a8fe6c42a45e072e5f49bf1e417412`, before collection. Guard
+unchanged; no release artifact collected, and `bd-build-farm-reliability-lb19.2` stays
+open. R232 formatting, interrupted R233 `failed/0` and R234 keyboard-failure evidence
+remain; R234's final source receipt/manifest are absent. UBS remains non-clean at
+2 / 2,833 / 915. Original `bd-2z0.10.7` status/acceptance/graph stay in progress and
+unchanged; resource/palette authoring, full keyboard/focus/native editor journeys and
+actual native accessibility remain. Separate `/dp` work stays inventory-only.
+
+Palette/brush solo audit (2026-10-20; source window `e7a56ff7..0fe84b66`, source
+qualification complete; documentation/tracker handoff being prepared):
+
+Creation worksheet: this existing TODO/audit is PROCESS, read by the operator who
+explicitly requested granular tracking. It gates this palette/brush handoff; fixed map
+colors and a three-kind-only quick brush are the observed defects. Retire the active
+checklist at original editor acceptance, keeping history. No integrity-control exception
+or new recovery mechanism is used. Opportunity cost: macOS P0 `bd-e6ff` and actual native
+visual acceptance remain higher-priority outcomes; the Linux lane cannot prove them.
+Complete the existing consumer connection and keep further machinery frozen.
+
+Real-work worksheet: README purpose is deterministic artificial life with GPU interaction
+and first-class analytics. Actual `git log --stat` gives USER `17c2fece` (map accessibility
+palette and cues), ENABLER `1011d06c` (reported format/direct RGB correction), USER
+`5a302c38` (six selectable brushes and positive input/generation probes), and USER
+`0fe84b66` (observed focus fix and distinguishing cell-key probes). README instructions
+are USER; audit/plan/tracker records are PROCESS, never capability credit.
+No closes or subagents. Hard questions: (1) demonstrate choosing Bloom, painting and
+generating it, plus a shared accessibility mode; native-window demonstration remains
+unverified. (2) Omitting PROCESS would leave product behavior unchanged but discard the
+explicitly requested remaining-work/failure record. (3) R235 consumes both corrections:
+formatting and both renderer input/generation/focus probes pass. (4) The original native
+editor journey remains open; this work connects existing core functionality without
+changing scientific semantics. (5) Solo; no pane/close comparison. (6) No plan/spec
+substitution, acceptance split or original closure. HEALTHY for the bounded
+positive increment; avoidable formatting and the interrupted scope extension cost time.
+
+Honesty inventory, all twenty prompts:
+
+1. No (checked: all exact source diffs; pre-existing assertions/ignores/deadlines and CI unchanged).
+2. No (checked: actual GPUI callbacks, real map generation/file decoding and existing host;
+   preparing a different brush before Space distinguishes activation from a no-op).
+3. No (checked: no golden, snapshot, dependency or baseline file changes).
+4. Yes: extend external required probes from 109 to 113; retain every old requirement,
+   command, reader negative and tolerance. No gate is weakened. The direct legend handlers
+   use existing validated paint/sample paths; no alternate success path is introduced.
+5. No (checked: distinct actual five-mode matrices and independent Natural constants are
+   asserted; no test/CI sniffing or production special case).
+6. No (checked: all six raw nonzero suite summaries, 440 passing executions, zero failures,
+   six ignored executions and all 113 required completions; R233/R234 are not counted as passes).
+7. No (checked: completed commands/events, typed source receipt and fresh reader verification).
+8. No (checked: color calculations/headless input are explicitly distinct from native
+   pixels, actual assistive technology, hardware, performance and independent proof).
+9. No (checked: R232 formatting failure, interrupted R233 and R234 keyboard failure are
+   retained/disclosed, including incomplete receipts; no first-attempt-success claim).
+10. No (checked: source logs retain command/log exits and stderr; CASS/UBS stderr is retained).
+11. No (checked: original `bd-2z0.10.7` remains in progress, with no acceptance follow-up laundering).
+12. No (checked: README/plan describe actual wiring and open native acceptance; original criteria unchanged).
+13. No (checked: solo execution; no delegated closure).
+14. No (checked: no subagent dispatch).
+15. No (checked: own exact diffs and raw records, no accepted peer claim).
+16. No (checked: no swarm/refusal farming; positive authoring capability is the target).
+17. No (checked: no agreement used as verification; same-origin evidence counts once).
+18. No (checked: nineteen commands/113 completions predeclared; final passing, distinct-name,
+    failure and ignored counters derive from all six raw logs).
+19. Yes: disclose avoidable formatting, restarting R233 for six brushes and R234's real
+    keyboard failure. Fix production focus and retain the failing expectation. The probe
+    prepares different values instead of accepting no-ops. No original test is weakened.
+20. Strongest evidence is both R235 renderer modes' production mouse/keyboard input that
+    chooses each real terrain kind, generates it and undoes, plus palette changes and
+    preview/exemplar/artifact Space handling. Fresh reader verification passes; this
+    remains headless evidence, with draft/preview/science preservation observed.
+
+CASS bounded check: status claims healthy/fresh but last indexed time remains
+2026-09-16T19:46:10.964Z. Session-derived input-test-name search returns two of nine
+matches. Follow both file coordinates with context one: Sept 4 physical line 34 is an
+AGENTS/README read; Sept 6 line 202 is token metadata. These are not verification of
+the new input behavior or historical clearance. Earlier five-phrase sweeps remain in
+prior audits and were not rerun. Disposition: ordinary source corrections and attempts
+are retained/disclosed (comments 2888–2891); RH-5 requires distinguishing keyboard state
+and actual generated kinds, RH-1 preserves old gates, SM-11 retains every attempt and
+RH-2 forbids promotion of headless evidence to native acceptance. No independent
+verification or new process machinery is claimed.
+
 Saved-artifact patch selection (`bd-2z0.10.7`, 2026-10-20, in progress):
 
 - [x] Refresh ready work, original acceptance, source/extraction consumers and reservations.
