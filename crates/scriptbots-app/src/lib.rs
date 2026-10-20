@@ -133,7 +133,8 @@ impl LaunchEnvironmentV0 {
 impl BuildProvenanceV0 {
     /// Capture provenance embedded in the current `scriptbots-app` build.
     ///
-    /// Reproducible builds must embed `SCRIPTBOTS_SOURCE_REVISION`,
+    /// Reproducible builds must embed `SCRIPTBOTS_SOURCE_REVISION` (or RCH's build-time
+    /// `RCH_BUILD_SOURCE` when no explicit ScriptBots revision is supplied),
     /// `SCRIPTBOTS_SOURCE_TREE_CLEAN=true`, `SCRIPTBOTS_SOURCE_STATUS_DIGEST`,
     /// `SCRIPTBOTS_SOURCE_DIFF_DIGEST`, and `SCRIPTBOTS_RUSTC_VV` while invoking Cargo. These are
     /// deliberately compile-time inputs: a shipped binary must never describe the caller's
@@ -144,7 +145,10 @@ impl BuildProvenanceV0 {
     #[must_use]
     pub fn current() -> Self {
         let launch_environment = LaunchEnvironmentV0::pin();
-        let source_revision = compile_time_text(option_env!("SCRIPTBOTS_SOURCE_REVISION"));
+        let source_revision = embedded_source_revision(
+            option_env!("SCRIPTBOTS_SOURCE_REVISION"),
+            option_env!("RCH_BUILD_SOURCE"),
+        );
         let source_branch = compile_time_text(option_env!("SCRIPTBOTS_SOURCE_BRANCH"));
         let source_tree_clean =
             option_env!("SCRIPTBOTS_SOURCE_TREE_CLEAN").and_then(parse_compile_time_bool);
@@ -2227,6 +2231,10 @@ fn compile_time_text(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn embedded_source_revision(explicit: Option<&str>, rch: Option<&str>) -> Option<String> {
+    compile_time_text(explicit).or_else(|| compile_time_text(rch))
+}
+
 fn is_nonblank_text(value: &str) -> bool {
     !value.trim().is_empty()
 }
@@ -2332,7 +2340,10 @@ mod characterization_tests {
 
         assert_eq!(
             build.source_revision,
-            compile_time_text(option_env!("SCRIPTBOTS_SOURCE_REVISION"))
+            embedded_source_revision(
+                option_env!("SCRIPTBOTS_SOURCE_REVISION"),
+                option_env!("RCH_BUILD_SOURCE"),
+            )
         );
         assert_eq!(
             build.source_branch,
@@ -2369,6 +2380,28 @@ mod characterization_tests {
         .collect::<Vec<_>>();
         expected_features.sort_unstable();
         assert_eq!(build.compiled_features, expected_features);
+    }
+
+    #[test]
+    fn embedded_source_provenance_preserves_explicit_precedence_and_unknown_inputs() {
+        for (explicit, rch, expected) in [
+            (
+                Some("explicit-revision"),
+                Some("rch-revision"),
+                Some("explicit-revision"),
+            ),
+            (Some("explicit-revision"), None, Some("explicit-revision")),
+            (None, Some("rch-revision"), Some("rch-revision")),
+            (Some(" \t"), Some(" rch-revision\n"), Some("rch-revision")),
+            (None, None, None),
+            (Some(" \t"), Some("\n"), None),
+        ] {
+            assert_eq!(
+                embedded_source_revision(explicit, rch).as_deref(),
+                expected,
+                "explicit={explicit:?}, rch={rch:?}"
+            );
+        }
     }
 
     #[test]
