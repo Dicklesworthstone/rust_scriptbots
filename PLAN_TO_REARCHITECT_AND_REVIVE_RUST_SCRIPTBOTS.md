@@ -2410,6 +2410,15 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Recorded archipelago migration, 2026-10-20 (`bd-16g.5`):**
+connect the existing deterministic runtime migration policy and atomic barrier sink
+to the recorded CLI runner, which currently hard-codes migration off. Keep isolated
+runs unchanged by default; validate explicit cadence/count/selection/topology before
+creating a database, retain policy provenance, and persist actual move identities in
+the same barrier transaction. Verify real CLI runs, reconstruction/conservation,
+thread-budget determinism and invalid input through strict-remote RCH. The original
+parent's scaling, speciation, tiled UI and long-run acceptance remain open.
+
 **[Currently In Progress] Per-field generated-default painting, 2026-10-20 (`bd-2z0.10.7`):**
 connect absent per-cell overrides to an explicit native paint-source control. Restore
 only the active field while retaining all other overrides and cells, undo/redo and

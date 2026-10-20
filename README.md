@@ -494,7 +494,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
    describe the state after migration. Result fields label these phases and report the
    number of moves persisted, which can be zero if no migration falls within the run.
    This mode currently has no scheduled interventions, bootstrap, or host-session
-   checkpoint resume. The JSON result names those limits and the observed durability watermarks.
+   checkpoint resume. The JSON result reports the observed durability watermarks.
    The manifest's `archipelago` extension records all island configs and the common root seed;
    its ordinary world fields describe island zero. For example:
 

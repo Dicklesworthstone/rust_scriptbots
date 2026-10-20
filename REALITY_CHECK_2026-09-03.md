@@ -10,6 +10,25 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Recorded archipelago migration (`bd-16g.5`, 2026-10-20; in progress):
+
+- [x] Read all project instructions/README; register/coordinate; inspect recent Git, BR/BV and indexed CASS context (index ends September 16).
+- [x] Confirm production runtime migration and atomic storage sink exist while the recorded runner selects `migration: None`.
+- [x] Claim the original ready P1 parent and reserve only app sources, existing integration tests and handoff files; leave original acceptance intact.
+- [x] Implement optional validated cadence, emigrant count, selection and topology; preserve migration-disabled defaults and record the exact policy (source `534290c4`, executable verification pending).
+- [x] Connect actual barrier moves to the existing atomic sink and label pre-migration summaries/post-migration membership; retain observed pool size rather than trusting two requested counts (`c731d647`, verification pending).
+- [ ] Exercise real CLI migrations, stored identity/graph/conservation, disabled defaults, invalid-input no-file behavior and thread-budget determinism.
+- [ ] Run strict-remote RCH tests, workspace check/Clippy and formatting; retain every failure and report proof limits.
+- [ ] Review the exact diff and UBS, update the original Bead with evidence, export/check cycles, and publish normally to both required refs.
+
+This minimal in-place TODO is requested by the operator and gates the implementation
+handoff; retire its active status at handoff. The observed defect is an unavailable
+recorded migration capability despite existing runtime and storage consumers. No new
+process framework, schema, golden or dependency is needed. Resource-strata inspection
+was read-only: the map draft/artifact has no resource-strata model to connect, so that
+larger editor change was not started. RCH is explicitly requested for this turn;
+functional RCH results will not be described as native, performance or DSR release proof.
+
 Per-field generated-default painting (`bd-2z0.10.7`, 2026-10-20, qualified increment;
 original native acceptance in progress):
 
