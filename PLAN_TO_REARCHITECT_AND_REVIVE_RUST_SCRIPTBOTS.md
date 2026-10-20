@@ -4,6 +4,20 @@
 
 **Evidence date:** 2026-07-11
 
+**Reality-check refresh (2026-10-20):** [Assessment completed — LilacElm;
+implementation and original acceptance remain in progress]
+The current 25-outcome checklist and ordered bridge are at the top of
+`REALITY_CHECK_2026-09-03.md`, inspected at `7c4dc194`. Real owner/control,
+heredity, storage, replay, terminal/map and recorded-migration consumers are
+credited separately from missing implementation and qualification. Earlier-today
+RCH passes at unchanged Rust source `9ce6ef2a` cover formatting, all-target check,
+strict Clippy and bounded recorded-migration tests, not full workspace tests,
+native/GPU/browser/performance or DSR release acceptance. Four existing Bead
+records are reconciled without new issues, closures or graph changes. Persistent
+run reliability, exact owner/session continuation, long-horizon meadow, GPU
+evidence identity, scientific acceptance and the composed release journey remain
+the critical path. The latest published `v0.4.0` has no attached binary assets.
+
 **Reality-check refresh (2026-10-10):** [Assessment completed — LilacElm;
 source-bound DSR result and existing acceptance-owner reconciliation retained]
 The audit inspected clean `main` at `ea491f369557b20a44a71227a1713efd345332e2`.
@@ -4253,7 +4267,49 @@ The revival is complete only when all of the following are true.
 
 ---
 
-## 19. Immediate Next Actions
+## 19. Immediate Next Actions — reconciled 2026-10-20
+
+These are remaining work under existing acceptance, not new phase gates. Preserve
+the original tests, scientific requirements, supported matrix and active owners.
+
+1. Complete persistent-run reliability and the pinned engine migration:
+   `bd-l103`, `bd-kgob`, `bd-w1oi`, `bd-j8o2`, `bd-50bg`. Observe causal repair,
+   unchanged long probes, actual control progress, graceful shutdown and durable
+   readback. Source-pass/outer-collection-refusal is not final DSR acceptance;
+   `bd-build-farm-reliability-lb19.2` retains that collection boundary.
+2. Qualify the existing full-owner checkpoint/continuation candidate under
+   `bd-2z0.5.13`; use actual file CLI handoff/restore, exact journal/session cuts,
+   corruption and first-divergence controls. Keep launch guarantees conservative
+   until original acceptance, rather than reimplementing an already present seam.
+3. Resolve `bd-lmk6`'s long-horizon core/scenario ecology deliberately, then complete
+   `bd-2z0.10.5` same-input GUI/TUI cohort and raw ledger balance. A 360-tick envelope
+   cannot qualify a long-lived meadow. Baselines change only through reviewed DSR.
+4. Repair `bd-16g.15.3`'s full evidence identity: the current certification predicate
+   matches vendor OR adapter name without the complete device/driver/build tuple.
+   Exercise exact positives and mismatched/stale/forged negatives through the real
+   matcher/CLI; generated hardware labels must derive from real qualified evidence.
+   Preserve original hardware 1,000-tick, fault and scaling requirements.
+5. Finish `.11.9` analytics, narrative parity and `bd-16g.12.3` full tournament
+   publication with actual planted/null/lineage/FTS joins and original match matrix.
+6. Complete actual FrankenTUI/platform and GPU interaction/instancing/showcase
+   acceptance, plus independent browser scheduling/package/durability where ready.
+   The map editor and recorded islands have substantive qualified increments;
+   their remaining resource/native/long-run/scaling criteria stay with their parents.
+   Do not put further editor polish before the first playable meadow by default.
+7. Compose `.19` and `.13.9`/`.13.11` from the owning evidence: scenario → evolution →
+   inspection → acknowledged intervention → durable continuation → matched-seed
+   analysis → independent bundle. Then publish the exact verified binaries and
+   truthful supported/experimental matrix under `bd-1bdd` and the release owners.
+
+Use `br ready` for new claims; authoritative BV ranking informs judgment but is
+not claim authority. Existing in-progress work can continue with coordination.
+Current snapshot: 718 records, 140 unfinished, 29 BR-ready and no BR dependency
+cycles; no percent-complete or completion date is inferred. No new builds belong
+on the capacity-constrained production host. Functional checks use strict-remote
+RCH as explicitly directed; performance/native/release acceptance keeps its DSR
+and actual-surface requirements.
+
+### Historical initial actions — July bootstrap, retained for context
 
 1. **Done:** complete and record the current host-target build/test baseline.
 2. **Done:** review this plan in four adversarial passes: correctness, dependency/sequence, test honesty, and product usefulness.

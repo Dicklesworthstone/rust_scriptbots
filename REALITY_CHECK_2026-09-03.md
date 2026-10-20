@@ -1,12 +1,209 @@
-# Reality Check — rust_scriptbots — reassessed 2026-10-14
+# Reality Check — rust_scriptbots — reassessed 2026-10-20
 
-## Current assessment — 2026-10-14
+## Current assessment — 2026-10-20
 
 **This is a substantial deterministic simulator with real control, persistence, replay and
 research machinery. It is still an unfinished Evolution Lab. The remaining gap is the complete
 user journey: a useful live frontend, a responsive durable run, a trustworthy continuation,
 qualified scientific results and an independently verifiable release. The cinematic hardware-GPU
 meadow and durable browser laboratory also remain unfinished.**
+
+### Comprehensive review and execution boundary
+
+Inspected `main` at `7c4dc19416e2eecfa72933fbffdb7c1b090ff457`. This review reread
+all 1,057 lines of AGENTS.md and all 1,434 lines of the initial README, applied
+`reality-check-for-project` and its five references, and traced the active recovery
+architecture, relevant historical designs, production consumers, original Bead acceptance
+and retained execution evidence. `/data/projects/AGENTS.md` remains absent. Historical
+plan checkmarks are not current proof. Older assessments below retain their original
+source/date boundaries and are superseded where this section differs.
+
+No Rust source, dependency, test, gate, golden or scientific requirement changes in this
+review. No new compilation, performance, GPU, PTY or browser run is claimed. The functional
+RCH runs below were executed earlier today, then their retained envelopes/logs were reread
+for this assessment. Source under `crates/` and Cargo/toolchain configuration is unchanged
+between tested `9ce6ef2a` and inspected `7c4dc194`; documentation/tracker differences do not
+convert those scoped results into a current full-workspace test pass.
+
+| Evidence | Observed scope and limit |
+|---|---|
+| R7/R8 at `9ce6ef2a` | Six real archipelago integration tests pass, one original long test ignored; two focused library tests pass, 646 filtered. Eight MLP CLI runs cover four policy/topology pairings at observed one/three threads, four islands/four ticks; 256 moves, actual SQL/offline reconstruction and equal paired science. This is not all topology/selection combinations, other brain families, eight-island scaling or long-run qualification. Exact jobs and failures remain in the increment record below. |
+| R16/R18/R20 at that same source/tree | Formatting, workspace all-target check and strict workspace all-target Clippy pass through strict-remote RCH with terminal acknowledgement. An upstream future-incompatibility notice remains. These commands do not execute the workspace test suite or supply DSR release acceptance. |
+| Retained DSR observations | Real terminal, map-editor, control, analytics and replay component executions exist at their named older revisions. Later map R240 has typed source `pass/0` while outer DSR exits 6 at the contained Proptest README-link guard. Do not conflate inner source checks, final artifact collection and complete product acceptance. |
+| Earlier failed suites | October 10 workspace analytics fails at actual tick 193 with rolled-back admission and ENOSPC; October 14 storage has 372 passes, two failures and five existing ignores. Later focused passes do not clear those whole-suite results or establish their causes. |
+| Published product | Fresh GitHub API read: `v0.4.0` published October 14, tag commit `aae509b804e1d24b72bb98caca532174639251d1`, 117 commits behind inspected HEAD. Its attached-assets array is empty, as are the other three published releases. Source releases exist; attached downloadable binaries are not observed. |
+
+### Vision checklist: complete outcomes versus implemented parts
+
+**PARTIAL** means real functionality with a missing boundary. **UNPROVEN** means the
+required execution has not been established here. A named working component below does
+not certify its containing product outcome. These rows are deliberately not averaged into
+a completion percentage.
+
+| # | Testable promise | Current reality | Existing acceptance owners |
+|---|---|---|---|
+| 1 | Seeded populations really evolve with reproducible science | Real staged kernel, stable UIDs, domain/agent RNG, genome/evaluator codecs, heredity and digest/checkpoint machinery. Long-lived balanced default ecology is PARTIAL. | `bd-2z0.10.5`, `bd-lmk6` |
+| 2 | Claimed preserved mechanics agree with captured C++ execution | Transcribed micro-oracles and intentional differences exist. Broader captured-reference qualification is UNPROVEN. | `bd-2z0.18` |
+| 3 | Honest pluggable, heritable default brains | Production `brains.rs` admits MLP/DWRAON/Assembly; optional FtBrain is wired. NeuroFlow is explicitly selectable but withheld from mixed heritable founders. Sensor-copy ML is excluded. | Delivered brain foundation; `bd-2z0.3`, `.3.12.3`–`.6` |
+| 4 | Optional ML inference/learning is usable and qualified | Candle has real CPU tensor/batch inference but no production heritable-family preset. Tract/tch/no-backend `MlBrain` copies sensors. FtBrain has real source; cohort/learning/qualification remains PARTIAL. Existing ML disposition selects FtBrain, rather than promising separate production Candle/Tract/tch families. | Closed disposition `bd-2z0.8.10`, `bd-rcae`; open `.3.12.*` |
+| 5 | Rendering/polling never owns native scientific time | `HostThread` transfers the world to sole-owner `HostCore`; clients consume snapshots and submit commands. Architecture is implemented; full lifecycle/contention/soak qualification remains UNPROVEN. | `bd-2z0.4.11`, `.8.9.16`; closed `bd-pcfj` foundation |
+| 6 | Persistent runs remain responsive and durable as data grows | Real worker confinement, bounded queues/outbox, identity leases, exact retry, three watermarks and recovery. Original long-run cost/latency/pin/throughput acceptance remains open. | `bd-l103`, `bd-kgob`, `bd-w1oi`, `bd-j8o2`, `bd-50bg`, `bd-vrb3` |
+| 7 | REST/MCP commands have truthful application/journal outcomes | Real common owner, immutable reads, blocking isolation, guards, two-axis receipts and supervision. Joined authority, load/PNG and persistent-process proof is PARTIAL. | `bd-134`, `bd-2z0.15`, `.19` |
+| 8 | Users run matched-seed experiments and compare results | Real CLI/REST/MCP worker execution, status/cancel/resume and artifacts. Full scientific and frontend journey acceptance remains PARTIAL. | Delivered runner/API; `bd-2z0.11.9`, `.13.11` |
+| 9 | Checkpoint production stays bounded across every producer | Real API/periodic capture and aggregate file/SQL/metadata/lease accounting. Complete operational acceptance remains open. | `bd-2z0.16`, `.19` |
+| 10 | A saved live owner/session continues exactly | Core checkpoint-start replay exists. `HostCheckpointV1`, exact journal cut, deliberate handoff/join and bounded same-session file CLI continuation are implemented candidates, with a real-process test. Original full qualification is UNPROVEN; launch manifests remain conservative. | `bd-2z0.5.13` |
+| 11 | Replay explains events and the first divergence | Real nonempty replay, typed journal readers and digest/stage comparison. Narrated scrubbing and complete live experiment/replay panes are PARTIAL. | `bd-ji3a`, `bd-16g.2.9*`, `bd-2z0.7.6.1` |
+| 12 | A portable finished bundle verifies independently | Actual leased DB copy/logical readback and create/verify CLI exist. Complete same-source process journey and collected release proof are UNPROVEN. | `bd-2z0.17`, `.19`, `.13.11` |
+| 13 | Analysis demonstrates causal ecological effects and lineage | Real report/statistics/graph/Parquet machinery; retained seeded-world run observes 400 ticks, 183 births, 12 deaths, twelve reports and SQL joins. Planted scarcity/null, full lineage/FTS and repeated acceptance remain missing. | `bd-2z0.11.9`, `bd-16g.2.9*` |
+| 14 | Comparative brain results are publishable | Actual bounded tournament smoke/ratings exist. Original 32-seed × three-order × 20k-tick publication remains uncompleted. | `bd-16g.12.3` |
+| 15 | Terminal users can perform the laboratory workflow | Actual FrankenTUI Program/Model with retained Ratatui widgets, six science providers and presentation-gated receipts. Real scoped PTY evidence exists; full capability/storm/platform/composed qualification remains open. | `bd-2z0.6.8`, `bd-dkd9`, `.14.3.5.2` |
+| 16 | Native GPU users can inspect, intervene and replay | GPUI/Bevy/wgpu consume owner data, with real input/capture components. Complete per-window interactions, workflow panes and hardware/device/platform proof remain PARTIAL. | `bd-2z0.7.11`, `.7.14`, `.7.6`, `.7.8` |
+| 17 | Cinematic meadow is playable at population budgets | Style/material/scene code exists. Live Bevy still constructs per-agent root/body/stripe/wheel/spike entities/materials; resident creature instancing, terrain/effects integration and hardware showcase remain unfinished. | `.7.3`, `.14.1.*`, especially `.20`/`.21` |
+| 18 | Graphics measurements and captures prove their named paths | Semantic, software offscreen and native framebuffer evidence have distinct meaning. GPUI decision numbers lack an inspected raw receipt; hardware FPS/memory/ablations remain UNPROVEN. | `.7.7`, `.14.3.10`, `.14.3.5.3`/`.4`, `.14.1.12` |
+| 19 | CPU/snapshot scaling meets declared budgets | Real SIMD/Rayon/grid and exact-class performance gate. Golden is July Apple M4/APFS/nightly class, not this Linux fleet/current toolchain. No fresh TPS, 10k publication, scaling win or replacement baseline is claimed. | `bd-h33`, `bd-jfd1`, `.4.8.1`, `.4.16` |
+| 20 | GPU sensing certification binds the actual target | Provider and approximate/exact policy are real. Static matcher accepts vendor OR name and omits full device/driver/build identity; generated Certified table exceeds retained evidence. This is a concrete admission/design gap plus missing hardware proof. | `bd-16g.15.3` |
+| 21 | Browser laboratory has independent time and durable recovery | Real bindings/Canvas/package wiring. `main.js::stepSimulation` still calls `simHandle.tick(1)` per RAF; WebGPU prototype is unwired. Actual packaged-browser, independent scheduling and IndexedDB durability remain PARTIAL. | `.12.3`, `.12.4`, `.12.7`, `bd-azi3`, `bd-ywtv`, `bd-ac4l` |
+| 22 | Users author/apply procedural maps safely | Native draft/rules/sample/field/history/file/artifact/palette controls are implemented, with source-bound headless input/owner-Apply evidence. Resource strata have no model; native OS/accessibility/full editor acceptance remains open. | `.10.7`, `.10.8` |
+| 23 | Islands, communication and sound support richer research | Recorded migration now has real bounded CLI/SQL proof. Outer islands still step sequentially; original long/scaling/speciation/tiled-view acceptance, distributed transport, signaling study and integrated sonification remain PARTIAL. Prior phenotypic-divergence evidence is retained at its original scope. | `bd-16g.5`, `bd-t3ge`, `bd-brw4`, `bd-16g.7*`, `bd-16g.14` |
+| 24 | First launch and released downloads deliver the whole lab | Startup/scenarios/packaging code exist. Ordinary launch versus meadow long-horizon ecology, onboarding/tutorials, supported matrix and complete independently verified release remain unfinished; no attached binaries observed. | `.10.4`, `.10.5`, `bd-lmk6`, `bd-1bdd`, `.13.3`/`.9`/`.11` |
+| 25 | An external/built-in agent performs bounded scientific work | Real controls and production `lab` proposal/validation/executor/notebook path exist, including offline mode. Live-provider science quality and composed publication are not established by those components. | Delivered `bd-16g.1`; `.11.9`, `.13.11` |
+
+### Five answers and bridge to completion
+
+1. **What works:** substantial real simulation, heredity, owner/control, durable-storage
+   protocol, checkpoint/replay, experiment/report and frontend machinery. Recorded migration
+   is a particularly clear working bounded user capability, not merely scaffolding.
+2. **What does not yet meet the vision:** reliable qualified long runs, complete continuation
+   acceptance, balanced first-run ecology, complete scientific publication, hardware/native/
+   browser workflows, and a joined binary release. Tract/tch inference, map resources,
+   browser durability and scalable live creature rendering are actual implementation gaps.
+3. **What blocks it:** persistent-service cost and latency, incomplete exact-source acceptance
+   and DSR collection, scientific scenario/provenance joins, missing target hardware execution,
+   and remaining frontend wiring. These are different blockers; rerunning until one subset
+   passes does not resolve all of them.
+4. **Would all open/in-progress Beads close it:** the active vision is covered **if their
+   original acceptance is fulfilled**, including the root's conjunctive `.13.9`/`.13.11`
+   journey. Their statuses alone cannot establish that. The GPU identity example shows why
+   an existing acceptance sentence still needs a concrete production counterexample.
+5. **Any goal with no Bead:** none established among the active promises after mapping this
+   checklist and the 140 unfinished records. Historical superseded/deferred alternatives
+   are not silently revived as commitments. Four existing records are reconciled below;
+   no new epic, duplicate issue, closure or dependency change is needed.
+
+Execute the following bridge against the original owners; these are remaining product TODOs,
+not claims that this assessment implemented them:
+
+| Order / size | Concrete next work and falsifiable exit |
+|---|---|
+| 1 / L | Finish persistence/pin/liveness owners and DSR collection compatibility. Retain original long-run stimulus, per-stage latency, default file/memory distinction, normal shutdown and independent durable readback; demonstrate the causal repair rather than increasing deadlines or disabling constraints. Do not run more builds on the capacity-constrained production host. |
+| 2 / M–L | Qualify the existing `.5.13` owner/session continuation through its real file-backed CLI and original corruption/divergence tests. Observe exact source/session/command/revision/schedule/journal cuts and equal next transitions; preserve tick-zero/core replay. This is high-value existing code awaiting complete proof. |
+| 3 / L | Decide/tune long-horizon ecology under `bd-lmk6`, then fulfil `.10.5` with the actual same-input GUI/TUI cohort and independently balanced ledger. The short meadow envelope cannot establish equilibrium; no seed substitution or automatic golden rebaseline. |
+| 4 / M | Repair `bd-16g.15.3`'s production evidence matcher and generated hardware statuses before treating any hardware report as certification. Keep exact valid positives; reject changed same-vendor device, driver, backend, target, source/toolchain/shader and malformed/stale/zero reports. Original 1,000-tick hardware and fault/scaling acceptance remains. |
+| 5 / L | Finish `.11.9`, narrative parity and `.12.3` tournament publication with actual intervention/null, lineage/interaction/FTS joins and original match matrix. Smoke outputs and a fixture do not substitute for causal science. |
+| 6 / L–XL | Qualify connected FrankenTUI, complete native GPU interactions/instancing/showcase, and then browser clock/package/durability in their actual environments. Hardware/PTY/browser evidence stays separate. Map resource authoring is subsequent product work, not a prerequisite to the first playable meadow. |
+| 7 / M–L after owning gates | Execute `.19` and `.13.9`/`.13.11`: scenario → evolution → stable-UID inspection → acknowledged intervention → durable checkpoint/continuation → matched-seed analysis → independent bundle verification. Publish the exact qualified binary assets and truthful supported/experimental matrix; preserve all required cells and negative controls. |
+
+Ready work is not identical to priority: BR authorizes 29 new claims; BV reports 75 graph-actionable
+items and ranks the old macOS/exFAT blocker first. That host-specific finding cannot be
+cleared on this Linux machine. Existing in-progress persistence/continuation owners can continue;
+coordinate them instead of claiming an unrelated ready cosmetic task just to increase closes.
+
+### Skill completion, graph refinement and bounded honesty record
+
+- [x] Read both required files completely, extract testable vision and inspect real consumers.
+- [x] Reconcile implementation, retained proof and actual published releases separately.
+- [x] Map gaps to original acceptance; revise the existing plan and existing Beads in place.
+- [x] Apply the Phase 3a and Phase 5 frozen operators retained verbatim under **Frozen operators**.
+  Generation/re-generation reuses existing owners where they already cover the gap.
+- [x] Three ambition passes: complete user journey; adversarial identity/failure boundaries;
+  scientific/service capacity and real hardware. These sharpen the bridge without inventing
+  another framework, speculative mathematical subsystem or reduced acceptance.
+- [x] Five refinement passes: source/status accuracy; owner overlap/feature preservation;
+  positive/negative test scope; dependency/readiness/source joins; quiet final reread.
+  The last pass requires no additional issue or graph change.
+- [x] Verify the exact four-record export, preserved original criteria/status/assignees,
+  empty cycles and current authoritative BV output; prepare separate reviewed publication
+  of documentation and tracker. Publication itself is reported after the Git operations.
+
+At the inspected snapshot there are **718 records: 578 closed, 107 open, 33 in progress**.
+BR cycles are empty. BV triage reads the authoritative export; PageRank is computed,
+betweenness is explicitly approximate (50 samples), and its other triage metrics including
+Cycles are skipped. The BR cycle result, not a skipped BV field, establishes the cycle check.
+The subsequent authoritative insights run computes all its named metrics, with approximate
+100-sample betweenness and `Cycles: []`; graph hash is
+`8d9309e7d763afae89bcb6ae32a1f23a2b7330d05d89c61c74131af0e1b1d0f5`.
+The unscoped robot plan refuses with exit 65 because its native plan is not exactly BR-ready;
+that fail-closed result is retained, not relabelled as a usable execution plan.
+No completion forecast is inferred from those counts. Existing assignees, acceptance,
+prior failures and blocking edges are preserved. Comments 2904–2906 record GPU identity,
+assetless releases and composed-proof scope; `.5.13`'s description now credits the implemented
+owner-continuation candidate without closing its original acceptance.
+BR additionally normalizes legacy `source_repo_path` to null in three touched records:
+`bd-1bdd` and `.5.13` previously named `/Users/jemanuel/projects/rust_scriptbots`, while
+`.13.9` named `/data/projects/rust_scriptbots`. Those metadata preimages are retained here;
+the original descriptions/criteria/comments remain in Git. The merge anchor, cursor and
+pre-existing WAL quarantines remain local and are not release content.
+
+Fresh AST results contain zero `todo!` calls and five `unimplemented!` calls: two in the
+`#[cfg(test)]` module of `genome_browser.rs` and three in `tests/genome_diff.rs`.
+These test-fixture counts do not establish production implementation
+completeness. The real sensor-copy fallback, RAF tick authority and per-agent Bevy construction
+were checked by reading their bodies/consumers. `git diff --check` passes. UBS on the three
+changed Markdown files returns exit 3, `no-supported-languages`, zero files/scanners; that is
+not a clean code scan. No Rust tests are rerun for this documentation/tracker-only review.
+
+**Creation gate:** running code does not branch on this assessment. The user explicitly
+requested this reality check; its consumer is that user's steering decision, its gate is
+choosing the next product work, and observed defects include unsupported GPU certification
+and contradictory current-status prose. This dated assessment retires as current guidance
+when superseded; retained failure history remains evidence. The integrity-control exception
+is not invoked (no new recovery/control artifact is necessary). Opportunity cost is real:
+continuation/persistence work would deliver more capability than another audit after this one.
+
+**Real-work audit:** this request's window begins after `7c4dc194`; there are no implementation
+commits or closures in it. Public README corrections are USER documentation; this assessment,
+roadmap and tracker reconciliation are PROCESS, with no ENABLER/runtime credit. The most visible
+result is truthful current usage/status, demonstrable by the source-linked statements; omitting
+the process changes would leave runtime behavior identical. No enabler is claimed. The July
+root Evolution Lab work remains older than this audit; this effort follows the explicit audit
+request, not a claim to have finished that work. No swarm was dispatched or audited as independent.
+No original acceptance was moved to a new task. Verdict: process-heavy by design for this bounded
+request; freeze further assessment machinery here and spend the next implementation block on
+the named persistent-run/continuation path.
+
+**Twenty-question honesty inventory, bounded to this review:**
+1. No (checked: changed paths/diff); no tests or CI/gates changed.
+2. No (checked: changed paths); no runtime mocks/fixtures added.
+3. No (checked: changed paths); no golden regenerated.
+4. No (checked: diff); no validator/suppression/budget/bypass change.
+5. No (checked: source versus proof labels); no special demo or benchmark path.
+6. No (checked: R7/R8 raw counts); filtered/ignored tests are explicit, not green executions.
+7. No (checked: commands and retained receipts); fresh reads are separated from earlier runs.
+8. No (checked: matrix); software/fixture/source evidence is not hardware or release proof.
+9. No (checked: evidence table); failed suites and outer collection refusals remain visible.
+10. No (checked: command outputs); no hidden stderr is used to support a pass.
+11. No (checked: four tracker diffs); no closure or follow-up laundering.
+12. No (checked: original acceptance/dependencies); bridge edits do not reduce requirements.
+13. No (checked: dispatch/tracker record); solo review, no agent closure.
+14. No (checked: dispatch record); no subagent task.
+15. No (checked: evidence sources); no unverified subagent report accepted.
+16. No (checked: new work); no refusal-farming pane or new implementation claim.
+17. No (checked: wording); solo reread is not independent confirmation.
+18. No (checked: original test matrix and counts); no post-result denominator substitution.
+19. Yes: some large read batches were truncated; they cannot support a claim that every
+    historical Markdown line or every open description was read in full. Both explicitly
+    requested files were reread with overlapping ranges; broader code/doc coverage is bounded.
+    The first draft's AST count omitted three integration-test stubs; the actual JSON-array
+    count is five and is corrected above before publication.
+    Corrective rule: use small reads for decisive claims and name inspected scope, not universal
+    understanding (proof-class inflation). This review also delivers no new runtime capability.
+20. Strongest evidence: actual source consumer bodies, the reread RCH envelopes/raw counts,
+    canonical JSONL and live GitHub release/tag API. A skeptic can repeat those checks; this is
+    not independent product certification or a newly executed complete journey.
+
+Disposition: retain limitations here and in the operator handoff, preserve all original work
+and proof, and stop this assessment after its publication checks. The earlier bounded CASS
+search remains limited by its September 16 index; no fresh comprehensive archive clearance is claimed.
 
 ### Current implementation and granular TODO — 2026-10-14
 

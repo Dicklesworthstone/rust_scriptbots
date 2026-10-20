@@ -37,7 +37,7 @@ rust_scriptbots/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
 │   ├── scriptbots-runtime    # Sole-owner HostCore, protocol, fixed-deadline lifecycle, null frontend
 │   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
-│   ├── scriptbots-brain-ml   # Candle/Tract/tch probes plus the optional Frankentorch FtBrain
+│   ├── scriptbots-brain-ml   # Candle tensors, Tract/tch probes, optional Frankentorch FtBrain
 │   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
 │   ├── scriptbots-index      # Uniform-grid index; alternate backends are not implemented
 │   ├── scriptbots-storage    # FrankenSQLite persistence worker & analytics snapshots
@@ -113,7 +113,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - Startup is fail-closed and transactional. Renderer selection and control-environment validation happen first, then every enabled REST/MCP socket is prebound and held before configuration output, auto-tuning, process-priority changes, world construction, or storage reservation. Launch consumes those exact listeners, so a bind failure cannot leave config, tuning, or run-database artifacts behind and cannot race a later rebind.
 - REST and MCP run as supervised sibling tasks. An unexpected error or clean task exit stops the sibling, preserves the original failure as the root cause, and publishes failed runtime health; the TUI, GPUI, and Bevy frontends observe that health and terminate with the same root failure. Graceful shutdown joins both tasks and releases both listeners.
 - That supervision guarantee covers ordinary returned errors and task exits. Debug/test builds use unwinding boundaries to exercise panic reporting, while the shipped `panic = "abort"` release profile intentionally cannot recover from a panic or promise destructor-based cleanup after one.
-- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The app transfers the scientific world to `HostThread`; TUI, GPUI, Bevy, and live server transports use ports to that same owner. Both GPUI windows are presentation-only projections, and repaint cadence does not drive scientific ticks. Host lifecycle publications distinguish recoverable blockers, terminal faults, and completed shutdown. The obsolete GPUI science driver has been removed; its boundary-failure tests now exercise `HostCore`. Scheduled scenario patches use that owner during bootstrap and interactive execution. The broader `bd-pcfj` cutover remains in progress, including remaining client interaction work and native acceptance evidence.
+- Frontends do not query FrankenSQLite or wait on a storage mutex during paint. The app transfers the scientific world to `HostThread`; TUI, GPUI, Bevy, and live server transports use ports to that same owner. Both GPUI windows are presentation-only projections, and repaint cadence does not drive scientific ticks. Host lifecycle publications distinguish recoverable blockers, terminal faults, and completed shutdown. The obsolete GPUI science driver has been removed; its boundary-failure tests now exercise `HostCore`. Scheduled scenario patches use that owner during bootstrap and interactive execution. The `bd-pcfj` cutover is closed; broader client interaction, lifecycle and native qualification remain with their open frontend/runtime acceptance owners.
 - `scriptbots-runtime` owns the renderer-neutral command, two-axis status, snapshot, event-cursor, and manual-drive contracts plus the exact sole-owner `HostCore`. Command lifecycle schema v1 retains the exact envelope, client namespace/sequence, optional admission order, typed control/scientific/config guards, and contiguous application transitions; every terminal runtime outcome has a journal obligation. Its optional `native-asupersync` feature drives that same `!Send` host as one current-thread root future at absolute deadlines. Commands and journal-ready signals wake the owner, catch-up is bounded and reported, quiescent paused worlds have no periodic timer, and ordered shutdown retains its exact host and journal obligations without spawning or detaching a simulation task. The lifecycle persistence work is `bd-2z0.5.2` (closed).
 - Brain introspection is an explicit read-only projection, never a per-tick side effect. A client issues a revisioned request for up to eight stable `AgentUid` values; core and each brain family enforce independent bounds for layers, names, values, edges, source scalars, and retained payload. Responses carry the exact source tick and typed unavailable/clipped status, while TUI and GPUI cache by client, stable identity, and source tick. With no request, no brain is inspected and NeuroFlow performs no inspection JSON serialization; digest-neutrality and next-output purity are tested across the supported families.
 - Assembly arithmetic can overflow during valid execution. Its protocol adapter discards that candidate state; the world supplies zero actions for the containment tick and schedules the agent for normal death cleanup. The death records the failing cell and exact float bits; analytics shows a separate **Brain fault** cause. Healthy agents continue, while malformed inputs, corrupt envelopes, missing evaluators, and other protocol errors still stop the world. This policy is part of Assembly adapter semantic identity v4; the interpreter arithmetic and genome/state codecs are unchanged.
@@ -123,7 +123,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
 - **`scriptbots-runtime`**: Renderer-neutral command, immutable lifecycle evidence, two-axis status, snapshot, and event-cursor contracts with typed revision domains; the sole-owner `HostCore`; a pure injected-time fixed-deadline adapter; and an optional Asupersync `=0.5.0` native lifecycle (migration validation pending). It depends on core but not storage, servers, or renderers. The default and WASM-facing surface remains runtime-neutral; Asupersync is activated only by `native-asupersync` on native targets.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
-- **`scriptbots-brain-ml`**: Feature selection and the retained `ml.placeholder` sensor-copy probe for Candle, Tract, and tch, plus the non-default code-first Frankentorch `FtBrain` family. The FtBrain source is implemented under `brain-ft`; its pinned DSR compile, determinism, and benchmark proof remains pending under `bd-2z0.3.12.3`.
+- **`scriptbots-brain-ml`**: Feature-gated Candle tensor inference and the retained `ml.placeholder` sensor-copy fallback for Tract, tch and no-backend builds, plus the non-default code-first Frankentorch `FtBrain` family. Candle is not registered as a production heritable family. FtBrain is wired under `brain-ft`; its pinned DSR compile, determinism, and benchmark proof remains pending under `bd-2z0.3.12.3`.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
 - **`scriptbots-index`**: Production uniform-grid neighborhood index. Alternate backends are not advertised until they have real implementations and conformance coverage.
 - **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
@@ -139,18 +139,15 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - `scriptbots-core`: World state, agent runtime, staged tick, reproduction/combat hooks, history summaries, and brain registry integration are implemented; parity tasks are tracked in the plan doc.
 - `scriptbots-runtime`: the protocol boundary, typed command/revision/status domains, schema-v1 lifecycle evidence, opaque client ports, cursors, manual-drive contract, sole-owner `HostCore`, pure fixed-deadline driver, and optional current-thread Asupersync lifecycle are implemented. The app uses `HostCore` through its owner thread and channel ports. The `bd-2z0.5.2` lifecycle work and the `bd-pcfj` frontend cutover are closed.
 - `scriptbots-render`: GPUI World + tabbed Lab windows with camera controls, selection highlights, scrollable diagnostics, and optional `kira` audio.
-- `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The full cross-feature/platform startup matrix remains a Phase 0.4 acceptance gate.
+- `scriptbots-app`: explicit renderer selection, pre-storage control-socket reservation, supervised REST/MCP lifecycle, and frontend health propagation are implemented. The original Phase 0.4 startup matrix passed at its July revisions; that historical result does not qualify every current frontend, feature and platform combination.
 - Interactive terminal mode now runs the pinned FrankenTUI `Program` with the actual
   simulation owner and shared control services. It preserves the existing map and inspector
   widgets and adds live lineage, brain-arena, experiment, replay, environment and diagnostic
   views. Own commands and checkpoints require successful Pending presentation before dispatch
   and exact final-result presentation before the next request; checkpoint details survive
   reduced rendering and queued input. Native acceptance remains open under `bd-2z0.6.8` and
-  `bd-dkd9`. R28 passed 309 terminal tests and all three fault PTYs, then failed the executable
-  observer before app launch. R38 later passed strict workspace Clippy/check and 527 tests but
-  failed three terminal assertions. R40 at their repair `cdab86ae` passes 533 tests but fails
-  two executable checkpoint observations. Actual bytes corroborate the stale Pending literal;
-  test-only `1301ac49` corrects it and the related Shutdown expectation. Complete native
+  `bd-dkd9`. Scoped source and real-PTY observations are retained separately from
+  containing DSR collection failures. Complete capability, input-storm and supported-platform
   qualification remains pending.
   See [the current implementation and TODO](REALITY_CHECK_2026-09-03.md) for exact revisions,
   retained evidence and remaining qualification.
@@ -184,7 +181,7 @@ cargo run -p scriptbots-app
 - Threads: By default, the core auto-budgets worker threads conservatively. Our profiling shows best throughput at 8 threads on a 32-core CPU for this workload. To match that:
 
 ```bash
-SCRIPTBOTS_MAX_THREADS=8 cargo run -p scriptbots-app -- --storage memory --storage-thresholds 128,4096,1024,1024
+SCRIPTBOTS_MAX_THREADS=8 cargo run -p scriptbots-app -- --storage file --storage-thresholds 128,4096,1024,1024
 ```
 
 - With servers disabled (avoid port conflicts/background overhead):
@@ -193,7 +190,7 @@ SCRIPTBOTS_MAX_THREADS=8 cargo run -p scriptbots-app -- --storage memory --stora
 SCRIPTBOTS_CONTROL_REST_ENABLED=false \
 SCRIPTBOTS_CONTROL_MCP=disabled \
 SCRIPTBOTS_MAX_THREADS=8 \
-cargo run -p scriptbots-app -- --mode terminal --storage memory --storage-thresholds 128,4096,1024,1024
+cargo run -p scriptbots-app -- --mode terminal --storage file --storage-thresholds 128,4096,1024,1024
 ```
 
 - Profiling helpers (headless):
@@ -390,8 +387,8 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
 1. Install Rust (MSVC toolchain):
    - Download `rustup-init.exe` and select the MSVC target, or run in PowerShell:
    ```powershell
-   rustup default stable-x86_64-pc-windows-msvc
-   rustup component add clippy rustfmt
+   rustup toolchain install nightly-2026-08-31 --profile minimal
+   rustup component add --toolchain nightly-2026-08-31 clippy rustfmt
    ```
 2. Install Visual Studio Build Tools (2022+):
    - Select the "Desktop development with C++" workload (includes MSVC, Windows 10/11 SDK).
@@ -418,11 +415,12 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - `audio` → enable Kira-driven audio in the UI layer
 - **`scriptbots-index`**: the uniform-grid backend is unconditional; there are no backend-selection feature flags.
 - **`scriptbots-brain-ml`**:
-  - `candle`, `tract`, and `tch` retain the dependency probes and `ml.placeholder`.
+  - `candle` enables real tensor forward/batch inference, without production heritable-family registration.
+  - `tract`, `tch`, and no-backend builds retain the sensor-copy `ml.placeholder` fallback.
   - `brain-ft` exposes `FtBrainConfig`, `FtBrainFamily`, and `FT_BRAIN_KIND`.
   - The pinned Frankentorch `vector_to_parameters` path is not F32-safe, so FtBrain keeps a canonical flat F32 genome and materializes its layer slices without widening through F64. Resolution of that upstream gap and all compile/benchmark proof remain part of `bd-2z0.3.12.3`.
 
-Note: NeuroFlow and the native brain implementations are functional. Candle/Tract/tch inference and alternate spatial-index backends remain tracked implementation work. FtBrain now has a real code-first inference implementation, but is not accepted as complete until its pinned DSR evidence is green.
+Note: NeuroFlow and the native brain implementations are functional. Candle has real library inference; Tract/tch inference and alternate spatial-index backends remain unimplemented. The ML disposition keeps placeholders out of production populations and selects FtBrain as the app-level ML family. FtBrain has real code-first inference, but is not accepted as complete until its pinned DSR evidence is green.
 
 ### NeuroFlow runtime configuration (optional)
 If built with the `neuro` feature, runtime toggles can be applied via env vars before launch:
@@ -450,7 +448,7 @@ cargo fmt --all
 cargo test --workspace
 
 # Build optional crates with features
-cargo build -p scriptbots-brain-ml --features candle # compile probe; inference is still a placeholder
+cargo build -p scriptbots-brain-ml --features candle # library tensor inference; not a production family preset
 ```
 
 ### Command-line options (scriptbots-app)
@@ -552,7 +550,7 @@ cargo build -p scriptbots-brain-ml --features candle # compile probe; inference 
 - The same request policy protects REST, Swagger, streams, WebSocket upgrades and MCP HTTP. Absolute request targets must agree with Host. Forwarded and `X-Forwarded-*` headers are refused: there is no configured trusted-proxy boundary. These checks validate request targeting and do not authenticate callers; stdio MCP is unchanged.
 - Control-server environment is validated before startup side effects. Malformed or non-Unicode control values fail closed; `https://` in either MCP transport/address setting is rejected because the embedded MCP listener is plaintext HTTP rather than silently claiming TLS.
 - `SCRIPTBOTS_STORAGE_PATH` — optional new-run FrankenSQLite file path. Without it, ScriptBots creates a unique `runs/scriptbots-<unix-ms>-<pid>.sqlite`. In either case the app reserves the path with create-new semantics and refuses an existing database or stale `-wal`, `-shm`, `-journal`, `-wal-fec`, or lock sidecar. A cleanly closed run keeps an empty `-wal` and its `-shm` beside the database, so remove the database together with its sidecars before reusing a path. The selected path is printed as `Run database: ...`; save that exact value for later reads and exports.
-- `SCRIPTBOTS_RECOVER_STORAGE` — existing file-backed run to repair and finalize, equivalent to `--recover-storage FILE`. Recovery exits after persistence repair; it does not resume the simulation. The core science checkpoint is a separate persistence-disabled API, while application run-bundle discovery and resume remain roadmap work.
+- `SCRIPTBOTS_RECOVER_STORAGE` — existing file-backed run to repair and finalize, equivalent to `--recover-storage FILE`. Recovery exits after persistence repair; it does not resume the simulation. Run-bundle export/verification and core checkpoint-start replay are separate implemented paths. Full host/session continuation has an implemented bounded CLI candidate whose original qualification remains open under `bd-2z0.5.13`.
 
 `--create-bundle RUN_DB --bundle-output DIRECTORY` exports a finished, checkpointed database
 under its existing writer/path/identity lease. The destination must be new. Live writers,
@@ -855,7 +853,7 @@ Simulation controls and retained-history playback are separate. The unmodified `
 - Channels planned for ambience/effects; platform caveats apply on Linux/WSL2. Audio is disabled in wasm; use Web Audio API from JS if needed.
 
 ### Terminal mode
-The implemented Ratatui frontend provides an emoji-rich dashboard and headless snapshot mode. Automatic selection chooses it only before launch; an explicit GPUI/Bevy request or a native window launch failure is surfaced rather than silently changing products.
+The interactive frontend runs FrankenTUI's `Program` and retains Ratatui widgets; headless mode uses its buffer adapter. Automatic selection chooses terminal mode only before launch; an explicit GPUI/Bevy request or a native window launch failure is surfaced rather than silently changing products.
 
 #### Terminal-only mode
 - Force the emoji TUI renderer (useful on headless machines):
@@ -1209,9 +1207,10 @@ MCP quickstart:
   - ✅ Core science checkpoint with strict restore and next-transition proof. Its envelope excludes host/session ownership and retained frontend history.
   - ✅ Checkpoint-start replay: `--checkpoint-start` restores the latest valid checkpoint before the replay limit and verifies the run from its tick (`bd-2z0.5.13`). Interactive runs record one automatically every `--checkpoint-interval` ticks (default 1000, `0` disables, env `SCRIPTBOTS_CHECKPOINT_INTERVAL`) together with a canonical world digest, so interactive and server runs can be replay-verified; REST (`POST /api/v1/checkpoints`) and MCP (`checkpoint_create`) add checkpoints on demand. All go through the storage worker (`bd-1dvs`).
 - **Planned**
-  - ❌ Full host/session restore: command ordering, exact retry identities, revisions,
-    schedule position, configuration audit and persistence ownership/watermarks. The
-    original `bd-2z0.5.13` acceptance remains open. Emitted and persisted manifests keep
+  - ❌ Full host/session restore qualification: a bounded CLI candidate now captures and
+    restores the owner/session cut, command identities/revisions, schedule cursor and
+    persistence journal. Its original `bd-2z0.5.13` acceptance remains open; implemented
+    source and the existing real-file/subprocess test are not completed acceptance. Launch manifests keep
     `checkpoint_replay_guarantee=false` until that complete boundary is implemented and
     verified; the independently supported restorable RNG capability remains enabled.
   - ❌ Branch/diff workflows comparing Rust vs. Rust PR builds vs. the legacy C++ baseline.
@@ -1290,7 +1289,7 @@ ScriptBots is licensed under **`LicenseRef-MIT-OpenAI-Anthropic-Rider`** — MIT
 
 ## Troubleshooting
 - **Fresh clone fails inside the `fsqlite` git dependency** (`failed to update submodule legacy_sqlite_code/sqlite: object not found - no match for id 450a9009...`): the pinned frankensqlite revision records a sqlite submodule commit that is not reachable from any branch/tag on `github.com/sqlite/sqlite`. The checked-in `.cargo/config.toml` sets `[net] git-fetch-with-cli = true`, which routes submodule fetches through the git CLI (it retries by exact OID, and GitHub honors fetch-by-SHA), so current checkouts build on a fresh cache. If you build with a cargo older than 1.46 or deliberately bypass the repo config, pre-populate the submodule once in the failed checkout (`git init && git remote add origin https://github.com/sqlite/sqlite && git fetch --depth 1 origin 450a90097fabf4eac7568a9688b34278b4d72122 && git checkout FETCH_HEAD`, then set `submodule.legacy_sqlite_code/sqlite.update=none` in the checkout's `.git/config`).
-- **MSVC/SDK link errors on Windows**: Ensure VS Build Tools "Desktop development with C++" and Windows 11 SDK are installed. Then run `rustup default stable-x86_64-pc-windows-msvc`.
+- **MSVC/SDK link errors on Windows**: Ensure VS Build Tools "Desktop development with C++" and Windows 11 SDK are installed. Install the pinned `nightly-2026-08-31` MSVC toolchain; this checkout's `rust-toolchain.toml` selects it.
 - **Blank or crashing window**: Update GPU drivers. On WSL2, update the WSL kernel and try again. Verify that your system supports D3D12 (Windows) or Vulkan/Metal (Linux/macOS).
 - **Storage admission or commit failure**: Compare the live tick with the published committed tick and compare the admitted, applied, and durable batch watermarks. Inspect the structured last error, operation, attempt, and commit state. A definite synchronous `NotAdmitted` fault pauses later science ticks and retains the exact batch for explicit retry. A file admission receipt proves that the exact payload can be recovered; application and terminal durability remain separately visible until the later watermarks advance.
 - **Determinism regressions**: Ensure you haven't introduced unordered parallel reductions; stage results and apply in a stable commit phase.
@@ -1421,7 +1420,7 @@ This matrix covers bounded tournament smoke, not the full publication protocol.
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).
 2. World mechanics and determinism under parallelism; spatial index tuning.
 3. Brains: MLP shipped; DWRAON + Assembly (feature-gated) and NeuroFlow optional.
-4. Storage: durable outbox, exact identity/schema recovery, direct-write/root-cause unification, V6/V7 base/archive lineage, indexed pairwise interaction edges, and run bundles are integrated. V8/V9 command/domain projections are integrated (V8 has no production reader yet); remaining work includes strict-run host policy, automatic checkpoint recording in ordinary runs, and in-memory commit scaling (`bd-kgob`).
+4. Storage: durable outbox, exact identity/schema recovery, direct-write/root-cause unification, V6/V7 base/archive lineage, indexed pairwise interaction edges, run bundles, V8/V9 typed evidence readers and automatic checkpoints are integrated. Remaining work includes complete host/session continuation and retention acceptance, persistent-run liveness/throughput and in-memory commit scaling (`bd-kgob`).
 5. Runtime: renderer-neutral protocol, sole-owner `HostCore`, fixed-deadline native lifecycle, and frontend ports are integrated; complete remaining client interactions and native acceptance for the host cutover.
 6. Rendering: Lab/overlays/inspector polish; performance diagnostics.
 7. DSR packaging and verification: release builds, binaries, and WASM/browser evidence from the pinned repository profile.
