@@ -24992,6 +24992,12 @@ mod command_characterization_tests {
                 source.edit(MapAction::Paint(x, y));
             }
         }
+        // Distinguish all four wrapped two-cell rows. Otherwise N=2 may
+        // legitimately repeat a shorter cycle and omit the fourth row.
+        source.brush = TerrainKind::Grass;
+        source.edit(MapAction::Paint(5, 1));
+        source.brush = TerrainKind::Rock;
+        source.edit(MapAction::Paint(0, 1));
         source.draft.generate_artifact().unwrap()
     }
 
@@ -25035,8 +25041,8 @@ mod command_characterization_tests {
                     TerrainKind::Sand,
                     TerrainKind::Rock,
                     TerrainKind::DeepWater,
-                    TerrainKind::ShallowWater,
-                    TerrainKind::Sand,
+                    TerrainKind::Grass,
+                    TerrainKind::Rock,
                     TerrainKind::Grass,
                     TerrainKind::Bloom,
                 ],
