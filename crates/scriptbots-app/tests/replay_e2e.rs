@@ -23,7 +23,7 @@ const HOST_HANDOFF_TICK: u64 = 7;
 const HOST_MINIMUM_POPULATION: usize = 20;
 
 /// Keep the subprocess streams beside the closed databases, including failed invocations.
-/// The connectivity DSR lane places TMPDIR beneath its retained external proof directory.
+/// DSR uses a retained TMPDIR; RCH can select an external SCRIPTBOTS_TEST_ARTIFACT_ROOT.
 fn retained_host_output(directory: &Path, name: &str, command: &mut Command) -> Output {
     let stdout_path = directory.join(format!("{name}.stdout"));
     let stderr_path = directory.join(format!("{name}.stderr"));
@@ -1177,9 +1177,12 @@ fn mock_free_checkpoint_start_replay_e2e() {
 /// Every database and subprocess stream remains beneath the unique external proof directory.
 #[test]
 fn mock_free_full_host_checkpoint_continuation_e2e() {
+    let artifact_root = env::var_os("SCRIPTBOTS_TEST_ARTIFACT_ROOT")
+        .map_or_else(env::temp_dir, std::path::PathBuf::from);
+    fs::create_dir_all(&artifact_root).expect("create external host continuation artifact root");
     let directory = tempfile::Builder::new()
         .prefix("host-checkpoint-continuation-")
-        .tempdir()
+        .tempdir_in(artifact_root)
         .expect("unique external host continuation proof")
         .keep();
     eprintln!(
