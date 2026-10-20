@@ -5852,8 +5852,13 @@ impl SimulationView {
         let paint_help = match sandbox.paint_channel {
             channel if sandbox.paint_generated_default && channel != MapPaintChannel::Erase => {
                 format!(
-                    "Click a cell to restore only its {} override to the current generator's default. Other painted fields and cells stay unchanged. Undo restores the override; regenerate to see the result. Generated hazards may remain. Changing channel returns to brush values.",
+                    "Clear only the {} override; other fields and cells stay painted. Undo restores it. Regenerate to preview. Changing channel returns to brush values.{}",
                     channel.label(),
+                    if channel == MapPaintChannel::Hazard {
+                        " Generated hazards may remain."
+                    } else {
+                        ""
+                    },
                 )
             }
             MapPaintChannel::Hazard => format!(
@@ -23964,9 +23969,10 @@ mod command_characterization_tests {
 
     #[test]
     fn map_sandbox_default_paint_restores_each_field_without_losing_other_work() {
+        type ClearPaintField = fn(&mut PaintedConstraint);
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
-        let fields: &[(MapPaintChannel, fn(&mut PaintedConstraint))] = &[
+        let fields: &[(MapPaintChannel, ClearPaintField)] = &[
             (MapPaintChannel::Terrain, |p| p.terrain_kind = None),
             (MapPaintChannel::Elevation, |p| p.elevation = None),
             (MapPaintChannel::Moisture, |p| p.moisture = None),
