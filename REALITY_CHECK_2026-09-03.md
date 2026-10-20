@@ -10,24 +10,163 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
-Recorded archipelago migration (`bd-16g.5`, 2026-10-20; in progress):
+Recorded archipelago migration (`bd-16g.5`, 2026-10-20; qualified increment,
+original parent in progress):
 
-- [x] Read all project instructions/README; register/coordinate; inspect recent Git, BR/BV and indexed CASS context (index ends September 16).
+- [x] Read all available project instructions/README (`/data/projects/AGENTS.md` is absent); register/coordinate; inspect recent Git, BR/BV and indexed CASS context (index ends September 16).
 - [x] Confirm production runtime migration and atomic storage sink exist while the recorded runner selects `migration: None`.
 - [x] Claim the original ready P1 parent and reserve only app sources, existing integration tests and handoff files; leave original acceptance intact.
-- [x] Implement optional validated cadence, emigrant count, selection and topology; preserve migration-disabled defaults and record the exact policy (source `534290c4`, executable verification pending).
-- [x] Connect actual barrier moves to the existing atomic sink and label pre-migration summaries/post-migration membership; retain observed pool size rather than trusting two requested counts (`c731d647`, verification pending).
-- [ ] Exercise real CLI migrations, stored identity/graph/conservation, disabled defaults, invalid-input no-file behavior and thread-budget determinism.
-- [ ] Run strict-remote RCH tests, workspace check/Clippy and formatting; retain every failure and report proof limits.
-- [ ] Review the exact diff and UBS, update the original Bead with evidence, export/check cycles, and publish normally to both required refs.
+- [x] Implement optional validated cadence, emigrant count, selection and topology; preserve migration-disabled defaults and record the exact policy (qualified source `9ce6ef2a`).
+- [x] Connect actual barrier moves to the existing atomic sink and label pre-migration summaries/post-migration membership; retain the observed Rayon pool size.
+- [x] Exercise eight real MLP CLI migration cases: four selection/topology pairings, each at observed one/three threads, four islands and four ticks; compare exact final science and move identities, graph edges, conservation, manifest policy and all three watermarks.
+- [x] Retain default-disabled behavior, eight invalid-policy/overlay refusals before database creation, and a planted capture-name collision that preserves existing report bytes.
+- [x] Run strict-remote RCH integration (six passed, one unchanged long-lane ignore), focused library tests (two passed, 646 filtered) and workspace formatting at the pinned source.
+- [x] Complete the required strict-remote workspace all-target compiler check (R18, Hz4 job `30072644099375117`).
+- [x] Complete strict-remote workspace Clippy with warnings denied (R20, Hz3 job `30072644099375118`); infrastructure refusals do not qualify this gate.
+- [x] Review the exact source/test diff and UBS without adding suppressions; retain the non-clean scan and its triage.
+- [x] Retain raw execution results outside temporary storage, reread the real CLI reports and update the original Bead with observed results (comment 2902).
+- [x] Record the final lint result, export the original Bead and verify preserved acceptance/comments, exact JSONL contents and empty dependency cycles (comment 2903; 718 records, only the original parent changed).
+- [x] Finish source qualification and verify source `9ce6ef2a` is already on both required refs; prepare the updated handoff and tracker for separate reviewed publication, leaving runtime/merge-anchor/recovery artifacts local.
 
 This minimal in-place TODO is requested by the operator and gates the implementation
-handoff; retire its active status at handoff. The observed defect is an unavailable
+handoff; its active status now retires to this qualified-increment record. The observed defect was an unavailable
 recorded migration capability despite existing runtime and storage consumers. No new
 process framework, schema, golden or dependency is needed. Resource-strata inspection
 was read-only: the map draft/artifact has no resource-strata model to connect, so that
 larger editor change was not started. RCH is explicitly requested for this turn;
 functional RCH results will not be described as native, performance or DSR release proof.
+
+The final functional runs bind source `9ce6ef2aeaf331723a825388bb2602eaedf28a4c`,
+tree `02d187e41dc759fecf757f619a7bef0a48617252`, through RCH's clean-overlay receipt.
+R7 (Hz4 job `30072644099375111`) executes all seven integration tests: six pass,
+zero fail, one pre-existing long-lane test remains ignored. The eight positive MLP CLI
+cases cover random/ring, fittest/fully-connected, youngest/ring and
+wanderer/fully-connected at one and three observed threads. They persist 256 moves
+in total (16 per ring case, 48 per fully-connected case); every run's admitted,
+applied and durable watermark reaches four. Real read-only database readers and
+the offline report CLI reconstruct all island histories and migration graphs.
+R8 (Hz4 job `30072644099375112`) passes both focused library tests; its 646 filtered
+tests were not executed. R16 (vmi1149989 job `30072644099375115`) passes
+`cargo fmt --all -- --check`. R18 (Hz4 job `30072644099375117`) passes
+`cargo check --workspace --all-targets --locked`, remote exit zero with terminal
+acknowledgement and the same clean-overlay source receipt. R20 (Hz3 job
+`30072644099375118`) passes
+`cargo clippy --workspace --all-targets --locked -j 1 -- -D warnings`, again
+remote/zero, terminal-acknowledged and bound to the same source/tree. The existing
+`proc-macro-error2` future-compatibility notice remains. These are functional Linux
+results, not a full workspace test run, independent review, native UI acceptance
+or a scaling claim. RCH's cross-command timing banners are not performance evidence.
+The app's optional compile-time source provenance remains incomplete in this lane;
+the exact source binding comes from the separate RCH receipt.
+
+Raw R7 databases, reports, command metadata and stdout/stderr remain on Hz4 at
+`/var/tmp/scriptbots-recorded-migration-20261020-lilacelm-r7` (206 files).
+A fresh solo readback confirms all eight positive reports, paired thread equality,
+256 moves and eight negative exits with no database; it is not independent review.
+R4's failed first case is retained separately at
+`/var/tmp/scriptbots-recorded-migration-r4-failure-20261020-lilacelm`.
+R4 actually ran four passing tests, one failure and one unchanged ignore: the
+capture helper overwrote its own offline-report JSON after storing the first
+16 moves. Fix `9ce6ef2a` uses a distinct metadata basename, exclusive-create writes
+and a planted collision probe; no assertion, ignore or tolerance was weakened.
+The overwritten original report cannot be recovered from that failed capture.
+Available raw RCH envelopes/logs, UBS, CASS and the fresh readback output are copied
+with byte readback verification to
+`/data/tmp/scriptbots-recorded-migration-20261020-lilacelm` (108 files / 862,932 bytes
+at this handoff). The initial preflight flag-conflict stderr file was reused by
+the baseline run; that original parser error survives in the session transcript,
+not as a separate raw file in this retained directory.
+
+Infrastructure history is retained, not counted as tests: R2/R3/R5 and R17 refuse
+namespace setup; R6 loses transport; R9 times out before Cargo; R10, R12/R13 and R15
+refuse admission. R1's wrong revision and R14's incompatible flags are invocation
+mistakes, not compiler failures. R11 cannot create source-ownership records because
+Hz4's `/tmp` has zero free inodes despite 77 GiB of free bytes. At 17:31:46 UTC,
+raising only the live tmpfs inode limit from 1,048,576 to 2,097,152 restores one
+million free inodes, without deleting files or changing its 126 GiB byte cap.
+Exact R11 recovery then acknowledges terminal failure before another job starts.
+No local compilation, source-lock bypass, worker slot/priority edit or file cleanup
+is used. R18 subsequently passes the compiler check. R19 refuses admission after
+Hz4's budget falls to zero slots; R20 runs the unchanged full lint selection on
+Hz3 with one compilation job and passes. No retained artifact is deleted to make
+room for qualification. The final JSONL flush preserves all eight original parent
+comments literally and appends five progress/evidence comments, without changing
+its description, acceptance, dependencies or priority; dependency cycles remain empty.
+
+The final three-file UBS scan exits 1 with three critical heuristics, 982 warnings
+and 429 informational findings. The critical sites are unchanged `Command::new(&exe)`
+calls at `main.rs:1868`, `6411` and `6525`; each executable comes from
+`std::env::current_exe()`, not caller input. This is a bounded triage, not a clean
+scanner result or a claim that every old warning was resolved. The Markdown-only
+scan exits 3 with no supported language and nothing checked; no allow-no-scan or
+other suppression is used. The README's compile-time-consumed GPUI shortcut table
+is byte-identical to the qualified source; the later prose correction does not
+change that consumer.
+
+Bounded anti-ceremony audit, 2026-10-20 (`efbcc857..384df7e9`, six commits,
+one original Bead; subsequent handoff edits receive no capability credit):
+
+Creation worksheet: runtime migration options are FEATURE because the actual runner
+consumes them. This existing TODO/report is PROCESS: its consumer is the operator
+who explicitly requested granular tracking, its gate is this migration handoff, its
+observed defect is the recorded runner leaving an existing migrator disconnected,
+and its active status retires at the bounded handoff. The optional retention hook
+is INTEGRITY CONTROL: (1) RCH actually removed its source/TMPDIR and R4 actually
+overwrote report evidence; (2) retaining eight real databases is needed at this run's
+scale; (3) one optional root and exclusive-create writes are the smallest reliable
+change to the existing fixtures; (4) ordinary `keep()` was demonstrably insufficient,
+so no cheaper existing retention path gives the same protection. Retire the hook
+when RCH compilation supports retained result directories. Opportunity cost:
+BR-ready P0 `bd-e6ff` needs an unavailable Mac/exFAT host; this ready P1 migration
+increment exposes existing capability. Another hour of report machinery would have
+less value than the next user-facing gap, so add no framework or speculative gate.
+
+Real-work worksheet: the README's purpose is a reproducible evolutionary simulator
+and Evolution Lab. Mechanical Git/reflog and tracker review finds USER `534290c4`;
+ENABLER `c731d647`, `67212f0e`, `9ce6ef2a`; PROCESS `65dbeaf0`, `384df7e9`;
+UNKNOWN zero. These are one feature and three support corrections, not four
+capabilities. Hard questions: (1) demo a recorded migration run and its offline
+conservation report; (2) omitting process commits changes no runtime behavior;
+(3) R7 exercises each enabler; (4) the oldest open user goal is the July 11
+Evolution Lab parent `bd-2z0`, and this wiring advances its multi-island experiment
+journey; (5) no delegated swarm or closes were used; (6) original acceptance is
+unchanged, with no follow-up minted to close it. Verdict: DRIFTING on infrastructure
+and invocation overhead despite a real capability increment. Correction to self:
+finish the named existing checks and handoff, then return to product code; do not
+turn the RCH failures into another reporting framework.
+
+Honesty worksheet, same bounded window plus the qualification attempts:
+
+1. No (checked: final source diff and individual test corrections retain every old assertion and the one old ignore; no CI/lint configuration changes).
+2. No (checked: positive migration cases launch the real binary and real file storage; the capture collision sentinel only tests capture integrity).
+3. No (checked: changed-path inventory contains no golden or snapshot).
+4. Yes: `9ce6ef2a` repairs the capture helper after R4; distinct basenames and exclusive creation strengthen evidence preservation. No tolerance, timeout, test selection, assertion or project gate is relaxed.
+5. No (checked: all four declared policy pairings execute at both thread counts; no runtime fixture sniffing or special success path).
+6. No (checked: R7 runs seven tests, six pass and one remains ignored; R8 runs two with 646 explicitly filtered; formatting is not a test count).
+7. No (checked: RCH envelopes, raw logs and retained reports support only the commands and results named above; pending checks remain pending).
+8. No (checked: live CLI/file results are called functional Linux evidence; solo readback, incomplete app provenance and absent DSR/native/performance proof are explicit).
+9. No (checked: R4's overwritten report, failed test, infrastructure refusals and unexecuted acceptance are retained alongside the passes; UBS is not called clean).
+10. No (checked: cited RCH stdout envelopes and complete stderr logs are retained; captured subprocess stdout/stderr are separate files).
+11. No (checked: `bd-16g.5` remains in progress; no closure or replacement Bead was created).
+12. No (checked: only a progress entry is added to the roadmap; original parent description and acceptance remain unchanged).
+13. No (checked: no delegation or tracker closes in this window; peer preservation commits do not certify the feature).
+14. No (checked: no subagent dispatched).
+15. No (checked: no subagent result accepted; the current source diff and raw execution results were read directly).
+16. No (checked: refusals have zero capability/closure credit; the positive migration journey remains the deliverable).
+17. No (checked: Agent Mail messages coordinate capacity and ownership only; agreement supplies no additional proof).
+18. No (checked: four policy pairings, two thread counts, four islands/four ticks and expected edge-derived move counts precede execution; this is not a full selection-by-topology Cartesian matrix).
+19. Yes: R4's metadata collision destroyed its report JSON, and incorrect revisions/incompatible flags caused avoidable setup work. The failure was disclosed and repaired, not hidden by rewriting history; it remains visible beside R7's result.
+20. Strongest evidence: R7's actual CLI execution plus read-only DB/offline-report reconstruction at exact source `9ce6ef2a`; a skeptic can rerun the unchanged integration command with a fresh external artifact root. This does not establish the parent's eight-island/5k-tick or scaling acceptance.
+
+Disposition for answers 4/19: corrected in place by `9ce6ef2a`, disclosed in Bead
+comment 2901 and this report, and guarded by exclusive-create capture plus the
+planted collision test (PL-2 positive observables; RH-2 proof-class inflation).
+Retain exact command failures and consult installed flag conflicts before retrying;
+never promote a setup refusal to a test result. No independent verifier was used.
+CASS is only historical context: its actual index ends September 16 even though
+status says fresh. Five bounded honesty searches plus `archipelago_report_cli`
+find older hits; followed raw coordinates show old tool/storage activity rather
+than a complete October audit. No historical clean bill is inferred from that.
 
 Per-field generated-default painting (`bd-2z0.10.7`, 2026-10-20, qualified increment;
 original native acceptance in progress):

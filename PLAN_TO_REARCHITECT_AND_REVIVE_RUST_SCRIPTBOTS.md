@@ -2410,14 +2410,19 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
-**[Currently In Progress] Recorded archipelago migration, 2026-10-20 (`bd-16g.5`):**
+**[Qualified increment; parent Currently In Progress] Recorded archipelago migration, 2026-10-20 (`bd-16g.5`):**
 connect the existing deterministic runtime migration policy and atomic barrier sink
-to the recorded CLI runner, which currently hard-codes migration off. Keep isolated
-runs unchanged by default; validate explicit cadence/count/selection/topology before
-creating a database, retain policy provenance, and persist actual move identities in
-the same barrier transaction. Verify real CLI runs, reconstruction/conservation,
-thread-budget determinism and invalid input through strict-remote RCH. The original
-parent's scaling, speciation, tiled UI and long-run acceptance remain open.
+to the recorded CLI runner. Source `9ce6ef2a` now keeps migration off by default,
+validates explicit cadence/count/selection/topology before creating a database,
+retains policy provenance, and persists actual move identities in the same barrier
+transaction. Strict-remote RCH verifies eight real CLI cases with 256 stored moves,
+offline reconstruction/conservation and equality at observed one/three-thread pools;
+eight invalid policy/overlay cases create no database. Six integration tests and two
+focused library tests pass; one original long-lane test remains ignored. Workspace
+formatting, the all-target compiler check and Clippy with warnings denied pass at
+that pinned source through strict-remote RCH (R7/R8/R16/R18/R20).
+The original parent remains open for its broader acceptance. This increment adds no
+new scaling, speciation, native UI or long-run result and does not erase earlier evidence.
 
 **[Currently In Progress] Per-field generated-default painting, 2026-10-20 (`bd-2z0.10.7`):**
 connect absent per-cell overrides to an explicit native paint-source control. Restore
