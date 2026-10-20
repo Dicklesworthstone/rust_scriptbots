@@ -3082,7 +3082,7 @@ fn map_preview_color(kind: TerrainKind, palette: ColorPaletteMode) -> Rgba {
         TerrainKind::Bloom => 0xb7ca71,
         TerrainKind::Rock => 0x898f9b,
     };
-    apply_palette(rgb(natural).into(), palette)
+    apply_palette(rgb(natural), palette)
 }
 
 const fn map_terrain_symbol(kind: TerrainKind) -> &'static str {
@@ -25098,14 +25098,17 @@ mod command_characterization_tests {
             .collect();
         assert_eq!(symbols, ["D", "W", "S", "G", "B", "R"]);
         assert_eq!(
-            symbols.iter().collect::<std::collections::HashSet<_>>().len(),
+            symbols
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
             symbols.len()
         );
         let mut matrices = Vec::new();
         for palette in ColorPaletteMode::ALL {
             let mut matrix = Vec::new();
             for (kind, packed) in MAP_TERRAIN_KINDS.into_iter().zip(natural) {
-                let base: Rgba = rgb(packed).into();
+                let base = rgb(packed);
                 let actual = map_preview_color(kind, palette);
                 let expected = visual::apply_accessibility_palette(
                     [base.r, base.g, base.b],
