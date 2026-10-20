@@ -3315,6 +3315,7 @@ struct MapSandbox {
     brush: TerrainKind,
     paint_channel: MapPaintChannel,
     paint_tenths: i16,
+    paint_generated_default: bool,
     painted_cell: Option<(u32, u32)>,
     notice: String,
 }
@@ -3352,6 +3353,7 @@ impl MapSandbox {
             brush: TerrainKind::Grass,
             paint_channel: MapPaintChannel::Terrain,
             paint_tenths: 5,
+            paint_generated_default: false,
             painted_cell: None,
             notice: "Draft only. Pause the world before generating a map to apply.".to_owned(),
         }
@@ -3797,8 +3799,15 @@ impl MapSandbox {
             }
             MapAction::PaintChannel => {
                 self.paint_channel = self.paint_channel.next();
+                self.paint_generated_default = false;
                 let (minimum, maximum) = self.paint_channel.range();
                 self.paint_tenths = self.paint_tenths.clamp(minimum, maximum);
+                return;
+            }
+            MapAction::PaintDefault => {
+                if self.paint_channel != MapPaintChannel::Erase {
+                    self.paint_generated_default = !self.paint_generated_default;
+                }
                 return;
             }
             MapAction::PaintValue(delta) => {
@@ -4354,30 +4363,39 @@ impl MapSandbox {
                 height: self.draft.state.height,
             });
         }
-        let mut constraint =
-            self.draft
-                .state
-                .constraints
-                .get(x, y)
-                .cloned()
-                .unwrap_or(PaintedConstraint {
-                    x,
-                    y,
-                    terrain_kind: None,
-                    elevation: None,
-                    moisture: None,
-                    fertility_bias: None,
-                    temperature_bias: None,
-                    permeability: None,
-                    runoff_bias: None,
-                    basin_rank: None,
-                    channel_priority: None,
-                    swim_cost: None,
-                    hazard: None,
-                });
-        let value = Some(f32::from(self.paint_tenths) / 10.0);
+        let empty = PaintedConstraint {
+            x,
+            y,
+            terrain_kind: None,
+            elevation: None,
+            moisture: None,
+            fertility_bias: None,
+            temperature_bias: None,
+            permeability: None,
+            runoff_bias: None,
+            basin_rank: None,
+            channel_priority: None,
+            swim_cost: None,
+            hazard: None,
+        };
+        let mut constraint = self
+            .draft
+            .state
+            .constraints
+            .get(x, y)
+            .cloned()
+            .unwrap_or_else(|| empty.clone());
+        if self.paint_generated_default
+            && self.paint_channel != MapPaintChannel::Erase
+            && constraint == empty
+        {
+            return Ok(());
+        }
+        let value = (!self.paint_generated_default).then_some(f32::from(self.paint_tenths) / 10.0);
         match self.paint_channel {
-            MapPaintChannel::Terrain => constraint.terrain_kind = Some(self.brush),
+            MapPaintChannel::Terrain => {
+                constraint.terrain_kind = (!self.paint_generated_default).then_some(self.brush);
+            }
             MapPaintChannel::Elevation => constraint.elevation = value,
             MapPaintChannel::Moisture => constraint.moisture = value,
             MapPaintChannel::Fertility => constraint.fertility_bias = value,
@@ -4387,8 +4405,14 @@ impl MapSandbox {
             MapPaintChannel::BasinRank => constraint.basin_rank = value,
             MapPaintChannel::ChannelPriority => constraint.channel_priority = value,
             MapPaintChannel::SwimCost => constraint.swim_cost = value,
-            MapPaintChannel::Hazard => constraint.hazard = (self.paint_tenths > 0).then_some(true),
+            MapPaintChannel::Hazard => {
+                constraint.hazard =
+                    (!self.paint_generated_default && self.paint_tenths > 0).then_some(true);
+            }
             MapPaintChannel::Erase => return self.draft.erase_constraint(x, y).map(|_| ()),
+        }
+        if self.paint_generated_default && constraint == empty {
+            return self.draft.erase_constraint(x, y).map(|_| ());
         }
         self.draft.paint_constraint(constraint)
     }
@@ -4456,6 +4480,7 @@ enum MapAction {
     Brush,
     SelectBrush(TerrainKind),
     PaintChannel,
+    PaintDefault,
     PaintValue(i16),
     Paint(u32, u32),
     Undo,
@@ -5784,6 +5809,20 @@ impl SimulationView {
         if sandbox.paint_channel != MapPaintChannel::Erase {
             let hazard = sandbox.paint_channel == MapPaintChannel::Hazard;
             paint_controls = paint_controls
+                .child(self.render_map_button(
+                    "map-paint-source",
+                    format!(
+                        "Paint source: {} (change)",
+                        if sandbox.paint_generated_default {
+                            "generated default"
+                        } else {
+                            "brush value"
+                        },
+                    ),
+                    MapAction::PaintDefault,
+                    true,
+                    cx,
+                ))
                 .child(
                     self.render_map_button(
                         "map-paint-decrease",
@@ -5794,7 +5833,8 @@ impl SimulationView {
                         }
                         .to_owned(),
                         MapAction::PaintValue(-1),
-                        sandbox.paint_channel != MapPaintChannel::Terrain
+                        !sandbox.paint_generated_default
+                            && sandbox.paint_channel != MapPaintChannel::Terrain
                             && sandbox.paint_tenths > sandbox.paint_channel.range().0,
                         cx,
                     ),
@@ -5803,12 +5843,19 @@ impl SimulationView {
                     "map-paint-increase",
                     if hazard { "Stamp hazard" } else { "Value +0.1" }.to_owned(),
                     MapAction::PaintValue(1),
-                    sandbox.paint_channel != MapPaintChannel::Terrain
+                    !sandbox.paint_generated_default
+                        && sandbox.paint_channel != MapPaintChannel::Terrain
                         && sandbox.paint_tenths < sandbox.paint_channel.range().1,
                     cx,
                 ));
         }
         let paint_help = match sandbox.paint_channel {
+            channel if sandbox.paint_generated_default && channel != MapPaintChannel::Erase => {
+                format!(
+                    "Click a cell to restore only its {} override to the current generator's default. Other painted fields and cells stay unchanged. Undo restores the override; regenerate to see the result. Generated hazards may remain. Changing channel returns to brush values.",
+                    channel.label(),
+                )
+            }
             MapPaintChannel::Hazard => format!(
                 "Hazard brush: {}. Stamp sets accent 1 and swim cost 10. Generated default removes only this override; natural hazards may remain. Regenerate after painting.",
                 if sandbox.paint_tenths > 0 {
@@ -23916,6 +23963,163 @@ mod command_characterization_tests {
     }
 
     #[test]
+    fn map_sandbox_default_paint_restores_each_field_without_losing_other_work() {
+        let host = TestHost::take(command_characterization_world());
+        let before = host.port.scientific_digest_v1().unwrap();
+        let fields: &[(MapPaintChannel, fn(&mut PaintedConstraint))] = &[
+            (MapPaintChannel::Terrain, |p| p.terrain_kind = None),
+            (MapPaintChannel::Elevation, |p| p.elevation = None),
+            (MapPaintChannel::Moisture, |p| p.moisture = None),
+            (MapPaintChannel::Fertility, |p| p.fertility_bias = None),
+            (MapPaintChannel::Temperature, |p| p.temperature_bias = None),
+            (MapPaintChannel::Permeability, |p| p.permeability = None),
+            (MapPaintChannel::Runoff, |p| p.runoff_bias = None),
+            (MapPaintChannel::BasinRank, |p| p.basin_rank = None),
+            (MapPaintChannel::ChannelPriority, |p| {
+                p.channel_priority = None;
+            }),
+            (MapPaintChannel::SwimCost, |p| p.swim_cost = None),
+            (MapPaintChannel::Hazard, |p| p.hazard = None),
+        ];
+        for sample_based in [false, true] {
+            for &(channel, clear) in fields {
+                let mut sandbox = MapSandbox::new(8, 8, 50);
+                if sample_based {
+                    sandbox.edit(MapAction::Generator);
+                }
+                let paint = PaintedConstraint {
+                    x: 0,
+                    y: 0,
+                    terrain_kind: Some(TerrainKind::Sand),
+                    elevation: Some(0.9),
+                    moisture: Some(0.8),
+                    fertility_bias: Some(0.7),
+                    temperature_bias: Some(0.6),
+                    permeability: Some(0.5),
+                    runoff_bias: Some(0.4),
+                    basin_rank: Some(0.3),
+                    channel_priority: Some(0.2),
+                    swim_cost: Some(0.1),
+                    hazard: Some(true),
+                };
+                sandbox.draft.paint_constraint(paint.clone()).unwrap();
+                let other = PaintedConstraint {
+                    x: 1,
+                    ..paint.clone()
+                };
+                sandbox.draft.paint_constraint(other.clone()).unwrap();
+                sandbox.paint_channel = channel;
+                let painted = sandbox.draft.clone();
+                sandbox.edit(MapAction::PaintDefault);
+                assert!(sandbox.paint_generated_default);
+                assert_eq!(sandbox.draft, painted, "choosing a source is not an edit");
+                let mut expected = paint;
+                clear(&mut expected);
+                let mut reference = painted.clone();
+                reference.paint_constraint(expected.clone()).unwrap();
+                sandbox.edit(MapAction::Paint(0, 0));
+                assert_eq!(sandbox.draft.state.constraints.get(0, 0), Some(&expected));
+                assert_eq!(sandbox.draft.state.constraints.get(1, 0), Some(&other));
+                assert_eq!(sandbox.draft.state, reference.state);
+                sandbox.edit(MapAction::Undo);
+                assert_eq!(sandbox.draft.state, painted.state);
+                sandbox.edit(MapAction::Redo);
+                assert_eq!(sandbox.draft.state, reference.state);
+                let artifact = sandbox.draft.generate_artifact().unwrap();
+                artifact.validate().unwrap();
+                assert_eq!(
+                    artifact.scientific_content_hash(),
+                    reference
+                        .generate_artifact()
+                        .unwrap()
+                        .scientific_content_hash(),
+                );
+                let mut imported = MapSandbox::new(1, 1, 1);
+                imported
+                    .import_draft(&sandbox.export_draft().unwrap())
+                    .unwrap();
+                assert_eq!(imported.draft.state, reference.state);
+                assert!(
+                    !imported.paint_generated_default,
+                    "paint source is session intent"
+                );
+
+                sandbox.edit(MapAction::NextSeed);
+                sandbox.edit(MapAction::Undo);
+                sandbox.generate(host.snapshot().revisions.scientific);
+                wait_map_job(&mut sandbox);
+                let retained = sandbox.draft.clone();
+                let preview = Arc::clone(&sandbox.preview.as_ref().unwrap().artifact);
+                sandbox.edit(MapAction::Paint(0, 0));
+                sandbox.edit(MapAction::Paint(7, 7));
+                assert_eq!(sandbox.draft, retained);
+                assert!(sandbox.draft.can_redo() && sandbox.can_apply());
+                assert!(Arc::ptr_eq(
+                    &sandbox.preview.as_ref().unwrap().artifact,
+                    &preview
+                ));
+                for (x, y) in [(8, 0), (0, 8), (u32::MAX, u32::MAX)] {
+                    sandbox.edit(MapAction::Paint(x, y));
+                    assert!(sandbox.notice.starts_with("Draft edit refused:"));
+                    assert_eq!(sandbox.draft, retained);
+                    assert!(sandbox.can_apply());
+                }
+                sandbox.generate(host.snapshot().revisions.scientific);
+                sandbox.edit(MapAction::Paint(0, 0));
+                wait_map_job(&mut sandbox);
+                assert_eq!(sandbox.draft, retained);
+                assert!(
+                    sandbox.can_apply(),
+                    "unchanged paint must not obsolete the job"
+                );
+                sandbox.edit(MapAction::Redo);
+                assert!(!sandbox.can_apply());
+                assert_eq!(sandbox.draft.state.seed, retained.state.seed + 1);
+            }
+            let mut sandbox = MapSandbox::new(8, 8, 50);
+            if sample_based {
+                sandbox.edit(MapAction::Generator);
+            }
+            let initial = sandbox.draft.generate_artifact().unwrap();
+            sandbox.brush = TerrainKind::Sand;
+            sandbox.edit(MapAction::Paint(0, 0));
+            sandbox.edit(MapAction::Paint(1, 0));
+            let painted = sandbox.draft.state.clone();
+            sandbox.edit(MapAction::PaintDefault);
+            sandbox.edit(MapAction::Paint(0, 0));
+            assert!(sandbox.draft.state.constraints.get(0, 0).is_none());
+            assert_eq!(sandbox.draft.state.constraints.count(), 1);
+            sandbox.edit(MapAction::Undo);
+            assert_eq!(sandbox.draft.state, painted);
+            sandbox.edit(MapAction::Redo);
+            sandbox.edit(MapAction::Paint(1, 0));
+            assert!(sandbox.draft.state.constraints.is_empty());
+            assert_eq!(
+                sandbox
+                    .draft
+                    .generate_artifact()
+                    .unwrap()
+                    .scientific_content_hash(),
+                initial.scientific_content_hash(),
+            );
+            let retained = sandbox.draft.clone();
+            sandbox.edit(MapAction::Paint(0, 0));
+            assert_eq!(sandbox.draft, retained);
+            let mut empty = painted.constraints.get(0, 0).unwrap().clone();
+            empty.terrain_kind = None;
+            sandbox.draft.paint_constraint(empty).unwrap();
+            let explicit_empty = sandbox.draft.clone();
+            sandbox.edit(MapAction::Paint(0, 0));
+            assert_eq!(sandbox.draft, explicit_empty);
+            sandbox.edit(MapAction::PaintChannel);
+            assert!(!sandbox.paint_generated_default);
+            assert_eq!(sandbox.draft, explicit_empty);
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 0);
+    }
+
+    #[test]
     fn map_sandbox_roster_clones_permissions_and_restores_generated_output() {
         let host = TestHost::take(command_characterization_world());
         let before = host.port.scientific_digest_v1().unwrap();
@@ -26300,6 +26504,171 @@ mod command_characterization_tests {
             }
             let live = host.snapshot();
             assert_eq!(live.layers.terrain.tiles[0].kind, TerrainKind::Sand);
+            assert_eq!(live.world.tick, 0);
+            assert_ne!(host.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn map_sandbox_default_paint_production_input_regenerates_and_applies() {
+        for sample_based in [false, true] {
+            let host = TestHost::take(command_characterization_world());
+            let before = host.port.scientific_digest_v1().unwrap();
+            let mut session = GuiSession::new(
+                host.port.clone(),
+                AnalyticsSnapshotProvider::empty(),
+                Arc::new(|_| None),
+            );
+            session.map_apply_submit = Some(map_owner_submit(Arc::clone(&host)));
+            let session = Arc::new(session);
+            let context = gpui::TestAppContext::single();
+            let windows = context.update(|app| session.install(app)).unwrap();
+            let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+            lab.simulate_resize(size(px(480.0), px(1400.0)));
+            let redraw = |lab: &mut gpui::VisualTestContext| {
+                lab.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear();
+                });
+            };
+            let click = |lab: &mut gpui::VisualTestContext, selector| {
+                let bounds = lab
+                    .debug_bounds(selector)
+                    .expect("production map field control");
+                let viewport = lab.update(|window, _| window.viewport_size());
+                assert!(
+                    bounds.origin.x >= px(0.0)
+                        && bounds.origin.y >= px(0.0)
+                        && bounds.right() <= viewport.width
+                        && bounds.bottom() <= viewport.height,
+                    "{selector} must be visible: {bounds:?}, viewport {viewport:?}"
+                );
+                lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+                redraw(lab);
+            };
+            let generate = |lab: &mut gpui::VisualTestContext| {
+                click(lab, "map-generate");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while session.map_sandbox.lock().unwrap().job.is_some() {
+                    redraw(lab);
+                    assert!(
+                        Instant::now() < deadline,
+                        "field-default preview did not arrive"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                redraw(lab);
+                assert!(session.map_sandbox.lock().unwrap().can_apply());
+            };
+            redraw(&mut lab);
+            click(&mut lab, "dashboard-tab-maps");
+            click(&mut lab, "map-live-grid");
+            if sample_based {
+                click(&mut lab, "map-generator");
+            }
+            generate(&mut lab);
+            let natural_fertility = session
+                .map_sandbox
+                .lock()
+                .unwrap()
+                .preview
+                .as_ref()
+                .unwrap()
+                .artifact
+                .terrain()
+                .tile(0, 0)
+                .unwrap()
+                .fertility_bias;
+            click(&mut lab, "map-terrain-brush-Sand");
+            click(&mut lab, "map-cell-0-0");
+            for _ in 0..3 {
+                click(&mut lab, "map-paint-channel");
+            }
+            click(&mut lab, "map-paint-increase");
+            click(&mut lab, "map-paint-increase");
+            click(&mut lab, "map-cell-0-0");
+            let painted = session.map_sandbox.lock().unwrap().draft.clone();
+            assert_eq!(
+                painted.state.constraints.get(0, 0).unwrap().fertility_bias,
+                Some(0.7)
+            );
+            click(&mut lab, "map-paint-source");
+            assert!(session.map_sandbox.lock().unwrap().paint_generated_default);
+            assert_eq!(session.map_sandbox.lock().unwrap().draft, painted);
+            click(&mut lab, "map-cell-0-0");
+            let cleared = session.map_sandbox.lock().unwrap().draft.state.clone();
+            let constraint = cleared.constraints.get(0, 0).unwrap();
+            assert_eq!(constraint.terrain_kind, Some(TerrainKind::Sand));
+            assert_eq!(constraint.fertility_bias, None);
+            // Undo establishes a different value without moving cell focus;
+            // each actual key must clear it again, so an inert handler fails.
+            for key in ["space", "enter"] {
+                {
+                    let mut sandbox = session.map_sandbox.lock().unwrap();
+                    sandbox.edit(MapAction::Undo);
+                    assert_eq!(sandbox.draft.state, painted.state);
+                }
+                lab.simulate_keystrokes(key);
+                redraw(&mut lab);
+                assert_eq!(session.map_sandbox.lock().unwrap().draft.state, cleared);
+            }
+            generate(&mut lab);
+            let (retained, preview) = {
+                let sandbox = session.map_sandbox.lock().unwrap();
+                (
+                    sandbox.draft.clone(),
+                    Arc::clone(&sandbox.preview.as_ref().unwrap().artifact),
+                )
+            };
+            assert_eq!(preview.terrain().tile(0, 0).unwrap().kind, TerrainKind::Sand);
+            assert_eq!(
+                preview.terrain().tile(0, 0).unwrap().fertility_bias,
+                natural_fertility
+            );
+            click(&mut lab, "map-cell-0-0");
+            lab.simulate_keystrokes("space");
+            redraw(&mut lab);
+            {
+                let sandbox = session.map_sandbox.lock().unwrap();
+                assert_eq!(sandbox.draft, retained);
+                assert!(sandbox.can_apply());
+                assert!(Arc::ptr_eq(
+                    &sandbox.preview.as_ref().unwrap().artifact,
+                    &preview
+                ));
+            }
+            click(&mut lab, "map-paint-source");
+            assert!(!session.map_sandbox.lock().unwrap().paint_generated_default);
+            lab.simulate_keystrokes("space");
+            redraw(&mut lab);
+            assert!(session.map_sandbox.lock().unwrap().paint_generated_default);
+            lab.simulate_keystrokes("enter");
+            redraw(&mut lab);
+            assert!(!session.map_sandbox.lock().unwrap().paint_generated_default);
+            assert_eq!(session.map_sandbox.lock().unwrap().draft, retained);
+            click(&mut lab, "map-undo");
+            assert_eq!(
+                session.map_sandbox.lock().unwrap().draft.state,
+                painted.state
+            );
+            assert!(!session.map_sandbox.lock().unwrap().can_apply());
+            click(&mut lab, "map-redo");
+            assert_eq!(session.map_sandbox.lock().unwrap().draft.state, cleared);
+            generate(&mut lab);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+            let expected_revision = host.snapshot().revisions.scientific;
+            click(&mut lab, "map-apply");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while host.snapshot().revisions.scientific == expected_revision {
+                assert!(
+                    Instant::now() < deadline,
+                    "field-default Apply did not reach owner"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let live = host.snapshot();
+            assert_eq!(live.layers.terrain.tiles[0].kind, TerrainKind::Sand);
+            assert_eq!(live.layers.terrain.tiles[0].fertility_bias, natural_fertility);
             assert_eq!(live.world.tick, 0);
             assert_ne!(host.port.scientific_digest_v1().unwrap(), before);
         }
