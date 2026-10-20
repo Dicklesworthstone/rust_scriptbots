@@ -720,16 +720,20 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   preview and live world stay unchanged; **Back to unchanged draft** returns to the editor.
   Viewing does not change the draft or apply the saved map. **Use selected … sample**
   explicitly copies a terrain-kind patch starting at the selected cell, wrapping across
-  opposite edges. The patch is at most 3×3 cells, shrinking to the source dimensions for
-  smaller maps. The new sample label records the source content hash, origin and patch
+  opposite edges. **Patch width ±1** and **Patch height ±1** select independent dimensions
+  within the source and the displayed exemplar/output-work budget. Selection starts at
+  at most 3×3 cells for each newly opened artifact and leaves the draft, history and
+  preview unchanged until extraction. Cancelled or failed file opens retain the selection.
+  The new sample label records the source content hash, origin and patch
   dimensions; its pattern starts at 2, or 1 for a one-cell-wide/tall patch, with periodic
   extraction and rotations/reflections enabled. This is one undoable generator-config edit
   that opens the exemplar view. Output dimensions, seed and painted output constraints
   are retained. Fertility, temperature and hydrology are not copied into the exemplar;
   they come from generation defaults and output constraints. Generate a fresh preview
   before applying. Enlarging the draft exemplar repeats its current cells; it does not
-  extract a larger saved-map region. Resource controls, configurable saved-artifact patch
-  dimensions, accessible palettes and actual native OS-input acceptance remain open.
+  extract a larger saved-map region; use the inspection patch controls to copy additional
+  saved cells. Resource controls, accessible palettes and actual native OS-input acceptance
+  remain open.
 - The core ships a rule-based Wave Function Collapse (WFC) generator that produces deterministic terrain (`TerrainLayer`) and optional fertility/temperature fields from a tileset spec. This enables quick scenario bootstrapping and repeatable experiments.
 - Sample generation uses the existing overlapping-pattern backend: CLI `map-generate --sample sample.json`, or REST/MCP `sample: {...}`, selects it explicitly. `sample` and `tileset` are mutually exclusive; omitting both selects the default rule tileset. Invalid specifications and dimensions are rejected rather than replaced with defaults. Scoped source-pinned tests cover sample output and input validation; interactive native editor acceptance remains open.
 - A sample specifies `sample_id`, `sample_width`, `sample_height`, `pattern_size`, and row-major `sample_tiles` terrain kinds. `all_orientations` and `periodic` default to true; `periodic: false` is refused because non-periodic extraction is not implemented. Core bounds (`MAX_SAMPLE_CELLS`, `MAX_SAMPLE_OUTPUT_CELLS`, `MAX_SAMPLE_CELL_PAIRS`) admit at most 64 exemplar cells, 65,536 output cells, and 1,048,576 output/exemplar cell pairs before model construction. These are input-work bounds, not wall-clock or exact-byte guarantees. For example, a 2×2 all-sand sample is:

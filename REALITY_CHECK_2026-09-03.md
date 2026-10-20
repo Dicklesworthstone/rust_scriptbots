@@ -10,6 +10,178 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Saved-artifact patch selection (`bd-2z0.10.7`, 2026-10-20, in progress):
+
+- [x] Refresh ready work, original acceptance, source/extraction consumers and reservations.
+- [x] Connect bounded patch width/height controls and one shared cell-budget calculation (both R231 modes).
+- [x] Preserve draft/history/preview while selecting; reset selection on successful new inspection (both modes).
+- [x] Copy actual wrapped saved-map cells beyond 3×3 through one atomic shared-history edit (both modes).
+- [x] Observe different generated outputs, provenance, recipe/history and unchanged science/source (both modes).
+- [x] Probe source/count/work/file bounds, no-ops/refusals and selection-versus-extraction jobs (both modes).
+- [x] Exercise all four controls and extraction through production headless input; retain old journeys (both modes).
+- [x] Review exact diffs/UBS; qualify all nineteen pinned DSR checks with prior probes retained.
+- [x] Recompute evidence and publish qualified source to both required refs; prepare existing docs/tracker snapshots.
+- [ ] Original acceptance: resource/palette authoring, accessibility and actual native OS/full editor journeys; release collection remains blocked separately.
+
+Creation gate: this in-place PROCESS list serves the operator's explicit granular TODO
+request. The observed defect is fixed-size extraction despite existing bounded rectangular
+generation. It gates this handoff; retire the active list at original editor acceptance,
+retaining history. No integrity exception or new machinery. Opportunity cost remains
+broader visual work and the unavailable macOS P0 incident.
+
+Patch-selection source `4a9fe4c6623ad34970cbae9acbe86a0ca26e8664`, tree
+`5d24b2e05f64954e53fecff07e3465d3cd9dcc02`, begins R229. Nineteen unchanged
+commands and all previous 103 required completions remain; three new probes in each
+renderer mode extend the predeclared requirement to 109. R229 stops at four formatting
+layouts before compilation/tests: source `failed/1`, one command/log pair `1/0`, outer
+6 / runner identity zero, finished 2026-10-20 01:10:27 UTC. All ten manifest files /
+28,244 bytes and exact membership recompute; owned SID 1251569 is absent. Profile SHA256
+`a37b5c75188afe2b076ea73a6b02cf85eb6c80a39ba8f381b02f2a05afa804d4`;
+launcher `84b4108e26004cf52d9f88d069a0da5735a7f6c52f8c37a51c97f8292a4fd6e9`.
+
+Manual formatting correction `21a23e7386a78671e98fbad2bbcc28be7bbf469d`, tree
+`ee04680e2b1124cb519cf7f96a89600fb7093238`, starts R230 with unchanged commands,
+reader and planted negatives. Profile SHA256
+`0d3c20683e137e7faf6b737cbe0948b7fe9e2844b20122a5be990be82c894db2`;
+launcher `cd8a4166e4a9c7b88c0156549285480d3a11f0d526778632dba1190116709bf4`.
+Formatting and four repository guards pass. Fresh review finds a repeated source row
+could legitimately let the real N=2 solver omit the fourth row. Stop only inspected
+native group 1274814 (SID 1270636) during core compilation, before any compiler/test
+success claim. Paint two source cells through production authoring so all four wrapped
+row pairs differ; change their independently expected values, with no production or
+solver/gate/tolerance change. Retain the interrupted attempt and repeat qualification.
+
+R230 ends at 2026-10-20 01:12:30 UTC with outer 6 / runner identity zero. Its final
+source verdict and manifest are absent after interruption; retain all 19 raw files /
+36,378 bytes, five completed zero command/log pairs and the incomplete core compilation
+log. The five recorded log hashes recompute; commands SHA256
+`4f064ecee1c123c1c44e419e4ba6bc0e4cc4ca9afe1b3d9d05427d01ef973a80`.
+Owned SID 1270636 is absent. No compiler/test success or synthetic receipt is claimed.
+
+Discriminating-source correction `efef1a6121f85ea7462e31a7ee011dfa8085e9b6`, tree
+`da121ddea5aa65da4654410bc1b08b44a27bd36f`, starts R231, retaining all nineteen
+commands, all 109 required completions and byte-identical reader/planted negatives.
+Profile SHA256 `0ae86d622d9585a8c7dd736e266da4d2d462bb12368b94edaa59d3af1aa91d6c`;
+launcher `e913a9e06e87765f64093bdaa248c36aa08f9454571efffe4873a3c9bb25e3b2`.
+Exact-file UBS remains non-clean: exit 1, two existing timestamp critical heuristics,
+2,713 warnings and 909 informational findings. Qualification/publication pending.
+
+R231 final self-review: qualified source `efef1a6121f85ea7462e31a7ee011dfa8085e9b6`
+is pushed normally to both required refs. Four patch controls select independent source-
+bounded dimensions using the core exemplar/output-work budget. Selection is presentation-
+only; Extract copies actual saved-map cells across both toroidal edges into one validated
+shared-history edit with source hash, origin and dimensions. Generated output, recipe
+round trips, history, unchanged source/science, budget/file/job guards and production
+input through owner Apply are observed in both renderer modes. Existing assertions,
+viewport/deadlines, ignored diagnostics, dependency/golden files and external gates stay
+unchanged; all nineteen command files are byte-identical to R228.
+
+R231 finishes 2026-10-20 01:31:09 UTC: nineteen zero command/log pairs and typed source
+`pass/0`. Fresh solo execution of the retained reader and planted negatives verifies all
+109 predeclared required completions. Six raw logs agree with nonzero suite summaries:
+436 passing executions / 256 distinct passing names / zero failures / six executions of
+three unchanged ignored HUD diagnostics. Core maps 29; runtime focused/channel 1/37;
+renderer focused 5; default renderer 190 (187 library + 2 + 1 integration), feature-off
+renderer 174 (171 + 2 + 1). No full-workspace-test or independent-verifier claim.
+
+Proof directory:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-extract-patch-20261020-efef1a61-r231-local`.
+All 136 manifest files / 370,410,363 bytes and exact membership recompute. Nineteen log
+hashes, profile byte identity and prelaunch SHA256, clean source main commit/tree and
+retained source status, frozen clean runner main commit/tree, five helper hashes and ten
+before/after OK lines verify; owned SID 1289619 is absent. Verdict SHA256
+`eefe6e94142544e775ea46aac2f340886b2b621062f66ab2c3b85df5f0e4744f`;
+manifest `bfcb088c96ddae0e5fbeb798f1859af9fd4c2830d433a4901cd5535c7ec2d850`.
+Build `d8115943-f1a5-4af4-9bfa-e0eacedd3716`;
+outer envelope `a191a314-fef1-4985-b6d3-ccf5d3a8b844`.
+
+Outer DSR exits 6 / runner identity zero: the actual final private-cache guard refuses
+Proptest's tracked `README.md` symlink to `proptest/README.md`, mode `120000`, blob
+`39f5a6b376a8fe6c42a45e072e5f49bf1e417412`, before artifact collection. Guard unchanged;
+no collected release. The fresh verification initially looked in the native child log,
+which lacks that collection message; the retained parent attempt log contains both actual
+refusal lines. No reason is inferred solely from the exit code. `bd-build-farm-reliability-lb19.2`
+remains open. R229 failure and R230 interrupted/incomplete evidence remain retained.
+Original `bd-2z0.10.7` status, acceptance and graph stay unchanged and in progress.
+Resource/palette authoring, accessibility and actual native OS/full editor journeys remain.
+Separate `/dp` work remains inventory-only in this continuation.
+
+Patch-selection solo audit (2026-10-20; source window `b4aa5d09..efef1a61`, pending
+documentation/tracker handoff; this is self-review, not independent verification):
+
+Creation worksheet: running product code does not branch on this in-place TODO/audit.
+Consumer is the operator explicitly requesting granular tracking and an honest reality
+check; gate is the patch-selection handoff. Observed defects are fixed 3×3 extraction,
+R229 formatting and an ambiguous taller-source oracle. Retire the active checklist at
+original editor acceptance, preserving history. The integrity-control exception is not
+invoked: no separate recovery control is proposed. Highest-priority ready item is the
+macOS P0 `bd-e6ff`; this Linux lane cannot establish its host recovery. An hour on actual
+native acceptance or visual usability could be more valuable; keep this record bounded
+and finish the already-owned editor increment rather than create new machinery.
+
+Real-work worksheet: README purpose is deterministic artificial life with GPU interaction
+and first-class analytics. Actual `git log --stat` gives USER `4a9fe4c6` (patch controls
+and their tests), ENABLER `21a23e73` (format correction) and ENABLER `efef1a61`
+(discriminating test source). Pending audit/plan/tracker records are PROCESS; README
+instructions are USER documentation. No closes and no subagents. This is classification,
+not a commit-count target. Hard questions: (1) demonstrate opening an artifact, choosing
+a wider patch, extracting and generating/applying it; feature-off headless input observes
+this, actual native-window demonstration remains unverified. (2) Omitting PROCESS would
+leave runtime behavior unchanged but remove the requested failure/remaining-work record.
+(3) Both corrections are consumed by R231: formatting passes and the actual taller-source
+generation probe passes in feature-off mode. (4) The still-open native editor journey and
+macOS P0 matter more broadly; continue the owned connection because it removes an observed
+authoring limit with existing production machinery. (5) Solo; no pane/close comparison.
+(6) No spec substitution or follow-up laundering: original task and acceptance stay open.
+Verdict HEALTHY for this bounded capability increment; avoidable formatting and source-
+oracle retries cost time, while source checks cannot complete the native product journey.
+
+Honesty inventory, all twenty prompts:
+
+1. No (checked: all three exact source diffs; prior tests, ignores, deadlines and CI unchanged).
+2. No (checked: real draft painting, file decoding, solver, host and production GPUI callbacks).
+3. No (checked: no golden, snapshot or dependency file changes).
+4. Yes: runtime input-budget guards share existing core bounds; required DSR probes grow
+   from 103 to 109. No external gate or old assertion is weakened. The separately reviewed
+   oracle correction paints distinct real source rows instead of relaxing the expected output.
+5. No (checked: two independently expected wrapped rectangles and different generated outputs;
+   no production test/CI sniffing or special source path).
+6. No (checked: all six raw nonzero suite summaries, 436 passing executions, zero failures,
+   six executions of three unchanged ignored diagnostics; all 109 required completions).
+7. No (checked: completed raw commands/events, typed source receipt and fresh reader verification).
+8. No (checked: production headless input and software-lane evidence explicitly qualified;
+   no native-window, hardware, independent, performance or full-workspace-test claim).
+9. No (checked: R229 failure and deliberately interrupted R230 are disclosed, including
+   missing final receipt/manifest; the actual DSR collection refusal remains unresolved).
+10. No (checked: command/log channels and separate CASS/UBS stderr retained; interrupted
+    evidence is explicitly incomplete).
+11. No (checked: original `bd-2z0.10.7` remains in progress; no close/new acceptance follow-up).
+12. No (checked: plan records implementation status; original acceptance text is unchanged).
+13. No (checked: solo execution, no delegated closure).
+14. No (checked: no subagent dispatch).
+15. No (checked: own exact diffs and raw events reviewed; no peer report substituted).
+16. No (checked: no swarm/refusal farming and no closure credit).
+17. No (checked: no agent agreement used as verification; repeated source evidence counts once).
+18. No (checked: nineteen commands/109 required completions predeclared; failures, ignored
+    executions and distinct-name countermetrics retained).
+19. Yes: explain the avoidable formatting failure and ambiguous taller-source design; ordinary
+    corrections retain both attempts instead of rewriting history or asserting a false failure.
+20. Strongest evidence is actual production input through all four patch controls,
+    real file inspection and guarded owner Apply, plus independent exact wrapped cells and
+    different generated outputs in both modes. R231 retains commands/raw events for
+    re-execution; fresh full reader verification passes. This remains solo headless evidence.
+
+CASS bounded check: status claims healthy/fresh, but last indexed time remains
+2026-09-16T19:46:10.964Z. Session-derived `saved artifact patch extraction` returns two
+of four matches, both in the 2026-09-03 `PlanDocScout.jsonl`. Following physical lines
+29 and 13 with context one shows rate-limit records and an older plan read, respectively,
+not the indexed excerpts. Do not treat that coordinate mismatch as historical clearance.
+Prior five phrase sweeps remain in earlier audits; they were not rerun for this increment.
+Disposition: corrections are in place and disclosed in comments 2885–2886 and this record;
+RH-5 requires distinguishing source cells, RH-1 keeps old gates/expectations intact,
+SM-11 retains every attempt, and RH-2 forbids promoting headless proof to native acceptance.
+No new process machinery or independent verification is claimed.
+
 Native rectangular sample sizing (`bd-2z0.10.7`, 2026-10-19, in progress):
 
 - [x] Recheck ready work, existing core limits, original acceptance and reservations.
@@ -20,7 +192,7 @@ Native rectangular sample sizing (`bd-2z0.10.7`, 2026-10-19, in progress):
 - [x] Extend production headless input without changing previous assertions, viewport or deadlines (both modes).
 - [x] Review exact diffs/UBS and all nineteen pinned DSR checks with prior probes retained.
 - [x] Recompute evidence, publish qualified source and prepare existing docs/tracker snapshots.
-- [ ] Original acceptance: palette/resource authoring, configurable saved-artifact patch dimensions, accessibility and actual native OS/full editor journeys.
+- [ ] Original acceptance: palette/resource authoring, accessibility and actual native OS/full editor journeys. Saved-artifact dimensions subsequently qualify in R231 above.
 
 Creation gate: this in-place PROCESS list serves the operator's explicit granular TODO
 request. The observed defect is recipe-only sample dimensions despite the existing bounded

@@ -2410,6 +2410,27 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Saved-artifact patch selection, 2026-10-20 (`bd-2z0.10.7`):**
+connect bounded width/height selection to actual saved-map extraction, not draft repetition.
+Selection preserves draft/history/preview; Extract copies wrapped source cells into one
+validated shared-history edit. Verify provenance, real generation, bounds/job guards and
+production input while retaining original native OS/full editor acceptance unchanged.
+
+Qualified source `efef1a6121f85ea7462e31a7ee011dfa8085e9b6` is published to both
+required refs. R231 passes nineteen source command/log pairs and typed `pass/0`; fresh
+solo reader/planted-negative execution verifies 109 required completions. Raw totals:
+436 passing executions / 256 distinct names / zero failures / six executions of three
+unchanged ignored diagnostics. Both modes observe distinct wider/taller wrapped source
+cells and generated outputs, source-hash/origin/dimension provenance, recipe/history,
+budget/file/job guards and production input through guarded owner Apply. Selection alone
+preserves draft/history/preview; only Extract edits. All 136 manifest files / 370,410,363
+bytes and source/profile/log/helper identities recompute; all nineteen command files
+match R228. Outer DSR exits 6 on the actual tracked Proptest README symlink before
+collection; guard unchanged, no collected release. R229 formatting failure and interrupted
+R230 evidence remain, including R230's absent final source receipt/manifest. Resource/
+palette authoring, accessibility and actual native OS/full editor acceptance stay open.
+No original acceptance or dependency is narrowed and no item closes.
+
 **[Currently In Progress] Native rectangular sample sizing, 2026-10-19 (`bd-2z0.10.7`):**
 connect exemplar width/height controls to bounded, whole-draft validated crop/repeat edits.
 Preserve seed, output grid and constraints; clamp overlapping pattern size when shrinking.
