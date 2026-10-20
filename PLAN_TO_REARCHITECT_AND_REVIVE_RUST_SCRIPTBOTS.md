@@ -2410,6 +2410,24 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Identical map paint, 2026-10-20 (`bd-2z0.10.7`):**
+make repeated painting preserve draft revision, undo/redo and a current preview at the
+shared core boundary. Validate before the no-op guard; distinguish absent overrides,
+all fields and signed-zero payloads. Exercise actual production mouse/Space input in
+both generator modes plus a changed-value counterexample. Keep original acceptance,
+all prior tests and the pinned nineteen-command source lane intact.
+Implementation is qualified at `f9cbca49a5d3e8393c4e1771f86f8e5da38718d3`
+and pushed to both required refs. R237 passes all nineteen source commands and typed
+`pass/0`; both renderer modes exercise the new actual input/owner-Apply journey.
+Core maps pass 31/31; six raw test logs total 444 passing executions / 261 distinct
+passing names, zero failures and six executions of three unchanged ignored diagnostics.
+Fresh solo reader/planted negatives verify the old 113 plus four new required
+completions; all 138 manifest files / 370,416,194 bytes and identities recompute.
+R236's formatting failure remains retained. Final DSR collection still exits 6 on
+the existing Proptest README cache symlink; the guard is unchanged and no release is
+collected. Native OS/resource/full editor acceptance remains open under the original
+Bead, with exact pins, TODO and bounded honesty audit in the reality-check report.
+
 **[Currently In Progress] Map accessibility palette, 2026-10-20 (`bd-2z0.10.7`):**
 connect preview, exemplar and artifact grids to the shared application palette using the
 existing core transform. Preserve Natural colors; show a named terrain legend and

@@ -10,6 +10,126 @@ meadow and durable browser laboratory also remain unfinished.**
 
 ### Current implementation and granular TODO — 2026-10-14
 
+Identical map paint (`bd-2z0.10.7`, 2026-10-20, in progress):
+
+- [x] Refresh authoritative BR/BV priorities and inspect remaining native editor gaps.
+- [x] Trace identical painting to the shared draft checkpoint, redo loss and preview revision mismatch.
+- [x] Preserve revision/history only for an identical existing constraint, after validation; retain explicit overrides, signed-zero changes and genuine edits (source `f9cbca49`).
+- [x] Verify first paint, every field, repeated paint, undo/redo, invalid input and history limits in core (31/31 map tests in R237).
+- [x] Exercise repeated mouse/Space/Enter painting and actual changed painting in both generator modes through production GPUI input; retain preview identity, eligibility, redo and science (both R237 renderer modes).
+- [x] Qualify exact clean source through the existing pinned DSR checks, review raw results and publish normally (R237/source `f9cbca49`, both required refs).
+- [x] Update Beads/evidence and complete the bounded honesty audit; original native acceptance stays open.
+
+Creation worksheet: the code is FEATURE, consumed by all draft paint callers. This
+existing PROCESS list is explicitly requested by the operator and gates this handoff;
+the observed source defect is unconditional checkpointing on duplicate paint. Retire
+the active list after qualification. No integrity-control exception is needed. The
+Mac P0 is unavailable here; fixing the actual shared editor defect takes priority over
+new process artifacts or a resource layer without an existing scientific contract.
+
+Source `f4c0330a1f4e07fcfd47231f9b9c8ffd74e86e41` adds the shared guard and
+three regression functions. Bounds and finite-value validation precede the guard;
+new explicit overrides, removals, every discrete/numeric field and signed-zero
+changes remain edits. The production input journey repeats an existing paint with
+mouse/Space/Enter, observes unchanged draft and preview pointer, restores a different
+cell through redo, then changes terrain, undoes/redoes and applies Sand through the
+real runtime owner. Both rule/sample modes keep the scientific digest unchanged
+until Apply and retain tick zero afterward. This is headless GPUI input, not native
+OS/window-system or assistive-technology acceptance. No pre-fix failing test run is
+claimed; the defect was identified from the unconditional shared checkpoint.
+
+R236, `map-identical-paint-20261020-f4c0330a-r236-local`, stops before compilation
+at one assertion layout: source `failed/1`, command/log `1/0`, outer DSR `6`, runner
+identity zero, finished 2026-10-20 02:56:18 UTC. All ten manifest files / 26,894 bytes
+and exact membership recompute. Profile SHA256
+`c4df38defee4a44285f4f41728bc94d1cd379b30597af9846079ef1713bf8441`;
+launcher `d33bb6bb4d7acf890caa2b0b5cc668128903c5d5e4705c28e358386db20fff92`.
+Manual layout correction `f9cbca49a5d3e8393c4e1771f86f8e5da38718d3`, tree
+`b9faaa117458fe6153742e0b3972340efa3401c7`, changes no condition or expectation.
+R237 profile SHA256 `09c988c0047bbb3d806fed58a36f3edf143d56453a97b0eb2e2b12f769c36320`;
+launcher `412ac76af4722d2dfec6f6ef22107e307f4d1ab6662ef08272544dab9ae242ce`.
+All nineteen command definitions and the old 113 completion requirements are retained;
+the two new core tests and input test in both renderer modes raise the requirement to 117.
+
+R237 raw test logs: core maps 31; runtime focused/channel 1/37; renderer focused 5;
+default renderer 193; feature-off renderer 177. Total 444 passing executions / 261
+distinct passing names / zero failures / six executions of three unchanged ignored
+HUD diagnostics. Fresh solo retained-reader/planted-negative execution validates
+all 117 required completions; this is self-verification, not independent evidence.
+R237 finishes 2026-10-20 03:14:54 UTC: all nineteen command/log pairs are zero,
+including workspace check/strict Clippy and the final analytics build; typed source
+verdict is `pass/0`. All 138 manifest files / 370,416,194 bytes, exact membership,
+nineteen log hashes, unchanged command files, profile bytes/pins and clean source
+commit/tree verify. A second fresh solo reader/planted-negative execution again
+verifies all 117 completions. Ten before/after helper checks and runner identity pass;
+owned R236/R237 SIDs 2048278/2054494 are absent. Source is pushed normally to both
+required refs. Proof directory:
+`/data/tmp/scriptbots-fxaa-local-20261016-lilacelm/proofs/map-identical-paint-20261020-f9cbca49-r237-local`.
+Verdict SHA256 `599257ca4a10a35c1c2748b91adbf6da06b74a189ec4da071cc7b120e93dc80a`;
+manifest `99d89f8af1eca7b087c58522f1c5e100ed4934472c6aeb5156e793ceeb0b920d`.
+Build `4f8468aa-1c5a-4016-b5e4-45c41a2b5bd7`, envelope
+`3ce4deba-fc5d-476c-84a0-4c5cfc387b23`. Outer DSR exits 6/runner identity zero:
+the actual parent attempt log refuses the Proptest `README.md` cache symlink before
+artifact collection. Guard unchanged, artifact path empty, no collected release;
+`bd-build-farm-reliability-lb19.2` stays open. No performance, hardware, independent,
+native OS or full-workspace-test proof is inferred.
+UBS core exits zero with 0 critical / 5,406 warnings / 1,056 informational; renderer
+exits one with the same two pre-existing timestamp critical heuristics / 2,879 warnings /
+917 informational. These are not clean scans. No suppression, dependency, golden,
+viewport, deadline, old assertion or external gate is changed.
+
+Bounded audit, `be508aec..f9cbca49` plus this prepared handoff: the README's purpose is
+evolving autonomous agents with interpretable interactive experiments. Inventory:
+one USER source fix, one ENABLER formatting correction, two prepared PROCESS snapshots
+(docs/TODO and Beads), zero UNKNOWN, zero closes, no subagents. This is one editor fix,
+not project completion or a performance win. The mandatory DSR lane and handoff cost
+more elapsed time than the small runtime guard; that cost earns no capability credit.
+Real-work answers: (1) demo repeated paint, preserved redo and a still-applicable preview;
+(2) without process the same fix ships, but the explicitly requested tracking is missing;
+(3) formatting enabled the actual source lane; (4) full native authoring remains old/open,
+with resource semantics still absent, while this Linux lane fixes a confirmed core defect;
+(5) solo, so no close-farming comparison applies; (6) no acceptance edits, splits or closes.
+Verdict: HEALTHY bounded fix; stop expanding the machinery and finish qualification.
+
+Honesty inventory, same bounded window; all source hunks and retained profile changes
+read, with raw suite summaries recomputed directly from logs by the solo reader:
+
+1. No (checked: only new tests plus unchanged assertion layout; no old test weakened).
+2. No (checked: shared production draft/GPUI/runtime owner, no new doubles).
+3. No (checked: exact changed paths contain no golden or snapshot).
+4. Yes: new required test names strengthen the existing reader; all old commands,
+   planted negatives, requirements and tolerances are byte-preserved. No relaxation.
+5. No (checked: no environment-specific production branch or hard-coded success).
+6. No (checked: six nonzero raw suites, exact starts/completions and 117 requirements).
+7. No (checked: nineteen executed commands, typed source pass and outer collection refusal).
+8. No (checked: headless input/software lane is explicitly qualified above).
+9. No (checked: R236 formatting failure is retained; no first-attempt-success claim).
+10. No (checked: cited scans/builds retain stdout and stderr; command/log exits recorded).
+11. No (checked: original Bead remains in progress with unchanged acceptance/graph).
+12. No (checked: plan adds progress only; original criteria remain unchanged).
+13. No (checked: solo; no subagent or tracker closure).
+14. No (checked: no delegation).
+15. No (checked: no delegated report accepted).
+16. No (checked: no panes, refusals or closes credited as delivered capability).
+17. No (checked: self-verification labeled solo, not independent).
+18. No (checked: six log lanes, old 113 plus four new completions declared before launch).
+19. Yes: R236 caught a manual formatting mistake; corrected transparently in `f9cbca49`.
+    A final log-reader inspection also hit a schema `KeyError` after the source/manifest
+    checks passed; selecting the aggregate target record then verifies the actual
+    parent refusal and absent processes. No artifact was modified to satisfy it.
+20. Strongest evidence: actual input changes the draft and reaches owner Apply, while
+    repeated input retains redo and the preview; raw logs and pinned profile are retained.
+
+Disposition: RH-1 keeps every old gate intact and strengthens positive requirements;
+RH-2 keeps headless proof below native acceptance; SM-11 retains the failed attempt and
+correction. No hidden failure or acceptance reduction found in this bounded review.
+CASS status claims fresh/healthy but last indexed 2026-09-16. Workspace-derived query
+`map_editor_identical_paint`, limit two, returns two hits; both followed with context.
+They resolve to historical exploration/tool metadata at physical lines 58/60 of
+`rollout-2026-09-04T22-29-42-01a06e8a-c1d3-7333-b9cd-f367479333cf.jsonl`,
+not relevant paint verification or historical clearance. Query/views are retained in
+`/data/tmp/scriptbots-identical-paint-cass-*-20261020.*`. No broader history claim.
+
 Map accessibility palette (`bd-2z0.10.7`, 2026-10-20, in progress):
 
 - [x] Refresh BR/BV readiness, original acceptance and live palette/grid consumers.

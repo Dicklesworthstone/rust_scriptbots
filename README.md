@@ -637,8 +637,10 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   permeability, runoff bias, basin rank, channel priority and swim cost. For numeric
   channels, **Value −0.1 / +0.1** adjusts the disclosed brush value: 0–1 for normalized
   fields, −1–1 for runoff and 0–10 for swim cost. Terrain uses the existing terrain brush.
-  Painting preserves the cell's other overrides and is one undoable draft edit. Changing
-  the brush alone does not change the draft or invalidate its preview. Regenerate to see
+  Painting preserves the cell's other overrides and is one undoable draft edit. Repeating
+  the exact same painted override preserves undo/redo and the current preview; a new or
+  changed override still requires regeneration. Changing the brush alone does not change
+  the draft or invalidate its preview. Regenerate to see
   the actual stored value for the selected channel at the last painted cell; that label
   names the preview revision, which may precede newer edits. Recipe files preserve every
   painted channel. **Hazard override** adds **Generated default / Stamp hazard** choices:
