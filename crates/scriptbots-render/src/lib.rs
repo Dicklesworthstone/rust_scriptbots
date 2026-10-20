@@ -4901,7 +4901,7 @@ impl SimulationView {
                         this.map_button_action(action, cx);
                         cx.notify();
                     }
-                    cx.stop_propagation();
+                    // GPUI's default mouse listener must still focus the button.
                 }),
             )
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -5352,7 +5352,6 @@ impl SimulationView {
                         cx.listener(move |this, _, _, cx| {
                             this.map_action(MapAction::SelectBrush(kind));
                             cx.notify();
-                            cx.stop_propagation();
                         }),
                     )
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -5510,7 +5509,6 @@ impl SimulationView {
                             cx.listener(move |this, _, _, cx| {
                                 this.map_action(MapAction::SampleCell(x, y));
                                 cx.notify();
-                                cx.stop_propagation();
                             }),
                         )
                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -5701,7 +5699,6 @@ impl SimulationView {
                             cx.listener(move |this, _, _, cx| {
                                 this.map_action(MapAction::InspectCell(x, y));
                                 cx.notify();
-                                cx.stop_propagation();
                             }),
                         )
                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -6083,7 +6080,6 @@ impl SimulationView {
                                 cx.listener(move |this, _, _, cx| {
                                     this.map_action(MapAction::Paint(x, y));
                                     cx.notify();
-                                    cx.stop_propagation();
                                 }),
                             )
                             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -25261,6 +25257,28 @@ mod command_characterization_tests {
             redraw(&mut lab);
             assert_eq!(session.map_sandbox.lock().unwrap().brush, kind);
             click(&mut lab, "map-cell-0-0");
+            let keyboard_kind = if kind == TerrainKind::Rock {
+                TerrainKind::Grass
+            } else {
+                TerrainKind::Rock
+            };
+            session.map_sandbox.lock().unwrap().brush = keyboard_kind;
+            lab.simulate_keystrokes("space");
+            redraw(&mut lab);
+            assert_eq!(
+                session
+                    .map_sandbox
+                    .lock()
+                    .unwrap()
+                    .draft
+                    .state
+                    .constraints
+                    .get(0, 0)
+                    .unwrap()
+                    .terrain_kind,
+                Some(keyboard_kind)
+            );
+            click(&mut lab, "map-undo");
             click(&mut lab, "map-generate");
             let deadline = Instant::now() + Duration::from_secs(10);
             while session.map_sandbox.lock().unwrap().job.is_some() {
@@ -25328,6 +25346,19 @@ mod command_characterization_tests {
             };
             assert_eq!(sample.sample_tiles[0], TerrainKind::Bloom);
         }
+        session.map_sandbox.lock().unwrap().brush = TerrainKind::Rock;
+        lab.simulate_keystrokes("space");
+        redraw(&mut lab);
+        {
+            let sandbox = session.map_sandbox.lock().unwrap();
+            let DraftGeneratorConfig::SampleBased { sample } =
+                &sandbox.draft.state.generator_config
+            else {
+                panic!("keyboard paint retains sample mode");
+            };
+            assert_eq!(sample.sample_tiles[0], TerrainKind::Rock);
+        }
+        click(&mut lab, "map-undo");
         click(&mut lab, "map-undo");
         assert_eq!(
             session.map_sandbox.lock().unwrap().draft.state,
@@ -25353,6 +25384,10 @@ mod command_characterization_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         click(&mut lab, "map-artifact-cell-5-4");
+        session.map_sandbox.lock().unwrap().inspection_cell = (0, 0);
+        lab.simulate_keystrokes("space");
+        redraw(&mut lab);
+        assert_eq!(session.map_sandbox.lock().unwrap().inspection_cell, (5, 4));
         click(&mut lab, "map-palette");
         click(&mut lab, "map-terrain-brush-ShallowWater");
         assert!(lab.debug_bounds("map-terrain-legend").is_some());
