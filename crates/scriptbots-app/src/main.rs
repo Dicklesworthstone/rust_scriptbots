@@ -533,6 +533,7 @@ fn main() -> Result<()> {
     let launch_scenario_shared = Arc::new(launch_scenario.clone());
 
     if let Some(ticks) = cli.characterize_v0 {
+        configure_simulation_parallelism(launch_thread_policy(&cli, None).threads)?;
         run_characterization_v0(&cli, config, launch_scenario, config_overrides, ticks)?;
         return Ok(());
     }
@@ -571,6 +572,7 @@ fn main() -> Result<()> {
     }
 
     if cli.replay_db.is_some() {
+        configure_simulation_parallelism(launch_thread_policy(&cli, None).threads)?;
         run_replay_cli(
             &cli,
             &config,
@@ -665,12 +667,7 @@ fn main() -> Result<()> {
     // Optional: profiling runs (headless). Execute and exit if specified.
     let thresholds = thresholds_from_cli(&cli);
     if cli.profile_steps.is_some() || cli.profile_storage_steps.is_some() {
-        let env_threads = std::env::var("SCRIPTBOTS_MAX_THREADS")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|threads| *threads > 0);
-        let profile_thread_policy =
-            resolve_thread_policy(cli.threads, env_threads, None, cli.low_power);
+        let profile_thread_policy = launch_thread_policy(&cli, None);
         // The same resolved value reaches Rayon's builder in the headless lane.
         configure_simulation_parallelism(profile_thread_policy.threads)?;
         if let Some(ticks) = cli.profile_steps {
@@ -755,11 +752,7 @@ fn main() -> Result<()> {
     // `scriptbots_app::precedence`. The bug that arrangement used to hide: a user
     // who exported SCRIPTBOTS_MAX_THREADS=16 and passed --low-power had their
     // explicit value silently replaced with 2.
-    let env_threads = std::env::var("SCRIPTBOTS_MAX_THREADS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|threads| *threads > 0);
-    let policy = resolve_thread_policy(cli.threads, env_threads, auto_tune_threads, cli.low_power);
+    let policy = launch_thread_policy(&cli, auto_tune_threads);
     tracing::info!(
         threads = ?policy.threads,
         source = %policy.source,
@@ -1472,6 +1465,15 @@ fn configure_simulation_parallelism(threads: Option<usize>) -> Result<()> {
             .context("failed to initialize the resolved simulation thread budget")?;
     }
     Ok(())
+}
+
+/// Read the launch environment at one boundary; keep precedence in the pure resolver.
+fn launch_thread_policy(cli: &AppCli, auto_tune_threads: Option<usize>) -> ThreadPolicy {
+    let env_threads = std::env::var("SCRIPTBOTS_MAX_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|threads| *threads > 0);
+    resolve_thread_policy(cli.threads, env_threads, auto_tune_threads, cli.low_power)
 }
 
 /// Every renderer environment value startup publishes for a later reader.

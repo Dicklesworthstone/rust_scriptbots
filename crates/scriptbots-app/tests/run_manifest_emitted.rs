@@ -126,6 +126,27 @@ fn manifest_digest_for_test(manifest: &RunManifestV3) -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
+fn observed_science_pool_widths(output: &std::process::Output) -> Vec<usize> {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.lines()
+        .filter(|line| line.contains("observed science-step Rayon pool"))
+        .map(|line| {
+            line.split_once("rayon_threads=")
+                .expect("science-step observation names its measured width")
+                .1
+                .split_whitespace()
+                .next()
+                .expect("measured width")
+                .parse()
+                .expect("numeric measured width")
+        })
+        .collect()
+}
+
 #[test]
 fn persisted_manifests_withhold_unverified_host_session_continuation() {
     let mut previous_roster = None;
@@ -240,25 +261,7 @@ fn resolved_thread_budget_controls_actual_science_pool() {
             .end
             .validate_contract()
             .expect("complete bootstrap digest");
-        let text = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let widths: Vec<usize> = text
-            .lines()
-            .filter(|line| line.contains("observed science-step Rayon pool"))
-            .map(|line| {
-                line.split_once("rayon_threads=")
-                    .expect("science-step observation names its measured width")
-                    .1
-                    .split_whitespace()
-                    .next()
-                    .expect("measured width")
-                    .parse()
-                    .expect("numeric measured width")
-            })
-            .collect();
+        let widths = observed_science_pool_widths(&output);
         println!(
             "{label}: actual science widths {widths:?}; retained {}",
             dir.display()
@@ -283,6 +286,41 @@ fn resolved_thread_budget_controls_actual_science_pool() {
             "same bootstrap science across observed pools"
         );
     }
+}
+
+#[test]
+fn characterization_honors_an_explicit_thread_budget() {
+    let dir = run_dir("characterization_thread_budget");
+    let path = dir.join("characterization.json");
+    let ticks = MANIFEST_BOOTSTRAP_TICKS.to_string();
+    let output = launch_with(
+        &dir,
+        &[
+            ("RAYON_NUM_THREADS", "8"),
+            ("RUST_LOG", "info,scriptbots_core::parallelism=debug"),
+            ("NO_COLOR", "1"),
+        ],
+        &[
+            "--characterize-v0",
+            &ticks,
+            "--characterization-out",
+            path.to_str().expect("UTF-8 output"),
+            "--threads",
+            "1",
+            "--brain",
+            "mlp",
+            "--set",
+            "population_minimum=24",
+        ],
+    );
+    std::fs::write(dir.join("stdout.log"), &output.stdout).expect("retain stdout");
+    std::fs::write(dir.join("stderr.log"), &output.stderr).expect("retain stderr");
+    let trace = characterization_trace_of(&output, &path);
+    assert_eq!(trace.manifest.build.rayon_num_threads.as_deref(), Some("8"));
+    assert_eq!(
+        observed_science_pool_widths(&output),
+        vec![1; usize::try_from(MANIFEST_BOOTSTRAP_TICKS).expect("bounded steps")]
+    );
 }
 
 #[test]
