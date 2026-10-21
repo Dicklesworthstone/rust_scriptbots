@@ -897,10 +897,13 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
     // ------------------------------------------------------------------
     let mut verify = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
     verify
+        .env("RAYON_NUM_THREADS", HOST_INHERITED_RAYON_THREADS)
+        .env("RUST_LOG", "info,scriptbots_core::parallelism=debug")
+        .env("NO_COLOR", "1")
         .arg("--replay-db")
         .arg(&baseline_db)
         .arg("--threads")
-        .arg("1")
+        .arg(HOST_THREAD_BUDGET.to_string())
         .arg("--set")
         .arg(format!("rng_seed={SEED}"))
         .arg("--set")
@@ -908,6 +911,7 @@ fn mock_free_terminal_to_sqlite_export_and_replay_e2e() {
         .arg("--set")
         .arg("replay_event_tick_cap=65536");
     let verified = verify.output().expect("failed to run replay verification");
+    assert_host_science_pool(&verified, ledger.tick_count);
     let verify_out = strip_ansi(&format!(
         "{}{}",
         stdout_text(&verified),
