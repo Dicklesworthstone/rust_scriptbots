@@ -2273,9 +2273,12 @@ fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
     source_tick
         .checked_add(ticks)
         .context("host continuation tick limit overflowed")?;
+    let manifest: RunManifestV3 = serde_json::from_str(&reader.run_manifest()?.manifest_json)
+        .context("host continuation requires readable launch provenance")?;
+    reader.close()?;
+    configure_simulation_parallelism(manifest.thread_policy.and_then(|policy| policy.threads))?;
     let world = prepare_bounded_host_continuation(&checkpoint, cli.brain)
         .with_context(|| format!("host checkpoint {checkpoint_id} at source tick {source_tick} in {path} refused world reconstruction"))?;
-    reader.close()?;
     let mut pipeline = StoragePipeline::recover_existing_run(path, run_id)
         .context("host continuation refused leased run recovery")?;
     let prepared = (|| -> Result<HostThread> {

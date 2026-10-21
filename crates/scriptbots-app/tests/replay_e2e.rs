@@ -21,6 +21,8 @@ const BOOTSTRAP_TICKS: u64 = 24;
 const HOST_CONTINUATION_TICKS: u64 = 18;
 const HOST_HANDOFF_TICK: u64 = 7;
 const HOST_MINIMUM_POPULATION: usize = 20;
+const HOST_THREAD_BUDGET: usize = 1;
+const HOST_INHERITED_RAYON_THREADS: &str = "8";
 
 /// Keep the subprocess streams beside the closed databases, including failed invocations.
 /// DSR uses a retained TMPDIR; RCH can select an external SCRIPTBOTS_TEST_ARTIFACT_ROOT.
@@ -42,6 +44,9 @@ fn retained_host_output(directory: &Path, name: &str, command: &mut Command) -> 
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     command
+        .env("RAYON_NUM_THREADS", HOST_INHERITED_RAYON_THREADS)
+        .env("RUST_LOG", "info,scriptbots_core::parallelism=debug")
+        .env("NO_COLOR", "1")
         .env(
             "RCH_BUILD_SOURCE",
             "runtime-source-must-not-replace-embedded-identity",
@@ -80,7 +85,9 @@ fn produce_host_handoff(
     let mut command = base_command(env!("CARGO_BIN_EXE_scriptbots-app"));
     command
         .env("SCRIPTBOTS_STORAGE_PATH", database)
-        .args(["--storage", "file", "--threads", "1", "--brain", brain])
+        .args(["--storage", "file", "--threads"])
+        .arg(HOST_THREAD_BUDGET.to_string())
+        .args(["--brain", brain])
         .arg("--bootstrap-ticks")
         .arg(ticks.to_string())
         .arg("--checkpoint-handoff")
@@ -100,7 +107,9 @@ fn produce_host_handoff(
     if brain == "mixed" {
         command.args(["--set", "neuroflow.enabled=true"]);
     }
-    retained_host_output(directory, name, &mut command)
+    let output = retained_host_output(directory, name, &mut command);
+    assert_host_science_pool(&output, ticks);
+    output
 }
 
 fn continue_host_handoff(
@@ -121,7 +130,41 @@ fn continue_host_handoff(
         .arg("--continue-ticks")
         .arg(ticks.to_string())
         .args(["--brain", brain]);
-    retained_host_output(directory, name, &mut command)
+    let output = retained_host_output(directory, name, &mut command);
+    assert_host_science_pool(&output, ticks);
+    output
+}
+
+/// Observe the actual production step context, including steps after restoration.
+/// Failure paths retain their existing exit and unchanged-prefix assertions below.
+fn assert_host_science_pool(output: &Output, ticks: u64) {
+    if !output.status.success() {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let widths = stderr
+        .lines()
+        .filter(|line| line.contains("observed science-step Rayon pool"))
+        .map(|line| {
+            line.split_once("rayon_threads=")
+                .expect("observed science pool field")
+                .1
+                .split_whitespace()
+                .next()
+                .expect("actual width")
+                .parse::<usize>()
+                .expect("numeric actual science pool width")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        u64::try_from(widths.len()).expect("bounded observations"),
+        ticks,
+        "each actual fresh/continued science transition must be observed"
+    );
+    assert!(
+        widths.iter().all(|width| *width == HOST_THREAD_BUDGET),
+        "actual fresh/continued science widths {widths:?} must retain budget {HOST_THREAD_BUDGET}"
+    );
 }
 
 fn compare_host_handoffs(
@@ -363,6 +406,17 @@ fn assert_host_handoff_readback(
     let manifest = reader.run_manifest().expect("actual stored provenance");
     let launch: scriptbots_app::RunManifestV3 = serde_json::from_str(&manifest.manifest_json)
         .expect("independent immutable launch provenance");
+    assert_eq!(
+        launch.build.rayon_num_threads.as_deref(),
+        Some(HOST_INHERITED_RAYON_THREADS)
+    );
+    assert_eq!(
+        launch
+            .thread_policy
+            .as_ref()
+            .and_then(|policy| policy.threads),
+        Some(HOST_THREAD_BUDGET)
+    );
     let built = scriptbots_app::BuildProvenanceV0::current();
     assert_eq!(
         manifest.source_revision, built.source_revision,
