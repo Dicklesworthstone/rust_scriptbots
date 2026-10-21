@@ -2424,6 +2424,26 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Currently In Progress] Continued-host command-authority failure, 2026-10-21
+(`bd-2z0.5.13`):** trace the original intermittent witness failure through the
+actual worker, durable claim reader and restored owner. Keep the original poll
+bound, deadlines and acceptance. Any correction needs a causal counterexample;
+a passing rerun alone does not repair the earlier failure.
+
+**[Qualified availability increment; parent Currently In Progress] Retained command
+receipts, 2026-10-21 (`bd-2z0.5.13`, comments 2919–2920):** source `12d7d0a5`
+consults existing digest-validating retained authority before an unrelated pending
+lookup can return `Busy`. The identical real file-backed regression fails on old
+runtime and passes on this source: exact receipt preserved, changed payload rejected,
+new command still ordered, full science unchanged, and fresh SQL readback shows two
+commands/claims, tick 1 and durable sequence 2. The original feature-bearing checkpoint
+group passes 21 core, 8 runtime and 14 storage cases; eight existing authority guards
+pass with `native-asupersync`. Formatting, workspace all-target check and strict Clippy
+pass through RCH at the pinned source. Cargo's pre-existing dependency future-compatibility
+warning remains documented. This does not establish the historical failure's cause,
+real-storage native CLI/DSR acceptance, a full-suite pass or a performance win. The
+reality check retains exact receipts, artifacts, failed attempts and the bounded TODO.
+
 **[Qualified increment; parent Currently In Progress] Actual science thread-budget
 enforcement, 2026-10-21 (`bd-0oro`, comment 2911):** source `c6caa5f0` connects
 the resolved policy directly to Rayon before world construction, restores stored

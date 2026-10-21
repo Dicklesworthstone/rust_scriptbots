@@ -301,6 +301,113 @@ original acceptance remains in progress):
 - [ ] Finish original acceptance: causally resolve the intermittent storage-witness
   failure and complete the original native/DSR qualification; current scoped RCH passes
   do not close `bd-2z0.5.13`.
+  Qualified cached-receipt increment, 2026-10-21 (`bd-2z0.5.13`);
+  historical authority investigation still open:
+  - [x] Recheck original ownership, canonical triage, recent commits and inbox;
+    reserve existing source and handoff paths and notify peers.
+  - [x] Read the exact failed test, retry helper, production claim SQL and
+    nonblocking reader/host admission paths; retain the original poll bound.
+  - [x] Run the original exact case at pinned current source through strict RCH.
+    R1 runs that exact test name at clean `726f859b` with default features. The
+    original R8/R13 also enabled core's `economy-faults`; preserve that distinction
+    and include the original feature choice in the subsequent checkpoint group.
+    R1 on hz2 (`30074093214629889`) passes 1 test, 0 failed/ignored, 268 filtered,
+    in 5.85 seconds at clean `726f859b`, with terminal acknowledgement. This is
+    another passing rerun, not an explanation or causal repair of the earlier R8.
+  - [ ] Identify the causal state transition behind the historical R8 failure.
+    The separate cached-receipt counterexample below does not exercise that
+    fresh-command workflow; do not infer a cause from a passing retry.
+  - [x] Implement and qualify the separate cached-receipt availability correction
+    below, including its counterexample, original continuation group and compiler
+    gates. This does not complete the historical causal investigation.
+  - [x] Read retained real observations and update the original owner (comments
+    2917–2920), preserving its original acceptance and all unrelated work.
+  Confirmed availability defect, separate from the unexplained earlier failure:
+  pending durable authority was checked before an existing cached command receipt,
+  so a different in-flight lookup hid an already completed exact retry.
+  - [x] Trace the public client and actual host admission path; add a real
+    file-backed regression with collision, ordered-new-command and unchanged
+    science/SQL guards. Extend the existing test path helper to retain artifacts
+    only when the explicit external test-root variable is supplied.
+  - [x] Execute the final regression against unchanged runtime `726f859b`.
+    R10 (`30074093214629897`, vmi1149989) fails exactly at the retained-receipt
+    assertion: command 1 returns `Busy` while command 2 is pending, instead of
+    its original Applied-at-tick-1, journal-Durable receipt. Actual result:
+    0 passed, 1 failed, 0 ignored, 269 filtered, 4.03 seconds, exit 101,
+    terminal acknowledged. Later guards do not run on this failed path.
+  - [x] Let existing authority settle exact retries and collisions while
+    preserving ordering for new cache misses. Clean `12d7d0a5`, tree `5570c8a7`,
+    passes the identical final test in R11 (`30074093214629898`): 1 passed,
+    0 failed/ignored, 269 filtered, 5.77 seconds, terminal acknowledged.
+    Full original receipt equality, changed-payload collision, fresh-command
+    `Busy`, retained pending identity and unchanged full science digest pass.
+    After explicit storage shutdown, fresh FrankenSQLite queries observe exactly
+    commands 1 and 2, two claims, one science tick and durable sequence 2;
+    science digest `2153532e56fdfaed`. This is real local-host/file-backed
+    component evidence, not native release, CLI or performance qualification.
+  - [x] Finish the original feature-bearing checkpoint group. Clean-source R15
+    (`30074093214629902`, vmi1149989) passes core 21/21 (834 filtered, 0.25s),
+    runtime 8/8 (234 filtered, 3.55s) and storage 14/14 (256 filtered, 154.74s),
+    with zero failures/ignores, strict-remote exit 0 and terminal acknowledgement.
+    The original intermittent witness also passes; its earlier failure remains
+    unexplained. The real continued-file case observes four command rows,
+    trace ticks 1–4, digest `231877fc8fc8f941` and science watermarks 4/4/4.
+    These scoped component results do not provide original native/DSR acceptance.
+  - [x] Finish existing authority component guards with `native-asupersync`.
+    Clean-source R19 (`30074093214629905`, vmi1149989) passes 8 tests, 0 failed,
+    0 ignored, 263 filtered, in 1.21s, with strict-remote exit 0 and terminal
+    acknowledgement. This includes the native buffered-FIFO case, channel
+    timeout correlation and host fail-closed/cancellation guards. Existing
+    controlled-reader component tests are not real-storage native CLI or DSR proof.
+  - [x] Finish workspace all-target compiler check at clean `12d7d0a5`, tree
+    `5570c8a7`. R21 (`30074093214629907`, vmi1153651) completes with strict-remote
+    exit 0 and terminal acknowledgement. Cargo reports the pre-existing
+    `proc-macro-error2 2.0.1` future-compatibility warning, also present in the
+    previous thread-policy R5/R18/R20 logs; this is not a warning-free build.
+    The retained Cargo report identifies E0365: that dependency privately declares
+    `proc_macro` and re-exports it at `src/lib.rs:494`. No dependency patch or
+    suppression is introduced in this receipt fix.
+  - [x] Finish strict workspace all-target Clippy (`-D warnings`). R22
+    (`30074093214629908`, vmi1153651) completes at the same clean source/tree
+    with strict-remote exit 0 and terminal acknowledgement. The same upstream
+    Cargo future-compatibility warning remains. Final-source R9 formatting
+    (`30074093214629896`) also passes; no source changed after these checks.
+    R12 checkpoint compilation timed out before tests (exit 137, terminal
+    acknowledged); identical R15 reused its completed dependencies and passed. R14
+    authority and R8/R13 workspace checks also reached their unchanged
+    1800-second compilation deadlines, without observed tests or source errors
+    before stopping (exit 137, terminal acknowledged). R16's identical workspace
+    retry was refused before Cargo for critical worker memory pressure (103);
+    strict remote mode prevented local fallback. After memory pressure recovered
+    to 77%, identical R18 resumed the workspace check, then also reached its
+    unchanged deadline without source errors (137, terminal acknowledged).
+    Identical R20 reused further completed dependencies after pressure recovered
+    to 50%, then also reached the unchanged deadline (137, terminal acknowledged).
+    Identical R21 passed after reusing more completed application/Bevy
+    dependencies and worker memory pressure recovered to 26%. R17's authority
+    retry also timed out in the same Asupersync compilation unit without tests
+    (exit 137, terminal acknowledged); identical R19 passed after rerouting to
+    vmi1149989 once that worker completed R15. A refusal or compilation deadline
+    is not a test or compiler pass.
+    R5's earlier old-runtime compilation also timed out without running tests;
+    actual red/green evidence is R10/R11, whose final storage fixture is identical
+    (`db4cb236`) and whose runtime differs only by the five production lines.
+  - [x] Copy both actual database artifact directories without deletion to
+    `/data/tmp/scriptbots-authority-20261021-lilacelm/r10-artifacts` and
+    `r11-artifacts`; retain the failed attempt as partial/fault-path evidence.
+    The completed R15 group is also retained in `r15-artifacts` (179 files,
+    including 20 SQLite files; this includes deliberately invalid fixtures,
+    so the artifact count is not a claim of additional passing test cases).
+  - [x] Finish actual-result readback, the bounded honesty audit and original-owner
+    comments; prepare this review-ready handoff, plan and canonical tracker update.
+    Final commit, push, actual ref/source confirmation and artifact checksums are
+    subsequent external operations recorded in
+    `/data/tmp/scriptbots-authority-20261021-lilacelm/publication.json` and
+    `SHA256SUMS`. This preparation record does not assert a push already happened.
+  This is the operator-requested task accounting in the existing handoff: the
+  consumer is the operator, the observed defect is R8's unresolved authority
+  failure, and active status retires at the qualified increment or recorded limit.
+  It adds no new dashboard, gate or replacement bead.
 - [x] [Qualified increment; parent still in progress, 2026-10-21] Qualify actual science-pool width against the declared CLI policy. R9's manifests
   record global Rayon width 1 and no launch `RAYON_NUM_THREADS`; R26's record global
   width 8 and launch value `8`, while both declare CLI policy 1. The preceding core
@@ -400,6 +507,101 @@ original acceptance remains in progress):
   separate reviewed source/handoff/tracker publication, preserving original acceptance
   and all other work. Active TODO status retires to this bounded increment record;
   final publication is verified against the actual refs after this record is committed.
+
+Retained-receipt increment self-audit (2026-10-21; source `12d7d0a5` and
+this handoff; fresh solo review, not independent verification):
+
+The README's purpose is a faithful, deterministic evolution lab with reproducible
+experiments. The actual source-commit inventory is one USER runtime fix with its
+real regression; the optional test artifact-root helper is its exercised ENABLER.
+The existing handoff, plan marker and tracker comments are PROCESS. No item was
+closed. The two-minute demo is command 1's completed receipt remaining available
+while command 2 waits for durable authority: old runtime returns `Busy`; fixed
+runtime returns the entire original receipt. Removing the process records would
+leave that behavior intact but lose the requested accounting and explicit limits.
+The oldest still-open canonical item is `bd-2z0` (2026-07-11); preserving command
+authority serves its reproducibility goal. No panes were dispatched, ranked by
+closes or treated as independent confirmation; no follow-up replaced acceptance.
+
+Verdict: DRIFTING in turnaround cost. Cold dependencies, source-namespace refusals
+and compilation deadlines cost much more than this bounded product fix. Correction
+to this agent: freeze source, finish the named original regressions and mandatory
+compiler gates, then publish the qualified increment; add no framework or new audit
+program. The classification is retrospective, not a production quota.
+
+Honesty inventory, bounded to every source hunk, actual receipts and commentary:
+
+1. No (checked: full `12d7d0a5` diff and reflog; no existing test removed,
+   weakened or ignored, and no hidden amend/reset/rebase).
+2. No (checked: the new case uses the actual file worker, host/client and fresh
+   FrankenSQLite readback; it adds no mock or fabricated lifecycle result).
+3. No (checked: exact changed paths contain no golden or baseline).
+4. The regression changed with the fix, strengthening acceptance. No relaxation
+   (checked: unchanged CI/Cargo inputs, suppressions, 30,000-poll bound, 120-second
+   receipt deadline and 1,800-second RCH compilation deadline).
+5. No (checked: five production lines call the existing digest-validating cache;
+   the optional artifact-root environment variable is confined to test paths).
+6. No claimed zero-run green (checked: R10 runs and fails one real case; R11
+   runs and passes one; formatting and compilation are separately named).
+7. Yes: the first original-witness retry omitted the historical `economy-faults`
+   feature. It is recorded as default-feature evidence, not equivalent coverage;
+   R12 restores the original command's feature. Commentary also initially called
+   one formatting difference two; the actual one was disclosed and corrected
+   manually before final R9 passed. A later progress update inferred the native
+   run's active compiler from Cargo's last `scriptbots-core` line; actual process
+   readback showed Asupersync still compiling, and the update was corrected.
+   Bead comment 2919's overbroad wording about unchanged tests is explicitly
+   clarified in 2920: the new regression/helper were added; existing assertions
+   and gates were not weakened. The add/list-only interface leaves both records.
+   None of these observations is promoted to a functional verdict or hidden by
+   rewriting history.
+8. No (checked: RCH component receipts are not native/DSR release or performance
+   evidence; test wall times are not speedup claims).
+9. No (checked: old R8 remains unexplained; R2/R6/R7 namespace refusals, R4/R16
+   nonadmissions, R5/R8/R12/R13/R14/R17/R18/R20 compilation deadlines and actual
+   R10 failure stay retained; successful check/Clippy retain the upstream warning).
+10. No (checked: raw RCH build stdout/stderr and machine envelopes remain external;
+    failed old-runtime database artifacts are identified as partial/fault-path).
+11. No (checked: `bd-2z0.5.13` remains in progress; no close or substitute task).
+12. No (checked: plan/tracker edits contain status prose/comments; original
+    acceptance and dependencies remain, including causal repair and native/DSR
+    qualification).
+13. Not applicable (checked: no delegated closure or new subagent this increment).
+14. Not applicable (checked: no subagent dispatch).
+15. Not applicable (checked: no accepted subagent result).
+16. Not applicable (checked: no swarm/refusal farming).
+17. No (checked: this explicitly solo review claims no independent agreement).
+18. No (checked: exact test/filter and positive/collision/order/science/SQL
+    assertions were fixed before R10/R11; raw summaries supply the denominators).
+19. Yes: the source commit was prepared while its old-runtime run was still
+    compiling; its immutable message explicitly says qualification is pending.
+    R5 then timed out without tests; only subsequent R10/R11 prove the defect/fix.
+    An initial SSH hash read used another worker's old project hash and failed;
+    the corrected actual R5 source path matches retained snapshots. Static UBS
+    was run before this source commit: runtime 0 critical/1,680 warning/209 info;
+    storage 1 critical/1,925 warning/714 info. The critical is the unchanged
+    intentional panic inside `catch_unwind` in `poison_reaper_registry_for_test`,
+    consumed by `reaper_bounds.rs`; it is not `cfg(test)`-gated. The full warning
+    population is not claimed triaged; no suppression was added.
+    An optional read-only cache census was stopped with SIGINT to its verified
+    owned CLI PID (2174938, exit 130) after it took too long; its empty output is
+    unavailable evidence, not cache validation. No cache cleanup or foreign
+    process termination was performed.
+20. Strongest evidence: the identical final real fixture fails on old runtime in
+    R10 and passes every guard on clean `12d7d0a5` in R11. Exact commands, receipts,
+    old/final source variants, logs and both actual database directories are at
+    `/data/tmp/scriptbots-authority-20261021-lilacelm` for skeptical re-execution.
+
+CASS's work-derived exact query `host_checkpoint_continuation_witness_expires`
+has zero workspace matches; the usable index still ends in September. Prior five
+honesty-phrase sweeps remain recorded, not promoted to recent-session clearance.
+Disposition: the feature omission, formatting-count correction, failed hash lookup,
+Bead-wording clarification and pending-at-commit qualification are disclosed and
+corrected above. Concrete
+countermeasures are exact command/source receipts and real old/fixed observations
+(RH-2 proof-class inflation), retained findings and unchanged gates (RH-13/RH-14),
+and preservation of original commits and failed attempts (RH-17). None of this
+closes the historical failure or the parent's original acceptance.
 
 Thread-policy increment self-audit (2026-10-21; five source commits
 `33f7a80c` through `c6caa5f0`, plus this handoff; solo review):
