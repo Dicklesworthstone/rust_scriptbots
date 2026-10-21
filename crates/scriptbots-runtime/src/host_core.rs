@@ -1940,6 +1940,11 @@ impl SharedHostState {
             return Err(error);
         }
         if let Some(pending) = &self.pending_command_authority {
+            // The outstanding lookup orders cache misses, not retries or collisions
+            // that retained authority can already settle without touching storage.
+            if let Some(result) = self.cached_submission(envelope.command_id, envelope_digest) {
+                return result;
+            }
             if pending.envelope.command_id == envelope.command_id
                 && pending.envelope_digest != envelope_digest
             {

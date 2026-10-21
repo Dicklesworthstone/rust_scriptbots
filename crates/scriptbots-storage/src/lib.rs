@@ -27846,7 +27846,10 @@ mod tests {
     const JOURNAL_WORKER_RETRY_LIMIT: usize = 30_000;
 
     fn temp_db_path(prefix: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
+        let mut path = std::env::var_os("SCRIPTBOTS_TEST_ARTIFACT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        fs::create_dir_all(&path).expect("storage test artifact directory");
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
@@ -38759,6 +38762,105 @@ mod tests {
             .close_without_checkpoint()
             .expect("close command identity reader");
         rows
+    }
+
+    #[test]
+    fn retained_command_receipt_bypasses_unrelated_durable_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("retained-command-during-authority-lookup");
+        let path_text = path.to_string_lossy().into_owned();
+        let session = HostSessionId::new(0xc09d);
+        let (mut pipeline, mut owner, mut frontend) =
+            host_checkpoint_file_owner(&path_text, session, 4242);
+        let mut clock = 0;
+        let step = CommandEnvelope::new(
+            CommandId::from_client_sequence(session.get(), 1),
+            HostCommand::Step,
+        );
+        let original = apply_host_checkpoint_command(&mut frontend, &mut owner, &step, &mut clock);
+        let before = owner.scientific_digest_v1()?;
+        println!("CACHED_AUTHORITY_DATABASE: {path_text}");
+        let later = CommandEnvelope::new(
+            CommandId::from_client_sequence(session.get(), 2),
+            HostCommand::SetSpeed(2.0),
+        );
+        // The actual storage reader always queues its first lookup before returning Pending.
+        // Do not drive the owner: the unrelated lookup must remain pending for every probe.
+        let initial = frontend.submit_envelope(later.clone());
+        assert!(matches!(
+            &initial,
+            Err(NullFrontendSubmissionError::HostAccess {
+                source: HostAccessError::CommandAuthorityLookup {
+                    failure: CommandAuthorityLookupFailure::Pending,
+                    ..
+                },
+                ..
+            })
+        ));
+        let replayed = frontend.submit_envelope(step.clone());
+        println!(
+            "CACHED_AUTHORITY_RETRY: pending={:?}, actual={replayed:?}, expected={original:?}",
+            owner.pending_command_authority_id()
+        );
+        assert_eq!(
+            replayed.expect("retained exact receipt needs no new lookup"),
+            original
+        );
+        assert!(matches!(
+            frontend.submit_envelope(CommandEnvelope::new(step.command_id, HostCommand::Pause)),
+            Err(NullFrontendSubmissionError::HostAccess {
+                source: HostAccessError::CommandIdCollision { command_id },
+                ..
+            }) if command_id == step.command_id
+        ));
+        let unknown = CommandId::from_client_sequence(session.get(), 3);
+        assert!(matches!(
+            frontend.submit_envelope(CommandEnvelope::new(unknown, HostCommand::Step)),
+            Err(NullFrontendSubmissionError::HostAccess {
+                source: HostAccessError::CommandAuthorityLookup {
+                    command_id,
+                    failure: CommandAuthorityLookupFailure::Busy,
+                },
+                ..
+            }) if command_id == unknown
+        ));
+        assert_eq!(owner.pending_command_authority_id(), Some(later.command_id));
+        assert_eq!(owner.scientific_digest_v1()?, before);
+        resolve_authority_submission(&mut frontend, &mut owner, initial, &mut clock);
+        let completed = drive_journal_command_to_terminal(
+            &mut frontend,
+            &mut owner,
+            later.command_id,
+            &mut clock,
+        );
+        assert!(matches!(
+            completed.application(),
+            ApplicationState::Applied(_)
+        ));
+        assert_eq!(completed.journal(), &JournalState::Durable);
+        assert_eq!(owner.scientific_digest_v1()?, before);
+        drop(frontend);
+        drop(owner);
+        pipeline.shutdown()?;
+        let commands = host_checkpoint_sql_commands(&path_text);
+        let expected = vec![step.command_id.to_string(), later.command_id.to_string()];
+        assert_eq!(
+            commands.iter().map(|row| row.0.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        let stored = journal_database_snapshot(&path_text);
+        assert_eq!(stored.tick_count, i64::try_from(before.tick.0)?);
+        assert_eq!(stored.durable_journal, u64::try_from(commands.len())?);
+        assert_eq!(stored.command_claim_count, i64::try_from(commands.len())?);
+        println!(
+            "CACHED_AUTHORITY_STORAGE: database={path_text}, commands={}, claims={}, tick={}, durable={}, digest={}",
+            commands.len(),
+            stored.command_claim_count,
+            stored.tick_count,
+            stored.durable_journal,
+            before.overall
+        );
+        Ok(())
     }
 
     #[test]
