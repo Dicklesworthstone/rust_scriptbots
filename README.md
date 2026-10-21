@@ -479,7 +479,7 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
  - `--png-size WxH` (GUI builds): snapshot size for `--dump-png` (e.g., `1280x720`).
  - `--debug-watermark`: overlay a tiny diagnostics watermark in the render canvas.
  - `--renderer-safe`: force a conservative paint path (useful for troubleshooting black canvas on some Windows setups).
- - `--threads N`: cap simulation worker threads (overrides low-power defaults).
+ - `--threads N`: cap simulation worker threads with a positive budget (overrides inherited Rayon and low-power defaults).
  - `--low-power`: prefer lower CPU usage (equivalent to `--threads 2` unless `--threads` is provided); also biases `auto` toward terminal.
  - `--profile-steps N`: headless `world.step()` profiling without persistence.
  - `--profile-storage-steps N`: headless profiling with selected storage mode.
@@ -535,14 +535,16 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
-- `RAYON_NUM_THREADS` — set simulation thread pool size when `parallel` is enabled.
+  Use `info,scriptbots_core::parallelism=debug` to observe the Rayon pool width inside each actual science step.
+- `RAYON_NUM_THREADS` — simulation pool default when `parallel` is enabled and the app resolves no explicit thread budget. The resolved `--threads`, `SCRIPTBOTS_MAX_THREADS`, auto-tune or low-power budget takes precedence.
 - `SCRIPTBOTS_MODE` — `auto|gui|bevy|terminal|server` (frontend or server-only selection).
 - `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — override Auto-mode renderer detection (`1|true|yes`); explicit `--mode` remains authoritative.
 - `SCRIPTBOTS_BOOTSTRAP_TICKS` — explicit pre-frontend science ticks (default `0`, equivalent to `--bootstrap-ticks`; set a nonzero value only when an intentional warmup is part of the run).
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
 - `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
 - `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run.
-- `SCRIPTBOTS_MAX_THREADS` — preferred maximum thread budget; core will cap Rayon to min of CPUs and this value (used unless `RAYON_NUM_THREADS` is already set).
+- `SCRIPTBOTS_MAX_THREADS` — explicit application thread budget, below `--threads` and above auto-tune or low-power defaults. Startup passes the resolved number directly to Rayon. Standalone core callers retain the physical-CPU-capped default when `RAYON_NUM_THREADS` is absent; world construction never rewrites either variable.
+  Full-host checkpoint continuation restores the launch manifest's resolved budget, when present, before reconstructing the world. The debug observation reports pool capacity at science-step entry, rather than busy-worker utilization.
  - `SCRIPTBOTS_TERMINAL_EMOJI` — force emoji mode `1|true|yes|on` or disable with `0|false|off|no`.
  - `SCRIPTBOTS_RENDER_SAFE` — force conservative rendering path in GUI mode (also enabled by `--renderer-safe` or `--low-power`).
  - `SCRIPTBOTS_RENDER_WATERMARK` — overlay a tiny diagnostics watermark in the GUI canvas (also enabled by `--debug-watermark`).
@@ -650,7 +652,7 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
   ```
 - The root seed deterministically derives all six domain streams and every stable agent/offspring substream. The canonical launch manifest is `scriptbots.run-manifest.v3.3`: it records the six-domain checkpoint, exact `AgentSubstreamProtocolV1`, and UID-ordered `AgentRngCounterStateV1` launch rows. Once the tick-zero V1.7 start digest is bound, the bootstrap form is `scriptbots.run-manifest.v3.6`; it must bind the same root, protocol, counters, registry semantics, locomotion model, and `WorldDigestV1` evidence rather than describing a different launch state. Neither form collapses the domains back into one ambiguous global stream.
 - The `bd-1kxd` keyed-substream schema and the `bd-2i1` V1.6 locomotion contract are closed with pinned DSR evidence. The reviewed exact-class full performance baseline was promoted byte-for-byte in `39fc2f0`, and the final same-class comparison passed in DSR `0.1.0-bd2i1-perf-compare-quiet1.20260716T160817Z`. `bd-hiv1` is closed: movement-noise sensing and spike-speed damage now consume a typed peak-wheel-effort lane rather than physical displacement (`scriptbots-core` `wheel_effort`; `spike_speed_damage_bonus` scales peak normalized wheel output, and `speed_mag` no longer contributes).
-- For CPU thread control during profiling, prefer the standard `RAYON_NUM_THREADS` env var.
+- For CPU thread control in app profiling, use `--threads N`; `RAYON_NUM_THREADS` supplies the default only when the app resolves no thread budget.
 
 ### Data model & spatial indexing
 - **SoA layout**: agents use cache-friendly columns (`AgentColumns`) for fast scans during sense/actuation.

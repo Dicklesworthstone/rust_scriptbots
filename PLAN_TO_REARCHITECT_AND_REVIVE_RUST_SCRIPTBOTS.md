@@ -2424,6 +2424,22 @@ Skill inventory/census/verification scripts may produce evidence outside project
 
 ## 12. Phased Execution Roadmap
 
+**[Qualified increment; parent Currently In Progress] Actual science thread-budget
+enforcement, 2026-10-21 (`bd-0oro`, comment 2911):** source `c6caa5f0` connects
+the resolved policy directly to Rayon before world construction, restores stored
+explicit budgets before full-host continuation, and removes core's unsafe
+environment write. Old startup/restore counterexamples fail on measured width;
+the fixed real launches observe distinct 8/1/3 widths with identical typed bootstrap
+science. Strict-remote RCH passes five CLI tests, the original full-host E2E and
+the original tick-zero/export/bundle/replay E2E, plus final formatting, workspace
+all-target compiler and strict Clippy checks. Twenty-one core checkpoint tests
+pass on byte-unchanged component source. Actual 18 versus 7+11 continuation steps
+all observe width 1, with equal science traces/digests and original negative
+prefix guards. The reality check retains exact source, receipts, failed attempts,
+artifact paths and granular TODO. Original class and continuation acceptance stay
+open; this is pool-capacity evidence, not performance, utilization or native/DSR
+qualification.
+
 **[Qualified provenance increment; parent Currently In Progress] Full-owner continuation,
 2026-10-20 (`bd-2z0.5.13`):** source `d6f89eac` connects the existing clean RCH commit
 stamp to persisted run provenance, preserving explicit identity precedence and unknown,

@@ -301,22 +301,196 @@ original acceptance remains in progress):
 - [ ] Finish original acceptance: causally resolve the intermittent storage-witness
   failure and complete the original native/DSR qualification; current scoped RCH passes
   do not close `bd-2z0.5.13`.
-- [ ] Qualify actual science-pool width against the declared CLI policy. R9's manifests
+- [x] [Qualified increment; parent still in progress, 2026-10-21] Qualify actual science-pool width against the declared CLI policy. R9's manifests
   record global Rayon width 1 and no launch `RAYON_NUM_THREADS`; R26's record global
   width 8 and launch value `8`, while both declare CLI policy 1. The preceding core
-  checkpoint test constructs `WorldState`, whose existing `configure_parallelism`
+  checkpoint test constructs `WorldState`, whose then-current `configure_parallelism`
   writes the default budget into the parent environment. The raw context difference
   is retained, not normalized. A supplementary whole-build-metadata equality check
   rejected this difference; the separate source/science checks passed. This is no
   exact-class performance comparison or new thread-matrix qualification, and declared
   policy is not substituted for an observed science-pool width (`bd-0oro`).
+  Bounded execution TODO for this probe:
+  - [x] Check current work, original ownership and canonical BV/BR triage; preserve
+    existing derived tracker files. Direct BV was initially used in error, then
+    corrected to `scripts/bv_authoritative.sh --robot-triage` before choosing work.
+  - [x] Reserve the existing implementation, test and handoff files; notify peers.
+  - [x] Add opt-in observation inside the common production science-step path.
+  - [x] Run the real CLI counterexample and retain its actual widths and output.
+    R22 uses old app startup (`480acbcc`) plus the current observer/stronger test
+    overlay: inherited, CLI 1 and CLI 3 each observe four width-8 steps. Its one
+    selected test fails on CLI 1 as intended (0 passed, 1 failed, 17 filtered;
+    10.75 seconds), with actual databases, manifests and streams retained.
+  - [x] Connect the resolved budget directly to the pool builder; preserve the
+    launch snapshot and remove core's unsafe environment mutation.
+  - [x] Re-run the same CLI cases, require distinct observed widths and compare
+    science, including a no-override control and invalid-budget refusal.
+    R23 at `c6caa5f0` passes five selected tests (0 failed/ignored, 13 filtered;
+    31.15 seconds): the same controls observe four steps each at widths 8, 1
+    and 3, with identical typed two-tick bootstrap science; characterization
+    observes two width-1 steps. Original launch-environment provenance, declared
+    environment-budget science invariance and pre-database zero refusal pass.
+    The actual measured fresh-run matrix is 8/1/3; the older 1/2/4/8 environment
+    test does not independently observe its science-pool widths.
+  - [x] Restore the run's stored explicit budget before full-host world
+    reconstruction; extend the existing full-host test to count actual fresh and
+    continued step observations under inherited Rayon width 8. Keep all original
+    trace/digest, persistence and negative-prefix assertions.
+    R24 independently reproduces the old restore defect at `efb54a28` with the
+    current replay test overlaid: fresh runs observe width 1, but all eleven
+    continued steps observe width 8 despite the stored explicit budget 1.
+    The selected test fails that assertion (exit 101, terminally acknowledged);
+    its later acceptance checks are not claimed as executed. R25 at clean
+    `c6caa5f0` passes the full original case (1 passed, 0 failed/ignored, 4
+    filtered; 201.32 seconds), acknowledged strict-remote job `30072644099375161`.
+    Actual fresh/continued observations are 18/7/11 steps, all width 1. The 94-file
+    readback retains equal eighteen six-stage traces, final digest
+    `02d29615da597594` and watermarks 18/18/18; configurations, traces and boundary
+    digests also equal the previous increment. Perturbation still diverges at
+    tick 1 / `sense`; corrupt/truncated and uncovered-factory prefixes remain
+    unchanged. Ordinary manifests keep provenance incomplete, reproducibility
+    false and the general checkpoint guarantee false. No performance claim.
+  - [x] Apply the existing resolver before headless characterization and replay
+    world construction. Qualify characterization's actual steps and strengthen
+    the existing real database-replay case with inherited width 8 and budget 1.
+    R23 covers characterization. R26 at `c6caa5f0` passes the exact original
+    tick-zero/CSV/bundle/replay/divergence case (1 passed, 0 failed/ignored, 4
+    filtered; 71.57 seconds), acknowledged strict-remote job `30072644099375162`.
+    The added assertion requires every actual replay observation to have width 1
+    and derives its count from the real stored ledger. This successful subprocess's
+    raw width vector is not separately printed or archived. The verified portable
+    bundle was copied before temporary fixture cleanup; all three artifact sizes
+    and BLAKE3 hashes match its manifest, which records source `c6caa5f0`, maximum
+    tick 26 and watermarks 26/26/26. The other temporary fixture files are not
+    claimed retained. These two E2Es are selected cases, not the entire five-test file.
+  - [x] Run strict-remote formatting, workspace all-target check and strict Clippy,
+    plus the original launch-provenance regression and core checkpoint coverage.
+    At final source `c6caa5f0`, R16 formatting, R18 workspace all-target check and
+    R20 strict Clippy pass through strict-remote RCH. R12 passes 21 core checkpoint
+    tests (0 failed/ignored, 834 filtered) in 0.79 seconds at `43994aa9`; the core,
+    brain dependencies and Cargo inputs are byte-unchanged through `c6caa5f0`.
+    R23 also passes the original launch-provenance regression. R25/R26 qualify
+    full-host continuation and database replay separately, with original assertions.
+  - [x] Review the source diff and retained evidence; update the original Beads
+    (comments 2912–2915 on `bd-0oro`, 2916 on `bd-2z0.5.13`) without closure,
+    and prepare frozen handoff/tracker commits. Publish to main and its legacy
+    mirror after releasing these reservations; verify the actual refs after this
+    record is committed and retain that final readback with the external evidence.
+  Retained evidence: `/data/tmp/scriptbots-thread-policy-20261021-lilacelm` contains
+  R22/R23/R24/R25 process artifacts, the R26 portable bundle, source-variant
+  readbacks, original execution receipts, static findings and raw logs. R25's
+  worker root is `/var/tmp/scriptbots-thread-policy-20261021-lilacelm-r25/host-checkpoint-continuation-1hxtJR`.
+  R1 is transport failure with no observed tests (recovery delivery 255, earlier
+  daemon 130); R19 is an owned cancellation/recovery 143 after measured low compiler
+  progress; R21 reaches the unchanged 1,800-second compilation deadline (137).
+  All are terminally acknowledged and none is a functional verdict. R17 is setup
+  refusal for incompatible flags; R2/R6/R14 are infrastructure admission refusals.
+  Formatting feedback in R3/R7/R9 was manually corrected before final R16 passed.
+  Performance/profile execution was not run; its source wiring is not DSR proof.
+  The operator-requested TODO is PROCESS: consumer is this handoff's reader, gate
+  is the requested complete accounting of the probe, observed defect is the R9/R26
+  mismatch, and active status retires when the bounded probe is qualified or its
+  unresolved limitation is recorded. No separate dashboard or gate is introduced;
+  the existing P0 host-toolchain item describes another host, while this already
+  owned probe can deliver a direct CLI correction here. An hour on extra process
+  would deliver less capability. Integrity exception is unused (no recovery
+  machinery); verdict: minimal operator-requested accounting only.
 - [x] Update the original Beads with observed results (parent comments 2907–2910;
   the bounded thread-width observation is comment 2911 on `bd-0oro`) and prepare
   separate reviewed source/handoff/tracker publication, preserving original acceptance
   and all other work. Active TODO status retires to this bounded increment record;
   final publication is verified against the actual refs after this record is committed.
 
-Continuation increment self-audit (2026-10-20; `4caab68f` through the current
+Thread-policy increment self-audit (2026-10-21; five source commits
+`33f7a80c` through `c6caa5f0`, plus this handoff; solo review):
+
+The README's core purpose is a faithful, deterministic evolution lab with
+reproducible experiments. The actual five-commit inventory contains three USER
+fixes (fresh startup, stored-budget continuation and headless dispatch) and two
+ENABLER test changes. R23/R26 exercise them against real processes, with R22
+and R24 exposing the corresponding old behavior. The README explanation is USER
+documentation; this audit, TODO, plan marker and tracker comments are PROCESS.
+There are no new closes. The two-minute demo is inherited Rayon 8 with `--threads
+1`: old startup observes 8 and fixed startup observes 1 in actual science steps.
+Removing the process records would not change that behavior, but would lose the
+explicitly requested accounting and unresolved acceptance. The oldest open item
+in the ascending creation query remains `bd-2z0` (2026-07-11); honoring reproducible
+run policy serves it. No pane was dispatched or ranked by closes, no follow-up
+was minted, and the original requirements remain intact.
+
+Verdict: DRIFTING in turnaround cost. Dependency compilation and several failed
+infrastructure/setup attempts consumed much more time than the bounded fix.
+Correction applied to this agent: freeze application source, finish the named
+real-process checks, retain their failures and publish; do not start a framework,
+additional audit program or speculative source change. Counts classify the work
+already done and are not a target.
+
+Honesty inventory for this bounded increment:
+
+1. No (checked: every hunk of all five source/test commits; existing tests,
+   seeds, horizons and negative assertions remain, with additional observations).
+2. No (checked: production step tracing, real child processes and FrankenSQLite;
+   no added mock, fabricated result or replacement engine).
+3. No (checked: four changed source/test paths; no golden or baseline changes).
+4. Test code changed alongside the fix, but only strengthened acceptance
+   (checked: full diffs). No new suppression, bypass, tolerance, retry, feature
+   matrix or deadline relaxation; CI, Cargo inputs and dependencies are unchanged.
+5. No (checked: ordinary startup uses the same direct initializer as the tested
+   paths; the production observer is feature-gated tracing, not a test-only pool).
+6. No claimed zero-run green (checked: actual R12 and R23 test counts; formatting,
+   compiler checks, infrastructure refusals and compile timeouts are separately named).
+7. No unobserved execution claimed in this increment (checked: raw RCH receipts,
+   step logs and commentary). Early direct BV use and the first artifact-root
+   environment prefix were wrong: the canonical wrapper and Cargo's forced
+   environment configuration replaced them before the relevant proof was accepted.
+8. No (checked: pool capacity is not called worker utilization or performance;
+   old 1/2/4/8 inputs are not promoted to a measured-width matrix; overlays are
+   identified separately from clean committed source; no native/DSR claim).
+9. No (checked: R1 transport failure, owned R19 cancellation, R21 deadline and
+   earlier storage-witness failure stay recorded; neither passing reruns nor this
+   thread fix is represented as a causal repair of that storage failure).
+10. No (checked: stdout/stderr are retained, including deliberately failing old
+    source tests; RCH cleanup loss is qualified rather than called archived proof).
+11. No (checked: both original owners remain in progress; no close or follow-up).
+12. No (checked: original acceptance/dependencies are unchanged; plan prose records
+    this increment without replacing the original native/storage qualification).
+13. Not applicable (checked: no delegated work or peer closure in this increment).
+14. Not applicable (checked: no subagent dispatch).
+15. Not applicable (checked: no accepted subagent report).
+16. Not applicable (checked: no swarm/refusal farming).
+17. No (checked: all review here is explicitly solo; shared observations are not
+    independent confirmation).
+18. No (checked: the three launch controls and original continuation horizons
+    were declared before execution; test counts come from their raw summaries).
+19. Yes: UBS for the first source commit ran after that local commit, before
+    publication; manual diff review preceded it. This sequencing miss is disclosed
+    rather than hidden by rewriting history. UBS is not clean: the first scan has
+    3 critical, 6,507 warning and 1,477 informational findings. All three criticals
+    are unchanged `current_exe()` self-spawns, manually reviewed as bounded false
+    positives; the full warning population is not claimed reviewed. Subsequent
+    touched-test scans and strict Clippy are retained, with no suppressions added.
+    R17 also refused conflicting RCH options before execution; it is setup failure,
+    not a test result. No foreign process was killed to recover build capacity.
+20. Strongest observed evidence is the same real launch controls failing
+    on old startup in R22 and passing at clean `c6caa5f0` in R23, with non-null
+    typed bootstrap digests and distinct actual 8/1/3 widths. Exact commands,
+    receipts, streams, manifests and databases are retained for re-execution.
+    R24 also fails the old restore path, and final-source R25 passes the original
+    full-host case with actual restored width 1 and unchanged science/negatives.
+    R26 passes the original real replay case with ledger-derived observation
+    count and unchanged exports/divergence checks; its portable bundle is retained.
+
+The bounded CASS query derived from this work is `run_manifest_emitted`; its
+sampled canonical message is old September 6 source context. The prior five
+honesty-phrase sweeps remain recorded below. The usable index ends in September;
+neither lookup establishes recent-session clearance. Disposition: errors are
+disclosed here, corrected without hiding failed attempts, and countermeasures
+are concrete: RH-2 proof-class inflation is prevented by retaining overlay/source
+identity and raw widths; RH-13/RH-14 suppression/bypass laundering is prevented
+by preserving findings and the original hooks/gates; RH-17 history rewriting is
+avoided by keeping the original commits and all failed execution records.
+
+Continuation increment self-audit (2026-10-20; `4caab68f` through the then-current
 `d6f89eac` source and pending handoff; solo review, not independent verification):
 
 The README's purpose is a faithful, deterministic evolution lab with reproducible
