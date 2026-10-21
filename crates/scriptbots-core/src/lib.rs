@@ -1149,12 +1149,9 @@ fn configure_parallelism() {
             limit = 1;
         }
 
-        // SAFETY: `limit` is a finite positive integer converted to string; the standard library
-        // marks `set_var` as unsafe on nightly, but providing well-formed Unicode strings is safe.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("RAYON_NUM_THREADS", limit.to_string());
-        }
+        // Pass the budget directly. World construction can occur after other
+        // threads exist, so it must never mutate the process environment. A pool
+        // already installed by the application retains its explicit policy.
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(limit)
             .build_global();
@@ -30150,6 +30147,13 @@ impl WorldState {
         self.canonicalize_agent_execution_order()?;
         let next_tick = self.tick.next();
         self.validate_step_generation_headroom(next_tick)?;
+        #[cfg(feature = "parallel")]
+        tracing::debug!(
+            target: "scriptbots_core::parallelism",
+            tick = next_tick.0,
+            rayon_threads = rayon::current_num_threads(),
+            "observed science-step Rayon pool"
+        );
         let step_started_at = observer.begin_step(next_tick);
         let previous_epoch = self.epoch;
         // bd-it29: the already-REPORTED watermark, not the current length.

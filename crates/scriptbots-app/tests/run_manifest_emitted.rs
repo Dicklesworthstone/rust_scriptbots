@@ -29,7 +29,10 @@ fn run_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
+    let root = std::env::var_os("SCRIPTBOTS_TEST_ARTIFACT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = root.join(format!(
         "scriptbots_manifest_{label}_{}_{nonce}",
         std::process::id()
     ));
@@ -191,6 +194,102 @@ fn persisted_manifests_withhold_unverified_host_session_continuation() {
 }
 
 #[test]
+fn resolved_thread_budget_controls_actual_science_pool() {
+    let scenario_dir = run_dir("observed_pool_scenario");
+    let scenario_path = write_scenario(&scenario_dir, FIXTURE_SCENARIO);
+    let scenario_arg = scenario_path.to_str().expect("UTF-8 scenario path");
+    let mut observations = Vec::new();
+    let mut science = Vec::new();
+    // Separate processes, with the same inherited Rayon setting. The no-override
+    // control must actually differ from the explicit budgets; manifest policy
+    // alone cannot prove which pool executed a scientific transition (bd-0oro).
+    for (label, args, expected) in [
+        ("inherited", vec![], 8),
+        ("cli_one", vec!["--threads", "1"], 1),
+        ("cli_three", vec!["--threads", "3"], 3),
+    ] {
+        let dir = run_dir(label);
+        let mut args = args;
+        args.extend(["--scenario", scenario_arg, "--brain", "mlp"]);
+        let output = launch_with(
+            &dir,
+            &[
+                ("RAYON_NUM_THREADS", "8"),
+                ("RUST_LOG", "info,scriptbots_core::parallelism=debug"),
+                ("NO_COLOR", "1"),
+            ],
+            &args,
+        );
+        std::fs::write(dir.join("stdout.log"), &output.stdout).expect("retain stdout");
+        std::fs::write(dir.join("stderr.log"), &output.stderr).expect("retain stderr");
+        let manifest = manifest_of(&output, &dir);
+        assert_eq!(manifest["build"]["rayon_num_threads"], "8");
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let widths: Vec<usize> = text
+            .lines()
+            .filter(|line| line.contains("observed science-step Rayon pool"))
+            .map(|line| {
+                line.split_once("rayon_threads=")
+                    .expect("science-step observation names its measured width")
+                    .1
+                    .split_whitespace()
+                    .next()
+                    .expect("measured width")
+                    .parse()
+                    .expect("numeric measured width")
+            })
+            .collect();
+        println!(
+            "{label}: actual science widths {widths:?}; retained {}",
+            dir.display()
+        );
+        assert!(
+            widths.len() >= 2,
+            "observe both actual bootstrap transitions"
+        );
+        observations.push((label, widths, expected));
+        science.push(manifest["bootstrap_evidence"].clone());
+    }
+    for (label, widths, expected) in &observations {
+        assert!(
+            widths.iter().all(|width| width == expected),
+            "{label}: actual science widths {widths:?}, expected {expected}"
+        );
+    }
+    for actual in &science[1..] {
+        assert_eq!(
+            actual, &science[0],
+            "same bootstrap science across observed pools"
+        );
+    }
+}
+
+#[test]
+fn zero_thread_budget_is_rejected_before_storage_registration() {
+    let dir = run_dir("zero_thread_budget");
+    let output = launch_with(&dir, &[("RAYON_NUM_THREADS", "8")], &["--threads", "0"]);
+    std::fs::write(dir.join("stdout.log"), &output.stdout).expect("retain stdout");
+    std::fs::write(dir.join("stderr.log"), &output.stderr).expect("retain stderr");
+    assert!(
+        !output.status.success(),
+        "zero is not an explicit thread budget"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("simulation thread budget must be greater than zero")
+    );
+    assert!(
+        !dir.join("run.sqlite").exists(),
+        "no run registered for an invalid budget"
+    );
+    assert!(!dir.join("run.manifest.json").exists());
+}
+
+#[test]
 fn the_manifest_records_the_thread_policy_the_run_actually_resolved() {
     // A manifest that records the ENVIRONMENT rather than the DECISION describes a run that did
     // not happen.
@@ -240,16 +339,15 @@ fn the_manifest_records_the_thread_policy_the_run_actually_resolved() {
     );
 
     // AND THE ENVIRONMENT CAPTURE NOW AGREES WITH REALITY. The user exported 16; the run
-    // used 4; the capture must say 16. Startup still communicates the resolved count to
-    // Rayon through `set_var`, but provenance reads the launch-pinned
-    // `LaunchEnvironmentV0` snapshot taken before any mutation (bd-3p7i), so our own
-    // write can no longer masquerade as the user's environment. `thread_policy` above
+    // used 4; the capture must say 16. Startup passes the resolved count directly to
+    // Rayon's builder, while provenance reads the launch-pinned `LaunchEnvironmentV0`
+    // snapshot (bd-3p7i). `thread_policy` above
     // records the DECISION; this field records the USER'S STATEMENT; they differ exactly
     // when precedence did its job.
     assert_eq!(
         manifest["build"]["scriptbots_max_threads"], "16",
         "the environment capture must report what the USER exported at launch (16), not \
-         the resolved value startup wrote back into the environment (4). If this reports \
+         the resolved value passed to the pool builder (4). If this reports \
          4 again, the launch-environment snapshot is being taken after startup mutation — \
          the exact bd-3p7i clobber regressing."
     );

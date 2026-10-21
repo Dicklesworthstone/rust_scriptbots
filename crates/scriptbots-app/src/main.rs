@@ -16,7 +16,7 @@ use scriptbots_app::{
     ScenarioDocumentV1, ScenarioIdentityV0, ScenarioInterventionV1, SharedAnalytics,
     ThreadPolicyV0, apply_scenario_interventions, create_brain_registry_for_config, install_brains,
     precedence::{
-        ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy, ThreadSource,
+        ConfigFieldOverride, ConfigLayerKind, ConfigLayerStatement, ThreadPolicy,
         canonical_layer_bytes, resolve_config_layers, resolve_thread_policy,
     },
     regions::{AppRoot, RegionOutcome, ServiceRegion},
@@ -671,18 +671,8 @@ fn main() -> Result<()> {
             .filter(|threads| *threads > 0);
         let profile_thread_policy =
             resolve_thread_policy(cli.threads, env_threads, None, cli.low_power);
-        // Profile dispatch is the other pre-thread path, and it publishes only the
-        // thread cap: it never reaches a renderer, so the render toggles and the GPU
-        // adapter preference have no meaning here (bd-o0cq).
-        PreThreadEnvironment {
-            max_threads: profile_thread_policy
-                .threads
-                .filter(|_| profile_thread_policy.source != ThreadSource::Environment),
-            render_watermark: false,
-            render_safe: false,
-            prefer_high_performance_gpu: false,
-        }
-        .publish();
+        // The same resolved value reaches Rayon's builder in the headless lane.
+        configure_simulation_parallelism(profile_thread_policy.threads)?;
         if let Some(ticks) = cli.profile_steps {
             profile_world_steps(
                 &config,
@@ -759,8 +749,8 @@ fn main() -> Result<()> {
         );
     }
 
-    // Configure the thread budget before world creation so the Rayon pool is
-    // capped. Precedence is resolved in ONE place, by a pure function, rather than
+    // Resolve the thread budget before world creation. Precedence is resolved
+    // in ONE place, by a pure function, rather than
     // by whichever branch of a chain happened to run last — see
     // `scriptbots_app::precedence`. The bug that arrangement used to hide: a user
     // who exported SCRIPTBOTS_MAX_THREADS=16 and passed --low-power had their
@@ -791,20 +781,14 @@ fn main() -> Result<()> {
         sensor_count = scriptbots_core::INPUT_SIZE,
         "canonical sensor layout loaded"
     );
-    // One audited environment publication for the whole interactive startup, rather
-    // than four scattered `unsafe` blocks (bd-o0cq).
+    // Publish renderer environment before creating any Rayon workers (bd-o0cq).
     PreThreadEnvironment {
-        // Only write the variable when a layer other than the environment decided;
-        // rewriting it with the value it already holds is noise, and rewriting it
-        // with a DIFFERENT value is the clobber `precedence` exists to prevent.
-        max_threads: policy
-            .threads
-            .filter(|_| policy.source != ThreadSource::Environment),
         render_watermark: cli.debug_watermark,
         render_safe: cli.renderer_safe || cli.low_power,
         prefer_high_performance_gpu: true,
     }
     .publish();
+    configure_simulation_parallelism(policy.threads)?;
 
     // Apply OS-level priority niceness where supported.
     apply_process_niceness(cli.low_power)?;
@@ -1473,23 +1457,37 @@ fn validate_shutdown_receipt(
     Ok(receipt)
 }
 
-/// Every process-environment value startup publishes for a later reader.
+/// Apply the resolved budget as a value before any world initializes Rayon.
+/// An inherited `RAYON_NUM_THREADS` is a default, not an override of an explicit
+/// policy. Failure to install the requested pool stops startup before storage
+/// registration rather than silently running science at a different width.
+fn configure_simulation_parallelism(threads: Option<usize>) -> Result<()> {
+    if let Some(threads) = threads {
+        if threads == 0 {
+            bail!("simulation thread budget must be greater than zero");
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .context("failed to initialize the resolved simulation thread budget")?;
+    }
+    Ok(())
+}
+
+/// Every renderer environment value startup publishes for a later reader.
 ///
-/// These four variables are consumed through the environment because their readers
-/// require it, not by preference: `SCRIPTBOTS_MAX_THREADS` is read by
-/// `scriptbots-core` when it caps Rayon, `SCRIPTBOTS_RENDER_SAFE` and
+/// These three variables are consumed through the environment because their readers
+/// require it, not by preference: `SCRIPTBOTS_RENDER_SAFE` and
 /// `SCRIPTBOTS_RENDER_WATERMARK` by `scriptbots-render`, and
 /// `WGPU_POWER_PREFERENCE` by `wgpu` itself, which offers no programmatic
 /// equivalent. Collecting them in one value keeps the set closed and reviewable and
-/// reduces startup from four separate `unsafe` blocks to the single audited write
-/// below (bd-o0cq).
+/// keeps a single audited write below (bd-o0cq). The simulation thread budget is
+/// passed directly to Rayon and is never published into the environment.
 ///
-/// A `None`/`false` field means "do not speak for this variable", which is not the
+/// A `false` field means "do not speak for this variable", which is not the
 /// same as clearing it: an operator's exported value must survive a layer that
 /// declined to override it.
 struct PreThreadEnvironment {
-    /// Resolved worker-thread cap, when a layer other than the environment won.
-    max_threads: Option<usize>,
     /// Overlay the diagnostics watermark in the render canvas.
     render_watermark: bool,
     /// Force the conservative paint path.
@@ -1507,16 +1505,12 @@ impl PreThreadEnvironment {
     fn publish(&self) {
         // SAFETY: `std::env::set_var` is unsound only when it races another thread
         // touching the environment. This is the one audited write for the whole
-        // binary and every caller is on the single-threaded startup path: profile
-        // dispatch runs before any world is constructed, and the interactive path
-        // runs before `bootstrap_world`, the Rayon pool, the control runtime, and
+        // binary and the caller is on the single-threaded interactive startup path,
+        // before `bootstrap_world`, the Rayon pool, the control runtime, and
         // every renderer. `LaunchEnvironmentV0::pin()` has already captured the
         // operator's pre-publication environment for build provenance (bd-3p7i), so
         // these writes cannot retroactively rewrite what the manifest reports.
         unsafe {
-            if let Some(threads) = self.max_threads {
-                std::env::set_var("SCRIPTBOTS_MAX_THREADS", threads.to_string());
-            }
             if self.render_watermark {
                 std::env::set_var("SCRIPTBOTS_RENDER_WATERMARK", "1");
             }
