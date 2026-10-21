@@ -23,6 +23,8 @@ use scriptbots_core::{Tick, rng_domains::AgentSubstreamProtocolV1, world_counter
 use scriptbots_runtime::RunId;
 use scriptbots_storage::StorageReader;
 
+const MANIFEST_BOOTSTRAP_TICKS: u64 = 2;
+
 fn run_dir(label: &str) -> PathBuf {
     // ubs:ignore[rust.security.non-crypto-random] — unique test directory suffix, not a security token.
     let nonce = SystemTime::now()
@@ -70,7 +72,8 @@ fn launch_with(dir: &Path, envs: &[(&str, &str)], args: &[&str]) -> std::process
         .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
         .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", "2")
         .env("SCRIPTBOTS_TERMINAL_HEADLESS", "1")
-        .args(["--mode", "terminal", "--bootstrap-ticks", "2"]);
+        .args(["--mode", "terminal", "--bootstrap-ticks"])
+        .arg(MANIFEST_BOOTSTRAP_TICKS.to_string());
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -224,6 +227,19 @@ fn resolved_thread_budget_controls_actual_science_pool() {
         std::fs::write(dir.join("stderr.log"), &output.stderr).expect("retain stderr");
         let manifest = manifest_of(&output, &dir);
         assert_eq!(manifest["build"]["rayon_num_threads"], "8");
+        let evidence: scriptbots_app::BootstrapEvidenceV0 =
+            serde_json::from_value(manifest["bootstrap_evidence"].clone())
+                .expect("actual typed bootstrap evidence, never equal null placeholders");
+        assert_eq!(evidence.requested, MANIFEST_BOOTSTRAP_TICKS);
+        assert_eq!(evidence.completed, evidence.requested);
+        evidence
+            .start
+            .validate_contract()
+            .expect("complete launch digest");
+        evidence
+            .end
+            .validate_contract()
+            .expect("complete bootstrap digest");
         let text = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -248,11 +264,11 @@ fn resolved_thread_budget_controls_actual_science_pool() {
             dir.display()
         );
         assert!(
-            widths.len() >= 2,
-            "observe both actual bootstrap transitions"
+            widths.len() >= usize::try_from(evidence.completed).expect("bounded bootstrap ticks"),
+            "observe every actual bootstrap transition"
         );
         observations.push((label, widths, expected));
-        science.push(manifest["bootstrap_evidence"].clone());
+        science.push(evidence);
     }
     for (label, widths, expected) in &observations {
         assert!(
@@ -260,9 +276,10 @@ fn resolved_thread_budget_controls_actual_science_pool() {
             "{label}: actual science widths {widths:?}, expected {expected}"
         );
     }
-    for actual in &science[1..] {
+    let first = science.first().expect("the declared controls executed");
+    for actual in science.iter().skip(1) {
         assert_eq!(
-            actual, &science[0],
+            actual, first,
             "same bootstrap science across observed pools"
         );
     }
