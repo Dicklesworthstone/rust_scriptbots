@@ -410,8 +410,8 @@ fn verify_cadence_replay(database: &std::path::Path, tick: u64) -> Result<()> {
     Ok(())
 }
 
-/// Configuration CLI clients must consume the real receipt contract, then allow
-/// the operator to observe application and journal durability independently.
+/// Configuration and legacy control clients must preserve the real receipt and
+/// a usable polling command on the same executable and server.
 #[test]
 #[serial]
 fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
@@ -460,6 +460,38 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
         std::fs::write(run_dir.join(format!("{name}.stderr")), &output.stderr)?;
         Ok(output)
     };
+    let read_cli_receipt =
+        |name: &str, arguments: &[&str]| -> Result<scriptbots_app::CommandStatusDto> {
+            let output = run_cli(name, arguments)?;
+            let stdout = String::from_utf8(output.stdout)?;
+            anyhow::ensure!(
+                output.status.success(),
+                "the real {name} CLI failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let start = stdout.find('{').context("receipt JSON must be printed")?;
+            let receipt = serde_json::Deserializer::from_str(&stdout[start..])
+                .into_iter::<scriptbots_app::CommandStatusDto>()
+                .next()
+                .context("one receipt")??;
+            let hint = format!(
+                "'{}' --base-url '{base_url}' lookup-status '{}'",
+                std::fs::canonicalize(env!("CARGO_BIN_EXE_control_cli"))?.display(),
+                receipt.command_id,
+            );
+            anyhow::ensure!(
+                stdout.contains(&hint),
+                "missing usable polling hint: {stdout}"
+            );
+            anyhow::ensure!(
+                !stdout.contains("Configuration patch applied")
+                    && !stdout.contains("Applied preset")
+                    && !stdout.contains("updated"),
+                "a receipt cannot assert a future configuration: {stdout}"
+            );
+            Ok(receipt)
+        };
     let result = (|| {
         apply_cadence_control(addr, "/api/control/pause", b"")?;
         let (_, before) = http(addr, "GET", "/api/config")?;
@@ -493,39 +525,12 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
                 before["config"].get(field).is_some() && before["config"][field] != expected,
                 "{name} must exercise a real configuration change"
             );
-            let output = run_cli(name, &arguments)?;
-            let stdout = String::from_utf8(output.stdout)?;
-            anyhow::ensure!(
-                output.status.success(),
-                "the real {name} CLI failed: {}\n{stdout}\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr),
-            );
-            let start = stdout.find('{').context("receipt JSON must be printed")?;
-            let receipt = serde_json::Deserializer::from_str(&stdout[start..])
-                .into_iter::<scriptbots_app::CommandStatusDto>()
-                .next()
-                .context("one receipt")??;
+            let receipt = read_cli_receipt(name, &arguments)?;
             anyhow::ensure!(
                 !receipt.command_id.is_empty()
                     && receipt.admission_sequence.is_some()
                     && !command_ids.contains(&receipt.command_id),
                 "each configuration edit needs its own observed admission: {receipt:?}"
-            );
-            let hint = format!(
-                "'{}' --base-url '{base_url}' lookup-status '{}'",
-                std::fs::canonicalize(env!("CARGO_BIN_EXE_control_cli"))?.display(),
-                receipt.command_id,
-            );
-            anyhow::ensure!(
-                stdout.contains(&hint),
-                "missing usable polling hint: {stdout}"
-            );
-            anyhow::ensure!(
-                !stdout.contains("Configuration patch applied")
-                    && !stdout.contains("Applied preset")
-                    && !stdout.contains("updated"),
-                "a receipt cannot assert a future configuration: {stdout}"
             );
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut lookup_attempt = 0;
@@ -600,6 +605,69 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
                 "{name} changed owner configuration: {after}"
             );
         }
+        apply_cadence_control(addr, "/api/control/resume", b"")?;
+        for (name, arguments) in [
+            ("control-pause", vec!["pause"]),
+            ("control-step", vec!["step", "1"]),
+        ] {
+            let (code, before) = http(addr, "GET", "/api/status")?;
+            anyhow::ensure!(code == 200, "status before {name}: {code}: {before}");
+            std::fs::write(run_dir.join(format!("{name}-before-status.json")), &before)?;
+            let before: scriptbots_app::SimulationStatusDto = serde_json::from_str(&before)?;
+            anyhow::ensure!(
+                before.paused == (name == "control-step"),
+                "{name} must exercise its actual running/paused precondition: {before:?}"
+            );
+            let receipt = read_cli_receipt(name, &arguments)?;
+            anyhow::ensure!(
+                !receipt.command_id.is_empty()
+                    && receipt.admission_sequence.is_some()
+                    && !command_ids.contains(&receipt.command_id),
+                "each control needs a distinct observed admission: {receipt:?}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut lookup_attempt = 0;
+            loop {
+                let output = run_cli(
+                    &format!("{name}-lookup-{lookup_attempt}"),
+                    &["lookup-status", &receipt.command_id],
+                )?;
+                lookup_attempt += 1;
+                anyhow::ensure!(output.status.success(), "lookup failed: {output:?}");
+                let status: scriptbots_app::CommandStatusDto =
+                    serde_json::from_slice(&output.stdout)?;
+                anyhow::ensure!(
+                    status.command_id == receipt.command_id
+                        && status.admission_sequence == receipt.admission_sequence,
+                    "lookup changed control identity: {status:?}"
+                );
+                if status.application_state == "applied" && status.journal_state == "durable" {
+                    println!("CONTROL_CLI: {name}, admission={receipt:?}, observed={status:?}");
+                    break;
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "{name} never settled: {status:?}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let (code, after) = http(addr, "GET", "/api/status")?;
+            anyhow::ensure!(code == 200, "status after {name}: {code}: {after}");
+            std::fs::write(run_dir.join(format!("{name}-after-status.json")), &after)?;
+            let after: scriptbots_app::SimulationStatusDto = serde_json::from_str(&after)?;
+            anyhow::ensure!(
+                after.paused
+                    && after.last_applied_command.as_deref() == Some(receipt.command_id.as_str()),
+                "{name} readback does not identify the applied control: {after:?}"
+            );
+            if name == "control-step" {
+                anyhow::ensure!(
+                    Some(after.tick) == before.tick.checked_add(1),
+                    "one CLI step must advance exactly one paused tick: {before:?} -> {after:?}"
+                );
+            }
+            command_ids.push(receipt.command_id);
+        }
         let (code, shutdown) = http(addr, "POST", "/api/control/shutdown")?;
         anyhow::ensure!(code == 200, "shutdown returned {code}: {shutdown}");
         let child = guard.0.as_mut().context("owned server child")?;
@@ -612,7 +680,7 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
             anyhow::ensure!(Instant::now() < deadline, "server did not shut down");
             std::thread::sleep(Duration::from_millis(25));
         }
-        println!("CONFIGURATION_CLI: three distinct durable command identities: {command_ids:?}");
+        println!("CLI: distinct durable command identities: {command_ids:?}");
         Ok(())
     })();
     std::fs::write(

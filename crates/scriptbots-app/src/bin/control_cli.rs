@@ -1151,18 +1151,26 @@ fn print_configuration_receipt(
 ) -> Result<()> {
     println!("{label} command receipt");
     println!("{}", serde_json::to_string_pretty(receipt)?);
-    let executable =
-        std::env::current_exe().context("failed to locate this control CLI executable")?;
     println!(
-        "  poll with: '{}' --base-url '{}' lookup-status '{}'",
-        executable.display().to_string().replace('\'', "'\\''"),
-        base_url.replace('\'', "'\\''"),
-        receipt.command_id.replace('\'', "'\\''"),
+        "  poll with: {}",
+        command_polling_hint(base_url, &receipt.command_id)?,
     );
     if matches!(receipt.application_state.as_str(), "rejected" | "failed") {
         bail!("{label} command {}", receipt.application_state);
     }
     Ok(())
+}
+
+/// Keep status polling on this executable and the server that admitted the command.
+fn command_polling_hint(base_url: &str, command_id: &str) -> Result<String> {
+    let executable =
+        std::env::current_exe().context("failed to locate this control CLI executable")?;
+    Ok(format!(
+        "'{}' --base-url '{}' lookup-status '{}'",
+        executable.display().to_string().replace('\'', "'\\''"),
+        base_url.replace('\'', "'\\''"),
+        command_id.replace('\'', "'\\''"),
+    ))
 }
 
 async fn presets_list(client: &Client, base_url: &str) -> Result<()> {
@@ -1210,8 +1218,8 @@ fn receipt_command_id(body: &str) -> Option<String> {
 /// two different wordings.
 ///
 /// The endpoints return a `CommandStatusDto` as of this bead, so the receipt is
-/// printed and its id is offered to `status <id>` — a subcommand the CLI already
-/// shipped for ids it previously had no way to obtain.
+/// printed and its id is offered to `lookup-status <id>` on the same executable
+/// and server that accepted the command.
 async fn issue_control_command(
     client: &Client,
     base_url: &str,
@@ -1244,7 +1252,10 @@ async fn issue_control_command(
         // `Command::LookupStatus`, and `status` is the unrelated simulation
         // status command. Printing a command that does not exist would be the
         // same fabricated guidance this bead is removing.
-        println!("  poll with: scriptbots-control lookup-status {command_id}");
+        println!(
+            "  poll with: {}",
+            command_polling_hint(base_url, &command_id)?
+        );
     }
     Ok(())
 }
@@ -2111,13 +2122,12 @@ mod tests {
     /// removing, so the name is checked against clap rather than trusted.
     #[test]
     fn the_polling_hint_names_a_subcommand_clap_actually_exposes() {
-        // Assembled so this test cannot satisfy itself from its own literal.
-        let hinted = format!("{}-status", "lookup");
-        let source = include_str!("control_cli.rs");
-        assert!(
-            source.contains(&format!("scriptbots-control {hinted} ")),
-            "the polling hint changed; update what this test checks against"
-        );
+        let base_url = "http://127.0.0.1:47123";
+        let rendered = command_polling_hint(base_url, "cmd-7").expect("actual polling hint");
+        let hinted = rendered
+            .split_whitespace()
+            .nth_back(1)
+            .expect("subcommand before the known command ID");
 
         let command = Cli::command();
         let names: Vec<String> = command
@@ -2125,8 +2135,16 @@ mod tests {
             .map(|sub| sub.get_name().to_owned())
             .collect();
         assert!(
-            names.contains(&hinted),
+            names.iter().any(|name| name == hinted),
             "the hint points at `{hinted}`, which clap does not expose; available: {names:?}"
+        );
+        let parsed = Cli::try_parse_from(["control", "--base-url", base_url, hinted, "cmd-7"])
+            .expect("the printed subcommand accepts the receipt identity");
+        assert_eq!(parsed.base_url, base_url);
+        assert!(matches!(parsed.command, Command::LookupStatus { id } if id == "cmd-7"));
+        assert!(
+            Cli::try_parse_from(["control", "status", "cmd-7"]).is_err(),
+            "the unrelated simulation status command must not accept a receipt identity"
         );
     }
 
