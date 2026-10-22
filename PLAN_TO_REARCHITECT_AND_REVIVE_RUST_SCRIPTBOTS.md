@@ -498,6 +498,18 @@ remains unchanged and open.]
 
 ---
 
+[Scoped Repair Qualified — `bd-0oro`, LilacElm, 2026-10-22: reconnect CLI
+`set`, `patch` and `apply-preset` to the actual REST configuration receipt
+contract. Source `175c8849` decodes `CommandStatusDto`, reports its actual
+application/journal axes and identity, names the running executable for polling,
+and retains HTTP errors. R10 reproduces the old snapshot-decoding failure; R19
+rejects the first candidate's unavailable executable hint. R20 passes the real
+CLI/server journey: three changed configurations with distinct durable receipts,
+three invalid requests preserving state, and orderly shutdown. R21 passes all
+19 existing CLI units; final-source format/check/strict-Clippy gates pass via RCH.
+Copied external streams and databases match worker hashes. This qualifies the
+scoped repair; the original broader defect class and native/DSR acceptance remain open.]
+
 ## 1. Why This Rebuild Exists
 
 The repository contains a remarkable amount of ambitious code, but it does not yet form one coherent application. The core simulator, GPUI renderer, Bevy renderer, TUI, server, replay layer, storage layer, and web target were developed as parallel feature islands. They compile against some combinations of features, but their ownership models and behavioral contracts disagree.

@@ -205,7 +205,183 @@ Disposition: retain limitations here and in the operator handoff, preserve all o
 and proof, and stop this assessment after its publication checks. The earlier bounded CASS
 search remains limited by its September 16 index; no fresh comprehensive archive clearance is claimed.
 
-### Current implementation and granular TODO — 2026-10-20
+### Current implementation and granular TODO — 2026-10-22
+
+CLI configuration receipts (`bd-0oro`, started 2026-10-22, LilacElm):
+
+- [x] Refresh Agent Mail, canonical BR/BV, recent commits and bounded CASS context;
+  reserve exact existing files and check remote capacity before editing.
+- [x] Trace all three CLI writers to the actual REST response declarations and
+  handlers: `set`, `patch` and `apply-preset` expect the obsolete snapshot shape.
+- [x] Decode the existing typed command receipt for all three commands; print
+  observed application/journal states, identity and a working polling command.
+- [x] Retain HTTP status/body on rejected edits; do not print application success.
+  Initial source `81f80840`; final product source `ed1ec8a6` and test-retention
+  successor `175c8849` are functionally qualified below.
+- [x] Exercise real CLI and server processes for set, patch and preset; poll the
+  exact identities and independently read back the resulting configuration.
+- [x] Exercise invalid configuration/preset and preserve the unchanged owner state.
+  Final source `175c8849`, R20/job `30074093214629927`, completed 0 with terminal
+  acknowledgement: 1 passed / 0 failed / 0 ignored / 9 filtered in 14.07 seconds.
+  Three distinct command IDs end in 02/03/04, with admission sequences 3/4/5;
+  actual CLI lookups progress from admitted/pending to applied/durable. The test
+  checks each real GET configuration change at the paused tick, all three HTTP-400
+  refusals against unchanged configuration, and successful orderly server shutdown.
+  These are six cells inside one executed test, not six separately counted tests.
+- [x] Run the same regression against old CLI source as a real negative control.
+  R3 refuses before execution on hz2 because no slots are admissible. R5 on
+  vmi1149989 reaches the original 1,800-second compile deadline before tests
+  (`deadline_exceeded`, 137, terminal acknowledgement). Its actual owned compiler
+  is Asupersync 0.5.0; the last Cargo line does not identify that active compiler.
+  These attempts establish no functional result. After R5 terminates, hz2's
+  observed capacity changes to one admissible slot and 17.8 GiB free; R10 retries
+  there without changing the command, feature selection, bounds or admission policy.
+  R10 actually reaches the real CLI after a 29m36 dependency build: job
+  `30074093214629917`, completed 101 with terminal acknowledgement, 0 passed,
+  1 failed, 0 ignored and 9 filtered in 2.09 seconds. The first valid `set`
+  fails decoding the successful response because `tick` is missing. Later cells
+  are not counted as exercised. The original proc-macro-error2 2.0.1 future
+  incompatibility warning remains. Its managed scratch path was already absent
+  during rsync (23); the raw transcript survives but the database was not recovered.
+- [x] Add the existing opt-in external artifact-root convention to the new test
+  after observing that retention failure. Source `175c8849`, tree
+  `8d4112ff43ab20b90f21c774370b803ae3d1eeb8`, changes only test output location;
+  product source remains `ed1ec8a6`. R14 formatting passes at this final source.
+- [x] Verify actual external files after the subsequent negative and positive runs;
+  a kept TempDir or printed path alone does not establish retained evidence.
+  R19's 13 files and R20's 86 files are copied from their actual generated
+  external directories, and every copied file matches its worker SHA-256.
+  Independent stream readback observes 12/10/9 lookup receipts for set/patch/preset,
+  stable identities and final applied/durable axes, and the three exact refusal
+  reasons. R20 retains the 1,589,248-byte run database and subprocess streams.
+  Its embedded manifest names `175c8849` but declares `provenance_complete=false`;
+  absent cleanliness/status/diff and full rustc identity remain unqualified.
+  No separate offline SQL, complete log-EOF or cross-platform proof is inferred.
+- [x] Run formatting, workspace/all-target compiler and strict Clippy through RCH;
+  retain terminal outcomes and qualify any pre-existing warnings explicitly.
+  Final source `175c8849`: R14 formatting, R16 workspace/all-target check
+  and R18 strict workspace/all-target Clippy pass with terminal acknowledgements
+  (jobs `30074093214629921` / `30074093214629923` /
+  `30074093214629925`). Cargo still reports the existing proc-macro-error2 2.0.1
+  future incompatibility warning; no warning-free claim. Functional execution
+  is separately qualified by R20.
+  R13, R15 and R17 reach the unchanged compile deadline, return acknowledged 137,
+  and execute zero tests; none is recorded as a functional failure or pass.
+  Exact clean source `81f80840`: R7 formatting, R8 workspace/all-target check
+  and R9 strict workspace/all-target Clippy pass through strict RCH with terminal
+  acknowledgements (jobs `30074093214629914` / `30074093214629915` /
+  `30074093214629916`). No workspace test, performance or DSR acceptance is
+  inferred from these compiler/lint gates.
+- [x] Qualify the successor polling hint: Cargo emits `control_cli`, while the
+  first candidate copied the existing `scriptbots-control` display name. Resolve
+  the actual executable, keep it shell-quoted, and require its real canonical path
+  in the process test. Preserve every original assertion and bound; the stronger
+  hint expectation must fail against `81f80840` before passing the corrected source.
+  R14/R16/R18 qualify final source `175c8849`; they do not replace this functional
+  hint qualification.
+  R19 actually rejects the old hint: job `30074093214629926`, completed 101
+  with acknowledgement, 0 passed / 1 failed / 9 filtered in 7.84 seconds. The
+  real `set` decodes its admitted/pending receipt, then fails the exact executable
+  hint guard because stdout names `scriptbots-control`. Later matrix cells remain
+  unexercised in this negative. Its 13 external files are copied successfully,
+  including the actual receipt streams and database/sidecars; this guard-terminated
+  negative does not establish orderly shutdown or a finished database.
+  The identical stronger hint assertion passes at corrected source `175c8849`
+  in R20, together with all three valid and all three invalid matrix cells.
+- [x] Run the existing complete `control_cli` unit suite at the qualified source.
+  R21/job `30074093214629928`, source `175c8849`: acknowledged exit 0,
+  19 passed / 0 failed / 0 ignored / 0 filtered in 31.44 seconds. This does not
+  convert existing unit test doubles into real-service evidence.
+- [x] Review the source diff and static findings; prepare separate reviewed source
+  and tracker/handoff snapshots for publication. Actual push and four-ref checks
+  are recorded in external `publication.json` after this metadata is committed;
+  this checkbox records preparation, not an already observed push.
+- [x] Record the bounded real-work audit, honesty inventory, failures and remaining
+  original acceptance. Do not close the broader defect-class bead for this increment.
+
+Evidence root: `/data/tmp/scriptbots-cli-receipts-20261022-lilacelm` contains
+the separate raw RCH envelopes/logs, reviewed source identities and actual R19/R20
+streams, databases and worker hash manifests. UBS on the two source files reports
+2 critical / 434 warnings / 401 informational findings; the two critical findings
+misclassify unchanged outbound reqwest Idempotency-Key header setters as response
+headers. They are manually triaged, without suppression or a claim that all warnings
+are cleared. The final test-only retention scan reports 0 critical / 332 warnings /
+287 informational findings. No whole-workspace test or performance execution is claimed.
+
+Bounded audit of this qualified CLI increment (publication preparation):
+the README's purpose is a deterministic artificial-life laboratory with usable
+CLI/REST/MCP experiment controls. The three source commits are one USER repair,
+including correction of its new polling hint and artifact retention. The regression
+is its ENABLER, and this requested TODO/plan/tracker record is PROCESS. There are no closes
+or delegated-agent deliverables. R20 executes the demo's real actions: edit, inspect
+the actual receipt, look up its identity and read the changed configuration.
+Removing the process record would not change runtime behavior, but would lose the
+requested qualification/remaining-work handoff.
+The test now enables this bounded functional claim, with R10/R19 failing at the
+intended old-client guards. Broader host/frontend qualification remains important;
+this bounded repair targets three broken research
+controls with a source-proven contract mismatch. No successor bead carries away
+unmet acceptance. Verdict: **DRIFTING in turnaround cost** from dependency rebuilds;
+the correction was to freeze additional feature work and reuse admitted caches
+sequentially. The named checks are now complete, with no new framework or relaxed
+bound. Publish this increment and stop expanding its process record.
+
+Twenty-question honesty inventory, bounded to this increment:
+1. No (checked: source/test diffs add one regression; original tests and assertions
+   remain intact, with no new ignore or deleted test).
+2. No (checked: the regression spawns the real app and CLI, real HTTP listeners
+   and a file-backed FrankenSQLite owner; it introduces no test double).
+3. No (checked: changed paths contain no golden or snapshot regeneration).
+4. The new regression's hint expectation was strengthened after finding the actual
+   binary-name mismatch. Existing gates, features, bounds and tolerances are unchanged.
+   R19 rejects the old hint and R20 passes the corrected source; neither formatter
+   failure nor compile deadline was bypassed.
+5. No (checked: no product branch on a test name, proof root or expected outcome;
+   executable discovery supplies an actual operator command).
+6. No (checked: R20 executes 1 test with six cells; R21 executes all 19 CLI unit
+   tests. No unexecuted or filtered test is reported as passing).
+7. Some progress wording inferred completion/remaining phases from Cargo line order
+   ("past Asupersync", "last" crates). Those lines establish dispatch only. Corrected
+   in commentary and here; the raw outcomes still distinguish completed, refused,
+   deadline-exceeded and pending. No functional pass is inferred from those lines.
+8. No (checked: no RCH result is promoted to DSR, performance, native UI,
+   cross-platform or independent acceptance).
+9. The initial polling hint assumed the display name was an available executable.
+   Source review disproved that assumption. Corrected in `ed1ec8a6`, disclosed in
+   comment 2924 and commentary; actual-program R19/R20 now discriminate that fix.
+10. No (checked: every cited build retains separate raw stdout/envelope and stderr;
+    the original formatter failures and compile deadline remain available).
+11. No (checked: original `bd-0oro` status/criteria/dependencies remain, with no
+    closure, new follow-up or graph rewrite).
+12. No (checked: plan changes mark work and qualification; they do not replace
+    the original acceptance with this smaller repair).
+13. Not applicable: no subagent was dispatched or accepted in this increment.
+14. Not applicable: no delegation prompt or swarm success criterion was issued.
+15. Not applicable: no agent report substitutes for direct execution/readback.
+16. Not applicable: no managed pane or agent produced guard/refusal closes.
+17. No (checked: source inspection and self-authored tests count once; no peer
+    agreement is represented as independent proof).
+18. No (checked: three valid mutations and three invalid requests are declared
+    before execution; a negative stopping early will not count as the whole matrix).
+19. Explanations worth preserving: both presumed warm pools rebuilt dependencies;
+    R5/R13/R15/R17 timed out before tests. A broad process probe printed excessive
+    foreign compiler arguments, then was narrowed to the owned pool/PID before attribution.
+    Prototype field selection and both formatting failures were corrected before
+    acceptance claims. The first run directory did not survive copying; overlooking
+    the existing external-root convention was avoidable. Source `175c8849` corrects
+    that test-only location. No source-history rewrite hides those iterations.
+20. Strongest observed evidence is the real old-client decoding failure in R10,
+    the old-hint failure in R19 and all six corrected-source cells in R20, plus
+    actual copied/hash-checked streams and 19 passing existing CLI units. Compiler
+    gates bind final source `175c8849`; this remains functional RCH qualification,
+    with no DSR, full-workspace test or complete platform/provenance claim.
+
+The bounded CASS search still reports a September 16 index timestamp despite its
+fresh flag. A configuration-receipt hit view returned old transport context; the
+quoted exact new test name returns zero hits. These observations provide no recent
+session clearance. Disposition: retain failures and limitations, publish the
+qualified repair with its actual-program negative/positive evidence, and leave the
+original defect class open with its existing acceptance and dependencies.
 
 Full-owner continuation (`bd-2z0.5.13`, started 2026-10-20, LilacElm;
 original acceptance remains in progress):
