@@ -505,7 +505,8 @@ fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
                 "each configuration edit needs its own observed admission: {receipt:?}"
             );
             let hint = format!(
-                "scriptbots-control --base-url '{base_url}' lookup-status '{}'",
+                "'{}' --base-url '{base_url}' lookup-status '{}'",
+                std::fs::canonicalize(env!("CARGO_BIN_EXE_control_cli"))?.display(),
                 receipt.command_id,
             );
             anyhow::ensure!(

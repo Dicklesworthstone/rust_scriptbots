@@ -1151,8 +1151,11 @@ fn print_configuration_receipt(
 ) -> Result<()> {
     println!("{label} command receipt");
     println!("{}", serde_json::to_string_pretty(receipt)?);
+    let executable =
+        std::env::current_exe().context("failed to locate this control CLI executable")?;
     println!(
-        "  poll with: scriptbots-control --base-url '{}' lookup-status '{}'",
+        "  poll with: '{}' --base-url '{}' lookup-status '{}'",
+        executable.display().to_string().replace('\'', "'\\''"),
         base_url.replace('\'', "'\\''"),
         receipt.command_id.replace('\'', "'\\''"),
     );
