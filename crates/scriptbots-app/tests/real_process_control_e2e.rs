@@ -410,6 +410,209 @@ fn verify_cadence_replay(database: &std::path::Path, tick: u64) -> Result<()> {
     Ok(())
 }
 
+/// Configuration CLI clients must consume the real receipt contract, then allow
+/// the operator to observe application and journal durability independently.
+#[test]
+#[serial]
+fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
+    let run_dir = tempdir()?.keep();
+    println!("configuration CLI artifacts: {}", run_dir.display());
+    let database = run_dir.join("configuration.sqlite");
+    let mut child = cadence_replay_command()
+        .args(["--mode", "server", "--storage", "file", "--brain", "mlp"])
+        .args(["--threads", "1", "--checkpoint-interval", "0"])
+        .env("SCRIPTBOTS_STORAGE_PATH", &database)
+        .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "1")
+        .env("SCRIPTBOTS_CONTROL_REST_ADDR", "127.0.0.1:0")
+        .env("SCRIPTBOTS_CONTROL_MCP", "http")
+        .env("SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR", "127.0.0.1:0")
+        .current_dir(&run_dir)
+        .stdout(std::fs::File::create(run_dir.join("server.stdout"))?)
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (addr, _, log) = match wait_for_control_addresses(&mut child, Duration::from_secs(90)) {
+        Ok(found) => found,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let mut guard = ChildGuard(Some(child));
+    let base_url = format!("http://{addr}");
+    let run_cli = |name: &str, arguments: &[&str]| -> Result<std::process::Output> {
+        let output = Command::new(env!("CARGO_BIN_EXE_control_cli"))
+            .args(["--base-url", &base_url])
+            .args(arguments)
+            .env_remove("SCRIPTBOTS_CONTROL_IDEMPOTENCY_KEY")
+            .env("NO_COLOR", "1")
+            .current_dir(&run_dir)
+            .output()?;
+        std::fs::write(run_dir.join(format!("{name}.stdout")), &output.stdout)?;
+        std::fs::write(run_dir.join(format!("{name}.stderr")), &output.stderr)?;
+        Ok(output)
+    };
+    let result = (|| {
+        apply_cadence_control(addr, "/api/control/pause", b"")?;
+        let (_, before) = http(addr, "GET", "/api/config")?;
+        let before: serde_json::Value = serde_json::from_str(&before)?;
+        let mut command_ids = Vec::new();
+        for (name, arguments, field, expected) in [
+            (
+                "set",
+                vec!["set", "food_growth_rate", "0.001"],
+                "food_growth_rate",
+                serde_json::json!(0.001_f32),
+            ),
+            (
+                "patch",
+                vec!["patch", r#"{"closed":true}"#],
+                "closed",
+                serde_json::json!(true),
+            ),
+            (
+                "preset",
+                vec!["apply-preset", "arctic"],
+                "food_max",
+                serde_json::json!(
+                    scriptbots_core::PresetKind::Arctic.patch()["food_max"]
+                        .as_f64()
+                        .context("Arctic declares food_max")? as f32
+                ),
+            ),
+        ] {
+            anyhow::ensure!(
+                before["config"].get(field).is_some() && before["config"][field] != expected,
+                "{name} must exercise a real configuration change"
+            );
+            let output = run_cli(name, &arguments)?;
+            let stdout = String::from_utf8(output.stdout)?;
+            anyhow::ensure!(
+                output.status.success(),
+                "the real {name} CLI failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let start = stdout.find('{').context("receipt JSON must be printed")?;
+            let receipt = serde_json::Deserializer::from_str(&stdout[start..])
+                .into_iter::<scriptbots_app::CommandStatusDto>()
+                .next()
+                .context("one receipt")??;
+            anyhow::ensure!(
+                !receipt.command_id.is_empty()
+                    && receipt.admission_sequence.is_some()
+                    && !command_ids.contains(&receipt.command_id),
+                "each configuration edit needs its own observed admission: {receipt:?}"
+            );
+            let hint = format!(
+                "scriptbots-control --base-url '{base_url}' lookup-status '{}'",
+                receipt.command_id,
+            );
+            anyhow::ensure!(
+                stdout.contains(&hint),
+                "missing usable polling hint: {stdout}"
+            );
+            anyhow::ensure!(
+                !stdout.contains("Configuration patch applied")
+                    && !stdout.contains("Applied preset")
+                    && !stdout.contains("updated"),
+                "a receipt cannot assert a future configuration: {stdout}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut lookup_attempt = 0;
+            loop {
+                let output = run_cli(
+                    &format!("{name}-lookup-{lookup_attempt}"),
+                    &["lookup-status", &receipt.command_id],
+                )?;
+                lookup_attempt += 1;
+                anyhow::ensure!(output.status.success(), "lookup failed: {output:?}");
+                let status: scriptbots_app::CommandStatusDto =
+                    serde_json::from_slice(&output.stdout)?;
+                anyhow::ensure!(
+                    status.command_id == receipt.command_id
+                        && status.admission_sequence == receipt.admission_sequence,
+                    "lookup changed command identity: {status:?}"
+                );
+                if status.application_state == "applied" && status.journal_state == "durable" {
+                    println!(
+                        "CONFIGURATION_CLI: {name}, admission={receipt:?}, observed={status:?}"
+                    );
+                    break;
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "{name} never settled: {status:?}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let (code, after) = http(addr, "GET", "/api/config")?;
+            let after: serde_json::Value = serde_json::from_str(&after)?;
+            anyhow::ensure!(
+                code == 200
+                    && after["config"][field] == expected
+                    && after["tick"] == before["tick"],
+                "{name} configuration readback differs: expected {field}={expected}, actual {after}"
+            );
+            command_ids.push(receipt.command_id);
+        }
+        let (_, settled) = http(addr, "GET", "/api/config")?;
+        let settled: serde_json::Value = serde_json::from_str(&settled)?;
+        for (name, arguments, reason) in [
+            (
+                "invalid-set",
+                vec!["set", "no_such_knob", "1"],
+                "no_such_knob",
+            ),
+            (
+                "invalid-patch",
+                vec!["patch", r#"{"food_growth_rate":-1}"#],
+                "food_growth_rate",
+            ),
+            (
+                "invalid-preset",
+                vec!["apply-preset", "no-such-preset"],
+                "unknown preset",
+            ),
+        ] {
+            let output = run_cli(name, &arguments)?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::ensure!(
+                !output.status.success()
+                    && output.stdout.is_empty()
+                    && stderr.contains("400 Bad Request")
+                    && stderr.contains(reason),
+                "{name} must preserve the real HTTP refusal: {output:?}"
+            );
+            let (_, after) = http(addr, "GET", "/api/config")?;
+            let after: serde_json::Value = serde_json::from_str(&after)?;
+            anyhow::ensure!(
+                after == settled,
+                "{name} changed owner configuration: {after}"
+            );
+        }
+        let (code, shutdown) = http(addr, "POST", "/api/control/shutdown")?;
+        anyhow::ensure!(code == 200, "shutdown returned {code}: {shutdown}");
+        let child = guard.0.as_mut().context("owned server child")?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::ensure!(status.success(), "server shutdown failed: {status}");
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "server did not shut down");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        println!("CONFIGURATION_CLI: three distinct durable command identities: {command_ids:?}");
+        Ok(())
+    })();
+    std::fs::write(
+        run_dir.join("server.stderr"),
+        log.lock().unwrap().join("\n"),
+    )?;
+    result
+}
+
 /// A sealed cadence batch must already contain the digest that shutdown cannot append.
 #[test]
 #[serial]

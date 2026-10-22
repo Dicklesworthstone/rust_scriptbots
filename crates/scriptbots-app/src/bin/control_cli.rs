@@ -25,8 +25,8 @@ use ratatui::{
 use reqwest::{Client, StatusCode};
 use scriptbots_app::control::MapApplyAgentPolicy;
 use scriptbots_app::{
-    ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest, KnobEntry, KnobKind,
-    KnobUpdate, STORAGE_SIDECAR_SUFFIXES, default_control_rest_base_url,
+    CommandStatusDto, ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest,
+    KnobEntry, KnobKind, KnobUpdate, STORAGE_SIDECAR_SUFFIXES, default_control_rest_base_url,
     narrative_search::{
         NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery,
         execute_narrative_around, execute_narrative_search, format_hits_table,
@@ -786,19 +786,8 @@ async fn set_command(
             value: value.clone(),
         }],
     };
-    let snapshot: ConfigSnapshot = apply_updates(client, base_url, &request).await?;
-    let resolved = snapshot
-        .config
-        .pointer(&json_pointer(&path))
-        .cloned()
-        .unwrap_or(Value::Null);
-    println!(
-        "{} {} => {}",
-        "updated".green().bold(),
-        path,
-        value_to_string(&resolved, 48)
-    );
-    Ok(())
+    let receipt = apply_updates(client, base_url, &request).await?;
+    print_configuration_receipt(base_url, &format!("set {path}"), &receipt)
 }
 
 async fn patch_command(
@@ -826,10 +815,8 @@ async fn patch_command(
     }
 
     let body = ConfigPatchRequest { patch: patch_value };
-    let snapshot: ConfigSnapshot = apply_patch(client, base_url, &body).await?;
-    println!("{}", "Configuration patch applied".green().bold());
-    println!("tick {}", snapshot.tick);
-    Ok(())
+    let receipt = apply_patch(client, base_url, &body).await?;
+    print_configuration_receipt(base_url, "configuration patch", &receipt)
 }
 
 async fn run_watch(client: Client, base_url: String, interval: Duration) -> Result<()> {
@@ -1114,7 +1101,7 @@ async fn apply_updates(
     client: &Client,
     base_url: &str,
     request: &KnobApplyRequest,
-) -> Result<ConfigSnapshot> {
+) -> Result<CommandStatusDto> {
     let url = join_url(base_url, "/api/knobs/apply");
     let response = client
         .post(url)
@@ -1129,7 +1116,7 @@ async fn apply_patch(
     client: &Client,
     base_url: &str,
     request: &ConfigPatchRequest,
-) -> Result<ConfigSnapshot> {
+) -> Result<CommandStatusDto> {
     let url = join_url(base_url, "/api/config");
     let response = client
         .patch(url)
@@ -1154,6 +1141,25 @@ where
         let body = response.text().await.unwrap_or("<unavailable>".to_string());
         bail!("control API request failed ({status}): {body}");
     }
+}
+
+/// Configuration mutations return owner receipts, not projected future config.
+fn print_configuration_receipt(
+    base_url: &str,
+    label: &str,
+    receipt: &CommandStatusDto,
+) -> Result<()> {
+    println!("{label} command receipt");
+    println!("{}", serde_json::to_string_pretty(receipt)?);
+    println!(
+        "  poll with: scriptbots-control --base-url '{}' lookup-status '{}'",
+        base_url.replace('\'', "'\\''"),
+        receipt.command_id.replace('\'', "'\\''"),
+    );
+    if matches!(receipt.application_state.as_str(), "rejected" | "failed") {
+        bail!("{label} command {}", receipt.application_state);
+    }
+    Ok(())
 }
 
 async fn presets_list(client: &Client, base_url: &str) -> Result<()> {
@@ -1794,9 +1800,9 @@ async fn presets_apply(client: &Client, base_url: &str, name: &str) -> Result<()
     let body = Apply {
         name: name.to_string(),
     };
-    let snapshot: ConfigSnapshot = client.post(url).json(&body).send().await?.json().await?;
-    println!("Applied preset '{}' at tick {}", name, snapshot.tick);
-    Ok(())
+    let response = client.post(url).json(&body).send().await?;
+    let receipt = parse_response(response).await?;
+    print_configuration_receipt(base_url, &format!("preset {name}"), &receipt)
 }
 
 async fn screenshot_request(
@@ -1939,12 +1945,6 @@ fn value_to_string(value: &Value, max_len: usize) -> String {
     let mut truncated: String = raw.chars().take(max_len.saturating_sub(1)).collect();
     truncated.push('…');
     truncated
-}
-
-fn json_pointer(path: &str) -> String {
-    let mut pointer = String::from("/");
-    pointer.push_str(&path.replace('.', "/"));
-    pointer
 }
 
 #[cfg(test)]

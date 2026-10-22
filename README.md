@@ -1179,7 +1179,7 @@ Example PATCH body:
 cargo run -p scriptbots-app --bin control_cli -- list
 cargo run -p scriptbots-app --bin control_cli -- get
 cargo run -p scriptbots-app --bin control_cli -- set neuroflow.enabled true
-cargo run -p scriptbots-app --bin control_cli -- patch --json '{"food_max":0.6}'
+cargo run -p scriptbots-app --bin control_cli -- patch '{"food_max":0.6}'
 cargo run -p scriptbots-app --bin control_cli -- watch --interval-ms 750
 # `--db` is required: paste the exact path printed as `Run database: ...` by the file-mode app.
 # `--out` must name a fresh path; export refuses every existing file, symlink, or database sidecar.
@@ -1194,6 +1194,11 @@ cargo run -p scriptbots-app --bin control_cli -- screenshot --out screenshots/fr
 cargo run -p scriptbots-app --bin control_cli -- screenshot --png --out screenshots/frame_0001.png
 cargo run -p scriptbots-app --bin control_cli -- hydrology
 ``` 
+
+`set`, `patch` and `apply-preset` print the owner's command receipt, including
+separate application and journal states. Follow the printed `lookup-status`
+command against the same server; use `get` to inspect the resulting configuration.
+An admission receipt alone does not prove application or durable storage.
 
 Interactive dashboard:
 ```bash
