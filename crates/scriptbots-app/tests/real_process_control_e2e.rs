@@ -415,7 +415,15 @@ fn verify_cadence_replay(database: &std::path::Path, tick: u64) -> Result<()> {
 #[test]
 #[serial]
 fn real_process_configuration_cli_receipts_and_rejections() -> Result<()> {
-    let run_dir = tempdir()?.keep();
+    let run_dir = if let Some(root) = std::env::var_os("SCRIPTBOTS_TEST_ARTIFACT_ROOT") {
+        std::fs::create_dir_all(&root)?;
+        tempfile::Builder::new()
+            .prefix("configuration-cli-")
+            .tempdir_in(root)?
+    } else {
+        tempdir()?
+    }
+    .keep();
     println!("configuration CLI artifacts: {}", run_dir.display());
     let database = run_dir.join("configuration.sqlite");
     let mut child = cadence_replay_command()
