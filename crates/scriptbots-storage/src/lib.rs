@@ -20104,7 +20104,7 @@ impl Storage {
                 "UPDATE host_journal_progress
                  SET applied_journal_prefix = ?1,
                      applied_event_prefix = CASE WHEN ?2 IS NULL THEN applied_event_prefix ELSE ?2 END
-                 WHERE run_id = ?3 AND host_session_id = ?4
+                 WHERE rowid = ?7 AND run_id = ?3 AND host_session_id = ?4
                    AND applied_journal_prefix = ?5
                    AND (?2 IS NULL OR applied_event_prefix = ?6)"
             }
@@ -20113,7 +20113,7 @@ impl Storage {
                  SET committed_volatile_journal_prefix = ?1,
                      committed_volatile_event_prefix = CASE WHEN ?2 IS NULL
                          THEN committed_volatile_event_prefix ELSE ?2 END
-                 WHERE run_id = ?3 AND host_session_id = ?4
+                 WHERE rowid = ?7 AND run_id = ?3 AND host_session_id = ?4
                    AND committed_volatile_journal_prefix = ?5
                    AND (?2 IS NULL OR committed_volatile_event_prefix = ?6)"
             }
@@ -20121,7 +20121,7 @@ impl Storage {
                 "UPDATE host_journal_progress
                  SET durable_journal_prefix = ?1,
                      durable_event_prefix = CASE WHEN ?2 IS NULL THEN durable_event_prefix ELSE ?2 END
-                 WHERE run_id = ?3 AND host_session_id = ?4
+                 WHERE rowid = ?7 AND run_id = ?3 AND host_session_id = ?4
                    AND durable_journal_prefix = ?5
                    AND (?2 IS NULL OR durable_event_prefix = ?6)"
             }
@@ -20193,6 +20193,12 @@ impl Storage {
                     sqlite_optional_i64(ledger_rowid),
                 ],
             )?;
+            let progress_rowid = rowid_of(
+                transaction,
+                "SELECT rowid FROM host_journal_progress
+                 WHERE run_id = ?1 AND host_session_id = ?2",
+                &[sqlite_run_id(self.run_id), session.as_str().into()],
+            )?;
             let progress_rows = transaction.execute_with_params(
                 progress_sql,
                 &[
@@ -20202,6 +20208,7 @@ impl Storage {
                     session.as_str().into(),
                     prior_journal.as_str().into(),
                     prior_event.as_str().into(),
+                    sqlite_optional_i64(progress_rowid),
                 ],
             )?;
             if ledger_rows != 1 || progress_rows != 1 {
