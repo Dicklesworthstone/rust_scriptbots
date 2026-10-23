@@ -1,5 +1,164 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-20
 
+### GPU evidence matcher execution TODO — 2026-10-23, LilacElm
+
+Consumer: the user's explicitly requested granular work list and the agent
+implementing `bd-16g.15.3`. It gates this scoped repair's completion statement,
+addresses the observed same-vendor/name false admission (comment 2904), and
+retires as an active checklist when the repair is qualified or handed off.
+It earns no capability credit. Original ownership and acceptance are unchanged.
+
+- [x] Refresh instructions, canonical BR readiness, BV analysis, recent commits,
+  Agent Mail and CASS; preserve the original 718-record tracker preimage.
+- [x] Reserve the exact implementation and existing documentation/tracker paths;
+  announce the contribution and retain LavenderLion as the original owner.
+- [x] Implement full adapter matching and embedded source/target/compiler binding;
+  missing build evidence must remain unavailable, never a fabricated default.
+- [x] Implement a recomputed digest over all report fields and require nonvacuous,
+  internally consistent exact parity before certification.
+- [x] Add predicate tests for matching evidence and changed identity, stale/short/zero/divergent,
+  tampered and missing-build counterexamples through the production predicate.
+- [x] Correct unsupported hardware status claims in the existing generator/docs.
+- [x] Correct the helper's claimed 1,000-tick/shader-fault coverage and the enum
+  comments: current modes perturb integer accumulators; actual shader faults remain open.
+- [x] Qualify focused tests through strict-remote RCH: final Rust
+  `d8da9b42`, docs `9109f741`, runner `e62ea661`, job `30074093214629993`,
+  nine passed, zero failed/ignored, 49 filtered, 0.71 seconds under the
+  1,800-second outer test cap.
+  Actual llvmpipe Vulkan execution
+  records five dispatches and 1,250 paired sensor values, then one empty science
+  tick with zero dispatches/values despite equal world digests. Both reports are
+  Approximate and explicitly lack build provenance; constructed admission fixtures
+  establish no hardware result. Active worker hashes match all three frozen files
+  at `2026-10-23T17:34:06.540321Z`.
+- [x] Verify formatting on that candidate: RCH job `30074093214629995`, exit zero
+  with terminal acknowledgement. The original v0 software fixture is unchanged.
+- [x] Wire the existing DSR runner's checked native compiler host into the required
+  embedded target field; `bash -n scripts/dsr_verify.sh` passes. A native DSR
+  execution of this changed runner has not been established here.
+- [x] Reject a missing comparison observation during deserialization; retain the
+  existing report roundtrip and distinguish unrecorded data from an observed zero.
+- [x] Observe the missing-identity counterexample before its repair: test-only
+  `d08906b4`, RCH job `30074093214629986`, exit 101/acknowledged, zero passed,
+  one failed, 57 filtered, 0.03 seconds. It stops at equal blank adapter names;
+  the driver cases are not credited as exercised by that red run. The green
+  candidate retains the valid positive and refuses all three equal-blank fields.
+- [x] Complete final-source workspace all-target check: RCH job
+  `30074093214629992`, exit zero/terminal acknowledgement, 64.248 seconds remote
+  execution. Earlier draft job `30074093214629977` passes after 3,424.109 seconds;
+  it does not qualify later bytes.
+- [x] Complete final-source strict workspace all-target Clippy: RCH job
+  `30074093214629994`, exit zero/terminal acknowledgement, 112.653 seconds remote
+  execution. The first Clippy
+  run (`30074093214629990`) fails on the new test table's type complexity;
+  a local type alias fixes that declaration without a suppression.
+- [x] Run targeted UBS on Rust and the DSR runner: exit zero, zero critical,
+  114 warnings and 80 information items. Bash has no findings. Test-only
+  assertions/unwraps, per-case clones/string allocations and existing provider
+  indexing remain visible; no scanner suppression or clean-warning claim is made.
+- [x] Recheck the diff and original acceptance in a fresh pass; document the
+  observed scope without claiming hardware, performance or full task completion.
+- [x] Commit the complete immutable three-path source review as
+  `fece974739581c40d10033e3afac44fedba53b9b`; committed blobs match the tested
+  Rust, documentation and runner snapshots. No further source changes follow.
+- [x] Append evidence to the existing Bead and preserve all 718 tracker records.
+  The exporter omits `source_repo_path` from 392 unrelated records; the first
+  preservation audit refuses that output. After proving it is their sole
+  difference, restore each exact original row. The final audit permits only
+  four appended comments (`2946`–`2949`) and `updated_at` on `bd-16g.15.3`,
+  preserves all 717 unrelated records and the ten original comments, and confirms
+  unchanged owner/status/acceptance/dependencies. Dependency cycles remain zero.
+- [x] Prepare a separate metadata snapshot and explicit final transport checks:
+  safe fast-forward pull followed immediately by BR import, normal main/mirror
+  pushes, ref/ancestry verification and release of owned leases. Actual transport
+  outcomes belong to the external publication record and final response; this
+  preparation entry does not assert a successful push.
+
+Evidence directory: `/data/tmp/scriptbots-gpu-evidence-20261023T1625-lilacelm`.
+Final jobs share base `626cdf60` and explicit overlay
+`446e136f786b05c42e3dee6a0f2ef82d75a5d3cb99001d9daa917faa42d1c44f`.
+Final tracker SHA256: `1d43be1d6d283b836ce8cb80dc5a34a5de7d55c77b4693b523dcbff3299cce62`.
+The requested checklist retires at publication/handoff; the original Bead does not.
+
+**Bounded self-audit (scoped source qualified; no independent verifier):**
+The README's purpose is a faithful deterministic artificial-life laboratory with
+GPU visualization, pluggable brains and trustworthy analytics. The production
+admission/reporting repair and user documentation are USER work; this requested
+TODO and tracker notes are PROCESS and earn no capability credit. The scoped
+source commit exists; remote publication is a separate transport check. The
+smallest demonstrable result is the actual
+one-tick empty-world diagnostic: zero GPU calls/observations and Approximate,
+rather than treating a planned tick or equal digests as sufficient evidence.
+Removing the TODO would change no runtime behavior; its consumer/gate is the
+user's explicit request above. It retires at publication/handoff. The integrity
+exception is unnecessary. Highest-priority ready work includes a host-specific
+toolchain problem that this Linux host cannot resolve; this existing P1 matcher
+defect is actionable. Another hour of process design would add less value than
+finishing this repair. No new process framework is being built.
+Inventory: one USER implementation/documentation increment and one requested
+PROCESS tracking record; no new framework or unknown-purpose item. The existing
+consumer is application startup's `is_adapter_certified_exact` call, while the
+executed positive here is the predicate/software diagnostic, not a hardware lane.
+The long-standing open user outcome is the `bd-2z0` Evolution Lab; this concrete
+false-certification defect is part of its scientific trust boundary. Solo work
+has no pane/close-rate comparison. No plan-only commit or follow-up closes an
+unfinished original. Verdict: bounded implementation work with required checks
+passed; no further process machinery, finish the normal publication checks.
+
+Honesty inventory, limited to this increment's diff, raw RCH logs, original Bead
+criteria and the CASS results actually inspected:
+
+1. No test weakening (checked: source diff preserves existing assertions and
+   adds rejection/positive/actual-provider cases; no ignore or configuration change).
+2. Constructed adapter/report fixtures are used for predicate tests; they are
+   explicitly labelled constructed and are not GPU execution evidence.
+3. No golden regeneration (checked: the retained parity fixture is unchanged).
+4. The production gate is the repair target. Its admissible set narrows; no
+   suppression/bypass is added. Compiler-inclusive RCH test caps were 14,400s,
+   while every completed focused invocation also finished inside 1,800s; those
+   caps are not hardware/native acceptance. Functional deadlines in source are unchanged.
+5. No demo-path special case (checked: the production reader uses the same
+   predicate as the mutation controls; fixture names grant no exception).
+6. No zero-run credit (checked: final raw result is nine passes/49 filtered;
+   actual llvmpipe startup, dispatch/comparison counts and both reports are present).
+7. No unexecuted command credited (checked: final source commands and terminal
+   acknowledgements pass; older-draft passes are labelled with their own source.
+   Shell syntax and the new target export do not claim a native DSR execution).
+8. No proof-class promotion (checked: software, constructed evidence and missing
+   build provenance remain explicit; hardware and DSR scaling are unqualified).
+9. Failures remain recorded: initial formatting failures, hz3 runtime refusal,
+   incompatible RCH option rejection, the reaped post-run source path, and the
+   deliberately red missing-identity predicate test before its repair, first
+   Clippy type-complexity failure, final-format slot refusals, and refused
+   tracker export with omitted historical fields. The successful formatter uses
+   a per-command one-slot request, without changing worker or daemon policy.
+10. No evidence stderr suppression (checked: command logs retain stdout/stderr).
+11. No closure (checked: original owner/status/criteria remain; no successor is
+    created to carry unfinished acceptance).
+12. Documentation corrects unsupported claims; original acceptance is unchanged.
+13. Solo work; no subagent closure or independent-verification claim.
+14. No delegation (checked: no subagent dispatch in this increment).
+15. No delegated report accepted as evidence; actual logs and hashes were read.
+16. No refusal farming close; counters improve real reports and the parent stays open.
+17. No inter-agent agreement counted as confirmation; mail delivery is coordination.
+18. Counts use the named focused test selection and observed dispatch/sensor loops;
+    no performance speedup or whole-workspace test denominator is claimed.
+19. Execution mistakes to explain: initial read batches truncated, an early direct
+    BV query was discarded in favor of the authoritative wrapper, and RCH rejects
+    clean-overlay plus source-content-receipt. Bounded rereads and a supported
+    invocation corrected these; no policy override or local fallback was used.
+20. Strongest current evidence is the final source-bound nine-test run plus the
+    active worker file hashes and actual empty/nonempty provider observations.
+    It is repeatable software/predicate evidence, not independent hardware proof.
+
+Disposition: source review and re-execution are self-verification. Matching
+constructed complete evidence is admitted; missing, mismatched, unobserved or
+corrupt evidence is refused even after independently rehashing identity/outcome
+counterexamples. This split narrows the defective gate; no hardware run or
+performance improvement is inferred. The original
+1,000-tick hardware, real shader/f32 faults, complete downstream and DSR scaling
+requirements remain open. No remaining requirement is silently split away.
+
 ## Current assessment — 2026-10-20
 
 **This is a substantial deterministic simulator with real control, persistence, replay and

@@ -49,6 +49,15 @@ Passing server runs do not close the intermittent storage/journal latency invest
 
 **Primary outcome:** turn the repository into a deterministic, genuinely evolving artificial-life laboratory with one correct simulation runtime, a polished FrankenTUI interface, a real GPU desktop interface, trustworthy replay/experiments, and tests that exercise the actual shipped paths.
 
+[Scoped repair qualified — `bd-16g.15.3`, LilacElm, 2026-10-23, `fece97473958`:
+the matcher binds complete adapter/build/report evidence, actual dispatch and
+comparison observations replace planned-work counts, and generated hardware rows
+are unverified targets. Strict-remote workspace all-target check/Clippy, formatting
+and nine focused tests pass. These are software/predicate checks, not hardware
+qualification. LavenderLion retains ownership and the original task stays in
+progress: actual hardware parity, shader faults, downstream labels and DSR scaling
+acceptance remain open. Exact evidence and the scoped TODO are in the reality check.]
+
 ### Implementation pass — 2026-10-10, LilacElm [Currently In Progress]
 
 Original owners `bd-2z0.6.8`, `bd-dkd9` and `bd-2z0.5.13` remain open. The current
