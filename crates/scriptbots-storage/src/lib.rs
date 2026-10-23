@@ -274,8 +274,8 @@ impl<'a> Transaction<'a> {
 /// An autocommit read makes fsqlite refresh its committed pager state first, including a
 /// BLAKE3 digest over the WAL frames; a read inside an open transaction reuses that
 /// transaction's snapshot. Measured on this host in file mode: 0.39-0.44 ms against
-/// 0.015-0.023 ms per point read (bd-w1oi). Journal precondition reads therefore run inside
-/// the transaction whose writes depend on them.
+/// 0.015-0.023 ms per point read (bd-w1oi). Journal preconditions run inside the transaction
+/// whose writes depend on them; post-commit projection checks use a fresh read snapshot.
 trait RowReader {
     fn read_rows(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, FrankenError>;
 }
@@ -20230,23 +20230,29 @@ impl Storage {
         if !advanced {
             return Ok(());
         }
-        // Post-commit read-back of the committed rows, unchanged.
-        Self::validate_domain_event_projection_for_connection(
-            self.connection()?,
+        // Read back the committed rows after the write transaction has finished. Both complete
+        // validators share one fresh snapshot, avoiding a committed-state reload per query.
+        // Roll back only this read scope; the journal transition is already committed.
+        let mut snapshot = self.connection()?.transaction()?;
+        let validation = Self::validate_domain_event_projection_for_connection(
+            &snapshot,
             self.run_id,
             batch_id,
             event_sequence,
             target,
             domain_events,
-        )?;
-        Self::validate_command_projection_for_connection(
-            self.connection()?,
-            self.run_id,
-            batch_id,
-            target,
-            command,
-        )?;
-        Ok(())
+        )
+        .and_then(|()| {
+            Self::validate_command_projection_for_connection(
+                &snapshot,
+                self.run_id,
+                batch_id,
+                target,
+                command,
+            )
+        });
+        snapshot.rollback()?;
+        validation
     }
 
     fn complete_host_journal_archive(
