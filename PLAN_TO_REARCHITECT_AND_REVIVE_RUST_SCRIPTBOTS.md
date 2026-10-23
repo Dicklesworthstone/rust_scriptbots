@@ -510,6 +510,49 @@ three invalid requests preserving state, and orderly shutdown. R21 passes all
 Copied external streams and databases match worker hashes. This qualifies the
 scoped repair; the original broader defect class and native/DSR acceptance remain open.]
 
+[Scoped Repair Qualified — `bd-0oro`, LilacElm, 2026-10-23 continuation: share the
+actual-executable polling formatter with legacy control commands and retain their
+selected server URL. Qualify the real no-payload and JSON-payload CLI paths without
+weakening the existing configuration journey, receipt assertions or compiler gates.
+Source `1fa33c36` passed formatting, workspace check, strict Clippy and all 19 CLI
+units. At that source, process qualification remained pending: two old-source
+runs failed at resume applied/journal-pending before the hint guard, and subsequent fleet pressure/namespace
+refusals are retained separately. R30 executes the unchanged final-source journey
+and reproduces resume applied/journal-pending before legacy pause/step. Those
+earlier streams do not qualify the later controls. Source `d0f72040` then adds
+the guarded progress-row lookup described below. R49 executes the same original
+case successfully: five distinct durable CLI identities, all configuration and
+refusal assertions, running-to-paused control, exactly one paused JSON step, and
+HTTP shutdown plus successful child exit. Its 168 copied files match worker
+hashes. Formatting, workspace/all-target check and strict Clippy pass on the
+byte-identical source overlay; the original broader defect class and storage
+acceptance remain open.]
+
+[Currently In Progress — `bd-w1oi`, LilacElm scoped contribution, 2026-10-23:
+R30 at `1fa33c36` executes the unchanged CLI journey and fails at resume
+applied/journal-pending before legacy pause/step. The separate R32 retained-binary
+diagnostic observes the owner waiting in storage admission and the storage worker
+reloading committed state during post-commit projection checks. Keep both complete
+validators after commit, but run their readback on one fresh transaction snapshot
+and explicitly roll back that read scope. No engine pin, SQL predicate, durability
+stage or deadline changes. NobleRiver's broader original acceptance remains open.
+Continuation: `5e1d80a0` passes fresh format/workspace-check/strict-Clippy gates,
+but R40 still fails at resume before legacy pause/step. A separate exact-binary
+R41 diagnostic locates an executing progress UPDATE, with its call site bound
+by the retained ELF. The next candidate adds a transaction-resolved rowid to
+that progress UPDATE while preserving every original key/prefix guard. Its
+source blob is `2da6dce4b44edeedd412808d8114bfd1960843f7`. R49 passes the original
+process case with unchanged bounds: all five distinct CLI identities become
+durable, pause changes running to paused, one JSON step advances paused tick
+17 to 18, and the server shuts down successfully. All 168 copied files match
+worker hashes. The exact tested storage blob is committed in `d0f72040`.
+R47/R48/R52 pass formatting, workspace/all-target check and strict Clippy;
+R51/R53/R54 pass the 44 journal tests plus the existing rowid/key negative and
+V12 corrupt-command recovery guards. Their retained files match worker hashes.
+UBS retains the disclosed nonzero baseline; no scanner/lint policy is weakened.
+This qualifies the bounded workflow and scoped guards, not a performance win,
+universal stall remedy or the original file/memory/native acceptance.]
+
 ## 1. Why This Rebuild Exists
 
 The repository contains a remarkable amount of ambitious code, but it does not yet form one coherent application. The core simulator, GPUI renderer, Bevy renderer, TUI, server, replay layer, storage layer, and web target were developed as parallel feature islands. They compile against some combinations of features, but their ownership models and behavioral contracts disagree.

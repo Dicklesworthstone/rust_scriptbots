@@ -205,7 +205,538 @@ Disposition: retain limitations here and in the operator handoff, preserve all o
 and proof, and stop this assessment after its publication checks. The earlier bounded CASS
 search remains limited by its September 16 index; no fresh comprehensive archive clearance is claimed.
 
-### Current implementation and granular TODO — 2026-10-22
+### Current implementation and granular TODO — 2026-10-22 through 2026-10-23
+
+Scoped workflow repair qualified at `d0f72040e27f19e37c26a3b7976cc96042634fd4`
+(tree `532615d37dde8378cdc49608e47f98a16115546f`). The committed storage blob
+is byte-identical to the tested `5e1d80a0` plus `2da6dce4` overlay. R47 formatting,
+R48 workspace/all-target check and R52 strict Clippy complete 0 with terminal
+acknowledgement. R49 passes the original process case; R51/R53/R54 pass 46
+distinct existing storage tests. The previously stalled workflow now reaches
+durable pause/step receipts and successful application shutdown. The full-symbol
+process lane, native/DSR, original long-run storage acceptance and the broader
+18-form signal task remain open. UBS retains its disclosed nonzero baseline;
+these results do not establish a clean whole-file scan or a performance win.
+
+Shared control polling hints (`bd-0oro`, continuation at `c22f9d7c`, LilacElm):
+
+- [x] Refresh instructions, BR readiness, isolated authoritative BV, commits,
+  bounded CASS and coordination. BV has 75 graph-actionable entries while BR
+  authorizes 29 ready claims; recommendations do not override BR or current owners.
+- [x] Preserve the disk/Mail incident boundary. Capacity and a current supervised
+  Mail owner recovered externally. No cache deletion or live mailbox rewrite was
+  performed here. An isolated snapshot/recovery comparison preserves 23 application
+  tables; its first physical hashes were taken before connection close and are
+  superseded by explicit-close readback, retained separately. No infrastructure
+  recovery is credited as a delivered ScriptBots capability.
+- [x] Reserve exact existing files and append scope to the original in-progress
+  bead without changing acceptance, dependencies or prior comments.
+- [x] Trace the shared legacy writer: its hint hardcodes the marketing name and
+  drops the nondefault server URL. Configuration commands already resolve both.
+- [x] Extract one actual-executable/server-bound formatter and connect both paths;
+  preserve existing receipt output, idempotency headers and HTTP error behavior.
+- [x] Make the existing polling-subcommand test consume the actual formatter and
+  verify its command with Clap, retaining its rejection of the unrelated status route.
+- [x] Extend the existing real-process journey with actual legacy no-payload and
+  JSON-payload controls, exact receipt IDs and a nondefault server; preserve every
+  existing configuration/rejection assertion and bound.
+  These implementation checkboxes name source authoring, not executed outcomes.
+  Frozen source `1fa33c36`, tree `9faa327c690f9afd4055524a40cbca405f886d5e`:
+  pause must change a running owner to paused, and one JSON step must advance
+  exactly one paused tick. Both retain before/after status JSON and exact receipt
+  identities. R4 formatting passes on these bytes. R1 refuses admission because
+  its default four-slot estimate exceeds the worker's three slots; the formatter
+  is retried with one slot, without changing worker capacity or any gate. R3 finds
+  new layout differences, corrected manually before R4. R2/job 30074093214629929
+  and R5/job 30074093214629932 reach the unchanged 1,800-second compile deadline
+  (137, terminal acknowledged), without a functional result or compiler verdict.
+  R6/job 30074093214629933 also reaches that compile deadline (137, terminal
+  acknowledged), with no test result. Its exact committed regression-test bytes
+  are verified against the worker. Late owned-process inspection observes runtime
+  and CSV compilation after the earlier Asupersync/FrankenSQLite-core stretch;
+  the last Cargo line alone does not identify the active compiler. R8 reuses that
+  accumulated cache with the identical R6 command and assertions. R7/job
+  30074093214629934 reaches the same compile deadline without a compiler verdict
+  (137, terminal acknowledged); R9 reuses its exact-source check cache. These
+  retries retain their original deadline and admission policy. R8/job 30074093214629935 reaches the
+  original compile deadline before tests (137, terminal acknowledged); R10 reuses
+  that cache and identical command. Both R8 source blobs and R9's final CLI/test/
+  lockfile blobs are read back from the workers and match their intended inputs.
+  R9/job 30074093214629936 reaches the same deadline after advancing to final
+  source checks (137, terminal acknowledged). R11 refuses before execution (103):
+  the worker now advertises one total slot, below the requested two. After more
+  than 60 seconds of backoff, R12 requests one slot and actually runs `cargo check
+  -j1 --workspace --all-targets --locked` against the same clean source. This
+  reduces build concurrency to the admitted capacity; it changes no checked
+  targets, features, source, lint policy, test assertions or execution deadline.
+  No attempt is counted as functional evidence until its test actually executes.
+  UBS retains 2 critical / 441 warning /
+  415 informational findings; the two critical matches are unchanged outbound
+  Idempotency-Key setters misclassified as response headers, with no suppression.
+- [ ] Observe the old-source hint failure, preserve its actual worker sources and
+  streams, and distinguish an executed assertion from a compiler deadline.
+  The retained R2 test differs from the final test only in formatting and four
+  status-artifact writes; its behavioral assertions are unchanged.
+- [x] Diagnose the resume/journal stall in the original process reproducer without changing the test's
+  scenario, durability requirement or 30-second bound. R10/job 30074093214629937
+  and R13/job 30074093214629939 each execute one test and fail before the intended
+  hint assertion: 0 passed / 1 failed / 0 ignored / 9 filtered, in 45.25 and
+  66.27 seconds respectively. The earlier configuration and rejection assertions
+  complete; resume becomes applied but remains journal-pending. These are real
+  functional failures, not compile/admission failures or a successful hint guard.
+  R10's 66 and R13's 104 retained files match worker/local hashes. R13's separate
+  read-only observer captures 139 trace rows, including healthy snapshots with
+  paused=false, tick 1 and the exact resume identity still journal-pending.
+  The initial pause's observed pending interval is only a few seconds and is
+  not itself evidence of an abnormal delay. A later thread probe misses process
+  exit (header only, exit 1), so it establishes no blocked-thread diagnosis.
+  R15/R16 attempts on hz2 refuse before execution (103); live RCH status attributes
+  its zero admitted slots to critical free space. No cross-worker result exists.
+- [x] Execute the candidate real-process journey and copy the actual external
+  run directory; verify worker/local hashes, five distinct admitted identities,
+  final applied/durable receipts, three unchanged-state HTTP refusals, and the
+  independent pause/single-step status responses.
+  R18/R20 refuse critical memory admission on the warmed test worker. R19/hz3
+  and R21/hz4 refuse source namespace initialization (status 73, wrapper 103);
+  their terminal acknowledgement is not established and no test result is
+  claimed. No namespace, pressure policy or timeout is bypassed. R22/job
+  30074093214629944 is admitted on vmi1293453 with one actual Cargo job and the
+  unchanged runtime scenario/bounds. Its CLI/test/lockfile blobs match the pinned
+  inputs; dependency fetching completes and compilation begins.
+  R22 attempt then reaches the original compile deadline before tests (137,
+  terminal acknowledged). R23/job 30074093214629945 continues on the same worker,
+  source, one-job command, lockfile and runtime bounds; it advances from an
+  observed package-cache lock wait into dependency compilation, then reaches
+  the original compile deadline before tests (137, terminal acknowledged).
+  R24/job 30074093214629946 separates compilation preparation from functional
+  proof: the same pinned source, Cargo configuration, worker and naturally
+  selected target pool run `cargo test --no-run` with a per-invocation
+  7,200-second preparation budget. It executes no tests and cannot qualify the
+  journey. No global configuration, source, admission limit or fingerprint is
+  altered. After preparation, the original exact one-test command must execute
+  with explicit 1,800-second outer limits and the unchanged source assertions
+  (30-second command wait and 15-second shutdown). The related
+  `bd-w1oi` remains open with its original owner and criteria; its file-mode
+  failures and I/O-wait observations are historical context, not a diagnosis of
+  this resume failure. No new workaround or backend fix is claimed.
+  A later fleet readback shows vmi1149989 admissible again, with two free slots.
+  R25 runs the exact final-source journey there with one actual Cargo job and
+  explicit 1,800-second outer limits; the same naturally selected target pool
+  as R17 is observed, but Cargo rebuilds dependencies. R25/job
+  30074093214629949 reaches that original compile deadline (137, terminal
+  acknowledged), with no tests executed. Its separate read-only
+  observer exits 0 at its bounded wait with `no_owned_child_observed`, so it
+  establishes no runtime or thread-state evidence. R24 remains compilation
+  preparation on a different worker.
+  The earlier R19 namespace-refusal lease is no longer readable; supported
+  `rch jobs recover` returns RCH-E504 without replay. Its terminal acknowledgement
+  remains unestablished; no daemon restart or lock-file removal is performed.
+  At 22:13 the original preparation worker reports critical memory pressure.
+  Fresh readbacks find the prior workspace-check worker admissible, with about
+  40 GiB available memory and low observed I/O pressure. R26 refuses before
+  Cargo when creating the local Git archive hits a disk quota (103); no prepared
+  binary or test result is credited. R27 retries after more than 60 seconds with
+  only the caller's `TMPDIR` changed to `/run/user/1000`. Source transfer succeeds;
+  the worker's CLI/test/lockfile blobs match `bfa87040`/`d34c3ea8`/`751ff287`.
+  RCH naturally selects the existing workspace-check target pool. This remains
+  a 7,200-second `--no-run` preparation pass, followed by the original
+  1,800-second functional gate. No worker limit, priority, cache, source,
+  feature or functional assertion is changed. A separate shell resource probe
+  had exited 0 despite a quota error and empty JSON; it is retained as failed
+  observation, and the valid `python3 -c` readback is retained separately.
+  R24 first ends as transport error/SSH 255 with remote completion unconfirmed;
+  it is not relabeled as a compile-deadline verdict. Supported recovery then
+  returns `recovered`, delivery exit 255 and terminal acknowledgement true,
+  retaining its explicit difference from the daemon's earlier 130. Recovery
+  success establishes delivery reconciliation, not successful preparation or
+  a test result. R27/job 30074093214629951 is the sole active preparation lane,
+  with one actual Cargo job; no healthy advancing compiler is interrupted to
+  resize concurrency. The functional journey still must execute at its original
+  1,800-second outer and 30/15-second source bounds.
+  Build-class change disclosed before results: R27 is deliberately cancelled
+  through its exact RCH wrapper; caller exit 143 is reconciled by supported
+  recovery as delivery 143 with terminal acknowledgement true. It executes no
+  tests and is not reported as a compiler failure or pass. R28 prepares a
+  separate symbol-limited test class using only per-invocation Cargo profile
+  settings: `opt-level=0`, `debug=0`, `debug-assertions=true`, and
+  `overflow-checks=true`. Source, features, scenario, durability requirements,
+  test body and 1,800/30/15-second functional bounds remain unchanged. Cargo
+  documents debug information and runtime checks as separate controls
+  ([profile reference](https://doc.rust-lang.org/cargo/reference/profiles.html)).
+  The original default/full-symbol final-source process journey remains
+  unqualified; prior compiler and CLI-unit results retain their stated scope.
+  No result in the new
+  class will be presented as full-symbol, native/DSR or performance acceptance.
+  The actual compiler configuration must corroborate this declaration before
+  any new functional outcome is credited.
+  The first Cargo-main-thread child snapshot finds no compiler and is not used
+  as evidence about the whole process tree. A subsequent process-group readback
+  observes a runtime dependency (`indexmap`) compiling without full debuginfo
+  or an optimization flag, with the expected target/worker settings. A separate
+  same-agent `rustc --print cfg` query using those observed codegen settings
+  reports `debug_assertions`. This corroborates compiler configuration; it is
+  neither an executed runtime assertion test nor independent review. Overflow
+  checks are explicitly configured true in the actual Cargo invocation.
+  R28/job 30074093214629952 reaches its disclosed 7,200-second preparation
+  deadline (137, terminal acknowledged), with no prepared binary or tests.
+  An owned process-group readback shortly before the deadline identifies an
+  active Asupersync compiler. R29 continues compilation only on the same
+  worker/source/profile with a disclosed 14,400-second preparation budget.
+  The subsequent functional invocation retains its explicit 1,800-second
+  outer limit and unchanged 30/15-second source assertions. Compilation
+  preparation, including a successful one, receives no functional credit.
+  R29/job 30074093214629953 completes preparation 0 with terminal acknowledgement
+  on `1fa33c36`/`9faa327c`; worker CLI/test/lockfile blobs match the pinned inputs.
+  R30/job 30074093214629954 then executes the original one-test journey under
+  the original functional limits: 0 passed / 1 failed / 0 ignored / 9 filtered,
+  68.02 seconds, exit 101 with terminal acknowledgement. The first three changes
+  and three refusals complete; resume remains applied/journal-pending. Legacy
+  pause/step and the intended hint guard are not reached. All 122 copied run
+  files match the worker's bytes and hashes. The read-only observer captures
+  20 live thread snapshots, with the host waiting and storage active; snapshots
+  reach tick 2. This alone does not diagnose the cause.
+  R31/job 30074093214629955 unexpectedly rebuilds dependencies in the same
+  selected build directory and reaches its original compile deadline (137,
+  terminal acknowledged), with no child, test or GDB attachment. The prior
+  prepared executable is absent on the worker; its removal cause is unknown.
+  Retained R29 application/CLI/test executables are copied outside the mutable
+  local target directory. Their exact application/CLI bytes are verified before
+  a separate runtime-only R32 diagnostic on the same worker, without building
+  or modifying its target cache. R32 is not the original E2E: its launcher and
+  observed niceness differ (5 versus R30's 19), its initial pause is already
+  paused, and it does not exercise the later single-step cell. It observes the
+  actual legacy pause receipt and executable/server-bound hint; resume eventually
+  becomes durable, but shutdown returns HTTP 503 after its 10-second admission
+  reply deadline. Its owned child is killed/reaped, not orderly finalized.
+  One bounded GDB attach verifies PID/birth/executable, returns 0 and observes
+  detachment. The host waits in `StorageSink::submit_with_receipt` from
+  `HostCore::seal_core_persistence`; storage reloads committed state in
+  `advance_host_journal_state`'s post-commit domain-event validator. This locates
+  a blocking path, not a universal cause or performance result.
+- [x] Author the narrow `bd-w1oi` contribution at `5e1d80a0`: pass the existing
+  transaction-backed `RowReader` to both complete post-commit projection
+  validators, after the write commits, then explicitly roll back only the read
+  scope. Every validator, SQL predicate, write/durability stage and deadline is
+  retained. The synchronous owner admission path remains unchanged. This source
+  checkbox is not an executed progress claim or closure of NobleRiver's bead.
+- [x] R33/job 30074093214629956 passes formatting 0 with terminal acknowledgement
+  on new source `5e1d80a0`, tree `3e95d30824d6c0cf8c3c05eede6cba7a1163c85d`.
+- [x] Run fresh workspace/all-target check and strict Clippy on `5e1d80a0`.
+  R34/job 30074093214629957 reaches the 1,800-second compiler deadline (137,
+  terminal acknowledged), without a compiler verdict. R35 continues the
+  identical check on the same worker/source/features and one Cargo job with
+  a disclosed 7,200-second compiler-only budget. Test limits remain unchanged.
+  R35/job 30074093214629958 reaches that compiler deadline (137, terminal
+  acknowledged), without a completed compiler verdict. It advances through
+  the workspace and begins core test-target checks. R37 continues the
+  identical check on the same source/worker with the same compiler budget;
+  no source, feature, target, lint or functional bound changes.
+  R37/job 30074093214629960 completes 0 with terminal acknowledgement,
+  binding source `5e1d80a0` and tree `3e95d308`. This qualifies the fresh
+  workspace/all-target compiler check. R38 then runs strict Clippy on that
+  same commit; functional tests are still pending.
+  R38/job 30074093214629961 completes strict Clippy 0 with terminal
+  acknowledgement on the same source/tree. These are compiler/lint results,
+  not functional test passes; Cargo's retained future-incompatibility warning
+  is not suppressed or converted into a clean whole-project claim.
+  R35's worker storage/CLI/test/lockfile blobs match the pinned inputs. While
+  that check continues, R36 prepares the same symbol-limited process-test
+  class on the separately admitted `vmi1149989`, with one actual Cargo job
+  and a disclosed 14,400-second compilation-only budget. Each worker has one
+  owned build; preparation executes no tests. The subsequent functional run
+  retains the original 1,800/30/15-second limits. No cross-worker speedup or
+  original full-symbol qualification is inferred.
+- [x] Execute unchanged storage journal/corruption tests and the original CLI
+  journey on the new storage candidate; preserve actual counts and failures.
+  Run the existing `journal` unit-test filter and the exact
+  `tests::production_recovery_refuses_noncanonical_v12_command_projection_without_mutation`
+  case: its real file fixture corrupts the command envelope and must refuse
+  recovery without mutating the database. No new substitute guard is added.
+  After Clippy, R39 separately prepares the existing storage library test
+  target with `--no-run`, the same explicit symbol-limited test profile,
+  one Cargo job and a 14,400-second compilation-only budget. Actual unit
+  invocations retain 1,800-second outer limits and unchanged source bounds.
+  R36/job 30074093214629959 completes application preparation 0 with terminal
+  acknowledgement on `5e1d80a0`/`3e95d308`. Its application, CLI and test
+  executables are retained outside mutable targets; all three worker,
+  retrieved and retained byte counts/hashes agree. R40 then invokes the
+  unchanged original one-test journey with its original execution bounds;
+  preparation itself receives no functional credit.
+  R40/job 30074093214629963 executes and fails at resume again: 0 passed /
+  1 failed / 0 ignored / 9 filtered, 57.63 seconds, exit 101 with terminal
+  acknowledgement. Configuration changes and their three refusal assertions
+  complete; resume remains applied/journal-pending, so legacy pause/step and
+  the intended hint guard are not reached. The narrow snapshot change is not
+  sufficient to resolve this stall. The read-only observer records the owned
+  child at niceness 19, 18 thread samples and the exact pending resume receipt;
+  it exits 0 after observing child exit. No GDB attachment perturbs this test.
+  R39/job 30074093214629962 completes storage-unit compilation preparation 0
+  with terminal acknowledgement. Its retrieved and separately retained unit
+  executable agree at SHA256 `6596966c8f0cfd1966876b756cd1de02ad22b3f72c1808d778e6f8e9c426d703`.
+  The later worker-path readback fails because that logged executable is absent;
+  the resulting empty JSON is not evidence of worker/retrieved byte equality.
+  R42/job 30074093214629964 unexpectedly rebuilds dependencies in the same
+  naturally selected pool and reaches the unchanged 1,800-second compiler
+  deadline (137, terminal acknowledged), without running tests. The reason for
+  the rebuild is not established. R43 is rejected before execution because
+  installed RCH forbids combining job mode with a clean overlay. R44 instead
+  uses supported normal RCH job mode on the original worker to execute the
+  retained Cargo-built unit binary, verifying its SHA256 before execution.
+  Its executable belongs to `5e1d80a0`; the ordinary source transfer includes
+  the later candidate, so this run cannot qualify that candidate. Runtime
+  bounds and test assertions are unchanged. R44/job 30074093214629965 completes
+  0 with terminal acknowledgement: 44 passed / 0 failed / 0 ignored /
+  226 filtered, 360.10 seconds. Its job launcher observes niceness 5; this is
+  retained-binary unit evidence, not an original Cargo process-test pass.
+  Some existing tests retain files
+  under the worker's rewritten temporary directory rather than the explicitly
+  selected artifact root. The 63 additional harness-PID-named files
+  (4,684,439 bytes) have been copied and match worker/local hashes.
+  R41 is a separate runtime-only diagnostic using R36's exact retained app/CLI
+  bytes on the original application worker. Its initial pause is already paused
+  and it does not exercise the single-step cell. Resume eventually becomes
+  durable, but shutdown returns HTTP 503 at the unchanged 10-second admission
+  reply bound; the owned child is killed/reaped, not orderly finalized. Its
+  observed niceness is 5, versus R40's 19, and no comparative performance
+  attribution is made. One PID/birth/executable-checked bounded GDB attachment
+  returns 0, prints detachment and leaves TracerPid 0. The owner waits in storage
+  admission; the storage worker is inside the progress UPDATE's execution.
+  Retained ELF disassembly, symbol and relocation data bind the captured return
+  address to the second SQL execution in `advance_host_journal_state`, rather
+  than its already-rowid-qualified ledger UPDATE. This locates an executing
+  call, not a universal stall cause or measured speedup. All 29 copied diagnostic
+  files (13,014,701 bytes) match worker/local hashes.
+  R12/R14/R17 below remain scoped to `1fa33c36`, not this new storage source.
+  The required UBS scan was missed before committing the storage candidate;
+  it is completed afterwards, before publication. The first SARIF attempt
+  exits 1 with no merged finding reports; its empty run list is not a clean
+  scan. Text output reports 1 critical / 1,925 warning / 714 informational
+  findings in the whole storage file. The critical location is the unchanged,
+  public `poison_reaper_registry_for_test` helper's intentional panic inside
+  `catch_unwind`; its sole workspace caller is the reaper integration test.
+  It is not falsely labelled compile-time test-only. No suppression, skipped
+  category or scanner policy change is introduced. The report shows samples,
+  so absence of a changed-hunk location in those samples is not claimed as
+  exhaustive clearance of all warnings. Preserve the nonzero scan result.
+- [x] Author a second narrow storage candidate in the existing function: resolve
+  the progress row's identity inside the same write transaction and add that
+  rowid to all three progress UPDATE variants. Retain every original run/session,
+  previous-prefix and affected-row predicate, validator and durability stage.
+  At authoring time, storage blob `2da6dce4b44edeedd412808d8114bfd1960843f7`
+  was not yet qualified; completed qualification is recorded below.
+  Its pre-commit UBS scan remained nonzero with the same
+  1 critical / 1,925 warning / 714 informational whole-file counts; the critical
+  sample is the unchanged caught intentional reaper-poison panic. No scanner
+  suppression, category exclusion or gate-policy change is introduced.
+- [x] Qualify this exact candidate's source gates, existing rowid/key negative
+  guard, journal filter, V12 corrupt-command recovery guard and original process
+  journey. R45 is my invalid invocation of a nonexistent `headless` feature;
+  Cargo rejects it before compilation (101), so it earns no test or compiler
+  credit. R46 corrects the command to R36's exact default feature configuration
+  and prepares the candidate app with `--no-run`, one Cargo job and the same
+  explicit symbol-limited profile. Worker storage/CLI/test/lockfile blobs match
+  the intended inputs. Its 14,400-second budget is compilation-only; actual
+  functional invocations still require the original 1,800/30/15-second bounds.
+  R47/job 30074093214629968 passes candidate formatting 0 with terminal
+  acknowledgement. R48 starts the required workspace/all-target check on the
+  identical base-plus-storage-blob overlay with one Cargo job and a disclosed
+  14,400-second compilation-only budget; this changes no functional bound.
+  R46/job 30074093214629967 completes preparation 0 with terminal acknowledgement,
+  executing no tests. The retained app/CLI/test executables match both retrieved
+  and worker byte counts/hashes. R49/job 30074093214629970 then executes the
+  original case on that exact overlay: 1 passed / 0 failed / 0 ignored /
+  9 filtered, 31.55 seconds, exit 0 with terminal acknowledgement. The original
+  1,800/30/15-second bounds, features, profile and assertions remain unchanged.
+  All three configuration changes, all three refusal assertions and both legacy
+  controls complete. Five CLI identities are distinct and settle applied/durable.
+  Retained status JSON shows pause changing running tick 9 to paused tick 17,
+  then a single JSON step changing paused tick 17 to paused tick 18; both after
+  snapshots name their exact applied receipt. Shutdown returns HTTP 200 and
+  the owned child exits successfully within the original bound. This case does
+  not perform a finished-database SQL readback, so none is inferred from its exit.
+  All 168 copied files (2,473,620 bytes) match worker/local hashes. The separate
+  read-only observer exits 0 after child exit, with 10 thread samples at niceness
+  19, 56 status rows and 27 receipt rows; these rows are not independent tests.
+  No debugger attachment perturbs R49. This is bounded functional evidence,
+  not a universal stall diagnosis, performance win or original long-run/native
+  acceptance. RCH's generated "99% faster" banner compares preparation with a
+  functional invocation and is not credited as a performance measurement.
+- [x] Finish the candidate workspace/all-target check and strict Clippy.
+  R48/job 30074093214629969 and R52/job 30074093214629973 both complete 0 with
+  terminal acknowledgement on the identical explicit overlay. Cargo's existing
+  `proc-macro-error2` future-incompatibility warning remains visible.
+- [x] Execute the candidate's existing journal filter; earlier R44's 44 passes
+  belong to `5e1d80a0`, not the rowid candidate.
+  R51/job 30074093214629972 passes 44 / fails 0 / ignores 0 / filters 226,
+  219.76 seconds, exit 0 with terminal acknowledgement.
+- [x] Execute the existing rowid/key mismatch, repeated-state, missing-row and
+  multiple-row negative guard on the candidate.
+  R53/job 30074093214629974 passes 1 / fails 0 / ignores 0 / filters 269,
+  0.02 seconds, exit 0 with terminal acknowledgement.
+- [x] Execute the existing V12 corrupt-command recovery guard on the candidate.
+  R54/job 30074093214629975 passes 1 / fails 0 / ignores 0 / filters 269,
+  7.73 seconds, exit 0 with terminal acknowledgement. The fixture first observes
+  a durable command, changes its envelope to noncanonical bytes, verifies the
+  exact supported V12 schema and explicitly closes the setup connection. Recovery
+  must refuse with the expected envelope error; accepting it fails the test,
+  and a separate before/after database-file byte comparison detects mutation.
+  R50/job 30074093214629971 completes storage-library preparation 0 with terminal
+  acknowledgement on the same
+  application worker and naturally selected target pool, using the identical
+  explicit profile and a 14,400-second compilation-only budget. Preparation
+  receives no functional credit; actual unit runs retain 1,800-second limits.
+  All three unit selections execute the retained Cargo-built binary through
+  supported RCH job mode. Its SHA256 is
+  `f0a74c9c15d4c0607b10412b347d6e4f0aca819371cb1d7da7817f7ce8fdb8f7`;
+  retained worker, retrieved and local retained bytes/hashes agree. An extra
+  post-build source-path check fails after RCH has reaped its temporary checkout;
+  that empty JSON and the mistakenly attempted dependent parse are retained as
+  failed observations. The corrected binary readback succeeds and does not
+  invent post-teardown source access; the earlier active-build source readback
+  and exact overlay receipt bind its source identity.
+  R51's 217 result files (16,038,521 bytes) and 63 additional PID-named temporary
+  files (4,684,439 bytes) match worker/local hashes. R53's one result file
+  (1,014 bytes) and R54's ten result files (1,846,761 bytes) also match.
+  This is direct libtest execution, not an original Cargo unit invocation,
+  full-symbol process qualification or native/DSR acceptance.
+- [x] Run every existing CLI unit without a positional test filter; retain the
+  observed test count and terminal acknowledgement.
+  R17/job 30074093214629941 passes all 19, with 0 failed / 0 ignored /
+  0 filtered, in 121.17 seconds, against clean `1fa33c36` and tree `9faa327c`.
+- [x] Finish workspace/all-target compilation and strict Clippy on the exact
+  source commit through RCH; retain R4 formatting on the identical source bytes.
+  R12/job 30074093214629938 passes `cargo check -j1 --workspace --all-targets
+  --locked`; R14/job 30074093214629940 passes strict Clippy over the same scope
+  with `-D warnings`. Both complete 0 with terminal acknowledgement and bind
+  `1fa33c36`, tree `9faa327c690f9afd4055524a40cbca405f886d5e`.
+- [ ] Review actual source/static findings, fill the bounded honesty audit, preserve
+  unmet original acceptance and publish separately reviewed source/tracker metadata.
+  Strict tracker comparison catches BR's intentional export omission of the
+  existing `bd-w1oi.source_repo_path`. Restore that original recorded field
+  after the final BR comments/flush, then repeat the unchanged preservation
+  assertions; do not expand the allowed-field list to conceal the omission.
+  Final comparison now passes across all 718 original issue IDs. Only comments
+  and update timestamps differ on `bd-0oro` and `bd-w1oi`: 16 and 3 comments
+  respectively were appended, with every original comment prefix intact.
+  All other fields, owners, statuses, acceptance text and dependency data are
+  preserved, including the original canonical source path. The full active and
+  archived graph reports zero cycles. Both original beads remain in progress.
+- [ ] Verify safe pull/import, both canonical/mirror refs, released reservations
+  and the final external evidence record. Retire this active TODO at publication.
+  This last step records its observed final state in external `publication.json`
+  alongside the raw evidence, after the report commit is published.
+
+Historical bounded honesty review through R35: the `c22f9d7c..1fa33c36` repair
+and early `5e1d80a0` storage candidate, when functional qualification was still
+pending. Completed `d0f72040` qualification is recorded above:
+
+1. Yes: the old source-literal assertion was replaced in the existing unit test.
+   It required the hardcoded display-name string and therefore admitted the
+   broken executable/server hint while rejecting a correct extracted formatter.
+   The replacement retains Clap subcommand discovery, consumes the production
+   formatter, checks receipt-ID parsing and rejects the unrelated status route.
+   This is an explicit gate change, not an incidental implementation detail.
+   The real-process test additionally requires the complete executable/URL/ID
+   hint; its old-source counterexample is still pending. The unit alone does
+   not establish shell execution or output-path correctness (RH-1, RH-5).
+2. No (checked: both source diffs); no mock, fixture or substitute server added.
+3. No (checked: commit paths); no golden or snapshot regenerated.
+4. Yes: the existing unit and process gates change with the feature. The
+   admission split is stated in item 1; original configuration/rejection checks,
+   features, functional timeouts, test retry bounds and mandatory compiler gates
+   remain unchanged. R24/R27's disclosed 7,200-second `--no-run` compilation
+   preparation budget is separate from the final 1,800-second execution gate;
+   it receives no test credit.
+   R28 additionally changes the test build class to omit debug information,
+   while explicitly preserving unoptimized code, debug assertions and integer
+   overflow checks. This configuration change is disclosed before execution;
+   earlier full-symbol failures/refusals remain retained and unqualified.
+   R29's disclosed 14,400-second budget remains compilation-only. R30 executes
+   with the original functional limits and fails. R32 is explicitly a separate
+   debugger-assisted diagnostic, with a different launcher and observed niceness;
+   its partial observations do not replace the original test or qualify a pass.
+   No suppression or bypass flag was introduced (RH-1, RH-13, RH-15).
+5. No (checked: production formatter and both callers); no test-only branch,
+   special server, science-setting change or benchmark-path shortcut.
+6. No (checked: R10/R13/R17 raw results); each process attempt actually runs one
+   failing test, not a zero-run green. The intended hint guard is not reached.
+   R17 runs and passes all 19 CLI units with none ignored or filtered. Compiler/
+   format results are not counted as functional greens.
+7. No (checked: raw command records and source-authoring qualifiers); pending
+   qualification is not reported as executed behavior.
+8. No (checked: proof labels); RCH process evidence is not native/DSR acceptance,
+   performance evidence, offline SQL certification or independent verification.
+9. Yes: the first isolated recovery report's physical hashes became stale
+   because connection close had not completed. The original report survives;
+   explicit-close readback corrects it and the incident is disclosed above and
+   in item 19. Refusals, layout failures and deadlines remain in the record.
+10. No (checked: separate JSON/stdout and stderr logs); cited failures are retained.
+11. No (checked: canonical tracker); the original bead remains in progress.
+12. No (checked: plan/tracker diff); scope notes do not replace original criteria.
+13. No (checked: current dispatch/tracker record); no delegated agent or closure.
+14. No (checked: current dispatch record); no subagent was assigned this repair.
+15. No (checked: proof sources); no subagent report substitutes for qualification.
+16. No (checked: scope); this block targets usable positive control hints, with
+    refusals retained only as necessary negative and infrastructure evidence.
+17. No (checked: wording); solo review is not independent confirmation.
+18. No (checked: pre-result source diff); the eight process cells were specified
+    before execution and remain one test; other shared callers are not newly
+    claimed as exercised CLI journeys.
+19. Yes: Python's connection context manager committed without closing, so the
+    first recovery hash capture preceded final checkpoint/close. The later
+    `mailbox-recovery-closed-readback.json` explicitly closes before hashing and
+    rechecks all 23 application tables and rowids. Only isolated copies changed;
+    no live vacuum or cache deletion occurred here. Countermeasure: bind physical
+    file claims to explicit-close readback, and credit no external recovery as
+    product work (RH-2). Long infrastructure/compile turnaround is also disclosed.
+    The later storage commit also precedes its required UBS scan. That ordering
+    mistake is disclosed and the actual scan is retained before publication;
+    it is not retroactively called pre-commit or clean. The correction is to
+    run the required static review before freezing the next source commit.
+20. Strongest evidence so far: the exact-source compiler/19-unit receipts at
+    `1fa33c36`, R30's executed functional failure and 122 hash-matched files,
+    and R32's bounded, detached stack capture with 29 hash-matched diagnostic
+    files. They establish the stated observations, not a successful full journey,
+    old-source hint guard, independent review or native/DSR qualification.
+    The new `5e1d80a0` storage candidate has formatting only; its remaining
+    compiler and functional checks are pending.
+
+Six bounded October workspace CASS lexical searches (the five inventory phrases
+plus this exact process-test name, limit three each, no maintenance) return zero
+matches. This does not establish archive coverage or clear earlier sessions;
+the earlier bounded search found only older September material.
+
+Real-work audit, same source window: one USER commit (`1fa33c36`, CLI repair
+and its regression checks), no new closure. The pending metadata publication is
+PROCESS and gets no capability credit. README purpose: a faithful deterministic
+evolution simulator with GPU UI, pluggable brains and first-class analytics.
+
+1. Demo target: issue a real pause or single-step against a nondefault server,
+   then use its printed executable/server/receipt identity to observe completion.
+   Execution is still pending; the source commit alone is not the demo.
+2. Without the report/tracker work, the executable behavior would be identical.
+3. Regression checks are bundled with the USER repair; their named consumer is
+   the actual CLI/server journey. No separate speculative enabler was introduced.
+4. Oldest open user-facing umbrella: `bd-2z0`, July 11, deterministic Evolution
+   Lab. This repair addresses a directly observed control-path defect while
+   preserving the broader runtime/native/science acceptance work as open.
+5. Solo increment, no pane or close-count comparison; no closure credit claimed.
+6. No original requirement was weakened or moved to a new successor. Source and
+   tests remain on the original bead; plan notes only identify this bounded repair.
+
+Verdict: DRIFTING in turnaround cost. Infrastructure recovery and dependency
+compilation have consumed much more time than the product change. Correction:
+freeze feature scope, reuse sequential worker caches, finish this qualification
+and publication, and add no process framework or speculative proof matrix.
+
+October 23 storage continuation: the actual failed journey justifies one bounded
+diagnostic and the existing-reader snapshot repair at `5e1d80a0`. Classify that
+unqualified storage change as MAINTENANCE, with no throughput win or completed
+product capability credited. It reuses the original validators and changes no
+test, golden, predicate, pin or acceptance criterion. The earlier CLI repair is
+still unpublished and its full process qualification remains open. Runtime-only
+diagnostic outcomes and RCH compiler outcomes remain separate; the synchronous
+owner admission path and original long-run criteria are not declared solved.
 
 CLI configuration receipts (`bd-0oro`, started 2026-10-22, LilacElm):
 
