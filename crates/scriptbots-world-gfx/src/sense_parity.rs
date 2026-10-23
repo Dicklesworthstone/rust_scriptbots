@@ -13,7 +13,10 @@ use scriptbots_core::sense_fixed::{SenseAccum, SenseProvider, SenseProviderError
 use scriptbots_core::{AgentData, AgentId, OutputsExt, Position, ScriptBotsConfig, WorldState};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// Typed identifier for sensory accumulation execution backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,10 +198,12 @@ pub struct SenseLaneParityReport {
     pub max_sensor_delta: f32,
     /// Whether the adapter was a software fallback (e.g. llvmpipe).
     pub is_software_adapter: bool,
-    /// Total compute dispatches executed.
+    /// Successful nonempty sensing executions completed by the GPU provider.
     pub dispatches: u64,
-    /// Total channel saturations observed.
+    /// Lifetime channel saturations observed by the GPU-backed world.
     pub saturations: u64,
+    /// Actual paired CPU/GPU sensor values observed, rather than planned work.
+    pub sensor_values_compared: u64,
 }
 
 impl SenseLaneParityReport {
@@ -376,6 +381,7 @@ pub struct GpuSenseProvider {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: GpuSensePipeline,
+    completed_dispatches: Arc<AtomicU64>,
 }
 
 impl GpuSenseProvider {
@@ -390,6 +396,7 @@ impl GpuSenseProvider {
             device,
             queue,
             pipeline,
+            completed_dispatches: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -415,6 +422,7 @@ impl SenseProvider for GpuSenseProvider {
             .pipeline
             .execute_sense(&self.device, &self.queue, &agents, uniforms)
             .map_err(|e| SenseProviderError::Execution(format!("{e:?}")))?;
+        self.completed_dispatches.fetch_add(1, Ordering::Relaxed);
         Ok(outputs.into_iter().map(|o| o.to_sense_accum()).collect())
     }
 }
@@ -422,9 +430,9 @@ impl SenseProvider for GpuSenseProvider {
 /// Injected fault mode to prove negative gate behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FaultInjectionMode {
-    /// Injected fault: replace Horner polynomial `poly_acos` with driver builtin `acos`.
+    /// Diagnostic density perturbation; does not replace the shader's `acos`.
     DriverAcos,
-    /// Injected fault: non-associative float addition in shader term accumulation.
+    /// Diagnostic smell perturbation; does not execute f32 shader accumulation.
     F32Accumulator,
     /// Injected fault: deterministic scalar delta on first agent's channel.
     PerturbChannel,
@@ -453,7 +461,7 @@ impl SenseProvider for FaultInjectedGpuSenseProvider {
         let mut accumulators = self.provider.compute_accumulators(world, handles)?;
         match self.mode {
             FaultInjectionMode::DriverAcos => {
-                // Driver acos introduces slight deviations from Horner poly_acos
+                // Accumulator diagnostic only; a real driver-acos shader fault remains open.
                 for accum in &mut accumulators {
                     if accum.density[0] > 0 {
                         accum.density[0] ^= 0x01; // flip least significant bit
@@ -463,7 +471,7 @@ impl SenseProvider for FaultInjectedGpuSenseProvider {
                 }
             }
             FaultInjectionMode::F32Accumulator => {
-                // Emulate f32 accumulation reordering error
+                // Accumulator diagnostic only; this does not run a reordered f32 shader.
                 for accum in &mut accumulators {
                     if accum.smell > 0 {
                         accum.smell = accum.smell.saturating_add(0x10); // 16 fixed-point units
@@ -537,16 +545,136 @@ pub fn is_adapter_certified_exact(
     let default_path = Path::new("ci/fixtures/sense_lane_parity.json");
     let path = parity_report_path.unwrap_or(default_path);
     let report = SenseLaneParityReport::load_from_file(path).ok()?;
+    certified_report_evidence(
+        &report,
+        adapter_info,
+        ParityBuildIdentity::current().as_ref(),
+    )
+}
 
-    if report.verdict == SenseDeterminism::Exact
-        && !report.is_software_adapter
-        && report.shader_digest == crate::sense_wgsl::sense_shader_digest()
-        && (report.vendor == adapter_info.vendor || report.adapter == adapter_info.name)
-    {
-        Some(report.to_gate_evidence())
-    } else {
-        None
+/// Build-time evidence only: runtime environment changes cannot recertify a binary.
+/// Missing provenance refuses certification but does not prevent exploratory parity runs.
+#[derive(Clone)]
+struct ParityBuildIdentity {
+    target: String,
+    build: String,
+    toolchain: String,
+}
+
+impl ParityBuildIdentity {
+    fn current() -> Option<Self> {
+        Self::from_embedded(
+            option_env!("SCRIPTBOTS_SOURCE_TREE_CLEAN"),
+            option_env!("SCRIPTBOTS_SOURCE_REVISION").or(option_env!("RCH_BUILD_SOURCE")),
+            option_env!("SCRIPTBOTS_BUILD_TARGET"),
+            option_env!("SCRIPTBOTS_RUSTC_VV"),
+        )
     }
+
+    fn from_embedded(
+        clean: Option<&str>,
+        revision: Option<&str>,
+        target: Option<&str>,
+        toolchain: Option<&str>,
+    ) -> Option<Self> {
+        if clean != Some("true") {
+            return None;
+        }
+        let revision = revision?;
+        if !matches!(revision.len(), 40 | 64)
+            || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let target = target?;
+        let toolchain = toolchain?;
+        if target.trim().is_empty()
+            || !toolchain.lines().any(|line| line.starts_with("release: "))
+            || !toolchain
+                .lines()
+                .any(|line| line.starts_with("commit-hash: "))
+            || !toolchain.lines().any(|line| line.starts_with("host: "))
+        {
+            return None;
+        }
+        // Length-delimited JSON binds the source, lockfile, manifests and this crate's
+        // feature/code-generation settings without ambiguous string concatenation.
+        let inputs = serde_json::json!({
+            "schema": "scriptbots.sense-build.v1",
+            "revision": revision,
+            "lockfile": blake3::hash(include_bytes!("../../../Cargo.lock")).to_hex().as_str(),
+            "workspace": blake3::hash(include_bytes!("../../../Cargo.toml")).to_hex().as_str(),
+            "crate": blake3::hash(include_bytes!("../Cargo.toml")).to_hex().as_str(),
+            "compute_binning": cfg!(feature = "compute_binning"),
+            "perf_counters": cfg!(feature = "perf_counters"),
+            "debug_assertions": cfg!(debug_assertions),
+            "rustflags": option_env!("CARGO_ENCODED_RUSTFLAGS").or(option_env!("RUSTFLAGS")),
+        });
+        let bytes = serde_json::to_vec(&inputs).ok()?;
+        Some(Self {
+            target: target.to_owned(),
+            build: blake3::hash(&bytes).to_hex().to_string(),
+            toolchain: toolchain.to_owned(),
+        })
+    }
+}
+
+fn certified_report_evidence(
+    report: &SenseLaneParityReport,
+    adapter: &wgpu::AdapterInfo,
+    build: Option<&ParityBuildIdentity>,
+) -> Option<SenseGateEvidenceV0> {
+    let build = build?;
+    let valid_world_digest = |digest: &str| {
+        digest.len() == (u64::BITS / 4) as usize
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && digest.bytes().any(|byte| byte != b'0')
+    };
+    if adapter.device_type == wgpu::DeviceType::Cpu
+        || report.is_software_adapter
+        || adapter.name.trim().is_empty()
+        || adapter.driver.trim().is_empty()
+        || adapter.driver_info.trim().is_empty()
+        || report.adapter != adapter.name
+        || report.vendor != adapter.vendor
+        || report.device != adapter.device
+        || report.backend != format!("{:?}", adapter.backend)
+        || report.driver != adapter.driver
+        || report.driver_info != adapter.driver_info
+        || report.target != build.target
+        || report.build_identity != build.build
+        || report.toolchain_identity != build.toolchain
+        || report.shader_digest != crate::sense_wgsl::sense_shader_digest()
+        || report.fixture_digest != parity_fixture_digest(&SenseParityOptions::default()).ok()?
+        || report.tick_count < SenseParityOptions::default().tick_count
+        || report.dispatches != report.tick_count
+        || report.sensor_values_compared == 0
+        || report.saturations != 0
+        || report.evidence_time_unix_ms == 0
+        || report.verdict != SenseDeterminism::Exact
+        || report.first_divergence.is_some()
+        || !report.max_sensor_delta.is_finite()
+        || report.max_sensor_delta != 0.0
+        || !valid_world_digest(&report.cpu_digest)
+        || report.cpu_digest != report.gpu_digest
+        || report.evidence_digest != compute_evidence_digest(report).ok()?
+    {
+        return None;
+    }
+    Some(report.to_gate_evidence())
+}
+
+fn parity_fixture_digest(options: &SenseParityOptions) -> Result<String, serde_json::Error> {
+    let fixture = serde_json::json!({
+        "schema": "scriptbots.sense-fixture.v1",
+        "config": ScriptBotsConfig { rng_seed: Some(options.seed), ..Default::default() },
+        "population": options.population,
+        "placement": "x=100+i*25;y=100+i*20;AgentData::default",
+        "fault_injection": options.fault_injection.map(|mode| format!("{mode:?}")),
+    });
+    Ok(blake3::hash(&serde_json::to_vec(&fixture)?)
+        .to_hex()
+        .to_string())
 }
 
 /// Errors returned by the sensory parity verification runner.
@@ -599,37 +727,17 @@ impl Default for SenseParityOptions {
     }
 }
 
-/// Compute a BLAKE3 hex digest of the parity report fields for tamper-evident provenance.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
+/// Hash every report field except its own digest using the versioned report wire.
+/// This detects corruption; it does not authenticate the author of a report.
 pub fn compute_evidence_digest(
-    target: &str,
-    adapter: &str,
-    backend: &str,
-    shader_digest: &str,
-    toolchain: &str,
-    cpu_digest: &str,
-    gpu_digest: &str,
-    verdict: SenseDeterminism,
-) -> String {
+    report: &SenseLaneParityReport,
+) -> Result<String, serde_json::Error> {
+    let mut canonical = report.clone();
+    canonical.evidence_digest.clear();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"scriptbots.sense-parity.v0:");
-    hasher.update(target.as_bytes());
-    hasher.update(b":");
-    hasher.update(adapter.as_bytes());
-    hasher.update(b":");
-    hasher.update(backend.as_bytes());
-    hasher.update(b":");
-    hasher.update(shader_digest.as_bytes());
-    hasher.update(b":");
-    hasher.update(toolchain.as_bytes());
-    hasher.update(b":");
-    hasher.update(cpu_digest.as_bytes());
-    hasher.update(b":");
-    hasher.update(gpu_digest.as_bytes());
-    hasher.update(b":");
-    hasher.update(verdict.to_string().as_bytes());
-    hasher.finalize().to_hex().to_string()
+    hasher.update(b"scriptbots.sense-parity.v1\0");
+    hasher.update(&serde_json::to_vec(&canonical)?);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Execute a complete CPU-vs-GPU parity verification run across the specified tick count.
@@ -644,17 +752,22 @@ pub fn run_sense_parity_check(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let target = option_env!("TARGET")
-        .unwrap_or("x86_64-unknown-linux-gnu")
-        .to_string();
-    let toolchain = format!(
-        "rustc {} ({})",
-        option_env!("RUSTC_VERSION").unwrap_or("1.89-nightly"),
-        target
-    );
-    let build_identity = env!("CARGO_PKG_VERSION").to_string();
+    let build = ParityBuildIdentity::current();
+    let target = build
+        .as_ref()
+        .map_or("unavailable", |identity| &identity.target)
+        .to_owned();
+    let toolchain = build
+        .as_ref()
+        .map_or("unavailable", |identity| &identity.toolchain)
+        .to_owned();
+    let build_identity = build
+        .as_ref()
+        .map_or("unavailable", |identity| &identity.build)
+        .to_owned();
     let shader_digest = crate::sense_wgsl::sense_shader_digest().to_string();
-    let fixture_digest = format!("blake3:seed_{}", options.seed);
+    let fixture_digest = parity_fixture_digest(options)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let is_software = adapter_info.device_type == wgpu::DeviceType::Cpu;
 
     // Structured start diagnostics
@@ -697,6 +810,7 @@ pub fn run_sense_parity_check(
 
     let pipeline = GpuSensePipeline::new(device, adapter_info, PRODUCTION_WORKGROUP_SIZE)?;
     let base_gpu_provider = GpuSenseProvider::new(Arc::clone(device), Arc::clone(queue), pipeline);
+    let completed_dispatches = Arc::clone(&base_gpu_provider.completed_dispatches);
 
     if let Some(fault) = options.fault_injection {
         world_gpu.set_sense_provider(Box::new(FaultInjectedGpuSenseProvider::new(
@@ -709,8 +823,7 @@ pub fn run_sense_parity_check(
 
     let mut max_sensor_delta: f32 = 0.0;
     let mut first_divergence: Option<SenseDivergenceCoordinates> = None;
-    let dispatches = options.tick_count;
-    let mut saturations: u64 = 0;
+    let mut sensor_values_compared = 0_u64;
 
     for tick in 0..options.tick_count {
         world_cpu
@@ -719,8 +832,6 @@ pub fn run_sense_parity_check(
         world_gpu
             .step()
             .map_err(|e| SenseParityError::Simulation(format!("{e:?}")))?;
-
-        saturations = saturations.saturating_add(world_gpu.sense_saturations_total());
 
         // Compare sensor arrays across all live agents
         let handles: Vec<AgentId> = world_cpu.agents().iter_handles().collect();
@@ -731,6 +842,7 @@ pub fn run_sense_parity_check(
             if let (Some(c_rt), Some(g_rt)) = (cpu_rt, gpu_rt) {
                 let uid = world_cpu.agent_uid(handle).map_or(0, |u| u.get());
                 for s in 0..scriptbots_core::INPUT_SIZE {
+                    sensor_values_compared = sensor_values_compared.saturating_add(1);
                     let c_val = c_rt.sensors[s];
                     let g_val = g_rt.sensors[s];
                     let delta = (c_val - g_val).abs();
@@ -767,31 +879,28 @@ pub fn run_sense_parity_check(
 
     let cpu_digest = world_cpu
         .world_digest_v1()
-        .map(|d| d.overall)
-        .unwrap_or_else(|_| "cpu_digest_error".to_string());
+        .map_err(|error| SenseParityError::Simulation(format!("CPU digest unavailable: {error}")))?
+        .overall;
     let gpu_digest = world_gpu
         .world_digest_v1()
-        .map(|d| d.overall)
-        .unwrap_or_else(|_| "gpu_digest_error".to_string());
+        .map_err(|error| SenseParityError::Simulation(format!("GPU digest unavailable: {error}")))?
+        .overall;
 
-    let verdict = if first_divergence.is_none() && cpu_digest == gpu_digest {
+    // Core exposes a lifetime total: adding it again after each tick double-counts.
+    let saturations = world_gpu.sense_saturations_total();
+    let dispatches = completed_dispatches.load(Ordering::Relaxed);
+    let verdict = if first_divergence.is_none()
+        && cpu_digest == gpu_digest
+        && sensor_values_compared > 0
+        && dispatches == options.tick_count
+        && saturations == 0
+    {
         SenseDeterminism::Exact
     } else {
         SenseDeterminism::Approximate
     };
 
-    let evidence_digest = compute_evidence_digest(
-        &target,
-        &adapter_info.name,
-        &format!("{:?}", adapter_info.backend),
-        &shader_digest,
-        &toolchain,
-        &cpu_digest,
-        &gpu_digest,
-        verdict,
-    );
-
-    let report = SenseLaneParityReport {
+    let mut report = SenseLaneParityReport {
         target,
         adapter: adapter_info.name.clone(),
         vendor: adapter_info.vendor,
@@ -805,7 +914,7 @@ pub fn run_sense_parity_check(
         fixture_digest,
         tick_count: options.tick_count,
         evidence_time_unix_ms: start_time_ms,
-        evidence_digest,
+        evidence_digest: String::new(),
         cpu_digest,
         gpu_digest,
         verdict,
@@ -814,13 +923,20 @@ pub fn run_sense_parity_check(
         is_software_adapter: is_software,
         dispatches,
         saturations,
+        sensor_values_compared,
     };
+    report.evidence_digest = compute_evidence_digest(&report)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
     tracing::info!(
         target: "scriptbots::sense::parity",
         verdict = ?report.verdict,
         max_sensor_delta = report.max_sensor_delta,
         has_divergence = report.first_divergence.is_some(),
+        dispatches = report.dispatches,
+        sensor_values_compared = report.sensor_values_compared,
+        saturations = report.saturations,
+        build_provenance_available = build.is_some(),
         cpu_digest = %report.cpu_digest,
         gpu_digest = %report.gpu_digest,
         "Completed CPU-vs-GPU sense parity run"
@@ -859,11 +975,21 @@ mod tests {
             is_software_adapter: false,
             dispatches: 1000,
             saturations: 0,
+            sensor_values_compared: 500_000,
         };
 
         let json = serde_json::to_string(&report).expect("serialize");
         let roundtrip: SenseLaneParityReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(report, roundtrip);
+        let mut missing_observation = serde_json::to_value(&report).expect("report JSON");
+        missing_observation
+            .as_object_mut()
+            .expect("report object")
+            .remove("sensor_values_compared");
+        assert!(
+            serde_json::from_value::<SenseLaneParityReport>(missing_observation).is_err(),
+            "an unrecorded observation must not silently become an observed zero"
+        );
     }
 
     #[test]
@@ -891,6 +1017,7 @@ mod tests {
             is_software_adapter: false,
             dispatches: 1000,
             saturations: 0,
+            sensor_values_compared: 500_000,
         };
 
         let evidence = report.to_gate_evidence();
@@ -972,6 +1099,28 @@ mod tests {
         let div = report.first_divergence.unwrap();
         assert_eq!(div.tick, 0, "PerturbChannel should diverge on tick 0");
         assert!(div.sensor_delta > 0.0);
+        assert_eq!(report.dispatches, options.tick_count);
+        assert!(report.sensor_values_compared > 0);
+
+        let empty = run_sense_parity_check(
+            &SenseParityOptions {
+                tick_count: 1,
+                population: 0,
+                ..SenseParityOptions::default()
+            },
+            &device,
+            &queue,
+            &info,
+        )
+        .expect("empty diagnostic run");
+        assert_eq!(
+            empty.tick_count, 1,
+            "one science tick does not imply GPU work"
+        );
+        assert_eq!(empty.dispatches, 0);
+        assert_eq!(empty.sensor_values_compared, 0);
+        assert_eq!(empty.saturations, 0);
+        assert_eq!(empty.verdict, SenseDeterminism::Approximate);
     }
 
     #[test]
@@ -1005,6 +1154,255 @@ mod tests {
         };
         assert!(is_adapter_certified_exact(&info, None).is_none());
     }
+
+    /// Construct evidence, not simulated hardware: these tests qualify only the
+    /// admission predicate, never an actual GPU or a 1,000-tick correctness run.
+    fn exact_report_fixture() -> (
+        SenseLaneParityReport,
+        wgpu::AdapterInfo,
+        ParityBuildIdentity,
+    ) {
+        let adapter = wgpu::AdapterInfo {
+            name: "admission-test-device".to_owned(),
+            vendor: 0x1002,
+            device: 0x73ff,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            driver: "test-driver".to_owned(),
+            driver_info: "test-driver-version".to_owned(),
+            backend: wgpu::Backend::Vulkan,
+        };
+        let build = ParityBuildIdentity {
+            target: "test-target".to_owned(),
+            build: "test-source-and-build".to_owned(),
+            toolchain: "test-compiler".to_owned(),
+        };
+        let mut report = SenseLaneParityReport {
+            target: build.target.clone(),
+            adapter: adapter.name.clone(),
+            vendor: adapter.vendor,
+            device: adapter.device,
+            backend: format!("{:?}", adapter.backend),
+            driver: adapter.driver.clone(),
+            driver_info: adapter.driver_info.clone(),
+            shader_digest: crate::sense_wgsl::sense_shader_digest().to_owned(),
+            build_identity: build.build.clone(),
+            toolchain_identity: build.toolchain.clone(),
+            fixture_digest: parity_fixture_digest(&SenseParityOptions::default()).unwrap(),
+            tick_count: SenseParityOptions::default().tick_count,
+            evidence_time_unix_ms: 1,
+            evidence_digest: String::new(),
+            cpu_digest: "1234567890abcdef".to_owned(),
+            gpu_digest: "1234567890abcdef".to_owned(),
+            verdict: SenseDeterminism::Exact,
+            first_divergence: None,
+            max_sensor_delta: 0.0,
+            is_software_adapter: false,
+            dispatches: SenseParityOptions::default().tick_count,
+            saturations: 0,
+            sensor_values_compared: 500_000,
+        };
+        report.evidence_digest = compute_evidence_digest(&report).unwrap();
+        (report, adapter, build)
+    }
+
+    #[test]
+    fn certification_build_identity_requires_explicit_complete_clean_build_inputs() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let compiler = "rustc test\nrelease: test\ncommit-hash: test\nhost: test-target\n";
+        let input = [
+            Some("true"),
+            Some(revision),
+            Some("test-target"),
+            Some(compiler),
+        ];
+        let resolve = |args: [Option<&str>; 4]| {
+            ParityBuildIdentity::from_embedded(args[0], args[1], args[2], args[3])
+        };
+        let valid = resolve(input).expect("declared complete inputs");
+        assert_eq!(valid.target, "test-target");
+        assert_eq!(valid.toolchain, compiler);
+        assert_eq!(valid.build.len(), blake3::OUT_LEN * 2);
+        for index in 0..input.len() {
+            let mut missing = input;
+            missing[index] = None;
+            assert!(resolve(missing).is_none(), "missing build input {index}");
+        }
+        for (index, value) in [
+            (0, "false"),
+            (0, "unknown"),
+            (1, "unknown"),
+            (1, "0123456789abcdef0123456789abcdef01234567-overlay-1234"),
+            (2, " "),
+            (3, "rustc 1.89-nightly (fabricated default)"),
+        ] {
+            let mut invalid = input;
+            invalid[index] = Some(value);
+            assert!(
+                resolve(invalid).is_none(),
+                "invalid build input {index}: {value}"
+            );
+        }
+        let mut changed = input;
+        changed[1] = Some("abcdef0123456789abcdef0123456789abcdef01");
+        assert_ne!(resolve(changed).unwrap().build, valid.build);
+    }
+
+    #[test]
+    fn certification_requires_matching_adapter_build_and_observed_exact_parity() {
+        let (report, adapter, build) = exact_report_fixture();
+        assert_eq!(
+            certified_report_evidence(&report, &adapter, Some(&build)),
+            Some(report.to_gate_evidence()),
+            "the positive path preserves the exact matched evidence"
+        );
+        assert!(certified_report_evidence(&report, &adapter, None).is_none());
+        for field in ["adapter", "driver", "driver_info"] {
+            let (mut anonymous, mut adapter, build) = exact_report_fixture();
+            match field {
+                "adapter" => {
+                    adapter.name.clear();
+                    anonymous.adapter.clear();
+                }
+                "driver" => {
+                    adapter.driver.clear();
+                    anonymous.driver.clear();
+                }
+                "driver_info" => {
+                    adapter.driver_info.clear();
+                    anonymous.driver_info.clear();
+                }
+                _ => unreachable!("unknown identity field"),
+            }
+            anonymous.evidence_digest = compute_evidence_digest(&anonymous).unwrap();
+            assert!(
+                certified_report_evidence(&anonymous, &adapter, Some(&build)).is_none(),
+                "equal missing {field} values do not establish an observed identity"
+            );
+        }
+        type ReportMutation = (&'static str, fn(&mut SenseLaneParityReport));
+        let mutations: &[ReportMutation] = &[
+            ("same vendor, other name", |r| r.adapter.push_str("-other")),
+            ("same name, other vendor", |r| r.vendor += 1),
+            ("same vendor/name, other device", |r| r.device += 1),
+            ("backend", |r| r.backend = "Metal".to_owned()),
+            ("driver", |r| r.driver.push_str("-changed")),
+            ("driver info", |r| r.driver_info.push_str("-changed")),
+            ("target", |r| r.target.push_str("-changed")),
+            ("build", |r| r.build_identity.push_str("-changed")),
+            ("compiler", |r| r.toolchain_identity.push_str("-changed")),
+            ("shader", |r| r.shader_digest.clear()),
+            ("fixture", |r| r.fixture_digest.clear()),
+            ("short run", |r| {
+                r.tick_count -= 1;
+                r.dispatches = r.tick_count;
+            }),
+            ("zero ticks", |r| {
+                r.tick_count = 0;
+                r.dispatches = 0;
+            }),
+            ("dispatch count", |r| r.dispatches -= 1),
+            ("no observations", |r| r.sensor_values_compared = 0),
+            ("numeric saturation", |r| r.saturations = 1),
+            ("missing timestamp", |r| r.evidence_time_unix_ms = 0),
+            ("software report", |r| r.is_software_adapter = true),
+            ("approximate verdict", |r| {
+                r.verdict = SenseDeterminism::Approximate
+            }),
+            ("nonzero delta", |r| r.max_sensor_delta = 0.1),
+            ("nonfinite delta", |r| r.max_sensor_delta = f32::NAN),
+            ("unequal science", |r| {
+                r.gpu_digest = "abcdef1234567890".to_owned()
+            }),
+            ("zero science", |r| {
+                r.cpu_digest = "0000000000000000".to_owned();
+                r.gpu_digest.clone_from(&r.cpu_digest);
+            }),
+            ("malformed science", |r| {
+                r.cpu_digest = "cpu_digest_error".to_owned();
+                r.gpu_digest.clone_from(&r.cpu_digest);
+            }),
+            ("divergence coordinates", |r| {
+                r.first_divergence = Some(SenseDivergenceCoordinates {
+                    tick: 1,
+                    agent_uid: 1,
+                    agent_index: 0,
+                    sensor_index: 0,
+                    cpu_sensor_value: 0.0,
+                    gpu_sensor_value: 1.0,
+                    sensor_delta: 1.0,
+                    cpu_accumulator: None,
+                    gpu_accumulator: None,
+                })
+            }),
+        ];
+        for (label, mutate) in mutations {
+            let mut changed = report.clone();
+            mutate(&mut changed);
+            // Rehash so identity/outcome checks must discriminate independently
+            // of the corruption check. A valid checksum is not certification.
+            changed.evidence_digest = compute_evidence_digest(&changed).unwrap();
+            assert!(
+                certified_report_evidence(&changed, &adapter, Some(&build)).is_none(),
+                "incorrectly certified {label}"
+            );
+        }
+        let mut software = adapter;
+        software.device_type = wgpu::DeviceType::Cpu;
+        assert!(certified_report_evidence(&report, &software, Some(&build)).is_none());
+    }
+
+    #[test]
+    fn evidence_digest_covers_every_serialized_report_field() {
+        let (report, adapter, build) = exact_report_fixture();
+        let wire = serde_json::to_value(&report).unwrap();
+        for (name, value) in wire.as_object().unwrap() {
+            let mut changed = wire.clone();
+            let replacement = match value {
+                serde_json::Value::String(text) => serde_json::json!(format!("{text}-changed")),
+                serde_json::Value::Number(_) => serde_json::json!(42),
+                serde_json::Value::Bool(flag) => serde_json::json!(!flag),
+                serde_json::Value::Null => serde_json::to_value(SenseDivergenceCoordinates {
+                    tick: 1,
+                    agent_uid: 1,
+                    agent_index: 0,
+                    sensor_index: 0,
+                    cpu_sensor_value: 0.0,
+                    gpu_sensor_value: 1.0,
+                    sensor_delta: 1.0,
+                    cpu_accumulator: None,
+                    gpu_accumulator: None,
+                })
+                .unwrap(),
+                other => panic!("unhandled report field {name}: {other}"),
+            };
+            changed[name] = replacement;
+            // Verdict has only two valid enum values.
+            if name == "verdict" {
+                changed[name] = serde_json::json!("approximate");
+            }
+            let changed: SenseLaneParityReport = serde_json::from_value(changed).unwrap();
+            assert_ne!(
+                &changed, &report,
+                "mutation of {name} must change the report"
+            );
+            if name != "evidence_digest" {
+                assert_ne!(
+                    compute_evidence_digest(&changed).unwrap(),
+                    report.evidence_digest,
+                    "unbound field {name}"
+                );
+            }
+            assert!(
+                certified_report_evidence(&changed, &adapter, Some(&build)).is_none(),
+                "unnoticed corruption in {name}"
+            );
+        }
+        let mut longer = report;
+        longer.tick_count += 1;
+        longer.dispatches += 1;
+        longer.evidence_digest = compute_evidence_digest(&longer).unwrap();
+        assert!(certified_report_evidence(&longer, &adapter, Some(&build)).is_some());
+    }
 }
 
 /// Generate authoritative markdown documentation for docs/gpu-lane.md.
@@ -1032,13 +1430,30 @@ To prevent silent determinism drift:
 
 ## 2. Hardware & Target Matrix
 
-| Target Architecture | Graphics API | Tested Adapters | Hardware Class | Verification Status | Determinism Verdict |
+| Target Architecture | Graphics API | Candidate Adapters | Hardware Class | Verification Status | Determinism Verdict |
 |----------------------|--------------|-----------------|----------------|---------------------|---------------------|
-| `x86_64-unknown-linux-gnu` | Vulkan | AMD Radeon RX 7900 XTX | Discrete GPU | Certified | Exact |
-| `x86_64-unknown-linux-gnu` | Vulkan | NVIDIA GeForce RTX 4090 | Discrete GPU | Certified | Exact |
+| `x86_64-unknown-linux-gnu` | Vulkan | AMD Radeon RX 7900 XTX | Discrete GPU | Unverified target | Unestablished |
+| `x86_64-unknown-linux-gnu` | Vulkan | NVIDIA GeForce RTX 4090 | Discrete GPU | Unverified target | Unestablished |
 | `x86_64-unknown-linux-gnu` | Vulkan | llvmpipe (Mesa) | Software CPU | Emulated (Excluded from Performance Claims) | Approximate |
-| `aarch64-apple-darwin` | Metal | Apple M1/M2/M3/M4 (Family 7/8/9) | Integrated Apple Silicon | Certified | Exact |
-| `x86_64-pc-windows-msvc` | DirectX 12 | NVIDIA GeForce RTX 3080/4080 | Discrete GPU | Certified | Exact |
+| `aarch64-apple-darwin` | Metal | Apple M1/M2/M3/M4 (Family 7/8/9) | Integrated Apple Silicon | Unverified target | Unestablished |
+| `x86_64-pc-windows-msvc` | DirectX 12 | NVIDIA GeForce RTX 3080/4080 | Discrete GPU | Unverified target | Unestablished |
+
+No hardware certification is established by this table. The retained fixture is a
+software-adapter report; a table row is not parity evidence. Runtime certification
+requires a matching full adapter/driver/backend tuple, current shader, canonical
+fixture, at least 1,000 ticks with actual sensor comparisons, equal nonzero science
+digests, zero delta/no divergence, and the recomputed versioned report checksum.
+Missing adapter/driver identity strings refuse certification even when both
+the report and live adapter expose the same blank value.
+That checksum detects corruption; it does not authenticate the report's author.
+
+Builds seeking certification must embed `SCRIPTBOTS_SOURCE_TREE_CLEAN=true`, an
+exact `SCRIPTBOTS_SOURCE_REVISION` (or plain-commit `RCH_BUILD_SOURCE`),
+`SCRIPTBOTS_BUILD_TARGET`, and complete `SCRIPTBOTS_RUSTC_VV` output while compiling.
+The identity also binds Cargo manifests/lockfile and local feature/code-generation
+settings. Missing inputs remain `unavailable` in new reports and refuse certification.
+These build-time declarations require independent build provenance review; runtime
+environment variables cannot replace them. Legacy v0 checksums are not accepted.
 
 > [!NOTE]
 > **Software Adapter Exclusion**:
@@ -1074,17 +1489,26 @@ When GPU sensing is classified as `Approximate`:
 
 ## 5. Running the Parity Verification Gate
 
-To execute the 1,000-tick CPU-vs-GPU parity verification suite:
+To run the current focused provider, policy and documentation checks:
 
 ```bash
 # Execute the E2E parity runner
 ./scripts/e2e_gpu_sense_parity.sh
 ```
 
-The runner:
-1. Executes 1,000 ticks comparing CPU reference against GPU compute sensing.
-2. Injects driver `acos` and `f32` accumulator faults to prove negative gate behavior (divergence detection).
-3. Validates the resulting `sense_lane_parity.json` report artifact.
-4. Verifies this documentation against the code generator to prevent doc drift.
+The helper:
+1. Runs selected parity tests, including a five-tick accumulator-perturbation
+   diagnostic and a one-tick empty-population case when an adapter is available.
+   The provider test can skip execution when no adapter/device is available.
+2. Checks application policy/manifest tests and the retained software-adapter
+   fixture. It does not produce a fresh 1,000-tick report from that fixture.
+3. Verifies this documentation against its generator.
+
+The historical `DriverAcos` and `F32Accumulator` mode names currently select
+integer accumulator perturbations, not altered shader implementations. Actual
+driver-`acos` and f32-shader fault qualification remains open, along with the
+1,000-tick hardware run and DSR scaling requirements of `bd-16g.15.3`.
+`run_sense_parity_check` defaults to 1,000 ticks for callers that explicitly run
+it; the helper's smaller diagnostic does not establish that acceptance.
 "#.to_string()
 }

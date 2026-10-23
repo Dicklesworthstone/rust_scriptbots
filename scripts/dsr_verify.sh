@@ -525,6 +525,7 @@ SCRIPTBOTS_SOURCE_STATUS_DIGEST="$(git status --porcelain --untracked-files=all 
 SCRIPTBOTS_SOURCE_DIFF_DIGEST="$(git diff --binary HEAD | sha256sum | cut -d ' ' -f 1)"
 export SCRIPTBOTS_SOURCE_BRANCH SCRIPTBOTS_SOURCE_STATUS_DIGEST SCRIPTBOTS_SOURCE_DIFF_DIGEST
 export SCRIPTBOTS_RUSTC_VV="$compiler_identity"
+export SCRIPTBOTS_BUILD_TARGET="$actual_target"
 steps=0
 touch "$proof_dir/commands.jsonl"
 record_failed_verdict() {
