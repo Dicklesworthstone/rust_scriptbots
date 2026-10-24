@@ -1091,7 +1091,9 @@ pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
     artifacts: Mutex<BTreeMap<String, ArtifactMetadataDto>>,
-    idempotency: Mutex<BTreeMap<String, (String, Value)>>,
+    /// Process-local admission authority: request key -> (payload hash, admitted ID).
+    /// Status is read from the job rather than cached as a creation response.
+    idempotency: Mutex<BTreeMap<String, (String, String)>>,
     artifacts_dir: RwLock<PathBuf>,
     checkpoint_retention: Mutex<CheckpointRetentionState>,
 }
@@ -1566,32 +1568,43 @@ impl ControlHandle {
 
         let ticks_per_run = request.ticks_per_run.unwrap_or(1000).clamp(1, 10_000_000);
 
-        if let Some(ref key) = request.idempotency_key {
-            if key.is_empty() || key.len() > 1024 {
-                return Err(ControlError::BadRequest(
-                    "idempotency key must contain 1..=1024 bytes".into(),
-                ));
-            }
-            let payload_hash = compute_blake3(
-                serde_json::to_string(&request)
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-            if let Ok(lock) = self.data_services.idempotency.lock()
-                && let Some((stored_hash, cached_val)) = lock.get(key)
-            {
-                if stored_hash == &payload_hash {
-                    if let Ok(dto) =
-                        serde_json::from_value::<ExperimentBatchStatusDto>(cached_val.clone())
-                    {
-                        return self.get_experiment(&dto.experiment_id);
-                    }
-                } else {
-                    return Err(ControlError::Conflict(
-                        "idempotency key reused with different payload".into(),
+        let request_identity = request
+            .idempotency_key
+            .as_ref()
+            .map(|key| {
+                if key.is_empty() || key.len() > 1024 {
+                    return Err(ControlError::BadRequest(
+                        "idempotency key must contain 1..=1024 bytes".into(),
                     ));
                 }
+                let payload = serde_json::to_vec(&request)
+                    .map_err(|error| ControlError::Serialization(error.to_string()))?;
+                Ok((key.clone(), compute_blake3(&payload)))
+            })
+            .transpose()?;
+        // Keep keyed admission serialized from lookup through publication. The
+        // background runner never needs this lock; unkeyed creates do not take it.
+        let mut idempotency = request_identity
+            .as_ref()
+            .map(|_| {
+                self.data_services
+                    .idempotency
+                    .lock()
+                    .map_err(|_| ControlError::Lock)
+            })
+            .transpose()?;
+        if let (Some((key, payload_hash)), Some(registry)) =
+            (request_identity.as_ref(), idempotency.as_ref())
+            && let Some((stored_hash, experiment_id)) = registry.get(key)
+        {
+            if stored_hash != payload_hash {
+                return Err(ControlError::Conflict(
+                    "idempotency key reused with different payload".into(),
+                ));
             }
+            let experiment_id = experiment_id.clone();
+            drop(idempotency);
+            return self.get_experiment(&experiment_id);
         }
 
         let secs = std::time::SystemTime::now()
@@ -1701,22 +1714,16 @@ impl ControlHandle {
             job.start();
             lock.insert(experiment_id.clone(), job);
         }
-        let status_dto = self.get_experiment(&experiment_id)?;
-
-        if let Some(ref key) = request.idempotency_key {
-            let payload_hash = compute_blake3(
-                serde_json::to_string(&request)
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-            if let Ok(mut lock) = self.data_services.idempotency.lock()
-                && let Ok(val) = serde_json::to_value(&status_dto)
-            {
-                lock.insert(key.clone(), (payload_hash, val));
-            }
+        // Admission has happened even if the first status read fails. Publish
+        // its identity before that fallible observation so an exact retry can
+        // only look up this job, never start a second sweep.
+        if let (Some((key, payload_hash)), Some(registry)) =
+            (request_identity, idempotency.as_mut())
+        {
+            registry.insert(key, (payload_hash, experiment_id.clone()));
         }
-
-        Ok(status_dto)
+        drop(idempotency);
+        self.get_experiment(&experiment_id)
     }
 
     /// Look up status of an experiment by ID.
@@ -3528,6 +3535,140 @@ pub(crate) mod tests {
             .expect("world"),
         );
         (host.handle(), host)
+    }
+
+    fn experiment_creation_request() -> ExperimentCreateRequest {
+        ExperimentCreateRequest {
+            experiment_id: None,
+            description: Some("actual retry admission regression".to_owned()),
+            variants: vec![ExperimentVariantDto {
+                variant_id: "baseline".to_owned(),
+                brain_family: "mlp".to_owned(),
+                config_overrides: Some(serde_json::json!({
+                    "world_width": 40,
+                    "world_height": 40,
+                    "food_cell_size": 10,
+                    "population_minimum": 2,
+                    "population_spawn_interval": 0
+                })),
+            }],
+            seeds: vec![7],
+            ticks_per_run: Some(2),
+            max_concurrency: Some(1),
+            idempotency_key: Some("one-actual-sweep".to_owned()),
+        }
+    }
+
+    #[test]
+    fn experiment_creation_concurrent_retry_admits_one_real_batch() {
+        let (handle, _host) = handle();
+        let request = experiment_creation_request();
+        let gate = std::sync::Barrier::new(4);
+        let replies = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        handle.create_experiment(request.clone())
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .expect("create caller joined")
+                        .expect("create")
+                })
+                .collect::<Vec<_>>()
+        });
+        let identities: std::collections::BTreeSet<_> = replies
+            .iter()
+            .map(|reply| reply.experiment_id.as_str())
+            .collect();
+        assert_eq!(identities.len(), 1, "retry identities: {identities:?}");
+        assert_eq!(handle.list_experiments(Some(100), None).unwrap().total, 1);
+        let experiment_id = &replies[0].experiment_id;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle.get_experiment(experiment_id).expect("actual status");
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(completed.completed_runs, 1);
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(
+            completed.runs[0].total_ticks,
+            request.ticks_per_run.unwrap()
+        );
+        let bundle = scriptbots_storage::verify_run_bundle(Path::new(
+            completed.runs[0].bundle_path.as_ref().expect("real bundle"),
+        ))
+        .expect("independently read the actual completed bundle");
+        assert_eq!(bundle.max_tick, completed.runs[0].total_ticks);
+        assert!(
+            completed.runs[0]
+                .final_digest
+                .as_ref()
+                .is_some_and(|digest| !digest.is_empty())
+        );
+        let retry = handle
+            .create_experiment(request.clone())
+            .expect("completed retry");
+        assert_eq!(retry.experiment_id, *experiment_id);
+        assert_eq!(retry.completed_runs, 1);
+        let mut changed = request;
+        changed.seeds.push(8);
+        assert!(matches!(
+            handle.create_experiment(changed),
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(handle.list_experiments(Some(100), None).unwrap().total, 1);
+    }
+
+    #[test]
+    fn experiment_creation_status_failure_retains_the_admitted_identity() {
+        let (handle, _host) = handle();
+        let mut request = experiment_creation_request();
+        request.experiment_id = Some("status-unreadable".to_owned());
+        // A real directory at the expected status-file path makes every read fail;
+        // it does not replace the runner or synthesize a status response.
+        let status_path = handle
+            .artifacts_dir()
+            .join("experiments/status-unreadable/status.json");
+        fs::create_dir_all(&status_path).expect("actual unreadable status path");
+        assert!(matches!(
+            handle.create_experiment(request.clone()),
+            Err(ControlError::Serialization(_))
+        ));
+        assert_eq!(handle.data_services.experiments.lock().unwrap().len(), 1);
+        assert!(matches!(
+            handle.create_experiment(request),
+            Err(ControlError::Serialization(_))
+        ));
+        assert_eq!(handle.data_services.experiments.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn experiment_creation_poisoned_retry_authority_admits_nothing() {
+        let (handle, _host) = handle();
+        let services = std::sync::Arc::clone(&handle.data_services);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = services.idempotency.lock().expect("initially unpoisoned");
+            panic!("intentional retry-authority poison");
+        });
+        assert!(poisoned.join().is_err());
+        assert!(matches!(
+            handle.create_experiment(experiment_creation_request()),
+            Err(ControlError::Lock)
+        ));
+        assert!(handle.data_services.experiments.lock().unwrap().is_empty());
+        assert!(!handle.artifacts_dir().join("experiments").exists());
     }
 
     fn checkpoint_test_handle(

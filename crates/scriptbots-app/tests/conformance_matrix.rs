@@ -1008,6 +1008,55 @@ fn test_experiments_checkpoints_and_artifacts_lifecycle() {
         "ticks_per_run": 5,
         "idempotency_key": "conformance-exp-idem-42"
     });
+    // REST and MCP retries reach the same live admission authority concurrently.
+    // Starting all clients together exercises the miss-to-admission window;
+    // the completed bundles below still come from the real background runner.
+    let create_gate = std::sync::Barrier::new(4);
+    let concurrent_creates = std::thread::scope(|scope| {
+        let clients: Vec<_> = (0..4)
+            .map(|index| {
+                let payload = &create_payload;
+                let gate = &create_gate;
+                let rest_addr = fixture.rest_addr;
+                let mcp_addr = fixture.mcp_addr;
+                scope.spawn(move || {
+                    gate.wait();
+                    if index % 2 == 0 {
+                        let (status, body) = http_request(
+                            rest_addr,
+                            "POST",
+                            "/api/v1/experiments",
+                            &[("Content-Type", "application/json")],
+                            Some(payload.to_string().as_bytes()),
+                        )
+                        .expect("concurrent REST create");
+                        assert_eq!(status, 201, "{body}");
+                        serde_json::from_str::<Value>(&body).expect("REST create JSON")
+                    } else {
+                        let (status, reply) = mcp_json_rpc(
+                            mcp_addr,
+                            Some(400 + index),
+                            "tools/call",
+                            Some(serde_json::json!({
+                                "name": "experiment_create",
+                                "arguments": payload
+                            })),
+                        )
+                        .expect("concurrent MCP create");
+                        assert_eq!(status, 200, "{reply}");
+                        let text = reply["result"]["content"][0]["text"]
+                            .as_str()
+                            .expect("MCP create result");
+                        serde_json::from_str::<Value>(text).expect("MCP create JSON")
+                    }
+                })
+            })
+            .collect();
+        clients
+            .into_iter()
+            .map(|client| client.join().expect("create client joined"))
+            .collect::<Vec<_>>()
+    });
     let (st_create, body_create) = http_request(
         fixture.rest_addr,
         "POST",
@@ -1023,6 +1072,21 @@ fn test_experiments_checkpoints_and_artifacts_lifecycle() {
         .expect("experiment_id string")
         .to_string();
     assert_eq!(create_json["total_runs"], 2);
+    for reply in &concurrent_creates {
+        assert_eq!(reply["experiment_id"], exp_id, "{reply}");
+        assert_eq!(reply["total_runs"], 2);
+    }
+    let (list_status, list_body) = http_request(
+        fixture.rest_addr,
+        "GET",
+        "/api/v1/experiments?limit=100",
+        &[],
+        None,
+    )
+    .expect("list concurrent admissions");
+    assert_eq!(list_status, 200, "{list_body}");
+    let admitted: Value = serde_json::from_str(&list_body).expect("admission list JSON");
+    assert_eq!(admitted["total"], 1, "{admitted}");
 
     // Idempotent retry returns identical experiment
     let (st_create_retry, body_create_retry) = http_request(
@@ -1036,6 +1100,18 @@ fn test_experiments_checkpoints_and_artifacts_lifecycle() {
     assert_eq!(st_create_retry, 201);
     let retry_json: Value = serde_json::from_str(&body_create_retry).expect("parse retry");
     assert_eq!(retry_json["experiment_id"], exp_id);
+
+    let mut changed_payload = create_payload.clone();
+    changed_payload["seeds"] = serde_json::json!([101, 102, 103]);
+    let (changed_status, changed_body) = http_request(
+        fixture.rest_addr,
+        "POST",
+        "/api/v1/experiments",
+        &[("Content-Type", "application/json")],
+        Some(changed_payload.to_string().as_bytes()),
+    )
+    .expect("changed retry payload");
+    assert_eq!(changed_status, 409, "{changed_body}");
 
     // --- 3. Experiment Lookup & Status Parity (REST vs MCP) ---
     let (st_get, body_get) = http_request(
