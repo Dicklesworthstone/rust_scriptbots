@@ -1861,7 +1861,7 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
     })?;
 
     let spawn_child = |threads: Option<&str>| -> Result<std::process::Child> {
-        let mut child = Command::new(&exe);
+        let mut child = Command::new(&exe); // ubs:ignore -- exe comes from std::env::current_exe(), never caller input.
         child.arg("--config-only"); // avoid launching UI
         child.arg("--config");
         child.arg(&layer_path);
@@ -2282,14 +2282,14 @@ fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
     let world = prepare_bounded_host_continuation(&checkpoint, cli.brain)
         .with_context(|| format!("host checkpoint {checkpoint_id} at source tick {source_tick} in {path} refused world reconstruction"))?;
     let mut pipeline = StoragePipeline::recover_existing_run(path, run_id)
-        .context("host continuation refused leased run recovery")?;
+        .with_context(|| format!("host checkpoint {checkpoint_id} at source tick {source_tick} in {path} refused leased run recovery"))?;
     let prepared = (|| -> Result<HostThread> {
         let journal = pipeline
             .continue_journal_port(&record, Default::default())
-            .context("host continuation refused the exact stored journal/science cut")?;
+            .with_context(|| format!("host checkpoint {checkpoint_id} at source tick {source_tick} in {path} refused the exact stored journal/science cut"))?;
         let persistence = world
             .bind_persistence(Box::new(pipeline.sink()))
-            .context("failed to bind continued host persistence ownership")?;
+            .with_context(|| format!("host checkpoint {checkpoint_id} at source tick {source_tick} in {path} failed to bind continued persistence ownership"))?;
         HostThread::spawn_from_checkpoint(
             checkpoint,
             world,
@@ -2298,6 +2298,7 @@ fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
             ChannelHostOptions::default(),
             ticks,
         )
+        .with_context(|| format!("host checkpoint {checkpoint_id} at source tick {source_tick} in {path} refused owner startup"))
     })();
     let host = match prepared {
         Ok(host) => host,
@@ -6407,7 +6408,7 @@ fn run_profile_sweep(_config: &ScriptBotsConfig, ticks: u64, cli: &AppCli) -> Re
                     StorageMode::File => "file",
                     StorageMode::Memory => "memory",
                 };
-                let mut cmd = Command::new(&exe);
+                let mut cmd = Command::new(&exe); // ubs:ignore -- exe comes from std::env::current_exe(), never caller input.
                 cmd.env("SCRIPTBOTS_DET_RUN", "0");
                 cmd.env("RUST_LOG", "error");
                 configure_profile_child_storage(&mut cmd, storage);
@@ -6521,7 +6522,7 @@ fn pick_best_for_storage(
 
     for threads in thread_candidates {
         for thresholds in &threshold_candidates {
-            let mut cmd = Command::new(&exe);
+            let mut cmd = Command::new(&exe); // ubs:ignore -- exe comes from std::env::current_exe(), never caller input.
             cmd.env("SCRIPTBOTS_DET_RUN", "0");
             cmd.env("RUST_LOG", "error");
             configure_profile_child_storage(&mut cmd, storage);

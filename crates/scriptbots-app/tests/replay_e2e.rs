@@ -1657,6 +1657,104 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
         )
         .expect("retain real uncovered-factory observations");
     }
+    // Resume the returned artifact again, as the documented repeated-handoff workflow does.
+    // The same next transition must agree after one handoff versus two handoffs.
+    let chained_tick = HOST_CONTINUATION_TICKS + 1;
+    let baseline_next = continue_host_handoff(
+        &directory,
+        "uninterrupted-next",
+        &baseline_db,
+        &baseline_record.checkpoint_id,
+        1,
+        "mlp",
+    );
+    assert!(
+        baseline_next.status.success(),
+        "{}",
+        stderr_text(&baseline_next)
+    );
+    let baseline_next_report =
+        host_cli_report(&baseline_next, "scriptbots.host-checkpoint-handoff.v1");
+    let baseline_next_record =
+        assert_host_handoff_readback(&baseline_db, &baseline_next_report, chained_tick);
+    let continued_next = continue_host_handoff(
+        &directory,
+        "continuation-next",
+        &split_db,
+        &continued_record.checkpoint_id,
+        1,
+        "mlp",
+    );
+    assert!(
+        continued_next.status.success(),
+        "{}",
+        stderr_text(&continued_next)
+    );
+    let continued_next_report =
+        host_cli_report(&continued_next, "scriptbots.host-checkpoint-handoff.v1");
+    let continued_next_record =
+        assert_host_handoff_readback(&split_db, &continued_next_report, chained_tick);
+    let baseline_next_host = baseline_next_record
+        .host_checkpoint()
+        .expect("next baseline host");
+    let continued_next_host = continued_next_record
+        .host_checkpoint()
+        .expect("next continued host");
+    assert_eq!(
+        baseline_next_host.world_checkpoint().source_digest(),
+        continued_next_host.world_checkpoint().source_digest()
+    );
+    assert_eq!(
+        baseline_next_host.step_traces(),
+        continued_next_host.step_traces()
+    );
+    assert_eq!(
+        baseline_next_report["session_id"],
+        baseline_report["session_id"]
+    );
+    assert_eq!(
+        continued_next_report["session_id"],
+        cut_report["session_id"]
+    );
+    assert_eq!(baseline_next_report["run_id"], baseline_report["run_id"]);
+    assert_eq!(continued_next_report["run_id"], cut_report["run_id"]);
+
+    // A valid artifact from an older cut must be attributable and must not rewind the run.
+    let stale_before = host_database_prefix(&split_db);
+    let stale = continue_host_handoff(
+        &directory,
+        "stale-cut",
+        &split_db,
+        &cut_record.checkpoint_id,
+        1,
+        "mlp",
+    );
+    let stale_after = host_database_prefix(&split_db);
+    fs::write(
+        directory.join("stale-cut.observations.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "checkpoint_id": cut_record.checkpoint_id, "source_tick": HOST_HANDOFF_TICK,
+            "before": stale_before, "after": stale_after,
+        }))
+        .expect("encode actual stale-cut observations"),
+    )
+    .expect("retain actual stale-cut observations");
+    assert!(
+        !stale.status.success(),
+        "an obsolete handoff must refuse continuation"
+    );
+    assert_eq!(
+        stale_after, stale_before,
+        "stale-cut refusal cannot rewind or append science/journal rows"
+    );
+    let stale_text = strip_ansi(&format!("{}{}", stdout_text(&stale), stderr_text(&stale)));
+    assert!(
+        stale_text.contains(&cut_record.checkpoint_id)
+            && stale_text.contains(&format!("source tick {HOST_HANDOFF_TICK}"))
+            && stale_text.contains(split_db.to_str().expect("UTF-8 actual database")),
+        "stale-cut refusal must name the actual checkpoint, source tick and database: {stale_text}"
+    );
+    assert!(stale_text.contains("checkpoints.host_continuation_cut"));
     fs::write(
         directory.join("observed-handoffs.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -1664,6 +1762,8 @@ fn mock_free_full_host_checkpoint_continuation_e2e() {
             "continued": continued_report, "perturbed": perturbed_report,
             "matched_comparison": matched, "divergent_comparison": divergent,
             "source_prefix": source_prefix,
+            "next_uninterrupted": baseline_next_report,
+            "next_continued": continued_next_report,
         }))
         .expect("encode actual handoff observations"),
     )
