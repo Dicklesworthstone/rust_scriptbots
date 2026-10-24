@@ -49,6 +49,16 @@ The crate exposes the following wasm-bindgen surface:
   - `seed_strategy`: `"wander"` (default) to attach lightweight wander brains or `"none"` to start with passive agents for custom registry wiring.
   - `default_brain`: `"mlp"` to pre-bind agents to the baseline MLP implementation during seeding.
 - `SimHandle::tick(steps: u32) -> JsValue` — advances the simulation and returns either JSON or a `Uint8Array` depending on `snapshot_format`.
+- `SimHandle::drive(elapsedMilliseconds: number) -> JsValue` — drives the existing
+  `HostCore` at monotonic elapsed time since initialization/reset. Returns its
+  actual scientific-step, due and skipped-opportunity receipt. Each call retains
+  the host's bounded automatic catch-up policy; invalid/backwards time or a
+  nanosecond receipt beyond JavaScript's safe-integer range refuses before work.
+  This is a scheduling entry point, never a render callback.
+- `SimHandle::setSpeed(multiplier: number) -> JsValue` — applies a canonical host
+  command in the range `0..=32` and returns its two-axis command status. Zero
+  pauses automatic science. Explicit `tick(steps)` still completes exactly the
+  requested manual steps without advancing the elapsed clock or changing speed.
 - `SimHandle::snapshot() -> JsValue` — builds a snapshot without ticking (uses the same format toggle).
 - `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
   overrides the nested config for that reset; omitting it falls back to the
@@ -63,3 +73,11 @@ Snapshots are deterministic and use camelCase field names at the JavaScript boun
 - Per-agent state (`position`, `velocity`, `heading`, `energy`, `health`, `color`, `spikeLength`, `boost` flag)
 
 The wasm crate depends on `scriptbots-core` with `default-features = false`, disabling Rayon on wasm targets. Native builds can re-enable parallelism via the `parallel` feature if needed.
+
+The Canvas demo drives elapsed time from one independent timer. RAF only reads
+the latest immutable snapshot. Its speed slider and visibility changes use host
+commands; hidden pages pause and resume without catching up the hidden interval.
+Browser timers and rendering still share the main JS thread, so suspended or busy
+pages have no hard real-time guarantee. The receipt exposes skipped opportunities.
+Full packaged-browser/DSR acceptance remains with `bd-2z0.12.3` and `bd-azi3`;
+native unit tests alone do not establish browser scheduling or durability.

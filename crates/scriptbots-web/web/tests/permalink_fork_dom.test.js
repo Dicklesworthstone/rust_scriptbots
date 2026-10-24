@@ -87,6 +87,13 @@ const mockWasmModule = `
     return {
       __link: link,
       permalinkOf() { return link; },
+      setSpeed(value) { this.__speed = value; },
+      drive(now) {
+        const steps = Math.floor(now * (this.__speed ?? 1) * 60 / 1000) - tick;
+        this.tick(Math.max(0, steps));
+        return { scientific_steps: Math.max(0, steps), automatic_steps_skipped: 0 };
+      },
+      snapshot() { return this.tick(0); },
       tick(steps) {
         tick += steps;
         return {
@@ -118,6 +125,13 @@ const mockWasmModule = `
     return {
       __link: currentWorldLink,
       permalinkOf() { return currentWorldLink; },
+      setSpeed(value) { this.__speed = value; },
+      drive(now) {
+        const steps = Math.floor(now * (this.__speed ?? 1) * 60 / 1000) - tick;
+        this.tick(Math.max(0, steps));
+        return { scientific_steps: Math.max(0, steps), automatic_steps_skipped: 0 };
+      },
+      snapshot() { return this.tick(0); },
       tick(steps) {
         tick += steps;
         return {

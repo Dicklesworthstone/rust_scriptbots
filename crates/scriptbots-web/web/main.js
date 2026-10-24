@@ -64,14 +64,19 @@ const perfWindow = {
 };
 
 let simHandle = null;
-let stepsPerFrame = Number(stepsSlider.value);
+let speedMultiplier = Number(stepsSlider.value);
+let simulationStartedAt = null;
+let simulationTimer = null;
 let queuedReset = false;
 let population = Number(populationSlider.value);
 
 stepsSlider.addEventListener("input", () => {
-  stepsPerFrame = Number(stepsSlider.value);
-  appendLog(`Steps/frame set to ${stepsPerFrame}`);
+  speedMultiplier = Number(stepsSlider.value);
+  applyPlaybackSpeed();
+  appendLog(`Simulation speed set to ${speedMultiplier}×`);
 });
+
+document.addEventListener("visibilitychange", applyPlaybackSpeed);
 
 populationSlider.addEventListener("input", () => {
   population = Number(populationSlider.value);
@@ -83,6 +88,7 @@ resetButton.addEventListener("click", () => {
     permalinkStatus.textContent = "";
   }
   appendLog("Reset requested");
+  if (simulationStartedAt !== null && simulationTimer === null) pumpSimulation();
 });
 
 function appendLog(message) {
@@ -184,11 +190,43 @@ function updateStats(snapshot, now) {
   }
 }
 
-function stepSimulation(now) {
+function presentSimulation(now) {
   if (!simHandle) {
-    requestAnimationFrame(stepSimulation);
+    requestAnimationFrame(presentSimulation);
     return;
   }
+
+  const snapshot = simHandle.snapshot();
+  drawSnapshot(snapshot);
+  updateStats(snapshot, now);
+  requestAnimationFrame(presentSimulation);
+}
+
+function driveSimulation() {
+  if (!simHandle || simulationStartedAt === null) return;
+  const receipt = simHandle.drive(performance.now() - simulationStartedAt);
+  if (receipt.automatic_steps_skipped > 0) {
+    appendLog(
+      `Simulation timer missed ${receipt.automatic_steps_skipped} tick opportunities; completed ${receipt.scientific_steps} bounded catch-up ticks`,
+    );
+  }
+}
+
+function applyPlaybackSpeed() {
+  if (!simHandle) return;
+  // Settle the prior speed up to this input boundary before applying the new
+  // canonical command. Resuming never accrues science for a hidden interval.
+  driveSimulation();
+  simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
+}
+
+function startSimulationClock() {
+  simulationStartedAt = performance.now();
+  simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
+}
+
+function pumpSimulation() {
+  simulationTimer = null;
 
   if (queuedReset) {
     resetSimulation(population).catch((err) => {
@@ -198,14 +236,16 @@ function stepSimulation(now) {
     queuedReset = false;
   }
 
-  let snapshot = null;
-  for (let i = 0; i < stepsPerFrame; i += 1) {
-    snapshot = simHandle.tick(1);
+  try {
+    driveSimulation();
+  } catch (err) {
+    console.error("Simulation clock stopped", err);
+    appendLog(`Simulation clock stopped: ${err}`);
+    return;
   }
-
-  drawSnapshot(snapshot);
-  updateStats(snapshot, now);
-  requestAnimationFrame(stepSimulation);
+  // One outstanding callback, no snapshot queue. HostCore owns deadlines and
+  // its unchanged catch-up bound; timer jitter never becomes a render tick.
+  simulationTimer = setTimeout(pumpSimulation, 1000 / 60);
 }
 
 function updateMismatchBanner(matchResult) {
@@ -332,6 +372,7 @@ async function loadWorldFromPermalink(linkStr) {
 
     const handle = init_from_permalink(linkStr);
     simHandle = handle;
+    startSimulationClock();
     currentPermalink = linkStr;
     if (permalinkInput) {
       permalinkInput.value = linkStr;
@@ -496,6 +537,7 @@ async function resetSimulation(populationOverride) {
   };
 
   simHandle = init_sim(options);
+  startSimulationClock();
   resetPerformanceWindows();
 
   currentPermalink = null;
@@ -547,7 +589,8 @@ async function bootstrap() {
       await resetSimulation(population);
     }
 
-    requestAnimationFrame(stepSimulation);
+    if (simulationTimer === null) pumpSimulation();
+    requestAnimationFrame(presentSimulation);
   } catch (err) {
     console.error("Failed to initialise wasm module", err);
     appendLog(`Bootstrap failed: ${err}`);

@@ -34,7 +34,8 @@ use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
 
 use scriptbots_runtime::{
-    HostCore, HostCoreOptions, HostSessionId, ManualHostDriver, ManualInstant, PlaybackSnapshot,
+    ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
+    HostSessionId, LocalHostPort, ManualHostDriver, ManualInstant, NullFrontend, PlaybackSnapshot,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -95,6 +96,7 @@ pub struct SimHandle {
 
 struct Simulation {
     core: HostCore,
+    controls: NullFrontend<LocalHostPort>,
     spec: SimSpec,
     mlp_key: Option<u64>,
     now_nanos: u64,
@@ -217,8 +219,10 @@ impl Simulation {
             .map_err(|e| anyhow::anyhow!("failed to build HostCore for web: {e}"))?;
         core.drive(ManualInstant::from_nanos(0))
             .context("failed to establish the initial ScriptBots web time boundary")?;
+        let controls = NullFrontend::new(core.local_port(), 1);
         Ok(Self {
             core,
+            controls,
             spec,
             mlp_key,
             now_nanos: 0,
@@ -249,6 +253,7 @@ impl Simulation {
             .map_err(|e| anyhow::anyhow!("failed to rebuild HostCore for web: {e}"))?;
         core.drive(ManualInstant::from_nanos(0))
             .context("failed to establish the reset ScriptBots web time boundary")?;
+        self.controls = NullFrontend::new(core.local_port(), 1);
         self.core = core;
         self.spec = spec;
         self.now_nanos = 0;
@@ -256,30 +261,81 @@ impl Simulation {
     }
 
     fn tick(&mut self, steps: u32) -> Result<SimulationSnapshot> {
-        let period = self.core.tick_period_nanos();
+        let resume = !self.core.latest_snapshot().playback.paused;
         for step_index in 0..steps {
-            self.now_nanos = self.now_nanos.saturating_add(period);
-            let receipt = self
-                .core
-                .drive(ManualInstant::from_nanos(self.now_nanos))
-                .with_context(|| {
-                    format!(
-                        "HostCore failed during WASM step {} of {steps}",
-                        step_index + 1
-                    )
-                })?;
+            let before = self.core.world_tick();
+            self.apply_command(HostCommand::Step).with_context(|| {
+                format!(
+                    "HostCore failed during WASM step {} of {steps}",
+                    step_index + 1
+                )
+            })?;
             ensure!(
-                receipt.scientific_steps == 1,
-                "HostCore completed {} scientific steps during requested WASM step {} of {steps}",
-                receipt.scientific_steps,
+                self.core.world_tick().0.checked_sub(before.0) == Some(1),
+                "HostCore did not complete exactly one scientific step during requested WASM step {} of {steps}",
                 step_index + 1
             );
+        }
+        if steps != 0 && resume {
+            self.apply_command(HostCommand::Resume)
+                .context("failed to restore browser playback after manual stepping")?;
         }
         Ok(self.core.latest_snapshot().world.clone())
     }
 
     fn snapshot(&self) -> SimulationSnapshot {
         self.core.latest_snapshot().world.clone()
+    }
+
+    fn drive(&mut self, elapsed_ms: f64) -> Result<DriveReceipt> {
+        let duration = std::time::Duration::try_from_secs_f64(elapsed_ms / 1000.0)
+            .context("browser elapsed milliseconds must be finite and nonnegative")?;
+        let now_nanos = u64::try_from(duration.as_nanos())
+            .context("browser elapsed milliseconds exceed the host clock range")?;
+        let max_safe_nanos = js_sys::Number::MAX_SAFE_INTEGER as u64;
+        ensure!(
+            now_nanos <= max_safe_nanos,
+            "browser elapsed time exceeds JavaScript's exact nanosecond range ({max_safe_nanos}ns)"
+        );
+        ensure!(
+            now_nanos >= self.now_nanos,
+            "browser elapsed time moved backwards: {now_nanos}ns before {}ns",
+            self.now_nanos
+        );
+        // The host may complete work before returning a fault. Keep its observed
+        // monotonic boundary even on failure; never retry against an older clock.
+        self.now_nanos = now_nanos;
+        self.core
+            .drive(ManualInstant::from_nanos(now_nanos))
+            .context("HostCore failed at the browser time boundary")
+    }
+
+    fn set_speed(&mut self, multiplier: f32) -> Result<CommandStatus> {
+        ensure!(
+            multiplier.is_finite() && (0.0..=32.0).contains(&multiplier),
+            "browser speed multiplier must be finite and within 0..=32"
+        );
+        self.apply_command(HostCommand::SetSpeed(multiplier))
+    }
+
+    fn apply_command(&mut self, command: HostCommand) -> Result<CommandStatus> {
+        let admitted = self
+            .controls
+            .submit(command, None)
+            .context("browser host command was not admitted")?;
+        self.core
+            .drive(ManualInstant::from_nanos(self.now_nanos))
+            .context("HostCore failed while applying the browser host command")?;
+        let status = self
+            .controls
+            .command_status(admitted.command_id())
+            .context("browser host command status is unavailable")?
+            .context("admitted browser host command has no status")?;
+        ensure!(
+            matches!(status.application(), ApplicationState::Applied { .. }),
+            "browser host command did not apply: {status:?}"
+        );
+        Ok(status)
     }
 }
 
@@ -345,6 +401,31 @@ impl SimHandle {
         let mut simulation = self.inner.borrow_mut();
         let snapshot = simulation.tick(steps).map_err(js_error)?;
         encode_snapshot(&snapshot, simulation.spec.snapshot_format)
+    }
+
+    /// Drive the existing fixed-deadline host independently of presentation.
+    /// Time is monotonic milliseconds elapsed since this simulation's reset.
+    /// The receipt exposes actual work and the host's bounded catch-up losses.
+    #[wasm_bindgen(js_name = drive)]
+    pub fn drive_js(&self, elapsed_ms: f64) -> Result<JsValue, JsValue> {
+        let receipt = self
+            .inner
+            .borrow_mut()
+            .drive(elapsed_ms)
+            .map_err(js_error)?;
+        to_value(&receipt).map_err(js_error)
+    }
+
+    /// Apply a canonical host speed command (zero pauses automatic science).
+    /// The returned status preserves separate application and journal outcomes.
+    #[wasm_bindgen(js_name = setSpeed)]
+    pub fn set_speed_js(&self, multiplier: f32) -> Result<JsValue, JsValue> {
+        let status = self
+            .inner
+            .borrow_mut()
+            .set_speed(multiplier)
+            .map_err(js_error)?;
+        to_value(&status).map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = snapshot)]
@@ -1483,6 +1564,218 @@ mod tests {
 
         simulation.reset(None).expect("reset web simulation");
         assert_eq!(simulation.tick(1).expect("first step after reset").tick, 1);
+    }
+
+    fn browser_clock_simulation() -> Simulation {
+        Simulation::new(SimSpec::new(
+            ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                food_cell_size: 20,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            },
+            4,
+            Some(91),
+            SnapshotFormat::Json,
+            SeedStrategy::None,
+            Some(BrainPreset::Mlp),
+        ))
+        .expect("seeded nonempty browser host")
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_clock_observers_do_not_authorize_science() {
+        let mut unobserved = browser_clock_simulation();
+        let mut observed = browser_clock_simulation();
+        let origin = observed.core.scientific_digest_v1().expect("origin digest");
+        for boundary in 1..=12 {
+            let elapsed_ms = f64::from(boundary * 20);
+            let receipt = unobserved.drive(elapsed_ms).expect("unobserved timer");
+            let observed_receipt = observed.drive(elapsed_ms).expect("observed timer");
+            assert_eq!(receipt, observed_receipt);
+            let before = observed.core.scientific_digest_v1().expect("before reads");
+            for _ in 0..boundary {
+                assert_eq!(observed.snapshot().tick, observed.core.world_tick().0);
+            }
+            assert_eq!(
+                observed.core.scientific_digest_v1().expect("after reads"),
+                before
+            );
+        }
+        assert!(observed.snapshot().tick > 0);
+        assert_eq!(observed.snapshot().agents.len(), 4);
+        let final_digest = observed.core.scientific_digest_v1().expect("final digest");
+        assert_ne!(final_digest, origin, "a frozen host cannot pass this test");
+        assert_eq!(
+            unobserved
+                .core
+                .scientific_digest_v1()
+                .expect("unobserved digest"),
+            final_digest
+        );
+        let repeated = observed.drive(240.0).expect("same time boundary");
+        assert_eq!(repeated.scientific_steps, 0);
+        assert_eq!(
+            observed
+                .core
+                .scientific_digest_v1()
+                .expect("repeated digest"),
+            final_digest
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_clock_speed_pause_manual_steps_and_reset_use_the_host() {
+        let mut simulation = browser_clock_simulation();
+        let speed = simulation.set_speed(2.0).expect("canonical speed command");
+        assert!(matches!(
+            speed.application(),
+            ApplicationState::Applied { .. }
+        ));
+        assert_eq!(
+            simulation.core.latest_snapshot().playback.speed_multiplier,
+            2.0
+        );
+        let first = simulation.drive(50.0).expect("double-speed interval");
+        assert!(first.scientific_steps > 0);
+        let paused = simulation.set_speed(0.0).expect("pause automatic science");
+        assert_ne!(speed.command_id(), paused.command_id());
+        let before_pause = simulation
+            .core
+            .scientific_digest_v1()
+            .expect("pause digest");
+        assert_eq!(
+            simulation
+                .drive(1000.0)
+                .expect("hidden interval")
+                .scientific_steps,
+            0
+        );
+        assert_eq!(
+            simulation
+                .core
+                .scientific_digest_v1()
+                .expect("hidden digest"),
+            before_pause
+        );
+        let paused_tick = simulation.snapshot().tick;
+        assert_eq!(
+            simulation
+                .tick(2)
+                .expect("manual steps while speed is zero")
+                .tick,
+            paused_tick + 2
+        );
+        simulation.set_speed(2.0).expect("resume speed");
+        let resumed = simulation.drive(1050.0).expect("resumed interval");
+        assert_eq!(resumed.scientific_steps, first.scientific_steps);
+        assert_eq!(resumed.automatic_steps_skipped, 0);
+        let tick = simulation.snapshot().tick;
+        assert_eq!(
+            simulation
+                .tick(2)
+                .expect("manual steps at double speed")
+                .tick,
+            tick + 2
+        );
+        simulation.reset(Some(91)).expect("reset scheduled host");
+        assert_eq!(simulation.now_nanos, 0);
+        assert_eq!(simulation.snapshot().tick, 0);
+        assert_eq!(
+            simulation.core.latest_snapshot().playback.speed_multiplier,
+            1.0
+        );
+        assert_eq!(
+            simulation
+                .drive(0.0)
+                .expect("reset origin")
+                .scientific_steps,
+            0
+        );
+        assert_eq!(simulation.tick(1).expect("manual step after reset").tick, 1);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_clock_rejects_invalid_time_and_speed_without_mutation() {
+        let mut simulation = browser_clock_simulation();
+        simulation.drive(50.0).expect("valid boundary");
+        let before = simulation
+            .core
+            .scientific_digest_v1()
+            .expect("before digest");
+        let revisions = simulation.core.latest_snapshot().revisions;
+        for elapsed_ms in [
+            49.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::MAX,
+            js_sys::Number::MAX_SAFE_INTEGER / 1_000_000.0 + 1.0,
+        ] {
+            assert!(
+                simulation.drive(elapsed_ms).is_err(),
+                "invalid time {elapsed_ms}"
+            );
+            assert_eq!(simulation.now_nanos, 50_000_000);
+            assert_eq!(
+                simulation
+                    .core
+                    .scientific_digest_v1()
+                    .expect("refused time digest"),
+                before
+            );
+            assert_eq!(simulation.core.latest_snapshot().revisions, revisions);
+        }
+        for speed in [-1.0, 33.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                simulation.set_speed(speed).is_err(),
+                "invalid speed {speed}"
+            );
+            assert_eq!(
+                simulation
+                    .core
+                    .scientific_digest_v1()
+                    .expect("refused speed digest"),
+                before
+            );
+            assert_eq!(simulation.core.latest_snapshot().revisions, revisions);
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_clock_long_gap_uses_the_existing_bounded_catch_up_receipt() {
+        let mut simulation = browser_clock_simulation();
+        let max_steps = simulation.core.max_automatic_steps_per_drive();
+        let receipt = simulation.drive(20_000.0).expect("late timer boundary");
+        assert_eq!(receipt.scientific_steps, max_steps);
+        assert!(receipt.automatic_steps_skipped > 0);
+        assert_eq!(
+            receipt.automatic_steps_due,
+            receipt.automatic_steps_skipped + u64::try_from(max_steps).expect("bounded steps")
+        );
+        assert_eq!(
+            simulation.snapshot().tick,
+            u64::try_from(max_steps).expect("bounded tick")
+        );
+        assert_eq!(
+            simulation
+                .drive(20_000.0)
+                .expect("repeated late boundary")
+                .scientific_steps,
+            0
+        );
+        let safe_ms = (js_sys::Number::MAX_SAFE_INTEGER / 1_000_000.0).floor();
+        let safe = simulation
+            .drive(safe_ms)
+            .expect("representable late boundary");
+        assert_eq!(safe.scientific_steps, max_steps);
+        assert!(safe.now.as_nanos() <= js_sys::Number::MAX_SAFE_INTEGER as u64);
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]

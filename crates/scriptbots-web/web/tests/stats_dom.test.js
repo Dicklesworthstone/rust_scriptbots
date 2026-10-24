@@ -61,7 +61,20 @@ const camelCaseWasmModule = `
   export function default_init_options() { return { world_width: 1280, world_height: 720 }; }
   export function init_sim(opts) {
     let tick = 0;
+    let elapsed = 0;
+    let speed = 1;
+    let credit = 0;
     return {
+      setSpeed(value) { speed = value; },
+      drive(now) {
+        credit += (now - elapsed) * speed * 60 / 1000;
+        elapsed = now;
+        const steps = Math.floor(credit);
+        credit -= steps;
+        this.tick(steps);
+        return { scientific_steps: steps, automatic_steps_skipped: 0 };
+      },
+      snapshot() { return this.tick(0); },
       tick(steps) {
         tick += steps;
         const pop = 200 + tick;
@@ -100,7 +113,17 @@ const snakeCaseWasmModule = `
   export function default_init_options() { return { world_width: 1280, world_height: 720 }; }
   export function init_sim(opts) {
     let tick = 0;
+    let elapsed = 0;
+    let speed = 1;
     return {
+      setSpeed(value) { speed = value; },
+      drive(now) {
+        const steps = Math.floor((now - elapsed) * speed * 60 / 1000);
+        elapsed = now;
+        this.tick(steps);
+        return { scientific_steps: steps, automatic_steps_skipped: 0 };
+      },
+      snapshot() { return this.tick(0); },
       tick(steps) {
         tick += steps;
         return {
@@ -375,7 +398,8 @@ async function runTests() {
         );
       }
 
-      // Verify DOM element was never populated with a valid number and loop froze
+      // Verify the DOM stayed unpopulated and the presentation loop froze.
+      // The independent science timer is not stopped by a paint contract error.
       const popAfterCrash = await page.textContent("#metric-population");
       if (popAfterCrash !== "–") {
         throw new Error(
@@ -383,7 +407,7 @@ async function runTests() {
         );
       }
 
-      // Advancing clock further must NOT execute more frames because the loop halted
+      // Advancing time must NOT present more frames after the fatal paint error.
       const tickBefore = await page.textContent("#metric-tick");
       await context.clock.runFor(500);
       const tickAfter = await page.textContent("#metric-tick");
@@ -534,6 +558,24 @@ async function runTests() {
               || reset.tick !== initial.tick || reset.summary.agentCount !== options.population) {
             throw new Error("Packaged init/snapshot/tick/reset did not preserve their public contracts");
           }
+          let unrepresentableTimeError = null;
+          try {
+            handle.drive(Number.MAX_SAFE_INTEGER / 1_000_000 + 1);
+          } catch (error) {
+            unrepresentableTimeError = String(error);
+          }
+          if (!unrepresentableTimeError?.includes("exact nanosecond range")
+              || handle.snapshot().tick !== reset.tick) {
+            throw new Error("Unrepresentable receipt time was not refused before scientific work");
+          }
+          const late = handle.drive(20_000);
+          const afterLate = handle.snapshot();
+          if (late.scientific_steps <= 0 || late.automatic_steps_skipped <= 0
+              || late.automatic_steps_due !== late.scientific_steps + late.automatic_steps_skipped
+              || afterLate.tick !== reset.tick + late.scientific_steps
+              || handle.drive(20_000).scientific_steps !== 0) {
+            throw new Error("Packaged host did not retain bounded catch-up and same-time idempotence");
+          }
           let invalidGeometryError = null;
           try {
             const invalid = wasm.init_sim({ ...options, world_width: initial.world.width + 1 });
@@ -552,6 +594,7 @@ async function runTests() {
             initial: { tick: initial.tick, summary: initial.summary, agentCount: initial.agents.length },
             advanced: { tick: advanced.tick, summary: advanced.summary, agentCount: advanced.agents.length },
             reset: { tick: reset.tick, summary: reset.summary, agentCount: reset.agents.length },
+            boundedCatchUp: { receipt: late, observedTick: afterLate.tick, unrepresentableTimeError },
             invalidGeometryError,
           };
         } finally {
@@ -562,6 +605,75 @@ async function runTests() {
         throw new Error(`Real packaged demo failed: ${JSON.stringify({ pageErrors, consoleLogs })}`);
       }
       await context.close();
+
+      // Real package and production main.js, with RAF held by the browser test.
+      // No simulation/module replacement: a render-authorized tick throws.
+      const clockContext = await browser.newContext();
+      await clockContext.clock.install();
+      await clockContext.addInitScript(() => {
+        window.__heldFrames = [];
+        window.requestAnimationFrame = (callback) => window.__heldFrames.push(callback);
+      });
+      const clockPage = await clockContext.newPage();
+      const clockErrors = [];
+      clockPage.on("pageerror", (error) => clockErrors.push(error.message));
+      await clockPage.goto(`${baseUrl}/`);
+      await clockPage.waitForFunction((version) => document.getElementById("version").textContent === version, expectedVersion);
+      await clockPage.evaluate(async () => {
+        const wasm = await import("/pkg/scriptbots_web.js");
+        const snapshot = wasm.SimHandle.prototype.snapshot;
+        wasm.SimHandle.prototype.snapshot = function () {
+          window.__clockHandle = this;
+          return snapshot.call(this);
+        };
+        wasm.SimHandle.prototype.tick = function () {
+          throw new Error("RAF attempted to authorize scientific work");
+        };
+      });
+      await clockContext.clock.runFor(300);
+      const clockBefore = await clockPage.evaluate(() => {
+        if (window.__heldFrames.length !== 1) throw new Error("Expected one outstanding presentation callback");
+        window.__heldFrames.shift()(performance.now());
+        return window.__clockHandle.snapshot().tick;
+      });
+      if (clockBefore <= 0) throw new Error("Science did not advance while RAF was held");
+      await clockContext.clock.runFor(300);
+      const clockAfter = await clockPage.evaluate(() => {
+        const before = window.__clockHandle.snapshot().tick;
+        for (let index = 0; index < 120; index += 1) {
+          window.__heldFrames.shift()(performance.now());
+        }
+        const after = window.__clockHandle.snapshot().tick;
+        if (after !== before) throw new Error("Extra presentation callbacks advanced science");
+        const speed = document.getElementById("steps-per-frame");
+        speed.value = "0";
+        speed.dispatchEvent(new Event("input", { bubbles: true }));
+        return { before, after, pausedTick: window.__clockHandle.snapshot().tick };
+      });
+      if (clockAfter.before <= clockBefore) throw new Error("Independent timer stopped with RAF held");
+      await clockContext.clock.runFor(300);
+      const pausedTick = await clockPage.evaluate(() => window.__clockHandle.snapshot().tick);
+      if (pausedTick !== clockAfter.pausedTick) throw new Error("Zero speed did not pause science");
+      await clockPage.evaluate(() => {
+        const speed = document.getElementById("steps-per-frame");
+        speed.value = "2";
+        speed.dispatchEvent(new Event("input", { bubbles: true }));
+        Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await clockContext.clock.runFor(5_000);
+      const hiddenTick = await clockPage.evaluate(() => window.__clockHandle.snapshot().tick);
+      if (hiddenTick !== pausedTick) throw new Error("Hidden page accrued scientific work");
+      await clockPage.evaluate(() => {
+        Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await clockContext.clock.runFor(100);
+      const resumedTick = await clockPage.evaluate(() => window.__clockHandle.snapshot().tick);
+      if (resumedTick <= hiddenTick || clockErrors.length !== 0) {
+        throw new Error(`Independent browser clock did not resume cleanly: ${JSON.stringify({ hiddenTick, resumedTick, clockErrors })}`);
+      }
+      await clockContext.close();
 
       // The same actual glue must refuse an invalid WASM version, rather than
       // allowing the DOM fixture to stand in for a compiled module.
@@ -598,6 +710,11 @@ async function runTests() {
         files: packageInfo.files,
         loadedFiles,
         window1, window2, api, pageErrors, consoleLogs,
+        independentClock: {
+          passed: true, clockBefore, clockAfter, pausedTick, hiddenTick, resumedTick,
+          heldRaf: true, extraPresentations: 120, clockErrors,
+          visibilityControl: "visibilitychange with injected document.hidden; not an OS suspension proof",
+        },
         corruptedWasmNegative: { passed: true, requests: corruptRequests, dom: corruptDom, consoleLogs: corruptConsole },
       };
     }

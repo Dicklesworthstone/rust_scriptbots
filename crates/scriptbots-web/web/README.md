@@ -39,10 +39,16 @@ The pinned DSR profile can select its provisioned Chrome binary with
 
 ### Controls & metrics
 
-- **Steps / frame**: choose how many simulation ticks to execute per animation frame (default `2`).
+- **Simulation speed**: choose the host playback multiplier (default `2×`;
+  `0` pauses). An independent timer supplies monotonic elapsed time to the Rust
+  host scheduler. RAF reads the latest snapshot and never authorizes a tick.
+  Hidden pages pause; becoming visible resumes the selected speed without
+  replaying the hidden interval. A late timer retains the host's bounded catch-up
+  policy and logs actual skipped tick opportunities. This main-thread adapter
+  cannot guarantee deadlines when the browser suspends or blocks JavaScript.
 - **Population**: select the spawn count used the next time you reset. The wander brain offers immediate motion for visual feedback.
-- **Snapshot format**: toggle between JSON and Postcard binary snapshots; the chosen format applies at the next reset and updates the status chip.
-- **Renderer**: switch between Canvas 2D and WebGPU (if supported). WebGPU falls back gracefully when unavailable.
+- The demo uses JSON snapshots and Canvas 2D. Binary bindings and the renderer
+  prototypes are separate from its current controls.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
 - Runtime brain presets can be toggled programmatically via `registerBrain("wander" | "mlp" | "none")` on the `SimHandle`.
 
