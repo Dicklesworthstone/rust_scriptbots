@@ -100,7 +100,7 @@ function resetPerformanceWindows() {
   const now = performance.now();
   metrics.lastFrameTs = now;
   metrics.lastStatsTs = now;
-  metrics.previousTick = null;
+  metrics.previousTick = simHandle ? simHandle.snapshot().tick : null;
   metrics.fps = 0;
   metrics.tps = 0;
   metrics.tick = 0;

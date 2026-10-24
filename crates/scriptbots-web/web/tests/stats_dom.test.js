@@ -630,13 +630,17 @@ async function runTests() {
           throw new Error("RAF attempted to authorize scientific work");
         };
       });
-      await clockContext.clock.runFor(300);
+      await clockContext.clock.runFor(600);
       const clockBefore = await clockPage.evaluate(() => {
         if (window.__heldFrames.length !== 1) throw new Error("Expected one outstanding presentation callback");
         window.__heldFrames.shift()(performance.now());
         return window.__clockHandle.snapshot().tick;
       });
       if (clockBefore <= 0) throw new Error("Science did not advance while RAF was held");
+      const firstPresentedTps = Number(await clockPage.textContent("#metric-tps"));
+      if (!Number.isFinite(firstPresentedTps) || firstPresentedTps <= 0) {
+        throw new Error("First delayed presentation omitted the already observed science interval from TPS");
+      }
       await clockContext.clock.runFor(300);
       const clockAfter = await clockPage.evaluate(() => {
         const before = window.__clockHandle.snapshot().tick;
@@ -711,7 +715,7 @@ async function runTests() {
         loadedFiles,
         window1, window2, api, pageErrors, consoleLogs,
         independentClock: {
-          passed: true, clockBefore, clockAfter, pausedTick, hiddenTick, resumedTick,
+          passed: true, clockBefore, firstPresentedTps, clockAfter, pausedTick, hiddenTick, resumedTick,
           heldRaf: true, extraPresentations: 120, clockErrors,
           visibilityControl: "visibilitychange with injected document.hidden; not an OS suspension proof",
         },
