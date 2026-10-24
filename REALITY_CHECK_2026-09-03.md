@@ -1,5 +1,232 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-20
 
+### Experiment retry admission TODO — 2026-10-24, LilacElm
+
+Consumer: the user's explicit granular TODO request. Gate: report atomic retry
+only after actual concurrent service/transport calls and real runner/file results.
+Observed defect: `create_experiment` releases the idempotency map before admission
+and records its entry after the initial fallible status read. This can duplicate
+generated-ID sweeps or lose the identity of an admitted job. Retire this scoped
+checklist at publication/handoff; original API acceptance remains in Beads.
+
+- [x] Refresh authoritative BR/BV, source, commits, Agent Mail and CASS; reserve
+  the exact edit paths and preserve the complete 718-record canonical preimage.
+- [x] Trace priority persistence/continuation owners first. Existing server
+  fault propagation is already implemented; do not claim an absent repair.
+- [x] Reopen `bd-2z0.12.2` against its original stable-ID/idempotency criterion,
+  preserve its acceptance and prior evidence, and coordinate the source scope.
+- [x] Reproduce concurrent duplicate creation and post-admission status failure
+  against the old production path with real files/runners; preserve every result.
+- [x] Atomically admit keyed requests and retain the admitted identity before
+  any fallible status read. Changed payloads conflict; poisoned locks admit nothing.
+- [x] Exercise actual concurrent REST/MCP creates plus original complete
+  lifecycle assertions, direct-service completion/bundle readback and negative cases.
+- [x] Pass frozen-source remote formatting and workspace/all-target check;
+  verify actual worker/source identities and acknowledged zero outcomes.
+- [x] Pass strict workspace/all-target Clippy through RCH; preserve refusals
+  and require its actual acknowledged lint result before committing.
+- [x] Read every immutable source hunk, inspect retained UBS inputs/findings
+  and fill the bounded written real-work/honesty worksheets; update final outcomes.
+- [x] Commit the product change and append scoped evidence plus the preserved
+  prior closure text to the original owner, leaving complete acceptance open.
+- [x] Export/audit every original record and provenance field; confirm the
+  original criteria, dependencies and comment prefix remain unchanged.
+- [ ] Commit tracking separately, release leases, pull/import, publish and
+  verify both required refs. Record the subsequent outcome in external
+  `publication.json` at the proof root and retire this scoped checklist there.
+
+Proof root: `/data/tmp/scriptbots-experiment-retry-20261024-lilacelm`. This is
+process-local admission; no restart-persistent experiment catalog, scientific
+comparison, performance improvement or full native/DSR acceptance is implied.
+
+Attempt record: initial RCH `30078439050444837` starts cold dependency compilation
+inside the unchanged 1,800-second functional cap. It is cooperatively cancelled
+before any tests; recovery observes 143/acknowledged. Preparation `44838` refuses
+103 on the unfinished prior source owner, runs nothing and earns no test credit.
+After recovering that owner, `44839` runs explicit library `--no-run` preparation
+with the separate 14,400-second compile cap. Its actual source SHA256 matches the
+saved tests-only old implementation. Local admission changes are separate; no
+new overlay is transferred into that active compilation. Formatter `44840` fails
+four new layouts, manually corrected; intermediate candidate formatter `44841` passes
+zero/acknowledged on two source paths. UBS observes zero critical, 1,011 warnings
+and 297 information findings across those two Rust files, with temporary copies
+retained through the earlier per-child cleanup adapters. Its intentional caught
+poison warning is a test of the authority failure path, not a clean-warning claim.
+The frozen candidate also drops the admission lock before a retry's status read.
+Its formatter `44842` passes zero/acknowledged on overlay
+`7b9a67597d7909bc3d7b61a080e042b9d652a0318d1e2fb0c122a9e189324094`;
+final UBS observes 0 critical / 1,011 warning / 298 information findings.
+Old-source reproduction and subsequent candidate qualification are recorded below.
+
+Old-source preparation `44839` passes zero/acknowledged after 3,371,802 execution
+milliseconds, with overlay `f08d27a47d35940e78ea0ebdca915e42e8f57e4bf17484a6e7cd0683a97f0360`.
+The retained library binary matches its RCH published BLAKE3 receipt
+`cf93c2f1c486cf4ddf760c87d44f6019203b274f46c60bcd414c10dae396c0e0`;
+SHA256 is `e25106a58e78367691f1e95934f2e8dce2518b928f08aef0b5933df3f68816c9`.
+RCH non-compilation job `44844` runs those exact protected bytes with the declared
+32MiB stack/one test thread and unchanged 1,800-second functional cap. All three
+regressions fail on old production admission: four concurrent callers receive
+four distinct generated experiment IDs, poisoned authority does not return Lock,
+and the unreadable-status retry no longer returns the original Serialization
+observation. Actual result: 0 passed / 3 failed / 0 ignored / 650 filtered in
+0.29 seconds, exit 101/acknowledged. SHA256 checks before and after match; this is
+failed old behavior reproduced, not three green tests. Candidate library and
+the entire existing conformance binary are prepared and executed subsequently,
+with their outcomes recorded separately below.
+The retained files corroborate all four duplicate batches completing their actual
+two-tick runs, plus a fifth admitted job in Running state under poisoned
+authority. All 29 files are copied and match the remote byte/SHA256 inventory.
+An initial local verification was attempted before SCP completed and failed on a
+not-yet-copied file; verification after transfer acknowledgement succeeds. It is
+not another remote artifact-loss incident. No completed run is inferred for the
+poisoned-authority job, which remains observed as Running at tick zero.
+
+Candidate preparation `44845` passes zero/acknowledged (400,112 execution ms),
+producing library and conformance binaries from the final two-path overlay.
+Their BLAKE3 receipts are respectively
+`022796087ff73ecac23b8531d6ef7e4744bd2cdb05974561ff7a10998d21ed2c` and
+`93ee7d1ff9d82e1739b3ca83b7cf819fd77ffe84a9576f03a6d9e1e2c14777d0`.
+RCH non-compilation job `44846` executes the exact protected bytes: new library
+regressions 3 passed / 0 failed / 0 ignored / 650 filtered in 0.28 seconds,
+then the complete conformance binary 9 passed / 0 failed / 0 ignored / 0 filtered
+in 10.34 seconds. All checksums match before and after; final exit 0/acknowledged.
+This is twelve distinct passing cases, not four clients counted as four tests.
+The unchanged expectations that fail old admission now pass; concurrent actual
+REST/MCP creates enumerate one batch and the original completion/bundle,
+cancellation/resume, checkpoint/artifact, schema, command, selection and stream
+assertions remain. This is real in-process HTTP/host/file execution with the
+existing volatile/null-persistence fixture, not a file-backed server subprocess
+or full native/DSR acceptance. Compiler outcomes are recorded separately below.
+The final-source workspace/all-target check `44843` subsequently passes
+zero/acknowledged (4,147,176 execution ms), with the same final two-path overlay
+and actual worker source hashes. Strict Clippy follows sequentially on that
+worker, but the first attempt refuses 103 before execution on `no_free_slots`;
+it is infrastructure, not a lint result. Fresh telemetry identifies critical
+disk pressure (1.3GiB free/zero usable slots) on that worker. The unchanged strict
+command is routed to the eligible candidate-build worker (32.7GiB free/two slots),
+without deleting anything, changing quotas/cache policy or falling back locally.
+The unchanged strict command `44847` passes zero/acknowledged (2,993,574 execution
+ms; 3,025,776 wrapper ms). Actual worker source SHA256 values match the tested
+candidate. The twelve functional cases and
+all 27 copied candidate/conformance files are verified. CSV readback observes
+seed 7/tick 2 and both seeds 101/102 at tick 5, with distinct final digests for
+the latter cohort. End populations are 8/16/16; no ecological equilibrium is
+claimed. Automatic RCH cross-command timing banners are not performance evidence.
+
+**Bounded written audit — experiment admission, solo, compiler qualification passed.**
+Window: this increment against `7c54f7c8`, its exact two-file source review and
+retained attempts. The README's goal is an evolutionary artificial-life laboratory
+with reproducible observation and experimentation. Inventory: one USER repair
+candidate (one sweep per logical concurrent request), one ENABLER (regressions and
+required checks), one requested PROCESS record (this TODO/Beads accounting), no
+UNKNOWN items. Twelve distinct actual functional passes and required remote
+format/check/strict-Clippy outcomes are observed on the frozen candidate.
+The reviewed source is committed as `3757fc93`; publication is tracked separately.
+The four-client demo is exercised by the actual in-process REST/MCP lifecycle:
+one experiment retains both completed seed runs and their real bundles. Without the process
+record runtime behavior is identical; it serves the user's explicit tracking
+request and keeps the original incomplete API owner visible. Format/static checks
+have real consumers; they remain separate from the executed cases above. The oldest user outcome is
+the July lab umbrella; the ready macOS P0 is unavailable here, and the persistence
+owners retain their original causal scope. This directly observed API admission
+window is a bounded correctness repair, rather than another cosmetic task. There
+is no swarm, close-count competition, speculative framework or follow-up split.
+Verdict at this cut: substantive repair with **solo functional verification**,
+compiler qualification passed, and validation-logistics drift from the cold-build,
+early replacement and premature copy-verification attempts. Correct those in
+place and retain their failures; never change a gate to conceal them.
+
+Process worksheet for the existing requested TODO: running code does not branch
+on it. Consumer/gate: the operator explicitly requests complete granular tracking
+of this repair. Observed defect: the source releases retry authority before
+admission and stores it after a fallible read. Retirement: publication/handoff,
+with original acceptance continuing in Beads. Integrity exception: exact source
+snapshots and the canonical preimage prevent the already-observed exporter's
+392-field provenance loss and prior volatile-artifact loss; at 718 records they
+are required, minimal and have no cheaper reliable substitute preserving the
+missing bytes. Opportunity cost: the highest ready P0 requires the affected
+macOS host; more prose cannot fix it. Keep this existing report bounded and
+finish the real admission path. Verdict: requested gate plus minimal integrity
+copies; neither earns capability credit.
+
+Honesty inventory, bounded to the exact reviewed candidate and attempts above:
+
+1. No (checked both complete source/test diffs and unchanged workflow/config
+   paths): no guard, assertion, ignore or tolerance is removed or weakened.
+2. No (checked new service cases and the retained conformance fixture): clients
+   invoke real runners/files; the directory failure and caught mutex poison are
+   explicit fault inputs. Barrier scheduling is not a replacement implementation.
+3. No (checked the changed-path set): no golden, snapshot, dependency or pin changes.
+4. Yes, conformance code is extended with concurrent clients and exact cardinality;
+   every old lifecycle assertion and deadline remains. No suppression, bypass or
+   relaxation is added. Compile preparation alone uses its separate 14,400s cap.
+5. No (checked production admission): no test/seed/benchmark branch or canned
+   result is added. Fixed tiny regression inputs are not a scientific study.
+6. No (checked both actual harness summaries): three new cases and all nine
+   conformance cases execute and pass. Compile-only, cancellation, refusal,
+   formatting and static analysis receive no functional test credit.
+7. No (checked raw commands/logs): old-source failures and candidate passes are
+   observed, and workspace check plus strict Clippy pass. Inspection is
+   not a test result.
+8. No (checked fixture/claim boundaries): the conformance fixture is a real
+   in-process HTTP server with a volatile/null-persistence host. It does not prove
+   a file-backed production subprocess, restart durability or centralized DSR.
+9. No (checked the attempt record): formatter failure, cancellation and unfinished
+   owner refusal remain visible. No whole-suite or native acceptance is inferred.
+10. No (checked cited invocations): native stdout/stderr are retained. UBS cleanup
+    retention changes no analyzer rules or findings; warnings are not a clean scan.
+11. Yes, the prior API closure did not cover the observed concurrent admission
+    window. The original owner is reopened under unchanged criteria, with its
+    previous evidence retained in the canonical preimage; no replacement task closes it.
+12. No (checked original criteria and source review): the plan annotation tracks
+    the repair; requirements/dependencies and the scientific runner are unchanged.
+13. No (checked this increment's coordination): solo work, no delegated/peer closes.
+14. No (checked dispatch history): no subagent was spawned or assigned a green-only goal.
+15. No (checked evidence origin): no delegate report is accepted as verification.
+16. No (checked task changes): no refusal-only item is minted or closed; the
+    positive outcome is one actually executed sweep for concurrent callers.
+17. No (checked Agent Mail): targeted coordination supplies no independent review
+    or agreement claim. All current evidence is self-executed/self-reviewed.
+18. No (checked proposed denominators): actual harness cases and batch cardinality
+    are the declared observations; repeated clients are not distinct passing tests.
+19. Yes: the initial cold build used the functional cap before preparation was
+    separated, and replacement `44838` was attempted before the cancelled owner
+    was acknowledged. A source probe also preceded transfer readiness. The owned
+    wrapper was recovered, actual source hashes were then observed, and explicit
+    preparation proceeds without extending a functional deadline. Copy verification
+    was also attempted before SCP completed, then correctly repeated only after
+    acknowledgement; all 29 old-run files match. The later two-worker adjustment
+    is capacity-checked/coordinated, not concealed overlap.
+20. Strongest evidence: old admission produces four actually completed duplicate
+    batches, while unchanged expectations pass on the candidate with one actual
+    completed batch. Four concurrent REST/MCP calls also retain both declared
+    cohort seeds. Actual binaries match RCH receipts and worker source hashes;
+    all 27 candidate/conformance files match the retained inventory. This is
+    reproducible solo evidence, not independent certification.
+
+Disposition: preserve every first attempt and require nonzero observed execution
+before any pass claim. Six bounded CASS audit queries since October 24 return zero
+indexed hits; this does not audit unindexed sessions. Compiler and functional
+outcomes are observed; prior closure preservation, final graph integrity and
+publication are recorded separately below before the scoped handoff.
+
+**Tracking snapshot before publication.** Source commit
+`3757fc93e8f92451716c62a468b955fcb5810cce` contains exactly the reviewed two-file
+tree. Comments 2962/2963 reopen and record evidence on `bd-2z0.12.2`, which remains
+`in_progress` with LilacElm. All seven original criteria, every dependency and
+the original eight-comment prefix are unchanged; comment 2963 preserves the
+complete prior closure reason and its timestamp verbatim as historical evidence.
+Final export retains all 718 ordered unique records and all 717 unrelated raw
+rows. Its exporter again drops 392 proven `source_repo_path` fields; those exact
+values are restored from the preserved preimage before committing. No foreign
+semantic changes are overwritten. Canonical SHA256 is
+`743aa831f280342861f3cc1962330d6011c852a1487c54763745e12d57204f82`;
+`br dep cycles --include-closed` observes zero cycles. Tracker caches and WAL
+directories are preserved and excluded from commits. The metadata commit,
+lease release, pull/import, pushes and exact-ref verification occur after this
+frozen tracking snapshot; the external publication record supplies those actual
+outcomes without a recursive documentation-only certification commit.
+
 ### Saved checkpoint catalog TODO — 2026-10-24, LilacElm
 
 Consumer: the user's requested granular TODO. Gate: report this connection only

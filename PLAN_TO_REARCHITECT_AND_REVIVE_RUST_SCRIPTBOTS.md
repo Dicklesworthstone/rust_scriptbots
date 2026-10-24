@@ -4,6 +4,18 @@
 
 **Evidence date:** 2026-07-11
 
+**Experiment retry admission (2026-10-24):** [Currently In Progress — LilacElm,
+`bd-2z0.12.2` reopened; scoped source committed as `3757fc93`]
+The committed source serializes keyed lookup through admission, retains the
+identity before a fallible status read and refuses poisoned authority. Old
+production admission fails all three new regressions and creates four completed
+duplicate sweeps; the candidate passes those three plus all nine existing
+conformance cases, including concurrent real REST/MCP clients. Remote formatting,
+workspace/all-target check and strict Clippy pass on the same frozen source.
+Scientific execution and deadlines are unchanged. Original complete
+API/file-backed/native/DSR acceptance remains open; the existing Reality Check
+carries the execution TODO and exact evidence boundaries.
+
 **Saved checkpoint catalog (2026-10-24):** [Currently In Progress — LilacElm,
 `bd-2z0.6.8` / `bd-2z0.5.13`; scoped source committed as `dc8aa8bd`]
 That source connects the exact captured checkpoint population and
