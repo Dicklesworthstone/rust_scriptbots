@@ -1,5 +1,189 @@
 # Reality Check — rust_scriptbots — reassessed 2026-10-20
 
+### Host-continuation execution TODO — 2026-10-24, LilacElm
+
+Consumer: the user explicitly requests a granular TODO and implementation of
+the highest-value remaining gaps. Gate: this increment cannot be reported as
+qualified until the actual CLI continuation and original negatives are observed.
+The existing unfinished continuation acceptance (`bd-2z0.5.13`) is the observed
+gap. This checklist retires at publication/handoff and earns no capability credit.
+
+- [x] Refresh canonical BR/BV readiness, source history, CASS and Agent Mail;
+  preserve the 718-record preimage and the existing owner's complete criteria.
+- [x] Trace actual file CLI capture, independent SQL readback, prepared registry,
+  exact session restore and the existing real-process positive/negative test.
+- [x] Reserve source/tracker paths, announce the work and start the unchanged
+  default-feature E2E through strict-remote RCH with retained external artifacts.
+- [x] Inspect the old-CLI functional result: RCH `30078439050444804`, exit 101
+  with terminal acknowledgement, zero passed/one failed/four filtered in 440.89
+  test seconds. The original controls and both next handoffs complete before
+  the stale-cut attribution assertion fails. All 104 retained files (104,298,983
+  bytes) match worker hashes after non-deleting local copy; stale-cut before/after
+  observations are equal. This is the demonstrated diagnostic red, not a green.
+- [x] Extend the existing real-process test with another continuation of both
+  settled tick-18 artifacts, compare the next science/stage traces and retained
+  run/session identities, then refuse the old tick-7 cut without advancing the
+  observed tick/replay rows, durability/journal prefixes or eight table counts.
+- [x] Require that stale-cut CLI diagnostic to name checkpoint, source tick and
+  database. The old CLI's error context omits those identities; its retained
+  error fails the assertion because checkpoint ID and source tick are absent.
+  The identical test passes on the repaired source: RCH `30078439050444805`,
+  exit zero/terminal acknowledgement, one passed/zero failed/four filtered in
+  426.37 test seconds. All 13 child commands complete: eight exit zero and five
+  have the expected negative exits. The 105 green artifacts (105,692,823 bytes)
+  match worker hashes after non-deleting copy. Independent report inspection
+  confirms equal tick-19 boundary digests and all 19 trace entries, retained
+  run/session identities and unchanged stale-cut observations. The error now
+  names the actual artifact and retains the typed journal/science-cut cause.
+- [x] Retain the first clean E2E attempt as compilation-only failure: RCH job
+  `30074093214629996`, exit 137/terminal acknowledgement, `deadline_exceeded`
+  after 1,807.421 seconds of remote execution. No test started. Its 1,800-second
+  wrapper includes cold compilation; it is neither a functional red nor a green.
+- [x] Complete separate `--no-run` preparation (14,400-second compiler allowance):
+  RCH `30074093214630000`, exit zero/terminal acknowledgement, 5,344.371 seconds
+  remote compilation and zero functional-test credit. The later real old/new CLI
+  invocations retain the 1,800-second cap. No application deadline or retry bound
+  changes.
+- [x] Review UBS's three existing critical findings: all are self-executable
+  launches whose `exe` is `std::env::current_exe()`, not caller input. Three
+  line-specific explanations reduce critical findings to zero without a global
+  suppression. The retained untrusted-executable source control still exits 1
+  with one critical finding under the same rule. Source warnings remain 1,191
+  and information items 384; no warning-clean or executed-exploit claim is made.
+- [x] Repair the demonstrated attribution defect with context on leased recovery,
+  journal-cut selection, persistence binding and owner startup. Preserve the
+  original typed cause, ownership, shutdown, deadlines and all test assertions.
+  The observed red/green pair covers journal-cut attribution; the other contexts
+  are source-reviewed and compiler-checked, not separately induced failures.
+- [x] Verify final source formatting, workspace all-target check and strict Clippy
+  through RCH: jobs `30078439050444801`–`30078439050444803`, each exit zero with
+  terminal acknowledgement. Worker hashes match the reviewed source at
+  `2026-10-24T04:09:08Z`. Relevant original functional results are recorded here.
+- [x] Review the exact source and evidence afresh, record remaining original
+  acceptance and a bounded honesty audit; do not claim native DSR or independence.
+- [x] Commit the immutable two-path source review as
+  `2b76d30df4054c6d3f347cac0d23ba47a1c5bc91`; committed blobs match the tested
+  source. A fresh targeted pre-commit UBS invocation again reports zero critical,
+  1,191 warnings and 384 information items. No further source changes follow.
+- [x] Execute the same case from committed source without overlays: RCH
+  `30078439050444806`, exit zero/terminal acknowledgement, one passed/zero
+  failed/zero ignored/four filtered in 474.03 test seconds. All seven actual
+  handoff reports record `2b76d30df4054c6d3f347cac0d23ba47a1c5bc91` despite the
+  conflicting runtime override. All 105 retained files (105,693,421 bytes) match
+  worker hashes. Tick-19 digests/traces, identities and stale-cut observations
+  pass again. Source cleanliness, status/diff digests and full `rustc -Vv`
+  remain visibly unavailable; the manifest still declines reproducibility.
+- [x] Export and audit all 718 tracker records. Refuse the exporter's omission of
+  `source_repo_path` from 392 unrelated records, prove it is their sole change,
+  then restore their exact original rows. All 717 unrelated rows are byte-identical
+  to the preimage. Only four comments (`2950`–`2953`) and `updated_at` change on
+  the target; all 48 original comments, owner, status, criteria and dependencies
+  remain intact. Dependency cycles, including archived closed tasks, remain zero.
+- [ ] Final transport, pending when this metadata snapshot is frozen: commit the
+  separately reviewed metadata, release the five owned reservations, pull and
+  immediately import BR, push main and its legacy mirror, and verify actual refs
+  and source/tracker preservation. The external publication record and final
+  response record those outcomes; this snapshot does not assert its own future push.
+
+Evidence directory: `/data/tmp/scriptbots-continuation-20261024-lilacelm`.
+The original Bead remains in progress. This increment repairs error attribution
+and exercises existing positive continuation; it does not implement a new
+simulation mechanic or establish the full checkpoint replay guarantee. Native
+runtime/central DSR qualification and the original full history, counters and
+exact-retry criteria remain open.
+
+Final tracker SHA256 before transport:
+`ecb945b9a65e68aff91b5c7f80d2dc5a3e3d7caff3063d7b6bf1aaf6c9a817a4`.
+The requested checklist retires as active work at publication/handoff; the original
+Bead does not. No new source file, framework, dependency or capability flag was added.
+
+**Bounded self-audit — October 24 continuation increment; solo verification.**
+The README's purpose is a faithful, deterministic artificial-life laboratory with
+GPU visualization, pluggable brains and trustworthy analytics. Inventory by work
+item: one USER repair (attributable continuation errors), one ENABLER (the existing
+real-process test extended and exercised), one requested PROCESS record (TODO,
+tracking and preservation/publication evidence), zero UNKNOWN items. This is no quota.
+The two-minute visible demo uses a retained database and an obsolete checkpoint:
+the error now identifies the requested checkpoint, source tick and database while
+preserving the storage cause. Removing this TODO changes no runtime behavior; its
+consumer is the user's explicit tracking request. The test's consumer is the actual
+CLI/FrankenSQLite save/continue workflow. The oldest open user outcome in the
+718-record preimage is `bd-2z0`, created July 11; this work exercises its existing
+checkpoint component. There are no delegated panes or close-count comparisons.
+No plan-only work substitutes for implementation and no follow-up closes the
+original. Verdict: HEALTHY within this bounded increment; the visible repair is
+modest, most elapsed time was cold compilation, and waiting earns no capability
+credit. Finish the normal transport without creating more process machinery.
+
+Honesty inventory, bounded to the two-path source diff, actual RCH logs/readbacks,
+original Bead criteria and recent indexed CASS results:
+
+1. No test weakening (checked: complete source diff retains original assertions,
+   controls, features and bounds; 100 test lines are added).
+2. No mock substituted for behavior (checked: 13 real child processes and actual
+   file storage/readback; the separate UBS source control is static, never executed).
+3. No golden regeneration (checked: no golden or fixture file changes).
+4. Yes, three line-specific UBS explanations accompany existing `current_exe()`
+   launches. Each executable origin was inspected. Critical findings change from
+   three to zero while an untrusted-executable control still fails the same rule
+   with one critical finding; 1,191 warnings and 384 information items remain.
+   No global scanner/CI bypass is used. The 14,400-second `--no-run` preparation
+   is separate from unchanged 1,800-second functional invocations; application
+   deadlines/retries and RCH total worker slots remain unchanged. Formatting's
+   per-job request was corrected to one core after admission refused its default
+   four-core estimate on a three-slot worker.
+5. No demo special case (checked: production formats the selected ID/tick/path;
+   no fixture-name, test-environment or benchmark exception is introduced).
+6. No zero-run credit (checked: each green runs one selected test/four filtered,
+   with eight successful and five expected negative child exits. Compile-only
+   success, the first compiler timeout and admission refusal earn no test credit).
+7. No unobserved command credited (checked: final commands have terminal receipts
+   and worker/source hashes; the earlier draft check is labelled separately).
+8. No proof-class promotion (checked: Linux RCH/debug/default-feature diagnostics
+   are distinct from native/central DSR acceptance. Existing 32 MiB test-stack
+   configuration is unchanged; this is no default 2 MiB stack or performance proof).
+9. Failures remain visible (checked: first exit-137 compiler deadline with zero
+   tests, unsupported RCH flag combinations with no jobs, formatting admission
+   refusal, original UBS findings and actual old-CLI diagnostic red are retained).
+10. No stderr discarded (checked: full RCH/UBS logs and each child's separate
+    stdout/stderr/process record are retained).
+11. No false closure (checked: no close/create/dependency operation; original
+    status, assignee and complete acceptance remain unchanged).
+12. No spec weakened (checked: plan changes record observed progress; original
+    replay guarantee and original acceptance are preserved).
+13. No delegate closes in this increment: no delegated work or closes occurred.
+14. No gaming-oriented dispatch: no subagent was dispatched in this increment.
+15. No unverified subagent report accepted: none was used for this increment.
+16. No refusal-farming delegation: no delegates or additional tasks were created.
+17. No agreement counted as evidence (checked: Agent Mail is coordination only;
+    this source and its checks were self-reviewed, with no independent verifier).
+18. No post-result denominator selection (checked: same preselected test,
+    default features, seed, thread budget, original controls and fixed 18/7/19-tick
+    comparisons; counts are derived from actual test/process records).
+19. Yes, the limited scope and cost matter: this exercises existing continuation,
+    rather than implementing a new simulation mechanic. Only the journal-cut
+    failure was induced for the four added contexts. A post-run inspector initially
+    used `tick` instead of the declared `checkpoint_tick`; its corrected readback
+    succeeds without changing source or tests. The unavailable provenance fields
+    and lack of native/independent qualification are explicit above.
+20. Strongest evidence: identical test blob `2236575b` fails on old main, passes
+    on final main, and passes again from committed source `2b76d30d`; retained
+    reports independently expose the matching tick-19 science/traces and the
+    unchanged stale-cut observations. The exact target is
+    `mock_free_full_host_checkpoint_continuation_e2e` in `replay_e2e`.
+
+Disposition: the narrowly justified scanner exceptions carry their original
+findings and unsafe-input falsifier (RH-1/RH-13); compile-only and functional
+results stay separate (RH-15/PL-1); required field names and positive readbacks
+are inspected from declarations/observations (PL-2); proof configuration and
+remaining limits stay explicit (RH-2/PL-3). Six bounded CASS searches since
+October 20, including this test filename, return zero hits; that is not a claim
+about unindexed sessions. Scoped SBH markers and sacred-path entries protect the
+local proof root and remote r2/r3/r4 evidence roots against the documented prior
+active-data loss. No RCH worker/daemon/cache policy, priority or total slots was
+changed, and no cleanup/unprotect command ran. The metadata audit preserves all
+unrelated work. There is no independent sign-off or original-task closure.
+
 ### GPU evidence matcher execution TODO — 2026-10-23, LilacElm
 
 Consumer: the user's explicitly requested granular work list and the agent

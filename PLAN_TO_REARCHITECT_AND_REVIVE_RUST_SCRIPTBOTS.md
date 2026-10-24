@@ -49,6 +49,16 @@ Passing server runs do not close the intermittent storage/journal latency invest
 
 **Primary outcome:** turn the repository into a deterministic, genuinely evolving artificial-life laboratory with one correct simulation runtime, a polished FrankenTUI interface, a real GPU desktop interface, trustworthy replay/experiments, and tests that exercise the actual shipped paths.
 
+[Currently In Progress — `bd-2z0.5.13`, LilacElm, 2026-10-24:
+scoped source `2b76d30d` identifies failed checkpoint continuations and extends
+the original real-file CLI test through another handoff and stale-cut refusal.
+The unchanged test fails diagnostic attribution on old main and passes on final
+source, then passes again from committed source without overlays. Final-source
+RCH workspace all-target check/strict Clippy and formatting also pass. Original
+acceptance, conservative launch claims and negative controls remain unchanged;
+native/centralized DSR, full history/counters and exact-retry qualification remain
+open. Actual evidence, limits and the scoped TODO are in the existing reality check.]
+
 [Scoped repair qualified — `bd-16g.15.3`, LilacElm, 2026-10-23, `fece97473958`:
 the matcher binds complete adapter/build/report evidence, actual dispatch and
 comparison observations replace planned-work counts, and generated hardware rows
